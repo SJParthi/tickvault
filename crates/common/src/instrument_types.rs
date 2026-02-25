@@ -64,6 +64,85 @@ impl DhanInstrumentKind {
 }
 
 // ---------------------------------------------------------------------------
+// Subscribed Index (8 F&O + 23 Display = 31 total)
+// ---------------------------------------------------------------------------
+
+/// Category of a subscribed index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IndexCategory {
+    /// F&O underlying index (has derivatives, e.g., NIFTY, BANKNIFTY, SENSEX).
+    FnoUnderlying,
+    /// Display-only index (market dashboard, no derivatives, e.g., INDIA VIX).
+    DisplayIndex,
+}
+
+impl IndexCategory {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FnoUnderlying => "FnoUnderlying",
+            Self::DisplayIndex => "DisplayIndex",
+        }
+    }
+}
+
+/// Subcategory of a display index for dashboard grouping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IndexSubcategory {
+    /// Volatility indices (e.g., INDIA VIX).
+    Volatility,
+    /// Broad market indices (e.g., NIFTY 100, NIFTY 500).
+    BroadMarket,
+    /// Mid cap indices (e.g., NIFTYMCAP50).
+    MidCap,
+    /// Small cap indices (e.g., NIFTY SMALLCAP 50).
+    SmallCap,
+    /// Sectoral indices (e.g., NIFTY AUTO, NIFTYIT).
+    Sectoral,
+    /// Thematic indices (e.g., NIFTY CONSUMPTION).
+    Thematic,
+    /// F&O index (category is FnoUnderlying, subcategory is Fno).
+    Fno,
+}
+
+impl IndexSubcategory {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Volatility => "Volatility",
+            Self::BroadMarket => "BroadMarket",
+            Self::MidCap => "MidCap",
+            Self::SmallCap => "SmallCap",
+            Self::Sectoral => "Sectoral",
+            Self::Thematic => "Thematic",
+            Self::Fno => "Fno",
+        }
+    }
+}
+
+/// A subscribed index — one of the 31 documented indices.
+///
+/// 8 F&O indices (NIFTY, BANKNIFTY, etc.) + 23 display indices (VIX, sectoral, etc.).
+/// All subscribed on IDX_I exchange segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscribedIndex {
+    /// Index symbol (e.g., "NIFTY", "INDIA VIX", "NIFTY AUTO").
+    pub symbol: String,
+
+    /// IDX_I security ID for WebSocket subscription.
+    pub security_id: SecurityId,
+
+    /// Exchange (NSE or BSE).
+    pub exchange: Exchange,
+
+    /// Category: FnoUnderlying or DisplayIndex.
+    pub category: IndexCategory,
+
+    /// Subcategory for dashboard grouping.
+    pub subcategory: IndexSubcategory,
+}
+
+// ---------------------------------------------------------------------------
 // F&O Underlying
 // ---------------------------------------------------------------------------
 
@@ -324,6 +403,9 @@ pub struct FnoUniverse {
 
     /// Expiry calendars per underlying symbol.
     pub expiry_calendars: HashMap<String, ExpiryCalendar>,
+
+    /// All 31 subscribed indices (8 F&O + 23 Display), keyed by security ID.
+    pub subscribed_indices: Vec<SubscribedIndex>,
 
     /// Build metadata for diagnostics.
     pub build_metadata: UniverseBuildMetadata,

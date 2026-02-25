@@ -91,6 +91,25 @@ Reference candles: Pre-market (9:00-9:15) + Post-market (15:30-16:00)
                    Useful for: gap analysis, opening range, settlement reference
 ```
 
+### Instrument Build Window (daily, BEFORE market opens)
+```
+8:30 AM IST → Server starts, all Docker containers health-checked
+8:30 AM IST → CSV download + universe build (3-10 seconds expected)
+8:31 AM IST → System READY with instruments loaded
+8:45 AM IST → DEADLINE — if not ready, SEV-1 alert fires
+9:00 AM IST → Pre-market data collection begins (instruments MUST be loaded)
+
+FAILURE PROTOCOL:
+  CSV download fails (primary + fallback + cache ALL exhausted):
+    → INSTANT Telegram alert — no waiting, no silent failure
+    → System cannot start instrument-dependent operations
+    → Total worst-case retry window: ~30 seconds before alert
+
+  Build/validation fails after CSV obtained:
+    → INSTANT Telegram alert with error details
+    → Previous day's in-memory universe NOT usable (stale contracts)
+```
+
 **SEBI compliance requirements (enforced when deploying to AWS for real money):**
 - Server must be physically located in India (AWS ap-south-1 Mumbai)
 - Static IP mandatory (Elastic IP) for audit trail
@@ -1154,10 +1173,19 @@ This system processes financial data. Every tick, every order, every state trans
 ```
 RULE: Every write operation must be idempotent — running it twice produces the same result.
 
-QuestDB writes:
+QuestDB writes (tick data):
   - Use designated timestamp + security_id as natural dedup key
   - QuestDB's out-of-order tolerance handles late-arriving ticks
   - NEVER rely on insert order — always use explicit timestamps
+
+Instrument persistence (daily snapshots):
+  - Call persist_instrument_snapshot() AT MOST ONCE per calendar day (IST)
+  - Caller must guard against double invocation (scheduler, not the writer)
+  - ILP auto-created tables have NO dedup keys — duplicate rows if called twice
+  - If dedup needed at DB level: use QuestDB DEDUP UPSERT KEYS via PG wire protocol
+  - expiry_date is a STRING (YYYY-MM-DD), NOT a TIMESTAMP — calendar dates are never timestamps
+  - Futures have option_type = '' (empty string), strike_price = 0.0 — NOT NULL
+  - Partial snapshot (mid-batch flush failure) is acceptable — non-critical observability data
 
 Valkey writes:
   - Use SET with explicit keys — naturally idempotent
@@ -1182,6 +1210,13 @@ Tick data:
   - Deduplicate by: (security_id, exchange_timestamp, sequence_number)
   - Keep a bounded ring buffer of recent tick hashes (rtrb) for O(1) lookup
   - Log duplicates at WARN level — they indicate reconnection overlap
+
+Instrument snapshots:
+  - Deduplicate at caller level: scheduler calls persist once per IST day
+  - Guard: check last_persisted_date before calling persist_instrument_snapshot()
+  - If accidentally called twice: duplicate rows in QuestDB (non-fatal, query still works)
+  - Recovery: SELECT DISTINCT on (snapshot_date, security_id) always returns correct data
+  - Future hardening: QuestDB DEDUP UPSERT KEYS(snapshot_date, security_id) via PG wire
 
 Orders:
   - Deduplicate by idempotency key (generated client-side)
@@ -1215,6 +1250,32 @@ Hot data (QuestDB):  90 days of tick data, all orders forever
 Cold data (S3):      All tick data archived, 5-year minimum retention
 Audit logs (Loki):   30 days hot, 5 years cold (SEBI requirement)
 Backups (EBS):       Daily automated snapshots, 30-day retention
+```
+
+### Extreme Scenario Coverage — 100% Rule
+```
+RULE: Every module must handle ALL scenarios — expected, unexpected, edge cases,
+      race conditions, double invocations, corrupt input, partial failures,
+      out-of-order events, and conditions not yet imagined.
+
+Approach:
+  1. Happy path tested — obvious
+  2. Every error variant tested — every Err() arm has a test
+  3. Boundary conditions tested — min, max, zero, overflow, empty, full
+  4. Race conditions tested — Loom for shared state, concurrent access patterns
+  5. Double invocation tested — what happens if called twice? Must be safe.
+  6. Corrupt/malformed input tested — fuzz tests for all external data
+  7. Partial failure tested — what if step 3 of 5 fails? Cleanup? Rollback? Safe state?
+  8. Resource exhaustion tested — disk full, memory pressure, connection pool drained
+  9. Time-based edge cases tested — midnight IST, DST-like transitions, market holidays
+  10. Network edge cases tested — timeout, partial response, connection reset mid-transfer
+
+If a scenario CAN happen, it MUST have a test.
+If a scenario MIGHT happen, it MUST have a test.
+If a scenario SEEMS IMPOSSIBLE, document WHY it's impossible — or write a test.
+
+Claude Code must proactively identify edge cases during implementation,
+not wait for Parthiban to discover them in review.
 ```
 
 ---

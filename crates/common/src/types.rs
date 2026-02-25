@@ -14,6 +14,16 @@ pub enum Exchange {
     BombayStockExchange,
 }
 
+impl Exchange {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NationalStockExchange => "NSE",
+            Self::BombayStockExchange => "BSE",
+        }
+    }
+}
+
 /// Exchange segment for subscription and routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExchangeSegment {

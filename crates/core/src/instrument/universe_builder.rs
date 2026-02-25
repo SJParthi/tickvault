@@ -543,6 +543,80 @@ fn build_derivatives_and_chains(
 }
 
 // ---------------------------------------------------------------------------
+// Subscribed Indices Builder (8 F&O + 23 Display = 31)
+// ---------------------------------------------------------------------------
+
+/// Build the list of 31 subscribed indices from F&O underlyings and display index constants.
+///
+/// F&O indices (8): extracted from the linked underlyings where kind is NseIndex or BseIndex.
+/// Display indices (23): from the `DISPLAY_INDEX_ENTRIES` compile-time constant.
+///
+/// All indices use the IDX_I exchange segment for WebSocket subscriptions.
+fn build_subscribed_indices(underlyings: &HashMap<String, FnoUnderlying>) -> Vec<SubscribedIndex> {
+    let mut indices = Vec::with_capacity(TOTAL_SUBSCRIBED_INDEX_COUNT);
+
+    // 8 F&O index underlyings — extract from the linked underlyings map
+    for underlying in underlyings.values() {
+        let exchange = match underlying.kind {
+            UnderlyingKind::NseIndex => Exchange::NationalStockExchange,
+            UnderlyingKind::BseIndex => Exchange::BombayStockExchange,
+            UnderlyingKind::Stock => continue, // Skip stocks, only indices
+        };
+
+        indices.push(SubscribedIndex {
+            symbol: underlying.underlying_symbol.clone(),
+            security_id: underlying.price_feed_security_id,
+            exchange,
+            category: IndexCategory::FnoUnderlying,
+            subcategory: IndexSubcategory::Fno,
+        });
+    }
+
+    // 23 display indices — from compile-time constant
+    for &(name, security_id, subcategory_str) in DISPLAY_INDEX_ENTRIES {
+        let subcategory = match subcategory_str {
+            "Volatility" => IndexSubcategory::Volatility,
+            "BroadMarket" => IndexSubcategory::BroadMarket,
+            "MidCap" => IndexSubcategory::MidCap,
+            "SmallCap" => IndexSubcategory::SmallCap,
+            "Sectoral" => IndexSubcategory::Sectoral,
+            "Thematic" => IndexSubcategory::Thematic,
+            _ => {
+                warn!(
+                    index_name = name,
+                    subcategory = subcategory_str,
+                    "unknown display index subcategory, defaulting to Thematic"
+                );
+                IndexSubcategory::Thematic
+            }
+        };
+
+        indices.push(SubscribedIndex {
+            symbol: name.to_string(),
+            security_id,
+            exchange: Exchange::NationalStockExchange, // All display indices are NSE
+            category: IndexCategory::DisplayIndex,
+            subcategory,
+        });
+    }
+
+    info!(
+        fno_index_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::FnoUnderlying)
+            .count(),
+        display_index_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .count(),
+        total = indices.len(),
+        "subscribed indices built"
+    );
+
+    indices
+}
+
+// ---------------------------------------------------------------------------
 // Public Orchestrator
 // ---------------------------------------------------------------------------
 
@@ -614,6 +688,9 @@ pub async fn build_fno_universe(
 
     let pass5_result = build_derivatives_and_chains(&parsed_rows, &mut underlyings, today);
 
+    // Step 7b: Build subscribed indices (8 F&O + 23 Display)
+    let subscribed_indices = build_subscribed_indices(&underlyings);
+
     // Assemble the universe
     let build_duration = build_start.elapsed();
     let build_timestamp = Utc::now().with_timezone(&ist_offset);
@@ -636,6 +713,7 @@ pub async fn build_fno_universe(
         instrument_info: pass5_result.instrument_info,
         option_chains: pass5_result.option_chains,
         expiry_calendars: pass5_result.expiry_calendars,
+        subscribed_indices,
     };
 
     // Step 8: Validate
@@ -647,6 +725,7 @@ pub async fn build_fno_universe(
         option_chains = universe.option_chains.len(),
         expiry_calendars = universe.expiry_calendars.len(),
         instrument_info = universe.instrument_info.len(),
+        subscribed_indices = universe.subscribed_indices.len(),
         build_ms = build_duration.as_millis(),
         "F&O universe built successfully"
     );
@@ -1696,5 +1775,121 @@ mod tests {
         // All underlyings should have contract_count > 0 (except those with no derivatives)
         let nifty = underlyings.get("NIFTY").unwrap();
         assert!(nifty.contract_count > 0, "NIFTY must have contracts");
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscribed Indices Builder Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_fno_count() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        // Test data has 8 index underlyings: 5 NSE + 3 BSE
+        let fno_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::FnoUnderlying)
+            .count();
+        assert_eq!(fno_count, 8, "test data has 8 F&O index underlyings");
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_display_count() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        let display_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .count();
+        assert_eq!(
+            display_count, DISPLAY_INDEX_COUNT,
+            "display indices must match constant"
+        );
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_total_count() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        // 8 F&O indices (from test data) + 23 display = 31
+        assert_eq!(indices.len(), 8 + DISPLAY_INDEX_COUNT);
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_skips_stock_underlyings() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        // No stock underlyings should appear (RELIANCE, HDFCBANK, etc. are stocks)
+        for index in &indices {
+            assert_ne!(index.symbol, "RELIANCE", "stock must not appear as index");
+            assert_ne!(index.symbol, "HDFCBANK", "stock must not appear as index");
+        }
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_fno_uses_price_feed_id() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        // NIFTY F&O index should use price_feed_security_id (IDX_I:13), not underlying_security_id (26000)
+        let nifty = indices
+            .iter()
+            .find(|i| i.symbol == "NIFTY")
+            .expect("NIFTY must be in subscribed indices");
+        assert_eq!(
+            nifty.security_id, 13,
+            "must use IDX_I price feed ID, not FNO phantom ID"
+        );
+        assert_eq!(nifty.category, IndexCategory::FnoUnderlying);
+        assert_eq!(nifty.subcategory, IndexSubcategory::Fno);
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_bse_index_has_correct_exchange() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        let sensex = indices
+            .iter()
+            .find(|i| i.symbol == "SENSEX")
+            .expect("SENSEX must be in subscribed indices");
+        assert_eq!(sensex.exchange, Exchange::BombayStockExchange);
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_display_subcategories() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        let vix = indices
+            .iter()
+            .find(|i| i.symbol == "INDIA VIX")
+            .expect("INDIA VIX must be in subscribed indices");
+        assert_eq!(vix.subcategory, IndexSubcategory::Volatility);
+        assert_eq!(vix.category, IndexCategory::DisplayIndex);
+
+        let nifty_auto = indices
+            .iter()
+            .find(|i| i.symbol == "NIFTY AUTO")
+            .expect("NIFTY AUTO must be in subscribed indices");
+        assert_eq!(nifty_auto.subcategory, IndexSubcategory::Sectoral);
     }
 }

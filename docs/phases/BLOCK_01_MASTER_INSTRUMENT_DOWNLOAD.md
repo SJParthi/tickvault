@@ -202,7 +202,7 @@ The FnoUniverse is rebuilt in-memory daily from the CSV. But after 90+ days, whe
 - Audit trail: confirm what the system knew about instruments when a trade was placed
 - Dashboard: show daily build health metrics over time
 
-### QuestDB Tables (3)
+### QuestDB Tables (4)
 
 #### Table 1: `instrument_build_metadata`
 
@@ -257,9 +257,9 @@ CREATE TABLE derivative_contracts (
     underlying_symbol   SYMBOL,       -- e.g., "NIFTY", "RELIANCE"
     instrument_kind     SYMBOL,       -- "FutureIndex", "FutureStock", "OptionIndex", "OptionStock"
     exchange_segment    SYMBOL,       -- "NSE_FNO" or "BSE_FNO"
-    expiry_date         TIMESTAMP,    -- contract expiry date
+    expiry_date         VARCHAR,      -- contract expiry as YYYY-MM-DD string (NOT timestamp)
     strike_price        DOUBLE,       -- strike price (0.0 for futures)
-    option_type         SYMBOL,       -- "CE", "PE", or NULL for futures
+    option_type         SYMBOL,       -- "CE", "PE", or "" (empty string) for futures
     lot_size            INT,          -- contract lot size
     tick_size           DOUBLE,       -- minimum price movement
     symbol_name         SYMBOL,       -- full symbol (e.g., "NIFTY-Mar2026-18000-CE")
@@ -269,16 +269,151 @@ CREATE TABLE derivative_contracts (
 
 **Volume:** ~150K rows/day = ~55M rows/year. Partitioned by month for efficient querying. QuestDB handles this easily — it's designed for exactly this kind of time-series data.
 
+#### Table 4: `subscribed_indices`
+
+Daily snapshot of all 31 subscribed indices (8 F&O + 23 Display). These are the indices that get WebSocket subscriptions for market data.
+
+```sql
+CREATE TABLE subscribed_indices (
+    snapshot_date   TIMESTAMP,    -- IST date (designated timestamp)
+    symbol          SYMBOL,       -- e.g., "NIFTY", "INDIA VIX", "NIFTY AUTO"
+    exchange        SYMBOL,       -- "NSE" or "BSE"
+    category        SYMBOL,       -- "FnoUnderlying" or "DisplayIndex"
+    subcategory     SYMBOL,       -- "Fno", "Volatility", "BroadMarket", "MidCap", "SmallCap", "Sectoral", "Thematic"
+    security_id     LONG          -- IDX_I security ID for WebSocket subscription
+) TIMESTAMP(snapshot_date) PARTITION BY MONTH;
+```
+
+**Composition:**
+- **8 F&O indices** (category=FnoUnderlying, subcategory=Fno): NIFTY(13), BANKNIFTY(25), FINNIFTY(27), MIDCPNIFTY(442), NIFTYNXT50(38), SENSEX(51), BANKEX(69), SENSEX50(83)
+- **23 Display indices** (category=DisplayIndex): INDIA VIX(21), NIFTY 100(17), NIFTY AUTO(14), etc. — see `DISPLAY_INDEX_ENTRIES` in constants.rs
+
+**Volume:** 31 rows/day = ~11K rows/year. Negligible storage.
+
+### Operational Timeline — Instrument Build
+
+```
+8:30 AM IST — Server starts. All Docker containers must be healthy.
+              Health check: QuestDB, Valkey, all infra services reporting UP.
+              ONLY when all services healthy → proceed to instrument build.
+
+8:30 AM IST — CSV download begins immediately after health check passes.
+  + seconds    Download + parse + 5-pass build + validation + persistence.
+              Expected: 3-10 seconds total on MacBook, ~1-3 seconds on c7i.2xlarge.
+
+8:31 AM IST — System READY with instruments loaded.
+              WebSocket subscriptions can be prepared.
+              Pre-market data collection starts at 9:00 AM.
+
+FAILURE SCENARIO:
+  If CSV download fails (primary + fallback + cache ALL fail):
+    → INSTANT Telegram alert to Parthiban
+    → System CANNOT proceed — instruments are required for everything
+    → No silent failure. No waiting. Alert the moment all retries are exhausted.
+    → Retry window: backon exponential backoff 2s → 8s, 3 retries per URL
+    → Total worst-case time: ~30 seconds before alert fires
+
+  If CSV downloaded but build/validation fails:
+    → INSTANT Telegram alert with build error details
+    → System halts instrument-dependent operations
+    → Previous day's cache may be usable as fallback (degraded mode)
+
+BY 8:45 AM IST — System MUST be fully operational with instruments loaded.
+                 If not ready by 8:45 AM → SEV-1 alert.
+                 Live trading system needs instruments before 9:00 AM pre-market.
+```
+
+### Incremental Persistence Strategy
+
+```
+Daily snapshots are ADDITIVE — they never delete historical data.
+
+Day 1: CSV has 150,949 contracts → 150,949 rows inserted with snapshot_date = Day 1
+Day 2: CSV has 151,200 contracts → 151,200 rows inserted with snapshot_date = Day 2
+        (Day 1 data untouched — new partition)
+
+What "incremental" means:
+  - New contracts (new listings, new expiries) → automatically appear in today's snapshot
+  - Changed contracts (lot size changes) → today's snapshot has new values, old snapshot preserved
+  - Expired contracts → not in today's CSV, so not in today's snapshot (but historical snapshots preserved)
+  - NOTHING is ever deleted from QuestDB — full audit trail
+
+What the caller must ensure:
+  - Call persist_instrument_snapshot() exactly ONCE per IST calendar day
+  - Scheduler guards against double invocation (check last_persisted_date)
+  - If called twice → duplicate rows (non-fatal, recoverable with SELECT DISTINCT)
+```
+
 ### Persistence Strategy
 
 ```
 1. build_fno_universe() completes successfully (existing Block 01)
-2. Immediately after: persist_instrument_snapshot(universe, questdb_client)
-3. Write order: metadata → underlyings → derivative_contracts
-4. Use ILP (InfluxDB Line Protocol) for high-speed ingestion
-5. All writes are idempotent — same (snapshot_date, security_id) = same row
-6. If QuestDB write fails: WARN log + continue (universe is in-memory, system still functional)
-7. QuestDB write failure does NOT block trading — it's observability data, not critical path
+2. Immediately after: persist_instrument_snapshot(universe, questdb_config)
+3. Write order: metadata → underlyings → derivative_contracts → subscribed_indices
+4. Use ILP (InfluxDB Line Protocol) for high-speed ingestion via questdb-rs 6.1.0
+5. Derivative contracts (~150K rows) batched: flush every ILP_FLUSH_BATCH_SIZE (10,000) rows
+6. If QuestDB write fails: WARN log + continue (non-critical observability data)
+7. QuestDB write failure does NOT block trading — universe is in-memory, system functional
+```
+
+### Deduplication & Idempotency
+
+```
+Current state:
+  - ILP auto-created tables have NO dedup keys
+  - Calling persist_instrument_snapshot() twice on the same IST day = duplicate rows
+  - The CALLER must ensure single invocation per day (scheduler responsibility)
+
+Why this is acceptable:
+  - Instrument persistence is observability data, not trading-critical
+  - Duplicate rows don't corrupt data — queries with DISTINCT still return correct results
+  - Daily scheduler (when built) will guard: check last_persisted_date before calling
+  - Worst case: duplicate rows waste ~5MB storage — trivial
+
+Future hardening (when scheduler is built):
+  - Option A: Caller guard — check last_persisted_date in QuestDB via PG wire before writing
+  - Option B: QuestDB DEDUP UPSERT KEYS(snapshot_date, security_id) via PG wire DDL
+  - Option C: Both — belt and suspenders
+
+Recovery from accidental duplicates:
+  SELECT DISTINCT snapshot_date, security_id, ... FROM derivative_contracts
+  WHERE snapshot_date = '2026-02-25'
+  -- Always returns correct data regardless of duplicates
+```
+
+### Edge Cases & Known Behaviors
+
+```
+expiry_date:
+  - Stored as VARCHAR in YYYY-MM-DD format, NOT as TIMESTAMP
+  - Prevents timezone-related date shift (e.g., 2026-03-27 becoming 2026-03-26T18:30:00Z)
+  - NaiveDate::to_string() produces clean YYYY-MM-DD — no .format() needed
+
+Futures contracts:
+  - option_type = "" (empty string), NOT NULL — ILP SYMBOL columns don't support NULL
+  - strike_price = 0.0 — meaningful zero, not missing data
+  - Downstream queries: WHERE option_type != '' filters to options only
+
+Type safety:
+  - u32 fields (security_id, lot_size) → i64::from() — infallible, zero risk
+  - usize fields (counts, durations) → i64::try_from().expect() — panics if >i64::MAX (impossible)
+  - f64 fields (strike_price, tick_size) → column_f64() — direct, no cast needed
+
+IST timestamp:
+  - Designated timestamp = IST midnight (00:00:00 IST) stored as UTC
+  - QuestDB displays as UTC: 2026-02-24T18:30:00Z = 2026-02-25 00:00:00 IST
+  - Grafana/downstream must set timezone to Asia/Kolkata for correct display
+
+Partial write failure:
+  - If flush fails mid-batch (e.g., batch 8 of 15), rows 1-7 are committed
+  - Result: partial snapshot in QuestDB — metadata and underlyings present, some contracts missing
+  - This is acceptable: non-critical data, next day's full snapshot covers the gap
+  - Logged as WARN with table name and error details
+
+Corporate actions (demergers, symbol changes):
+  - Daily snapshot captures the instrument state AS OF THAT DAY
+  - Historical queries always join on snapshot_date to get the correct mapping
+  - security_id changes between days are visible via diff queries across snapshot_dates
 ```
 
 ### Retention

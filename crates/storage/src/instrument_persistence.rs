@@ -3,10 +3,11 @@
 //! After `build_fno_universe()` produces the in-memory universe, this module
 //! writes a daily snapshot to QuestDB via the InfluxDB Line Protocol (ILP).
 //!
-//! Three tables are written:
+//! Four tables are written:
 //! - `instrument_build_metadata` — 1 row per build (health and statistics)
 //! - `fno_underlyings` — ~215 rows per day (underlying reference data)
 //! - `derivative_contracts` — ~150K rows per day (contract → security_id mapping)
+//! - `subscribed_indices` — 31 rows per day (8 F&O + 23 Display indices)
 //!
 //! # Error Handling
 //!
@@ -39,9 +40,10 @@ use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
     ILP_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS, QUESTDB_TABLE_BUILD_METADATA,
     QUESTDB_TABLE_DERIVATIVE_CONTRACTS, QUESTDB_TABLE_FNO_UNDERLYINGS,
+    QUESTDB_TABLE_SUBSCRIBED_INDICES,
 };
 use dhan_live_trader_common::instrument_types::{
-    DerivativeContract, FnoUnderlying, FnoUniverse, UniverseBuildMetadata,
+    DerivativeContract, FnoUnderlying, FnoUniverse, SubscribedIndex, UniverseBuildMetadata,
 };
 use dhan_live_trader_common::types::SecurityId;
 
@@ -62,6 +64,7 @@ pub fn persist_instrument_snapshot(
             info!(
                 underlying_count = universe.underlyings.len(),
                 derivative_count = universe.derivative_contracts.len(),
+                subscribed_index_count = universe.subscribed_indices.len(),
                 "instrument snapshot persisted to QuestDB"
             );
             Ok(())
@@ -110,6 +113,13 @@ fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -> Resu
         &mut sender,
         &mut buffer,
         &universe.derivative_contracts,
+        snapshot_nanos,
+    )?;
+
+    write_subscribed_indices(
+        &mut sender,
+        &mut buffer,
+        &universe.subscribed_indices,
         snapshot_nanos,
     )?;
 
@@ -348,6 +358,53 @@ fn write_single_contract(
 }
 
 // ---------------------------------------------------------------------------
+// Table 4: subscribed_indices (31 rows: 8 F&O + 23 Display)
+// ---------------------------------------------------------------------------
+
+/// Writes all subscribed indices as a daily snapshot.
+fn write_subscribed_indices(
+    sender: &mut Sender,
+    buffer: &mut Buffer,
+    indices: &[SubscribedIndex],
+    snapshot_nanos: TimestampNanos,
+) -> Result<()> {
+    for index in indices {
+        write_single_subscribed_index(buffer, index, snapshot_nanos)?;
+    }
+
+    if !buffer.is_empty() {
+        sender.flush(buffer).context("flush subscribed_indices")?;
+    }
+
+    Ok(())
+}
+
+/// Writes a single subscribed index row into the ILP buffer.
+fn write_single_subscribed_index(
+    buffer: &mut Buffer,
+    index: &SubscribedIndex,
+    snapshot_nanos: TimestampNanos,
+) -> Result<()> {
+    buffer
+        .table(QUESTDB_TABLE_SUBSCRIBED_INDICES)
+        .context("table name")?
+        .symbol("symbol", &index.symbol)
+        .context("symbol")?
+        .symbol("exchange", index.exchange.as_str())
+        .context("exchange")?
+        .symbol("category", index.category.as_str())
+        .context("category")?
+        .symbol("subcategory", index.subcategory.as_str())
+        .context("subcategory")?
+        .column_i64("security_id", i64::from(index.security_id))
+        .context("security_id")?
+        .at(snapshot_nanos)
+        .context("designated timestamp")?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -356,9 +413,9 @@ mod tests {
     use super::*;
     use chrono::{FixedOffset, NaiveDate};
     use dhan_live_trader_common::instrument_types::{
-        DhanInstrumentKind, UnderlyingKind, UniverseBuildMetadata,
+        DhanInstrumentKind, IndexCategory, IndexSubcategory, UnderlyingKind, UniverseBuildMetadata,
     };
-    use dhan_live_trader_common::types::{ExchangeSegment, OptionType};
+    use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType};
     use questdb::ingress::ProtocolVersion;
     use std::time::Duration;
 
@@ -608,5 +665,115 @@ mod tests {
     fn test_option_type_as_str() {
         assert_eq!(OptionType::Call.as_str(), "CE");
         assert_eq!(OptionType::Put.as_str(), "PE");
+    }
+
+    // --- Subscribed Indices Tests ---
+
+    /// Helper: create a minimal SubscribedIndex for testing.
+    fn make_test_fno_index(symbol: &str, security_id: SecurityId) -> SubscribedIndex {
+        SubscribedIndex {
+            symbol: symbol.to_string(),
+            security_id,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::FnoUnderlying,
+            subcategory: IndexSubcategory::Fno,
+        }
+    }
+
+    /// Helper: create a display index for testing.
+    fn make_test_display_index(
+        symbol: &str,
+        security_id: SecurityId,
+        subcategory: IndexSubcategory,
+    ) -> SubscribedIndex {
+        SubscribedIndex {
+            symbol: symbol.to_string(),
+            security_id,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::DisplayIndex,
+            subcategory,
+        }
+    }
+
+    #[test]
+    fn test_subscribed_indices_buffer_has_correct_row_count() {
+        let snapshot_nanos = naive_date_to_timestamp_nanos(
+            NaiveDate::from_ymd_opt(2026, 2, 25).expect("valid date"),
+        )
+        .expect("valid timestamp");
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let indices = vec![
+            make_test_fno_index("NIFTY", 13),
+            make_test_fno_index("BANKNIFTY", 25),
+            make_test_display_index("INDIA VIX", 21, IndexSubcategory::Volatility),
+            make_test_display_index("NIFTY AUTO", 14, IndexSubcategory::Sectoral),
+        ];
+
+        for index in &indices {
+            write_single_subscribed_index(&mut buffer, index, snapshot_nanos).unwrap();
+        }
+
+        assert_eq!(buffer.row_count(), 4);
+    }
+
+    #[test]
+    fn test_subscribed_index_buffer_contains_fields() {
+        let snapshot_nanos = naive_date_to_timestamp_nanos(
+            NaiveDate::from_ymd_opt(2026, 2, 25).expect("valid date"),
+        )
+        .expect("valid timestamp");
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let index = make_test_fno_index("NIFTY", 13);
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_SUBSCRIBED_INDICES));
+        assert!(content.contains("NIFTY"));
+        assert!(content.contains("NSE"));
+        assert!(content.contains("FnoUnderlying"));
+        assert!(content.contains("Fno"));
+    }
+
+    #[test]
+    fn test_display_index_buffer_contains_subcategory() {
+        let snapshot_nanos = naive_date_to_timestamp_nanos(
+            NaiveDate::from_ymd_opt(2026, 2, 25).expect("valid date"),
+        )
+        .expect("valid timestamp");
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let index = make_test_display_index("INDIA VIX", 21, IndexSubcategory::Volatility);
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("DisplayIndex"));
+        assert!(content.contains("Volatility"));
+        // ILP protocol escapes spaces in SYMBOL columns as "\ " (backslash-space).
+        assert!(content.contains("INDIA\\ VIX"));
+    }
+
+    #[test]
+    fn test_index_category_as_str() {
+        assert_eq!(IndexCategory::FnoUnderlying.as_str(), "FnoUnderlying");
+        assert_eq!(IndexCategory::DisplayIndex.as_str(), "DisplayIndex");
+    }
+
+    #[test]
+    fn test_index_subcategory_as_str() {
+        assert_eq!(IndexSubcategory::Volatility.as_str(), "Volatility");
+        assert_eq!(IndexSubcategory::BroadMarket.as_str(), "BroadMarket");
+        assert_eq!(IndexSubcategory::MidCap.as_str(), "MidCap");
+        assert_eq!(IndexSubcategory::SmallCap.as_str(), "SmallCap");
+        assert_eq!(IndexSubcategory::Sectoral.as_str(), "Sectoral");
+        assert_eq!(IndexSubcategory::Thematic.as_str(), "Thematic");
+        assert_eq!(IndexSubcategory::Fno.as_str(), "Fno");
+    }
+
+    #[test]
+    fn test_exchange_as_str() {
+        assert_eq!(Exchange::NationalStockExchange.as_str(), "NSE");
+        assert_eq!(Exchange::BombayStockExchange.as_str(), "BSE");
     }
 }

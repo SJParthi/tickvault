@@ -255,6 +255,7 @@ mod tests {
             instrument_info,
             option_chains,
             expiry_calendars,
+            subscribed_indices: Vec::new(),
             build_metadata: UniverseBuildMetadata {
                 csv_source: "test".to_owned(),
                 csv_row_count: 200_000,

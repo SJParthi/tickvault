@@ -225,36 +225,40 @@ pub const CSV_TEST_SYMBOL_MARKER: &str = "TEST";
 
 use crate::types::SecurityId;
 
-/// Display indices: (display name, IDX_I security ID).
+/// Display indices: (display name, IDX_I security ID, subcategory string).
 /// Subscribed for market dashboard and sentiment display.
-pub const DISPLAY_INDEX_SECURITY_IDS: &[(&str, SecurityId)] = &[
-    ("INDIA VIX", 21),
-    ("NIFTY 100", 17),
-    ("NIFTY 200", 18),
-    ("NIFTY 500", 19),
-    ("NIFTYMCAP50", 20),
-    ("NIFTY MIDCAP 150", 1),
-    ("NIFTY SMALLCAP 50", 22),
-    ("NIFTY SMALLCAP 100", 5),
-    ("NIFTY SMALLCAP 250", 3),
-    ("NIFTY AUTO", 14),
-    ("NIFTY PVT BANK", 15),
-    ("NIFTY FMCG", 28),
-    ("NIFTY ENERGY", 42),
-    ("NIFTYINFRA", 43),
-    ("NIFTYIT", 29),
-    ("NIFTY MEDIA", 30),
-    ("NIFTY METAL", 31),
-    ("NIFTY MNC", 44),
-    ("NIFTY PHARMA", 32),
-    ("NIFTY PSU BANK", 33),
-    ("NIFTY REALTY", 34),
-    ("NIFTY SERV SECTOR", 46),
-    ("NIFTY CONSUMPTION", 40),
+/// Subcategory must match `IndexSubcategory::as_str()` values.
+pub const DISPLAY_INDEX_ENTRIES: &[(&str, SecurityId, &str)] = &[
+    ("INDIA VIX", 21, "Volatility"),
+    ("NIFTY 100", 17, "BroadMarket"),
+    ("NIFTY 200", 18, "BroadMarket"),
+    ("NIFTY 500", 19, "BroadMarket"),
+    ("NIFTYMCAP50", 20, "MidCap"),
+    ("NIFTY MIDCAP 150", 1, "MidCap"),
+    ("NIFTY SMALLCAP 50", 22, "SmallCap"),
+    ("NIFTY SMALLCAP 100", 5, "SmallCap"),
+    ("NIFTY SMALLCAP 250", 3, "SmallCap"),
+    ("NIFTY AUTO", 14, "Sectoral"),
+    ("NIFTY PVT BANK", 15, "Sectoral"),
+    ("NIFTY FMCG", 28, "Sectoral"),
+    ("NIFTY ENERGY", 42, "Sectoral"),
+    ("NIFTYINFRA", 43, "Sectoral"),
+    ("NIFTYIT", 29, "Sectoral"),
+    ("NIFTY MEDIA", 30, "Sectoral"),
+    ("NIFTY METAL", 31, "Sectoral"),
+    ("NIFTY MNC", 44, "Sectoral"),
+    ("NIFTY PHARMA", 32, "Sectoral"),
+    ("NIFTY PSU BANK", 33, "Sectoral"),
+    ("NIFTY REALTY", 34, "Sectoral"),
+    ("NIFTY SERV SECTOR", 46, "Sectoral"),
+    ("NIFTY CONSUMPTION", 40, "Thematic"),
 ];
 
 /// Number of display indices.
 pub const DISPLAY_INDEX_COUNT: usize = 23;
+
+/// Total subscribed indices: 8 F&O + 23 Display = 31.
+pub const TOTAL_SUBSCRIBED_INDEX_COUNT: usize = 31;
 
 // ---------------------------------------------------------------------------
 // F&O Universe — Full Chain Indices
@@ -328,6 +332,9 @@ pub const QUESTDB_TABLE_FNO_UNDERLYINGS: &str = "fno_underlyings";
 
 /// QuestDB table: daily derivative contract snapshots.
 pub const QUESTDB_TABLE_DERIVATIVE_CONTRACTS: &str = "derivative_contracts";
+
+/// QuestDB table: daily subscribed index snapshots (8 F&O + 23 Display = 31).
+pub const QUESTDB_TABLE_SUBSCRIBED_INDICES: &str = "subscribed_indices";
 
 // ---------------------------------------------------------------------------
 // QuestDB ILP — Ingestion Configuration
