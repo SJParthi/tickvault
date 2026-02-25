@@ -44,4 +44,20 @@ pub enum ApplicationError {
         table: String,
         source: anyhow::Error,
     },
+
+    /// TOTP code generation failed.
+    #[error("TOTP generation failed: {reason}")]
+    TotpGenerationFailed { reason: String },
+
+    /// Dhan authentication API call failed.
+    #[error("Dhan authentication failed: {reason}")]
+    AuthenticationFailed { reason: String },
+
+    /// Token renewal failed after all retries.
+    #[error("token renewal failed after {attempts} attempts: {reason}")]
+    TokenRenewalFailed { attempts: u32, reason: String },
+
+    /// Authentication circuit breaker tripped — too many consecutive failures.
+    #[error("auth circuit breaker tripped after {failures} consecutive failures")]
+    AuthCircuitBreakerTripped { failures: u32 },
 }

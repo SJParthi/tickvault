@@ -350,3 +350,47 @@ pub const ILP_FLUSH_BATCH_SIZE: usize = 10_000;
 
 /// IST offset from UTC in seconds (5 hours 30 minutes = 19,800 seconds).
 pub const IST_UTC_OFFSET_SECONDS: i32 = 19_800;
+
+// ---------------------------------------------------------------------------
+// Authentication — TOTP Configuration
+// ---------------------------------------------------------------------------
+
+/// TOTP digit count (Dhan uses 6-digit codes).
+pub const TOTP_DIGITS: usize = 6;
+
+/// TOTP time period in seconds (standard 30-second window).
+pub const TOTP_PERIOD_SECS: u64 = 30;
+
+/// TOTP skew tolerance (number of periods to accept before/after current).
+pub const TOTP_SKEW: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Authentication — Dhan REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for initial token generation (appended to rest_api_base_url).
+pub const DHAN_GENERATE_TOKEN_PATH: &str = "/generateAccessToken";
+
+/// Path for token renewal (appended to rest_api_base_url).
+pub const DHAN_RENEW_TOKEN_PATH: &str = "/renewToken";
+
+// ---------------------------------------------------------------------------
+// Authentication — SSM Path Construction
+// ---------------------------------------------------------------------------
+
+/// Default environment name for SSM path construction.
+/// Overridden by `ENVIRONMENT` env var if present.
+pub const DEFAULT_SSM_ENVIRONMENT: &str = "dev";
+
+/// SSM service path segment for Dhan credentials.
+pub const SSM_DHAN_SERVICE: &str = "dhan";
+
+// ---------------------------------------------------------------------------
+// Authentication — Circuit Breaker
+// ---------------------------------------------------------------------------
+
+/// Maximum consecutive token renewal failures before circuit breaker trips.
+pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
+/// Circuit breaker reset timeout in seconds (try again after this).
+pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS: u64 = 60;

@@ -1,7 +1,9 @@
-//! Core engine: instrument universe, WebSocket management, binary parsing, tick pipeline.
+//! Core engine: instrument universe, authentication, WebSocket management,
+//! binary parsing, tick pipeline.
 //!
 //! # Modules
-//! - `instrument` — Master instrument download, CSV parsing, F&O universe building
+//! - `auth` — Authentication, TOTP generation, JWT token lifecycle (Block 02)
+//! - `instrument` — Master instrument download, CSV parsing, F&O universe building (Block 01)
 //!
 //! # Key Modules (to be built)
 //! - `websocket_client` — Dhan WebSocket V2 connection lifecycle
@@ -9,6 +11,7 @@
 //! - `tick_pipeline` — SPSC ring buffer routing to downstream consumers
 //!
 //! # Boot Sequence Position
-//! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket -> Parse -> Route
+//! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route
 
+pub mod auth;
 pub mod instrument;

@@ -90,7 +90,7 @@ pub struct PrometheusConfig {
 }
 
 /// Network timeout and retry configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NetworkConfig {
     /// HTTP request timeout in milliseconds.
     pub request_timeout_ms: u64,
@@ -105,7 +105,7 @@ pub struct NetworkConfig {
 }
 
 /// JWT token lifecycle configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenConfig {
     /// Hours before expiry to trigger token refresh.
     pub refresh_before_expiry_hours: u64,
