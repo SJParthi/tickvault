@@ -37,4 +37,11 @@ pub enum ApplicationError {
     /// Required CSV column not found in header.
     #[error("required CSV column '{column}' not found in header")]
     CsvColumnMissing { column: String },
+
+    /// QuestDB write operation failed.
+    #[error("QuestDB write failed for table '{table}': {source}")]
+    QuestDbWriteFailed {
+        table: String,
+        source: anyhow::Error,
+    },
 }

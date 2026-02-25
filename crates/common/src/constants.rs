@@ -315,3 +315,31 @@ pub const APPLICATION_NAME: &str = "dhan-live-trader";
 
 /// Application version (updated with each release).
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ---------------------------------------------------------------------------
+// QuestDB ILP — Table Names
+// ---------------------------------------------------------------------------
+
+/// QuestDB table: daily instrument build health and statistics.
+pub const QUESTDB_TABLE_BUILD_METADATA: &str = "instrument_build_metadata";
+
+/// QuestDB table: daily F&O underlying snapshots.
+pub const QUESTDB_TABLE_FNO_UNDERLYINGS: &str = "fno_underlyings";
+
+/// QuestDB table: daily derivative contract snapshots.
+pub const QUESTDB_TABLE_DERIVATIVE_CONTRACTS: &str = "derivative_contracts";
+
+// ---------------------------------------------------------------------------
+// QuestDB ILP — Ingestion Configuration
+// ---------------------------------------------------------------------------
+
+/// Number of ILP rows to buffer before flushing to QuestDB.
+/// Prevents unbounded memory growth when writing ~150K derivative contracts.
+pub const ILP_FLUSH_BATCH_SIZE: usize = 10_000;
+
+// ---------------------------------------------------------------------------
+// Timezone — IST (India Standard Time)
+// ---------------------------------------------------------------------------
+
+/// IST offset from UTC in seconds (5 hours 30 minutes = 19,800 seconds).
+pub const IST_UTC_OFFSET_SECONDS: i32 = 19_800;

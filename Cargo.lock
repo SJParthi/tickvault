@@ -1592,6 +1592,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1800c5c393af164102970b917daa2620cc60600ad4cada5a314b3083426f0f75"
 dependencies = [
  "base64ct",
+ "chrono",
  "dns-lookup",
  "indoc",
  "itoa",

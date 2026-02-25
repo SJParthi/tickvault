@@ -186,3 +186,136 @@ Block 01 produces a single FnoUniverse object containing:
 - 1,288 option chains grouped by (underlying, expiry), sorted by strike
 - 215 expiry calendars (sorted expiry dates per underlying)
 - A subscription plan of 14,577 entries ready to send to WebSocket
+
+---
+
+## BLOCK 01.1 — INSTRUMENT PERSISTENCE TO QUESTDB
+
+### Why Persist
+
+The FnoUniverse is rebuilt in-memory daily from the CSV. But after 90+ days, when reviewing historical tick data, charts, or trade audit trails, we need to know exactly what each security_id referred to on any given day. Security IDs can change due to corporate actions (demergers, symbol changes, new listings). Without persisted instrument snapshots, historical data becomes undecodable.
+
+**Use cases requiring persisted instruments:**
+- Decode security_id from historical tick data stored in QuestDB
+- Verify what lot sizes, strike prices, and expiry dates existed on a past date
+- Track instrument universe changes over time (new listings, delistings, lot size changes)
+- Audit trail: confirm what the system knew about instruments when a trade was placed
+- Dashboard: show daily build health metrics over time
+
+### QuestDB Tables (3)
+
+#### Table 1: `instrument_build_metadata`
+
+One row per daily build. Tracks build health and universe statistics.
+
+```sql
+CREATE TABLE instrument_build_metadata (
+    build_date         TIMESTAMP,    -- IST date of the build (designated timestamp)
+    csv_source         SYMBOL,       -- "primary" or "fallback" or "cache"
+    csv_row_count      INT,          -- total rows in raw CSV
+    parsed_row_count   INT,          -- rows after segment filtering
+    index_count        INT,          -- Pass 1 result
+    equity_count       INT,          -- Pass 2 result
+    underlying_count   INT,          -- Pass 3 result
+    derivative_count   INT,          -- Pass 5 result
+    option_chain_count INT,          -- Pass 5 result
+    build_duration_ms  INT,          -- total build time in milliseconds
+    build_timestamp    TIMESTAMP     -- exact IST time build completed
+) TIMESTAMP(build_date) PARTITION BY MONTH;
+```
+
+**Volume:** 1 row/day = 365 rows/year. Negligible storage.
+
+#### Table 2: `fno_underlyings`
+
+Daily snapshot of all F&O underlyings with their linked price IDs.
+
+```sql
+CREATE TABLE fno_underlyings (
+    snapshot_date           TIMESTAMP,    -- IST date (designated timestamp)
+    underlying_symbol       SYMBOL,       -- e.g., "NIFTY", "RELIANCE"
+    underlying_security_id  LONG,         -- FNO phantom ID (e.g., NIFTY=26000)
+    price_feed_security_id  LONG,         -- live price ID (e.g., NIFTY=13)
+    price_feed_segment      SYMBOL,       -- "IDX_I" or "NSE_EQ"
+    derivative_segment      SYMBOL,       -- "NSE_FNO" or "BSE_FNO"
+    kind                    SYMBOL,       -- "NseIndex", "BseIndex", "Stock"
+    lot_size                INT,          -- contract lot size
+    contract_count          INT           -- total derivative contracts
+) TIMESTAMP(snapshot_date) PARTITION BY MONTH;
+```
+
+**Volume:** ~215 rows/day = ~78K rows/year. Negligible storage.
+
+#### Table 3: `derivative_contracts`
+
+Daily snapshot of all active derivative contracts. Needed to decode any security_id from historical tick data.
+
+```sql
+CREATE TABLE derivative_contracts (
+    snapshot_date       TIMESTAMP,    -- IST date (designated timestamp)
+    security_id         LONG,         -- this contract's own security ID
+    underlying_symbol   SYMBOL,       -- e.g., "NIFTY", "RELIANCE"
+    instrument_kind     SYMBOL,       -- "FutureIndex", "FutureStock", "OptionIndex", "OptionStock"
+    exchange_segment    SYMBOL,       -- "NSE_FNO" or "BSE_FNO"
+    expiry_date         TIMESTAMP,    -- contract expiry date
+    strike_price        DOUBLE,       -- strike price (0.0 for futures)
+    option_type         SYMBOL,       -- "CE", "PE", or NULL for futures
+    lot_size            INT,          -- contract lot size
+    tick_size           DOUBLE,       -- minimum price movement
+    symbol_name         SYMBOL,       -- full symbol (e.g., "NIFTY-Mar2026-18000-CE")
+    display_name        STRING        -- human-readable display name
+) TIMESTAMP(snapshot_date) PARTITION BY MONTH;
+```
+
+**Volume:** ~150K rows/day = ~55M rows/year. Partitioned by month for efficient querying. QuestDB handles this easily — it's designed for exactly this kind of time-series data.
+
+### Persistence Strategy
+
+```
+1. build_fno_universe() completes successfully (existing Block 01)
+2. Immediately after: persist_instrument_snapshot(universe, questdb_client)
+3. Write order: metadata → underlyings → derivative_contracts
+4. Use ILP (InfluxDB Line Protocol) for high-speed ingestion
+5. All writes are idempotent — same (snapshot_date, security_id) = same row
+6. If QuestDB write fails: WARN log + continue (universe is in-memory, system still functional)
+7. QuestDB write failure does NOT block trading — it's observability data, not critical path
+```
+
+### Retention
+
+```
+Hot data (QuestDB):   90 days — matches tick data retention
+Cold data (S3):       5 years — SEBI audit compliance
+Cleanup:              Automated via QuestDB partition drop (monthly)
+```
+
+### Implementation Files
+
+| # | File | Purpose |
+|---|------|---------|
+| 1 | `crates/storage/src/instrument_persistence.rs` | QuestDB ILP writer for all 3 tables |
+
+Dependencies: `questdb-rs` (ILP client from Tech Stack Bible).
+
+### Queries for Historical Lookups
+
+```sql
+-- What was security_id 12345 on 2026-03-15?
+SELECT * FROM derivative_contracts
+WHERE snapshot_date = '2026-03-15' AND security_id = 12345;
+
+-- How many contracts did NIFTY have over the last 30 days?
+SELECT snapshot_date, contract_count FROM fno_underlyings
+WHERE underlying_symbol = 'NIFTY'
+AND snapshot_date > dateadd('d', -30, now());
+
+-- Build health over the last week
+SELECT * FROM instrument_build_metadata
+WHERE build_date > dateadd('d', -7, now())
+ORDER BY build_date;
+
+-- When did RELIANCE lot size change?
+SELECT snapshot_date, lot_size FROM fno_underlyings
+WHERE underlying_symbol = 'RELIANCE'
+ORDER BY snapshot_date;
+```

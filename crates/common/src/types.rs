@@ -31,6 +31,20 @@ pub enum ExchangeSegment {
     McxComm,
 }
 
+impl ExchangeSegment {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::IdxI => "IDX_I",
+            Self::NseEquity => "NSE_EQ",
+            Self::NseFno => "NSE_FNO",
+            Self::BseEquity => "BSE_EQ",
+            Self::BseFno => "BSE_FNO",
+            Self::McxComm => "MCX_COMM",
+        }
+    }
+}
+
 /// WebSocket feed mode determining the data granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FeedMode {
@@ -62,6 +76,16 @@ pub enum OptionType {
     Call,
     /// Put option.
     Put,
+}
+
+impl OptionType {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Call => "CE",
+            Self::Put => "PE",
+        }
+    }
 }
 
 /// Unique identifier for a security in the Dhan system.

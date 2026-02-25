@@ -27,6 +27,17 @@ pub enum UnderlyingKind {
     Stock,
 }
 
+impl UnderlyingKind {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NseIndex => "NseIndex",
+            Self::BseIndex => "BseIndex",
+            Self::Stock => "Stock",
+        }
+    }
+}
+
 /// Classification of a derivative instrument as it appears in the Dhan CSV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DhanInstrumentKind {
@@ -38,6 +49,18 @@ pub enum DhanInstrumentKind {
     OptionIndex,
     /// Stock option (OPTSTK).
     OptionStock,
+}
+
+impl DhanInstrumentKind {
+    /// Returns the canonical string representation for storage and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FutureIndex => "FutureIndex",
+            Self::FutureStock => "FutureStock",
+            Self::OptionIndex => "OptionIndex",
+            Self::OptionStock => "OptionStock",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
