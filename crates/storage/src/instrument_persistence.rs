@@ -12,6 +12,23 @@
 //!
 //! QuestDB persistence is observability data, NOT critical path.
 //! If writes fail, the system logs a WARN and continues trading.
+//!
+//! # Idempotency Warning
+//!
+//! This function MUST be called at most once per calendar day (IST).
+//! Calling it twice on the same day will insert duplicate rows because
+//! QuestDB ILP auto-created tables have no deduplication keys configured.
+//! The caller is responsible for ensuring single invocation per day.
+//!
+//! # Query Notes for Downstream Consumers
+//!
+//! - `expiry_date` is stored as a STRING in `YYYY-MM-DD` format, not a TIMESTAMP.
+//! - Futures have `option_type = ''` (empty string, not NULL) and `strike_price = 0.0`.
+//! - The designated timestamp (`timestamp` column) is IST midnight stored as UTC.
+//!   QuestDB displays it in UTC (e.g., `2026-02-24T18:30:00Z` = `2026-02-25 00:00:00 IST`).
+//!   Grafana dashboards should set timezone to IST for correct display.
+
+use std::convert::TryFrom;
 
 use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveDate, Utc};
@@ -138,23 +155,45 @@ fn write_build_metadata(
         .context("table name")?
         .symbol("csv_source", &metadata.csv_source)
         .context("csv_source")?
-        .column_i64("csv_row_count", metadata.csv_row_count as i64)
+        .column_i64(
+            "csv_row_count",
+            i64::try_from(metadata.csv_row_count).expect("csv_row_count fits in i64"),
+        )
         .context("csv_row_count")?
-        .column_i64("parsed_row_count", metadata.parsed_row_count as i64)
+        .column_i64(
+            "parsed_row_count",
+            i64::try_from(metadata.parsed_row_count).expect("parsed_row_count fits in i64"),
+        )
         .context("parsed_row_count")?
-        .column_i64("index_count", metadata.index_count as i64)
+        .column_i64(
+            "index_count",
+            i64::try_from(metadata.index_count).expect("index_count fits in i64"),
+        )
         .context("index_count")?
-        .column_i64("equity_count", metadata.equity_count as i64)
+        .column_i64(
+            "equity_count",
+            i64::try_from(metadata.equity_count).expect("equity_count fits in i64"),
+        )
         .context("equity_count")?
-        .column_i64("underlying_count", metadata.underlying_count as i64)
+        .column_i64(
+            "underlying_count",
+            i64::try_from(metadata.underlying_count).expect("underlying_count fits in i64"),
+        )
         .context("underlying_count")?
-        .column_i64("derivative_count", metadata.derivative_count as i64)
+        .column_i64(
+            "derivative_count",
+            i64::try_from(metadata.derivative_count).expect("derivative_count fits in i64"),
+        )
         .context("derivative_count")?
-        .column_i64("option_chain_count", metadata.option_chain_count as i64)
+        .column_i64(
+            "option_chain_count",
+            i64::try_from(metadata.option_chain_count).expect("option_chain_count fits in i64"),
+        )
         .context("option_chain_count")?
         .column_i64(
             "build_duration_ms",
-            metadata.build_duration.as_millis() as i64,
+            i64::try_from(metadata.build_duration.as_millis())
+                .expect("build_duration_ms fits in i64"),
         )
         .context("build_duration_ms")?
         .column_ts("build_timestamp", build_ts_micros)
@@ -218,7 +257,10 @@ fn write_single_underlying(
         .context("price_feed_security_id")?
         .column_i64("lot_size", i64::from(underlying.lot_size))
         .context("lot_size")?
-        .column_i64("contract_count", underlying.contract_count as i64)
+        .column_i64(
+            "contract_count",
+            i64::try_from(underlying.contract_count).expect("contract_count fits in i64"),
+        )
         .context("contract_count")?
         .at(snapshot_nanos)
         .context("designated timestamp")?;
@@ -264,12 +306,15 @@ fn write_single_contract(
     contract: &DerivativeContract,
     snapshot_nanos: TimestampNanos,
 ) -> Result<()> {
-    let expiry_nanos = naive_date_to_timestamp_nanos(contract.expiry_date)?;
     let option_type_str = contract
         .option_type
         .as_ref()
         .map(|ot| ot.as_str())
         .unwrap_or("");
+
+    // Expiry date stored as STRING "YYYY-MM-DD" — it's a calendar date, not a timestamp.
+    // NaiveDate::to_string() produces "YYYY-MM-DD" format.
+    let expiry_date_str = contract.expiry_date.to_string();
 
     buffer
         .table(QUESTDB_TABLE_DERIVATIVE_CONTRACTS)
@@ -286,10 +331,7 @@ fn write_single_contract(
         .context("symbol_name")?
         .column_i64("security_id", i64::from(contract.security_id))
         .context("security_id")?
-        .column_ts(
-            "expiry_date",
-            TimestampMicros::new(expiry_nanos.as_i64() / 1000),
-        )
+        .column_str("expiry_date", &expiry_date_str)
         .context("expiry_date")?
         .column_f64("strike_price", contract.strike_price)
         .context("strike_price")?
@@ -386,23 +428,41 @@ mod tests {
             .unwrap()
             .symbol("csv_source", &metadata.csv_source)
             .unwrap()
-            .column_i64("csv_row_count", metadata.csv_row_count as i64)
+            .column_i64(
+                "csv_row_count",
+                i64::try_from(metadata.csv_row_count).unwrap(),
+            )
             .unwrap()
-            .column_i64("parsed_row_count", metadata.parsed_row_count as i64)
+            .column_i64(
+                "parsed_row_count",
+                i64::try_from(metadata.parsed_row_count).unwrap(),
+            )
             .unwrap()
-            .column_i64("index_count", metadata.index_count as i64)
+            .column_i64("index_count", i64::try_from(metadata.index_count).unwrap())
             .unwrap()
-            .column_i64("equity_count", metadata.equity_count as i64)
+            .column_i64(
+                "equity_count",
+                i64::try_from(metadata.equity_count).unwrap(),
+            )
             .unwrap()
-            .column_i64("underlying_count", metadata.underlying_count as i64)
+            .column_i64(
+                "underlying_count",
+                i64::try_from(metadata.underlying_count).unwrap(),
+            )
             .unwrap()
-            .column_i64("derivative_count", metadata.derivative_count as i64)
+            .column_i64(
+                "derivative_count",
+                i64::try_from(metadata.derivative_count).unwrap(),
+            )
             .unwrap()
-            .column_i64("option_chain_count", metadata.option_chain_count as i64)
+            .column_i64(
+                "option_chain_count",
+                i64::try_from(metadata.option_chain_count).unwrap(),
+            )
             .unwrap()
             .column_i64(
                 "build_duration_ms",
-                metadata.build_duration.as_millis() as i64,
+                i64::try_from(metadata.build_duration.as_millis()).unwrap(),
             )
             .unwrap()
             .column_ts("build_timestamp", build_ts_micros)
@@ -514,6 +574,9 @@ mod tests {
         assert!(content.contains("OptionIndex"));
         assert!(content.contains("NSE_FNO"));
         assert!(content.contains("CE"));
+        // Expiry date must be stored as YYYY-MM-DD string, never as a timestamp.
+        assert!(content.contains("2026-03-27"));
+        assert!(!content.contains("T18:30:00"));
     }
 
     #[test]
