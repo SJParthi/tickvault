@@ -190,6 +190,100 @@ Parthiban opens IntelliJ pointing at the GitHub clone. Claude Code handles every
 
 ---
 
+## COMMUNICATION PROTOCOL — ALWAYS NOTIFY PARTHIBAN
+
+Parthiban has NO visibility into what Claude Code is doing unless Claude Code explicitly tells him. Without precise, clear notifications, work is invisible. This protocol is mandatory.
+
+### Status Markers — Use These Exact Labels
+
+```
+PLAN READY         → "Here is my plan. Is this fine?"
+AWAITING APPROVAL  → "I need your go-ahead before I proceed."
+IN PROGRESS        → "Working on [specific task]..."
+DONE               → "Finished. Here's what was built + proof."
+BLOCKED            → "Cannot proceed. Here's the issue + options."
+DECISION NEEDED    → "I have multiple approaches. Which one?"
+```
+
+### When Claude Code MUST Notify Parthiban
+
+**Before ANY work begins:**
+- Present the plan with every file, command, and approach
+- Ask explicitly: **"Is this fine?"**
+- Wait for "go ahead" — silence is NOT approval
+
+**At every decision point:**
+- When choosing between 2+ valid approaches → present options, ask which one
+- When a dependency is not in the Bible → propose it, wait for approval
+- When an architectural pattern choice matters → present trade-offs, ask
+- NEVER make silent decisions — every choice Parthiban would care about gets surfaced
+
+**After implementation completes:**
+- Show exactly what was done (files created/modified, commands run)
+- Show proof (command output, test results, Docker health checks)
+- State clearly: **"DONE. Here's what was built."**
+- State what comes next
+
+**When blocked:**
+- Describe what was attempted
+- Show the exact error or failure output
+- Propose 2-3 possible solutions with trade-offs
+- Ask: **"Which direction should I take?"**
+- NEVER silently retry the same failing approach more than once
+
+**When something unexpected happens:**
+- Alert immediately — don't bury surprises in a summary
+- Example: "A dependency version conflict appeared that wasn't expected."
+- Example: "Docker service X failed health check after 3 retries."
+
+### Post-Approval Automation — Full End-to-End
+
+Once Parthiban says **"go ahead"**, Claude Code executes the ENTIRE approved plan without stopping:
+
+```
+1. Create/modify all files in the plan
+2. Run cargo fmt → cargo clippy → cargo test (fix any failures)
+3. Verify Docker services if infrastructure was changed
+4. Git add → commit → push to GitHub
+5. Report back: "DONE. Here's the summary + proof."
+```
+
+**Rules for post-approval execution:**
+- Do NOT stop mid-way to ask again (unless genuinely blocked by an error)
+- Do NOT ask "should I continue?" after each sub-step — the approval covers the whole plan
+- If a genuine blocker appears mid-execution, stop and escalate with BLOCKED status
+- Small implementation details within the approved plan are Claude Code's call — don't ask about indentation, variable names within conventions, or obvious patterns
+
+### Blocker Escalation Protocol
+
+When Claude Code cannot proceed, it MUST escalate with this exact format:
+
+```
+BLOCKED: [one-line summary]
+
+What I tried:
+  1. [First attempt + result]
+  2. [Second attempt + result]
+
+Error output:
+  [exact error message or relevant output]
+
+Proposed solutions:
+  A. [Option A] — [trade-off]
+  B. [Option B] — [trade-off]
+  C. [Option C if applicable] — [trade-off]
+
+Which direction should I take?
+```
+
+**Rules:**
+- NEVER silently skip a failing step — escalate it
+- NEVER suppress errors — show the full error message
+- NEVER guess a fix without telling Parthiban what happened
+- Always propose at least 2 solutions — never just say "it's broken"
+
+---
+
 ## GIT CONVENTIONS
 
 ### Branch Naming
@@ -274,6 +368,27 @@ These rules govern EVERY phase, EVERY file, EVERY line of code, EVERY config. Th
 - No platform branching (no if-Mac-then-X, if-Linux-then-Y).
 - No host-specific paths. No OS detection.
 - Config injected at container startup, not baked in.
+
+**Local-AWS Parity Checklist — Claude Code MUST verify after every infrastructure change:**
+
+```
+BEFORE committing any Docker, config, or infrastructure change, verify ALL:
+
+[ ] No hardcoded hostnames — all services use Docker DNS names (dlt-questdb, dlt-valkey, etc.)
+[ ] No host-dependent volume mounts — no /Users/..., no /home/..., only named Docker volumes
+[ ] No platform-specific code paths — no if-mac/if-linux branching
+[ ] No localhost in application code — Docker DNS only
+[ ] Docker Compose is identical for both environments — same file, zero changes
+[ ] Config TOML uses Docker service names, not localhost or 127.0.0.1
+[ ] Secrets use SSM Parameter Store API — same code path for LocalStack and real AWS
+[ ] The ONLY env difference is AWS_ENDPOINT_URL — nothing else changes
+[ ] No architecture-specific Docker images — use multi-arch images or verify amd64 + arm64
+[ ] Health checks work in both environments — no curl/wget dependencies that differ
+```
+
+**If ANY item fails, the change does NOT ship. Fix parity BEFORE committing.**
+
+**The Golden Test:** If you deleted the local clone right now, cloned fresh on an AWS EC2 instance, ran `docker compose up -d`, would EVERYTHING work identically? If no → fix it. If yes → ship it.
 
 ### Principle 4: ZERO HARDCODED VALUES. ANYWHERE. EVER.
 No magic numbers. No inline strings. No embedded values.
