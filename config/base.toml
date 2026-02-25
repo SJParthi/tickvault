@@ -1,0 +1,58 @@
+# =============================================================================
+# dhan-live-trader — Base Configuration
+# =============================================================================
+# Non-secret runtime configuration. Same file on Mac and AWS.
+# Secrets come from AWS SSM Parameter Store (LocalStack for dev, real AWS for prod).
+# The ONLY env-level difference: AWS_ENDPOINT_URL for LocalStack vs real AWS.
+# =============================================================================
+
+[trading]
+market_open_time = "09:15:00"
+market_close_time = "15:30:00"
+order_cutoff_time = "15:29:00"
+data_collection_start = "09:00:00"
+data_collection_end = "16:00:00"
+timezone = "Asia/Kolkata"
+max_orders_per_second = 10
+
+[dhan]
+websocket_url = "wss://api-feed.dhan.co/v2"
+rest_api_base_url = "https://api.dhan.co/v2"
+instrument_csv_url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+instrument_csv_fallback_url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+max_instruments_per_connection = 5000
+max_websocket_connections = 5
+
+[questdb]
+host = "dlt-questdb"
+http_port = 9000
+pg_port = 8812
+ilp_port = 9009
+
+[valkey]
+host = "dlt-valkey"
+port = 6379
+max_connections = 16
+
+[prometheus]
+host = "dlt-prometheus"
+port = 9090
+
+[network]
+request_timeout_ms = 5000
+websocket_connect_timeout_ms = 10000
+retry_initial_delay_ms = 100
+retry_max_delay_ms = 30000
+retry_max_attempts = 5
+
+[token]
+refresh_before_expiry_hours = 1
+token_validity_hours = 24
+
+[risk]
+max_daily_loss_percent = 2.0
+max_position_size_lots = 50
+
+[logging]
+level = "info"
+format = "json"

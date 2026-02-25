@@ -1,0 +1,259 @@
+# =============================================================================
+# dhan-live-trader — Docker Compose
+# =============================================================================
+# ALL versions from Tech Stack Bible V6. Same file on Mac and AWS.
+# Container prefix: dlt- (dhan-live-trader)
+# Network: dlt-network (all services communicate via Docker DNS)
+# =============================================================================
+
+networks:
+  dlt-network:
+    name: dlt-network
+    driver: bridge
+
+volumes:
+  dlt-questdb-data:
+    name: dlt-questdb-data
+  dlt-valkey-data:
+    name: dlt-valkey-data
+  dlt-grafana-data:
+    name: dlt-grafana-data
+  dlt-prometheus-data:
+    name: dlt-prometheus-data
+  dlt-loki-data:
+    name: dlt-loki-data
+  dlt-localstack-data:
+    name: dlt-localstack-data
+
+services:
+  # ---------------------------------------------------------------------------
+  # QuestDB — Time-Series Database (tick data, orders, audit trail)
+  # ---------------------------------------------------------------------------
+  dlt-questdb:
+    image: questdb/questdb:8.2.3
+    container_name: dlt-questdb
+    hostname: dlt-questdb
+    restart: unless-stopped
+    ports:
+      - "9000:9000"    # HTTP API + Web Console
+      - "8812:8812"    # PostgreSQL wire protocol
+      - "9009:9009"    # InfluxDB Line Protocol (high-speed ingestion)
+    volumes:
+      - dlt-questdb-data:/var/lib/questdb
+    environment:
+      QDB_LOG_W_STDOUT_LEVEL: ERROR
+      QDB_TELEMETRY_ENABLED: "false"
+      QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9000' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Valkey — Cache (state, lookups, session data)
+  # ---------------------------------------------------------------------------
+  dlt-valkey:
+    image: valkey/valkey:8.1.1-alpine
+    container_name: dlt-valkey
+    hostname: dlt-valkey
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - dlt-valkey-data:/data
+    command: >
+      valkey-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+      --appendfsync everysec
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — Metrics Collection
+  # ---------------------------------------------------------------------------
+  dlt-prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: dlt-prometheus
+    hostname: dlt-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - dlt-prometheus-data:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Loki — Log Aggregation
+  # ---------------------------------------------------------------------------
+  dlt-loki:
+    image: grafana/loki:3.4.2
+    container_name: dlt-loki
+    hostname: dlt-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - dlt-loki-data:/loki
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Alloy — Log Collector (replaces Promtail, which is BANNED)
+  # ---------------------------------------------------------------------------
+  dlt-alloy:
+    image: grafana/alloy:v1.6.1
+    container_name: dlt-alloy
+    hostname: dlt-alloy
+    restart: unless-stopped
+    ports:
+      - "12345:12345"  # Alloy UI
+    volumes:
+      - ./alloy/alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["run", "/etc/alloy/config.alloy"]
+    depends_on:
+      dlt-loki:
+        condition: service_healthy
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Jaeger v2 — Distributed Tracing (v1 is BANNED — EOL Dec 2025)
+  # ---------------------------------------------------------------------------
+  dlt-jaeger:
+    image: jaegertracing/jaeger:2.4.0
+    container_name: dlt-jaeger
+    hostname: dlt-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Grafana — Dashboards & Visualization
+  # ---------------------------------------------------------------------------
+  dlt-grafana:
+    image: grafana/grafana-oss:11.5.2
+    container_name: dlt-grafana
+    hostname: dlt-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - dlt-grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "http://localhost:3000"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    depends_on:
+      dlt-prometheus:
+        condition: service_healthy
+      dlt-loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Traefik — Reverse Proxy & Load Balancer
+  # ---------------------------------------------------------------------------
+  dlt-traefik:
+    image: traefik:v3.3.4
+    container_name: dlt-traefik
+    hostname: dlt-traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"        # HTTP
+      - "443:443"      # HTTPS
+      - "8080:8080"    # Traefik Dashboard
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # LocalStack — AWS SSM Parameter Store (dev environment)
+  # ---------------------------------------------------------------------------
+  dlt-localstack:
+    image: localstack/localstack:4.2.0
+    container_name: dlt-localstack
+    hostname: dlt-localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"    # LocalStack gateway
+    volumes:
+      - dlt-localstack-data:/var/lib/localstack
+    environment:
+      SERVICES: ssm
+      DEFAULT_REGION: ap-south-1
+      EAGER_SERVICE_LOADING: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - dlt-network

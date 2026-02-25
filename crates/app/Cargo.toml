@@ -1,0 +1,26 @@
+[package]
+name = "dhan-live-trader-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dhan-live-trader"
+path = "src/main.rs"
+
+[dependencies]
+dhan-live-trader-common = { path = "../common" }
+dhan-live-trader-core = { path = "../core" }
+dhan-live-trader-trading = { path = "../trading" }
+dhan-live-trader-storage = { path = "../storage" }
+dhan-live-trader-api = { path = "../api" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+figment = { workspace = true }
+clap = { workspace = true }
+signal-hook = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }

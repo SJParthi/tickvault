@@ -1,0 +1,110 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93.1"
+license = "MIT"
+
+[workspace.dependencies]
+# ===========================================================================
+# ALL versions from Tech Stack Bible V6 — SINGLE SOURCE OF TRUTH
+# Crates inherit via { workspace = true } — no version in crate-level Cargo.toml
+# cargo update is BANNED — versions change ONLY via Bible updates
+# ===========================================================================
+
+# ---- Section 2: Async Runtime ----
+tokio = { version = "1.44.1", features = ["full"] }
+
+# ---- Section 3: Serialization ----
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+toml = "0.8.20"
+bitcode = "0.6.6"
+csv = "1.3.1"
+
+# ---- Section 4: HTTP Client ----
+reqwest = { version = "0.12.15", features = ["json", "rustls-tls"], default-features = false }
+
+# ---- Section 4: Web Framework ----
+axum = { version = "0.8.3", features = ["macros"] }
+tower = { version = "0.5.2", features = ["full"] }
+tower-http = { version = "0.6.4", features = ["cors", "trace", "compression-gzip"] }
+
+# ---- Section 5: WebSocket ----
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
+
+# ---- Section 6: Zero-Copy Parsing ----
+zerocopy = { version = "0.8.24", features = ["derive"] }
+bytes = "1.10.1"
+
+# ---- Section 7: Error Handling ----
+anyhow = "1.0.97"
+thiserror = "2.0.12"
+
+# ---- Section 8: Time ----
+chrono = { version = "0.4.40", features = ["serde"] }
+chrono-tz = "0.10.3"
+
+# ---- Section 9: Observability ----
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.29.0"
+opentelemetry = "0.28.0"
+opentelemetry_sdk = "0.28.0"
+opentelemetry-otlp = "0.28.0"
+prometheus = "0.13.4"
+metrics = "0.24.1"
+metrics-exporter-prometheus = "0.16.2"
+
+# ---- Section 10: Security & Secrets ----
+secrecy = { version = "0.10.3", features = ["serde"] }
+zeroize = { version = "1.8.1", features = ["derive"] }
+arc-swap = "1.7.1"
+totp-rs = { version = "5.7.0", features = ["gen_secret", "otpauth"] }
+
+# ---- Section 11: AWS SDK ----
+aws-config = "1.6.3"
+aws-sdk-ssm = "1.68.0"
+
+# ---- Section 12: Concurrent Data Structures ----
+papaya = "0.2.0"
+dashmap = "6.1.0"
+rtrb = "0.3.1"
+crossbeam-channel = "0.5.15"
+
+# ---- Section 13: Rate Limiting & Resilience ----
+governor = "0.8.0"
+backon = "1.4.0"
+failsafe = "1.3.0"
+
+# ---- Section 14: State Machine ----
+statig = "0.3.0"
+enum_dispatch = "0.3.13"
+
+# ---- Section 15: Stack Collections & Memory ----
+arrayvec = "0.7.6"
+memmap2 = "0.9.5"
+
+# ---- Section 16: Config & CLI ----
+figment = { version = "0.10.19", features = ["toml", "env"] }
+clap = { version = "4.5.32", features = ["derive"] }
+
+# ---- Section 17: Unique IDs & Connection Pooling ----
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+deadpool = "0.12.2"
+
+# ---- Section 18: Telegram Alerts ----
+teloxide = { version = "0.13.0", features = ["macros"] }
+
+# ---- Section 18: System Integration ----
+signal-hook = "0.3.18"
+sd-notify = "0.4.5"
+
+# ---- Section 19: Dev/Test Dependencies ----
+criterion = { version = "0.5.1", features = ["html_reports"] }
+proptest = "1.6.0"
+loom = "0.7.2"
+dhat = "0.3.3"
+tokio-test = "0.4.4"

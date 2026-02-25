@@ -1,0 +1,51 @@
+# =============================================================================
+# dhan-live-trader — .gitignore
+# =============================================================================
+
+# ---- Rust ----
+/target/
+**/*.rs.bk
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ---- Environment (BANNED — but gitignore for safety) ----
+.env
+.env.*
+*.env
+
+# ---- Config overrides (dev-only, not committed) ----
+config/local-overrides.toml
+
+# ---- Docker volumes (if mounted locally) ----
+docker-data/
+
+# ---- Logs ----
+*.log
+logs/
+
+# ---- Coverage reports ----
+tarpaulin-report.html
+lcov.info
+coverage/
+
+# ---- Benchmark artifacts ----
+criterion/
+
+# ---- Fuzz artifacts ----
+fuzz/artifacts/
+fuzz/corpus/
+
+# ---- Temporary files ----
+*.tmp
+*.bak

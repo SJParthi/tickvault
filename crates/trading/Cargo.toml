@@ -1,0 +1,19 @@
+[package]
+name = "dhan-live-trader-trading"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dhan-live-trader-common = { path = "../common" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+uuid = { workspace = true }
+governor = { workspace = true }
+statig = { workspace = true }

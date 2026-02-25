@@ -1,0 +1,34 @@
+# =============================================================================
+# dhan-live-trader — Traefik Configuration
+# =============================================================================
+# Reverse proxy for routing. Dashboard enabled for dev only.
+# =============================================================================
+
+api:
+  dashboard: true
+  insecure: true  # Dev only — dashboard on :8080 without auth
+
+ping: {}
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: dlt-network
+    watch: true
+
+log:
+  level: WARN
+  format: json
+
+accessLog:
+  format: json
+  filters:
+    statusCodes:
+      - "400-599"
