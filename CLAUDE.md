@@ -26,7 +26,8 @@ Every file, every function, every config decision must pass all three. No except
 - **Current Runtime:** MacBook Pro M4 Pro, 14-core, 48 GB RAM (March–June 2026)
 - **Future Production:** AWS c7i.2xlarge, Mumbai ap-south-1 (July 2026+ when real money trading starts)
 - **Data Source:** Dhan WebSocket V2 + Dhan REST API (₹499/mo subscription — single source, no Groww needed)
-- **Tools:** Claude Code (builder) + Docker (runtime) + GitHub (repo). No IDE needed.
+- **Tools:** Claude Code (builder) + Docker (runtime) + GitHub (repo)
+- **IDE (Parthiban's):** IntelliJ IDEA Ultimate 2025.3 — for code review, debugging, manual edits when Parthiban wants. Claude Code never depends on or automates IntelliJ.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
 ### Source of Truth — GITHUB IS EVERYTHING
@@ -791,7 +792,7 @@ Manual steps              → Claude Code does everything
 DashMap on hot path       → Use papaya for hot-path maps
 unbounded channels        → All channels MUST have bounded capacity
 dyn Trait on hot path     → Use enum_dispatch for jump table dispatch
-IntelliJ IDEA             → Not needed. Claude Code + Docker + GitHub is the full stack
+Claude Code automating IntelliJ → Parthiban uses IntelliJ himself. Claude Code never touches it
 cargo update              → Versions change ONLY via Bible updates
 ^ or ~ in Cargo.toml     → Exact versions only (e.g., "x.y.z" not "^x.y")
 println! in prod code     → Use tracing macros (info!, warn!, error!)
