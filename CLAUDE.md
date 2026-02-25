@@ -26,7 +26,7 @@ Every file, every function, every config decision must pass all three. No except
 - **Current Runtime:** MacBook Pro M4 Pro, 14-core, 48 GB RAM (March–June 2026)
 - **Future Production:** AWS c7i.2xlarge, Mumbai ap-south-1 (July 2026+ when real money trading starts)
 - **Data Source:** Dhan WebSocket V2 + Dhan REST API (₹499/mo subscription — single source, no Groww needed)
-- **IDE:** IntelliJ IDEA Ultimate 2025.3 + Rust Plugin (ID 22407)
+- **Tools:** Claude Code (builder) + Docker (runtime) + GitHub (repo). No IDE needed.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
 ### Source of Truth — GITHUB IS EVERYTHING
@@ -37,7 +37,7 @@ RULE: GitHub is the ONLY source of truth. Local folders are disposable working c
 - ALL code lives on GitHub: https://github.com/SJParthi/dhan-live-trader
 - Local clones are temporary — delete and re-clone anytime, zero loss
 - Every session: git pull from GitHub FIRST, git push to GitHub LAST
-- IntelliJ opens the GitHub clone — GitHub is the canonical reference
+- Claude Code operates on the GitHub clone — GitHub is the canonical reference
 - NEVER reference local absolute paths in code, config, or documentation
 - If local and GitHub diverge, GitHub wins — re-clone and rebuild
 ```
@@ -147,22 +147,21 @@ Step 6: Show Parthiban a summary      → What was done, what's next
 
 Parthiban is the **architect**. Claude Code is the **builder**.
 
-### The Three Pillars — Fully Integrated
+### The Three Pillars — That's It
 
 ```
+Claude Code     → Builder — writes all code, runs all commands, manages git
 GitHub          → Single source of truth for ALL code, config, docs
 Docker          → Single runtime for ALL infrastructure and services
-IntelliJ IDEA   → Single IDE — opens the GitHub clone, Rust Plugin for editing
 ```
 
-These three are fully integrated. No manual steps. No local-only state.
-Parthiban opens IntelliJ pointing at the GitHub clone. Claude Code handles everything else.
+No IDE. No manual steps. No local-only state. Claude Code does everything.
 
 ### What Parthiban does:
 - Discusses requirements and design decisions
 - Reviews plans presented by Claude Code
-- Reviews code in IntelliJ (which reads from the GitHub clone)
 - Says "go ahead" or "change X"
+- Checks dashboards in browser (Grafana, QuestDB Web Console, Jaeger)
 - That's it. Nothing else. No terminal commands. No manual file creation.
 
 ### What Claude Code does:
@@ -345,7 +344,7 @@ These rules govern EVERY phase, EVERY file, EVERY line of code, EVERY config. Th
 - GitHub repo: `https://github.com/SJParthi/dhan-live-trader`
 - Local folders are disposable working copies of the GitHub repo.
 - NEVER create files outside the GitHub clone. NEVER reference local absolute paths.
-- IntelliJ, Docker, and Claude Code all operate on the GitHub clone.
+- Docker and Claude Code all operate on the GitHub clone.
 - If it's not on GitHub, it doesn't exist.
 
 ### Principle 1: DOCKER IS THE RUNTIME
@@ -792,7 +791,7 @@ Manual steps              → Claude Code does everything
 DashMap on hot path       → Use papaya for hot-path maps
 unbounded channels        → All channels MUST have bounded capacity
 dyn Trait on hot path     → Use enum_dispatch for jump table dispatch
-intellij-rust plugin      → ARCHIVED. Use new Rust Plugin (ID 22407)
+IntelliJ IDEA             → Not needed. Claude Code + Docker + GitHub is the full stack
 cargo update              → Versions change ONLY via Bible updates
 ^ or ~ in Cargo.toml     → Exact versions only (e.g., "x.y.z" not "^x.y")
 println! in prod code     → Use tracing macros (info!, warn!, error!)

@@ -1,7 +1,7 @@
 -- =============================================================================
 -- dhan-live-trader — QuestDB Verification Queries
 -- =============================================================================
--- Run these in IntelliJ Database Console or QuestDB Web Console (localhost:9000)
+-- Run these in QuestDB Web Console (localhost:9000) or via psql
 -- Connection: PostgreSQL wire protocol → localhost:8812 → database: qdb
 -- Credentials: admin / quest (dev defaults)
 -- =============================================================================
@@ -21,8 +21,8 @@ SHOW TABLES;
 -- 3. Server Status
 -- ---------------------------------------------------------------------------
 SELECT
-    current_timestamp() AS server_time,
-    systimestamp()      AS system_timestamp;
+    now()          AS server_time,
+    systimestamp() AS system_timestamp;
 
 -- ---------------------------------------------------------------------------
 -- 4. Tick Data Queries (available after Block 01+ starts collecting)
