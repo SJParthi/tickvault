@@ -743,6 +743,33 @@ Claude Code must:
 
 **The Bible covers:** 109 components across 22 sections — Rust crates, Docker images (SHA256 pinned), AWS production stack, alerting chain, observability, testing tools, and more.
 
+### Dependency Update Process — When Bible Changes
+
+`cargo update` is BANNED for ad-hoc updates. Dependency versions change ONLY through this formal process:
+
+```
+TRIGGER: Parthiban updates the Tech Stack Bible (e.g., V6 → V7)
+
+Step 1: Parthiban provides updated Bible document
+Step 2: Claude Code reads the new Bible, identifies changed versions
+Step 3: Claude Code presents a diff:
+        "These versions changed: tokio 1.44.1 → 1.45.0, serde 1.0.219 → 1.0.225"
+Step 4: Parthiban approves the update batch
+Step 5: Claude Code updates workspace Cargo.toml with new versions
+Step 6: Run FULL CI pipeline (all 6 stages)
+Step 7: Run Criterion benchmarks — compare before/after
+Step 8: If any benchmark regresses >5% → ROLLBACK the update, investigate
+Step 9: If all gates pass → commit, push, tag
+
+CRITICAL RULES:
+- NEVER update a single dependency outside this process
+- NEVER run `cargo update` — it updates Cargo.lock with unpinned transitive deps
+- If a CVE is found (cargo audit), escalate to Parthiban immediately
+- Emergency CVE fix follows hotfix branch protocol, not this process
+- Transitive dependency updates happen ONLY via `cargo update -p <specific-crate>`
+  and ONLY after Parthiban approves the specific transitive crate
+```
+
 ---
 
 ## BANNED — NEVER USE THESE
@@ -808,12 +835,53 @@ Claude Code performs a **self-review** before presenting ANY code to Parthiban:
 - [ ] No commented-out code — delete it or don't write it
 - [ ] Every public function has a doc comment explaining what it does, not how
 
+**Automated Enforcement — Compile-Time Lint Gates:**
+
+These lints are MANDATORY in every library crate's `lib.rs`. They turn CLAUDE.md rules into compiler errors:
+
+```rust
+// Top of every lib.rs in production crates (common, core, trading, storage, api)
+#![deny(clippy::unwrap_used)]          // .unwrap() → compiler error
+#![deny(clippy::print_stdout)]         // println! → compiler error
+#![deny(clippy::print_stderr)]         // eprintln! → compiler error
+#![deny(clippy::dbg_macro)]            // dbg! → compiler error
+#![deny(clippy::todo)]                 // todo!() → compiler error
+#![deny(clippy::unimplemented)]        // unimplemented!() → compiler error
+#![deny(clippy::expect_used)]          // .expect() → compiler error (use ? instead)
+#![deny(clippy::panic)]               // panic!() → compiler error
+#![deny(clippy::large_futures)]        // Catch accidentally large futures
+#![deny(clippy::large_stack_arrays)]   // Stack overflow protection
+#![warn(clippy::pedantic)]             // Pedantic lints as warnings
+#![warn(clippy::nursery)]              // Nursery lints as warnings
+#![warn(missing_docs)]                 // Missing doc comments as warnings
+```
+
+**Exceptions:**
+- `app` crate (binary): `#![allow(clippy::unwrap_used)]` ONLY in `main.rs` for initial setup where panicking is acceptable (before trading starts)
+- Test modules: `#[cfg(test)]` modules may use `.unwrap()` and `panic!()`
+- No other exceptions without Parthiban's explicit approval
+
 **If any item fails, fix it before showing code to Parthiban.**
 
 ### Gate 2: TEST COVERAGE — Sniper Level
 
 **Minimum coverage: 90%+ line coverage on all production code.**
 **Target: 95%+ on critical paths (OMS, risk, order execution, WebSocket parsing).**
+
+**Per-Crate Coverage Thresholds — Enforced in CI:**
+
+| Crate | Minimum Coverage | Justification |
+|---|---|---|
+| `core` | **95%** | Binary parser, WebSocket, tick pipeline — hot path, financial data |
+| `trading` | **95%** | OMS, risk management, order execution — money at stake |
+| `common` | **90%** | Types, config, constants — foundational correctness |
+| `storage` | **90%** | QuestDB, Valkey — data persistence integrity |
+| `api` | **90%** | HTTP endpoints — external-facing correctness |
+| `app` | **80%** | Orchestration, boot/shutdown — harder to unit test, integration-tested |
+
+**Coverage tool:** `cargo-tarpaulin` with `--out Xml` for CI integration.
+**CI gate:** If ANY crate falls below its threshold, the build is RED.
+**Coverage exclusions:** Only `#[cfg(not(tarpaulin_include))]` on generated code or FFI bindings — NEVER on business logic.
 
 **Required test types per module:**
 
@@ -928,6 +996,49 @@ Stage 6 — Coverage:
 
 **If ANY stage fails, the build is RED. No merging. No deploying. No exceptions.**
 
+**GitHub Actions Configuration — Exact Requirements:**
+
+```yaml
+# .github/workflows/ci.yml structure requirements:
+name: CI
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# MANDATORY: All 6 stages as separate jobs with dependency chain
+# compile → lint → test → security → performance → coverage
+# Later stages depend on earlier stages passing
+```
+
+**Branch Protection Rules — MANDATORY on GitHub:**
+
+```
+main branch:
+  ✓ Require status checks to pass before merging
+  ✓ Required checks: compile, lint, test, security, coverage
+  ✓ Require branches to be up to date before merging
+  ✓ Require pull request reviews (at least 1 — Parthiban)
+  ✓ Do not allow bypassing the above settings
+  ✓ Restrict who can push: only via PR merge
+
+develop branch:
+  ✓ Require status checks to pass before merging
+  ✓ Required checks: compile, lint, test
+  ✓ Allow direct push from Claude Code (for approved work)
+```
+
+**CI Caching — Performance:**
+- Cache `~/.cargo/registry`, `~/.cargo/git`, `target/` between runs
+- Key on `Cargo.lock` hash — invalidate on dependency change
+- Saves 3-5 minutes per CI run
+
+**Auto-Cancel — Stale Workflows:**
+- If a new push arrives while CI is running on the same branch, cancel the old run
+- Prevents wasted compute on superseded commits
+- Configured via `concurrency` group in GitHub Actions
+
 ### Gate 5: PRE-DEPLOYMENT VERIFICATION
 
 Before ANY deployment to AWS production:
@@ -938,6 +1049,89 @@ Before ANY deployment to AWS production:
 4. **Smoke test** — connect to Dhan WebSocket, receive 1 tick, parse it, store it
 5. **Rollback plan confirmed** — Traefik blue-green ready, previous version tagged
 6. **Parthiban gives explicit "deploy" approval**
+
+### Gate 5a: BENCHMARK BASELINES — REGRESSION KILLS THE BUILD
+
+Every hot-path function has a baseline latency. CI compares against the baseline. >5% regression = build FAILS.
+
+**Baseline Performance Budgets:**
+
+| Operation | Budget | Tool | Crate |
+|---|---|---|---|
+| Tick binary parse (zerocopy) | **<10ns** | Criterion | core |
+| Tick pipeline routing (rtrb) | **<100ns** | Criterion | core |
+| papaya hash map lookup | **<50ns** | Criterion | core |
+| Full tick processing (parse→route→store) | **<10μs** | Criterion | core |
+| Valkey cache read (deadpool) | **<100μs** | Criterion | storage |
+| QuestDB ILP write (single row) | **<1ms** | Criterion | storage |
+| OMS state transition (statig) | **<100ns** | Criterion | trading |
+| Market hour validation | **<50ns** | Criterion | common |
+| Config TOML load (cold, one-time) | **<10ms** | Criterion | common |
+| REST API round-trip (Dhan) | **5-50ms** | Integration test | core |
+
+**Rules:**
+- Benchmarks run on EVERY PR in CI
+- Results compared against `main` branch baseline
+- >5% regression on ANY benchmark = automatic build failure
+- Baselines updated ONLY when intentional optimization is merged
+- All benchmarks use `criterion::black_box` to prevent dead code elimination
+- Benchmarks run with `--release` profile (optimized, like production)
+
+**Benchmark Directory Structure:**
+
+```
+crates/core/benches/
+  tick_parsing.rs          ← parse_ticker_packet, parse_market_depth
+  tick_pipeline.rs         ← rtrb push/pop, papaya lookup
+
+crates/trading/benches/
+  oms_transitions.rs       ← state machine transitions
+
+crates/storage/benches/
+  questdb_write.rs         ← ILP line protocol write
+  valkey_lookup.rs         ← cache get/set
+
+crates/common/benches/
+  market_hours.rs          ← validation checks
+  config_load.rs           ← TOML deserialization
+```
+
+### Gate 5b: RELEASE CHECKLIST — BEFORE EVERY VERSION BUMP
+
+No release happens without completing this entire checklist. Claude Code fills it out, Parthiban reviews.
+
+```
+RELEASE CHECKLIST for v<X.Y.Z>
+
+PRE-RELEASE:
+  [ ] All CI gates pass on `develop` (6 stages green)
+  [ ] All benchmarks within budget (zero regressions >5%)
+  [ ] Coverage meets per-crate thresholds
+  [ ] cargo audit: zero known CVEs
+  [ ] No TODO/FIXME/HACK in production code (grep verified)
+  [ ] CHANGELOG.md updated with all changes since last release
+  [ ] Version bumped in workspace Cargo.toml
+
+BUILD & TAG:
+  [ ] Merge develop → main via PR (with CI passing)
+  [ ] Tag: git tag -a v<X.Y.Z> -m "Release v<X.Y.Z>: <summary>"
+  [ ] Docker image built: docker build -t dlt:v<X.Y.Z> .
+  [ ] Docker image tagged: dlt:v<X.Y.Z> (NEVER :latest)
+  [ ] Push tag to GitHub: git push origin v<X.Y.Z>
+
+DEPLOY:
+  [ ] Traefik blue-green: new version behind canary route
+  [ ] Smoke test passes on canary
+  [ ] Swap traffic to new version
+  [ ] Old version kept running for 30 minutes (instant rollback window)
+  [ ] All Gate 6 runtime checks pass (dashboards, metrics, traces, alerts)
+
+POST-RELEASE:
+  [ ] Telegram notification: "v<X.Y.Z> deployed successfully"
+  [ ] Grafana annotation: release marker on dashboards
+  [ ] Old version containers stopped after 30-minute window
+  [ ] Git tag pushed, GitHub release created with changelog
+```
 
 ### Gate 6: RUNTIME MONITORING — POST-DEPLOYMENT
 
