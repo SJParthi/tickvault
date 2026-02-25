@@ -22,11 +22,25 @@ Every file, every function, every config decision must pass all three. No except
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
 - **Broker:** Dhan WebSocket V2 Binary Protocol
 - **Language:** Rust 2024 Edition (stable 1.93.1)
+- **GitHub Repository:** `https://github.com/SJParthi/dhan-live-trader` (SINGLE SOURCE OF TRUTH)
 - **Current Runtime:** MacBook Pro M4 Pro, 14-core, 48 GB RAM (March–June 2026)
 - **Future Production:** AWS c7i.2xlarge, Mumbai ap-south-1 (July 2026+ when real money trading starts)
 - **Data Source:** Dhan WebSocket V2 + Dhan REST API (₹499/mo subscription — single source, no Groww needed)
 - **IDE:** IntelliJ IDEA Ultimate 2025.3 + Rust Plugin (ID 22407)
 - **Owner:** Parthiban (architect). Claude Code (builder).
+
+### Source of Truth — GITHUB IS EVERYTHING
+
+```
+RULE: GitHub is the ONLY source of truth. Local folders are disposable working copies.
+
+- ALL code lives on GitHub: https://github.com/SJParthi/dhan-live-trader
+- Local clones are temporary — delete and re-clone anytime, zero loss
+- Every session: git pull from GitHub FIRST, git push to GitHub LAST
+- IntelliJ opens the GitHub clone — GitHub is the canonical reference
+- NEVER reference local absolute paths in code, config, or documentation
+- If local and GitHub diverge, GitHub wins — re-clone and rebuild
+```
 
 ---
 
@@ -84,7 +98,7 @@ Reference candles: Pre-market (9:00-9:15) + Post-market (15:30-16:00)
 - All orders must have audit trail — every state transition logged
 - Order audit logs must be retained for minimum 5 years
 
-**Note:** During local MacBook development (March–June 2026), SEBI server-location rules don't apply since no real orders are placed. But ALL other rules (2FA, rate limiting, audit logging, data retention) are enforced from day one — build it right the first time.
+**Note:** During MacBook development (March–June 2026), SEBI server-location rules don't apply since no real orders are placed. But ALL other rules (2FA, rate limiting, audit logging, data retention) are enforced from day one — build it right the first time.
 
 **Rules for Claude Code:**
 - NEVER write code that trades outside 9:15-15:30 IST
@@ -97,19 +111,21 @@ Reference candles: Pre-market (9:00-9:15) + Post-market (15:30-16:00)
 
 ## SESSION START PROTOCOL — EVERY TIME
 
-When Claude Code starts a new session on the dhan-live-trader project, it MUST follow this exact read order before writing any code:
+When Claude Code starts a new session on the dhan-live-trader project, it MUST follow this exact sequence before writing any code:
 
 ```
-Step 1: Read THIS file               → CLAUDE.md (rules, behavior, quality gates)
-Step 2: Read the Tech Stack Bible     → docs/tech_stack_bible_v6.pdf (versions, components)
-Step 3: Read the current phase doc    → docs/phases/PHASE_<N>_<NAME>.md (what to build)
-Step 4: Read recent git log           → git log --oneline -20 (where did we leave off)
-Step 5: Read Cargo.toml               → Verify dependency versions match Bible
-Step 6: Run cargo check               → Confirm project compiles clean
-Step 7: Run cargo test                → Confirm all tests pass
+Step 0: Ensure GitHub clone exists    → gh repo clone SJParthi/dhan-live-trader (if needed)
+Step 1: Pull latest from GitHub       → git pull origin main (always start from GitHub state)
+Step 2: Read THIS file                → CLAUDE.md (rules, behavior, quality gates)
+Step 3: Read the Tech Stack Bible     → docs/tech_stack_bible_v6.pdf (versions, components)
+Step 4: Read the current phase doc    → docs/phases/PHASE_<N>_<NAME>.md (what to build)
+Step 5: Read recent git log           → git log --oneline -20 (where did we leave off)
+Step 6: Read Cargo.toml               → Verify dependency versions match Bible
+Step 7: Run cargo check               → Confirm project compiles clean
+Step 8: Run cargo test                → Confirm all tests pass
 ```
 
-**Only after all 7 steps does Claude Code begin working.**
+**Only after all 9 steps does Claude Code begin working.**
 
 If any step fails (compilation error, test failure, version mismatch), Claude Code MUST fix the issue BEFORE proceeding to new work. Existing breakage takes priority over new features.
 
@@ -119,8 +135,11 @@ Step 1: Run cargo fmt                 → Format all code
 Step 2: Run cargo clippy              → Zero warnings
 Step 3: Run cargo test                → 100% pass
 Step 4: Git commit with proper message → See Git Conventions below
-Step 5: Show Parthiban a summary      → What was done, what's next
+Step 5: Git push to GitHub            → git push origin <branch> (MANDATORY — code MUST reach GitHub)
+Step 6: Show Parthiban a summary      → What was done, what's next
 ```
+
+**CRITICAL:** A session is NOT complete until code is pushed to GitHub. Local-only commits are incomplete work.
 
 ---
 
@@ -128,19 +147,32 @@ Step 5: Show Parthiban a summary      → What was done, what's next
 
 Parthiban is the **architect**. Claude Code is the **builder**.
 
+### The Three Pillars — Fully Integrated
+
+```
+GitHub          → Single source of truth for ALL code, config, docs
+Docker          → Single runtime for ALL infrastructure and services
+IntelliJ IDEA   → Single IDE — opens the GitHub clone, Rust Plugin for editing
+```
+
+These three are fully integrated. No manual steps. No local-only state.
+Parthiban opens IntelliJ pointing at the GitHub clone. Claude Code handles everything else.
+
 ### What Parthiban does:
 - Discusses requirements and design decisions
 - Reviews plans presented by Claude Code
+- Reviews code in IntelliJ (which reads from the GitHub clone)
 - Says "go ahead" or "change X"
 - That's it. Nothing else. No terminal commands. No manual file creation.
 
 ### What Claude Code does:
-- ALL file creation, modification, deletion
-- ALL git operations (init, add, commit, push, branch, tag)
-- ALL GitHub operations (repo creation, CI/CD setup)
-- ALL Docker operations (compose up, health checks, verification)
+- ALL file creation, modification, deletion (in GitHub clone, pushed to GitHub)
+- ALL git operations (clone, pull, add, commit, push, branch, tag)
+- ALL GitHub operations (repo management, CI/CD setup, PRs, issues)
+- ALL Docker operations (compose up/down, health checks, verification)
 - ALL tool installation (brew, rustup, cargo install)
 - ALL verification (run tests, check health, validate configs)
+- ALWAYS pushes to GitHub after every meaningful change
 - Presents results and waits for approval before next step
 
 ### The Approval Protocol:
@@ -197,6 +229,7 @@ Examples:
 **Rules:**
 - Every commit must compile (`cargo check` passes)
 - Every commit must pass all existing tests (`cargo test` passes)
+- Every commit MUST be pushed to GitHub — local-only commits are forbidden
 - No WIP commits on `main` or `develop` — squash before merging
 - Commit message must reference the phase: `[Phase 1]` prefix if relevant
 - One logical change per commit — not a dump of unrelated changes
@@ -213,11 +246,19 @@ Phase completion tag              → Example: phase-1-complete
 
 These rules govern EVERY phase, EVERY file, EVERY line of code, EVERY config. They are non-negotiable and override any conflicting instruction.
 
+### Principle 0: GITHUB IS THE SOURCE OF TRUTH
+- ALL code, config, docs, and infrastructure definitions live on GitHub.
+- GitHub repo: `https://github.com/SJParthi/dhan-live-trader`
+- Local folders are disposable working copies of the GitHub repo.
+- NEVER create files outside the GitHub clone. NEVER reference local absolute paths.
+- IntelliJ, Docker, and Claude Code all operate on the GitHub clone.
+- If it's not on GitHub, it doesn't exist.
+
 ### Principle 1: DOCKER IS THE RUNTIME
 - The app runs on Docker. Mac and AWS are just Docker hosts.
 - Same docker-compose.yml everywhere. No exceptions.
 - Same Dockerfile everywhere. No exceptions.
-- ALL infrastructure in containers. Nothing installed on host except Docker + Git.
+- ALL infrastructure in containers. Nothing installed on host except Docker + Git + gh CLI.
 - Service discovery via Docker DNS hostnames. Never localhost in app code.
 
 ### Principle 2: NO .env FILES. NO SECRETS ON DISK. EVER.
@@ -614,6 +655,8 @@ cargo update              → Versions change ONLY via Bible updates
 ^ or ~ in Cargo.toml     → Exact versions only (e.g., "x.y.z" not "^x.y")
 println! in prod code     → Use tracing macros (info!, warn!, error!)
 .unwrap() in prod code    → Propagate errors with ? and anyhow/thiserror
+Local absolute paths      → Use repo-relative paths only. Never /Users/... or /home/...
+Local-only commits        → Every commit MUST be pushed to GitHub immediately
 ```
 
 ---
@@ -1041,11 +1084,12 @@ Crates added by Claude Code during development that are NOT in the Tech Stack Bi
 ## DEPLOYMENT TIMELINE
 
 ```
-March 2026     → Local MacBook: Build live system (monitoring + debug, NO orders)
-                  Docker stack runs locally. Dhan WebSocket connected.
-                  Data collection 9:00-16:00 IST into local QuestDB.
+March 2026     → MacBook (Docker host): Build live system (monitoring + debug, NO orders)
+                  Docker stack runs on MacBook. Dhan WebSocket connected.
+                  Data collection 9:00-16:00 IST into Docker QuestDB.
+                  Code always on GitHub — MacBook is just a Docker host.
 
-April-June 2026 → Local MacBook: Backtesting engine development
+April-June 2026 → MacBook (Docker host): Backtesting engine development
                    Historical data from Dhan API + collected tick data.
                    Strategy optimization, walk-forward validation.
                    Paper trading (simulated orders, no real money).
@@ -1056,7 +1100,7 @@ July 2026+      → AWS c7i.2xlarge Mumbai: Real money trading begins
                    All quality gates, monitoring, alerting MUST be production-ready.
 ```
 
-**Key rule:** The code is written ONCE to work in BOTH environments. Docker + config TOML + SSM/LocalStack ensures zero code changes between MacBook and AWS. The ONLY difference is `AWS_ENDPOINT_URL` pointing to LocalStack vs real AWS.
+**Key rule:** The code is written ONCE to work in BOTH environments. Docker + config TOML + SSM/LocalStack ensures zero code changes between MacBook and AWS. The ONLY difference is `AWS_ENDPOINT_URL` pointing to LocalStack vs real AWS. Code always lives on GitHub — MacBook and AWS are just Docker hosts that clone from GitHub.
 
 ---
 
@@ -1076,7 +1120,7 @@ Read: `docs/phases/PHASE_1_ENVIRONMENT.md`
 
 - **Document:** Tech Stack Bible V6
 - **Components:** 109 total across 22 sections
-- **Location:** Project root or `docs/tech_stack_bible_v6.pdf`
+- **Location:** `docs/tech_stack_bible_v6.pdf` (in GitHub repo)
 - **Authority:** This is the SINGLE SOURCE OF TRUTH for all versions and components
 - **Update process:** Only Parthiban updates the Bible. Claude Code proposes changes, Parthiban approves and updates.
 
