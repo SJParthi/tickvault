@@ -14,96 +14,114 @@ license = "MIT"
 # cargo update is BANNED — versions change ONLY via Bible updates
 # ===========================================================================
 
-# ---- Section 2: Async Runtime ----
-tokio = { version = "1.44.1", features = ["full"] }
+# ---- Section 2: Backend Core — Async Runtime ----
+tokio = { version = "1.49.0", features = ["full"] }
 
-# ---- Section 3: Serialization ----
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-toml = "0.8.20"
-bitcode = "0.6.6"
-csv = "1.3.1"
+# ---- Section 2: Backend Core — WebSocket ----
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 
-# ---- Section 4: HTTP Client ----
+# ---- Section 2: Backend Core — Zero-Copy Parsing ----
+zerocopy = { version = "0.8.39", features = ["derive"] }
+
+# ---- Section 2: Backend Core — Dispatch ----
+enum_dispatch = "0.3.13"
+
+# ---- Section 3: Data Pipeline ----
+papaya = "0.2.3"
+dashmap = "6.1.0"
+crossbeam-channel = "0.5.15"
+rtrb = "0.3.1"
+ringbuf = "0.4.8"
+
+# ---- Section 4: Database & Cache ----
+questdb-rs = "6.1.0"
+redis = { version = "1.0.4", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.22.1"
+
+# ---- Section 5: Observability — Metrics ----
+metrics = "0.24.3"
+metrics-exporter-prometheus = "0.18.1"
+hdrhistogram = "7.5.4"
+quanta = "0.12.5"
+
+# ---- Section 5: Observability — OpenTelemetry ----
+opentelemetry = "0.31.0"
+opentelemetry_sdk = "0.31.0"
+opentelemetry-otlp = "0.31.0"
+
+# ---- Section 5: Observability — Tracing ----
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.31.0"
+
+# ---- Section 6: Trading Domain — Auth ----
+arc-swap = "1.7.1"
+jsonwebtoken = "10.3.0"
+totp-rs = { version = "5.7.0", features = ["gen_secret", "otpauth"] }
+
+# ---- Section 6: Trading Domain — OMS & Risk ----
+statig = "0.3.0"
+blackscholes = "0.24.0"
+governor = "0.10.2"
+failsafe = "1.3.0"
+backon = "1.6.0"
+yata = "0.7.0"
+
+# ---- Section 7: HTTP Client ----
 reqwest = { version = "0.12.15", features = ["json", "rustls-tls"], default-features = false }
 
-# ---- Section 4: Web Framework ----
-axum = { version = "0.8.3", features = ["macros"] }
+# ---- Section 8: HTTP Server ----
+axum = { version = "0.8.8", features = ["macros"] }
 tower = { version = "0.5.2", features = ["full"] }
-tower-http = { version = "0.6.4", features = ["cors", "trace", "compression-gzip"] }
+tower-http = { version = "0.6.5", features = ["cors", "trace", "compression-gzip"] }
 
-# ---- Section 5: WebSocket ----
-tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
+# ---- Section 9: Configuration ----
+toml = "0.9.11"
+figment = { version = "0.10.19", features = ["toml", "env"] }
 
-# ---- Section 6: Zero-Copy Parsing ----
-zerocopy = { version = "0.8.24", features = ["derive"] }
-bytes = "1.10.1"
-
-# ---- Section 7: Error Handling ----
-anyhow = "1.0.97"
-thiserror = "2.0.12"
-
-# ---- Section 8: Time ----
-chrono = { version = "0.4.40", features = ["serde"] }
+# ---- Section 10: Date & Time ----
+chrono = { version = "0.4.41", features = ["serde"] }
 chrono-tz = "0.10.3"
 
-# ---- Section 9: Observability ----
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.29.0"
-opentelemetry = "0.28.0"
-opentelemetry_sdk = "0.28.0"
-opentelemetry-otlp = "0.28.0"
-prometheus = "0.13.4"
-metrics = "0.24.1"
-metrics-exporter-prometheus = "0.16.2"
+# ---- Section 11: Serialization & Errors ----
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+bitcode = "0.6.7"
+csv = "1.3.1"
+thiserror = "2.0.18"
+anyhow = "1.0.98"
+bytes = "1.10.1"
 
-# ---- Section 10: Security & Secrets ----
+# ---- Section 12: System & Resilience ----
+core_affinity = "0.8.3"
+memmap2 = "0.9.9"
+notify = "8.2.0"
+signal-hook = "0.3.18"
+signal-hook-tokio = "0.3.1"
+sd-notify = "0.4.5"
+ahash = "0.8.12"
+nohash-hasher = "0.2.0"
+arrayvec = "0.7.6"
+
+# ---- Section 14: Security & Secrets ----
 secrecy = { version = "0.10.3", features = ["serde"] }
-zeroize = { version = "1.8.1", features = ["derive"] }
-arc-swap = "1.7.1"
-totp-rs = { version = "5.7.0", features = ["gen_secret", "otpauth"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
 
 # ---- Section 11: AWS SDK ----
 aws-config = "1.6.3"
 aws-sdk-ssm = "1.68.0"
 
-# ---- Section 12: Concurrent Data Structures ----
-papaya = "0.2.0"
-dashmap = "6.1.0"
-rtrb = "0.3.1"
-crossbeam-channel = "0.5.15"
-
-# ---- Section 13: Rate Limiting & Resilience ----
-governor = "0.8.0"
-backon = "1.4.0"
-failsafe = "1.3.0"
-
-# ---- Section 14: State Machine ----
-statig = "0.3.0"
-enum_dispatch = "0.3.13"
-
-# ---- Section 15: Stack Collections & Memory ----
-arrayvec = "0.7.6"
-memmap2 = "0.9.5"
-
-# ---- Section 16: Config & CLI ----
-figment = { version = "0.10.19", features = ["toml", "env"] }
+# ---- Section 16: CLI ----
 clap = { version = "4.5.32", features = ["derive"] }
 
-# ---- Section 17: Unique IDs & Connection Pooling ----
+# ---- Section 17: Unique IDs ----
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
-deadpool = "0.12.2"
 
 # ---- Section 18: Telegram Alerts ----
 teloxide = { version = "0.13.0", features = ["macros"] }
 
-# ---- Section 18: System Integration ----
-signal-hook = "0.3.18"
-sd-notify = "0.4.5"
-
-# ---- Section 19: Dev/Test Dependencies ----
-criterion = { version = "0.5.1", features = ["html_reports"] }
+# ---- Section 13: Dev/Test Dependencies ----
+criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.6.0"
 loom = "0.7.2"
 dhat = "0.3.3"

@@ -4,6 +4,7 @@
 # ALL versions from Tech Stack Bible V6. Same file on Mac and AWS.
 # Container prefix: dlt- (dhan-live-trader)
 # Network: dlt-network (all services communicate via Docker DNS)
+# ALL images pinned with SHA256 digest (Bible Section 14 #71)
 # =============================================================================
 
 networks:
@@ -28,9 +29,10 @@ volumes:
 services:
   # ---------------------------------------------------------------------------
   # QuestDB — Time-Series Database (tick data, orders, audit trail)
+  # Bible #16: questdb/questdb:9.3.2
   # ---------------------------------------------------------------------------
   dlt-questdb:
-    image: questdb/questdb:8.2.3
+    image: questdb/questdb:9.3.2@sha256:f8802d6ffa8c855fc3f9f69e86aaabcc4ee4d921e6755af4690b0b0290036517
     container_name: dlt-questdb
     hostname: dlt-questdb
     restart: unless-stopped
@@ -55,9 +57,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # Valkey — Cache (state, lookups, session data)
+  # Bible #18: valkey/valkey:9.0.2-alpine
   # ---------------------------------------------------------------------------
   dlt-valkey:
-    image: valkey/valkey:8.1.1-alpine
+    image: valkey/valkey:9.0.2-alpine@sha256:68677f85c863830af7836ff07c4a13b7f085ebeff62f4dedb71499ca27d229f2
     container_name: dlt-valkey
     hostname: dlt-valkey
     restart: unless-stopped
@@ -83,9 +86,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # Prometheus — Metrics Collection
+  # Bible #28: prom/prometheus:v3.9.1
   # ---------------------------------------------------------------------------
   dlt-prometheus:
-    image: prom/prometheus:v3.2.1
+    image: prom/prometheus:v3.9.1@sha256:1f0f50f06acaceb0f5670d2c8a658a599affe7b0d8e78b898c1035653849a702
     container_name: dlt-prometheus
     hostname: dlt-prometheus
     restart: unless-stopped
@@ -112,9 +116,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # Loki — Log Aggregation
+  # Bible #30: grafana/loki:3.6.6
   # ---------------------------------------------------------------------------
   dlt-loki:
-    image: grafana/loki:3.4.2
+    image: grafana/loki:3.6.6@sha256:434c7effbd66dbf69c2665fe4b2125549ecf7b45039ac28595d4034031cf47ce
     container_name: dlt-loki
     hostname: dlt-loki
     restart: unless-stopped
@@ -124,20 +129,24 @@ services:
       - dlt-loki-data:/loki
       - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
     command: ["-config.file=/etc/loki/loki-config.yml"]
+    # Loki 3.6.6 uses a minimal scratch image with no shell — cannot run CMD-SHELL.
+    # Healthcheck runs from host via curl in verify script. Dependent services
+    # use service_started condition instead of service_healthy.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
-      interval: 10s
+      test: ["CMD", "/usr/bin/loki", "--version"]
+      interval: 15s
       timeout: 5s
-      retries: 5
-      start_period: 15s
+      retries: 10
+      start_period: 30s
     networks:
       - dlt-network
 
   # ---------------------------------------------------------------------------
   # Alloy — Log Collector (replaces Promtail, which is BANNED)
+  # Bible #30: grafana/alloy:v1.8.0
   # ---------------------------------------------------------------------------
   dlt-alloy:
-    image: grafana/alloy:v1.6.1
+    image: grafana/alloy:v1.8.0@sha256:f54686e56a48f108779997ce87c4d9dc37df0e011802fb138b73c7ac31208108
     container_name: dlt-alloy
     hostname: dlt-alloy
     restart: unless-stopped
@@ -149,15 +158,22 @@ services:
     command: ["run", "/etc/alloy/config.alloy"]
     depends_on:
       dlt-loki:
-        condition: service_healthy
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/12345' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     networks:
       - dlt-network
 
   # ---------------------------------------------------------------------------
   # Jaeger v2 — Distributed Tracing (v1 is BANNED — EOL Dec 2025)
+  # Bible #29: jaegertracing/jaeger:2.15.0
   # ---------------------------------------------------------------------------
   dlt-jaeger:
-    image: jaegertracing/jaeger:2.4.0
+    image: jaegertracing/jaeger:2.15.0@sha256:a5221e8464fe7c3d77c9fb368dfc24771bfb02bf136f00b23ba374f1eac9c2bf
     container_name: dlt-jaeger
     hostname: dlt-jaeger
     restart: unless-stopped
@@ -178,9 +194,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # Grafana — Dashboards & Visualization
+  # Bible #27: grafana/grafana-oss:12.3.3
   # ---------------------------------------------------------------------------
   dlt-grafana:
-    image: grafana/grafana-oss:11.5.2
+    image: grafana/grafana-oss:12.3.3@sha256:9e1e77ade304069aee3196e9a4f210830e96e80ce9a2640891eccc324b152faf
     container_name: dlt-grafana
     hostname: dlt-grafana
     restart: unless-stopped
@@ -199,7 +216,7 @@ services:
       dlt-prometheus:
         condition: service_healthy
       dlt-loki:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
       interval: 10s
@@ -211,9 +228,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # Traefik — Reverse Proxy & Load Balancer
+  # Bible #79: traefik:v3.6.8
   # ---------------------------------------------------------------------------
   dlt-traefik:
-    image: traefik:v3.3.4
+    image: traefik:v3.6.8@sha256:90099f8948c828ecf0ababd711a4359a2443eba12261c1df2f548a3b1d815938
     container_name: dlt-traefik
     hostname: dlt-traefik
     restart: unless-stopped
@@ -235,9 +253,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # LocalStack — AWS SSM Parameter Store (dev environment)
+  # Bible #89: localstack/localstack:4.3.0
   # ---------------------------------------------------------------------------
   dlt-localstack:
-    image: localstack/localstack:4.2.0
+    image: localstack/localstack:4.3.0@sha256:f3cb1a79f3add997575e859c3a2808e6dae4b0de836661de255baa2b576868f8
     container_name: dlt-localstack
     hostname: dlt-localstack
     restart: unless-stopped

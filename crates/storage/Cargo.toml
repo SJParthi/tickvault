@@ -15,4 +15,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
-deadpool = { workspace = true }
+redis = { workspace = true }
+deadpool-redis = { workspace = true }
+questdb-rs = { workspace = true }
