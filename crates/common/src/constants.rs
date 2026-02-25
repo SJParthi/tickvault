@@ -141,8 +141,12 @@ pub const ORDER_EVENT_RING_BUFFER_CAPACITY: usize = 4096;
 // Instrument CSV — Download & Parse
 // ---------------------------------------------------------------------------
 
-/// Minimum expected rows in Dhan instrument CSV (sanity check).
+/// Minimum expected rows in Dhan instrument CSV (sanity check for row count).
 pub const INSTRUMENT_CSV_MIN_ROWS: usize = 100_000;
+
+/// Minimum expected bytes for a valid instrument CSV download.
+/// Dhan's CSV is ~40MB; anything under 1MB is suspiciously small.
+pub const INSTRUMENT_CSV_MIN_BYTES: usize = 1_000_000;
 
 /// Expected download time for instrument CSV in seconds.
 pub const INSTRUMENT_CSV_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
@@ -394,3 +398,36 @@ pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
 /// Circuit breaker reset timeout in seconds (try again after this).
 pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// Compile-Time Assertions
+// ---------------------------------------------------------------------------
+
+// Enforce: DISPLAY_INDEX_COUNT must equal DISPLAY_INDEX_ENTRIES length.
+const _: () = assert!(
+    DISPLAY_INDEX_COUNT == DISPLAY_INDEX_ENTRIES.len(),
+    "DISPLAY_INDEX_COUNT does not match DISPLAY_INDEX_ENTRIES.len()"
+);
+
+// Enforce: FULL_CHAIN_INDEX_COUNT must equal FULL_CHAIN_INDEX_SYMBOLS length.
+const _: () = assert!(
+    FULL_CHAIN_INDEX_COUNT == FULL_CHAIN_INDEX_SYMBOLS.len(),
+    "FULL_CHAIN_INDEX_COUNT does not match FULL_CHAIN_INDEX_SYMBOLS.len()"
+);
+
+// Enforce: TOTAL_SUBSCRIBED_INDEX_COUNT is the sum of F&O and display.
+// 8 F&O indices (from VALIDATION_MUST_EXIST_INDICES) + 23 display.
+const _: () = assert!(
+    TOTAL_SUBSCRIBED_INDEX_COUNT == VALIDATION_MUST_EXIST_INDICES.len() + DISPLAY_INDEX_COUNT,
+    "TOTAL_SUBSCRIBED_INDEX_COUNT mismatch"
+);
+
+// Sanity: ring buffer capacities must be powers of 2 (rtrb requirement).
+const _: () = assert!(
+    TICK_RING_BUFFER_CAPACITY.is_power_of_two(),
+    "TICK_RING_BUFFER_CAPACITY must be power of 2"
+);
+const _: () = assert!(
+    ORDER_EVENT_RING_BUFFER_CAPACITY.is_power_of_two(),
+    "ORDER_EVENT_RING_BUFFER_CAPACITY must be power of 2"
+);

@@ -61,3 +61,121 @@ pub enum ApplicationError {
     #[error("auth circuit breaker tripped after {failures} consecutive failures")]
     AuthCircuitBreakerTripped { failures: u32 },
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_configuration_error_display() {
+        let err = ApplicationError::Configuration("missing field".to_string());
+        assert_eq!(err.to_string(), "configuration error: missing field");
+    }
+
+    #[test]
+    fn test_secret_retrieval_error_display() {
+        let err = ApplicationError::SecretRetrieval {
+            path: "/dlt/dev/dhan/client-id".to_string(),
+            source: anyhow::anyhow!("not found"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/dlt/dev/dhan/client-id"));
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn test_market_hour_violation_display() {
+        let err = ApplicationError::MarketHourViolation("order after 15:30".to_string());
+        assert!(err.to_string().contains("15:30"));
+    }
+
+    #[test]
+    fn test_instrument_download_failed_display() {
+        let err = ApplicationError::InstrumentDownloadFailed {
+            reason: "all sources failed".to_string(),
+        };
+        assert!(err.to_string().contains("all sources failed"));
+    }
+
+    #[test]
+    fn test_instrument_parse_failed_display() {
+        let err = ApplicationError::InstrumentParseFailed {
+            row: 42,
+            reason: "missing column".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("42"));
+        assert!(msg.contains("missing column"));
+    }
+
+    #[test]
+    fn test_universe_validation_failed_display() {
+        let err = ApplicationError::UniverseValidationFailed {
+            check: "NIFTY missing".to_string(),
+        };
+        assert!(err.to_string().contains("NIFTY missing"));
+    }
+
+    #[test]
+    fn test_csv_column_missing_display() {
+        let err = ApplicationError::CsvColumnMissing {
+            column: "SECURITY_ID".to_string(),
+        };
+        assert!(err.to_string().contains("SECURITY_ID"));
+    }
+
+    #[test]
+    fn test_questdb_write_failed_display() {
+        let err = ApplicationError::QuestDbWriteFailed {
+            table: "fno_underlyings".to_string(),
+            source: anyhow::anyhow!("connection refused"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("fno_underlyings"));
+        assert!(msg.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_totp_generation_failed_display() {
+        let err = ApplicationError::TotpGenerationFailed {
+            reason: "invalid base32".to_string(),
+        };
+        assert!(err.to_string().contains("invalid base32"));
+    }
+
+    #[test]
+    fn test_authentication_failed_display() {
+        let err = ApplicationError::AuthenticationFailed {
+            reason: "HTTP 401".to_string(),
+        };
+        assert!(err.to_string().contains("HTTP 401"));
+    }
+
+    #[test]
+    fn test_token_renewal_failed_display() {
+        let err = ApplicationError::TokenRenewalFailed {
+            attempts: 3,
+            reason: "timeout".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("3"));
+        assert!(msg.contains("timeout"));
+    }
+
+    #[test]
+    fn test_auth_circuit_breaker_display() {
+        let err = ApplicationError::AuthCircuitBreakerTripped { failures: 5 };
+        assert!(err.to_string().contains("5"));
+    }
+
+    #[test]
+    fn test_application_error_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        // This will fail at compile time if ApplicationError is not Send + Sync
+        assert_send_sync::<ApplicationError>();
+    }
+}

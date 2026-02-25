@@ -33,8 +33,20 @@ fn build_ssm_path(environment: &str, secret_name: &str) -> String {
 
 /// Returns the SSM environment from the `ENVIRONMENT` env var,
 /// falling back to `DEFAULT_SSM_ENVIRONMENT` ("dev").
-pub fn resolve_environment() -> String {
-    std::env::var("ENVIRONMENT").unwrap_or_else(|_| DEFAULT_SSM_ENVIRONMENT.to_string())
+///
+/// Validates that the environment string contains only alphanumeric
+/// characters and hyphens to prevent path traversal.
+pub fn resolve_environment() -> Result<String, ApplicationError> {
+    let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| DEFAULT_SSM_ENVIRONMENT.to_string());
+
+    if env.is_empty() || !env.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(ApplicationError::Configuration(format!(
+            "ENVIRONMENT '{}' contains invalid characters (only alphanumeric and hyphen allowed)",
+            env
+        )));
+    }
+
+    Ok(env)
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +120,7 @@ async fn fetch_secret(
 /// Returns `ApplicationError::SecretRetrieval` if any secret cannot be fetched.
 #[instrument(skip_all, fields(environment))]
 pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationError> {
-    let environment = resolve_environment();
+    let environment = resolve_environment()?;
     tracing::Span::current().record("environment", environment.as_str());
 
     let ssm_client = create_ssm_client().await;
@@ -124,9 +136,12 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
         "fetching Dhan credentials from SSM"
     );
 
-    let client_id = fetch_secret(&ssm_client, &client_id_path).await?;
-    let client_secret = fetch_secret(&ssm_client, &client_secret_path).await?;
-    let totp_secret = fetch_secret(&ssm_client, &totp_secret_path).await?;
+    // Fetch all three secrets concurrently — 3x faster than sequential.
+    let (client_id, client_secret, totp_secret) = tokio::try_join!(
+        fetch_secret(&ssm_client, &client_id_path),
+        fetch_secret(&ssm_client, &client_secret_path),
+        fetch_secret(&ssm_client, &totp_secret_path),
+    )?;
 
     info!("all Dhan credentials fetched successfully from SSM");
 
@@ -167,7 +182,7 @@ mod tests {
     fn test_resolve_environment_default() {
         // When ENVIRONMENT env var is not set, should default to "dev"
         // Note: this test may be affected by CI/CD environment variables
-        let env = resolve_environment();
+        let env = resolve_environment().expect("resolve_environment should succeed");
         // Just verify it returns a non-empty string
         assert!(!env.is_empty());
     }

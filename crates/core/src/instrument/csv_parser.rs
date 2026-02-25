@@ -239,17 +239,18 @@ fn parse_row(
         .with_context(|| format!("invalid security_id: '{}'", security_id_str))?;
 
     let underlying_security_id_str = get(indices.underlying_security_id);
-    let underlying_security_id: SecurityId = underlying_security_id_str.parse().unwrap_or(0);
+    let underlying_security_id: SecurityId = underlying_security_id_str.parse().unwrap_or(0); // 0 is valid for equity rows; derivative validation happens in universe builder
 
     let lot_size_str = get(indices.lot_size);
-    let lot_size_float: f64 = lot_size_str.parse().unwrap_or(1.0);
-    let lot_size = lot_size_float as u32;
+    let lot_size: u32 = parse_lot_size(lot_size_str)
+        .with_context(|| format!("invalid lot_size: '{}'", lot_size_str))?;
 
     let strike_price_str = get(indices.strike_price);
-    let strike_price: f64 = strike_price_str.parse().unwrap_or(0.0);
+    let strike_price: f64 = parse_strike_price(strike_price_str);
 
     let tick_size_str = get(indices.tick_size);
-    let tick_size: f64 = tick_size_str.parse().unwrap_or(0.0);
+    let tick_size: f64 = parse_tick_size(tick_size_str)
+        .with_context(|| format!("invalid tick_size: '{}'", tick_size_str))?;
 
     let option_type_str = get(indices.option_type);
     let option_type = match option_type_str {
@@ -280,14 +281,74 @@ fn parse_row(
     })
 }
 
+/// Parse lot size from CSV string (Dhan stores as float, e.g., "75.0").
+///
+/// # Validation
+/// - Must parse as finite f64 > 0.
+/// - Must fit within u32 range after rounding.
+/// - NaN, infinity, zero, and negative values are rejected.
+fn parse_lot_size(value: &str) -> Result<u32> {
+    if value.is_empty() {
+        bail!("lot_size is empty");
+    }
+    let float_val: f64 = value.parse().context("lot_size is not a valid number")?;
+    if !float_val.is_finite() || float_val <= 0.0 {
+        bail!("lot_size must be finite and positive, got {}", float_val);
+    }
+    let rounded = float_val.round();
+    if rounded > f64::from(u32::MAX) {
+        bail!("lot_size {} exceeds u32::MAX", rounded);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(rounded as u32)
+}
+
+/// Parse strike price from CSV string.
+///
+/// Returns 0.0 for empty, negative sentinel (Dhan uses -0.01 for futures),
+/// or unparseable values. Actual strike price validation happens in the
+/// universe builder when attaching contracts to option chains.
+fn parse_strike_price(value: &str) -> f64 {
+    if value.is_empty() {
+        return 0.0;
+    }
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => v,
+        _ => 0.0, // Sentinel: futures use -0.01 or 0.0 — both map to 0.0
+    }
+}
+
+/// Parse tick size from CSV string.
+///
+/// # Validation
+/// - Must parse as finite f64 > 0.
+/// - NaN, infinity, zero, and negative values are rejected.
+fn parse_tick_size(value: &str) -> Result<f64> {
+    if value.is_empty() {
+        bail!("tick_size is empty");
+    }
+    let float_val: f64 = value.parse().context("tick_size is not a valid number")?;
+    if !float_val.is_finite() || float_val <= 0.0 {
+        bail!("tick_size must be finite and positive, got {}", float_val);
+    }
+    Ok(float_val)
+}
+
 /// Parse Dhan's expiry date format (e.g., "2026-03-27") into NaiveDate.
 ///
 /// Returns None for sentinel values like "0001-01-01" or empty strings.
+/// Logs a warning for non-sentinel strings that fail to parse.
 fn parse_expiry_date(date_str: &str) -> Option<NaiveDate> {
     if date_str.is_empty() || date_str == "0001-01-01" {
         return None;
     }
-    NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()
+    match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        Ok(date) => Some(date),
+        Err(error) => {
+            warn!(date_str, %error, "unparseable expiry date — treating as None");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -772,5 +833,171 @@ mod tests {
         assert_eq!(row.instrument, "OPTIDX");
         assert_eq!(row.strike_price, 22000.0);
         assert_eq!(row.option_type, Some(OptionType::Call));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_lot_size edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_lot_size_valid_integer() {
+        assert_eq!(parse_lot_size("75").unwrap(), 75);
+    }
+
+    #[test]
+    fn test_parse_lot_size_valid_float() {
+        assert_eq!(parse_lot_size("75.0").unwrap(), 75);
+    }
+
+    #[test]
+    fn test_parse_lot_size_rounds_to_nearest() {
+        assert_eq!(parse_lot_size("74.6").unwrap(), 75);
+        assert_eq!(parse_lot_size("75.4").unwrap(), 75);
+    }
+
+    #[test]
+    fn test_parse_lot_size_empty_string_fails() {
+        assert!(parse_lot_size("").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_zero_fails() {
+        assert!(parse_lot_size("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_negative_fails() {
+        assert!(parse_lot_size("-10").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_nan_fails() {
+        assert!(parse_lot_size("NaN").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_inf_fails() {
+        assert!(parse_lot_size("inf").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_not_a_number_fails() {
+        assert!(parse_lot_size("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_very_large_fails() {
+        // Value larger than u32::MAX
+        assert!(parse_lot_size("5000000000").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_u32_max_boundary() {
+        // u32::MAX = 4294967295
+        assert_eq!(parse_lot_size("4294967295").unwrap(), u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_strike_price edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_strike_price_valid() {
+        assert_eq!(parse_strike_price("22000.0"), 22000.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_empty_returns_zero() {
+        assert_eq!(parse_strike_price(""), 0.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_negative_sentinel_returns_zero() {
+        assert_eq!(parse_strike_price("-0.01"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_zero_returns_zero() {
+        assert_eq!(parse_strike_price("0.0"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_nan_returns_zero() {
+        assert_eq!(parse_strike_price("NaN"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_inf_returns_zero() {
+        assert_eq!(parse_strike_price("inf"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_garbage_returns_zero() {
+        assert_eq!(parse_strike_price("not_a_number"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_strike_price_small_positive() {
+        assert_eq!(parse_strike_price("0.05"), 0.05);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_tick_size edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_tick_size_valid() {
+        assert_eq!(parse_tick_size("0.05").unwrap(), 0.05);
+    }
+
+    #[test]
+    fn test_parse_tick_size_valid_integer() {
+        assert_eq!(parse_tick_size("1").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn test_parse_tick_size_empty_fails() {
+        assert!(parse_tick_size("").is_err());
+    }
+
+    #[test]
+    fn test_parse_tick_size_zero_fails() {
+        assert!(parse_tick_size("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_tick_size_negative_fails() {
+        assert!(parse_tick_size("-0.05").is_err());
+    }
+
+    #[test]
+    fn test_parse_tick_size_nan_fails() {
+        assert!(parse_tick_size("NaN").is_err());
+    }
+
+    #[test]
+    fn test_parse_tick_size_inf_fails() {
+        assert!(parse_tick_size("inf").is_err());
+    }
+
+    #[test]
+    fn test_parse_tick_size_garbage_fails() {
+        assert!(parse_tick_size("xyz").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_expiry_date additional edge cases
+    // (basic tests already exist above)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_expiry_date_impossible_date() {
+        // Feb 30 doesn't exist
+        assert_eq!(parse_expiry_date("2026-02-30"), None);
+    }
+
+    #[test]
+    fn test_parse_expiry_date_garbage_string() {
+        assert_eq!(parse_expiry_date("not-a-date"), None);
     }
 }

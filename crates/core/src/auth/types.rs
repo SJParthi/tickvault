@@ -13,6 +13,18 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 
 // ---------------------------------------------------------------------------
+// IST Helper
+// ---------------------------------------------------------------------------
+
+/// Returns the IST fixed offset (UTC+5:30).
+///
+/// Uses the compile-time constant `IST_UTC_OFFSET_SECONDS` (19800).
+/// This always succeeds — the value is within `FixedOffset`'s valid range.
+fn ist_offset() -> FixedOffset {
+    FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid")
+}
+
+// ---------------------------------------------------------------------------
 // Dhan Credentials (from SSM)
 // ---------------------------------------------------------------------------
 
@@ -47,28 +59,23 @@ impl fmt::Debug for DhanCredentials {
 /// Consumers call `arc_swap.load()` for O(1) reads on every WebSocket
 /// frame and REST API call. The token is swapped atomically on renewal.
 ///
-/// Memory is zeroized on drop to prevent token leakage from freed memory.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// `SecretString` internally zeroizes its memory on drop, so the access
+/// token is automatically wiped when this struct is dropped.
 pub struct TokenState {
-    /// JWT access token value.
-    #[zeroize(skip)]
+    /// JWT access token value (zeroized on drop by SecretString).
     access_token: SecretString,
 
     /// When this token expires (IST).
-    #[zeroize(skip)]
     expires_at: DateTime<FixedOffset>,
 
     /// When this token was issued (IST).
-    #[zeroize(skip)]
     issued_at: DateTime<FixedOffset>,
 }
 
 impl TokenState {
     /// Creates a new `TokenState` from a Dhan auth response.
     pub fn from_response(response: &DhanAuthResponseData) -> Self {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
-        let now_ist = Utc::now().with_timezone(&ist);
+        let now_ist = Utc::now().with_timezone(&ist_offset());
         let expires_at = now_ist + Duration::seconds(i64::from(response.expires_in));
 
         Self {
@@ -98,9 +105,7 @@ impl TokenState {
 
     /// Returns `true` if the token has not yet expired.
     pub fn is_valid(&self) -> bool {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
-        let now_ist = Utc::now().with_timezone(&ist);
+        let now_ist = Utc::now().with_timezone(&ist_offset());
         now_ist < self.expires_at
     }
 
@@ -109,11 +114,11 @@ impl TokenState {
     /// The refresh window starts at `token_validity - refresh_before_expiry`
     /// hours after issuance.
     pub fn needs_refresh(&self, refresh_before_expiry_hours: u64) -> bool {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
-        let now_ist = Utc::now().with_timezone(&ist);
-        let refresh_threshold =
-            self.expires_at - Duration::hours(i64::from(refresh_before_expiry_hours as u32));
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        // Safe cast: clamped to 8760 (1 year max) before widening to i64.
+        #[allow(clippy::cast_possible_wrap)]
+        let hours = refresh_before_expiry_hours.min(8760) as i64;
+        let refresh_threshold = self.expires_at - Duration::hours(hours);
         now_ist >= refresh_threshold
     }
 
@@ -121,11 +126,11 @@ impl TokenState {
     ///
     /// Returns zero if already past the refresh window.
     pub fn time_until_refresh(&self, refresh_before_expiry_hours: u64) -> std::time::Duration {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
-        let now_ist = Utc::now().with_timezone(&ist);
-        let refresh_at =
-            self.expires_at - Duration::hours(i64::from(refresh_before_expiry_hours as u32));
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        // Safe cast: clamped to 8760 (1 year max) before widening to i64.
+        #[allow(clippy::cast_possible_wrap)]
+        let hours = refresh_before_expiry_hours.min(8760) as i64;
+        let refresh_at = self.expires_at - Duration::hours(hours);
         if now_ist >= refresh_at {
             std::time::Duration::ZERO
         } else {
@@ -136,12 +141,13 @@ impl TokenState {
     }
 
     /// Returns the token age in hours (for logging only).
+    ///
+    /// Uses seconds-based precision. Clamps negative durations to zero.
     pub fn age_hours(&self) -> f64 {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
-        let now_ist = Utc::now().with_timezone(&ist);
+        let now_ist = Utc::now().with_timezone(&ist_offset());
         let age = now_ist - self.issued_at;
-        age.num_minutes() as f64 / 60.0
+        let seconds = age.num_seconds().max(0);
+        seconds as f64 / 3600.0
     }
 }
 
@@ -160,7 +166,9 @@ impl fmt::Debug for TokenState {
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /v2/generateAccessToken`.
-#[derive(serde::Serialize)]
+///
+/// Fields are zeroized on drop to prevent credential leakage from freed memory.
+#[derive(serde::Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct GenerateTokenRequest {
     pub client_id: String,
     pub client_secret: String,
@@ -168,7 +176,9 @@ pub struct GenerateTokenRequest {
 }
 
 /// Request body for `POST /v2/renewToken`.
-#[derive(serde::Serialize)]
+///
+/// Fields are zeroized on drop to prevent credential leakage from freed memory.
+#[derive(serde::Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct RenewTokenRequest {
     pub client_id: String,
     pub totp: String,
@@ -185,7 +195,7 @@ pub struct DhanAuthResponse {
 }
 
 /// Data payload from a successful Dhan auth response.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct DhanAuthResponseData {
     /// JWT access token string.
     pub access_token: String,
@@ -193,6 +203,16 @@ pub struct DhanAuthResponseData {
     pub token_type: String,
     /// Token validity in seconds (typically 86400 = 24 hours).
     pub expires_in: u32,
+}
+
+impl fmt::Debug for DhanAuthResponseData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DhanAuthResponseData")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

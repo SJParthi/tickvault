@@ -5,6 +5,7 @@
 //! can depend on them without importing `core`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
@@ -38,6 +39,12 @@ impl UnderlyingKind {
     }
 }
 
+impl fmt::Display for UnderlyingKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Classification of a derivative instrument as it appears in the Dhan CSV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DhanInstrumentKind {
@@ -63,6 +70,12 @@ impl DhanInstrumentKind {
     }
 }
 
+impl fmt::Display for DhanInstrumentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subscribed Index (8 F&O + 23 Display = 31 total)
 // ---------------------------------------------------------------------------
@@ -83,6 +96,12 @@ impl IndexCategory {
             Self::FnoUnderlying => "FnoUnderlying",
             Self::DisplayIndex => "DisplayIndex",
         }
+    }
+}
+
+impl fmt::Display for IndexCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -117,6 +136,12 @@ impl IndexSubcategory {
             Self::Thematic => "Thematic",
             Self::Fno => "Fno",
         }
+    }
+}
+
+impl fmt::Display for IndexSubcategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -409,4 +434,198 @@ pub struct FnoUniverse {
 
     /// Build metadata for diagnostics.
     pub build_metadata: UniverseBuildMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- UnderlyingKind ---
+
+    #[test]
+    fn test_underlying_kind_as_str_all_variants() {
+        assert_eq!(UnderlyingKind::NseIndex.as_str(), "NseIndex");
+        assert_eq!(UnderlyingKind::BseIndex.as_str(), "BseIndex");
+        assert_eq!(UnderlyingKind::Stock.as_str(), "Stock");
+    }
+
+    #[test]
+    fn test_underlying_kind_display() {
+        assert_eq!(format!("{}", UnderlyingKind::NseIndex), "NseIndex");
+        assert_eq!(format!("{}", UnderlyingKind::Stock), "Stock");
+    }
+
+    #[test]
+    fn test_underlying_kind_serde_roundtrip() {
+        let original = UnderlyingKind::BseIndex;
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: UnderlyingKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    // --- DhanInstrumentKind ---
+
+    #[test]
+    fn test_dhan_instrument_kind_as_str_all_variants() {
+        assert_eq!(DhanInstrumentKind::FutureIndex.as_str(), "FutureIndex");
+        assert_eq!(DhanInstrumentKind::FutureStock.as_str(), "FutureStock");
+        assert_eq!(DhanInstrumentKind::OptionIndex.as_str(), "OptionIndex");
+        assert_eq!(DhanInstrumentKind::OptionStock.as_str(), "OptionStock");
+    }
+
+    #[test]
+    fn test_dhan_instrument_kind_display() {
+        assert_eq!(
+            format!("{}", DhanInstrumentKind::FutureIndex),
+            "FutureIndex"
+        );
+        assert_eq!(
+            format!("{}", DhanInstrumentKind::OptionStock),
+            "OptionStock"
+        );
+    }
+
+    #[test]
+    fn test_dhan_instrument_kind_serde_roundtrip() {
+        let original = DhanInstrumentKind::OptionIndex;
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: DhanInstrumentKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    // --- IndexCategory ---
+
+    #[test]
+    fn test_index_category_as_str_all_variants() {
+        assert_eq!(IndexCategory::FnoUnderlying.as_str(), "FnoUnderlying");
+        assert_eq!(IndexCategory::DisplayIndex.as_str(), "DisplayIndex");
+    }
+
+    #[test]
+    fn test_index_category_display() {
+        assert_eq!(format!("{}", IndexCategory::FnoUnderlying), "FnoUnderlying");
+        assert_eq!(format!("{}", IndexCategory::DisplayIndex), "DisplayIndex");
+    }
+
+    #[test]
+    fn test_index_category_serde_roundtrip() {
+        let original = IndexCategory::DisplayIndex;
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: IndexCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    // --- IndexSubcategory ---
+
+    #[test]
+    fn test_index_subcategory_as_str_all_variants() {
+        assert_eq!(IndexSubcategory::Volatility.as_str(), "Volatility");
+        assert_eq!(IndexSubcategory::BroadMarket.as_str(), "BroadMarket");
+        assert_eq!(IndexSubcategory::MidCap.as_str(), "MidCap");
+        assert_eq!(IndexSubcategory::SmallCap.as_str(), "SmallCap");
+        assert_eq!(IndexSubcategory::Sectoral.as_str(), "Sectoral");
+        assert_eq!(IndexSubcategory::Thematic.as_str(), "Thematic");
+        assert_eq!(IndexSubcategory::Fno.as_str(), "Fno");
+    }
+
+    #[test]
+    fn test_index_subcategory_display() {
+        assert_eq!(format!("{}", IndexSubcategory::Volatility), "Volatility");
+        assert_eq!(format!("{}", IndexSubcategory::Fno), "Fno");
+    }
+
+    #[test]
+    fn test_index_subcategory_serde_roundtrip() {
+        let original = IndexSubcategory::Sectoral;
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: IndexSubcategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    // --- OptionChainKey equality and hash ---
+
+    #[test]
+    fn test_option_chain_key_equality() {
+        let key1 = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        let key2 = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_option_chain_key_inequality_symbol() {
+        let key1 = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        let key2 = OptionChainKey {
+            underlying_symbol: "BANKNIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_option_chain_key_inequality_expiry() {
+        let key1 = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        let key2 = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+        };
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_option_chain_key_hash_map_usage() {
+        use std::collections::HashMap;
+        let key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        let mut map = HashMap::new();
+        map.insert(key.clone(), 42);
+        assert_eq!(map.get(&key), Some(&42));
+    }
+
+    // --- Duration serde helper ---
+
+    #[test]
+    fn test_build_metadata_duration_serde_roundtrip() {
+        use chrono::{FixedOffset, Utc};
+        let ist = FixedOffset::east_opt(19_800).unwrap();
+        let metadata = UniverseBuildMetadata {
+            csv_source: "primary".to_string(),
+            csv_row_count: 100,
+            parsed_row_count: 50,
+            index_count: 10,
+            equity_count: 20,
+            underlying_count: 5,
+            derivative_count: 100,
+            option_chain_count: 10,
+            build_duration: std::time::Duration::from_millis(1234),
+            build_timestamp: Utc::now().with_timezone(&ist),
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let deserialized: UniverseBuildMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.build_duration,
+            std::time::Duration::from_millis(1234)
+        );
+        assert_eq!(deserialized.csv_source, "primary");
+        assert_eq!(deserialized.csv_row_count, 100);
+    }
 }

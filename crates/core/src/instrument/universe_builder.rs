@@ -61,7 +61,7 @@ struct UnlinkedUnderlying {
 /// Scans all rows with segment='I' from both NSE and BSE.
 /// Keyed by `underlying_symbol` from the IDX_I row.
 fn build_index_lookup(rows: &[ParsedInstrumentRow]) -> HashMap<String, IndexEntry> {
-    let mut lookup = HashMap::new();
+    let mut lookup = HashMap::with_capacity(256);
 
     for row in rows {
         if row.segment != 'I' {
@@ -89,7 +89,7 @@ fn build_index_lookup(rows: &[ParsedInstrumentRow]) -> HashMap<String, IndexEntr
 ///
 /// Only includes rows matching (NSE, segment='E', series='EQ').
 fn build_equity_lookup(rows: &[ParsedInstrumentRow]) -> HashMap<String, SecurityId> {
-    let mut lookup = HashMap::new();
+    let mut lookup = HashMap::with_capacity(4096);
 
     for row in rows {
         if row.exchange != Exchange::NationalStockExchange
@@ -115,7 +115,7 @@ fn build_equity_lookup(rows: &[ParsedInstrumentRow]) -> HashMap<String, Security
 /// Scans FUTIDX and FUTSTK rows, deduplicates by `underlying_symbol`,
 /// skips TEST instruments, and classifies each as NseIndex/BseIndex/Stock.
 fn discover_fno_underlyings(rows: &[ParsedInstrumentRow]) -> Vec<UnlinkedUnderlying> {
-    let mut seen: HashMap<String, UnlinkedUnderlying> = HashMap::new();
+    let mut seen: HashMap<String, UnlinkedUnderlying> = HashMap::with_capacity(256);
 
     for row in rows {
         if row.segment != 'D' {
@@ -181,7 +181,7 @@ fn link_price_ids(
     index_lookup: &HashMap<String, IndexEntry>,
     equity_lookup: &HashMap<String, SecurityId>,
 ) -> HashMap<String, FnoUnderlying> {
-    let mut underlyings = HashMap::new();
+    let mut underlyings = HashMap::with_capacity(unlinked.len());
 
     for item in unlinked {
         let (price_feed_security_id, price_feed_segment, derivative_segment) = match item.kind {
@@ -278,23 +278,25 @@ fn build_derivatives_and_chains(
     underlyings: &mut HashMap<String, FnoUnderlying>,
     today: NaiveDate,
 ) -> Pass5Result {
-    let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> = HashMap::new();
-    let mut instrument_info: HashMap<SecurityId, InstrumentInfo> = HashMap::new();
+    // Estimate: ~150K derivative contracts, ~160K instrument_info (indices + equities + derivatives)
+    let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> =
+        HashMap::with_capacity(160_000);
+    let mut instrument_info: HashMap<SecurityId, InstrumentInfo> = HashMap::with_capacity(170_000);
 
     // Intermediate: option chain accumulator — (calls, puts) per chain key
     let mut chain_builders: HashMap<
         OptionChainKey,
         (Vec<OptionChainEntry>, Vec<OptionChainEntry>),
-    > = HashMap::new();
+    > = HashMap::with_capacity(2048);
 
     // Track futures per (underlying, expiry) for linking to option chains
-    let mut futures_by_key: HashMap<OptionChainKey, SecurityId> = HashMap::new();
+    let mut futures_by_key: HashMap<OptionChainKey, SecurityId> = HashMap::with_capacity(1024);
 
     // Track expiry dates per underlying (BTreeSet for automatic sorting)
-    let mut expiry_sets: HashMap<String, BTreeSet<NaiveDate>> = HashMap::new();
+    let mut expiry_sets: HashMap<String, BTreeSet<NaiveDate>> = HashMap::with_capacity(256);
 
     // Track contract count per underlying
-    let mut contract_counts: HashMap<String, usize> = HashMap::new();
+    let mut contract_counts: HashMap<String, usize> = HashMap::with_capacity(256);
 
     // --- Step 1: Instrument info for indices and equities ---
     for row in rows {
@@ -476,7 +478,8 @@ fn build_derivatives_and_chains(
     );
 
     // --- Step 3: Finalize option chains (sort by strike) ---
-    let mut option_chains: HashMap<OptionChainKey, OptionChain> = HashMap::new();
+    let mut option_chains: HashMap<OptionChainKey, OptionChain> =
+        HashMap::with_capacity(chain_builders.len());
 
     for (key, (mut calls, mut puts)) in chain_builders {
         calls.sort_by(|a, b| {
@@ -510,7 +513,8 @@ fn build_derivatives_and_chains(
     );
 
     // --- Step 4: Build expiry calendars (already sorted via BTreeSet) ---
-    let mut expiry_calendars: HashMap<String, ExpiryCalendar> = HashMap::new();
+    let mut expiry_calendars: HashMap<String, ExpiryCalendar> =
+        HashMap::with_capacity(expiry_sets.len());
 
     for (symbol, dates) in expiry_sets {
         expiry_calendars.insert(
@@ -683,7 +687,8 @@ pub async fn build_fno_universe(
     let mut underlyings = link_price_ids(unlinked, &index_lookup, &equity_lookup);
 
     // Step 7: Pass 5 — Build derivatives, option chains, expiry calendars
-    let ist_offset = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("IST offset is always valid");
+    let ist_offset =
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
     let today = Utc::now().with_timezone(&ist_offset).date_naive();
 
     let pass5_result = build_derivatives_and_chains(&parsed_rows, &mut underlyings, today);

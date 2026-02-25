@@ -29,8 +29,6 @@
 //!   QuestDB displays it in UTC (e.g., `2026-02-24T18:30:00Z` = `2026-02-25 00:00:00 IST`).
 //!   Grafana dashboards should set timezone to IST for correct display.
 
-use std::convert::TryFrom;
-
 use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveDate, Utc};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
@@ -131,19 +129,23 @@ fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -> Resu
 /// All rows for a single day share the same designated timestamp, making
 /// date-based queries clean (e.g., `WHERE snapshot_date = '2026-03-15'`).
 fn build_snapshot_timestamp() -> Result<TimestampNanos> {
-    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+    let ist =
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
     let today_ist = Utc::now().with_timezone(&ist).date_naive();
     naive_date_to_timestamp_nanos(today_ist)
 }
 
 /// Converts a `NaiveDate` to `TimestampNanos` at midnight IST.
 fn naive_date_to_timestamp_nanos(date: NaiveDate) -> Result<TimestampNanos> {
-    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
-    let midnight = date.and_hms_opt(0, 0, 0).expect("midnight is always valid");
+    let ist =
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
+    let midnight = date
+        .and_hms_opt(0, 0, 0)
+        .context("failed to construct midnight time")?;
     let ist_datetime = midnight
         .and_local_timezone(ist)
         .single()
-        .expect("IST has no DST ambiguity");
+        .context("ambiguous or invalid IST timezone conversion")?;
     TimestampNanos::from_datetime(ist_datetime).context("failed to convert IST date to ILP nanos")
 }
 
@@ -167,43 +169,44 @@ fn write_build_metadata(
         .context("csv_source")?
         .column_i64(
             "csv_row_count",
-            i64::try_from(metadata.csv_row_count).expect("csv_row_count fits in i64"),
+            i64::try_from(metadata.csv_row_count).context("csv_row_count overflows i64")?,
         )
         .context("csv_row_count")?
         .column_i64(
             "parsed_row_count",
-            i64::try_from(metadata.parsed_row_count).expect("parsed_row_count fits in i64"),
+            i64::try_from(metadata.parsed_row_count).context("parsed_row_count overflows i64")?,
         )
         .context("parsed_row_count")?
         .column_i64(
             "index_count",
-            i64::try_from(metadata.index_count).expect("index_count fits in i64"),
+            i64::try_from(metadata.index_count).context("index_count overflows i64")?,
         )
         .context("index_count")?
         .column_i64(
             "equity_count",
-            i64::try_from(metadata.equity_count).expect("equity_count fits in i64"),
+            i64::try_from(metadata.equity_count).context("equity_count overflows i64")?,
         )
         .context("equity_count")?
         .column_i64(
             "underlying_count",
-            i64::try_from(metadata.underlying_count).expect("underlying_count fits in i64"),
+            i64::try_from(metadata.underlying_count).context("underlying_count overflows i64")?,
         )
         .context("underlying_count")?
         .column_i64(
             "derivative_count",
-            i64::try_from(metadata.derivative_count).expect("derivative_count fits in i64"),
+            i64::try_from(metadata.derivative_count).context("derivative_count overflows i64")?,
         )
         .context("derivative_count")?
         .column_i64(
             "option_chain_count",
-            i64::try_from(metadata.option_chain_count).expect("option_chain_count fits in i64"),
+            i64::try_from(metadata.option_chain_count)
+                .context("option_chain_count overflows i64")?,
         )
         .context("option_chain_count")?
         .column_i64(
             "build_duration_ms",
             i64::try_from(metadata.build_duration.as_millis())
-                .expect("build_duration_ms fits in i64"),
+                .context("build_duration_ms overflows i64")?,
         )
         .context("build_duration_ms")?
         .column_ts("build_timestamp", build_ts_micros)
@@ -269,7 +272,7 @@ fn write_single_underlying(
         .context("lot_size")?
         .column_i64(
             "contract_count",
-            i64::try_from(underlying.contract_count).expect("contract_count fits in i64"),
+            i64::try_from(underlying.contract_count).context("contract_count overflows i64")?,
         )
         .context("contract_count")?
         .at(snapshot_nanos)

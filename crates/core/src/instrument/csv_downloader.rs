@@ -151,12 +151,12 @@ async fn download_with_retry(client: &Client, url: &str) -> Result<String> {
                 .with_context(|| format!("failed to read response body from {}", url))?;
 
             // Sanity check: body should not be suspiciously small
-            if body.len() < INSTRUMENT_CSV_MIN_ROWS {
+            if body.len() < INSTRUMENT_CSV_MIN_BYTES {
                 bail!(
                     "CSV body too small ({} bytes) from {}, expected at least {} bytes",
                     body.len(),
                     url,
-                    INSTRUMENT_CSV_MIN_ROWS
+                    INSTRUMENT_CSV_MIN_BYTES
                 );
             }
 
@@ -218,11 +218,11 @@ async fn read_cache(cache_path: &Path) -> Result<String> {
         .await
         .with_context(|| format!("failed to read cache file {}", cache_path.display()))?;
 
-    if csv_text.len() < INSTRUMENT_CSV_MIN_ROWS {
+    if csv_text.len() < INSTRUMENT_CSV_MIN_BYTES {
         bail!(
             "cached CSV too small ({} bytes), expected at least {} bytes",
             csv_text.len(),
-            INSTRUMENT_CSV_MIN_ROWS
+            INSTRUMENT_CSV_MIN_BYTES
         );
     }
 
@@ -245,7 +245,7 @@ mod tests {
         let cache_filename = "test-instruments.csv";
 
         // Create a fake CSV large enough to pass the size check
-        let fake_csv = "H".repeat(INSTRUMENT_CSV_MIN_ROWS + 1);
+        let fake_csv = "H".repeat(INSTRUMENT_CSV_MIN_BYTES + 1);
 
         write_cache(cache_dir, cache_filename, &fake_csv).await;
 
@@ -309,7 +309,7 @@ mod tests {
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "cached-instruments.csv";
 
-        let fake_csv = "CACHED_DATA,".repeat(INSTRUMENT_CSV_MIN_ROWS);
+        let fake_csv = "CACHED_DATA,".repeat(INSTRUMENT_CSV_MIN_BYTES);
         write_cache(cache_dir, cache_filename, &fake_csv).await;
 
         let result = download_instrument_csv(

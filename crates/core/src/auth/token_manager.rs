@@ -89,6 +89,16 @@ impl TokenManager {
     ) -> Result<Arc<Self>, ApplicationError> {
         info!("initializing authentication — fetching credentials from SSM");
 
+        // Validate HTTPS scheme — credentials must never be sent over plain HTTP.
+        if !dhan_config.rest_api_base_url.starts_with("https://") {
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "rest_api_base_url must use HTTPS, got: {}",
+                    dhan_config.rest_api_base_url
+                ),
+            });
+        }
+
         let credentials = secret_manager::fetch_dhan_credentials().await?;
 
         let http_client = reqwest::Client::builder()
@@ -169,6 +179,13 @@ impl TokenManager {
             })?;
 
         let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!("generateAccessToken HTTP {status}: {body_text}"),
+            });
+        }
+
         let body: DhanAuthResponse =
             response
                 .json()
@@ -192,6 +209,13 @@ impl TokenManager {
             .ok_or_else(|| ApplicationError::AuthenticationFailed {
                 reason: "auth response has status=success but no data payload".to_string(),
             })?;
+
+        if response_data.expires_in == 0 {
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: "auth response has expires_in=0 — token would expire immediately"
+                    .to_string(),
+            });
+        }
 
         let token_state = TokenState::from_response(&response_data);
         self.token.store(Arc::new(Some(token_state)));
@@ -229,24 +253,32 @@ impl TokenManager {
             .send()
             .await
             .map_err(|err| ApplicationError::TokenRenewalFailed {
-                attempts: 1,
+                attempts: 0,
                 reason: format!("renewToken request failed: {err}"),
             })?;
 
         let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(ApplicationError::TokenRenewalFailed {
+                attempts: 0,
+                reason: format!("renewToken HTTP {status}: {body_text}"),
+            });
+        }
+
         let body: DhanAuthResponse =
             response
                 .json()
                 .await
                 .map_err(|err| ApplicationError::TokenRenewalFailed {
-                    attempts: 1,
+                    attempts: 0,
                     reason: format!("failed to parse renewal response (HTTP {status}): {err}"),
                 })?;
 
         if body.status != "success" {
             let remarks = body.remarks.unwrap_or_else(|| "no details".to_string());
             return Err(ApplicationError::TokenRenewalFailed {
-                attempts: 1,
+                attempts: 0,
                 reason: format!(
                     "Dhan API returned status='{}', remarks='{}'",
                     body.status, remarks
@@ -257,9 +289,17 @@ impl TokenManager {
         let response_data = body
             .data
             .ok_or_else(|| ApplicationError::TokenRenewalFailed {
-                attempts: 1,
+                attempts: 0,
                 reason: "renewal response has status=success but no data payload".to_string(),
             })?;
+
+        if response_data.expires_in == 0 {
+            return Err(ApplicationError::TokenRenewalFailed {
+                attempts: 0,
+                reason: "renewal response has expires_in=0 — token would expire immediately"
+                    .to_string(),
+            });
+        }
 
         let new_token_state = TokenState::from_response(&response_data);
         self.token.store(Arc::new(Some(new_token_state)));
