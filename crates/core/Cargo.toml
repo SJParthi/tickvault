@@ -21,3 +21,7 @@ arrayvec = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 serde = { workspace = true }
+reqwest = { workspace = true }
+csv = { workspace = true }
+backon = { workspace = true }
+ahash = { workspace = true }

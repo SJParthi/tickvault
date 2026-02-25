@@ -1,0 +1,15 @@
+//! Master instrument download, parsing, and F&O universe building.
+//!
+//! Downloads Dhan's instrument master CSV daily, parses it, runs a 5-pass
+//! mapping algorithm, and produces a complete [`FnoUniverse`] with all lookup
+//! maps ready for downstream consumption.
+//!
+//! # Boot Sequence Position
+//! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
+
+pub mod csv_downloader;
+pub mod csv_parser;
+pub mod universe_builder;
+pub mod validation;
+
+pub use universe_builder::build_fno_universe;

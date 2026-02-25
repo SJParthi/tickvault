@@ -17,6 +17,7 @@ pub struct ApplicationConfig {
     pub token: TokenConfig,
     pub risk: RiskConfig,
     pub logging: LoggingConfig,
+    pub instrument: InstrumentConfig,
 }
 
 /// Trading session timing configuration.
@@ -128,4 +129,17 @@ pub struct LoggingConfig {
     pub level: String,
     /// Log output format (json, pretty).
     pub format: String,
+}
+
+/// Instrument CSV download and universe build configuration.
+#[derive(Debug, Deserialize)]
+pub struct InstrumentConfig {
+    /// Time of day (IST) to download fresh instrument CSV. Format: "HH:MM:SS".
+    pub daily_download_time: String,
+    /// Directory path for caching the last successful CSV download.
+    pub csv_cache_directory: String,
+    /// Cached CSV filename.
+    pub csv_cache_filename: String,
+    /// Download timeout in seconds (overrides network timeout for this large file).
+    pub csv_download_timeout_secs: u64,
 }

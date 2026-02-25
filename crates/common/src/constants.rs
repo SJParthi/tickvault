@@ -138,7 +138,7 @@ pub const TICK_RING_BUFFER_CAPACITY: usize = 65536;
 pub const ORDER_EVENT_RING_BUFFER_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
-// Instrument CSV
+// Instrument CSV — Download & Parse
 // ---------------------------------------------------------------------------
 
 /// Minimum expected rows in Dhan instrument CSV (sanity check).
@@ -146,6 +146,165 @@ pub const INSTRUMENT_CSV_MIN_ROWS: usize = 100_000;
 
 /// Expected download time for instrument CSV in seconds.
 pub const INSTRUMENT_CSV_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+
+/// Maximum retry attempts for instrument CSV download.
+pub const INSTRUMENT_CSV_MAX_DOWNLOAD_RETRIES: usize = 3;
+
+/// Initial backoff delay for instrument CSV download retry in milliseconds.
+pub const INSTRUMENT_CSV_RETRY_INITIAL_DELAY_MS: u64 = 2000;
+
+/// Maximum backoff delay for instrument CSV download retry in milliseconds.
+pub const INSTRUMENT_CSV_RETRY_MAX_DELAY_MS: u64 = 8000;
+
+// ---------------------------------------------------------------------------
+// Instrument CSV — Column Names (for auto-detection from header)
+// ---------------------------------------------------------------------------
+
+pub const CSV_COLUMN_EXCH_ID: &str = "EXCH_ID";
+pub const CSV_COLUMN_SEGMENT: &str = "SEGMENT";
+pub const CSV_COLUMN_SECURITY_ID: &str = "SECURITY_ID";
+pub const CSV_COLUMN_INSTRUMENT: &str = "INSTRUMENT";
+pub const CSV_COLUMN_UNDERLYING_SECURITY_ID: &str = "UNDERLYING_SECURITY_ID";
+pub const CSV_COLUMN_UNDERLYING_SYMBOL: &str = "UNDERLYING_SYMBOL";
+pub const CSV_COLUMN_SYMBOL_NAME: &str = "SYMBOL_NAME";
+pub const CSV_COLUMN_DISPLAY_NAME: &str = "DISPLAY_NAME";
+pub const CSV_COLUMN_SERIES: &str = "SERIES";
+pub const CSV_COLUMN_LOT_SIZE: &str = "LOT_SIZE";
+pub const CSV_COLUMN_EXPIRY_DATE: &str = "SM_EXPIRY_DATE";
+pub const CSV_COLUMN_STRIKE_PRICE: &str = "STRIKE_PRICE";
+pub const CSV_COLUMN_OPTION_TYPE: &str = "OPTION_TYPE";
+pub const CSV_COLUMN_TICK_SIZE: &str = "TICK_SIZE";
+pub const CSV_COLUMN_EXPIRY_FLAG: &str = "EXPIRY_FLAG";
+
+// ---------------------------------------------------------------------------
+// Instrument CSV — Segment & Instrument Codes (text values in CSV)
+// ---------------------------------------------------------------------------
+
+/// CSV segment value for indices.
+pub const CSV_SEGMENT_INDEX: &str = "I";
+
+/// CSV segment value for equity.
+pub const CSV_SEGMENT_EQUITY: &str = "E";
+
+/// CSV segment value for derivatives.
+pub const CSV_SEGMENT_DERIVATIVE: &str = "D";
+
+/// CSV exchange value for NSE.
+pub const CSV_EXCHANGE_NSE: &str = "NSE";
+
+/// CSV exchange value for BSE.
+pub const CSV_EXCHANGE_BSE: &str = "BSE";
+
+/// CSV series value for equity stocks.
+pub const CSV_SERIES_EQUITY: &str = "EQ";
+
+/// CSV instrument value: index future.
+pub const CSV_INSTRUMENT_FUTIDX: &str = "FUTIDX";
+
+/// CSV instrument value: stock future.
+pub const CSV_INSTRUMENT_FUTSTK: &str = "FUTSTK";
+
+/// CSV instrument value: index option.
+pub const CSV_INSTRUMENT_OPTIDX: &str = "OPTIDX";
+
+/// CSV instrument value: stock option.
+pub const CSV_INSTRUMENT_OPTSTK: &str = "OPTSTK";
+
+/// CSV option type value: call.
+pub const CSV_OPTION_TYPE_CALL: &str = "CE";
+
+/// CSV option type value: put.
+pub const CSV_OPTION_TYPE_PUT: &str = "PE";
+
+/// Marker substring in symbol names indicating test instruments.
+pub const CSV_TEST_SYMBOL_MARKER: &str = "TEST";
+
+// ---------------------------------------------------------------------------
+// F&O Universe — Display Indices (23 IDX_I security IDs)
+// ---------------------------------------------------------------------------
+
+use crate::types::SecurityId;
+
+/// Display indices: (display name, IDX_I security ID).
+/// Subscribed for market dashboard and sentiment display.
+pub const DISPLAY_INDEX_SECURITY_IDS: &[(&str, SecurityId)] = &[
+    ("INDIA VIX", 21),
+    ("NIFTY 100", 17),
+    ("NIFTY 200", 18),
+    ("NIFTY 500", 19),
+    ("NIFTYMCAP50", 20),
+    ("NIFTY MIDCAP 150", 1),
+    ("NIFTY SMALLCAP 50", 22),
+    ("NIFTY SMALLCAP 100", 5),
+    ("NIFTY SMALLCAP 250", 3),
+    ("NIFTY AUTO", 14),
+    ("NIFTY PVT BANK", 15),
+    ("NIFTY FMCG", 28),
+    ("NIFTY ENERGY", 42),
+    ("NIFTYINFRA", 43),
+    ("NIFTYIT", 29),
+    ("NIFTY MEDIA", 30),
+    ("NIFTY METAL", 31),
+    ("NIFTY MNC", 44),
+    ("NIFTY PHARMA", 32),
+    ("NIFTY PSU BANK", 33),
+    ("NIFTY REALTY", 34),
+    ("NIFTY SERV SECTOR", 46),
+    ("NIFTY CONSUMPTION", 40),
+];
+
+/// Number of display indices.
+pub const DISPLAY_INDEX_COUNT: usize = 23;
+
+// ---------------------------------------------------------------------------
+// F&O Universe — Full Chain Indices
+// ---------------------------------------------------------------------------
+
+/// Index symbols that get full option chain subscriptions.
+pub const FULL_CHAIN_INDEX_SYMBOLS: &[&str] =
+    &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"];
+
+/// Number of full-chain indices.
+pub const FULL_CHAIN_INDEX_COUNT: usize = 5;
+
+// ---------------------------------------------------------------------------
+// F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
+// ---------------------------------------------------------------------------
+
+/// Aliases for indices whose FNO underlying symbol differs from IDX_I row symbol.
+/// Format: (fno_underlying_symbol, idx_i_symbol_name).
+pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] =
+    &[("NIFTYNXT50", "NIFTY NEXT 50"), ("SENSEX50", "SNSX50")];
+
+// ---------------------------------------------------------------------------
+// F&O Universe — Validation: Must-Exist Price IDs
+// ---------------------------------------------------------------------------
+
+/// Known index security IDs that MUST exist after universe build.
+/// (underlying_symbol, expected IDX_I security_id).
+pub const VALIDATION_MUST_EXIST_INDICES: &[(&str, SecurityId)] = &[
+    ("NIFTY", 13),
+    ("BANKNIFTY", 25),
+    ("FINNIFTY", 27),
+    ("MIDCPNIFTY", 442),
+    ("NIFTYNXT50", 38),
+    ("SENSEX", 51),
+    ("BANKEX", 69),
+    ("SENSEX50", 83),
+];
+
+/// Known equity security IDs that MUST exist after universe build.
+/// (symbol, expected NSE_EQ security_id).
+pub const VALIDATION_MUST_EXIST_EQUITIES: &[(&str, SecurityId)] = &[("RELIANCE", 2885)];
+
+/// Known stock symbols that MUST be present in the F&O universe.
+pub const VALIDATION_MUST_EXIST_FNO_STOCKS: &[&str] = &["RELIANCE", "HDFCBANK", "INFY", "TCS"];
+
+/// Minimum expected number of F&O stock underlyings.
+pub const VALIDATION_FNO_STOCK_MIN_COUNT: usize = 150;
+
+/// Maximum expected number of F&O stock underlyings.
+pub const VALIDATION_FNO_STOCK_MAX_COUNT: usize = 300;
 
 // ---------------------------------------------------------------------------
 // Application Identity

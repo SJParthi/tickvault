@@ -21,4 +21,20 @@ pub enum ApplicationError {
     /// Infrastructure service unavailable.
     #[error("infrastructure unavailable: {service} at {endpoint}")]
     InfrastructureUnavailable { service: String, endpoint: String },
+
+    /// Instrument CSV download failed after all retries and fallbacks.
+    #[error("instrument CSV download failed: {reason}")]
+    InstrumentDownloadFailed { reason: String },
+
+    /// Instrument CSV parsing failed.
+    #[error("instrument CSV parse error at row {row}: {reason}")]
+    InstrumentParseFailed { row: usize, reason: String },
+
+    /// F&O universe build validation failed.
+    #[error("F&O universe validation failed: {check}")]
+    UniverseValidationFailed { check: String },
+
+    /// Required CSV column not found in header.
+    #[error("required CSV column '{column}' not found in header")]
+    CsvColumnMissing { column: String },
 }
