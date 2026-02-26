@@ -134,6 +134,14 @@ fn discover_fno_underlyings(rows: &[ParsedInstrumentRow]) -> Vec<UnlinkedUnderly
             continue;
         }
 
+        // Skip BSE stock futures — BSE_FNO only allowed for index derivatives
+        // (SENSEX, BANKEX, SENSEX50). BSE stock derivatives are not traded.
+        if row.exchange == Exchange::BombayStockExchange && row.instrument == CSV_INSTRUMENT_FUTSTK
+        {
+            debug!(symbol = %row.underlying_symbol, "Pass 3: skipping BSE stock future");
+            continue;
+        }
+
         // Dedup: first occurrence wins (lot_size from first future encountered)
         if seen.contains_key(&row.underlying_symbol) {
             continue;
@@ -142,7 +150,7 @@ fn discover_fno_underlyings(rows: &[ParsedInstrumentRow]) -> Vec<UnlinkedUnderly
         let kind = match (row.instrument.as_str(), row.exchange) {
             (CSV_INSTRUMENT_FUTIDX, Exchange::NationalStockExchange) => UnderlyingKind::NseIndex,
             (CSV_INSTRUMENT_FUTIDX, Exchange::BombayStockExchange) => UnderlyingKind::BseIndex,
-            (CSV_INSTRUMENT_FUTSTK, _) => UnderlyingKind::Stock,
+            (CSV_INSTRUMENT_FUTSTK, Exchange::NationalStockExchange) => UnderlyingKind::Stock,
             _ => continue,
         };
 
@@ -331,6 +339,7 @@ fn build_derivatives_and_chains(
     let mut skipped_unknown_underlying: usize = 0;
     let mut skipped_test: usize = 0;
     let mut skipped_unknown_instrument: usize = 0;
+    let mut skipped_bse_stock_derivative: usize = 0;
 
     for row in rows {
         if row.segment != 'D' {
@@ -352,6 +361,18 @@ fn build_derivatives_and_chains(
         // Skip TEST instruments
         if row.underlying_symbol.contains(CSV_TEST_SYMBOL_MARKER) {
             skipped_test += 1;
+            continue;
+        }
+
+        // Skip BSE stock derivatives — BSE_FNO only allowed for index derivatives
+        // (SENSEX, BANKEX, SENSEX50). BSE stock futures/options are not traded.
+        if row.exchange == Exchange::BombayStockExchange
+            && matches!(
+                row.instrument.as_str(),
+                CSV_INSTRUMENT_FUTSTK | CSV_INSTRUMENT_OPTSTK
+            )
+        {
+            skipped_bse_stock_derivative += 1;
             continue;
         }
 
@@ -474,6 +495,7 @@ fn build_derivatives_and_chains(
         skipped_unknown_underlying,
         skipped_test,
         skipped_unknown_instrument,
+        skipped_bse_stock_derivative,
         "Pass 5: derivative scanning complete"
     );
 
@@ -1896,5 +1918,252 @@ mod tests {
             .find(|i| i.symbol == "NIFTY AUTO")
             .expect("NIFTY AUTO must be in subscribed indices");
         assert_eq!(nifty_auto.subcategory, IndexSubcategory::Sectoral);
+    }
+
+    // -----------------------------------------------------------------------
+    // BSE Stock Derivative Filter — Test Helpers
+    // -----------------------------------------------------------------------
+
+    /// Create a BSE stock future row (FUTSTK with BSE exchange).
+    fn make_futstk_row_bse(
+        security_id: SecurityId,
+        underlying_id: SecurityId,
+        symbol: &str,
+        expiry: &str,
+        lot_size: u32,
+    ) -> ParsedInstrumentRow {
+        ParsedInstrumentRow {
+            exchange: Exchange::BombayStockExchange,
+            segment: 'D',
+            security_id,
+            instrument: "FUTSTK".to_owned(),
+            underlying_security_id: underlying_id,
+            underlying_symbol: symbol.to_owned(),
+            symbol_name: format!("{}-{}-FUT", symbol, expiry),
+            display_name: format!("{} FUT", symbol),
+            series: "NA".to_owned(),
+            lot_size,
+            expiry_date: NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok(),
+            strike_price: -0.01,
+            option_type: None,
+            tick_size: 0.05,
+            expiry_flag: "M".to_owned(),
+        }
+    }
+
+    /// Create a BSE stock option row (OPTSTK with BSE exchange).
+    fn make_optstk_row_bse(
+        security_id: SecurityId,
+        underlying_id: SecurityId,
+        symbol: &str,
+        expiry: &str,
+        strike: f64,
+        opt_type: OptionType,
+        lot_size: u32,
+    ) -> ParsedInstrumentRow {
+        let option_suffix = match opt_type {
+            OptionType::Call => "CE",
+            OptionType::Put => "PE",
+        };
+        ParsedInstrumentRow {
+            exchange: Exchange::BombayStockExchange,
+            segment: 'D',
+            security_id,
+            instrument: "OPTSTK".to_owned(),
+            underlying_security_id: underlying_id,
+            underlying_symbol: symbol.to_owned(),
+            symbol_name: format!("{}-{}-{:.0}-{}", symbol, expiry, strike, option_suffix),
+            display_name: format!("{} {} {:.0} {}", symbol, expiry, strike, option_suffix),
+            series: "NA".to_owned(),
+            lot_size,
+            expiry_date: NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok(),
+            strike_price: strike,
+            option_type: Some(opt_type),
+            tick_size: 0.05,
+            expiry_flag: "M".to_owned(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // BSE Stock Derivative Filter — Pass 3 Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_skips_bse_stock_futures() {
+        // A row set with ONLY BSE FUTSTK → should produce zero stock underlyings
+        let rows = vec![
+            // Need an index row so equity lookup works, but the point is BSE FUTSTK
+            make_futstk_row_bse(80001, 9001, "FORTIS", "2026-03-30", 200),
+            make_futstk_row_bse(80002, 9002, "CAMS", "2026-03-30", 100),
+            make_futstk_row_bse(80003, 9003, "TITAN", "2026-03-30", 50),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+
+        let stock_count = underlyings
+            .iter()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert_eq!(
+            stock_count, 0,
+            "BSE FUTSTK rows must be filtered — zero stock underlyings expected"
+        );
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_keeps_bse_index_futures() {
+        // BSE FUTIDX (SENSEX) should still pass through
+        let rows = vec![make_futidx_row(
+            60000,
+            1,
+            "SENSEX",
+            "2026-03-30",
+            20,
+            Exchange::BombayStockExchange,
+        )];
+
+        let underlyings = discover_fno_underlyings(&rows);
+
+        assert_eq!(underlyings.len(), 1, "BSE FUTIDX must not be filtered");
+        assert_eq!(underlyings[0].kind, UnderlyingKind::BseIndex);
+        assert_eq!(underlyings[0].underlying_symbol, "SENSEX");
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_keeps_nse_stock_futures() {
+        // NSE FUTSTK (RELIANCE) should still pass through
+        let rows = vec![make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500)];
+
+        let underlyings = discover_fno_underlyings(&rows);
+
+        assert_eq!(underlyings.len(), 1, "NSE FUTSTK must not be filtered");
+        assert_eq!(underlyings[0].kind, UnderlyingKind::Stock);
+        assert_eq!(underlyings[0].underlying_symbol, "RELIANCE");
+    }
+
+    // -----------------------------------------------------------------------
+    // BSE Stock Derivative Filter — Pass 5 Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_skips_bse_stock_futures() {
+        // Build a universe with ONLY NSE underlyings + inject a BSE FUTSTK row
+        // that references a known underlying. The BSE FUTSTK should be filtered.
+        let mut rows = build_test_rows();
+        // Add a BSE FUTSTK for RELIANCE (which is an NSE stock underlying)
+        rows.push(make_futstk_row_bse(
+            80010,
+            2885,
+            "RELIANCE",
+            "2026-03-30",
+            500,
+        ));
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // The BSE FUTSTK (security_id 80010) must NOT be in contracts
+        assert!(
+            result.derivative_contracts.get(&80010).is_none(),
+            "BSE FUTSTK must be filtered from derivative contracts"
+        );
+    }
+
+    #[test]
+    fn test_pass5_skips_bse_stock_options() {
+        // Inject a BSE OPTSTK row for a known underlying
+        let mut rows = build_test_rows();
+        rows.push(make_optstk_row_bse(
+            80020,
+            2885,
+            "RELIANCE",
+            "2026-03-30",
+            2000.0,
+            OptionType::Call,
+            500,
+        ));
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // The BSE OPTSTK (security_id 80020) must NOT be in contracts
+        assert!(
+            result.derivative_contracts.get(&80020).is_none(),
+            "BSE OPTSTK must be filtered from derivative contracts"
+        );
+    }
+
+    #[test]
+    fn test_pass5_keeps_bse_index_derivatives() {
+        // BSE FUTIDX (SENSEX) should still pass through in Pass 5
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // SENSEX future (security_id 60000) should be present
+        assert!(
+            result.derivative_contracts.get(&60000).is_some(),
+            "BSE FUTIDX (SENSEX) must be present in derivative contracts"
+        );
+
+        // BANKEX future (security_id 60001) should be present
+        assert!(
+            result.derivative_contracts.get(&60001).is_some(),
+            "BSE FUTIDX (BANKEX) must be present in derivative contracts"
+        );
+
+        // SENSEX50 future (security_id 60002) should be present
+        assert!(
+            result.derivative_contracts.get(&60002).is_some(),
+            "BSE FUTIDX (SENSEX50) must be present in derivative contracts"
+        );
+    }
+
+    #[test]
+    fn test_no_bse_stock_underlyings_in_universe() {
+        // Add BSE FUTSTK rows to the standard test data — they should be fully
+        // filtered out, leaving zero BSE stock underlyings in the final universe.
+        let mut rows = build_test_rows();
+        rows.push(make_futstk_row_bse(
+            80001,
+            9001,
+            "FORTIS",
+            "2026-03-30",
+            200,
+        ));
+        rows.push(make_futstk_row_bse(80002, 9002, "CAMS", "2026-03-30", 100));
+        rows.push(make_futstk_row_bse(80003, 9003, "TITAN", "2026-03-30", 50));
+        rows.push(make_futstk_row_bse(
+            80004,
+            1333,
+            "HDFCBANK",
+            "2026-03-30",
+            550,
+        ));
+
+        let underlyings = discover_fno_underlyings(&rows);
+
+        // Count BSE stock underlyings — must be zero
+        let bse_stock_count = underlyings
+            .iter()
+            .filter(|u| {
+                u.kind == UnderlyingKind::Stock
+                    && u.derivative_exchange == Exchange::BombayStockExchange
+            })
+            .count();
+        assert_eq!(
+            bse_stock_count, 0,
+            "no BSE stock underlyings should exist in the universe"
+        );
+
+        // BSE index underlyings should still exist
+        let bse_index_count = underlyings
+            .iter()
+            .filter(|u| u.kind == UnderlyingKind::BseIndex)
+            .count();
+        assert_eq!(
+            bse_index_count, 3,
+            "BSE index underlyings (SENSEX, BANKEX, SENSEX50) must still exist"
+        );
     }
 }

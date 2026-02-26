@@ -18,3 +18,4 @@ chrono-tz = { workspace = true }
 redis = { workspace = true }
 deadpool-redis = { workspace = true }
 questdb-rs = { workspace = true }
+reqwest = { workspace = true }

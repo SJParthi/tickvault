@@ -1063,6 +1063,7 @@ dependencies = [
  "dhan-live-trader-common",
  "questdb-rs",
  "redis 1.0.4",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

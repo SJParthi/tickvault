@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 
     // Step 2: Persist to QuestDB.
     tracing::info!("Step 2: Persisting instrument snapshot to QuestDB...");
-    persist_instrument_snapshot(&universe, &questdb_config)?;
+    persist_instrument_snapshot(&universe, &questdb_config).await?;
 
     tracing::info!("=== Done! Check QuestDB console at http://localhost:9000 ===");
     tracing::info!("Try these queries:");
