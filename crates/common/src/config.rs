@@ -64,11 +64,11 @@ pub struct DhanConfig {
 /// WebSocket keep-alive and reconnection configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebSocketConfig {
-    /// Ping interval in seconds (Dhan spec: 10 seconds).
+    /// Expected server ping interval in seconds (Dhan server pings every 10s).
     pub ping_interval_secs: u64,
-    /// Pong timeout in seconds (WARN if no pong after this).
+    /// Server disconnects after this many seconds with no pong.
     pub pong_timeout_secs: u64,
-    /// Reconnect after this many consecutive pong failures.
+    /// Reserved for future use (server ping monitoring).
     pub max_consecutive_pong_failures: u32,
     /// Initial reconnection delay in milliseconds.
     pub reconnect_initial_delay_ms: u64,
@@ -299,7 +299,7 @@ mod tests {
                 max_orders_per_second: 10,
             },
             dhan: DhanConfig {
-                websocket_url: "wss://api-feed.dhan.co/v2".to_string(),
+                websocket_url: "wss://api-feed.dhan.co".to_string(),
                 rest_api_base_url: "https://api.dhan.co/v2".to_string(),
                 instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
                     .to_string(),

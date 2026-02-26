@@ -2,7 +2,7 @@
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads), skip PDFs.
 > Bible: `tech_stack_bible_v6.md` — read ONLY when adding a new dependency.
-> Updated: 2026-02-26 after Block 03 — WebSocket Connection Manager.
+> Updated: 2026-02-26 after Block 03 protocol verification (Dhan SDK-verified).
 
 ## File Tree
 
@@ -36,9 +36,9 @@ dhan-live-trader/
 │   │       └── validation.rs           # Post-build validation (must-exist checks)
 │   │   └── websocket/
 │   │       ├── mod.rs                  # Re-exports websocket submodules
-│   │       ├── types.rs               # ConnectionState, DisconnectCode, WebSocketError, InstrumentSubscription
-│   │       ├── subscription_builder.rs # JSON batch builder (≤100 instruments/msg)
-│   │       ├── connection.rs          # Single WebSocket lifecycle (connect, subscribe, ping, read)
+│   │       ├── types.rs               # ConnectionState, DisconnectCode(805-809), WebSocketError, InstrumentSubscription
+│   │       ├── subscription_builder.rs # JSON batch builder (subscribe/unsubscribe/disconnect)
+│   │       ├── connection.rs          # Single WebSocket lifecycle (URL query auth, subscribe, read)
 │   │       └── connection_pool.rs     # Multi-connection pool (up to 5 connections, 25K instruments)
 │   ├── storage/src/                    # Persistence layer
 │   │   ├── lib.rs                      # Re-exports: instrument_persistence
@@ -142,19 +142,20 @@ token_manager::TokenManager::spawn_renewal_task(&self) -> JoinHandle<()>
 ```rust
 // types.rs — connection types, errors, protocol constants
 ConnectionState { Disconnected, Connecting, Connected, Reconnecting }
-DisconnectCode::from_u16(code) -> Self   // 801-814 Dhan codes
-DisconnectCode::is_reconnectable(&self) -> bool
-DisconnectCode::requires_token_refresh(&self) -> bool
+DisconnectCode::from_u16(code) -> Self   // 805-809 Dhan SDK codes
+DisconnectCode::is_reconnectable(&self) -> bool       // only AccessTokenExpired(807) + Unknown
+DisconnectCode::requires_token_refresh(&self) -> bool  // only AccessTokenExpired(807)
 InstrumentSubscription::new(segment, security_id) -> Self
 WebSocketError { ConnectionFailed, NoTokenAvailable, DhanDisconnect, ... }
 
 // subscription_builder.rs — JSON message batching
 build_subscription_messages(instruments, feed_mode, batch_size) -> Vec<String>
-build_unsubscription_messages(instruments, batch_size) -> Vec<String>
+build_unsubscription_messages(instruments, feed_mode, batch_size) -> Vec<String>  // mode-specific codes (16/18/22)
+build_disconnect_message() -> String                                              // RequestCode 12
 
-// connection.rs — single WebSocket lifecycle
+// connection.rs — single WebSocket lifecycle (URL query param auth, server-initiated pings)
 WebSocketConnection::new(id, token, client_id, dhan_config, ws_config, instruments, feed_mode, sender) -> Self
-WebSocketConnection::run(&self) -> Result<(), WebSocketError>  // async — connect, subscribe, ping, read loop
+WebSocketConnection::run(&self) -> Result<(), WebSocketError>  // async — connect, subscribe, read loop
 WebSocketConnection::health(&self) -> ConnectionHealth
 
 // connection_pool.rs — multi-connection manager
@@ -211,14 +212,15 @@ TokenState {
 // TokenHandle — O(1) atomic read for WebSocket auth header injection
 type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
 
-// ConnectionHealth — monitoring snapshot per WebSocket connection
+// ConnectionHealth — monitoring snapshot per WebSocket connection (no pong tracking — server handles)
 ConnectionHealth {
     connection_id: u8, state: ConnectionState,
     subscribed_count: usize, total_reconnections: u64,
 }
+// Note: consecutive_pong_failures removed — server pings and tracks pong, not client
 ```
 
-## Test Counts (346 total)
+## Test Counts (347 total)
 
 | Crate | Module | Tests |
 |-------|--------|-------|
@@ -234,12 +236,12 @@ ConnectionHealth {
 | core | instrument/csv_parser | 53 |
 | core | instrument/universe_builder | 54 |
 | core | instrument/validation | 12 |
-| core | websocket/types | 30 |
-| core | websocket/subscription_builder | 22 |
-| core | websocket/connection | 12 |
-| core | websocket/connection_pool | 18 |
+| core | websocket/types | 32 |
+| core | websocket/subscription_builder | 24 |
+| core | websocket/connection | 11 |
+| core | websocket/connection_pool | 17 |
 | storage | instrument_persistence | 25 |
-| **Total** | | **346** |
+| **Total** | | **347** |
 
 ## QuestDB Tables (4) — DEDUP UPSERT KEYS enabled on all
 
@@ -285,3 +287,4 @@ ConnectionHealth {
 - **Bible fix**: Section 1 Frontend corrected to SolidJS (not Grafana), total 113 components
 - **Block 03**: WebSocket Connection Manager (types, subscription builder, connection lifecycle, connection pool) — 44 new tests (257 → 301)
 - **Block 03 hardening**: 45 coverage gaps closed — types, subscription, connection, pool, config validation (301 → 346)
+- **Block 03 protocol fix**: SDK-verified against Dhan Python SDK — 10 critical discrepancies fixed (URL query auth, server pings, packet sizes, exchange segments, disconnect codes 805-809, mode-specific unsubscribe codes) — tests updated (346 → 347)

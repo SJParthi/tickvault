@@ -6,10 +6,9 @@
 use std::fmt;
 
 use dhan_live_trader_common::constants::{
-    DISCONNECT_AUTH_FAILED, DISCONNECT_EXCEEDED_MAX_CONNECTIONS,
-    DISCONNECT_EXCEEDED_MAX_INSTRUMENTS, DISCONNECT_FORCE_KILLED, DISCONNECT_INVALID_CLIENT_ID,
-    DISCONNECT_INVALID_SUBSCRIPTION, DISCONNECT_PING_TIMEOUT, DISCONNECT_SERVER_MAINTENANCE,
-    DISCONNECT_SUBSCRIPTION_LIMIT, DISCONNECT_TOKEN_EXPIRED,
+    DISCONNECT_ACCESS_TOKEN_EXPIRED, DISCONNECT_AUTH_FAILED,
+    DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED, DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS,
+    DISCONNECT_INVALID_CLIENT_ID,
 };
 use dhan_live_trader_common::types::ExchangeSegment;
 use serde::{Deserialize, Serialize};
@@ -49,32 +48,23 @@ impl fmt::Display for ConnectionState {
 // Disconnect Code
 // ---------------------------------------------------------------------------
 
-/// Dhan WebSocket disconnect error codes (801–814).
+/// Dhan WebSocket disconnect error codes (805–809).
 ///
+/// Source: DhanHQ Python SDK v2 on_close handler.
 /// Each code maps to a specific recovery action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectCode {
-    /// 801 — Exceeded max connections (5 per account). Do NOT reconnect.
-    ExceededMaxConnections,
-    /// 802 — Exceeded max instruments per connection (5000). Do NOT reconnect.
-    ExceededMaxInstruments,
-    /// 803 — Authentication failed. Refresh token, then reconnect.
-    AuthenticationFailed,
-    /// 804 — Token expired. Refresh token, then reconnect.
-    TokenExpired,
-    /// 805 — Server maintenance. Backoff + reconnect.
-    ServerMaintenance,
-    /// 806 — No ping received in 40s. Bug in ping logic — fix + reconnect.
-    PingTimeout,
-    /// 807 — Invalid subscription request format. Do NOT reconnect (fix request).
-    InvalidSubscription,
-    /// 808 — Total subscription limit exceeded (25000). Do NOT reconnect.
-    SubscriptionLimitExceeded,
-    /// 810 — Force-disconnected by Dhan. Wait + retry later.
-    ForceKilled,
-    /// 814 — Invalid client ID. Check SSM credentials.
+    /// 805 — Active WebSocket connections exceeded (max 5 per account).
+    ExceededActiveConnections,
+    /// 806 — Data API subscription required (plan/subscription issue).
+    DataApiSubscriptionRequired,
+    /// 807 — Access token expired. Refresh token, then reconnect.
+    AccessTokenExpired,
+    /// 808 — Invalid client ID. Check SSM credentials.
     InvalidClientId,
-    /// Unknown disconnect code not in the Dhan spec.
+    /// 809 — Authentication failed. Invalid credentials.
+    AuthenticationFailed,
+    /// Unknown disconnect code not in the Dhan V2 SDK.
     Unknown(u16),
 }
 
@@ -82,16 +72,11 @@ impl DisconnectCode {
     /// Parse a disconnect code from the raw u16 value in the binary frame.
     pub fn from_u16(code: u16) -> Self {
         match code {
-            DISCONNECT_EXCEEDED_MAX_CONNECTIONS => Self::ExceededMaxConnections,
-            DISCONNECT_EXCEEDED_MAX_INSTRUMENTS => Self::ExceededMaxInstruments,
-            DISCONNECT_AUTH_FAILED => Self::AuthenticationFailed,
-            DISCONNECT_TOKEN_EXPIRED => Self::TokenExpired,
-            DISCONNECT_SERVER_MAINTENANCE => Self::ServerMaintenance,
-            DISCONNECT_PING_TIMEOUT => Self::PingTimeout,
-            DISCONNECT_INVALID_SUBSCRIPTION => Self::InvalidSubscription,
-            DISCONNECT_SUBSCRIPTION_LIMIT => Self::SubscriptionLimitExceeded,
-            DISCONNECT_FORCE_KILLED => Self::ForceKilled,
+            DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS => Self::ExceededActiveConnections,
+            DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED => Self::DataApiSubscriptionRequired,
+            DISCONNECT_ACCESS_TOKEN_EXPIRED => Self::AccessTokenExpired,
             DISCONNECT_INVALID_CLIENT_ID => Self::InvalidClientId,
+            DISCONNECT_AUTH_FAILED => Self::AuthenticationFailed,
             other => Self::Unknown(other),
         }
     }
@@ -99,59 +84,48 @@ impl DisconnectCode {
     /// Returns the raw u16 code value.
     pub fn as_u16(&self) -> u16 {
         match self {
-            Self::ExceededMaxConnections => DISCONNECT_EXCEEDED_MAX_CONNECTIONS,
-            Self::ExceededMaxInstruments => DISCONNECT_EXCEEDED_MAX_INSTRUMENTS,
-            Self::AuthenticationFailed => DISCONNECT_AUTH_FAILED,
-            Self::TokenExpired => DISCONNECT_TOKEN_EXPIRED,
-            Self::ServerMaintenance => DISCONNECT_SERVER_MAINTENANCE,
-            Self::PingTimeout => DISCONNECT_PING_TIMEOUT,
-            Self::InvalidSubscription => DISCONNECT_INVALID_SUBSCRIPTION,
-            Self::SubscriptionLimitExceeded => DISCONNECT_SUBSCRIPTION_LIMIT,
-            Self::ForceKilled => DISCONNECT_FORCE_KILLED,
+            Self::ExceededActiveConnections => DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS,
+            Self::DataApiSubscriptionRequired => DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED,
+            Self::AccessTokenExpired => DISCONNECT_ACCESS_TOKEN_EXPIRED,
             Self::InvalidClientId => DISCONNECT_INVALID_CLIENT_ID,
+            Self::AuthenticationFailed => DISCONNECT_AUTH_FAILED,
             Self::Unknown(code) => *code,
         }
     }
 
     /// Whether this disconnect code allows automatic reconnection.
     ///
-    /// Capacity/format errors (801, 802, 807, 808, 814) indicate
-    /// configuration bugs — reconnecting would just fail again.
+    /// Only token-expired (807) is auto-reconnectable after refresh.
+    /// All others indicate configuration/credential/plan issues.
     pub fn is_reconnectable(&self) -> bool {
         match self {
-            Self::AuthenticationFailed
-            | Self::TokenExpired
-            | Self::ServerMaintenance
-            | Self::PingTimeout
-            | Self::ForceKilled => true,
-            Self::ExceededMaxConnections
-            | Self::ExceededMaxInstruments
-            | Self::InvalidSubscription
-            | Self::SubscriptionLimitExceeded
-            | Self::InvalidClientId => false,
+            Self::AccessTokenExpired => true,
+            Self::ExceededActiveConnections
+            | Self::DataApiSubscriptionRequired
+            | Self::InvalidClientId
+            | Self::AuthenticationFailed => false,
             Self::Unknown(_) => true, // assume transient for unknown codes
         }
     }
 
     /// Whether this disconnect code requires a token refresh before reconnect.
     pub fn requires_token_refresh(&self) -> bool {
-        matches!(self, Self::AuthenticationFailed | Self::TokenExpired)
+        matches!(self, Self::AccessTokenExpired)
     }
 }
 
 impl fmt::Display for DisconnectCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ExceededMaxConnections => write!(f, "801: Exceeded max connections"),
-            Self::ExceededMaxInstruments => write!(f, "802: Exceeded max instruments"),
-            Self::AuthenticationFailed => write!(f, "803: Authentication failed"),
-            Self::TokenExpired => write!(f, "804: Token expired"),
-            Self::ServerMaintenance => write!(f, "805: Server maintenance"),
-            Self::PingTimeout => write!(f, "806: Ping timeout"),
-            Self::InvalidSubscription => write!(f, "807: Invalid subscription"),
-            Self::SubscriptionLimitExceeded => write!(f, "808: Subscription limit exceeded"),
-            Self::ForceKilled => write!(f, "810: Force killed"),
-            Self::InvalidClientId => write!(f, "814: Invalid client ID"),
+            Self::ExceededActiveConnections => {
+                write!(f, "805: Active connections exceeded")
+            }
+            Self::DataApiSubscriptionRequired => {
+                write!(f, "806: Data API subscription required")
+            }
+            Self::AccessTokenExpired => write!(f, "807: Access token expired"),
+            Self::InvalidClientId => write!(f, "808: Invalid client ID"),
+            Self::AuthenticationFailed => write!(f, "809: Authentication failed"),
             Self::Unknown(code) => write!(f, "{code}: Unknown disconnect"),
         }
     }
@@ -236,13 +210,6 @@ pub enum WebSocketError {
         reason: String,
     },
 
-    /// Ping send failed.
-    #[error("Failed to send ping on connection {connection_id}: {reason}")]
-    PingSendFailed {
-        connection_id: ConnectionId,
-        reason: String,
-    },
-
     /// Capacity exceeded — too many instruments for available connections.
     #[error("Instrument count {requested} exceeds total capacity {capacity}")]
     CapacityExceeded { requested: usize, capacity: usize },
@@ -261,8 +228,6 @@ pub struct ConnectionHealth {
     pub state: ConnectionState,
     /// Number of instruments subscribed on this connection.
     pub subscribed_count: usize,
-    /// Consecutive pong failures (0 = healthy).
-    pub consecutive_pong_failures: u32,
     /// Total reconnections since startup.
     pub total_reconnections: u64,
 }
@@ -280,35 +245,24 @@ mod tests {
     #[test]
     fn test_disconnect_code_from_u16_all_known_codes() {
         assert_eq!(
-            DisconnectCode::from_u16(801),
-            DisconnectCode::ExceededMaxConnections
-        );
-        assert_eq!(
-            DisconnectCode::from_u16(802),
-            DisconnectCode::ExceededMaxInstruments
-        );
-        assert_eq!(
-            DisconnectCode::from_u16(803),
-            DisconnectCode::AuthenticationFailed
-        );
-        assert_eq!(DisconnectCode::from_u16(804), DisconnectCode::TokenExpired);
-        assert_eq!(
             DisconnectCode::from_u16(805),
-            DisconnectCode::ServerMaintenance
+            DisconnectCode::ExceededActiveConnections
         );
-        assert_eq!(DisconnectCode::from_u16(806), DisconnectCode::PingTimeout);
+        assert_eq!(
+            DisconnectCode::from_u16(806),
+            DisconnectCode::DataApiSubscriptionRequired
+        );
         assert_eq!(
             DisconnectCode::from_u16(807),
-            DisconnectCode::InvalidSubscription
+            DisconnectCode::AccessTokenExpired
         );
         assert_eq!(
             DisconnectCode::from_u16(808),
-            DisconnectCode::SubscriptionLimitExceeded
-        );
-        assert_eq!(DisconnectCode::from_u16(810), DisconnectCode::ForceKilled);
-        assert_eq!(
-            DisconnectCode::from_u16(814),
             DisconnectCode::InvalidClientId
+        );
+        assert_eq!(
+            DisconnectCode::from_u16(809),
+            DisconnectCode::AuthenticationFailed
         );
     }
 
@@ -320,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_disconnect_code_roundtrip() {
-        let codes: &[u16] = &[801, 802, 803, 804, 805, 806, 807, 808, 810, 814];
+        let codes: &[u16] = &[805, 806, 807, 808, 809];
         for &code in codes {
             let parsed = DisconnectCode::from_u16(code);
             assert_eq!(parsed.as_u16(), code, "roundtrip failed for code {code}");
@@ -329,32 +283,27 @@ mod tests {
 
     #[test]
     fn test_disconnect_code_reconnectable() {
-        // Reconnectable: 803, 804, 805, 806, 810
-        assert!(DisconnectCode::AuthenticationFailed.is_reconnectable());
-        assert!(DisconnectCode::TokenExpired.is_reconnectable());
-        assert!(DisconnectCode::ServerMaintenance.is_reconnectable());
-        assert!(DisconnectCode::PingTimeout.is_reconnectable());
-        assert!(DisconnectCode::ForceKilled.is_reconnectable());
+        // Reconnectable: only 807 (token expired)
+        assert!(DisconnectCode::AccessTokenExpired.is_reconnectable());
 
-        // NOT reconnectable: 801, 802, 807, 808, 814
-        assert!(!DisconnectCode::ExceededMaxConnections.is_reconnectable());
-        assert!(!DisconnectCode::ExceededMaxInstruments.is_reconnectable());
-        assert!(!DisconnectCode::InvalidSubscription.is_reconnectable());
-        assert!(!DisconnectCode::SubscriptionLimitExceeded.is_reconnectable());
+        // NOT reconnectable: 805, 806, 808, 809
+        assert!(!DisconnectCode::ExceededActiveConnections.is_reconnectable());
+        assert!(!DisconnectCode::DataApiSubscriptionRequired.is_reconnectable());
         assert!(!DisconnectCode::InvalidClientId.is_reconnectable());
+        assert!(!DisconnectCode::AuthenticationFailed.is_reconnectable());
 
-        // Unknown: assume reconnectable
+        // Unknown: assume reconnectable (transient)
         assert!(DisconnectCode::Unknown(999).is_reconnectable());
     }
 
     #[test]
     fn test_disconnect_code_requires_token_refresh() {
-        assert!(DisconnectCode::AuthenticationFailed.requires_token_refresh());
-        assert!(DisconnectCode::TokenExpired.requires_token_refresh());
+        assert!(DisconnectCode::AccessTokenExpired.requires_token_refresh());
 
-        assert!(!DisconnectCode::ServerMaintenance.requires_token_refresh());
-        assert!(!DisconnectCode::PingTimeout.requires_token_refresh());
-        assert!(!DisconnectCode::ForceKilled.requires_token_refresh());
+        assert!(!DisconnectCode::ExceededActiveConnections.requires_token_refresh());
+        assert!(!DisconnectCode::DataApiSubscriptionRequired.requires_token_refresh());
+        assert!(!DisconnectCode::InvalidClientId.requires_token_refresh());
+        assert!(!DisconnectCode::AuthenticationFailed.requires_token_refresh());
         assert!(!DisconnectCode::Unknown(999).requires_token_refresh());
     }
 
@@ -362,7 +311,7 @@ mod tests {
     fn test_disconnect_code_display() {
         assert_eq!(
             DisconnectCode::AuthenticationFailed.to_string(),
-            "803: Authentication failed"
+            "809: Authentication failed"
         );
         assert_eq!(
             DisconnectCode::Unknown(999).to_string(),
@@ -399,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_disconnect_code_clone_and_copy() {
-        let code = DisconnectCode::TokenExpired;
+        let code = DisconnectCode::AccessTokenExpired;
         let cloned = code.clone();
         let copied = code; // Copy trait
         assert_eq!(code, cloned);
@@ -407,28 +356,28 @@ mod tests {
     }
 
     #[test]
-    fn test_disconnect_code_display_all_non_reconnectable() {
+    fn test_disconnect_code_display_all_known() {
         assert!(
-            DisconnectCode::ExceededMaxConnections
+            DisconnectCode::ExceededActiveConnections
                 .to_string()
-                .contains("801")
+                .contains("805")
         );
         assert!(
-            DisconnectCode::ExceededMaxInstruments
+            DisconnectCode::DataApiSubscriptionRequired
                 .to_string()
-                .contains("802")
+                .contains("806")
         );
         assert!(
-            DisconnectCode::InvalidSubscription
+            DisconnectCode::AccessTokenExpired
                 .to_string()
                 .contains("807")
         );
+        assert!(DisconnectCode::InvalidClientId.to_string().contains("808"));
         assert!(
-            DisconnectCode::SubscriptionLimitExceeded
+            DisconnectCode::AuthenticationFailed
                 .to_string()
-                .contains("808")
+                .contains("809")
         );
-        assert!(DisconnectCode::InvalidClientId.to_string().contains("814"));
     }
 
     #[test]
@@ -573,21 +522,21 @@ mod tests {
     #[test]
     fn test_websocket_error_connection_failed_display() {
         let err = WebSocketError::ConnectionFailed {
-            url: "wss://api-feed.dhan.co/v2".to_string(),
+            url: "wss://api-feed.dhan.co".to_string(),
             source: tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "connection timed out",
             )),
         };
-        assert!(err.to_string().contains("wss://api-feed.dhan.co/v2"));
+        assert!(err.to_string().contains("wss://api-feed.dhan.co"));
     }
 
     #[test]
     fn test_websocket_error_dhan_disconnect_display() {
         let err = WebSocketError::DhanDisconnect {
-            code: DisconnectCode::ServerMaintenance,
+            code: DisconnectCode::AccessTokenExpired,
         };
-        assert!(err.to_string().contains("805"));
+        assert!(err.to_string().contains("807"));
     }
 
     #[test]
@@ -595,7 +544,7 @@ mod tests {
         let err = WebSocketError::NonReconnectableDisconnect {
             code: DisconnectCode::InvalidClientId,
         };
-        assert!(err.to_string().contains("814"));
+        assert!(err.to_string().contains("808"));
     }
 
     #[test]
@@ -607,17 +556,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("connection 1"));
         assert!(msg.contains("write error"));
-    }
-
-    #[test]
-    fn test_websocket_error_ping_send_failed_display() {
-        let err = WebSocketError::PingSendFailed {
-            connection_id: 3,
-            reason: "broken pipe".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("connection 3"));
-        assert!(msg.contains("broken pipe"));
     }
 
     #[test]
@@ -636,14 +574,12 @@ mod tests {
             connection_id: 2,
             state: ConnectionState::Connected,
             subscribed_count: 500,
-            consecutive_pong_failures: 1,
             total_reconnections: 3,
         };
         let cloned = health.clone();
         assert_eq!(cloned.connection_id, 2);
         assert_eq!(cloned.state, ConnectionState::Connected);
         assert_eq!(cloned.subscribed_count, 500);
-        assert_eq!(cloned.consecutive_pong_failures, 1);
         assert_eq!(cloned.total_reconnections, 3);
     }
 
@@ -653,7 +589,6 @@ mod tests {
             connection_id: 0,
             state: ConnectionState::Disconnected,
             subscribed_count: 0,
-            consecutive_pong_failures: 0,
             total_reconnections: 0,
         };
         assert_eq!(health.connection_id, 0);

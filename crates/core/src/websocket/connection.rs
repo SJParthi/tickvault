@@ -7,7 +7,7 @@
 //! The connection pool creates up to 5 of these.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +18,8 @@ use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+
+use dhan_live_trader_common::constants::{WEBSOCKET_AUTH_TYPE, WEBSOCKET_PROTOCOL_VERSION};
 use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::{DhanConfig, WebSocketConfig};
@@ -35,8 +37,12 @@ use crate::websocket::types::{
 
 /// A single WebSocket connection to Dhan's live market feed.
 ///
-/// Manages its own lifecycle: connect, subscribe, ping, read, reconnect.
+/// Manages its own lifecycle: connect → subscribe → read loop → reconnect.
 /// Binary frames are forwarded to `frame_sender` for downstream processing.
+///
+/// # Ping/Pong
+/// Dhan server sends pings every 10 seconds. tokio-tungstenite auto-pongs.
+/// Server disconnects after 40 seconds with no pong (code 806).
 pub struct WebSocketConnection {
     /// Connection identifier within the pool (0–4).
     connection_id: ConnectionId,
@@ -47,13 +53,13 @@ pub struct WebSocketConnection {
     /// Dhan client ID (from SSM credentials).
     client_id: String,
 
-    /// Dhan WebSocket URL (from config).
-    websocket_url: String,
+    /// Dhan WebSocket base URL (from config, e.g., "wss://api-feed.dhan.co").
+    websocket_base_url: String,
 
     /// Dhan config for connection limits.
     dhan_config: DhanConfig,
 
-    /// WebSocket keep-alive and reconnection config.
+    /// WebSocket reconnection config.
     ws_config: WebSocketConfig,
 
     /// Instruments assigned to this connection.
@@ -67,9 +73,6 @@ pub struct WebSocketConnection {
 
     /// Current connection state (tracked for health reporting).
     state: std::sync::Mutex<ConnectionState>,
-
-    /// Consecutive pong failures counter.
-    consecutive_pong_failures: AtomicU32,
 
     /// Total reconnection count since startup.
     total_reconnections: AtomicU64,
@@ -90,19 +93,18 @@ impl WebSocketConnection {
         feed_mode: FeedMode,
         frame_sender: mpsc::Sender<Vec<u8>>,
     ) -> Self {
-        let websocket_url = dhan_config.websocket_url.clone();
+        let websocket_base_url = dhan_config.websocket_url.clone();
         Self {
             connection_id,
             token_handle,
             client_id,
-            websocket_url,
+            websocket_base_url,
             dhan_config,
             ws_config,
             instruments,
             feed_mode,
             frame_sender,
             state: std::sync::Mutex::new(ConnectionState::Disconnected),
-            consecutive_pong_failures: AtomicU32::new(0),
             total_reconnections: AtomicU64::new(0),
         }
     }
@@ -118,7 +120,6 @@ impl WebSocketConnection {
             connection_id: self.connection_id,
             state: *self.state.lock().expect("state lock poisoned"),
             subscribed_count: self.instruments.len(),
-            consecutive_pong_failures: self.consecutive_pong_failures.load(Ordering::Relaxed),
             total_reconnections: self.total_reconnections.load(Ordering::Relaxed),
         }
     }
@@ -134,7 +135,6 @@ impl WebSocketConnection {
             match self.connect_and_subscribe().await {
                 Ok(ws_stream) => {
                     self.set_state(ConnectionState::Connected);
-                    self.consecutive_pong_failures.store(0, Ordering::Relaxed);
 
                     info!(
                         connection_id = self.connection_id,
@@ -197,7 +197,9 @@ impl WebSocketConnection {
         }
     }
 
-    /// Establishes the WebSocket connection with auth headers and sends subscriptions.
+    /// Establishes the WebSocket connection with auth query params and sends subscriptions.
+    ///
+    /// Dhan V2 auth: `wss://api-feed.dhan.co?version=2&token=xxx&clientId=xxx&authType=2`
     async fn connect_and_subscribe(
         &self,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WebSocketError> {
@@ -210,32 +212,27 @@ impl WebSocketConnection {
 
         let access_token = token_state.access_token().expose_secret().to_string();
 
-        // Build HTTP request with auth headers.
-        let mut request = self
-            .websocket_url
+        // Build URL with auth query parameters (Dhan V2 protocol).
+        let authenticated_url = format!(
+            "{}?version={}&token={}&clientId={}&authType={}",
+            self.websocket_base_url,
+            WEBSOCKET_PROTOCOL_VERSION,
+            access_token,
+            self.client_id,
+            WEBSOCKET_AUTH_TYPE,
+        );
+
+        let request = authenticated_url
             .as_str()
             .into_client_request()
             .map_err(|err| WebSocketError::ConnectionFailed {
-                url: self.websocket_url.clone(),
+                url: self.websocket_base_url.clone(),
                 source: err,
             })?;
 
-        request.headers_mut().insert(
-            "Authorization",
-            access_token
-                .parse()
-                .map_err(|_| WebSocketError::NoTokenAvailable)?,
-        );
-        request.headers_mut().insert(
-            "Client-Id",
-            self.client_id
-                .parse()
-                .map_err(|_| WebSocketError::NoTokenAvailable)?,
-        );
-
         debug!(
             connection_id = self.connection_id,
-            url = %self.websocket_url,
+            url = %self.websocket_base_url,
             "Connecting to Dhan WebSocket"
         );
 
@@ -246,14 +243,14 @@ impl WebSocketConnection {
         let (ws_stream, _response) = time::timeout(connect_timeout, connect_async(request))
             .await
             .map_err(|_| WebSocketError::ConnectionFailed {
-                url: self.websocket_url.clone(),
+                url: self.websocket_base_url.clone(),
                 source: tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "WebSocket connection timed out",
                 )),
             })?
             .map_err(|err| WebSocketError::ConnectionFailed {
-                url: self.websocket_url.clone(),
+                url: self.websocket_base_url.clone(),
                 source: err,
             })?;
 
@@ -283,13 +280,15 @@ impl WebSocketConnection {
             "Subscriptions sent"
         );
 
-        // Reunite for the read loop (ping task gets its own write handle).
+        // Reunite for the read loop.
         Ok(read.reunite(write).expect("reunite same stream"))
     }
 
-    /// Runs the read loop: reads binary frames, handles pings, detects disconnects.
+    /// Runs the read loop: reads binary frames, handles server pings, detects disconnects.
     ///
-    /// Splits the stream: read half processes frames, write half sends pings.
+    /// Dhan server sends pings every 10 seconds. tokio-tungstenite auto-pongs
+    /// for standard WebSocket pings. For any explicit Ping frames that reach
+    /// the application layer, we send Pong manually.
     async fn run_read_loop(
         &self,
         ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -297,30 +296,7 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
-        // Spawn ping task.
-        let ping_write = Arc::clone(&write);
-        let ping_interval = Duration::from_secs(self.ws_config.ping_interval_secs);
-        let connection_id = self.connection_id;
-
-        let ping_handle = tokio::spawn(async move {
-            let mut interval = time::interval(ping_interval);
-            interval.tick().await; // first tick is immediate — skip it
-            loop {
-                interval.tick().await;
-                let mut sink = ping_write.lock().await;
-                if let Err(err) = sink.send(Message::Ping(vec![].into())).await {
-                    debug!(
-                        connection_id = connection_id,
-                        error = %err,
-                        "Ping send failed"
-                    );
-                    break;
-                }
-            }
-        });
-
-        // Read loop.
-        let result = loop {
+        loop {
             match read.next().await {
                 Some(Ok(Message::Binary(data))) => {
                     // Forward raw binary frame to downstream.
@@ -329,16 +305,16 @@ impl WebSocketConnection {
                             connection_id = self.connection_id,
                             "Frame receiver dropped — stopping read loop"
                         );
-                        break Ok(());
+                        return Ok(());
                     }
                 }
-                Some(Ok(Message::Pong(_))) => {
-                    self.consecutive_pong_failures.store(0, Ordering::Relaxed);
-                }
                 Some(Ok(Message::Ping(data))) => {
-                    // Respond to server pings (unusual but handle gracefully).
+                    // Server ping — respond with pong to keep connection alive.
                     let mut sink = write.lock().await;
                     let _ = sink.send(Message::Pong(data)).await;
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    // Pong from server (e.g., echo of our pong). Ignore.
                 }
                 Some(Ok(Message::Close(frame))) => {
                     if let Some(frame) = frame {
@@ -351,7 +327,7 @@ impl WebSocketConnection {
                             "WebSocket close frame received"
                         );
                     }
-                    break Ok(());
+                    return Ok(());
                 }
                 Some(Ok(Message::Text(text))) => {
                     // Dhan may send text for disconnect messages.
@@ -362,21 +338,18 @@ impl WebSocketConnection {
                     );
                 }
                 Some(Err(err)) => {
-                    break Err(WebSocketError::ConnectionFailed {
-                        url: self.websocket_url.clone(),
+                    return Err(WebSocketError::ConnectionFailed {
+                        url: self.websocket_base_url.clone(),
                         source: err,
                     });
                 }
                 None => {
                     // Stream ended.
-                    break Ok(());
+                    return Ok(());
                 }
                 _ => {}
             }
-        };
-
-        ping_handle.abort();
-        result
+        }
     }
 
     /// Waits with exponential backoff. Returns false if max attempts exhausted.
@@ -426,7 +399,7 @@ mod tests {
 
     fn make_test_dhan_config() -> DhanConfig {
         DhanConfig {
-            websocket_url: "wss://api-feed.dhan.co/v2".to_string(),
+            websocket_url: "wss://api-feed.dhan.co".to_string(),
             rest_api_base_url: "https://api.dhan.co/v2".to_string(),
             instrument_csv_url: "https://example.com/csv".to_string(),
             instrument_csv_fallback_url: "https://example.com/csv-fallback".to_string(),
@@ -468,7 +441,6 @@ mod tests {
         assert_eq!(health.state, ConnectionState::Disconnected);
         assert_eq!(health.connection_id, 0);
         assert_eq!(health.subscribed_count, 0);
-        assert_eq!(health.consecutive_pong_failures, 0);
         assert_eq!(health.total_reconnections, 0);
     }
 
@@ -588,26 +560,6 @@ mod tests {
 
         conn.set_state(ConnectionState::Disconnected);
         assert_eq!(conn.health().state, ConnectionState::Disconnected);
-    }
-
-    #[test]
-    fn test_health_tracks_pong_failure_increments() {
-        let (tx, _rx) = mpsc::channel(100);
-        let conn = WebSocketConnection::new(
-            0,
-            make_test_token_handle(),
-            "test-client".to_string(),
-            make_test_dhan_config(),
-            make_test_ws_config(),
-            vec![],
-            FeedMode::Ticker,
-            tx,
-        );
-        assert_eq!(conn.health().consecutive_pong_failures, 0);
-
-        conn.consecutive_pong_failures
-            .store(3, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(conn.health().consecutive_pong_failures, 3);
     }
 
     #[test]

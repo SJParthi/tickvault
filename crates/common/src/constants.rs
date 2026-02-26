@@ -5,22 +5,33 @@
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 Binary Protocol — Packet Sizes
+// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// All sizes verified against struct.calcsize() in the SDK.
 // ---------------------------------------------------------------------------
 
-/// Ticker packet: 25 bytes (compact price data).
-pub const TICKER_PACKET_SIZE: usize = 25;
+/// Ticker packet: 16 bytes (header 8 + LTP float32 + LTT int32).
+/// SDK format: `<BHBIfI`
+pub const TICKER_PACKET_SIZE: usize = 16;
 
-/// Quote packet: 51 bytes (price + depth level 1).
-pub const QUOTE_PACKET_SIZE: usize = 51;
+/// Quote packet: 50 bytes (header + LTP + LTQ + LTT + ATP + Vol + TSQ + TBQ + OHLC).
+/// SDK format: `<BHBIfHIfIIIffff`
+pub const QUOTE_PACKET_SIZE: usize = 50;
 
-/// Full quote packet (OI + market depth): 162 bytes.
+/// Full packet (quote + OI + 5-level market depth): 162 bytes.
+/// SDK format: `<BHBIfHIfIIIIIIffff100s`
 pub const FULL_QUOTE_PACKET_SIZE: usize = 162;
 
-/// Previous close packet: 20 bytes.
-pub const PREVIOUS_CLOSE_PACKET_SIZE: usize = 20;
+/// Previous close packet: 16 bytes (header 8 + prev_close float32 + prev_oi int32).
+/// SDK format: `<BHBIfI`
+pub const PREVIOUS_CLOSE_PACKET_SIZE: usize = 16;
 
-/// Market status packet: 10 bytes.
-pub const MARKET_STATUS_PACKET_SIZE: usize = 10;
+/// Market status packet: 8 bytes (header only, no additional payload).
+/// SDK format: `<BHBI`
+pub const MARKET_STATUS_PACKET_SIZE: usize = 8;
+
+/// Disconnect packet: 10 bytes (header 8 + disconnect_code uint16).
+/// SDK format: `<BHBIH`
+pub const DISCONNECT_PACKET_SIZE: usize = 10;
 
 /// Maximum size of a single WebSocket binary frame from Dhan.
 pub const MAX_WEBSOCKET_FRAME_SIZE: usize = 65536;
@@ -43,23 +54,26 @@ pub const MAX_TOTAL_SUBSCRIPTIONS: usize =
 // Dhan WebSocket V2 — Protocol Constants
 // ---------------------------------------------------------------------------
 
-/// Ping interval in seconds (Dhan spec: client sends ping every 10 seconds).
-pub const PING_INTERVAL_SECS: u64 = 10;
+/// Server ping interval in seconds (Dhan server pings client every 10 seconds).
+/// Client MUST respond with pong. tokio-tungstenite auto-pongs.
+pub const SERVER_PING_INTERVAL_SECS: u64 = 10;
 
-/// Pong timeout in seconds (if no pong received after ping, log WARN).
-pub const PONG_TIMEOUT_SECS: u64 = 10;
-
-/// Server disconnects if no ping received within this many seconds.
+/// Server disconnects if no pong received within this many seconds.
 pub const SERVER_PING_TIMEOUT_SECS: u64 = 40;
-
-/// Maximum consecutive pong failures before triggering reconnect.
-pub const MAX_CONSECUTIVE_PONG_FAILURES: u32 = 2;
 
 /// Maximum instruments per subscription message (Dhan limit).
 pub const SUBSCRIPTION_BATCH_SIZE: usize = 100;
 
+/// WebSocket V2 authentication type (always 2 for access token auth).
+pub const WEBSOCKET_AUTH_TYPE: u8 = 2;
+
+/// WebSocket V2 version string used in query parameters.
+pub const WEBSOCKET_PROTOCOL_VERSION: &str = "2";
+
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Exchange Segment Codes (Binary Protocol)
+// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// CRITICAL: These are binary wire codes, NOT subscription JSON strings.
 // ---------------------------------------------------------------------------
 
 /// IDX_I segment code in Dhan binary protocol.
@@ -71,75 +85,70 @@ pub const EXCHANGE_SEGMENT_NSE_EQ: u8 = 1;
 /// NSE_FNO segment code in Dhan binary protocol.
 pub const EXCHANGE_SEGMENT_NSE_FNO: u8 = 2;
 
-/// BSE_EQ segment code in Dhan binary protocol.
-pub const EXCHANGE_SEGMENT_BSE_EQ: u8 = 3;
+/// NSE_CURRENCY segment code in Dhan binary protocol.
+pub const EXCHANGE_SEGMENT_NSE_CURRENCY: u8 = 3;
 
-/// BSE_FNO segment code in Dhan binary protocol.
-pub const EXCHANGE_SEGMENT_BSE_FNO: u8 = 4;
+/// BSE_EQ segment code in Dhan binary protocol.
+pub const EXCHANGE_SEGMENT_BSE_EQ: u8 = 4;
 
 /// MCX_COMM segment code in Dhan binary protocol.
 pub const EXCHANGE_SEGMENT_MCX_COMM: u8 = 5;
 
+// Note: code 6 is unused/skipped in Dhan's protocol.
+
+/// BSE_CURRENCY segment code in Dhan binary protocol.
+pub const EXCHANGE_SEGMENT_BSE_CURRENCY: u8 = 7;
+
+/// BSE_FNO segment code in Dhan binary protocol.
+pub const EXCHANGE_SEGMENT_BSE_FNO: u8 = 8;
+
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Disconnect Error Codes
+// Source: DhanHQ Python SDK v2 on_close handler (src/dhanhq/marketfeed.py)
 // ---------------------------------------------------------------------------
 
-/// Exceeded max connections (5 per account).
-pub const DISCONNECT_EXCEEDED_MAX_CONNECTIONS: u16 = 801;
+/// 805 — Active WebSocket connections exceeded (max 5 per account).
+pub const DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS: u16 = 805;
 
-/// Exceeded max instruments per connection (5000).
-pub const DISCONNECT_EXCEEDED_MAX_INSTRUMENTS: u16 = 802;
+/// 806 — Data API subscription required (plan/subscription issue).
+pub const DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED: u16 = 806;
 
-/// Authentication failed — invalid access token.
-pub const DISCONNECT_AUTH_FAILED: u16 = 803;
+/// 807 — Access token expired. Refresh token, then reconnect.
+pub const DISCONNECT_ACCESS_TOKEN_EXPIRED: u16 = 807;
 
-/// Token expired — must refresh and reconnect.
-pub const DISCONNECT_TOKEN_EXPIRED: u16 = 804;
+/// 808 — Invalid client ID. Check SSM credentials.
+pub const DISCONNECT_INVALID_CLIENT_ID: u16 = 808;
 
-/// Server maintenance — wait and reconnect with backoff.
-pub const DISCONNECT_SERVER_MAINTENANCE: u16 = 805;
-
-/// Connection timeout — no ping received in 40 seconds.
-pub const DISCONNECT_PING_TIMEOUT: u16 = 806;
-
-/// Invalid subscription request format.
-pub const DISCONNECT_INVALID_SUBSCRIPTION: u16 = 807;
-
-/// Total subscription limit exceeded (25000 across all connections).
-pub const DISCONNECT_SUBSCRIPTION_LIMIT: u16 = 808;
-
-/// Force-disconnected by Dhan kill switch.
-pub const DISCONNECT_FORCE_KILLED: u16 = 810;
-
-/// Invalid client ID in connection headers.
-pub const DISCONNECT_INVALID_CLIENT_ID: u16 = 814;
+/// 809 — Authentication failed. Invalid credentials.
+pub const DISCONNECT_AUTH_FAILED: u16 = 809;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
+// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
 // ---------------------------------------------------------------------------
 
-/// Response code for index ticker packet (25 bytes).
+/// Response code for index ticker packet (16 bytes).
 pub const RESPONSE_CODE_INDEX_TICKER: u8 = 1;
 
-/// Response code for ticker packet (25 bytes).
+/// Response code for ticker packet (16 bytes).
 pub const RESPONSE_CODE_TICKER: u8 = 2;
 
-/// Response code for quote packet (51 bytes).
+/// Response code for quote packet (50 bytes).
 pub const RESPONSE_CODE_QUOTE: u8 = 4;
 
-/// Response code for OI data packet (17 bytes).
+/// Response code for OI data packet (12 bytes).
 pub const RESPONSE_CODE_OI: u8 = 5;
 
-/// Response code for previous close packet (20 bytes).
+/// Response code for previous close packet (16 bytes).
 pub const RESPONSE_CODE_PREVIOUS_CLOSE: u8 = 6;
 
-/// Response code for market status packet (10 bytes).
+/// Response code for market status packet (8 bytes, header only).
 pub const RESPONSE_CODE_MARKET_STATUS: u8 = 7;
 
 /// Response code for full packet (162 bytes).
 pub const RESPONSE_CODE_FULL: u8 = 8;
 
-/// Response code for disconnect (variable length).
+/// Response code for disconnect (10 bytes).
 pub const RESPONSE_CODE_DISCONNECT: u8 = 50;
 
 // ---------------------------------------------------------------------------
@@ -160,33 +169,52 @@ pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Subscription Request Codes
+// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// Subscribe codes: 15 (Ticker), 17 (Quote), 21 (Full).
+// Unsubscribe = subscribe_code + 1: 16 (Ticker), 18 (Quote), 22 (Full).
+// Disconnect = 12 (closes the WebSocket connection).
 // ---------------------------------------------------------------------------
 
-/// Unsubscription request code.
-pub const FEED_REQUEST_UNSUBSCRIBE: u8 = 12;
+/// Disconnect request code (closes the WebSocket connection).
+pub const FEED_REQUEST_DISCONNECT: u8 = 12;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Binary Header
 // ---------------------------------------------------------------------------
 
 /// Size of the binary response header in bytes.
+/// Format: response_code(u8) + msg_length(u16) + exchange_segment(u8) + security_id(u32) = 8.
 pub const BINARY_HEADER_SIZE: usize = 8;
 
-/// OI data packet size in bytes.
-pub const OI_PACKET_SIZE: usize = 17;
+/// OI data packet size in bytes (header 8 + OI int32 = 12).
+/// SDK format: `<BHBII`
+pub const OI_PACKET_SIZE: usize = 12;
+
+/// Market depth level size in bytes (per level within Full packet).
+/// Format: bid_qty(i32) + ask_qty(i32) + bid_orders(i16) + ask_orders(i16) + bid_price(f32) + ask_price(f32) = 20.
+pub const MARKET_DEPTH_LEVEL_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Feed Request Type Codes
 // ---------------------------------------------------------------------------
 
-/// Ticker feed mode (compact price updates).
+/// Subscribe Ticker mode (compact price updates). Unsubscribe = 16.
 pub const FEED_REQUEST_TICKER: u8 = 15;
 
-/// Quote feed mode (price + best bid/ask).
+/// Unsubscribe Ticker mode.
+pub const FEED_UNSUBSCRIBE_TICKER: u8 = 16;
+
+/// Subscribe Quote mode (price + volume + OHLC). Unsubscribe = 18.
 pub const FEED_REQUEST_QUOTE: u8 = 17;
 
-/// Full market depth feed mode (OI + 5-level depth).
+/// Unsubscribe Quote mode.
+pub const FEED_UNSUBSCRIBE_QUOTE: u8 = 18;
+
+/// Subscribe Full mode (quote + OI + 5-level depth). Unsubscribe = 22.
 pub const FEED_REQUEST_FULL: u8 = 21;
+
+/// Unsubscribe Full mode.
+pub const FEED_UNSUBSCRIBE_FULL: u8 = 22;
 
 // ---------------------------------------------------------------------------
 // Market Depth

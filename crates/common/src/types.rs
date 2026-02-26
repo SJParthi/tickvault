@@ -72,11 +72,11 @@ impl fmt::Display for ExchangeSegment {
 /// WebSocket feed mode determining the data granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FeedMode {
-    /// Compact price data (25 bytes).
+    /// Compact price data (16 bytes: header + LTP + LTT).
     Ticker,
-    /// Price + best bid/ask (51 bytes).
+    /// Price + volume + OHLC (50 bytes).
     Quote,
-    /// Full market depth with OI (162 bytes).
+    /// Full: quote + OI + 5-level market depth (162 bytes).
     Full,
 }
 

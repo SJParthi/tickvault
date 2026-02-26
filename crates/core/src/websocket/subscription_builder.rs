@@ -8,16 +8,30 @@ use dhan_live_trader_common::types::FeedMode;
 
 use crate::websocket::types::{InstrumentSubscription, SubscriptionRequest};
 
-/// Maps a `FeedMode` to the Dhan WebSocket RequestCode.
+/// Maps a `FeedMode` to the Dhan WebSocket subscribe RequestCode.
 ///
 /// - Ticker → 15
 /// - Quote  → 17
 /// - Full   → 21
-fn feed_mode_to_request_code(mode: FeedMode) -> u8 {
+fn feed_mode_to_subscribe_code(mode: FeedMode) -> u8 {
     match mode {
         FeedMode::Ticker => dhan_live_trader_common::constants::FEED_REQUEST_TICKER,
         FeedMode::Quote => dhan_live_trader_common::constants::FEED_REQUEST_QUOTE,
         FeedMode::Full => dhan_live_trader_common::constants::FEED_REQUEST_FULL,
+    }
+}
+
+/// Maps a `FeedMode` to the Dhan WebSocket unsubscribe RequestCode.
+///
+/// Per Dhan SDK: unsubscribe_code = subscribe_code + 1.
+/// - Ticker → 16
+/// - Quote  → 18
+/// - Full   → 22
+fn feed_mode_to_unsubscribe_code(mode: FeedMode) -> u8 {
+    match mode {
+        FeedMode::Ticker => dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_TICKER,
+        FeedMode::Quote => dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_QUOTE,
+        FeedMode::Full => dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_FULL,
     }
 }
 
@@ -44,7 +58,7 @@ pub fn build_subscription_messages(
 
     // Clamp batch size to Dhan's hard limit.
     let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
-    let request_code = feed_mode_to_request_code(feed_mode);
+    let request_code = feed_mode_to_subscribe_code(feed_mode);
 
     instruments
         .chunks(effective_batch)
@@ -62,9 +76,11 @@ pub fn build_subscription_messages(
 
 /// Builds unsubscription JSON messages from a list of instruments.
 ///
-/// Same batching logic as `build_subscription_messages` but uses RequestCode 12.
+/// Per Dhan SDK: unsubscribe_code = subscribe_code + 1.
+/// Ticker=16, Quote=18, Full=22.
 pub fn build_unsubscription_messages(
     instruments: &[InstrumentSubscription],
+    feed_mode: FeedMode,
     batch_size: usize,
 ) -> Vec<String> {
     if instruments.is_empty() {
@@ -72,18 +88,29 @@ pub fn build_unsubscription_messages(
     }
 
     let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
+    let unsubscribe_code = feed_mode_to_unsubscribe_code(feed_mode);
 
     instruments
         .chunks(effective_batch)
         .map(|chunk| {
             let request = SubscriptionRequest {
-                request_code: dhan_live_trader_common::constants::FEED_REQUEST_UNSUBSCRIBE,
+                request_code: unsubscribe_code,
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
             serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
         })
         .collect()
+}
+
+/// Builds a disconnect JSON message (RequestCode 12).
+///
+/// This closes the WebSocket connection gracefully on the server side.
+pub fn build_disconnect_message() -> String {
+    serde_json::json!({
+        "RequestCode": dhan_live_trader_common::constants::FEED_REQUEST_DISCONNECT
+    })
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -184,24 +211,44 @@ mod tests {
     }
 
     #[test]
-    fn test_unsubscription_uses_request_code_12() {
+    fn test_unsubscription_ticker_uses_request_code_16() {
         let instruments = make_instruments(5);
-        let messages = build_unsubscription_messages(&instruments, 100);
+        let messages = build_unsubscription_messages(&instruments, FeedMode::Ticker, 100);
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("\"RequestCode\":12"));
+        assert!(messages[0].contains("\"RequestCode\":16"));
+    }
+
+    #[test]
+    fn test_unsubscription_quote_uses_request_code_18() {
+        let instruments = make_instruments(3);
+        let messages = build_unsubscription_messages(&instruments, FeedMode::Quote, 100);
+        assert!(messages[0].contains("\"RequestCode\":18"));
+    }
+
+    #[test]
+    fn test_unsubscription_full_uses_request_code_22() {
+        let instruments = make_instruments(2);
+        let messages = build_unsubscription_messages(&instruments, FeedMode::Full, 100);
+        assert!(messages[0].contains("\"RequestCode\":22"));
     }
 
     #[test]
     fn test_unsubscription_empty_instruments() {
-        let messages = build_unsubscription_messages(&[], 100);
+        let messages = build_unsubscription_messages(&[], FeedMode::Ticker, 100);
         assert!(messages.is_empty());
     }
 
     #[test]
     fn test_unsubscription_batches_correctly() {
         let instruments = make_instruments(150);
-        let messages = build_unsubscription_messages(&instruments, 100);
+        let messages = build_unsubscription_messages(&instruments, FeedMode::Full, 100);
         assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_disconnect_message_uses_request_code_12() {
+        let msg = build_disconnect_message();
+        assert!(msg.contains("\"RequestCode\":12"));
     }
 
     #[test]
@@ -227,9 +274,9 @@ mod tests {
     fn test_unsubscription_batch_size_clamped_above_100() {
         let instruments = make_instruments(200);
         // batch_size = 999 clamped to 100
-        let messages = build_unsubscription_messages(&instruments, 999);
+        let messages = build_unsubscription_messages(&instruments, FeedMode::Ticker, 999);
         assert_eq!(messages.len(), 2);
-        assert!(messages[0].contains("\"RequestCode\":12"));
+        assert!(messages[0].contains("\"RequestCode\":16"));
     }
 
     #[test]
