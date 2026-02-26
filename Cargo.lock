@@ -552,6 +552,7 @@ checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
  "axum-core",
  "axum-macros",
+ "base64",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -570,8 +571,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -973,7 +976,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "dhan-live-trader-common",
+ "dhan-live-trader-core",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -988,6 +994,7 @@ name = "dhan-live-trader-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "chrono-tz",
  "clap",
@@ -997,6 +1004,7 @@ dependencies = [
  "dhan-live-trader-storage",
  "dhan-live-trader-trading",
  "figment",
+ "secrecy",
  "signal-hook",
  "tokio",
  "tracing",
@@ -1036,6 +1044,7 @@ dependencies = [
  "chrono-tz",
  "csv",
  "dhan-live-trader-common",
+ "dhan-live-trader-storage",
  "failsafe",
  "futures-util",
  "papaya",

@@ -25,9 +25,7 @@ use dhan_live_trader_common::error::ApplicationError;
 
 use super::secret_manager;
 use super::totp_generator::generate_totp_code;
-use super::types::{
-    DhanAuthResponse, DhanCredentials, GenerateTokenRequest, RenewTokenRequest, TokenState,
-};
+use super::types::{DhanCredentials, DhanGenerateTokenResponse, TokenState};
 
 // ---------------------------------------------------------------------------
 // Token Handle (shared with downstream consumers)
@@ -56,8 +54,11 @@ pub struct TokenManager {
     /// Cached credentials (fetched once from SSM at startup).
     credentials: DhanCredentials,
 
-    /// Dhan REST API base URL (from config).
+    /// Dhan REST API base URL (for data/orders/renewal).
     rest_api_base_url: String,
+
+    /// Dhan Auth base URL (for token generation).
+    auth_base_url: String,
 
     /// HTTP client for Dhan API calls (reused across requests).
     http_client: reqwest::Client,
@@ -98,6 +99,14 @@ impl TokenManager {
                 ),
             });
         }
+        if !dhan_config.auth_base_url.starts_with("https://") {
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "auth_base_url must use HTTPS, got: {}",
+                    dhan_config.auth_base_url
+                ),
+            });
+        }
 
         let credentials = secret_manager::fetch_dhan_credentials().await?;
 
@@ -114,6 +123,7 @@ impl TokenManager {
             token: Arc::clone(&token),
             credentials,
             rest_api_base_url: dhan_config.rest_api_base_url.clone(),
+            auth_base_url: dhan_config.auth_base_url.clone(),
             http_client,
             token_config: token_config.clone(),
             network_config: network_config.clone(),
@@ -156,22 +166,25 @@ impl TokenManager {
     // -----------------------------------------------------------------------
 
     /// Performs full authentication: TOTP → generateAccessToken → store.
+    ///
+    /// Calls `POST https://auth.dhan.co/app/generateAccessToken` with query params:
+    /// `dhanClientId`, `pin`, `totp`. Response is flat JSON with camelCase fields.
     #[instrument(skip_all)]
     async fn acquire_token(&self) -> Result<(), ApplicationError> {
         let totp_code = generate_totp_code(&self.credentials.totp_secret)?;
 
-        let url = format!("{}{}", self.rest_api_base_url, DHAN_GENERATE_TOKEN_PATH);
+        let url = format!("{}{}", self.auth_base_url, DHAN_GENERATE_TOKEN_PATH);
 
-        let request_body = GenerateTokenRequest {
-            client_id: self.credentials.client_id.expose_secret().to_string(),
-            client_secret: self.credentials.client_secret.expose_secret().to_string(),
-            totp: totp_code,
-        };
-
+        // Dhan expects query params: dhanClientId, pin, totp
+        // Our SSM `client_secret` maps to Dhan's `pin` (6-digit trading PIN).
         let response = self
             .http_client
             .post(&url)
-            .json(&request_body)
+            .query(&[
+                ("dhanClientId", self.credentials.client_id.expose_secret()),
+                ("pin", self.credentials.client_secret.expose_secret()),
+                ("totp", &totp_code),
+            ])
             .send()
             .await
             .map_err(|err| ApplicationError::AuthenticationFailed {
@@ -179,58 +192,55 @@ impl TokenManager {
             })?;
 
         let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+
         if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!("generateAccessToken HTTP {status}: {body_text}"),
             });
         }
 
-        let body: DhanAuthResponse =
-            response
-                .json()
-                .await
+        // Dhan returns HTTP 200 even on error — check for error response first.
+        // Error format: {"status":"error","message":"Invalid Pin"}
+        if let Ok(error_check) = serde_json::from_str::<serde_json::Value>(&body_text)
+            && error_check.get("status").and_then(|s| s.as_str()) == Some("error")
+        {
+            let message = error_check
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!("Dhan auth error: {message}"),
+            });
+        }
+
+        let body: DhanGenerateTokenResponse =
+            serde_json::from_str(&body_text)
                 .map_err(|err| ApplicationError::AuthenticationFailed {
-                    reason: format!("failed to parse auth response (HTTP {status}): {err}"),
+                    reason: format!(
+                        "failed to parse auth response (HTTP {status}): {err}\nResponse body: {body_text}"
+                    ),
                 })?;
 
-        if body.status != "success" {
-            let remarks = body.remarks.unwrap_or_else(|| "no details".to_string());
+        if body.access_token.is_empty() {
             return Err(ApplicationError::AuthenticationFailed {
-                reason: format!(
-                    "Dhan API returned status='{}', remarks='{}'",
-                    body.status, remarks
-                ),
+                reason: "generateAccessToken returned empty accessToken".to_string(),
             });
         }
 
-        let response_data = body
-            .data
-            .ok_or_else(|| ApplicationError::AuthenticationFailed {
-                reason: "auth response has status=success but no data payload".to_string(),
-            })?;
-
-        if response_data.expires_in == 0 {
-            return Err(ApplicationError::AuthenticationFailed {
-                reason: "auth response has expires_in=0 — token would expire immediately"
-                    .to_string(),
-            });
-        }
-
-        let token_state = TokenState::from_response(&response_data);
+        let token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(token_state)));
 
         Ok(())
     }
 
-    /// Attempts token renewal via the `renewToken` endpoint.
+    /// Attempts token renewal via the `RenewToken` endpoint.
     ///
-    /// Uses the current valid token + fresh TOTP. This is lighter than
-    /// full authentication since it doesn't require client_secret.
+    /// Calls `GET https://api.dhan.co/v2/RenewToken` with headers:
+    /// `access-token` (current JWT) and `dhanClientId`.
+    /// Expires the current token and returns a new one with 24h validity.
     #[instrument(skip_all)]
     async fn try_renew_token(&self) -> Result<(), ApplicationError> {
-        let totp_code = generate_totp_code(&self.credentials.totp_secret)?;
-
         let current_token = self.token.load();
         let token_state = current_token.as_ref().as_ref().ok_or_else(|| {
             ApplicationError::AuthenticationFailed {
@@ -240,21 +250,17 @@ impl TokenManager {
 
         let url = format!("{}{}", self.rest_api_base_url, DHAN_RENEW_TOKEN_PATH);
 
-        let request_body = RenewTokenRequest {
-            client_id: self.credentials.client_id.expose_secret().to_string(),
-            totp: totp_code,
-        };
-
+        // Dhan's RenewToken is a GET with headers, not POST with body
         let response = self
             .http_client
-            .post(&url)
-            .header("Authorization", token_state.access_token().expose_secret())
-            .json(&request_body)
+            .get(&url)
+            .header("access-token", token_state.access_token().expose_secret())
+            .header("dhanClientId", self.credentials.client_id.expose_secret())
             .send()
             .await
             .map_err(|err| ApplicationError::TokenRenewalFailed {
                 attempts: 0,
-                reason: format!("renewToken request failed: {err}"),
+                reason: format!("RenewToken request failed: {err}"),
             })?;
 
         let status = response.status();
@@ -262,11 +268,12 @@ impl TokenManager {
             let body_text = response.text().await.unwrap_or_default();
             return Err(ApplicationError::TokenRenewalFailed {
                 attempts: 0,
-                reason: format!("renewToken HTTP {status}: {body_text}"),
+                reason: format!("RenewToken HTTP {status}: {body_text}"),
             });
         }
 
-        let body: DhanAuthResponse =
+        // Renewal response uses the same flat format as generateAccessToken
+        let body: DhanGenerateTokenResponse =
             response
                 .json()
                 .await
@@ -275,33 +282,14 @@ impl TokenManager {
                     reason: format!("failed to parse renewal response (HTTP {status}): {err}"),
                 })?;
 
-        if body.status != "success" {
-            let remarks = body.remarks.unwrap_or_else(|| "no details".to_string());
+        if body.access_token.is_empty() {
             return Err(ApplicationError::TokenRenewalFailed {
                 attempts: 0,
-                reason: format!(
-                    "Dhan API returned status='{}', remarks='{}'",
-                    body.status, remarks
-                ),
+                reason: "RenewToken returned empty accessToken".to_string(),
             });
         }
 
-        let response_data = body
-            .data
-            .ok_or_else(|| ApplicationError::TokenRenewalFailed {
-                attempts: 0,
-                reason: "renewal response has status=success but no data payload".to_string(),
-            })?;
-
-        if response_data.expires_in == 0 {
-            return Err(ApplicationError::TokenRenewalFailed {
-                attempts: 0,
-                reason: "renewal response has expires_in=0 — token would expire immediately"
-                    .to_string(),
-            });
-        }
-
-        let new_token_state = TokenState::from_response(&response_data);
+        let new_token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(new_token_state)));
 
         Ok(())

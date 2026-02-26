@@ -23,6 +23,8 @@ pub struct ApplicationConfig {
     pub risk: RiskConfig,
     pub logging: LoggingConfig,
     pub instrument: InstrumentConfig,
+    pub api: ApiConfig,
+    pub pipeline: PipelineConfig,
 }
 
 /// Trading session timing configuration.
@@ -49,8 +51,11 @@ pub struct TradingConfig {
 pub struct DhanConfig {
     /// WebSocket V2 binary feed URL.
     pub websocket_url: String,
-    /// REST API base URL.
+    /// REST API base URL (for trading, data, renewal).
     pub rest_api_base_url: String,
+    /// Auth base URL (for token generation — separate from REST API).
+    /// Dhan uses `https://auth.dhan.co` for authentication endpoints.
+    pub auth_base_url: String,
     /// Primary instrument CSV download URL.
     pub instrument_csv_url: String,
     /// Fallback instrument CSV download URL.
@@ -81,7 +86,7 @@ pub struct WebSocketConfig {
 }
 
 /// QuestDB connection configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QuestDbConfig {
     /// QuestDB Docker hostname.
     pub host: String,
@@ -153,6 +158,22 @@ pub struct LoggingConfig {
     pub level: String,
     /// Log output format (json, pretty).
     pub format: String,
+}
+
+/// API server configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiConfig {
+    /// Bind address for the HTTP server.
+    pub host: String,
+    /// HTTP server port.
+    pub port: u16,
+}
+
+/// Pipeline processing configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineConfig {
+    /// Broadcast channel capacity for candle updates to WebSocket clients.
+    pub candle_broadcast_capacity: usize,
 }
 
 /// Instrument CSV download and universe build configuration.
@@ -301,6 +322,7 @@ mod tests {
             dhan: DhanConfig {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),
                 rest_api_base_url: "https://api.dhan.co/v2".to_string(),
+                auth_base_url: "https://auth.dhan.co".to_string(),
                 instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
                     .to_string(),
                 instrument_csv_fallback_url: "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -356,6 +378,13 @@ mod tests {
                 csv_cache_directory: "/tmp/dlt-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
+            },
+            api: ApiConfig {
+                host: "0.0.0.0".to_string(),
+                port: 3001,
+            },
+            pipeline: PipelineConfig {
+                candle_broadcast_capacity: 4096,
             },
         }
     }

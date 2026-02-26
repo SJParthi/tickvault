@@ -18,6 +18,7 @@ max_orders_per_second = 10
 [dhan]
 websocket_url = "wss://api-feed.dhan.co"
 rest_api_base_url = "https://api.dhan.co/v2"
+auth_base_url = "https://auth.dhan.co"
 instrument_csv_url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 instrument_csv_fallback_url = "https://images.dhan.co/api-data/api-scrip-master.csv"
 max_instruments_per_connection = 5000
@@ -71,3 +72,10 @@ daily_download_time = "08:45:00"
 csv_cache_directory = "/app/data/instrument-cache"
 csv_cache_filename = "api-scrip-master-detailed.csv"
 csv_download_timeout_secs = 120
+
+[api]
+host = "0.0.0.0"
+port = 3001
+
+[pipeline]
+candle_broadcast_capacity = 4096

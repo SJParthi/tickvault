@@ -24,6 +24,51 @@ fn ist_offset() -> FixedOffset {
     FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid")
 }
 
+/// Parses `expiryTime` from Dhan's generateAccessToken response.
+///
+/// Handles multiple formats:
+/// - Epoch milliseconds (number): `1772113432557`
+/// - Epoch seconds (number < 10_000_000_000): `1772113432`
+/// - ISO 8601 string: `"2026-02-27T13:45:00+05:30"`
+fn parse_expiry_time(value: &serde_json::Value) -> Option<DateTime<FixedOffset>> {
+    let ist = ist_offset();
+    match value {
+        serde_json::Value::Number(n) => {
+            let epoch = n.as_i64()?;
+            // Distinguish millis vs seconds: millis are > 10 billion
+            let epoch_secs = if epoch > 10_000_000_000 {
+                epoch / 1000
+            } else {
+                epoch
+            };
+            let dt = DateTime::from_timestamp(epoch_secs, 0)?;
+            Some(dt.with_timezone(&ist))
+        }
+        serde_json::Value::String(s) => {
+            // Try parsing as ISO 8601 with timezone
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                return Some(dt.with_timezone(&ist));
+            }
+            // Try common date-time formats
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+                return dt.and_local_timezone(ist).single();
+            }
+            // Try epoch millis as string
+            if let Ok(epoch) = s.parse::<i64>() {
+                let epoch_secs = if epoch > 10_000_000_000 {
+                    epoch / 1000
+                } else {
+                    epoch
+                };
+                let dt = DateTime::from_timestamp(epoch_secs, 0)?;
+                return Some(dt.with_timezone(&ist));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dhan Credentials (from SSM)
 // ---------------------------------------------------------------------------
@@ -73,10 +118,29 @@ pub struct TokenState {
 }
 
 impl TokenState {
-    /// Creates a new `TokenState` from a Dhan auth response.
+    /// Creates a new `TokenState` from a Dhan auth response (renewal/legacy).
     pub fn from_response(response: &DhanAuthResponseData) -> Self {
         let now_ist = Utc::now().with_timezone(&ist_offset());
         let expires_at = now_ist + Duration::seconds(i64::from(response.expires_in));
+
+        Self {
+            access_token: SecretString::from(response.access_token.clone()),
+            expires_at,
+            issued_at: now_ist,
+        }
+    }
+
+    /// Creates a new `TokenState` from the Dhan generateAccessToken response.
+    ///
+    /// Handles `expiryTime` as either epoch milliseconds (number) or ISO string.
+    /// Falls back to 24-hour default validity if parsing fails.
+    pub fn from_generate_response(response: &DhanGenerateTokenResponse) -> Self {
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+
+        let expires_at = parse_expiry_time(&response.expiry_time).unwrap_or_else(|| {
+            // Default: 24 hours from now (Dhan standard token validity)
+            now_ist + Duration::hours(24)
+        });
 
         Self {
             access_token: SecretString::from(response.access_token.clone()),
@@ -165,17 +229,19 @@ impl fmt::Debug for TokenState {
 // Dhan API Request/Response Types
 // ---------------------------------------------------------------------------
 
-/// Request body for `POST /v2/generateAccessToken`.
+/// Query parameters for `POST https://auth.dhan.co/app/generateAccessToken`.
 ///
 /// Fields are zeroized on drop to prevent credential leakage from freed memory.
+/// Dhan API expects: `dhanClientId`, `pin` (6-digit trading PIN), `totp`.
 #[derive(serde::Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct GenerateTokenRequest {
-    pub client_id: String,
-    pub client_secret: String,
+    #[serde(rename = "dhanClientId")]
+    pub dhan_client_id: String,
+    pub pin: String,
     pub totp: String,
 }
 
-/// Request body for `POST /v2/renewToken`.
+/// Request body for `POST /v2/renewToken` (unused — renewal uses GET with headers).
 ///
 /// Fields are zeroized on drop to prevent credential leakage from freed memory.
 #[derive(serde::Serialize, Zeroize, ZeroizeOnDrop)]
@@ -184,7 +250,34 @@ pub struct RenewTokenRequest {
     pub totp: String,
 }
 
-/// Top-level response from Dhan auth endpoints.
+/// Response from `POST https://auth.dhan.co/app/generateAccessToken`.
+///
+/// Dhan returns a flat JSON with camelCase field names (no wrapper).
+#[derive(Deserialize)]
+pub struct DhanGenerateTokenResponse {
+    /// Dhan client ID (echoed back).
+    #[serde(rename = "dhanClientId")]
+    pub dhan_client_id: String,
+    /// JWT access token string.
+    #[serde(rename = "accessToken")]
+    pub access_token: String,
+    /// Token expiry time as epoch milliseconds (or ISO timestamp string).
+    /// Example: "2026-02-27T13:45:00+05:30" or epoch millis.
+    #[serde(rename = "expiryTime")]
+    pub expiry_time: serde_json::Value,
+}
+
+impl fmt::Debug for DhanGenerateTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DhanGenerateTokenResponse")
+            .field("dhan_client_id", &self.dhan_client_id)
+            .field("access_token", &"[REDACTED]")
+            .field("expiry_time", &self.expiry_time)
+            .finish()
+    }
+}
+
+/// Legacy wrapped response format (kept for renewToken compatibility).
 #[derive(Debug, Deserialize)]
 pub struct DhanAuthResponse {
     pub status: String,
@@ -194,7 +287,7 @@ pub struct DhanAuthResponse {
     pub remarks: Option<String>,
 }
 
-/// Data payload from a successful Dhan auth response.
+/// Data payload from a Dhan auth response (renewal endpoint).
 #[derive(Deserialize)]
 pub struct DhanAuthResponseData {
     /// JWT access token string.
@@ -478,19 +571,18 @@ mod tests {
     #[test]
     fn test_generate_token_request_serializes_correctly() {
         let request = GenerateTokenRequest {
-            client_id: "test-client-id".to_string(),
-            client_secret: "test-secret".to_string(),
-            totp: "123456".to_string(),
+            dhan_client_id: "test-client-id".to_string(),
+            pin: "123456".to_string(),
+            totp: "654321".to_string(),
         };
 
         let json_value: serde_json::Value =
             serde_json::to_value(&request).expect("should serialize");
 
-        // Verify the serialized field names match Dhan API expectations
-        // (serde uses the Rust field names by default: snake_case).
-        assert_eq!(json_value["client_id"], "test-client-id");
-        assert_eq!(json_value["client_secret"], "test-secret");
-        assert_eq!(json_value["totp"], "123456");
+        // Verify the serialized field names match Dhan API expectations (camelCase).
+        assert_eq!(json_value["dhanClientId"], "test-client-id");
+        assert_eq!(json_value["pin"], "123456");
+        assert_eq!(json_value["totp"], "654321");
 
         // Verify no extra fields are present
         let obj = json_value.as_object().expect("should be an object");

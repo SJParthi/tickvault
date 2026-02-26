@@ -14,5 +14,8 @@
 //! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route
 
 pub mod auth;
+pub mod candle;
 pub mod instrument;
+pub mod parser;
+pub mod pipeline;
 pub mod websocket;

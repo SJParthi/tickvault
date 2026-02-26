@@ -401,6 +401,7 @@ mod tests {
         DhanConfig {
             websocket_url: "wss://api-feed.dhan.co".to_string(),
             rest_api_base_url: "https://api.dhan.co/v2".to_string(),
+            auth_base_url: "https://auth.dhan.co".to_string(),
             instrument_csv_url: "https://example.com/csv".to_string(),
             instrument_csv_fallback_url: "https://example.com/csv-fallback".to_string(),
             max_instruments_per_connection: 5000,

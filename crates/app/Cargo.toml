@@ -16,11 +16,13 @@ dhan-live-trader-trading = { path = "../trading" }
 dhan-live-trader-storage = { path = "../storage" }
 dhan-live-trader-api = { path = "../api" }
 tokio = { workspace = true }
+axum = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 figment = { workspace = true }
 clap = { workspace = true }
+secrecy = { workspace = true }
 signal-hook = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }

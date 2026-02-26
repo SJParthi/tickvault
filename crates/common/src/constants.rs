@@ -504,11 +504,13 @@ pub const TOTP_SKEW: u8 = 1;
 // Authentication — Dhan REST API Endpoint Paths
 // ---------------------------------------------------------------------------
 
-/// Path for initial token generation (appended to rest_api_base_url).
-pub const DHAN_GENERATE_TOKEN_PATH: &str = "/generateAccessToken";
+/// Path for initial token generation (appended to auth_base_url).
+/// Endpoint: POST https://auth.dhan.co/app/generateAccessToken
+pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 
 /// Path for token renewal (appended to rest_api_base_url).
-pub const DHAN_RENEW_TOKEN_PATH: &str = "/renewToken";
+/// Endpoint: GET https://api.dhan.co/v2/RenewToken
+pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 
 // ---------------------------------------------------------------------------
 // Authentication — SSM Path Construction
@@ -530,6 +532,147 @@ pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
 /// Circuit breaker reset timeout in seconds (try again after this).
 pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// Dhan WebSocket V2 — Binary Packet Byte Offsets
+// Source: SDK struct.unpack format strings, verified against Python SDK.
+// CRITICAL: Quote and Full packets DIVERGE at offset 34.
+// ---------------------------------------------------------------------------
+
+// --- Header offsets (shared by ALL packets) ---
+
+/// Response code byte position in binary header.
+pub const HEADER_OFFSET_RESPONSE_CODE: usize = 0;
+
+/// Message length (u16 LE) position in binary header.
+pub const HEADER_OFFSET_MESSAGE_LENGTH: usize = 1;
+
+/// Exchange segment byte position in binary header.
+pub const HEADER_OFFSET_EXCHANGE_SEGMENT: usize = 3;
+
+/// Security ID (u32 LE) position in binary header.
+pub const HEADER_OFFSET_SECURITY_ID: usize = 4;
+
+// --- Ticker packet body offsets (16 bytes total) ---
+
+/// Last traded price (f32 LE) offset in Ticker packet.
+pub const TICKER_OFFSET_LTP: usize = 8;
+
+/// Last trade time (u32 LE, epoch seconds) offset in Ticker packet.
+pub const TICKER_OFFSET_LTT: usize = 12;
+
+// --- Quote packet body offsets (50 bytes total) ---
+// Format: <BHBIfHIfIIIffff
+
+/// LTP (f32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_LTP: usize = 8;
+
+/// Last trade quantity (u16 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_LTQ: usize = 12;
+
+/// Last trade time (u32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_LTT: usize = 14;
+
+/// Average traded price (f32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_ATP: usize = 18;
+
+/// Cumulative volume (u32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_VOLUME: usize = 22;
+
+/// Total sell quantity (u32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_TOTAL_SELL_QTY: usize = 26;
+
+/// Total buy quantity (u32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_TOTAL_BUY_QTY: usize = 30;
+
+/// Day open (f32 LE) offset in Quote packet — DIVERGES from Full at this offset!
+pub const QUOTE_OFFSET_OPEN: usize = 34;
+
+/// Previous close (f32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_CLOSE: usize = 38;
+
+/// Day high (f32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_HIGH: usize = 42;
+
+/// Day low (f32 LE) offset in Quote packet.
+pub const QUOTE_OFFSET_LOW: usize = 46;
+
+// --- Full packet body offsets (162 bytes total) ---
+// Format: <BHBIfHIfIIIIIIffff100s
+// CRITICAL: Shares layout 0-33 with Quote, then DIVERGES at offset 34.
+// Full puts OI u32 fields at 34-45, then OHLC floats at 46-61, then depth.
+
+/// Open interest (u32 LE) offset in Full packet — Quote has Open(f32) here!
+pub const FULL_OFFSET_OI: usize = 34;
+
+/// OI day high (u32 LE) offset in Full packet — Quote has Close(f32) here!
+pub const FULL_OFFSET_OI_DAY_HIGH: usize = 38;
+
+/// OI day low (u32 LE) offset in Full packet — Quote has High(f32) here!
+pub const FULL_OFFSET_OI_DAY_LOW: usize = 42;
+
+/// Day open (f32 LE) offset in Full packet.
+pub const FULL_OFFSET_OPEN: usize = 46;
+
+/// Previous close (f32 LE) offset in Full packet.
+pub const FULL_OFFSET_CLOSE: usize = 50;
+
+/// Day high (f32 LE) offset in Full packet.
+pub const FULL_OFFSET_HIGH: usize = 54;
+
+/// Day low (f32 LE) offset in Full packet.
+pub const FULL_OFFSET_LOW: usize = 58;
+
+/// Start of 5-level market depth (100 bytes) in Full packet.
+pub const FULL_OFFSET_DEPTH_START: usize = 62;
+
+// --- OI packet body offset (12 bytes total) ---
+
+/// Open interest (u32 LE) offset in standalone OI packet.
+pub const OI_OFFSET_VALUE: usize = 8;
+
+// --- Previous Close packet body offsets (16 bytes total) ---
+
+/// Previous close price (f32 LE) offset.
+pub const PREV_CLOSE_OFFSET_PRICE: usize = 8;
+
+/// Previous OI (u32 LE) offset.
+pub const PREV_CLOSE_OFFSET_OI: usize = 12;
+
+// --- Disconnect packet body offset (10 bytes total) ---
+
+/// Disconnect code (u16 LE) offset.
+pub const DISCONNECT_OFFSET_CODE: usize = 8;
+
+// ---------------------------------------------------------------------------
+// QuestDB ILP — Tick & Candle Table Names
+// ---------------------------------------------------------------------------
+
+/// QuestDB table: raw tick data from WebSocket feed.
+pub const QUESTDB_TABLE_TICKS: &str = "ticks";
+
+/// QuestDB table: 1-second candles aggregated by Rust.
+pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
+
+// ---------------------------------------------------------------------------
+// Pipeline — Tick Processing Constants
+// ---------------------------------------------------------------------------
+
+/// Default tick batch flush size for QuestDB ILP writes.
+pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
+
+/// Default tick flush interval in milliseconds.
+pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
+
+/// Default broadcast channel capacity for candle updates.
+pub const CANDLE_BROADCAST_CAPACITY: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Candle — IST Timezone Offset
+// ---------------------------------------------------------------------------
+
+/// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for candle boundary math.
+pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions

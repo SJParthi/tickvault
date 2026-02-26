@@ -7,4 +7,5 @@ pub mod config;
 pub mod constants;
 pub mod error;
 pub mod instrument_types;
+pub mod tick_types;
 pub mod types;
