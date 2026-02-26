@@ -11,26 +11,27 @@ Download Dhan's instrument master CSV daily, parse it, run a 6-pass mapping algo
 
 ---
 
-## LIVE OUTPUT (2026-02-24)
+## LIVE OUTPUT (2026-02-26)
 
 ```
-CSV downloaded:      276,018 rows (detailed CSV, ~40 MB)
-Parsed:              160,245 relevant rows (NSE I/E/D + BSE I/D)
+CSV downloaded:      ~276K rows (detailed CSV, ~40 MB)
+Parsed:              ~160K relevant rows (NSE I/E/D + BSE I/D)
 Pipeline time:       ~3 seconds total
 
-Pass 1: Index lookup    → 119 NSE + 75 BSE = 194 indices
-Pass 2: Equity lookup   → 2,442 NSE_EQ stocks
-Pass 3: F&O underlyings → 215 unique (5 NSE idx + 3 BSE idx + 207 stocks)
-Pass 4: Price ID linking → All 215 linked successfully
-Pass 5: Derivatives     → 150,949 contracts (1,254 FUT + 149,695 OPT)
-Pass 6: Subscriptions   → 14,577 / 25,000 WebSocket slots
+Pass 1: Index lookup    → ~194 indices (119 NSE + 75 BSE)
+Pass 2: Equity lookup   → ~2,442 NSE_EQ stocks
+Pass 3: F&O underlyings → 214 unique (5 NSE idx + 3 BSE idx + 206 stocks)
+Pass 4: Price ID linking → All 214 linked successfully
+Pass 5: Derivatives     → 96,948 contracts
 
 Validation: ✅ ALL PASSED
-  - NIFTY     → IDX_I:13,  FNO id: 26000, 4,031 contracts
-  - RELIANCE  → NSE_EQ:2885, lot: 500, 828 contracts
-  - SENSEX    → IDX_I:51,  FNO id: 1, 3,943 contracts
-  - Option chains: 1,288 unique (underlying × expiry)
-  - Expiry calendar: 215 underlyings, NIFTY has 18 active expiry dates
+  - NIFTY     → IDX_I:13,  FNO id: 26000
+  - RELIANCE  → NSE_EQ:2885, lot: 500
+  - SENSEX    → IDX_I:51,  FNO id: 1
+  - 31 subscribed indices (8 F&O + 23 display)
+
+NOTE: Derivative count changes daily (80K-150K+ depending on
+active weekly/monthly expiry cycles). Underlying count stable ~210-215.
 ```
 
 ---
@@ -70,7 +71,7 @@ Scan all rows where SEGMENT = "I" (both NSE and BSE). Build a map of symbol → 
 Scan rows where EXCH_ID = "NSE", SEGMENT = "E", SERIES = "EQ". Build a map of symbol → security_id. Result: 2,442 entries.
 
 ### Pass 3: Find F&O Underlyings
-Scan all FUTIDX and FUTSTK rows from SEGMENT = "D". Deduplicate by UNDERLYING_SYMBOL. Skip anything containing "TEST". Classify each: FUTIDX+NSE = NSE Index, FUTIDX+BSE = BSE Index, FUTSTK = Stock. Record the UNDERLYING_SECURITY_ID, derivative segment (NSE_FNO or BSE_FNO), and lot size. Result: 215 unique underlyings (5 NSE indices + 3 BSE indices + 207 stocks).
+Scan all FUTIDX and FUTSTK rows from SEGMENT = "D". Deduplicate by UNDERLYING_SYMBOL. Skip anything containing "TEST". Classify each: FUTIDX+NSE = NSE Index, FUTIDX+BSE = BSE Index, FUTSTK = Stock. Record the UNDERLYING_SECURITY_ID, derivative segment (NSE_FNO or BSE_FNO), and lot size. Result: ~214 unique underlyings (5 NSE indices + 3 BSE indices + ~206 stocks). Count varies slightly as stocks are added/removed from F&O.
 
 ### Pass 4: Link Underlyings to Live Price IDs
 For each underlying found in Pass 3, find the security ID needed to subscribe for its live price feed:
@@ -79,34 +80,34 @@ For each underlying found in Pass 3, find the security ID needed to subscribe fo
 
 **Stocks** → Look up in Pass 2's equity map. Direct match by symbol name. Fallback: use UNDERLYING_SECURITY_ID directly (guaranteed equal to the NSE_EQ SECURITY_ID for stocks). The resulting ID is an NSE_EQ security ID (e.g., RELIANCE=2885).
 
-Result: All 215 linked successfully.
+Result: All underlyings linked successfully.
 
 ### Pass 5: Scan All Derivatives
-Scan ALL SEGMENT = "D" rows (~150K+). For each row with a known underlying, valid expiry (≥ today), and not a TEST instrument, create a derivative contract record keyed by its own SECURITY_ID. Also build: option chains grouped by (underlying, expiry) sorted by strike price, expiry calendars per underlying, and a global security_id → instrument info map covering indices, equities, AND derivatives (used later for WebSocket binary response decoding).
+Scan ALL SEGMENT = "D" rows. For each row with a known underlying, valid expiry (≥ today), and not a TEST instrument, create a derivative contract record keyed by its own SECURITY_ID. Also build: option chains grouped by (underlying, expiry) sorted by strike price, expiry calendars per underlying, and a global security_id → instrument info map covering indices, equities, AND derivatives (used later for WebSocket binary response decoding).
 
-Result: 150,949 contracts, 1,288 option chains, 215 expiry calendars.
+Result: ~97K contracts (varies 80K-150K+ by day, driven by active expiry cycles).
 
-### Pass 6: Build WebSocket Subscription Plan
-Decide what to subscribe on the fixed WebSocket connections. Each entry specifies a security_id, exchange_segment, and feed mode.
+### Subscription Planning (via SubscriptionPlanner module)
 
-**What SecurityId gets sent for each category:**
+After the 5-pass universe build, the `SubscriptionPlanner` module (`crates/core/src/instrument/subscription_planner.rs`) converts the raw FnoUniverse into a filtered `SubscriptionPlan` with an `InstrumentRegistry` for O(1) tick enrichment.
 
-| Category | SecurityId Sent | ExchangeSegment | Feed Mode | Count |
-|----------|----------------|-----------------|-----------|-------|
-| F&O Index prices (8) | Underlying's IDX_I price ID (e.g., NIFTY=13) | IDX_I | Ticker | 8 |
-| Display indices (23) | Hardcoded IDX_I IDs (e.g., VIX=21) | IDX_I | Ticker | 23 |
-| F&O Stock prices (207) | Underlying's NSE_EQ price ID (e.g., RELIANCE=2885) | NSE_EQ | Quote | 207 |
-| Index full chains (5 indices) | Each contract's OWN security ID | NSE_FNO / BSE_FNO | Full | 13,109 |
-| Stock futures (207 stocks) | Each contract's OWN security ID | NSE_FNO | Quote | 1,230 |
-| **TOTAL** | | | | **14,577** |
+**Subscription strategy (configurable via `[subscription]` in base.toml):**
 
-Capacity: 14,577 / 25,000 = 58.3% used. Remaining 10,423 slots reserved for active trade positions (dynamically subscribed, locked until exit).
+| Category | SecurityId Sent | ExchangeSegment | Feed Mode | Strategy |
+|----------|----------------|-----------------|-----------|----------|
+| Major index values (5) | Underlying's IDX_I price ID (e.g., NIFTY=13) | IDX_I | Ticker | NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX |
+| Display indices (~23) | Hardcoded IDX_I IDs (e.g., VIX=21) | IDX_I | Ticker | Deduped against major indices |
+| Index derivatives (5 indices) | Each contract's OWN security ID | NSE_FNO / BSE_FNO | Ticker | ALL expiries, ALL strikes for major 5 |
+| Stock equities (~206) | Underlying's NSE_EQ price ID (e.g., RELIANCE=2885) | NSE_EQ | Ticker | All F&O stocks |
+| Stock derivatives (~206 stocks) | Each contract's OWN security ID | NSE_FNO | Ticker | Current expiry only, ATM ± 10 strikes |
 
-**Full chain indices:** NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX. Other indices (BANKEX, SENSEX50, NIFTYNXT50) have price feeds but derivative chains are subscribed dynamically when needed.
+**Total varies daily** based on active derivative count. Must be ≤ 25,000 (Dhan WebSocket limit across 5 connections).
 
-**Stock options:** Not in fixed pool (~140K+ contracts). Subscribed dynamically per-trade.
-
-Dedup logic: If a display index overlaps with an F&O index, it's skipped (no double-subscribe).
+**Key differences from old hardcoded plan:**
+- Major indices get EVERYTHING (all expiries, all strikes) — not just 5 indices' full chains
+- Stock derivatives are now included (current expiry + ATM ± N strikes) — previously excluded
+- ATM approximation at startup uses middle strike of each option chain (no live prices yet)
+- Feed mode configurable per category (defaults to Ticker for bandwidth efficiency)
 
 Validation: Total must be ≤ 25,000 or system bails.
 
@@ -142,9 +143,10 @@ Dhan-marked indices subscribed for market dashboard and sentiment:
 | NIFTY SERV SECTOR | 46 | Sectoral |
 | NIFTY CONSUMPTION | 40 | Thematic |
 
-Combined with 8 F&O indices = 31 total index subscriptions on IDX_I.
+Combined with 5 major F&O indices + 3 additional F&O indices = 31 total index subscriptions on IDX_I.
 
-F&O Indices: NIFTY(13), BANKNIFTY(25), FINNIFTY(27), MIDCPNIFTY(442), NIFTYNXT50(38), SENSEX(51), BANKEX(69), SENSEX50(83).
+Major indices (full derivative chain): NIFTY(13), BANKNIFTY(25), FINNIFTY(27), MIDCPNIFTY(442), SENSEX(51).
+Additional F&O indices (price feed only, derivatives subscribed dynamically): NIFTYNXT50(38), BANKEX(69), SENSEX50(83).
 
 ---
 
@@ -165,7 +167,7 @@ F&O Indices: NIFTY(13), BANKNIFTY(25), FINNIFTY(27), MIDCPNIFTY(442), NIFTYNXT50
 Must-exist checks with exact price IDs:
 NIFTY → IDX_I:13, BANKNIFTY → IDX_I:25, FINNIFTY → IDX_I:27, MIDCPNIFTY → IDX_I:442, NIFTYNXT50 → IDX_I:38, SENSEX → IDX_I:51, BANKEX → IDX_I:69, SENSEX50 → IDX_I:83, RELIANCE → NSE_EQ:2885.
 
-Count checks: F&O stocks in 150–300 range (currently 207). Total subscriptions ≤ 25,000 (currently 14,577). Each F&O index has contract_count > 0. Known stocks present: RELIANCE, HDFCBANK, INFY, TCS.
+Count checks: F&O stocks in 150–300 range (currently ~206). Total subscriptions ≤ 25,000. Each F&O index has contract_count > 0. Known stocks present: RELIANCE, HDFCBANK, INFY, TCS.
 
 Any validation failure = system refuses to start.
 
@@ -180,12 +182,13 @@ If security IDs change (demerger, symbol change, etc.): daily CSV rebuild at 08:
 ## OUTPUT
 
 Block 01 produces a single FnoUniverse object containing:
-- 215 underlyings with their price IDs, derivative segments, and lot sizes
-- 150,949 derivative contracts keyed by their individual security IDs
+- ~214 underlyings with their price IDs, derivative segments, and lot sizes
+- ~97K derivative contracts keyed by their individual security IDs (varies 80K-150K+ daily)
 - A global security_id → instrument info map (covers indices, equities, AND derivatives)
-- 1,288 option chains grouped by (underlying, expiry), sorted by strike
-- 215 expiry calendars (sorted expiry dates per underlying)
-- A subscription plan of 14,577 entries ready to send to WebSocket
+- Option chains grouped by (underlying, expiry), sorted by strike
+- Expiry calendars (sorted expiry dates per underlying)
+
+The SubscriptionPlanner then filters this into a SubscriptionPlan with an InstrumentRegistry for O(1) tick lookup.
 
 ---
 
@@ -244,7 +247,7 @@ CREATE TABLE fno_underlyings (
 ) TIMESTAMP(snapshot_date) PARTITION BY MONTH;
 ```
 
-**Volume:** ~215 rows/day = ~78K rows/year. Negligible storage.
+**Volume:** ~214 rows/day = ~78K rows/year. Negligible storage.
 
 #### Table 3: `derivative_contracts`
 
@@ -267,7 +270,7 @@ CREATE TABLE derivative_contracts (
 ) TIMESTAMP(snapshot_date) PARTITION BY MONTH;
 ```
 
-**Volume:** ~150K rows/day = ~55M rows/year. Partitioned by month for efficient querying. QuestDB handles this easily — it's designed for exactly this kind of time-series data.
+**Volume:** ~80K-150K rows/day (varies by active expiry cycle) = ~30M-55M rows/year. Partitioned by month for efficient querying. QuestDB handles this easily — it's designed for exactly this kind of time-series data.
 
 #### Table 4: `subscribed_indices`
 
@@ -328,8 +331,8 @@ BY 8:45 AM IST — System MUST be fully operational with instruments loaded.
 ```
 Daily snapshots are ADDITIVE — they never delete historical data.
 
-Day 1: CSV has 150,949 contracts → 150,949 rows inserted with snapshot_date = Day 1
-Day 2: CSV has 151,200 contracts → 151,200 rows inserted with snapshot_date = Day 2
+Day 1: CSV has 96,948 contracts → 96,948 rows inserted with snapshot_date = Day 1
+Day 2: CSV has 97,100 contracts → 97,100 rows inserted with snapshot_date = Day 2
         (Day 1 data untouched — new partition)
 
 What "incremental" means:
@@ -351,7 +354,7 @@ What the caller must ensure:
 2. Immediately after: persist_instrument_snapshot(universe, questdb_config)
 3. Write order: metadata → underlyings → derivative_contracts → subscribed_indices
 4. Use ILP (InfluxDB Line Protocol) for high-speed ingestion via questdb-rs 6.1.0
-5. Derivative contracts (~150K rows) batched: flush every ILP_FLUSH_BATCH_SIZE (10,000) rows
+5. Derivative contracts (~80K-150K rows) batched: flush every ILP_FLUSH_BATCH_SIZE (10,000) rows
 6. If QuestDB write fails: WARN log + continue (non-critical observability data)
 7. QuestDB write failure does NOT block trading — universe is in-memory, system functional
 ```
@@ -359,26 +362,16 @@ What the caller must ensure:
 ### Deduplication & Idempotency
 
 ```
-Current state:
-  - ILP auto-created tables have NO dedup keys
-  - Calling persist_instrument_snapshot() twice on the same IST day = duplicate rows
-  - The CALLER must ensure single invocation per day (scheduler responsibility)
+Current state: ✅ DEDUP UPSERT KEYS ENABLED on all 4 tables
+  - ensure_table_dedup_keys() runs at startup via HTTP /exec DDL
+  - Re-runs are fully idempotent — duplicate writes are silently deduped by QuestDB
+  - No caller-side guard needed — safe to call persist_instrument_snapshot() multiple times
 
-Why this is acceptable:
-  - Instrument persistence is observability data, not trading-critical
-  - Duplicate rows don't corrupt data — queries with DISTINCT still return correct results
-  - Daily scheduler (when built) will guard: check last_persisted_date before calling
-  - Worst case: duplicate rows waste ~5MB storage — trivial
-
-Future hardening (when scheduler is built):
-  - Option A: Caller guard — check last_persisted_date in QuestDB via PG wire before writing
-  - Option B: QuestDB DEDUP UPSERT KEYS(snapshot_date, security_id) via PG wire DDL
-  - Option C: Both — belt and suspenders
-
-Recovery from accidental duplicates:
-  SELECT DISTINCT snapshot_date, security_id, ... FROM derivative_contracts
-  WHERE snapshot_date = '2026-02-25'
-  -- Always returns correct data regardless of duplicates
+DEDUP keys per table:
+  - instrument_build_metadata: UPSERT KEYS(build_date, csv_source)
+  - fno_underlyings: UPSERT KEYS(snapshot_date, underlying_symbol)
+  - derivative_contracts: UPSERT KEYS(snapshot_date, security_id)
+  - subscribed_indices: UPSERT KEYS(snapshot_date, security_id)
 ```
 
 ### Edge Cases & Known Behaviors
