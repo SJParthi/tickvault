@@ -98,15 +98,13 @@ pub async fn run_tick_processor(
                 let finalized_candles = candle_manager.process_tick(&tick);
 
                 // 3. Broadcast finalized candles to API subscribers
-                for candle in &finalized_candles {
+                // Each (candle, interval_id) pair carries the producing interval
+                // so WebSocket subscribers can filter by their subscribed timeframe.
+                for &(candle, interval_id) in &finalized_candles {
                     candles_finalized += 1;
-                    // Determine the interval label from the candle.
-                    // The CandleManager doesn't track interval labels, so we
-                    // use security_id lookup. For now, broadcast with "auto" label.
-                    // The API layer handles interval filtering per subscriber.
                     let msg = CandleBroadcastMessage {
-                        interval: String::new(), // populated by API layer based on subscription
-                        candle: *candle,
+                        interval: interval_id,
+                        candle,
                     };
                     // broadcast::send only fails if there are no receivers — that's fine.
                     let _ = candle_broadcast.send(msg);

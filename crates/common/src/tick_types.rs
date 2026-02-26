@@ -508,16 +508,101 @@ impl fmt::Display for ChartInterval {
 }
 
 // ---------------------------------------------------------------------------
+// IntervalId — zero-allocation interval identifier (Copy, 8 bytes)
+// ---------------------------------------------------------------------------
+
+/// Identifies which interval produced a finalized candle.
+///
+/// This is a `Copy` type (8 bytes on stack) used in the broadcast channel
+/// instead of `String` to eliminate heap allocation on the hot path.
+/// The `Time` variant holds `interval_secs`, the `Tick` variant holds `target_ticks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IntervalId {
+    /// Time-based interval identified by duration in seconds.
+    Time(i64),
+    /// Tick-count-based interval identified by tick count.
+    Tick(u32),
+}
+
+impl IntervalId {
+    /// Returns the canonical string label for this interval.
+    ///
+    /// Looks up standard timeframes first, falls back to custom format.
+    pub fn as_label(&self) -> String {
+        match self {
+            Self::Time(secs) => {
+                // Try to match a standard Timeframe
+                for tf in Timeframe::all_standard() {
+                    if tf.as_seconds() == *secs {
+                        return tf.as_str().to_string();
+                    }
+                }
+                // Custom time interval
+                if *secs % 3600 == 0 {
+                    format!("{}h", secs / 3600)
+                } else if *secs % 60 == 0 {
+                    format!("{}m", secs / 60)
+                } else {
+                    format!("{secs}s")
+                }
+            }
+            Self::Tick(count) => {
+                format!("{count}T")
+            }
+        }
+    }
+
+    /// Creates an IntervalId from a timeframe label string.
+    ///
+    /// Returns `None` for unrecognized labels.
+    pub fn from_label(s: &str) -> Option<Self> {
+        // Try tick-based first (e.g., "100T")
+        if let Some(ti) = TickInterval::from_label(s) {
+            return Some(Self::Tick(ti.tick_count()));
+        }
+        // Try standard timeframe
+        if let Some(tf) = Timeframe::from_label(s) {
+            return Some(Self::Time(tf.as_seconds()));
+        }
+        // Try custom time format (e.g., "7m", "90s")
+        let s = s.trim();
+        if s.len() < 2 {
+            return None;
+        }
+        let (num_str, unit) = s.split_at(s.len() - 1);
+        let n: i64 = num_str.parse().ok()?;
+        if n <= 0 {
+            return None;
+        }
+        let seconds = match unit {
+            "s" => n,
+            "m" => n * 60,
+            "h" => n * 3600,
+            _ => return None,
+        };
+        Some(Self::Time(seconds))
+    }
+}
+
+impl fmt::Display for IntervalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_label())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CandleBroadcastMessage — sent over broadcast channel
 // ---------------------------------------------------------------------------
 
 /// Message sent via `tokio::sync::broadcast` when a candle is finalized.
 ///
-/// Includes the interval label so subscribers can filter by timeframe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Includes the interval identifier so subscribers can filter by timeframe.
+/// Uses `IntervalId` (Copy, 8 bytes) instead of `String` to avoid heap
+/// allocation on the hot path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CandleBroadcastMessage {
-    /// The interval that produced this candle (e.g., "5m", "100T").
-    pub interval: String,
+    /// The interval that produced this candle.
+    pub interval: IntervalId,
     /// The finalized candle data.
     pub candle: Candle,
 }
@@ -761,12 +846,102 @@ mod tests {
         assert_eq!(format!("{}", ChartInterval::Time(Timeframe::H1)), "1h");
     }
 
+    // --- IntervalId ---
+
+    #[test]
+    fn test_interval_id_time_standard_label() {
+        let id = IntervalId::Time(300); // 5m
+        assert_eq!(id.as_label(), "5m");
+    }
+
+    #[test]
+    fn test_interval_id_time_custom_label() {
+        let id = IntervalId::Time(420); // 7m
+        assert_eq!(id.as_label(), "7m");
+    }
+
+    #[test]
+    fn test_interval_id_tick_label() {
+        let id = IntervalId::Tick(100);
+        assert_eq!(id.as_label(), "100T");
+    }
+
+    #[test]
+    fn test_interval_id_from_label_standard_time() {
+        assert_eq!(IntervalId::from_label("5m"), Some(IntervalId::Time(300)));
+        assert_eq!(IntervalId::from_label("1h"), Some(IntervalId::Time(3600)));
+        assert_eq!(IntervalId::from_label("1D"), Some(IntervalId::Time(86400)));
+    }
+
+    #[test]
+    fn test_interval_id_from_label_tick() {
+        assert_eq!(IntervalId::from_label("100T"), Some(IntervalId::Tick(100)));
+        assert_eq!(IntervalId::from_label("1T"), Some(IntervalId::Tick(1)));
+    }
+
+    #[test]
+    fn test_interval_id_from_label_custom_time() {
+        assert_eq!(IntervalId::from_label("7m"), Some(IntervalId::Time(420)));
+        assert_eq!(IntervalId::from_label("90s"), Some(IntervalId::Time(90)));
+    }
+
+    #[test]
+    fn test_interval_id_from_label_invalid() {
+        assert_eq!(IntervalId::from_label(""), None);
+        assert_eq!(IntervalId::from_label("x"), None);
+        assert_eq!(IntervalId::from_label("0m"), None);
+    }
+
+    #[test]
+    fn test_interval_id_roundtrip_all_standard() {
+        for tf in Timeframe::all_standard() {
+            let id = IntervalId::Time(tf.as_seconds());
+            let label = id.as_label();
+            let parsed = IntervalId::from_label(&label).unwrap();
+            assert_eq!(parsed, id, "roundtrip failed for {label}");
+        }
+    }
+
+    #[test]
+    fn test_interval_id_is_copy() {
+        let id = IntervalId::Time(300);
+        let id2 = id; // Copy, not move
+        assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn test_interval_id_display() {
+        assert_eq!(format!("{}", IntervalId::Time(300)), "5m");
+        assert_eq!(format!("{}", IntervalId::Tick(10)), "10T");
+    }
+
     // --- CandleBroadcastMessage ---
+
+    #[test]
+    fn test_candle_broadcast_message_is_copy() {
+        let msg = CandleBroadcastMessage {
+            interval: IntervalId::Time(300),
+            candle: Candle {
+                timestamp: 1740556500,
+                security_id: 13,
+                open: 24500.0,
+                high: 24510.0,
+                low: 24490.0,
+                close: 24505.0,
+                volume: 12345,
+                open_interest: 0,
+                tick_count: 50,
+            },
+        };
+        let msg2 = msg; // Copy, not move
+        assert_eq!(msg.candle.security_id, msg2.candle.security_id);
+        assert_eq!(msg.interval, IntervalId::Time(300));
+    }
 
     #[test]
     fn test_candle_broadcast_message_serde() {
         let msg = CandleBroadcastMessage {
-            interval: "5m".to_string(),
+            interval: IntervalId::Time(300),
             candle: Candle {
                 timestamp: 1740556500,
                 security_id: 13,
@@ -781,7 +956,7 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: CandleBroadcastMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.interval, "5m");
+        assert_eq!(deserialized.interval, IntervalId::Time(300));
         assert_eq!(deserialized.candle.security_id, 13);
     }
 }

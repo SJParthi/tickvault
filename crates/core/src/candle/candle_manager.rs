@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use arrayvec::ArrayVec;
 
-use dhan_live_trader_common::tick_types::{Candle, ParsedTick, TickInterval, Timeframe};
+use dhan_live_trader_common::tick_types::{
+    Candle, IntervalId, ParsedTick, TickInterval, Timeframe,
+};
 
 use super::rolling_candle::{RollingCandleState, TickCandleState};
 
@@ -100,7 +102,8 @@ impl CandleManager {
 
     /// Processes a tick for all time-based intervals.
     ///
-    /// Returns finalized candles for any intervals that rolled over.
+    /// Returns finalized candles with their interval identifiers for any
+    /// intervals that rolled over.
     ///
     /// # Performance
     /// O(N) where N = number of active time intervals (typically 27).
@@ -108,7 +111,7 @@ impl CandleManager {
     pub fn process_tick_time(
         &mut self,
         tick: &ParsedTick,
-    ) -> ArrayVec<Candle, MAX_TIME_CANDLES_PER_TICK> {
+    ) -> ArrayVec<(Candle, IntervalId), MAX_TIME_CANDLES_PER_TICK> {
         let mut finalized = ArrayVec::new();
         let tick_epoch = i64::from(tick.exchange_timestamp);
 
@@ -131,7 +134,7 @@ impl CandleManager {
                 tick.security_id,
             ) && finalized.len() < MAX_TIME_CANDLES_PER_TICK
             {
-                finalized.push(candle);
+                finalized.push((candle, IntervalId::Time(interval_secs)));
             }
         }
 
@@ -140,11 +143,12 @@ impl CandleManager {
 
     /// Processes a tick for all tick-count-based intervals.
     ///
-    /// Returns finalized candles for any intervals that hit their tick target.
+    /// Returns finalized candles with their interval identifiers for any
+    /// intervals that hit their tick target.
     pub fn process_tick_count(
         &mut self,
         tick: &ParsedTick,
-    ) -> ArrayVec<Candle, MAX_TICK_CANDLES_PER_TICK> {
+    ) -> ArrayVec<(Candle, IntervalId), MAX_TICK_CANDLES_PER_TICK> {
         let mut finalized = ArrayVec::new();
         let tick_epoch = i64::from(tick.exchange_timestamp);
 
@@ -166,7 +170,7 @@ impl CandleManager {
                 tick.security_id,
             ) && finalized.len() < MAX_TICK_CANDLES_PER_TICK
             {
-                finalized.push(candle);
+                finalized.push((candle, IntervalId::Tick(target_ticks)));
             }
         }
 
@@ -175,21 +179,24 @@ impl CandleManager {
 
     /// Processes a tick for both time-based and tick-based intervals.
     ///
-    /// Returns all finalized candles in a single ArrayVec.
-    pub fn process_tick(&mut self, tick: &ParsedTick) -> ArrayVec<Candle, MAX_CANDLES_PER_TICK> {
+    /// Returns all finalized candles with their interval identifiers.
+    pub fn process_tick(
+        &mut self,
+        tick: &ParsedTick,
+    ) -> ArrayVec<(Candle, IntervalId), MAX_CANDLES_PER_TICK> {
         let mut all = ArrayVec::new();
 
         let time_candles = self.process_tick_time(tick);
-        for c in time_candles {
+        for pair in time_candles {
             if all.len() < MAX_CANDLES_PER_TICK {
-                all.push(c);
+                all.push(pair);
             }
         }
 
         let tick_candles = self.process_tick_count(tick);
-        for c in tick_candles {
+        for pair in tick_candles {
             if all.len() < MAX_CANDLES_PER_TICK {
-                all.push(c);
+                all.push(pair);
             }
         }
 
@@ -289,10 +296,12 @@ mod tests {
         // Tick in second minute → first minute candle finalized
         let result = mgr.process_tick_time(&make_tick(13, 110.0, 1200, base + 60));
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].open, 100.0);
-        assert_eq!(result[0].high, 105.0);
-        assert_eq!(result[0].close, 105.0);
-        assert_eq!(result[0].security_id, 13);
+        let (candle, interval) = &result[0];
+        assert_eq!(candle.open, 100.0);
+        assert_eq!(candle.high, 105.0);
+        assert_eq!(candle.close, 105.0);
+        assert_eq!(candle.security_id, 13);
+        assert_eq!(*interval, IntervalId::Time(60)); // M1 = 60 seconds
     }
 
     #[test]
@@ -338,8 +347,8 @@ mod tests {
         let r2 = mgr.process_tick_time(&make_tick(42, 210.0, 2100, base + 60));
         assert_eq!(r1.len(), 1);
         assert_eq!(r2.len(), 1);
-        assert_eq!(r1[0].security_id, 13);
-        assert_eq!(r2[0].security_id, 42);
+        assert_eq!(r1[0].0.security_id, 13);
+        assert_eq!(r2[0].0.security_id, 42);
     }
 
     // --- Tick-based candle processing ---
@@ -357,7 +366,8 @@ mod tests {
 
         let result = mgr.process_tick_count(&make_tick(13, 109.0, 1090, base + 9));
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].tick_count, 10);
+        assert_eq!(result[0].0.tick_count, 10);
+        assert_eq!(result[0].1, IntervalId::Tick(10));
     }
 
     #[test]
@@ -427,6 +437,7 @@ mod tests {
         // 7 minutes later
         let result = mgr.process_tick_time(&make_tick(13, 110.0, 1100, base + 420));
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].open, 100.0);
+        assert_eq!(result[0].0.open, 100.0);
+        assert_eq!(result[0].1, IntervalId::Time(420));
     }
 }

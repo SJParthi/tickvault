@@ -1,4 +1,8 @@
 //! WebSocket handler for live candle streaming.
+//!
+//! Filters candle broadcasts by both security_id AND interval,
+//! so each client only receives candles for their subscribed instrument
+//! and timeframe.
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -6,6 +10,8 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
+
+use dhan_live_trader_common::tick_types::IntervalId;
 
 use crate::state::SharedAppState;
 
@@ -47,12 +53,19 @@ pub async fn ws_handler(
 }
 
 /// Handles an individual WebSocket connection.
+///
+/// Filters candle broadcasts by BOTH security_id AND interval_id.
+/// Only candles matching the client's subscription are forwarded.
 async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
     let mut candle_rx = state.subscribe_candles();
     let mut subscribed_security_id: Option<u32> = None;
-    let mut subscribed_timeframe: Option<String> = None;
+    let mut subscribed_interval: Option<IntervalId> = None;
+    let mut subscribed_timeframe_label: String = String::new();
 
     debug!("WebSocket client connected");
+
+    // Pre-serialize the available intervals message once (not per-message).
+    let intervals_json = build_intervals_json();
 
     loop {
         tokio::select! {
@@ -64,27 +77,22 @@ async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
                             match client_msg.action.as_str() {
                                 "subscribe" | "switch_timeframe" => {
                                     subscribed_security_id = client_msg.security_id.or(subscribed_security_id);
-                                    subscribed_timeframe = client_msg.timeframe.or(subscribed_timeframe.take());
+
+                                    // Parse timeframe label to IntervalId for O(1) filtering
+                                    if let Some(ref tf_label) = client_msg.timeframe {
+                                        subscribed_interval = IntervalId::from_label(tf_label);
+                                        subscribed_timeframe_label = tf_label.clone();
+                                    }
+
                                     debug!(
                                         ?subscribed_security_id,
-                                        ?subscribed_timeframe,
+                                        ?subscribed_interval,
+                                        timeframe = %subscribed_timeframe_label,
                                         "subscription updated"
                                     );
 
-                                    // Send available intervals
-                                    let intervals_msg = serde_json::json!({
-                                        "type": "available_intervals",
-                                        "time": dhan_live_trader_common::tick_types::Timeframe::all_standard()
-                                            .iter()
-                                            .map(|tf| tf.as_str())
-                                            .collect::<Vec<_>>(),
-                                        "tick": dhan_live_trader_common::tick_types::TickInterval::all_standard()
-                                            .iter()
-                                            .map(|ti| ti.as_str())
-                                            .collect::<Vec<_>>(),
-                                        "custom": true,
-                                    });
-                                    if let Err(err) = socket.send(Message::Text(intervals_msg.to_string().into())).await {
+                                    // Send pre-built available intervals message
+                                    if let Err(err) = socket.send(Message::Text(intervals_json.clone().into())).await {
                                         warn!(?err, "failed to send intervals");
                                         break;
                                     }
@@ -111,16 +119,20 @@ async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
             result = candle_rx.recv() => {
                 match result {
                     Ok(msg) => {
-                        // Filter by subscribed security_id
+                        // Filter by BOTH security_id AND interval_id
                         let sid_match = subscribed_security_id
                             .map(|sid| sid == msg.candle.security_id)
-                            .unwrap_or(true); // if no filter, send all
+                            .unwrap_or(true);
 
-                        if sid_match {
+                        let interval_match = subscribed_interval
+                            .map(|sub_id| sub_id == msg.interval)
+                            .unwrap_or(false); // require explicit subscription
+
+                        if sid_match && interval_match {
                             let update = ServerCandleUpdate {
                                 msg_type: "candle_update",
                                 security_id: msg.candle.security_id,
-                                timeframe: subscribed_timeframe.clone().unwrap_or_default(),
+                                timeframe: msg.interval.as_label(),
                                 data: CandleData {
                                     time: msg.candle.timestamp,
                                     open: msg.candle.open,
@@ -150,4 +162,21 @@ async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
             }
         }
     }
+}
+
+/// Pre-builds the available intervals JSON string (called once per connection).
+fn build_intervals_json() -> String {
+    let intervals_msg = serde_json::json!({
+        "type": "available_intervals",
+        "time": dhan_live_trader_common::tick_types::Timeframe::all_standard()
+            .iter()
+            .map(|tf| tf.as_str())
+            .collect::<Vec<_>>(),
+        "tick": dhan_live_trader_common::tick_types::TickInterval::all_standard()
+            .iter()
+            .map(|ti| ti.as_str())
+            .collect::<Vec<_>>(),
+        "custom": true,
+    });
+    intervals_msg.to_string()
 }

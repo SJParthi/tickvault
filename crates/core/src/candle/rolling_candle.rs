@@ -8,6 +8,23 @@ use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
 use dhan_live_trader_common::tick_types::Candle;
 
 // ---------------------------------------------------------------------------
+// Price Precision Helper
+// ---------------------------------------------------------------------------
+
+/// Rounds an f32 price to 2 decimal places when converting to f64.
+///
+/// Dhan sends prices as f32 (e.g., 150.35). Direct `f64::from(f32)` creates
+/// phantom precision artifacts like 150.35000610351562. Rounding to 2 decimals
+/// preserves the intended precision for Indian market prices (paise resolution).
+///
+/// # Performance
+/// O(1) — two multiplications, one round, one division.
+#[inline]
+fn f32_price_to_f64(price: f32) -> f64 {
+    (f64::from(price) * 100.0).round() / 100.0
+}
+
+// ---------------------------------------------------------------------------
 // IST Boundary Computation — O(1) integer math
 // ---------------------------------------------------------------------------
 
@@ -90,7 +107,7 @@ impl RollingCandleState {
         security_id: u32,
     ) -> Option<Candle> {
         let boundary = compute_ist_aligned_boundary(tick_epoch_utc, self.interval_secs);
-        let price = f64::from(ltp);
+        let price = f32_price_to_f64(ltp);
 
         if !self.initialized {
             // First tick ever — initialize state.
@@ -215,7 +232,7 @@ impl TickCandleState {
         tick_epoch_utc: i64,
         security_id: u32,
     ) -> Option<Candle> {
-        let price = f64::from(ltp);
+        let price = f32_price_to_f64(ltp);
 
         if !self.initialized {
             self.reset(price, volume, oi, tick_epoch_utc);
@@ -297,6 +314,23 @@ impl TickCandleState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- f32 Price Precision Tests ---
+
+    #[test]
+    fn test_f32_price_to_f64_rounds_correctly() {
+        // f32 150.35 → f64 would be 150.35000610351562 without rounding
+        assert_eq!(f32_price_to_f64(150.35_f32), 150.35);
+        assert_eq!(f32_price_to_f64(24500.50_f32), 24500.50);
+        assert_eq!(f32_price_to_f64(0.01_f32), 0.01);
+        assert_eq!(f32_price_to_f64(99999.99_f32), 99999.99);
+    }
+
+    #[test]
+    fn test_f32_price_to_f64_whole_numbers() {
+        assert_eq!(f32_price_to_f64(100.0_f32), 100.0);
+        assert_eq!(f32_price_to_f64(0.0_f32), 0.0);
+    }
 
     // --- IST Boundary Tests ---
 

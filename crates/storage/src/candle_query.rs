@@ -137,9 +137,13 @@ impl QuestDbCandleQuerier {
         // Build the SAMPLE BY query.
         // Uses first(ltp)/last(ltp) for open/close, max/min for high/low.
         // Volume delta = last(volume) - first(volume).
+        // Volume delta: last(volume) - first(volume).
+        // Use max(..., 0) to protect against volume resets mid-day
+        // where cumulative volume drops (exchange correction).
         let sql = format!(
             "SELECT ts, first(ltp) as open, max(ltp) as high, min(ltp) as low, \
-             last(ltp) as close, last(volume) - first(volume) as vol \
+             last(ltp) as close, \
+             case when last(volume) > first(volume) then last(volume) - first(volume) else 0 end as vol \
              FROM {table} \
              WHERE security_id = {sid} \
              AND ts >= cast({from_us} as timestamp) \
