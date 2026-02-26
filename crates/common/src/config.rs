@@ -14,6 +14,7 @@ use crate::constants::SEBI_MAX_ORDERS_PER_SECOND;
 pub struct ApplicationConfig {
     pub trading: TradingConfig,
     pub dhan: DhanConfig,
+    pub websocket: WebSocketConfig,
     pub questdb: QuestDbConfig,
     pub valkey: ValkeyConfig,
     pub prometheus: PrometheusConfig,
@@ -44,7 +45,7 @@ pub struct TradingConfig {
 }
 
 /// Dhan API and WebSocket connection configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DhanConfig {
     /// WebSocket V2 binary feed URL.
     pub websocket_url: String,
@@ -58,6 +59,25 @@ pub struct DhanConfig {
     pub max_instruments_per_connection: usize,
     /// Maximum concurrent WebSocket connections.
     pub max_websocket_connections: usize,
+}
+
+/// WebSocket keep-alive and reconnection configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebSocketConfig {
+    /// Ping interval in seconds (Dhan spec: 10 seconds).
+    pub ping_interval_secs: u64,
+    /// Pong timeout in seconds (WARN if no pong after this).
+    pub pong_timeout_secs: u64,
+    /// Reconnect after this many consecutive pong failures.
+    pub max_consecutive_pong_failures: u32,
+    /// Initial reconnection delay in milliseconds.
+    pub reconnect_initial_delay_ms: u64,
+    /// Maximum reconnection delay in milliseconds.
+    pub reconnect_max_delay_ms: u64,
+    /// Maximum reconnection attempts before giving up.
+    pub reconnect_max_attempts: u32,
+    /// Maximum instruments per subscription message (Dhan limit: 100).
+    pub subscription_batch_size: usize,
 }
 
 /// QuestDB connection configuration.
@@ -232,6 +252,27 @@ impl ApplicationConfig {
             bail!("instrument.csv_download_timeout_secs must be > 0");
         }
 
+        // WebSocket: ping interval must be positive.
+        if self.websocket.ping_interval_secs == 0 {
+            bail!("websocket.ping_interval_secs must be > 0");
+        }
+
+        // WebSocket: subscription batch must be in [1, 100] (Dhan limit).
+        if self.websocket.subscription_batch_size == 0
+            || self.websocket.subscription_batch_size > crate::constants::SUBSCRIPTION_BATCH_SIZE
+        {
+            bail!(
+                "websocket.subscription_batch_size must be in [1, {}], got {}",
+                crate::constants::SUBSCRIPTION_BATCH_SIZE,
+                self.websocket.subscription_batch_size
+            );
+        }
+
+        // WebSocket: reconnect attempts must be positive.
+        if self.websocket.reconnect_max_attempts == 0 {
+            bail!("websocket.reconnect_max_attempts must be > 0");
+        }
+
         Ok(())
     }
 }
@@ -266,6 +307,15 @@ mod tests {
                     .to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+            },
+            websocket: WebSocketConfig {
+                ping_interval_secs: 10,
+                pong_timeout_secs: 10,
+                max_consecutive_pong_failures: 2,
+                reconnect_initial_delay_ms: 500,
+                reconnect_max_delay_ms: 30000,
+                reconnect_max_attempts: 10,
+                subscription_batch_size: 100,
             },
             questdb: QuestDbConfig {
                 host: "dlt-questdb".to_string(),

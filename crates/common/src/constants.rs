@@ -43,11 +43,20 @@ pub const MAX_TOTAL_SUBSCRIPTIONS: usize =
 // Dhan WebSocket V2 — Protocol Constants
 // ---------------------------------------------------------------------------
 
-/// Ping interval in seconds (keep-alive heartbeat).
-pub const PING_INTERVAL_SECS: u64 = 30;
+/// Ping interval in seconds (Dhan spec: client sends ping every 10 seconds).
+pub const PING_INTERVAL_SECS: u64 = 10;
 
-/// Pong timeout in seconds (disconnect if no pong received).
+/// Pong timeout in seconds (if no pong received after ping, log WARN).
 pub const PONG_TIMEOUT_SECS: u64 = 10;
+
+/// Server disconnects if no ping received within this many seconds.
+pub const SERVER_PING_TIMEOUT_SECS: u64 = 40;
+
+/// Maximum consecutive pong failures before triggering reconnect.
+pub const MAX_CONSECUTIVE_PONG_FAILURES: u32 = 2;
+
+/// Maximum instruments per subscription message (Dhan limit).
+pub const SUBSCRIPTION_BATCH_SIZE: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Exchange Segment Codes (Binary Protocol)
@@ -70,6 +79,101 @@ pub const EXCHANGE_SEGMENT_BSE_FNO: u8 = 4;
 
 /// MCX_COMM segment code in Dhan binary protocol.
 pub const EXCHANGE_SEGMENT_MCX_COMM: u8 = 5;
+
+// ---------------------------------------------------------------------------
+// Dhan WebSocket V2 — Disconnect Error Codes
+// ---------------------------------------------------------------------------
+
+/// Exceeded max connections (5 per account).
+pub const DISCONNECT_EXCEEDED_MAX_CONNECTIONS: u16 = 801;
+
+/// Exceeded max instruments per connection (5000).
+pub const DISCONNECT_EXCEEDED_MAX_INSTRUMENTS: u16 = 802;
+
+/// Authentication failed — invalid access token.
+pub const DISCONNECT_AUTH_FAILED: u16 = 803;
+
+/// Token expired — must refresh and reconnect.
+pub const DISCONNECT_TOKEN_EXPIRED: u16 = 804;
+
+/// Server maintenance — wait and reconnect with backoff.
+pub const DISCONNECT_SERVER_MAINTENANCE: u16 = 805;
+
+/// Connection timeout — no ping received in 40 seconds.
+pub const DISCONNECT_PING_TIMEOUT: u16 = 806;
+
+/// Invalid subscription request format.
+pub const DISCONNECT_INVALID_SUBSCRIPTION: u16 = 807;
+
+/// Total subscription limit exceeded (25000 across all connections).
+pub const DISCONNECT_SUBSCRIPTION_LIMIT: u16 = 808;
+
+/// Force-disconnected by Dhan kill switch.
+pub const DISCONNECT_FORCE_KILLED: u16 = 810;
+
+/// Invalid client ID in connection headers.
+pub const DISCONNECT_INVALID_CLIENT_ID: u16 = 814;
+
+// ---------------------------------------------------------------------------
+// Dhan WebSocket V2 — Response Codes (Binary Protocol)
+// ---------------------------------------------------------------------------
+
+/// Response code for index ticker packet (25 bytes).
+pub const RESPONSE_CODE_INDEX_TICKER: u8 = 1;
+
+/// Response code for ticker packet (25 bytes).
+pub const RESPONSE_CODE_TICKER: u8 = 2;
+
+/// Response code for quote packet (51 bytes).
+pub const RESPONSE_CODE_QUOTE: u8 = 4;
+
+/// Response code for OI data packet (17 bytes).
+pub const RESPONSE_CODE_OI: u8 = 5;
+
+/// Response code for previous close packet (20 bytes).
+pub const RESPONSE_CODE_PREVIOUS_CLOSE: u8 = 6;
+
+/// Response code for market status packet (10 bytes).
+pub const RESPONSE_CODE_MARKET_STATUS: u8 = 7;
+
+/// Response code for full packet (162 bytes).
+pub const RESPONSE_CODE_FULL: u8 = 8;
+
+/// Response code for disconnect (variable length).
+pub const RESPONSE_CODE_DISCONNECT: u8 = 50;
+
+// ---------------------------------------------------------------------------
+// Dhan WebSocket V2 — Market Status Codes
+// ---------------------------------------------------------------------------
+
+/// Market is closed.
+pub const MARKET_STATUS_CLOSED: u16 = 0;
+
+/// Pre-open session.
+pub const MARKET_STATUS_PRE_OPEN: u16 = 1;
+
+/// Market is open for continuous trading.
+pub const MARKET_STATUS_OPEN: u16 = 2;
+
+/// Post-close session.
+pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
+
+// ---------------------------------------------------------------------------
+// Dhan WebSocket V2 — Subscription Request Codes
+// ---------------------------------------------------------------------------
+
+/// Unsubscription request code.
+pub const FEED_REQUEST_UNSUBSCRIBE: u8 = 12;
+
+// ---------------------------------------------------------------------------
+// Dhan WebSocket V2 — Binary Header
+// ---------------------------------------------------------------------------
+
+/// Size of the binary response header in bytes.
+pub const BINARY_HEADER_SIZE: usize = 8;
+
+/// OI data packet size in bytes.
+pub const OI_PACKET_SIZE: usize = 17;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Feed Request Type Codes

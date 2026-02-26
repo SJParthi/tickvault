@@ -408,7 +408,10 @@ mod tests {
             issued_at: now_ist - Duration::hours(25),    // issued 25 hours ago
         };
 
-        assert!(!state.is_valid(), "Token with past expires_at must not be valid");
+        assert!(
+            !state.is_valid(),
+            "Token with past expires_at must not be valid"
+        );
     }
 
     #[test]
@@ -491,7 +494,11 @@ mod tests {
 
         // Verify no extra fields are present
         let obj = json_value.as_object().expect("should be an object");
-        assert_eq!(obj.len(), 3, "GenerateTokenRequest should have exactly 3 fields");
+        assert_eq!(
+            obj.len(),
+            3,
+            "GenerateTokenRequest should have exactly 3 fields"
+        );
     }
 
     #[test]
@@ -508,7 +515,11 @@ mod tests {
         assert_eq!(json_value["totp"], "654321");
 
         let obj = json_value.as_object().expect("should be an object");
-        assert_eq!(obj.len(), 2, "RenewTokenRequest should have exactly 2 fields");
+        assert_eq!(
+            obj.len(),
+            2,
+            "RenewTokenRequest should have exactly 2 fields"
+        );
     }
 
     #[test]
@@ -580,7 +591,10 @@ mod tests {
         let state = TokenState::from_response(&response_data);
 
         // u32::MAX = 4294967295 seconds (~136 years). Token should be valid.
-        assert!(state.is_valid(), "Token with u32::MAX expires_in should be valid");
+        assert!(
+            state.is_valid(),
+            "Token with u32::MAX expires_in should be valid"
+        );
         assert!(
             state.expires_at() > state.issued_at(),
             "expires_at must be after issued_at"

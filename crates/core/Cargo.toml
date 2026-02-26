@@ -9,6 +9,7 @@ license.workspace = true
 dhan-live-trader-common = { path = "../common" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 zerocopy = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }

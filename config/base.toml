@@ -38,6 +38,15 @@ max_connections = 16
 host = "dlt-prometheus"
 port = 9090
 
+[websocket]
+ping_interval_secs = 10
+pong_timeout_secs = 10
+max_consecutive_pong_failures = 2
+reconnect_initial_delay_ms = 500
+reconnect_max_delay_ms = 30000
+reconnect_max_attempts = 10
+subscription_batch_size = 100
+
 [network]
 request_timeout_ms = 5000
 websocket_connect_timeout_ms = 10000

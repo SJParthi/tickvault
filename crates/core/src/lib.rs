@@ -15,3 +15,4 @@
 
 pub mod auth;
 pub mod instrument;
+pub mod websocket;

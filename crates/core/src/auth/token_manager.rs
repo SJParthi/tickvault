@@ -556,7 +556,9 @@ mod tests {
         // Main thread participates in barrier to release everyone
         barrier.wait();
 
-        writer_handle.join().expect("writer thread should not panic");
+        writer_handle
+            .join()
+            .expect("writer thread should not panic");
         for h in reader_handles {
             h.join().expect("reader thread should not panic");
         }
@@ -584,7 +586,10 @@ mod tests {
         }
 
         let guard = handle.load();
-        let state = guard.as_ref().as_ref().expect("should have token after 100 stores");
+        let state = guard
+            .as_ref()
+            .as_ref()
+            .expect("should have token after 100 stores");
         assert_eq!(
             state.access_token().expose_secret(),
             format!("jwt-{}", total_stores - 1),
@@ -614,7 +619,10 @@ mod tests {
 
         // handle_two must see the update
         let guard = handle_two.load();
-        let state = guard.as_ref().as_ref().expect("handle_two should see the stored token");
+        let state = guard
+            .as_ref()
+            .as_ref()
+            .expect("handle_two should see the stored token");
         assert_eq!(
             state.access_token().expose_secret(),
             "shared-jwt",
@@ -630,7 +638,10 @@ mod tests {
         handle_two.store(Arc::new(Some(TokenState::from_response(&data_v2))));
 
         let guard_one = handle_one.load();
-        let state_one = guard_one.as_ref().as_ref().expect("handle_one should see handle_two's update");
+        let state_one = guard_one
+            .as_ref()
+            .as_ref()
+            .expect("handle_one should see handle_two's update");
         assert_eq!(
             state_one.access_token().expose_secret(),
             "shared-jwt-v2",
@@ -658,7 +669,10 @@ mod tests {
         {
             let guard = handle.load();
             let state = guard.as_ref().as_ref().expect("should have old token");
-            assert_eq!(state.access_token().expose_secret(), "old-token-to-be-replaced");
+            assert_eq!(
+                state.access_token().expose_secret(),
+                "old-token-to-be-replaced"
+            );
         }
 
         // Store new token — this replaces the old Arc, which should be dropped

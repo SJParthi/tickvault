@@ -1105,7 +1105,8 @@ mod tests {
     fn test_naive_date_to_timestamp_nanos_far_future() {
         // 2099-12-31 — must not overflow or return an error.
         let far_future = NaiveDate::from_ymd_opt(2099, 12, 31).expect("valid date");
-        let ts = naive_date_to_timestamp_nanos(far_future).expect("far future date must not overflow");
+        let ts =
+            naive_date_to_timestamp_nanos(far_future).expect("far future date must not overflow");
 
         // 2099-12-31 midnight IST = 2099-12-30 18:30:00 UTC.
         // Must be well past 2020 epoch.

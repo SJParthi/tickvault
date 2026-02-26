@@ -1,7 +1,7 @@
 # Codebase Map — dhan-live-trader
 
 > Session start: read THIS + `bible_versions.md`. Skip CLAUDE.md (auto-loads), skip PDFs.
-> Updated: 2026-02-26 after Block 02 + hardening + BSE filter fix + test audit.
+> Updated: 2026-02-26 after Block 03 — WebSocket Connection Manager.
 
 ## File Tree
 
@@ -20,7 +20,7 @@ dhan-live-trader/
 │   │   ├── types.rs                    # Exchange, ExchangeSegment, FeedMode, InstrumentType, OptionType
 │   │   └── instrument_types.rs         # FnoUniverse, Underlying, DerivativeContract, OptionChain, etc.
 │   ├── core/src/                       # Core engine
-│   │   ├── lib.rs                      # Re-exports: auth, instrument
+│   │   ├── lib.rs                      # Re-exports: auth, instrument, websocket
 │   │   ├── auth/
 │   │   │   ├── mod.rs                  # Re-exports auth submodules
 │   │   │   ├── secret_manager.rs       # SSM fetch (LocalStack/AWS) → DhanCredentials
@@ -33,6 +33,12 @@ dhan-live-trader/
 │   │       ├── csv_parser.rs           # Parse 260K rows → 147K RawInstruments
 │   │       ├── universe_builder.rs     # 5-pass F&O universe build → FnoUniverse
 │   │       └── validation.rs           # Post-build validation (must-exist checks)
+│   │   └── websocket/
+│   │       ├── mod.rs                  # Re-exports websocket submodules
+│   │       ├── types.rs               # ConnectionState, DisconnectCode, WebSocketError, InstrumentSubscription
+│   │       ├── subscription_builder.rs # JSON batch builder (≤100 instruments/msg)
+│   │       ├── connection.rs          # Single WebSocket lifecycle (connect, subscribe, ping, read)
+│   │       └── connection_pool.rs     # Multi-connection pool (up to 5 connections, 25K instruments)
 │   ├── storage/src/                    # Persistence layer
 │   │   ├── lib.rs                      # Re-exports: instrument_persistence
 │   │   └── instrument_persistence.rs   # QuestDB ILP writer (4 tables)
@@ -70,6 +76,7 @@ dhan-live-trader/
 [questdb]     # host "dlt-questdb", http_port 9000, pg_port 8812, ilp_port 9009
 [valkey]      # host "dlt-valkey", port 6379, max_connections 16
 [prometheus]  # host "dlt-prometheus", port 9090
+[websocket]   # ping 10s, pong_timeout 10s, reconnect backoff, batch_size 100
 [network]     # request_timeout_ms 5000, ws_timeout_ms 10000, backoff, retries
 [token]       # validity_hours 24, refresh_before_expiry_hours 1
 [risk]        # max_daily_loss_percent 2.0, max_position_lots 50
@@ -130,6 +137,34 @@ token_manager::TokenManager::current_token(&self) -> Option<Arc<TokenState>>
 token_manager::TokenManager::spawn_renewal_task(&self) -> JoinHandle<()>
 ```
 
+### core::websocket
+```rust
+// types.rs — connection types, errors, protocol constants
+ConnectionState { Disconnected, Connecting, Connected, Reconnecting }
+DisconnectCode::from_u16(code) -> Self   // 801-814 Dhan codes
+DisconnectCode::is_reconnectable(&self) -> bool
+DisconnectCode::requires_token_refresh(&self) -> bool
+InstrumentSubscription::new(segment, security_id) -> Self
+WebSocketError { ConnectionFailed, NoTokenAvailable, DhanDisconnect, ... }
+
+// subscription_builder.rs — JSON message batching
+build_subscription_messages(instruments, feed_mode, batch_size) -> Vec<String>
+build_unsubscription_messages(instruments, batch_size) -> Vec<String>
+
+// connection.rs — single WebSocket lifecycle
+WebSocketConnection::new(id, token, client_id, dhan_config, ws_config, instruments, feed_mode, sender) -> Self
+WebSocketConnection::run(&self) -> Result<(), WebSocketError>  // async — connect, subscribe, ping, read loop
+WebSocketConnection::health(&self) -> ConnectionHealth
+
+// connection_pool.rs — multi-connection manager
+WebSocketConnectionPool::new(token, client_id, dhan_config, ws_config, instruments, feed_mode) -> Result<Self>
+WebSocketConnectionPool::spawn_all(&self) -> Vec<JoinHandle<Result<()>>>
+WebSocketConnectionPool::take_frame_receiver(&mut self) -> mpsc::Receiver<Vec<u8>>
+WebSocketConnectionPool::health(&self) -> Vec<ConnectionHealth>
+WebSocketConnectionPool::connection_count(&self) -> usize
+WebSocketConnectionPool::total_instruments(&self) -> usize
+```
+
 ### core::instrument
 ```rust
 csv_downloader::download_instrument_csv(config) -> Result<Vec<u8>>
@@ -171,9 +206,18 @@ TokenState {
     expires_at: DateTime<Utc>,
     issued_at: DateTime<Utc>,
 }
+
+// TokenHandle — O(1) atomic read for WebSocket auth header injection
+type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
+
+// ConnectionHealth — monitoring snapshot per WebSocket connection
+ConnectionHealth {
+    connection_id: u8, state: ConnectionState,
+    subscribed_count: usize, total_reconnections: u64,
+}
 ```
 
-## Test Counts (257 total)
+## Test Counts (301 total)
 
 | Crate | Module | Tests |
 |-------|--------|-------|
@@ -189,8 +233,12 @@ TokenState {
 | core | instrument/csv_parser | 53 |
 | core | instrument/universe_builder | 54 |
 | core | instrument/validation | 12 |
+| core | websocket/types | 17 |
+| core | websocket/subscription_builder | 15 |
+| core | websocket/connection | 4 |
+| core | websocket/connection_pool | 8 |
 | storage | instrument_persistence | 25 |
-| **Total** | | **257** |
+| **Total** | | **301** |
 
 ## QuestDB Tables (4) — DEDUP UPSERT KEYS enabled on all
 
@@ -234,3 +282,4 @@ TokenState {
 - **Test audit**: 37 coverage gaps closed (211 → 250)
 - **BSE filter fix**: BSE stock derivatives filtered in Pass 3 + Pass 5, 7 new tests (250 → 257)
 - **Bible fix**: Section 1 Frontend corrected to SolidJS (not Grafana), total 113 components
+- **Block 03**: WebSocket Connection Manager (types, subscription builder, connection lifecycle, connection pool) — 44 new tests (257 → 301)
