@@ -2,7 +2,7 @@
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads), skip PDFs.
 > Bible: `tech_stack_bible_v6.md` — read ONLY when adding a new dependency.
-> Updated: 2026-02-26 after Blocks 04-06 + API + Frontend (full tick-to-TradingView pipeline).
+> Updated: 2026-02-26 after O(1) hardening, ticks DDL, portal page, rustls TLS fix (515 tests).
 
 ## File Tree
 
@@ -74,11 +74,12 @@ dhan-live-trader/
 │   │       ├── health.rs              # GET /health → JSON status + version
 │   │       ├── candles.rs             # GET /api/candles/:security_id?timeframe=5m → QuestDB SAMPLE BY
 │   │       ├── websocket.rs           # WS /ws/live → subscribe/switch_timeframe, candle_update streaming
-│   │       └── static_file.rs        # GET / → serves index.html from embedded static/
+│   │       └── static_file.rs        # GET / → index.html, GET /portal → portal.html (embedded at compile time)
 │   │   └── static/
-│   │       └── index.html             # TradingView Lightweight Charts v5.1.0 — full interval selector
+│   │       ├── index.html             # TradingView Lightweight Charts v5.1.0 — full interval selector
+│   │       └── portal.html            # DLT Control Panel — nav dashboard with live status + stats
 │   └── app/
-│       ├── src/main.rs                 # Full orchestration: Config → Auth → WS → Parse → Candle → Persist → HTTP
+│       ├── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → WS → Parse → Candle → Persist → HTTP
 │       └── examples/
 │           └── persist_snapshot.rs      # Integration example: CSV → Universe → QuestDB
 ├── deploy/docker/
@@ -94,7 +95,6 @@ dhan-live-trader/
 │   └── notify-telegram.sh             # Sends Telegram alerts via real AWS SSM
 └── docs/
     ├── tech_stack_bible_v6.md          # 113 components (converted from PDF)
-    ├── bible_versions.md              # Quick-reference active + planned dep versions
     ├── codebase_map.md                 # THIS FILE
     └── phases/
         └── PHASE_1_LIVE_TRADING.md     # Full Phase 1 spec (1,412 lines)
@@ -316,11 +316,11 @@ instrument_persistence::persist_instrument_snapshot(
     universe: &FnoUniverse, questdb_config: &QuestDbConfig
 ) -> Result<()>
 
-// tick_persistence.rs — live tick data to QuestDB
+// tick_persistence.rs — live tick data to QuestDB (explicit DDL + ILP writes)
 TickPersistenceWriter::new(config: &QuestDbConfig) -> Result<Self>
 TickPersistenceWriter::write_tick(&mut self, tick: &ParsedTick) -> Result<()>
 TickPersistenceWriter::flush(&mut self) -> Result<()>
-ensure_tick_table_dedup_keys(config: &QuestDbConfig) -> ()  // async — creates ticks + candles_1s tables
+ensure_tick_table_dedup_keys(config: &QuestDbConfig) -> ()  // async — CREATE TABLE IF NOT EXISTS + DEDUP UPSERT KEYS
 ```
 
 ### api
@@ -333,6 +333,7 @@ SharedAppState::new(candle_tx: broadcast::Sender<CandleBroadcastMessage>, questd
 
 // handlers
 GET  /              → TradingView frontend (index.html with Lightweight Charts v5.1.0)
+GET  /portal        → DLT Control Panel (nav dashboard with live status, stats, service links)
 GET  /health        → { "status": "ok", "version": "0.1.0" }
 GET  /api/intervals → { "time": ["1s","5s",...,"1Y"], "tick": ["1T","10T","100T","1000T"] }
 GET  /api/candles/:security_id?timeframe=5m&from=<epoch>&to=<epoch>  → candle array
@@ -410,7 +411,7 @@ CRITICAL: Quote vs Full diverge at offset 34. Quote has OHLC(f32). Full has OI(u
 Prices are f32 in rupees (NOT paise). No division needed.
 ```
 
-## Test Counts (483 total)
+## Test Counts (515 total)
 
 | Crate | Module | Tests |
 |-------|--------|-------|
@@ -446,8 +447,9 @@ Prices are f32 in rupees (NOT paise). No division needed.
 | core | pipeline | 3 |
 | storage | instrument_persistence | 25 |
 | storage | tick_persistence | 11 |
-| api | handlers | 3 |
-| **Total** | | **483** |
+| api | handlers | 5 |
+| api | static_file | 2 |
+| **Total** | | **515** |
 
 ## QuestDB Tables (6) — DEDUP UPSERT KEYS enabled on all
 
@@ -487,6 +489,7 @@ Prices are f32 in rupees (NOT paise). No division needed.
 ## App Boot Sequence (main.rs)
 
 ```
+0. Install rustls CryptoProvider (aws_lc_rs — must happen before ANY TLS usage)
 1. Load config/base.toml → ApplicationConfig → validate()
 2. Initialize tracing (structured logging)
 3. Authenticate: SSM → TOTP → POST auth.dhan.co → JWT (graceful: OFFLINE mode if fails)
@@ -503,6 +506,7 @@ Prices are f32 in rupees (NOT paise). No division needed.
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/` | TradingView frontend (index.html) |
+| GET | `/portal` | DLT Control Panel — nav dashboard |
 | GET | `/health` | Health check + version |
 | GET | `/api/intervals` | Available time + tick intervals |
 | GET | `/api/candles/:id` | Historical candles from QuestDB |
@@ -544,3 +548,9 @@ Prices are f32 in rupees (NOT paise). No division needed.
 - **Auth fix**: Dhan endpoint corrected (auth.dhan.co, query params, flat camelCase response, 200-OK-error detection)
 - **Offline mode**: App starts API server even when auth fails — graceful degradation for development
 - **End-to-end verified**: App boots in ~1s, TradingView chart loads at localhost:3001, all 483 tests pass
+- **Candle API wired**: GET /api/candles/:id queries QuestDB SAMPLE BY with IST offset — 32 new tests (483 → 515)
+- **O(1) hardening**: Removed `.clone()` on Vec in candle_manager hot path (216 bytes/tick), pre-allocated HashMaps
+- **Ticks DDL**: Explicit CREATE TABLE IF NOT EXISTS for ticks (was auto-created by ILP — now predictable schema)
+- **TLS fix**: Install rustls CryptoProvider (aws_lc_rs) as Step 0 in main.rs — fixes WebSocket panic
+- **Portal page**: `/portal` route — DLT Control Panel with live status checks, QuestDB stats, service links
+- **Auth verified**: Dhan PIN corrected in SSM — app starts in LIVE mode (token acquired, renewal task running)
