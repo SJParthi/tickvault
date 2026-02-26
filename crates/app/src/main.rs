@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::tick_types::{CandleBroadcastMessage, TickInterval, Timeframe};
+use dhan_live_trader_common::tick_types::{PreSerializedCandleUpdate, TickInterval, Timeframe};
 use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
 
 use dhan_live_trader_core::auth::secret_manager;
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
     // Step 6: Create candle broadcast channel + spawn tick processor
     // -----------------------------------------------------------------------
     let (candle_tx, _candle_rx) =
-        broadcast::channel::<CandleBroadcastMessage>(config.pipeline.candle_broadcast_capacity);
+        broadcast::channel::<PreSerializedCandleUpdate>(config.pipeline.candle_broadcast_capacity);
 
     let candle_tx_clone = candle_tx.clone();
 

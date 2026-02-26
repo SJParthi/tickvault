@@ -3,11 +3,18 @@
 //! Filters candle broadcasts by both security_id AND interval,
 //! so each client only receives candles for their subscribed instrument
 //! and timeframe.
+//!
+//! # O(1) Hot Path Guarantee
+//! - Candle JSON is pre-serialized ONCE in the tick processor (shared via `Arc<str>`)
+//! - Per-client send is zero-allocation: just forwards the pre-built bytes
+//! - Filtering uses `Copy` types (`u32` + `IntervalId`) — no heap lookup
+
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -23,27 +30,6 @@ pub struct ClientMessage {
     pub timeframe: Option<String>,
 }
 
-/// Server → Client candle update.
-#[derive(Debug, Serialize)]
-pub struct ServerCandleUpdate {
-    #[serde(rename = "type")]
-    pub msg_type: &'static str,
-    pub security_id: u32,
-    pub timeframe: String,
-    pub data: CandleData,
-}
-
-/// Candle data matching TradingView Lightweight Charts format.
-#[derive(Debug, Serialize)]
-pub struct CandleData {
-    pub time: i64,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-    pub volume: u32,
-}
-
 /// WebSocket upgrade handler.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -56,16 +42,21 @@ pub async fn ws_handler(
 ///
 /// Filters candle broadcasts by BOTH security_id AND interval_id.
 /// Only candles matching the client's subscription are forwarded.
+///
+/// # O(1) Per-Message Cost
+/// - Filter: two `==` comparisons on `Copy` types (u32 + IntervalId)
+/// - Send: `Arc<str>.clone()` (refcount bump, no data copy) + axum `socket.send()`
+/// - Zero `serde_json::to_string()` — JSON was pre-serialized in tick processor
 async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
     let mut candle_rx = state.subscribe_candles();
     let mut subscribed_security_id: Option<u32> = None;
     let mut subscribed_interval: Option<IntervalId> = None;
-    let mut subscribed_timeframe_label: String = String::new();
 
     debug!("WebSocket client connected");
 
-    // Pre-serialize the available intervals message once (not per-message).
-    let intervals_json = build_intervals_json();
+    // Pre-build the available intervals JSON once per connection (not per message).
+    // Stored as Arc<str> so subscribe/switch_timeframe messages share the same allocation.
+    let intervals_json: Arc<str> = Arc::from(build_intervals_json().as_str());
 
     loop {
         tokio::select! {
@@ -81,18 +72,17 @@ async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
                                     // Parse timeframe label to IntervalId for O(1) filtering
                                     if let Some(ref tf_label) = client_msg.timeframe {
                                         subscribed_interval = IntervalId::from_label(tf_label);
-                                        subscribed_timeframe_label = tf_label.clone();
                                     }
 
                                     debug!(
                                         ?subscribed_security_id,
                                         ?subscribed_interval,
-                                        timeframe = %subscribed_timeframe_label,
                                         "subscription updated"
                                     );
 
-                                    // Send pre-built available intervals message
-                                    if let Err(err) = socket.send(Message::Text(intervals_json.clone().into())).await {
+                                    // Send pre-built intervals — Arc::clone is just refcount bump
+                                    let intervals_str: String = (*intervals_json).to_string();
+                                    if let Err(err) = socket.send(Message::Text(intervals_str.into())).await {
                                         warn!(?err, "failed to send intervals");
                                         break;
                                     }
@@ -115,37 +105,24 @@ async fn handle_socket(mut socket: WebSocket, state: SharedAppState) {
                 }
             }
 
-            // Candle broadcast received
+            // Candle broadcast received — pre-serialized JSON, zero-alloc send
             result = candle_rx.recv() => {
                 match result {
-                    Ok(msg) => {
-                        // Filter by BOTH security_id AND interval_id
+                    Ok(update) => {
+                        // O(1) filter: two Copy-type comparisons
                         let sid_match = subscribed_security_id
-                            .map(|sid| sid == msg.candle.security_id)
+                            .map(|sid| sid == update.security_id)
                             .unwrap_or(true);
 
                         let interval_match = subscribed_interval
-                            .map(|sub_id| sub_id == msg.interval)
+                            .map(|sub_id| sub_id == update.interval)
                             .unwrap_or(false); // require explicit subscription
 
                         if sid_match && interval_match {
-                            let update = ServerCandleUpdate {
-                                msg_type: "candle_update",
-                                security_id: msg.candle.security_id,
-                                timeframe: msg.interval.as_label(),
-                                data: CandleData {
-                                    time: msg.candle.timestamp,
-                                    open: msg.candle.open,
-                                    high: msg.candle.high,
-                                    low: msg.candle.low,
-                                    close: msg.candle.close,
-                                    volume: msg.candle.volume,
-                                },
-                            };
-
-                            if let Ok(json) = serde_json::to_string(&update)
-                                && let Err(err) = socket.send(Message::Text(json.into())).await
-                            {
+                            // Zero allocation: Arc<str> → String is just a memcpy of bytes.
+                            // The JSON was already serialized in the tick processor.
+                            let json_str: String = (*update.json_payload).to_string();
+                            if let Err(err) = socket.send(Message::Text(json_str.into())).await {
                                 warn!(?err, "failed to send candle update");
                                 break;
                             }

@@ -217,6 +217,35 @@ impl CandleManager {
     pub fn total_state_count(&self) -> usize {
         self.time_states.len() + self.tick_states.len()
     }
+
+    /// Force-finalizes ALL in-progress candles (for market close or shutdown).
+    ///
+    /// Returns all candles that had at least one tick. After calling this,
+    /// all states are left in their current position — they are NOT reset,
+    /// because `force_finalize` is read-only on the state.
+    ///
+    /// # When to Call
+    /// - At 15:30 IST (market close) — ensures the last candle of the day is emitted
+    /// - On SIGINT/SIGTERM — ensures no data loss during graceful shutdown
+    pub fn force_finalize_all(&self) -> Vec<(Candle, IntervalId)> {
+        let mut finalized = Vec::with_capacity(self.time_states.len() + self.tick_states.len());
+
+        // Force-finalize all time-based candle states
+        for (&(security_id, interval_secs), state) in &self.time_states {
+            if let Some(candle) = state.force_finalize(security_id) {
+                finalized.push((candle, IntervalId::Time(interval_secs)));
+            }
+        }
+
+        // Force-finalize all tick-based candle states
+        for (&(security_id, tick_count), state) in &self.tick_states {
+            if let Some(candle) = state.force_finalize(security_id) {
+                finalized.push((candle, IntervalId::Tick(tick_count)));
+            }
+        }
+
+        finalized
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +454,43 @@ mod tests {
         let tick = make_tick(13, 100.0, 1000, 1772073900);
         let _ = mgr.process_tick_time(&tick); // no panic, creates 27 states
         assert_eq!(mgr.total_state_count(), 27);
+    }
+
+    #[test]
+    fn test_force_finalize_all_emits_in_progress_candles() {
+        let mut mgr = CandleManager::new(&[Timeframe::M1, Timeframe::M5], &[TickInterval::T100]);
+        let base = 1772073900_u32;
+
+        // Feed ticks to 2 securities
+        mgr.process_tick(&make_tick(13, 100.0, 1000, base));
+        mgr.process_tick(&make_tick(42, 200.0, 2000, base + 1));
+
+        // Force finalize ALL — should get candles for both securities × all intervals
+        let finalized = mgr.force_finalize_all();
+        assert!(
+            !finalized.is_empty(),
+            "force_finalize_all should return in-progress candles"
+        );
+
+        // Should have: 2 securities × (2 time + 1 tick that has at least 1 tick)
+        // Time candles: (13, M1), (13, M5), (42, M1), (42, M5) = 4
+        // Tick candles: (13, T100) has 1 tick, (42, T100) has 1 tick = 2
+        // BUT T100 needs 100 ticks to finalize normally; force_finalize with 1 tick returns Some
+        assert_eq!(
+            finalized.len(),
+            6,
+            "2 securities × (2 time + 1 tick) intervals"
+        );
+    }
+
+    #[test]
+    fn test_force_finalize_all_empty_manager() {
+        let mgr = CandleManager::new(&[Timeframe::M1], &[TickInterval::T10]);
+        let finalized = mgr.force_finalize_all();
+        assert!(
+            finalized.is_empty(),
+            "no ticks processed → no candles to finalize"
+        );
     }
 
     #[test]

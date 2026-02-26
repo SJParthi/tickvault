@@ -5,6 +5,7 @@
 //! for zero-allocation on the hot path.
 
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -385,7 +386,7 @@ impl TickInterval {
         }
     }
 
-    /// Returns the canonical string label.
+    /// Returns the canonical string label (allocates for Custom variants).
     pub fn as_str(&self) -> String {
         match self {
             Self::T1 => "1T".to_string(),
@@ -393,6 +394,20 @@ impl TickInterval {
             Self::T100 => "100T".to_string(),
             Self::T1000 => "1000T".to_string(),
             Self::Custom(n) => format!("{n}T"),
+        }
+    }
+
+    /// Returns a static string label for standard tick intervals.
+    ///
+    /// Returns `None` for custom intervals (which require allocation).
+    /// Use this on hot paths to avoid heap allocation.
+    pub fn as_str_static(&self) -> Option<&'static str> {
+        match self {
+            Self::T1 => Some("1T"),
+            Self::T10 => Some("10T"),
+            Self::T100 => Some("100T"),
+            Self::T1000 => Some("1000T"),
+            Self::Custom(_) => None,
         }
     }
 
@@ -525,19 +540,16 @@ pub enum IntervalId {
 }
 
 impl IntervalId {
-    /// Returns the canonical string label for this interval.
+    /// Returns the canonical string label for this interval (allocates for custom).
     ///
     /// Looks up standard timeframes first, falls back to custom format.
     pub fn as_label(&self) -> String {
+        // Try static version first to avoid allocation for standard intervals
+        if let Some(label) = self.as_label_static() {
+            return label.to_string();
+        }
         match self {
             Self::Time(secs) => {
-                // Try to match a standard Timeframe
-                for tf in Timeframe::all_standard() {
-                    if tf.as_seconds() == *secs {
-                        return tf.as_str().to_string();
-                    }
-                }
-                // Custom time interval
                 if *secs % 3600 == 0 {
                     format!("{}h", secs / 3600)
                 } else if *secs % 60 == 0 {
@@ -549,6 +561,33 @@ impl IntervalId {
             Self::Tick(count) => {
                 format!("{count}T")
             }
+        }
+    }
+
+    /// Returns a static string label for standard intervals (zero allocation).
+    ///
+    /// Returns `None` for custom intervals that require heap allocation.
+    /// Use this on hot paths to avoid `String` allocation.
+    ///
+    /// # Performance
+    /// O(1) — direct match on 31 standard intervals (27 time + 4 tick).
+    pub fn as_label_static(&self) -> Option<&'static str> {
+        match self {
+            Self::Time(secs) => {
+                for tf in Timeframe::all_standard() {
+                    if tf.as_seconds() == *secs {
+                        return Some(tf.as_str());
+                    }
+                }
+                None
+            }
+            Self::Tick(count) => match *count {
+                1 => Some("1T"),
+                10 => Some("10T"),
+                100 => Some("100T"),
+                1000 => Some("1000T"),
+                _ => None,
+            },
         }
     }
 
@@ -605,6 +644,76 @@ pub struct CandleBroadcastMessage {
     pub interval: IntervalId,
     /// The finalized candle data.
     pub candle: Candle,
+}
+
+// ---------------------------------------------------------------------------
+// PreSerializedCandleUpdate — zero-allocation WebSocket broadcast
+// ---------------------------------------------------------------------------
+
+/// Pre-serialized candle update for WebSocket broadcast.
+///
+/// JSON is serialized ONCE in the tick processor and shared via `Arc<str>`
+/// across all WebSocket clients. This eliminates per-client `serde_json::to_string()`
+/// allocation on the hot path.
+///
+/// # Memory Layout
+/// - `security_id` + `interval`: 12 bytes (for O(1) client-side filtering)
+/// - `json_payload`: Arc<str> (16 bytes pointer, shared immutable JSON)
+///
+/// Total per-broadcast: 28 bytes on stack + one shared heap string.
+#[derive(Debug, Clone)]
+pub struct PreSerializedCandleUpdate {
+    /// Security ID for O(1) filtering (avoids deserializing JSON to check).
+    pub security_id: u32,
+    /// Interval ID for O(1) filtering.
+    pub interval: IntervalId,
+    /// Pre-serialized JSON string shared across all WebSocket clients.
+    /// Format: `{"type":"candle_update","security_id":N,"timeframe":"Xm","data":{...}}`
+    pub json_payload: Arc<str>,
+}
+
+impl PreSerializedCandleUpdate {
+    /// Creates a pre-serialized candle update from a broadcast message.
+    ///
+    /// Performs ONE `serde_json` serialization. The resulting `Arc<str>` is
+    /// then shared (Clone = Arc refcount bump) with every matching WebSocket client.
+    ///
+    /// # Performance
+    /// One allocation per finalized candle (NOT per tick, NOT per client).
+    /// With 31 intervals and ~250 securities, worst case is ~7750 allocations
+    /// per interval rollover — but interval rollovers happen once per interval
+    /// duration (1s minimum), so this is well within budget.
+    pub fn from_broadcast(msg: &CandleBroadcastMessage) -> Self {
+        // Use as_label_static for zero-alloc on standard intervals,
+        // fall back to as_label (allocates) for custom intervals.
+        let timeframe_label = msg
+            .interval
+            .as_label_static()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| msg.interval.as_label());
+
+        let json = serde_json::json!({
+            "type": "candle_update",
+            "security_id": msg.candle.security_id,
+            "timeframe": timeframe_label,
+            "data": {
+                "time": msg.candle.timestamp,
+                "open": msg.candle.open,
+                "high": msg.candle.high,
+                "low": msg.candle.low,
+                "close": msg.candle.close,
+                "volume": msg.candle.volume
+            }
+        });
+
+        let json_str = json.to_string();
+
+        Self {
+            security_id: msg.candle.security_id,
+            interval: msg.interval,
+            json_payload: Arc::from(json_str.as_str()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

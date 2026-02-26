@@ -384,7 +384,7 @@ mod tests {
                 port: 3001,
             },
             pipeline: PipelineConfig {
-                candle_broadcast_capacity: 4096,
+                candle_broadcast_capacity: 16_384,
             },
         }
     }

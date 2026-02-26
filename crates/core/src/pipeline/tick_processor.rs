@@ -13,7 +13,9 @@ use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
-use dhan_live_trader_common::tick_types::{CandleBroadcastMessage, TickInterval, Timeframe};
+use dhan_live_trader_common::tick_types::{
+    CandleBroadcastMessage, PreSerializedCandleUpdate, TickInterval, Timeframe,
+};
 
 use crate::candle::CandleManager;
 use crate::parser::dispatch_frame;
@@ -33,7 +35,7 @@ use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
 /// * `tick_intervals` — active tick-count-based intervals
 pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<Vec<u8>>,
-    candle_broadcast: broadcast::Sender<CandleBroadcastMessage>,
+    candle_broadcast: broadcast::Sender<PreSerializedCandleUpdate>,
     mut tick_writer: Option<TickPersistenceWriter>,
     timeframes: &[Timeframe],
     tick_intervals: &[TickInterval],
@@ -45,6 +47,7 @@ pub async fn run_tick_processor(
     let mut candles_finalized: u64 = 0;
     let mut parse_errors: u64 = 0;
     let mut storage_errors: u64 = 0;
+    let mut broadcast_drops: u64 = 0;
     let mut last_flush_check = Instant::now();
 
     info!(
@@ -98,16 +101,31 @@ pub async fn run_tick_processor(
                 let finalized_candles = candle_manager.process_tick(&tick);
 
                 // 3. Broadcast finalized candles to API subscribers
-                // Each (candle, interval_id) pair carries the producing interval
-                // so WebSocket subscribers can filter by their subscribed timeframe.
+                // Pre-serialize JSON ONCE here — all WebSocket clients share the Arc<str>.
+                // This eliminates per-client serde_json::to_string() on the hot path.
                 for &(candle, interval_id) in &finalized_candles {
                     candles_finalized += 1;
                     let msg = CandleBroadcastMessage {
                         interval: interval_id,
                         candle,
                     };
-                    // broadcast::send only fails if there are no receivers — that's fine.
-                    let _ = candle_broadcast.send(msg);
+                    let pre_serialized = PreSerializedCandleUpdate::from_broadcast(&msg);
+                    // broadcast::send only fails if there are no receivers.
+                    // Track send failures for monitoring — silent drops hide backpressure.
+                    match candle_broadcast.send(pre_serialized) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            broadcast_drops += 1;
+                            if broadcast_drops <= 10 {
+                                debug!(
+                                    security_id = candle.security_id,
+                                    interval = %interval_id,
+                                    total_drops = broadcast_drops,
+                                    "candle broadcast dropped — no active subscribers"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 trace!(
@@ -153,7 +171,26 @@ pub async fn run_tick_processor(
         }
     }
 
-    // Channel closed — final flush
+    // Channel closed — force-finalize all in-progress candles (last candle of day)
+    let shutdown_candles = candle_manager.force_finalize_all();
+    let shutdown_candle_count = shutdown_candles.len();
+    for (candle, interval_id) in shutdown_candles {
+        candles_finalized += 1;
+        let msg = CandleBroadcastMessage {
+            interval: interval_id,
+            candle,
+        };
+        let pre_serialized = PreSerializedCandleUpdate::from_broadcast(&msg);
+        let _ = candle_broadcast.send(pre_serialized);
+    }
+    if shutdown_candle_count > 0 {
+        info!(
+            shutdown_candle_count,
+            "force-finalized in-progress candles on shutdown"
+        );
+    }
+
+    // Final tick flush to QuestDB
     if let Some(ref mut writer) = tick_writer
         && let Err(err) = writer.force_flush()
     {
@@ -162,7 +199,12 @@ pub async fn run_tick_processor(
 
     info!(
         frames_processed,
-        ticks_processed, candles_finalized, parse_errors, storage_errors, "tick processor stopped"
+        ticks_processed,
+        candles_finalized,
+        parse_errors,
+        storage_errors,
+        broadcast_drops,
+        "tick processor stopped"
     );
 }
 
@@ -216,14 +258,16 @@ mod tests {
         let frame = make_ticker_frame(13, 24500.0, 1772073900);
         frame_tx.send(frame).await.unwrap();
 
-        // T1 should produce a candle
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), candle_rx.recv())
+        // T1 should produce a pre-serialized candle update
+        let update = tokio::time::timeout(std::time::Duration::from_secs(2), candle_rx.recv())
             .await
             .expect("should receive candle within 2s")
             .expect("broadcast recv should not fail");
 
-        assert_eq!(msg.candle.security_id, 13);
-        assert!((msg.candle.open - 24500.0).abs() < 0.1);
+        assert_eq!(update.security_id, 13);
+        // Verify the pre-serialized JSON contains expected data
+        assert!(update.json_payload.contains("\"security_id\":13"));
+        assert!(update.json_payload.contains("\"candle_update\""));
 
         // Close channel → processor exits
         drop(frame_tx);

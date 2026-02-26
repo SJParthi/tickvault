@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::tick_types::CandleBroadcastMessage;
+use dhan_live_trader_common::tick_types::PreSerializedCandleUpdate;
 use dhan_live_trader_storage::candle_query::QuestDbCandleQuerier;
 
 /// Shared state available to all API handlers via axum's `State` extractor.
@@ -16,7 +16,7 @@ pub struct SharedAppState {
 
 struct AppStateInner {
     /// Broadcast receiver source for live candle updates.
-    candle_broadcast: broadcast::Sender<CandleBroadcastMessage>,
+    candle_broadcast: broadcast::Sender<PreSerializedCandleUpdate>,
     /// QuestDB config for historical candle queries.
     questdb_config: QuestDbConfig,
     /// QuestDB HTTP candle querier (None if QuestDB unavailable).
@@ -26,7 +26,7 @@ struct AppStateInner {
 impl SharedAppState {
     /// Creates new shared state.
     pub fn new(
-        candle_broadcast: broadcast::Sender<CandleBroadcastMessage>,
+        candle_broadcast: broadcast::Sender<PreSerializedCandleUpdate>,
         questdb_config: QuestDbConfig,
     ) -> Self {
         let candle_querier = QuestDbCandleQuerier::new(&questdb_config)
@@ -49,7 +49,7 @@ impl SharedAppState {
     }
 
     /// Returns a new broadcast receiver for candle updates.
-    pub fn subscribe_candles(&self) -> broadcast::Receiver<CandleBroadcastMessage> {
+    pub fn subscribe_candles(&self) -> broadcast::Receiver<PreSerializedCandleUpdate> {
         self.inner.candle_broadcast.subscribe()
     }
 

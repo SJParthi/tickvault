@@ -11,17 +11,28 @@ use dhan_live_trader_common::tick_types::Candle;
 // Price Precision Helper
 // ---------------------------------------------------------------------------
 
-/// Rounds an f32 price to 2 decimal places when converting to f64.
+/// Converts f32 price to f64 with adaptive decimal rounding.
 ///
 /// Dhan sends prices as f32 (e.g., 150.35). Direct `f64::from(f32)` creates
-/// phantom precision artifacts like 150.35000610351562. Rounding to 2 decimals
-/// preserves the intended precision for Indian market prices (paise resolution).
+/// phantom precision artifacts like 150.35000610351562.
+///
+/// Uses adaptive rounding based on price magnitude:
+/// - Prices ≥ 1.0: round to 2 decimals (paise resolution, standard NSE tick size)
+/// - Prices < 1.0: round to 4 decimals (deep OTM option premiums like ₹0.0025)
+///
+/// This handles both regular stocks (₹24500.50) and penny options (₹0.05, ₹0.0025)
+/// while staying within f32's ~7 significant digits.
 ///
 /// # Performance
-/// O(1) — two multiplications, one round, one division.
+/// O(1) — one comparison, two multiplications, one round, one division.
 #[inline]
 fn f32_price_to_f64(price: f32) -> f64 {
-    (f64::from(price) * 100.0).round() / 100.0
+    let val = f64::from(price);
+    if val.abs() >= 1.0 {
+        (val * 100.0).round() / 100.0
+    } else {
+        (val * 10_000.0).round() / 10_000.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +136,11 @@ impl RollingCandleState {
             self.high = self.high.max(price);
             self.low = self.low.min(price);
             self.close = price;
+            // Volume reset detection: if cumulative volume drops below start,
+            // the exchange likely reset (halt/resume). Re-anchor to current.
+            if volume < self.volume_at_start {
+                self.volume_at_start = volume;
+            }
             self.current_volume = volume;
             self.open_interest = oi;
             self.tick_count += 1;
@@ -250,6 +266,10 @@ impl TickCandleState {
         self.high = self.high.max(price);
         self.low = self.low.min(price);
         self.close = price;
+        // Volume reset detection: if cumulative volume drops, re-anchor.
+        if volume < self.volume_at_start {
+            self.volume_at_start = volume;
+        }
         self.current_volume = volume;
         self.open_interest = oi;
         self.tick_count += 1;
@@ -330,6 +350,26 @@ mod tests {
     fn test_f32_price_to_f64_whole_numbers() {
         assert_eq!(f32_price_to_f64(100.0_f32), 100.0);
         assert_eq!(f32_price_to_f64(0.0_f32), 0.0);
+    }
+
+    #[test]
+    fn test_f32_price_to_f64_penny_stock_precision() {
+        // Penny stocks and derivative premiums < ₹1 use 4-decimal precision
+        assert_eq!(f32_price_to_f64(0.05_f32), 0.05);
+        assert_eq!(f32_price_to_f64(0.10_f32), 0.10);
+        // Sub-paise derivative premiums
+        let price_0_0025 = f32_price_to_f64(0.0025_f32);
+        assert!((price_0_0025 - 0.0025).abs() < 0.00005);
+    }
+
+    #[test]
+    fn test_f32_price_to_f64_adaptive_threshold() {
+        // At exactly ₹1.0, use 2-decimal rounding
+        assert_eq!(f32_price_to_f64(1.0_f32), 1.0);
+        assert_eq!(f32_price_to_f64(1.05_f32), 1.05);
+        // Just below ₹1.0, use 4-decimal rounding
+        let val = f32_price_to_f64(0.9999_f32);
+        assert!((val - 0.9999).abs() < 0.0001);
     }
 
     // --- IST Boundary Tests ---
@@ -608,5 +648,45 @@ mod tests {
 
         let candle = result.unwrap();
         assert_eq!(candle.volume, 300, "volume delta: 5300 - 5000");
+    }
+
+    // --- Volume Reset Detection Tests ---
+
+    #[test]
+    fn test_rolling_candle_volume_reset_during_halt() {
+        let mut state = RollingCandleState::new(60);
+        let base_epoch = 1772073900;
+
+        // Start with cumulative volume 10000
+        state.update(100.0, 10000, 0, base_epoch, 13);
+        // Volume increases normally
+        state.update(101.0, 11000, 0, base_epoch + 10, 13);
+        // Exchange halt + resume — volume resets to lower value
+        state.update(102.0, 500, 0, base_epoch + 20, 13);
+        // Volume resumes from reset point
+        state.update(103.0, 1500, 0, base_epoch + 30, 13);
+
+        let candle = state.force_finalize(13).unwrap();
+        // After reset detection: volume_at_start re-anchored to 500,
+        // so delta = 1500 - 500 = 1000
+        assert_eq!(candle.volume, 1000, "volume delta after reset re-anchor");
+    }
+
+    #[test]
+    fn test_tick_candle_volume_reset_during_halt() {
+        let mut state = TickCandleState::new(4);
+        let base_epoch = 1772073900;
+
+        // Start with high volume
+        state.update(100.0, 50000, 0, base_epoch, 13);
+        state.update(101.0, 51000, 0, base_epoch + 1, 13);
+        // Volume resets
+        state.update(102.0, 200, 0, base_epoch + 2, 13);
+        // Final tick with resumed volume
+        let result = state.update(103.0, 800, 0, base_epoch + 3, 13);
+
+        let candle = result.unwrap();
+        // After reset: volume_at_start re-anchored to 200, delta = 800 - 200 = 600
+        assert_eq!(candle.volume, 600, "volume delta after halt reset");
     }
 }

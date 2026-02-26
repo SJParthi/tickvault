@@ -665,7 +665,11 @@ pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
 pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 
 /// Default broadcast channel capacity for candle updates.
-pub const CANDLE_BROADCAST_CAPACITY: usize = 4096;
+///
+/// Sized for worst-case 1-second rollover: ~250 active securities × 31 intervals = 7750.
+/// 16384 provides ~2x headroom. With `PreSerializedCandleUpdate` (Arc<str>), each slot
+/// is ~28 bytes on stack + shared heap string, so total buffer ≈ 450KB.
+pub const CANDLE_BROADCAST_CAPACITY: usize = 16_384;
 
 // ---------------------------------------------------------------------------
 // Candle — IST Timezone Offset
