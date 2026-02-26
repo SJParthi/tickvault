@@ -3,6 +3,15 @@
 > Extracted from Tech Stack Bible V6. Read this INSTEAD of the PDF/MD.
 > Only read the full Bible when adding a NEW dependency not listed here.
 
+## Frontend — Trading Terminal
+
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| SolidJS | 1.9.11 | O(1) signal-to-DOM, no virtual DOM diffing |
+| TradingView LW Charts | v5.1.0 | O(1) candle append, viewport culling, ~45 KB gzip |
+| @dschz/solid-lwcharts | 0.4.0 | SolidJS reactive wrapper for TradingView charts |
+| DataView + SharedArrayBuffer | ES2020 | O(1) field reads from Dhan binary WebSocket frames |
+
 ## Workspace Cargo.toml — Exact Versions
 
 ### Backend Core
