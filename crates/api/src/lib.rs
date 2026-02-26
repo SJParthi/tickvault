@@ -39,6 +39,7 @@ pub fn build_router(state: SharedAppState) -> Router {
             "/api/intervals",
             axum::routing::get(handlers::candles::get_intervals),
         )
+        .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
             "/ws/live",
             axum::routing::get(handlers::websocket::ws_handler),

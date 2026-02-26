@@ -296,7 +296,7 @@
         <a class="card" href="http://localhost:3000" target="_blank">
             <div class="card-icon">📊</div>
             <div class="card-title">Grafana</div>
-            <div class="card-desc">Dashboards for tick latency, candle throughput, WebSocket health, system metrics. Default: admin/admin.</div>
+            <div class="card-desc">Dashboards for tick latency, candle throughput, WebSocket health, system metrics.<br><strong style="color:#ffab00">Login: admin / admin</strong></div>
             <div class="card-url">http://localhost:3000</div>
             <span class="card-badge badge-monitor">MONITORING</span>
         </a>
@@ -360,9 +360,22 @@
         </div>
     </div>
 
+    <div class="grid" style="margin-top:20px">
+        <div class="section-title">🔑 Service Credentials</div>
+        <div class="card" style="cursor:default">
+            <div class="card-title" style="font-size:14px">Quick Reference</div>
+            <div class="card-desc" style="line-height:2">
+                <strong style="color:var(--accent-green)">No login needed:</strong> QuestDB, Prometheus, Jaeger, Loki, Alloy, Traefik, LocalStack<br>
+                <strong style="color:var(--accent-yellow)">Grafana:</strong> <code style="color:#ffab00;background:#1a1a1a;padding:2px 6px;border-radius:3px">admin</code> / <code style="color:#ffab00;background:#1a1a1a;padding:2px 6px;border-radius:3px">admin</code> (change on first login)<br>
+                <strong style="color:var(--accent-blue)">Valkey (Redis):</strong> No auth (dev mode) — <code style="color:var(--accent-blue);background:#1a1a1a;padding:2px 6px;border-radius:3px">redis-cli -h localhost -p 6379</code><br>
+                <strong style="color:var(--accent-purple)">Dhan API:</strong> JWT from AWS SSM — auto-managed by app (24h rotation)
+            </div>
+        </div>
+    </div>
+
     <div class="footer">
         dhan-live-trader v0.1.0 &nbsp;·&nbsp; Phase 1: Environment Readiness &nbsp;·&nbsp;
-        <span id="testCount">514</span> tests passing &nbsp;·&nbsp;
+        <span id="testCount">528</span> tests passing &nbsp;·&nbsp;
         Blocks 01-06 + API + Frontend complete
     </div>
 
@@ -387,11 +400,16 @@
         }
 
         function checkQuestDB() {
-            fetch('http://localhost:9000/exec?query=SELECT+1')
+            fetch('/api/stats')
                 .then(function(r) { return r.json(); })
-                .then(function() {
-                    setDot('questdbDot', 'green');
-                    document.getElementById('questdbStatus').textContent = 'QuestDB: OK';
+                .then(function(d) {
+                    if (d.questdb_reachable) {
+                        setDot('questdbDot', 'green');
+                        document.getElementById('questdbStatus').textContent = 'QuestDB: OK';
+                    } else {
+                        setDot('questdbDot', 'red');
+                        document.getElementById('questdbStatus').textContent = 'QuestDB: DOWN';
+                    }
                 })
                 .catch(function() {
                     setDot('questdbDot', 'red');
@@ -417,48 +435,17 @@
             }
         }
 
-        // ── Live Stats ──────────────────────────────────────────────────
+        // ── Live Stats (via /api/stats — server-side proxy, no CORS) ──
         function loadStats() {
-            // Table count
-            fetch('http://localhost:9000/exec?query=SHOW+TABLES')
+            fetch('/api/stats')
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
-                    document.getElementById('statTables').textContent = d.dataset.length;
-                }).catch(function() {});
-
-            // Underlyings
-            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM fno_underlyings'))
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    document.getElementById('statUnderlyings').textContent = d.dataset[0][0].toLocaleString();
-                }).catch(function() {});
-
-            // Derivatives
-            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM derivative_contracts'))
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    document.getElementById('statDerivatives').textContent = d.dataset[0][0].toLocaleString();
-                }).catch(function() {});
-
-            // Indices
-            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM subscribed_indices'))
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    document.getElementById('statIndices').textContent = d.dataset[0][0].toLocaleString();
-                }).catch(function() {});
-
-            // Ticks
-            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM ticks'))
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    document.getElementById('statTicks').textContent = d.dataset[0][0].toLocaleString();
-                }).catch(function() { document.getElementById('statTicks').textContent = '0'; });
-
-            // Intervals
-            fetch('/api/intervals')
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    document.getElementById('statIntervals').textContent = d.time.length + d.tick.length;
+                    document.getElementById('statTables').textContent = d.tables || '—';
+                    document.getElementById('statUnderlyings').textContent = d.underlyings ? d.underlyings.toLocaleString() : '—';
+                    document.getElementById('statDerivatives').textContent = d.derivatives ? d.derivatives.toLocaleString() : '—';
+                    document.getElementById('statIndices').textContent = d.subscribed_indices ? d.subscribed_indices.toLocaleString() : '—';
+                    document.getElementById('statTicks').textContent = d.ticks ? d.ticks.toLocaleString() : '0';
+                    document.getElementById('statIntervals').textContent = d.time_intervals + d.tick_intervals;
                 }).catch(function() {});
         }
 
