@@ -1,7 +1,7 @@
 # BLOCK 03 — WEBSOCKET CONNECTION MANAGER
 
 ## Status: ✅ COMPLETE & HARDENED (Protocol-Verified)
-## Last Verified: 2026-02-26 (347 tests pass, zero clippy warnings)
+## Last Verified: 2026-02-26 (568 system tests pass, zero clippy warnings)
 ## Depends On: Block 02 (Authentication & Token Management)
 ## Blocks: Block 04 (Binary Protocol Parser)
 
@@ -16,7 +16,7 @@ Implement the Dhan WebSocket V2 connection lifecycle with multi-connection pooli
 ## BOOT CHAIN POSITION
 
 ```
-Config → Auth → ★ WEBSOCKET (Block 03) ★ → Parse (Block 04) → Route → Indicators
+Config → Auth → Persist → Universe → ★ WEBSOCKET (Block 03) ★ → Parse (Block 04) → Route → Indicators
                 │
                 ├─ Read token from ArcSwap (O(1) atomic)
                 ├─ Connect wss://api-feed.dhan.co?version=2&token=xxx&clientId=xxx&authType=2

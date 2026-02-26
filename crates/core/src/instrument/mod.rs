@@ -9,7 +9,9 @@
 
 pub mod csv_downloader;
 pub mod csv_parser;
+pub mod subscription_planner;
 pub mod universe_builder;
 pub mod validation;
 
+pub use subscription_planner::build_subscription_plan;
 pub use universe_builder::build_fno_universe;

@@ -1,7 +1,7 @@
 # BLOCK 01 — MASTER INSTRUMENT DOWNLOAD & F&O UNIVERSE BUILDER
 
 ## Status: ✅ COMPLETE & RUNNING
-## Last Verified: 2026-02-24 (live run against real Dhan CSV)
+## Last Verified: 2026-02-26 (568 system tests pass, zero clippy warnings)
 
 ---
 
@@ -454,3 +454,61 @@ SELECT snapshot_date, lot_size FROM fno_underlyings
 WHERE underlying_symbol = 'RELIANCE'
 ORDER BY snapshot_date;
 ```
+
+---
+
+## SUBSCRIPTION PLANNER & INSTRUMENT REGISTRY (Added 2026-02-26)
+
+Block 01 now includes two additional modules that bridge the universe build to WebSocket subscriptions:
+
+### InstrumentRegistry (`crates/common/src/instrument_registry.rs`)
+
+O(1) HashMap lookup for subscribed instruments. Given any `security_id` from a WebSocket tick, instantly get:
+- `SubscriptionCategory` (MajorIndexValue, DisplayIndex, IndexDerivative, StockEquity, StockDerivative)
+- Underlying symbol, instrument kind, expiry, strike, option type
+- Feed mode (Ticker/Quote/Full)
+
+Built once at startup, shared via `Arc<InstrumentRegistry>`. Immutable, lock-free. 14 tests.
+
+### SubscriptionPlanner (`crates/core/src/instrument/subscription_planner.rs`)
+
+Takes `FnoUniverse` + `SubscriptionConfig` + `today` and produces a filtered instrument list:
+
+| Category | Strategy | Filtering |
+|----------|----------|-----------|
+| 5 major indices (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY, FINNIFTY) | IDX_I value feed + ALL derivatives | None — every expiry, every strike |
+| Display indices (INDIA VIX, sectoral, etc.) | IDX_I value feed only | No derivatives |
+| Stock equities (~206) | NSE_EQ price feed | All F&O stocks |
+| Stock derivatives | Current expiry only | ATM ± N strikes (configurable) |
+
+ATM approximation at startup uses the middle strike of each option chain (no live prices available yet).
+
+17 tests covering: default config, all toggle combinations, expiry filtering, ATM range narrowing, dedup, feed mode variations.
+
+### Configuration (`config/base.toml`)
+
+```toml
+[subscription]
+feed_mode = "Ticker"
+subscribe_index_derivatives = true
+subscribe_stock_derivatives = true
+subscribe_display_indices = true
+subscribe_stock_equities = true
+stock_atm_strikes_above = 10
+stock_atm_strikes_below = 10
+stock_default_atm_fallback_enabled = true
+```
+
+### Boot Sequence Integration
+
+The planner runs as Step 5 in main.rs (between QuestDB persistence and WebSocket pool creation). It replaces the previously hardcoded 5-instrument list with dynamic subscription planning from the full FnoUniverse.
+
+### Test Counts (as of 2026-02-26)
+
+| Crate | Tests |
+|-------|-------|
+| common | 123 |
+| core | 373 |
+| storage | 64 |
+| api | 8 |
+| **Total** | **568** |

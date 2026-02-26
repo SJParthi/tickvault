@@ -25,6 +25,8 @@ pub struct ApplicationConfig {
     pub instrument: InstrumentConfig,
     pub api: ApiConfig,
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub subscription: SubscriptionConfig,
 }
 
 /// Trading session timing configuration.
@@ -187,6 +189,75 @@ pub struct InstrumentConfig {
     pub csv_cache_filename: String,
     /// Download timeout in seconds (overrides network timeout for this large file).
     pub csv_download_timeout_secs: u64,
+}
+
+/// Subscription planner configuration.
+///
+/// Controls which instruments are subscribed and at what feed mode.
+/// Indices get full chain (all expiries, all strikes). Stocks get current
+/// expiry only with ATM ± N strike filtering.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubscriptionConfig {
+    /// Feed mode for all subscriptions. Start with Ticker, upgrade later.
+    /// Valid values: "Ticker", "Quote", "Full".
+    pub feed_mode: String,
+
+    /// Whether to subscribe index derivatives (full chain, all expiries).
+    pub subscribe_index_derivatives: bool,
+
+    /// Whether to subscribe stock derivatives (current expiry, ATM ± N).
+    pub subscribe_stock_derivatives: bool,
+
+    /// Whether to subscribe display-only indices (INDIA VIX, sectoral, etc.).
+    pub subscribe_display_indices: bool,
+
+    /// Whether to subscribe stock equity price feeds (NSE_EQ segment).
+    pub subscribe_stock_equities: bool,
+
+    /// Number of strikes above ATM for stock options.
+    pub stock_atm_strikes_above: usize,
+
+    /// Number of strikes below ATM for stock options.
+    pub stock_atm_strikes_below: usize,
+
+    /// Default LTP to use for ATM calculation when no live price is available.
+    /// When the system first starts, there are no live prices yet.
+    /// This fallback ensures we subscribe to a reasonable strike range.
+    /// Once live prices arrive, dynamic rebalancing (Phase 2) will adjust.
+    pub stock_default_atm_fallback_enabled: bool,
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            feed_mode: "Ticker".to_string(),
+            subscribe_index_derivatives: true,
+            subscribe_stock_derivatives: true,
+            subscribe_display_indices: true,
+            subscribe_stock_equities: true,
+            stock_atm_strikes_above: 10,
+            stock_atm_strikes_below: 10,
+            stock_default_atm_fallback_enabled: true,
+        }
+    }
+}
+
+impl SubscriptionConfig {
+    /// Parses the feed_mode string into a `FeedMode` enum.
+    ///
+    /// # Errors
+    /// Returns error if the string is not a recognized feed mode.
+    pub fn parsed_feed_mode(&self) -> Result<crate::types::FeedMode> {
+        match self.feed_mode.as_str() {
+            "Ticker" => Ok(crate::types::FeedMode::Ticker),
+            "Quote" => Ok(crate::types::FeedMode::Quote),
+            "Full" => Ok(crate::types::FeedMode::Full),
+            other => bail!(
+                "subscription.feed_mode must be Ticker/Quote/Full, got '{}'",
+                other
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +457,7 @@ mod tests {
             pipeline: PipelineConfig {
                 candle_broadcast_capacity: 16_384,
             },
+            subscription: SubscriptionConfig::default(),
         }
     }
 

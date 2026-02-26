@@ -679,6 +679,21 @@ pub const CANDLE_BROADCAST_CAPACITY: usize = 16_384;
 pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 
 // ---------------------------------------------------------------------------
+// Subscription Planner — ATM Strike Range
+// ---------------------------------------------------------------------------
+
+/// Number of strikes above ATM to subscribe for stock options.
+pub const STOCK_ATM_STRIKES_ABOVE: usize = 10;
+
+/// Number of strikes below ATM to subscribe for stock options.
+pub const STOCK_ATM_STRIKES_BELOW: usize = 10;
+
+/// Total option contracts per stock per side (CE + PE) at one expiry:
+/// ATM + 10 above + 10 below = 21 strikes × 2 sides = 42, plus 1 future = 43.
+pub const STOCK_CONTRACTS_PER_EXPIRY: usize =
+    (1 + STOCK_ATM_STRIKES_ABOVE + STOCK_ATM_STRIKES_BELOW) * 2 + 1;
+
+// ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
 

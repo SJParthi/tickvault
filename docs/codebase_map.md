@@ -2,7 +2,7 @@
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads), skip PDFs.
 > Bible: `tech_stack_bible_v6.md` — read ONLY when adding a new dependency.
-> Updated: 2026-02-26 after O(1) hardening, ticks DDL, portal page, rustls TLS fix (515 tests).
+> Updated: 2026-02-26 after subscription planner, instrument registry, main.rs wiring (568 tests).
 
 ## File Tree
 
@@ -14,12 +14,13 @@ dhan-live-trader/
 │   └── base.toml                       # Runtime config (non-secret)
 ├── crates/
 │   ├── common/src/                     # Shared types — imported by all crates
-│   │   ├── lib.rs                      # Re-exports: config, constants, error, types, instrument_types, tick_types
-│   │   ├── config.rs                   # ApplicationConfig + validate() — 12 subsections
-│   │   ├── constants.rs                # 100+ named constants + compile-time assertions + byte offsets
+│   │   ├── lib.rs                      # Re-exports: config, constants, error, types, instrument_types, tick_types, instrument_registry
+│   │   ├── config.rs                   # ApplicationConfig + validate() — 13 subsections (incl. SubscriptionConfig)
+│   │   ├── constants.rs                # 100+ named constants + compile-time assertions + byte offsets + subscription limits
 │   │   ├── error.rs                    # ApplicationError enum (12 variants, thiserror)
 │   │   ├── types.rs                    # Exchange, ExchangeSegment, FeedMode, InstrumentType, OptionType
 │   │   ├── instrument_types.rs         # FnoUniverse, Underlying, DerivativeContract, OptionChain, etc.
+│   │   ├── instrument_registry.rs      # InstrumentRegistry (O(1) security_id → SubscribedInstrument lookup)
 │   │   └── tick_types.rs               # Timeframe(27), TickInterval(4), ChartInterval, Candle, CandleBroadcastMessage
 │   ├── core/src/                       # Core engine
 │   │   ├── lib.rs                      # Re-exports: auth, instrument, websocket, parser, candle, pipeline
@@ -30,10 +31,11 @@ dhan-live-trader/
 │   │   │   ├── token_manager.rs        # JWT lifecycle: acquire (auth.dhan.co), renew (api.dhan.co), arc-swap
 │   │   │   └── types.rs               # DhanCredentials, TokenState, DhanGenerateTokenResponse, parse_expiry_time()
 │   │   ├── instrument/
-│   │   │   ├── mod.rs                  # Re-exports instrument submodules
+│   │   │   ├── mod.rs                  # Re-exports instrument submodules + build_subscription_plan()
 │   │   │   ├── csv_downloader.rs       # Download Dhan CSV (primary + fallback + cache)
 │   │   │   ├── csv_parser.rs           # Parse 260K rows → 147K RawInstruments
 │   │   │   ├── universe_builder.rs     # 5-pass F&O universe build → FnoUniverse
+│   │   │   ├── subscription_planner.rs # FnoUniverse → SubscriptionPlan (filtered instruments + registry)
 │   │   │   └── validation.rs           # Post-build validation (must-exist checks)
 │   │   ├── websocket/
 │   │   │   ├── mod.rs                  # Re-exports websocket submodules
@@ -61,9 +63,10 @@ dhan-live-trader/
 │   │       ├── mod.rs                 # Re-exports pipeline submodules
 │   │       └── tick_processor.rs     # Main loop: frame → parse → candle update → broadcast + persist
 │   ├── storage/src/                    # Persistence layer
-│   │   ├── lib.rs                      # Re-exports: instrument_persistence, tick_persistence
+│   │   ├── lib.rs                      # Re-exports: instrument_persistence, tick_persistence, candle_query
 │   │   ├── instrument_persistence.rs   # QuestDB ILP writer (4 tables)
-│   │   └── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys()
+│   │   ├── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys()
+│   │   └── candle_query.rs            # QuestDB SAMPLE BY queries for historical candles
 │   ├── trading/src/
 │   │   └── lib.rs                      # SKELETON — OMS, risk (not started)
 │   ├── api/src/
@@ -79,7 +82,7 @@ dhan-live-trader/
 │   │       ├── index.html             # TradingView Lightweight Charts v5.1.0 — full interval selector
 │   │       └── portal.html            # DLT Control Panel — nav dashboard with live status + stats
 │   └── app/
-│       ├── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → WS → Parse → Candle → Persist → HTTP
+│       ├── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → Universe → Subscription → WS → Parse → Candle → Persist → HTTP
 │       └── examples/
 │           └── persist_snapshot.rs      # Integration example: CSV → Universe → QuestDB
 ├── deploy/docker/
@@ -113,9 +116,10 @@ dhan-live-trader/
 [token]       # validity_hours 24, refresh_before_expiry_hours 1
 [risk]        # max_daily_loss_percent 2.0, max_position_lots 50
 [logging]     # format "pretty", level "info"
-[instrument]  # daily_download_time "08:45", cache_directory "/app/data/"
-[pipeline]    # tick_flush_interval_ms 1000, tick_flush_batch_size 1000, candle_broadcast_capacity 4096
-[api]         # host "0.0.0.0", port 3001
+[instrument]     # daily_download_time "08:45", cache_directory "/app/data/"
+[subscription]   # feed_mode "Ticker", atm_strike_range 10, major_indices ["NIFTY 50", ...], display_indices [...]
+[pipeline]       # tick_flush_interval_ms 1000, tick_flush_batch_size 1000, candle_broadcast_capacity 4096
+[api]            # host "0.0.0.0", port 3001
 ```
 
 ## Dhan Auth Endpoints (SDK-verified)
@@ -157,6 +161,7 @@ AuthCircuitBreakerOpen(String)
 // config.rs
 ApplicationConfig::validate(&self) -> Result<()>
 DhanConfig { websocket_url, rest_api_base_url, auth_base_url, instrument_csv_url, ... }
+SubscriptionConfig { feed_mode, atm_strike_range, major_indices, display_indices }  // serde(default) for all
 PipelineConfig { tick_flush_interval_ms, tick_flush_batch_size, candle_broadcast_capacity }
 ApiConfig { host, port }
 
@@ -192,6 +197,15 @@ OptionChain { underlying_symbol, expiry_date, sorted_strikes, future_security_id
 SubscribedIndex { security_id, trading_symbol, exchange_segment, index_category, ... }
 InstrumentInfo { security_id, trading_symbol, exchange_segment, instrument_type }
 UniverseBuildMetadata { csv_source, csv_row_count, build_duration, ... }
+
+// instrument_registry.rs — O(1) lookup by security_id
+SubscriptionCategory { MajorIndexValue, DisplayIndex, IndexDerivative, StockEquity, StockDerivative }
+SubscribedInstrument { security_id, exchange_segment, trading_symbol, category, feed_mode }
+InstrumentRegistry::from_instruments(instruments: Vec<SubscribedInstrument>) -> Self
+InstrumentRegistry::get(security_id) -> Option<&SubscribedInstrument>
+InstrumentRegistry::iter() -> impl Iterator<Item = &SubscribedInstrument>
+InstrumentRegistry::total_count() -> usize
+InstrumentRegistry::category_count(category) -> usize
 ```
 
 ### core::auth
@@ -305,8 +319,16 @@ WebSocketConnectionPool::health(&self) -> Vec<ConnectionHealth>
 ```rust
 csv_downloader::download_instrument_csv(config) -> Result<Vec<u8>>
 csv_parser::parse_instrument_csv(raw_bytes: &[u8]) -> Result<Vec<RawInstrument>>
-universe_builder::build_fno_universe(config) -> Result<FnoUniverse>
+universe_builder::build_fno_universe(csv_url, fallback_url, instrument_config) -> Result<FnoUniverse>
 validation::validate_fno_universe(universe: &FnoUniverse) -> Result<()>
+
+// subscription_planner.rs — FnoUniverse → SubscriptionPlan
+SubscriptionPlan { registry: InstrumentRegistry, summary: PlanSummary }
+PlanSummary { major_index_values, display_indices, index_derivatives, stock_equities, stock_derivatives, total, feed_mode }
+build_subscription_plan(universe: &FnoUniverse, config: &SubscriptionConfig, today: NaiveDate) -> SubscriptionPlan
+// Strategy: 5 major indices → EVERYTHING (all expiries, all strikes)
+//           Display indices → value only (no derivatives)
+//           Stocks → current expiry + ATM ± config.atm_strike_range strikes
 ```
 
 ### storage
@@ -411,45 +433,47 @@ CRITICAL: Quote vs Full diverge at offset 34. Quote has OHLC(f32). Full has OI(u
 Prices are f32 in rupees (NOT paise). No division needed.
 ```
 
-## Test Counts (515 total)
+## Test Counts (568 total)
 
 | Crate | Module | Tests |
 |-------|--------|-------|
-| common | tick_types | 27 |
+| common | tick_types | 38 |
 | common | config | 21 |
 | common | types | 18 |
 | common | instrument_types | 17 |
+| common | instrument_registry | 16 |
 | common | error | 13 |
-| core | auth/types | 23 |
-| core | auth/secret_manager | 10 |
-| core | auth/token_manager | 8 |
-| core | auth/totp_generator | 4 |
 | core | instrument/universe_builder | 54 |
 | core | instrument/csv_parser | 53 |
-| core | instrument/validation | 12 |
-| core | instrument/csv_downloader | 5 |
 | core | websocket/types | 32 |
+| core | candle/rolling_candle | 25 |
 | core | websocket/subscription_builder | 24 |
+| core | auth/types | 23 |
+| core | instrument/subscription_planner | 17 |
 | core | websocket/connection_pool | 17 |
+| core | candle/candle_manager | 17 |
+| core | instrument/validation | 12 |
 | core | websocket/connection | 11 |
+| core | auth/secret_manager | 10 |
 | core | parser/dispatcher | 10 |
+| core | auth/token_manager | 8 |
 | core | parser/header | 8 |
 | core | parser/quote | 8 |
 | core | parser/full_packet | 7 |
 | core | parser/disconnect | 7 |
 | core | parser/ticker | 6 |
+| core | instrument/csv_downloader | 5 |
+| core | auth/totp_generator | 4 |
 | core | parser/oi | 4 |
 | core | parser/types | 3 |
 | core | parser/previous_close | 3 |
 | core | parser/market_status | 3 |
-| core | candle/rolling_candle | 19 |
-| core | candle/candle_manager | 14 |
 | core | pipeline | 3 |
+| storage | candle_query | 28 |
 | storage | instrument_persistence | 25 |
 | storage | tick_persistence | 11 |
-| api | handlers | 5 |
-| api | static_file | 2 |
-| **Total** | | **515** |
+| api | handlers | 8 |
+| **Total** | | **568** |
 
 ## QuestDB Tables (6) — DEDUP UPSERT KEYS enabled on all
 
@@ -486,7 +510,7 @@ Prices are f32 in rupees (NOT paise). No division needed.
 | /dlt/dev/telegram/bot-token | Seeded | Telegram bot API token |
 | /dlt/dev/telegram/chat-id | Seeded | Telegram chat ID |
 
-## App Boot Sequence (main.rs)
+## App Boot Sequence (main.rs) — 10 steps
 
 ```
 0. Install rustls CryptoProvider (aws_lc_rs — must happen before ANY TLS usage)
@@ -494,11 +518,12 @@ Prices are f32 in rupees (NOT paise). No division needed.
 2. Initialize tracing (structured logging)
 3. Authenticate: SSM → TOTP → POST auth.dhan.co → JWT (graceful: OFFLINE mode if fails)
 4. QuestDB: ensure ticks + candles_1s tables with DEDUP UPSERT KEYS
-5. WebSocket pool: 5 index instruments (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, INDIAVIX)
-6. Candle broadcast channel + tick processor task
-7. axum API server on 0.0.0.0:3001 (always starts, even in OFFLINE mode)
-8. Token renewal background task
-9. Await Ctrl+C → graceful shutdown (abort all tasks)
+5. Build F&O universe + subscription plan (FnoUniverse → SubscriptionPlan with InstrumentRegistry)
+6. WebSocket pool: dynamic instruments from SubscriptionPlan (not hardcoded)
+7. Candle broadcast channel + tick processor task
+8. axum API server on 0.0.0.0:3001 (always starts, even in OFFLINE mode)
+9. Token renewal background task
+10. Await Ctrl+C → graceful shutdown (abort all tasks)
 ```
 
 ## API Endpoints
@@ -554,3 +579,4 @@ Prices are f32 in rupees (NOT paise). No division needed.
 - **TLS fix**: Install rustls CryptoProvider (aws_lc_rs) as Step 0 in main.rs — fixes WebSocket panic
 - **Portal page**: `/portal` route — DLT Control Panel with live status checks, QuestDB stats, service links
 - **Auth verified**: Dhan PIN corrected in SSM — app starts in LIVE mode (token acquired, renewal task running)
+- **Subscription Planner**: InstrumentRegistry (O(1) lookup) + SubscriptionPlanner (FnoUniverse → filtered instruments) + main.rs wiring — 33 new tests (515 → 568)

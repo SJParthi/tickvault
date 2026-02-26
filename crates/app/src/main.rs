@@ -1,22 +1,24 @@
 //! Binary entry point for the dhan-live-trader application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Auth → WebSocket → Parse → Candle → Persist → HTTP → Shutdown
+//! Config → Auth → Persist → Universe → WebSocket → Pipeline → HTTP → Shutdown
 //!
 //! # Boot Sequence
 //! 1. Load and validate configuration from `config/base.toml`
 //! 2. Initialize structured logging (tracing)
 //! 3. Authenticate with Dhan API (SSM → TOTP → JWT)
 //! 4. Set up QuestDB tick persistence (best-effort)
-//! 5. Build WebSocket connection pool with subscribed instruments
-//! 6. Spawn tick processing pipeline
-//! 7. Start axum API server with TradingView frontend
-//! 8. Spawn token renewal background task
-//! 9. Await shutdown signal (Ctrl+C)
+//! 5. Build F&O universe + subscription plan from instrument CSV
+//! 6. Build WebSocket connection pool with planned instruments
+//! 7. Spawn tick processing pipeline
+//! 8. Start axum API server with TradingView frontend
+//! 9. Spawn token renewal background task
+//! 10. Await shutdown signal (Ctrl+C)
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use chrono::{FixedOffset, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
@@ -24,11 +26,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use dhan_live_trader_common::config::ApplicationConfig;
+use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_common::tick_types::{PreSerializedCandleUpdate, TickInterval, Timeframe};
-use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
+use dhan_live_trader_core::instrument::{build_fno_universe, build_subscription_plan};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::types::InstrumentSubscription;
@@ -148,57 +150,97 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 5: Build WebSocket connection pool (only if authenticated)
+    // Step 5: Build F&O universe + subscription plan (best-effort)
     // -----------------------------------------------------------------------
-    let (frame_receiver, ws_handles) = if let Some(ref tm) = token_manager {
-        info!("building WebSocket connection pool");
+    info!("building F&O universe from instrument CSV");
 
-        let token_handle = tm.token_handle();
-        let client_id = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for WebSocket")?;
-            credentials.client_id.expose_secret().to_string()
-        };
+    let subscription_plan = match build_fno_universe(
+        &config.dhan.instrument_csv_url,
+        &config.dhan.instrument_csv_fallback_url,
+        &config.instrument,
+    )
+    .await
+    {
+        Ok(universe) => {
+            let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
+                .context("invalid IST offset constant")?;
+            let today = Utc::now().with_timezone(&ist).date_naive();
+            let plan = build_subscription_plan(&universe, &config.subscription, today);
 
-        // For MVP: subscribe to the 5 core index instruments.
-        let instruments = vec![
-            InstrumentSubscription::new(ExchangeSegment::IdxI, 13), // NIFTY 50
-            InstrumentSubscription::new(ExchangeSegment::IdxI, 25), // BANK NIFTY
-            InstrumentSubscription::new(ExchangeSegment::IdxI, 27), // FINNIFTY
-            InstrumentSubscription::new(ExchangeSegment::IdxI, 442), // MIDCPNIFTY
-            InstrumentSubscription::new(ExchangeSegment::IdxI, 21), // INDIA VIX
-        ];
-
-        let instrument_count = instruments.len();
-
-        let mut pool = WebSocketConnectionPool::new(
-            token_handle,
-            client_id,
-            config.dhan.clone(),
-            config.websocket.clone(),
-            instruments,
-            FeedMode::Full,
-        )
-        .context("failed to create WebSocket connection pool")?;
-
-        let receiver = pool.take_frame_receiver();
-        let handles = pool.spawn_all();
-
-        info!(
-            connections = handles.len(),
-            instruments = instrument_count,
-            "WebSocket pool started"
-        );
-
-        (Some(receiver), handles)
-    } else {
-        warn!("WebSocket pool skipped — running in offline mode");
-        (None, Vec::new())
+            info!(
+                major_indices = plan.summary.major_index_values,
+                display_indices = plan.summary.display_indices,
+                index_derivatives = plan.summary.index_derivatives,
+                stock_equities = plan.summary.stock_equities,
+                stock_derivatives = plan.summary.stock_derivatives,
+                total = plan.summary.total,
+                feed_mode = %plan.summary.feed_mode,
+                "subscription plan ready"
+            );
+            Some(plan)
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "F&O universe build failed — no instruments to subscribe"
+            );
+            None
+        }
     };
 
     // -----------------------------------------------------------------------
-    // Step 6: Create candle broadcast channel + spawn tick processor
+    // Step 6: Build WebSocket connection pool (only if authenticated + plan ready)
+    // -----------------------------------------------------------------------
+    let (frame_receiver, ws_handles) =
+        if let (Some(tm), Some(plan)) = (&token_manager, &subscription_plan) {
+            info!("building WebSocket connection pool");
+
+            let token_handle = tm.token_handle();
+            let client_id = {
+                let credentials = secret_manager::fetch_dhan_credentials()
+                    .await
+                    .context("failed to fetch Dhan client ID for WebSocket")?;
+                credentials.client_id.expose_secret().to_string()
+            };
+
+            // Convert registry instruments → WebSocket subscription entries
+            let instruments: Vec<InstrumentSubscription> = plan
+                .registry
+                .iter()
+                .map(|inst| InstrumentSubscription::new(inst.exchange_segment, inst.security_id))
+                .collect();
+
+            let feed_mode = plan.summary.feed_mode;
+            let instrument_count = instruments.len();
+
+            let mut pool = WebSocketConnectionPool::new(
+                token_handle,
+                client_id,
+                config.dhan.clone(),
+                config.websocket.clone(),
+                instruments,
+                feed_mode,
+            )
+            .context("failed to create WebSocket connection pool")?;
+
+            let receiver = pool.take_frame_receiver();
+            let handles = pool.spawn_all();
+
+            info!(
+                connections = handles.len(),
+                instruments = instrument_count,
+                feed_mode = %feed_mode,
+                "WebSocket pool started"
+            );
+
+            (Some(receiver), handles)
+        } else {
+            warn!("WebSocket pool skipped — running in offline mode");
+            (None, Vec::new())
+        };
+
+    // -----------------------------------------------------------------------
+    // Step 7: Create candle broadcast channel + spawn tick processor
     // -----------------------------------------------------------------------
     let (candle_tx, _candle_rx) =
         broadcast::channel::<PreSerializedCandleUpdate>(config.pipeline.candle_broadcast_capacity);
@@ -233,7 +275,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 7: Start axum API server
+    // Step 8: Start axum API server
     // -----------------------------------------------------------------------
     let api_state = SharedAppState::new(candle_tx, config.questdb.clone());
 
@@ -260,7 +302,7 @@ async fn main() -> Result<()> {
     });
 
     // -----------------------------------------------------------------------
-    // Step 8: Spawn token renewal background task (only if authenticated)
+    // Step 9: Spawn token renewal background task (only if authenticated)
     // -----------------------------------------------------------------------
     let renewal_handle = if let Some(ref tm) = token_manager {
         let handle = tm.spawn_renewal_task();
@@ -271,7 +313,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 9: Await shutdown signal
+    // Step 10: Await shutdown signal
     // -----------------------------------------------------------------------
     let mode = if token_manager.is_some() {
         "LIVE"
