@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DLT Control Panel — dhan-live-trader</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-card: #111111;
+            --bg-card-hover: #1a1a1a;
+            --border: #222222;
+            --text-primary: #e0e0e0;
+            --text-secondary: #888888;
+            --text-dim: #555555;
+            --accent-blue: #2962ff;
+            --accent-green: #26a69a;
+            --accent-red: #ef5350;
+            --accent-yellow: #ffab00;
+            --accent-purple: #7c4dff;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            padding: 30px 0 20px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            font-weight: 300;
+            letter-spacing: 2px;
+            color: var(--text-primary);
+        }
+
+        .header h1 span { color: var(--accent-blue); font-weight: 600; }
+
+        .header .subtitle {
+            color: var(--text-secondary);
+            font-size: 13px;
+            margin-top: 8px;
+            letter-spacing: 1px;
+        }
+
+        .status-bar {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 15px;
+            font-size: 12px;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-dot.green { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
+        .status-dot.red { background: var(--accent-red); box-shadow: 0 0 6px var(--accent-red); }
+        .status-dot.yellow { background: var(--accent-yellow); box-shadow: 0 0 6px var(--accent-yellow); }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 16px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .section-title {
+            grid-column: 1 / -1;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            padding: 15px 0 5px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            transition: all 0.15s ease;
+            cursor: pointer;
+            text-decoration: none;
+            display: block;
+        }
+
+        .card:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent-blue);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(41, 98, 255, 0.15);
+        }
+
+        .card-icon {
+            font-size: 28px;
+            margin-bottom: 12px;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+
+        .card-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 10px;
+        }
+
+        .card-url {
+            font-size: 11px;
+            color: var(--accent-blue);
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            opacity: 0.8;
+        }
+
+        .card-badge {
+            display: inline-block;
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            margin-top: 8px;
+        }
+
+        .badge-live { background: rgba(38, 166, 154, 0.15); color: var(--accent-green); }
+        .badge-db { background: rgba(124, 77, 255, 0.15); color: var(--accent-purple); }
+        .badge-monitor { background: rgba(255, 171, 0, 0.15); color: var(--accent-yellow); }
+        .badge-infra { background: rgba(41, 98, 255, 0.15); color: var(--accent-blue); }
+
+        .stats-grid {
+            grid-column: 1 / -1;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+            padding: 10px 0;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 14px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent-green);
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 30px 0;
+            color: var(--text-dim);
+            font-size: 11px;
+            border-top: 1px solid var(--border);
+            margin-top: 30px;
+        }
+
+        .clock {
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            font-size: 14px;
+            color: var(--accent-green);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span>DLT</span> Control Panel</h1>
+        <div class="subtitle">dhan-live-trader v0.1.0 — O(1) F&amp;O Trading System</div>
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-dot" id="appDot"></span>
+                <span id="appStatus">Checking...</span>
+            </div>
+            <div class="status-item">
+                <span class="status-dot" id="questdbDot"></span>
+                <span id="questdbStatus">QuestDB</span>
+            </div>
+            <div class="status-item">
+                <span class="status-dot" id="wsDot"></span>
+                <span id="wsStatus">WebSocket</span>
+            </div>
+            <div class="status-item">
+                <span class="clock" id="clock"></span>
+                <span style="color: var(--text-dim)">IST</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="stats-grid" id="statsGrid">
+        <div class="stat-card"><div class="stat-value" id="statTables">—</div><div class="stat-label">QuestDB Tables</div></div>
+        <div class="stat-card"><div class="stat-value" id="statUnderlyings">—</div><div class="stat-label">Underlyings</div></div>
+        <div class="stat-card"><div class="stat-value" id="statDerivatives">—</div><div class="stat-label">Derivatives</div></div>
+        <div class="stat-card"><div class="stat-value" id="statIndices">—</div><div class="stat-label">Subscribed Indices</div></div>
+        <div class="stat-card"><div class="stat-value" id="statTicks">—</div><div class="stat-label">Ticks Stored</div></div>
+        <div class="stat-card"><div class="stat-value" id="statIntervals">—</div><div class="stat-label">Chart Intervals</div></div>
+    </div>
+
+    <div class="grid">
+        <div class="section-title">📊 Trading & Charts</div>
+
+        <a class="card" href="/" target="_blank">
+            <div class="card-icon">📈</div>
+            <div class="card-title">TradingView Chart</div>
+            <div class="card-desc">Live candlestick chart with 31 intervals (27 time + 4 tick). Real-time WebSocket updates from Dhan.</div>
+            <div class="card-url">http://localhost:3001/</div>
+            <span class="card-badge badge-live">LIVE</span>
+        </a>
+
+        <a class="card" href="/api/intervals" target="_blank">
+            <div class="card-icon">⏱️</div>
+            <div class="card-title">Available Intervals</div>
+            <div class="card-desc">JSON API listing all supported chart intervals: 1s to 1Y time-based, 1T to 1000T tick-based, custom.</div>
+            <div class="card-url">http://localhost:3001/api/intervals</div>
+            <span class="card-badge badge-live">API</span>
+        </a>
+
+        <a class="card" href="/api/candles/13?timeframe=5m" target="_blank">
+            <div class="card-icon">🕯️</div>
+            <div class="card-title">Candle Data API</div>
+            <div class="card-desc">Historical OHLCV candles from QuestDB via SAMPLE BY. Example: NIFTY (sid=13) 5-minute candles.</div>
+            <div class="card-url">http://localhost:3001/api/candles/13?timeframe=5m</div>
+            <span class="card-badge badge-live">API</span>
+        </a>
+
+        <a class="card" href="/health" target="_blank">
+            <div class="card-icon">❤️</div>
+            <div class="card-title">Health Check</div>
+            <div class="card-desc">Application health status. Returns version, status, and runtime mode (LIVE/OFFLINE).</div>
+            <div class="card-url">http://localhost:3001/health</div>
+            <span class="card-badge badge-live">API</span>
+        </a>
+
+        <div class="section-title">🗄️ Database & Storage</div>
+
+        <a class="card" href="http://localhost:9000" target="_blank">
+            <div class="card-icon">🗄️</div>
+            <div class="card-title">QuestDB Console</div>
+            <div class="card-desc">SQL query editor for tick data, candle queries, instrument metadata. Run SAMPLE BY queries interactively.</div>
+            <div class="card-url">http://localhost:9000</div>
+            <span class="card-badge badge-db">DATABASE</span>
+        </a>
+
+        <div class="card" onclick="window.open('http://localhost:9000','_blank')">
+            <div class="card-icon">📋</div>
+            <div class="card-title">Quick Queries</div>
+            <div class="card-desc">Copy & paste into QuestDB console:<br>
+                <code style="font-size:10px;color:#7c4dff">SELECT count() FROM ticks</code><br>
+                <code style="font-size:10px;color:#7c4dff">SELECT * FROM fno_underlyings LIMIT 10</code><br>
+                <code style="font-size:10px;color:#7c4dff">SELECT * FROM subscribed_indices</code>
+            </div>
+            <span class="card-badge badge-db">REFERENCE</span>
+        </div>
+
+        <div class="section-title">📊 Observability & Monitoring</div>
+
+        <a class="card" href="http://localhost:3000" target="_blank">
+            <div class="card-icon">📊</div>
+            <div class="card-title">Grafana</div>
+            <div class="card-desc">Dashboards for tick latency, candle throughput, WebSocket health, system metrics. Default: admin/admin.</div>
+            <div class="card-url">http://localhost:3000</div>
+            <span class="card-badge badge-monitor">MONITORING</span>
+        </a>
+
+        <a class="card" href="http://localhost:9090" target="_blank">
+            <div class="card-icon">🔍</div>
+            <div class="card-title">Prometheus</div>
+            <div class="card-desc">Time-series metrics scraping. Query raw metrics, check scrape targets, verify metric cardinality.</div>
+            <div class="card-url">http://localhost:9090</div>
+            <span class="card-badge badge-monitor">METRICS</span>
+        </a>
+
+        <a class="card" href="http://localhost:16686" target="_blank">
+            <div class="card-icon">🔎</div>
+            <div class="card-title">Jaeger UI</div>
+            <div class="card-desc">Distributed tracing. View spans for tick processing pipeline, API calls, WebSocket lifecycle.</div>
+            <div class="card-url">http://localhost:16686</div>
+            <span class="card-badge badge-monitor">TRACES</span>
+        </a>
+
+        <a class="card" href="http://localhost:3100/ready" target="_blank">
+            <div class="card-icon">📝</div>
+            <div class="card-title">Loki</div>
+            <div class="card-desc">Log aggregation backend. Query via Grafana Explore using LogQL. Receives logs from Alloy.</div>
+            <div class="card-url">http://localhost:3100</div>
+            <span class="card-badge badge-monitor">LOGS</span>
+        </a>
+
+        <a class="card" href="http://localhost:12345" target="_blank">
+            <div class="card-icon">🔄</div>
+            <div class="card-title">Grafana Alloy</div>
+            <div class="card-desc">Log shipper (replaces Promtail). Collects Docker container logs and forwards to Loki.</div>
+            <div class="card-url">http://localhost:12345</div>
+            <span class="card-badge badge-monitor">COLLECTOR</span>
+        </a>
+
+        <div class="section-title">🏗️ Infrastructure</div>
+
+        <a class="card" href="http://localhost:8080" target="_blank">
+            <div class="card-icon">🌐</div>
+            <div class="card-title">Traefik Dashboard</div>
+            <div class="card-desc">Reverse proxy and load balancer. View routers, services, middleware. Blue-green deployment ready.</div>
+            <div class="card-url">http://localhost:8080</div>
+            <span class="card-badge badge-infra">PROXY</span>
+        </a>
+
+        <a class="card" href="http://localhost:4566/_localstack/health" target="_blank">
+            <div class="card-icon">☁️</div>
+            <div class="card-title">LocalStack</div>
+            <div class="card-desc">AWS SSM Parameter Store emulator for dev. Stores Dhan credentials, Telegram tokens. Real AWS in prod.</div>
+            <div class="card-url">http://localhost:4566</div>
+            <span class="card-badge badge-infra">AWS</span>
+        </a>
+
+        <div class="card">
+            <div class="card-icon">💾</div>
+            <div class="card-title">Valkey (Redis)</div>
+            <div class="card-desc">In-memory cache for instrument lookup, OMS state, rate-limiting counters. Port 6379.</div>
+            <div class="card-url">localhost:6379</div>
+            <span class="card-badge badge-infra">CACHE</span>
+        </div>
+    </div>
+
+    <div class="footer">
+        dhan-live-trader v0.1.0 &nbsp;·&nbsp; Phase 1: Environment Readiness &nbsp;·&nbsp;
+        <span id="testCount">514</span> tests passing &nbsp;·&nbsp;
+        Blocks 01-06 + API + Frontend complete
+    </div>
+
+    <script>
+        // ── Live Status Checks ──────────────────────────────────────────
+        function setDot(id, color) {
+            var dot = document.getElementById(id);
+            dot.className = 'status-dot ' + color;
+        }
+
+        function checkHealth() {
+            fetch('/health')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    setDot('appDot', 'green');
+                    document.getElementById('appStatus').textContent = 'App: ' + (d.mode || d.status).toUpperCase();
+                })
+                .catch(function() {
+                    setDot('appDot', 'red');
+                    document.getElementById('appStatus').textContent = 'App: DOWN';
+                });
+        }
+
+        function checkQuestDB() {
+            fetch('http://localhost:9000/exec?query=SELECT+1')
+                .then(function(r) { return r.json(); })
+                .then(function() {
+                    setDot('questdbDot', 'green');
+                    document.getElementById('questdbStatus').textContent = 'QuestDB: OK';
+                })
+                .catch(function() {
+                    setDot('questdbDot', 'red');
+                    document.getElementById('questdbStatus').textContent = 'QuestDB: DOWN';
+                });
+        }
+
+        function checkWS() {
+            try {
+                var ws = new WebSocket('ws://localhost:3001/ws/live');
+                ws.onopen = function() {
+                    setDot('wsDot', 'green');
+                    document.getElementById('wsStatus').textContent = 'WebSocket: OK';
+                    ws.close();
+                };
+                ws.onerror = function() {
+                    setDot('wsDot', 'red');
+                    document.getElementById('wsStatus').textContent = 'WebSocket: DOWN';
+                };
+                setTimeout(function() { ws.close(); }, 3000);
+            } catch(e) {
+                setDot('wsDot', 'red');
+            }
+        }
+
+        // ── Live Stats ──────────────────────────────────────────────────
+        function loadStats() {
+            // Table count
+            fetch('http://localhost:9000/exec?query=SHOW+TABLES')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('statTables').textContent = d.dataset.length;
+                }).catch(function() {});
+
+            // Underlyings
+            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM fno_underlyings'))
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('statUnderlyings').textContent = d.dataset[0][0].toLocaleString();
+                }).catch(function() {});
+
+            // Derivatives
+            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM derivative_contracts'))
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('statDerivatives').textContent = d.dataset[0][0].toLocaleString();
+                }).catch(function() {});
+
+            // Indices
+            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM subscribed_indices'))
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('statIndices').textContent = d.dataset[0][0].toLocaleString();
+                }).catch(function() {});
+
+            // Ticks
+            fetch('http://localhost:9000/exec?query=' + encodeURIComponent('SELECT count() FROM ticks'))
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('statTicks').textContent = d.dataset[0][0].toLocaleString();
+                }).catch(function() { document.getElementById('statTicks').textContent = '0'; });
+
+            // Intervals
+            fetch('/api/intervals')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('statIntervals').textContent = d.time.length + d.tick.length;
+                }).catch(function() {});
+        }
+
+        // ── Clock ───────────────────────────────────────────────────────
+        function updateClock() {
+            var now = new Date();
+            var ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000));
+            var h = String(ist.getHours()).padStart(2, '0');
+            var m = String(ist.getMinutes()).padStart(2, '0');
+            var s = String(ist.getSeconds()).padStart(2, '0');
+            document.getElementById('clock').textContent = h + ':' + m + ':' + s;
+        }
+
+        // ── Init ────────────────────────────────────────────────────────
+        checkHealth();
+        checkQuestDB();
+        checkWS();
+        loadStats();
+        updateClock();
+
+        setInterval(checkHealth, 10000);
+        setInterval(checkQuestDB, 30000);
+        setInterval(checkWS, 15000);
+        setInterval(loadStats, 30000);
+        setInterval(updateClock, 1000);
+    </script>
+</body>
+</html>

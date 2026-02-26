@@ -26,3 +26,4 @@ secrecy = { workspace = true }
 signal-hook = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+rustls = { workspace = true }

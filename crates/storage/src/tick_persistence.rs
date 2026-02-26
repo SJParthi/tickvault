@@ -186,14 +186,44 @@ impl TickPersistenceWriter {
 }
 
 // ---------------------------------------------------------------------------
-// DEDUP UPSERT KEYS — Table Setup
+// Table DDL + DEDUP Setup
 // ---------------------------------------------------------------------------
 
-/// Enables DEDUP UPSERT KEYS on the `ticks` table via QuestDB HTTP `/exec`.
+/// SQL to create the `ticks` table with explicit schema.
 ///
-/// Best-effort: if QuestDB is unreachable or the table doesn't exist yet,
-/// logs a warning and continues. The ILP write will auto-create the table,
-/// and dedup will be enabled on the next successful call.
+/// Using CREATE TABLE IF NOT EXISTS so it's idempotent — safe to call every startup.
+/// Schema matches exactly what `append_tick()` writes via ILP:
+/// - `segment` as SYMBOL (indexed for WHERE clauses)
+/// - `security_id` as LONG (4-byte in Dhan, but LONG for QuestDB compat)
+/// - Price fields as DOUBLE (f64 from f32 parsed ticks)
+/// - Volume/quantity fields as LONG (cumulative, can exceed u32 for indices)
+/// - `received_at` as TIMESTAMP (local clock for latency measurement)
+/// - `ts` as designated TIMESTAMP (exchange time, partition key)
+const TICKS_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS ticks (\
+        segment SYMBOL,\
+        security_id LONG,\
+        ltp DOUBLE,\
+        open DOUBLE,\
+        high DOUBLE,\
+        low DOUBLE,\
+        close DOUBLE,\
+        volume LONG,\
+        oi LONG,\
+        avg_price DOUBLE,\
+        last_trade_qty LONG,\
+        total_buy_qty LONG,\
+        total_sell_qty LONG,\
+        received_at TIMESTAMP,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
+";
+
+/// Creates the `ticks` table (if not exists) and enables DEDUP UPSERT KEYS.
+///
+/// Best-effort: if QuestDB is unreachable, logs a warning and continues.
+/// The table must exist BEFORE ILP writes for predictable schema, and BEFORE
+/// candle queries to avoid "table does not exist" errors from SAMPLE BY.
 pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -208,44 +238,71 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         Err(err) => {
             warn!(
                 ?err,
-                "failed to build HTTP client for tick table DDL — dedup not enabled"
+                "failed to build HTTP client for tick table DDL — table not pre-created"
             );
             return;
         }
     };
 
-    let dedup_statements: &[(&str, &str)] = &[(QUESTDB_TABLE_TICKS, DEDUP_KEY_TICKS)];
-
-    for (table, key) in dedup_statements {
-        let sql = format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, {key})");
-        match client.get(&base_url).query(&[("query", &sql)]).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    debug!(table, key, "DEDUP UPSERT KEY enabled for tick table");
-                } else {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    warn!(
-                        table,
-                        key,
-                        %status,
-                        body = body.chars().take(200).collect::<String>(),
-                        "tick table DEDUP DDL returned non-success — table may not exist yet"
-                    );
-                }
-            }
-            Err(err) => {
+    // Step 1: Create the table with explicit schema (idempotent).
+    match client
+        .get(&base_url)
+        .query(&[("query", TICKS_CREATE_DDL)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                info!("ticks table ensured (CREATE TABLE IF NOT EXISTS)");
+            } else {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
                 warn!(
-                    table,
-                    key,
-                    ?err,
-                    "tick table DEDUP DDL request failed — dedup not enabled"
+                    %status,
+                    body = body.chars().take(200).collect::<String>(),
+                    "ticks table CREATE DDL returned non-success"
                 );
             }
         }
+        Err(err) => {
+            warn!(
+                ?err,
+                "ticks table CREATE DDL request failed — table not pre-created"
+            );
+            return;
+        }
     }
 
-    info!("DEDUP UPSERT KEYS ensured for tick table");
+    // Step 2: Enable DEDUP UPSERT KEYS (idempotent — re-enabling is a no-op).
+    let dedup_sql = format!(
+        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
+        QUESTDB_TABLE_TICKS, DEDUP_KEY_TICKS
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", &dedup_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                debug!("DEDUP UPSERT KEYS enabled for ticks table");
+            } else {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!(
+                    %status,
+                    body = body.chars().take(200).collect::<String>(),
+                    "ticks table DEDUP DDL returned non-success"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(?err, "ticks table DEDUP DDL request failed");
+        }
+    }
+
+    info!("ticks table setup complete (DDL + DEDUP UPSERT KEYS)");
 }
 
 // ---------------------------------------------------------------------------

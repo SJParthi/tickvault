@@ -6,6 +6,7 @@
 //! - `GET /api/intervals` — available chart intervals
 //! - `WS /ws/live` — live candle streaming via WebSocket
 //! - `GET /` — static HTML frontend (TradingView chart)
+//! - `GET /portal` — DLT Control Panel (links to all monitoring services)
 //!
 //! # Boot Sequence Position
 //! Pipeline → **API Server** → Frontend
@@ -43,6 +44,7 @@ pub fn build_router(state: SharedAppState) -> Router {
             axum::routing::get(handlers::websocket::ws_handler),
         )
         .route("/", axum::routing::get(handlers::static_file::index_html))
+        .route("/portal", axum::routing::get(handlers::static_file::portal))
         .layer(cors)
         .with_state(state)
 }

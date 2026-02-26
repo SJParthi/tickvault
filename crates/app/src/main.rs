@@ -58,6 +58,16 @@ const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 #[tokio::main]
 async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
+    // Step 0: Install rustls CryptoProvider (must happen before ANY TLS usage)
+    // -----------------------------------------------------------------------
+    // rustls 0.23+ requires an explicit CryptoProvider. Both tokio-tungstenite
+    // (WSS to Dhan) and reqwest (HTTPS to Dhan REST) depend on rustls.
+    // Using aws-lc-rs as the provider (already in the dependency tree).
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls CryptoProvider — cannot proceed without TLS");
+
+    // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
     // -----------------------------------------------------------------------
     let config: ApplicationConfig = Figment::new()

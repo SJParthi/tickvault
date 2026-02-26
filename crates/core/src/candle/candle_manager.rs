@@ -60,16 +60,25 @@ pub struct CandleManager {
 
 impl CandleManager {
     /// Creates a new CandleManager with the specified active intervals.
+    ///
+    /// Pre-allocates HashMap capacity based on expected securities × intervals
+    /// to avoid mid-session resizing on the hot path.
     pub fn new(timeframes: &[Timeframe], tick_intervals: &[TickInterval]) -> Self {
         let active_time_intervals: Vec<i64> = timeframes.iter().map(|tf| tf.as_seconds()).collect();
         let active_tick_intervals: Vec<u32> =
             tick_intervals.iter().map(|ti| ti.tick_count()).collect();
 
+        // Pre-allocate for ~250 securities × intervals to avoid resize during trading.
+        // 250 covers all 214 underlyings + headroom for new additions.
+        let estimated_securities: usize = 250;
+        let time_capacity = estimated_securities * active_time_intervals.len();
+        let tick_capacity = estimated_securities * active_tick_intervals.len();
+
         Self {
             active_time_intervals,
             active_tick_intervals,
-            time_states: HashMap::new(),
-            tick_states: HashMap::new(),
+            time_states: HashMap::with_capacity(time_capacity),
+            tick_states: HashMap::with_capacity(tick_capacity),
         }
     }
 
@@ -103,7 +112,10 @@ impl CandleManager {
         let mut finalized = ArrayVec::new();
         let tick_epoch = i64::from(tick.exchange_timestamp);
 
-        for &interval_secs in &self.active_time_intervals.clone() {
+        // Index-based iteration: avoids .clone() on Vec (was allocating 216 bytes per tick).
+        // Index access is O(1) and allows mutable access to time_states without borrow conflict.
+        for i in 0..self.active_time_intervals.len() {
+            let interval_secs = self.active_time_intervals[i];
             let key = (tick.security_id, interval_secs);
 
             let state = self
@@ -136,7 +148,9 @@ impl CandleManager {
         let mut finalized = ArrayVec::new();
         let tick_epoch = i64::from(tick.exchange_timestamp);
 
-        for &target_ticks in &self.active_tick_intervals.clone() {
+        // Index-based iteration: avoids .clone() on Vec (zero allocation on hot path).
+        for i in 0..self.active_tick_intervals.len() {
+            let target_ticks = self.active_tick_intervals[i];
             let key = (tick.security_id, target_ticks);
 
             let state = self

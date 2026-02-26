@@ -1005,6 +1005,7 @@ dependencies = [
  "dhan-live-trader-storage",
  "dhan-live-trader-trading",
  "figment",
+ "rustls 0.23.37",
  "secrecy",
  "signal-hook",
  "tokio",

@@ -108,6 +108,11 @@ arrayvec = "0.7.6"
 secrecy = { version = "0.10.3", features = ["serde"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 
+# ---- Section 14: TLS — Crypto Provider for rustls ----
+# Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
+# an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
+rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs"] }
+
 # ---- Section 11: AWS SDK ----
 aws-config = "1.6.3"
 aws-sdk-ssm = "1.68.0"
