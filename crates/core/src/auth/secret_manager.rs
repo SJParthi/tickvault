@@ -181,9 +181,135 @@ mod tests {
     #[test]
     fn test_resolve_environment_default() {
         // When ENVIRONMENT env var is not set, should default to "dev"
-        // Note: this test may be affected by CI/CD environment variables
-        let env = resolve_environment().expect("resolve_environment should succeed");
-        // Just verify it returns a non-empty string
-        assert!(!env.is_empty());
+        // Uses the shared mutex to avoid races with other env-var tests.
+        with_environment_var(None, || {
+            let env = resolve_environment().expect("resolve_environment should succeed");
+            assert!(!env.is_empty());
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_environment — validation & default value tests
+    // -----------------------------------------------------------------------
+    //
+    // NOTE: These tests mutate process-wide env vars via `std::env::set_var`
+    // / `std::env::remove_var`. In Rust 2024, these are `unsafe` because
+    // concurrent threads may observe partial writes. `cargo test` by default
+    // runs tests in separate threads. A `serial_test` crate could enforce
+    // serial execution, but it is not in the Tech Stack Bible. We use a
+    // static Mutex instead so only one env-var test runs at a time.
+
+    use std::sync::Mutex;
+    static ENVIRONMENT_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Helper: run a closure with `ENVIRONMENT` set to a specific value,
+    /// then restore it to unset. Holds `ENVIRONMENT_MUTEX` for the duration
+    /// to prevent parallel env-var tests from interfering.
+    fn with_environment_var<F, R>(value: Option<&str>, test_body: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = ENVIRONMENT_MUTEX.lock().expect("env mutex poisoned");
+        // SAFETY: env var mutation in test-only code. The Mutex ensures no
+        //         concurrent test touches ENVIRONMENT at the same time.
+        match value {
+            Some(val) => unsafe { std::env::set_var("ENVIRONMENT", val) },
+            None => unsafe { std::env::remove_var("ENVIRONMENT") },
+        }
+        let result = test_body();
+        // Always restore to unset after the test.
+        unsafe {
+            std::env::remove_var("ENVIRONMENT");
+        }
+        result
+    }
+
+    #[test]
+    fn test_resolve_environment_default_value_is_dev() {
+        with_environment_var(None, || {
+            let env =
+                resolve_environment().expect("resolve_environment should succeed with default");
+            assert_eq!(env, "dev", "default environment must be \"dev\"");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_empty_string_returns_error() {
+        with_environment_var(Some(""), || {
+            let result = resolve_environment();
+            assert!(result.is_err(), "empty ENVIRONMENT string must be rejected");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("invalid characters"),
+                "error message should mention invalid characters, got: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_path_traversal_returns_error() {
+        // "../../etc" contains dots and slashes — both rejected by validation.
+        with_environment_var(Some("../../etc"), || {
+            let result = resolve_environment();
+            assert!(result.is_err(), "path-traversal string must be rejected");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("invalid characters"),
+                "error message should mention invalid characters, got: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_spaces_returns_error() {
+        // "has spaces" contains space characters — rejected by validation.
+        with_environment_var(Some("has spaces"), || {
+            let result = resolve_environment();
+            assert!(
+                result.is_err(),
+                "environment string with spaces must be rejected"
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("invalid characters"),
+                "error message should mention invalid characters, got: {err_msg}"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ssm_path — exhaustive secret-type × environment coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_all_secret_types_dev() {
+        assert_eq!(
+            build_ssm_path("dev", DHAN_CLIENT_ID_SECRET),
+            "/dlt/dev/dhan/client-id"
+        );
+        assert_eq!(
+            build_ssm_path("dev", DHAN_CLIENT_SECRET_SECRET),
+            "/dlt/dev/dhan/client-secret"
+        );
+        assert_eq!(
+            build_ssm_path("dev", DHAN_TOTP_SECRET),
+            "/dlt/dev/dhan/totp-secret"
+        );
+    }
+
+    #[test]
+    fn test_build_ssm_path_all_secret_types_prod() {
+        assert_eq!(
+            build_ssm_path("prod", DHAN_CLIENT_ID_SECRET),
+            "/dlt/prod/dhan/client-id"
+        );
+        assert_eq!(
+            build_ssm_path("prod", DHAN_CLIENT_SECRET_SECRET),
+            "/dlt/prod/dhan/client-secret"
+        );
+        assert_eq!(
+            build_ssm_path("prod", DHAN_TOTP_SECRET),
+            "/dlt/prod/dhan/totp-secret"
+        );
     }
 }

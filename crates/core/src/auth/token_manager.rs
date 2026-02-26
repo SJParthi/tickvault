@@ -499,4 +499,197 @@ mod tests {
             h.join().expect("thread should not panic");
         }
     }
+
+    #[test]
+    fn test_token_handle_concurrent_write_and_reads() {
+        // One thread stores a new token while 10 threads are reading.
+        // Verify no panics, reads see either old or new value (never garbage).
+        // This tests the arc-swap safety guarantee.
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+
+        // Store an initial token so readers can see either "initial-jwt" or "updated-jwt".
+        let initial_data = DhanAuthResponseData {
+            access_token: "initial-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle.store(Arc::new(Some(TokenState::from_response(&initial_data))));
+
+        let barrier = Arc::new(std::sync::Barrier::new(12)); // 1 writer + 10 readers + main
+
+        // Spawn 10 reader threads
+        let reader_handles: Vec<_> = (0..10)
+            .map(|_| {
+                let h = Arc::clone(&handle);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait(); // synchronize start
+                    for _ in 0..1000 {
+                        let guard = h.load();
+                        let state = guard.as_ref().as_ref().expect("should always have a token");
+                        let token_value = state.access_token().expose_secret();
+                        // Must see either the old or new token, never garbage
+                        assert!(
+                            token_value == "initial-jwt" || token_value == "updated-jwt",
+                            "unexpected token value: {token_value}"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        // Spawn 1 writer thread
+        let writer_handle = {
+            let h = Arc::clone(&handle);
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait(); // synchronize start
+                let updated_data = DhanAuthResponseData {
+                    access_token: "updated-jwt".to_string(),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 86400,
+                };
+                h.store(Arc::new(Some(TokenState::from_response(&updated_data))));
+            })
+        };
+
+        // Main thread participates in barrier to release everyone
+        barrier.wait();
+
+        writer_handle.join().expect("writer thread should not panic");
+        for h in reader_handles {
+            h.join().expect("reader thread should not panic");
+        }
+
+        // After all threads complete, verify the final value is the updated token
+        let guard = handle.load();
+        let final_state = guard.as_ref().as_ref().expect("should have token");
+        assert_eq!(final_state.access_token().expose_secret(), "updated-jwt");
+    }
+
+    #[test]
+    fn test_token_handle_rapid_successive_stores() {
+        // Store 100 different tokens rapidly in sequence, verify the final
+        // read shows the last stored token. Tests that arc-swap doesn't lose updates.
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+
+        let total_stores: u32 = 100;
+        for i in 0..total_stores {
+            let data = DhanAuthResponseData {
+                access_token: format!("jwt-{i}"),
+                token_type: "Bearer".to_string(),
+                expires_in: 86400,
+            };
+            handle.store(Arc::new(Some(TokenState::from_response(&data))));
+        }
+
+        let guard = handle.load();
+        let state = guard.as_ref().as_ref().expect("should have token after 100 stores");
+        assert_eq!(
+            state.access_token().expose_secret(),
+            format!("jwt-{}", total_stores - 1),
+            "final read must show the last stored token"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_clone_shares_state() {
+        // Call token_handle() pattern (Arc::clone) twice, store via first handle,
+        // verify second handle sees the update. Verifies handles share the
+        // underlying ArcSwap.
+        let handle_one: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+        let handle_two: TokenHandle = Arc::clone(&handle_one);
+
+        // Both should initially see None
+        assert!(handle_one.load().as_ref().is_none());
+        assert!(handle_two.load().as_ref().is_none());
+
+        // Store via handle_one
+        let data = DhanAuthResponseData {
+            access_token: "shared-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle_one.store(Arc::new(Some(TokenState::from_response(&data))));
+
+        // handle_two must see the update
+        let guard = handle_two.load();
+        let state = guard.as_ref().as_ref().expect("handle_two should see the stored token");
+        assert_eq!(
+            state.access_token().expose_secret(),
+            "shared-jwt",
+            "cloned handle must share the same underlying ArcSwap"
+        );
+
+        // Store via handle_two, verify handle_one sees the update
+        let data_v2 = DhanAuthResponseData {
+            access_token: "shared-jwt-v2".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle_two.store(Arc::new(Some(TokenState::from_response(&data_v2))));
+
+        let guard_one = handle_one.load();
+        let state_one = guard_one.as_ref().as_ref().expect("handle_one should see handle_two's update");
+        assert_eq!(
+            state_one.access_token().expose_secret(),
+            "shared-jwt-v2",
+            "updates via either handle must be visible to the other"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_store_old_token_is_dropped() {
+        // Store a token, then store a new one. The old token should no longer
+        // be accessible via the handle. While we can't directly test drop
+        // (SecretString zeroizes on drop), we verify the old value is gone
+        // and only the new value is visible.
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+
+        // Store first token
+        let data_old = DhanAuthResponseData {
+            access_token: "old-token-to-be-replaced".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle.store(Arc::new(Some(TokenState::from_response(&data_old))));
+
+        // Verify old token is present
+        {
+            let guard = handle.load();
+            let state = guard.as_ref().as_ref().expect("should have old token");
+            assert_eq!(state.access_token().expose_secret(), "old-token-to-be-replaced");
+        }
+
+        // Store new token — this replaces the old Arc, which should be dropped
+        // when its reference count reaches zero.
+        let data_new = DhanAuthResponseData {
+            access_token: "new-replacement-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle.store(Arc::new(Some(TokenState::from_response(&data_new))));
+
+        // Verify ONLY the new token is accessible
+        let guard = handle.load();
+        let state = guard.as_ref().as_ref().expect("should have new token");
+        assert_eq!(
+            state.access_token().expose_secret(),
+            "new-replacement-token",
+            "only the new token should be accessible after replacement"
+        );
+        assert_ne!(
+            state.access_token().expose_secret(),
+            "old-token-to-be-replaced",
+            "old token value must not be accessible"
+        );
+
+        // Additionally verify that storing None clears the token entirely
+        handle.store(Arc::new(None));
+        let guard_after_clear = handle.load();
+        assert!(
+            guard_after_clear.as_ref().is_none(),
+            "storing None must clear the token state"
+        );
+    }
 }

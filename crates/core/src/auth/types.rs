@@ -393,4 +393,258 @@ mod tests {
         assert!(response.data.is_none());
         assert_eq!(response.remarks.as_deref(), Some("Invalid TOTP code"));
     }
+
+    // -----------------------------------------------------------------------
+    // CRITICAL gap tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_state_is_valid_returns_false_when_expired() {
+        // Construct a TokenState with expires_at in the past.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let state = TokenState {
+            access_token: SecretString::from("expired-token".to_string()),
+            expires_at: now_ist - Duration::seconds(60), // expired 1 minute ago
+            issued_at: now_ist - Duration::hours(25),    // issued 25 hours ago
+        };
+
+        assert!(!state.is_valid(), "Token with past expires_at must not be valid");
+    }
+
+    #[test]
+    fn test_token_state_needs_refresh_returns_true_inside_window() {
+        // Token with expires_in=3600 (1 hour from now).
+        // With refresh_before_expiry_hours=1, the refresh threshold is
+        // expires_at - 1h = now, so needs_refresh(1) should return true.
+        let response_data = DhanAuthResponseData {
+            access_token: "token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 3600, // 1 hour
+        };
+
+        let state = TokenState::from_response(&response_data);
+
+        // refresh window = 1 hour before expiry. Token expires in 1 hour,
+        // so the refresh threshold is approximately now. needs_refresh should be true.
+        assert!(
+            state.needs_refresh(1),
+            "Token expiring in 1h with 1h refresh window should need refresh"
+        );
+    }
+
+    #[test]
+    fn test_token_state_needs_refresh_returns_true_when_expired() {
+        // Construct a TokenState that has already expired.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let state = TokenState {
+            access_token: SecretString::from("expired-token".to_string()),
+            expires_at: now_ist - Duration::hours(2), // expired 2 hours ago
+            issued_at: now_ist - Duration::hours(26),
+        };
+
+        assert!(
+            state.needs_refresh(1),
+            "An expired token should always need refresh"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HIGH gap tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_state_time_until_refresh_returns_zero_when_past_window() {
+        // Token with 30 minutes left, refresh_before_expiry=1h.
+        // Refresh threshold = expires_at - 1h, which is 30 min in the past.
+        // time_until_refresh should return Duration::ZERO.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let state = TokenState {
+            access_token: SecretString::from("token".to_string()),
+            expires_at: now_ist + Duration::minutes(30), // 30 min left
+            issued_at: now_ist - Duration::hours(23) - Duration::minutes(30),
+        };
+
+        let until_refresh = state.time_until_refresh(1); // 1h window
+        assert_eq!(
+            until_refresh,
+            std::time::Duration::ZERO,
+            "Past the refresh window should return Duration::ZERO"
+        );
+    }
+
+    #[test]
+    fn test_generate_token_request_serializes_correctly() {
+        let request = GenerateTokenRequest {
+            client_id: "test-client-id".to_string(),
+            client_secret: "test-secret".to_string(),
+            totp: "123456".to_string(),
+        };
+
+        let json_value: serde_json::Value =
+            serde_json::to_value(&request).expect("should serialize");
+
+        // Verify the serialized field names match Dhan API expectations
+        // (serde uses the Rust field names by default: snake_case).
+        assert_eq!(json_value["client_id"], "test-client-id");
+        assert_eq!(json_value["client_secret"], "test-secret");
+        assert_eq!(json_value["totp"], "123456");
+
+        // Verify no extra fields are present
+        let obj = json_value.as_object().expect("should be an object");
+        assert_eq!(obj.len(), 3, "GenerateTokenRequest should have exactly 3 fields");
+    }
+
+    #[test]
+    fn test_renew_token_request_serializes_correctly() {
+        let request = RenewTokenRequest {
+            client_id: "renew-client-id".to_string(),
+            totp: "654321".to_string(),
+        };
+
+        let json_value: serde_json::Value =
+            serde_json::to_value(&request).expect("should serialize");
+
+        assert_eq!(json_value["client_id"], "renew-client-id");
+        assert_eq!(json_value["totp"], "654321");
+
+        let obj = json_value.as_object().expect("should be an object");
+        assert_eq!(obj.len(), 2, "RenewTokenRequest should have exactly 2 fields");
+    }
+
+    #[test]
+    fn test_dhan_auth_response_data_debug_redacted() {
+        let data = DhanAuthResponseData {
+            access_token: "super-secret-jwt-value-12345".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+
+        let debug_output = format!("{data:?}");
+
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for access_token"
+        );
+        assert!(
+            !debug_output.contains("super-secret-jwt-value-12345"),
+            "Debug output must NOT contain the raw access_token value"
+        );
+        // token_type and expires_in should still be visible
+        assert!(
+            debug_output.contains("Bearer"),
+            "Debug output should show token_type"
+        );
+        assert!(
+            debug_output.contains("86400"),
+            "Debug output should show expires_in"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MEDIUM gap tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_state_from_response_with_zero_expires_in() {
+        let response_data = DhanAuthResponseData {
+            access_token: "zero-expiry-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0,
+        };
+
+        let state = TokenState::from_response(&response_data);
+
+        // expires_in=0 means the token expires at issuance time.
+        // By the time we check, it should already be invalid (or at the boundary).
+        // is_valid checks now_ist < expires_at, and now_ist >= issued_at == expires_at.
+        assert!(
+            !state.is_valid(),
+            "Token with zero expires_in should be expired immediately"
+        );
+        assert_eq!(
+            state.expires_at(),
+            state.issued_at(),
+            "With zero expires_in, expires_at should equal issued_at"
+        );
+    }
+
+    #[test]
+    fn test_token_state_from_response_with_max_expires_in() {
+        let response_data = DhanAuthResponseData {
+            access_token: "max-expiry-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: u32::MAX,
+        };
+
+        // Must not panic due to overflow in Duration::seconds(i64::from(u32::MAX))
+        let state = TokenState::from_response(&response_data);
+
+        // u32::MAX = 4294967295 seconds (~136 years). Token should be valid.
+        assert!(state.is_valid(), "Token with u32::MAX expires_in should be valid");
+        assert!(
+            state.expires_at() > state.issued_at(),
+            "expires_at must be after issued_at"
+        );
+    }
+
+    #[test]
+    fn test_token_state_needs_refresh_with_zero_window() {
+        // Fresh 24h token with refresh_before_expiry_hours=0.
+        // Refresh threshold = expires_at - 0h = expires_at.
+        // Since now < expires_at, needs_refresh(0) should be false.
+        let response_data = DhanAuthResponseData {
+            access_token: "token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400, // 24 hours
+        };
+
+        let state = TokenState::from_response(&response_data);
+
+        assert!(
+            !state.needs_refresh(0),
+            "Fresh 24h token with zero refresh window should NOT need refresh"
+        );
+    }
+
+    #[test]
+    fn test_token_state_needs_refresh_with_window_larger_than_expiry() {
+        // 24h token with refresh_before_expiry_hours=48.
+        // Refresh threshold = expires_at - 48h, which is 24 hours in the PAST.
+        // Since now > threshold, needs_refresh(48) should be true immediately.
+        let response_data = DhanAuthResponseData {
+            access_token: "token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400, // 24 hours
+        };
+
+        let state = TokenState::from_response(&response_data);
+
+        assert!(
+            state.needs_refresh(48),
+            "24h token with 48h refresh window should immediately need refresh"
+        );
+    }
+
+    #[test]
+    fn test_dhan_auth_response_deserialize_missing_remarks() {
+        // JSON without a "remarks" field at all — should deserialize fine
+        // because remarks has #[serde(default)].
+        let json = r#"{
+            "status": "success",
+            "data": {
+                "access_token": "jwt-value",
+                "token_type": "Bearer",
+                "expires_in": 86400
+            }
+        }"#;
+
+        let response: DhanAuthResponse =
+            serde_json::from_str(json).expect("should deserialize without remarks field");
+        assert_eq!(response.status, "success");
+        assert!(
+            response.remarks.is_none(),
+            "Missing remarks field should deserialize as None"
+        );
+        assert!(response.data.is_some());
+    }
 }

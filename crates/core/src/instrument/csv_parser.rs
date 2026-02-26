@@ -1000,4 +1000,157 @@ mod tests {
     fn test_parse_expiry_date_garbage_string() {
         assert_eq!(parse_expiry_date("not-a-date"), None);
     }
+
+    // -----------------------------------------------------------------------
+    // parse_instrument_csv() public API tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_instrument_csv_below_min_rows_returns_error() {
+        // build_mock_csv() has ~33 data rows — far below INSTRUMENT_CSV_MIN_ROWS (100,000).
+        // parse_instrument_csv should return an error about insufficient row count.
+        let csv_text = build_mock_csv();
+        let result = parse_instrument_csv(&csv_text);
+        assert!(result.is_err(), "expected error for CSV with too few rows");
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("rows"),
+            "error should mention row count, got: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains(&INSTRUMENT_CSV_MIN_ROWS.to_string()),
+            "error should mention the minimum threshold {}, got: {}",
+            INSTRUMENT_CSV_MIN_ROWS,
+            error_message
+        );
+    }
+
+    #[test]
+    fn test_parse_row_unknown_exchange_returns_error() {
+        // Build a single-row CSV with exchange "MCX" (not NSE/BSE).
+        // parse_row should return an error about unknown exchange.
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "MCX,D,99999,NA,FUTCOM,500,CRUDEOIL,CRUDEOIL-FUT,CRUDE OIL FUT,FUT,NA,\
+             100.0,2026-03-28,-0.01,XX,1.0,M,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let result = parse_row(&record, &indices);
+        assert!(result.is_err(), "expected error for unknown exchange MCX");
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("unknown exchange"),
+            "error should mention unknown exchange, got: {}",
+            error_message
+        );
+    }
+
+    #[test]
+    fn test_parse_row_empty_segment_field_returns_error() {
+        // Build a row where the segment field is empty.
+        // parse_row should return an error about empty segment.
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            // Exchange is NSE (valid), but segment is empty
+            "NSE,,12345,NA,INDEX,12345,NIFTY,NIFTY,NIFTY Index,INDEX,NA,\
+             1.0,0001-01-01,,XX,0.0500,N,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let result = parse_row(&record, &indices);
+        assert!(result.is_err(), "expected error for empty segment field");
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("empty segment"),
+            "error should mention empty segment, got: {}",
+            error_message
+        );
+    }
+
+    #[test]
+    fn test_parse_row_unparseable_security_id_returns_error() {
+        // Build a row where SEM_SMST_SECURITY_ID is "abc" (not a number).
+        // parse_row should return an error about invalid security_id.
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "NSE,I,abc,NA,INDEX,13,NIFTY,NIFTY,NIFTY Index,INDEX,NA,\
+             1.0,0001-01-01,,XX,0.0500,N,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let result = parse_row(&record, &indices);
+        assert!(
+            result.is_err(),
+            "expected error for non-numeric security_id"
+        );
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("invalid security_id"),
+            "error should mention invalid security_id, got: {}",
+            error_message
+        );
+    }
+
+    #[test]
+    fn test_parse_instrument_csv_skips_malformed_rows_gracefully() {
+        // Build a CSV with a mix of valid and malformed rows.
+        // The function should not panic. It will return Err due to
+        // INSTRUMENT_CSV_MIN_ROWS, but the important thing is it processes
+        // gracefully without panicking on malformed data.
+        let header = build_mock_csv_header();
+        let valid_row = build_nse_index_row(13, "NIFTY");
+        // Malformed row: unbalanced quotes cause CSV parse error
+        let malformed_row = r#"NSE,I,"unclosed quote,NA,INDEX,13,NIFTY,NIFTY,NIFTY,INDEX,NA,1.0,0001-01-01,,XX,0.05,N,"#;
+        let another_valid_row = build_nse_index_row(25, "BANKNIFTY");
+
+        let csv_text = format!(
+            "{}\n{}\n{}\n{}",
+            header, valid_row, malformed_row, another_valid_row
+        );
+
+        // Must not panic — graceful handling of malformed rows is the goal.
+        let result = parse_instrument_csv(&csv_text);
+
+        // The function returns Err because total rows < INSTRUMENT_CSV_MIN_ROWS,
+        // but the key assertion is that we reached here without panicking.
+        assert!(
+            result.is_err(),
+            "expected error due to insufficient row count"
+        );
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("rows"),
+            "error should be about row count (not a panic from malformed data), got: {}",
+            error_message
+        );
+    }
 }

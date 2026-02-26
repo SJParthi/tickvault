@@ -148,7 +148,7 @@ mod tests {
 
     use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 
-    use dhan_live_trader_common::types::ExchangeSegment;
+    use dhan_live_trader_common::types::{Exchange, ExchangeSegment};
 
     /// Build a minimal valid FnoUniverse for testing validation.
     fn build_valid_universe() -> FnoUniverse {
@@ -396,6 +396,219 @@ mod tests {
         assert!(
             err_msg.contains("empty"),
             "error must mention empty: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_stock_count_above_maximum_fails() {
+        let mut universe = build_valid_universe();
+
+        // Add stocks until we exceed VALIDATION_FNO_STOCK_MAX_COUNT
+        let current_stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+
+        for i in 0..(VALIDATION_FNO_STOCK_MAX_COUNT + 1 - current_stock_count) {
+            let symbol = format!("EXCESSSTOCK{}", i);
+            universe.underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol,
+                    underlying_security_id: 50000 + i as u32,
+                    price_feed_security_id: 50000 + i as u32,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        let final_stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert!(
+            final_stock_count > VALIDATION_FNO_STOCK_MAX_COUNT,
+            "test setup: stock count {} must exceed max {}",
+            final_stock_count,
+            VALIDATION_FNO_STOCK_MAX_COUNT
+        );
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("outside expected range"),
+            "error must mention range: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_stock_count_exactly_at_minimum_passes() {
+        let mut universe = build_valid_universe();
+
+        // Remove all stocks, then add back exactly VALIDATION_FNO_STOCK_MIN_COUNT
+        let stock_symbols: Vec<String> = universe
+            .underlyings
+            .iter()
+            .filter(|(_, u)| u.kind == UnderlyingKind::Stock)
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in &stock_symbols {
+            universe.underlyings.remove(symbol);
+        }
+
+        // Re-add must-exist F&O stocks (they are stocks)
+        for symbol in VALIDATION_MUST_EXIST_FNO_STOCKS {
+            universe.underlyings.insert(
+                symbol.to_string(),
+                FnoUnderlying {
+                    underlying_symbol: symbol.to_string(),
+                    underlying_security_id: 9000,
+                    price_feed_security_id: 9000,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 500,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        // Fill remaining slots to reach exactly VALIDATION_FNO_STOCK_MIN_COUNT
+        let must_exist_count = VALIDATION_MUST_EXIST_FNO_STOCKS.len();
+        for i in 0..(VALIDATION_FNO_STOCK_MIN_COUNT - must_exist_count) {
+            let symbol = format!("BOUNDARYSTOCK{}", i);
+            universe.underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol,
+                    underlying_security_id: 30000 + i as u32,
+                    price_feed_security_id: 30000 + i as u32,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        let stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert_eq!(
+            stock_count, VALIDATION_FNO_STOCK_MIN_COUNT,
+            "test setup: stock count must equal min boundary"
+        );
+
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "stock count exactly at minimum must pass: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_stock_count_exactly_at_maximum_passes() {
+        let mut universe = build_valid_universe();
+
+        // Remove all stocks, then add back exactly VALIDATION_FNO_STOCK_MAX_COUNT
+        let stock_symbols: Vec<String> = universe
+            .underlyings
+            .iter()
+            .filter(|(_, u)| u.kind == UnderlyingKind::Stock)
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in &stock_symbols {
+            universe.underlyings.remove(symbol);
+        }
+
+        // Re-add must-exist F&O stocks
+        for symbol in VALIDATION_MUST_EXIST_FNO_STOCKS {
+            universe.underlyings.insert(
+                symbol.to_string(),
+                FnoUnderlying {
+                    underlying_symbol: symbol.to_string(),
+                    underlying_security_id: 9000,
+                    price_feed_security_id: 9000,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 500,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        // Fill remaining slots to reach exactly VALIDATION_FNO_STOCK_MAX_COUNT
+        let must_exist_count = VALIDATION_MUST_EXIST_FNO_STOCKS.len();
+        for i in 0..(VALIDATION_FNO_STOCK_MAX_COUNT - must_exist_count) {
+            let symbol = format!("MAXSTOCK{}", i);
+            universe.underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol,
+                    underlying_security_id: 40000 + i as u32,
+                    price_feed_security_id: 40000 + i as u32,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        let stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert_eq!(
+            stock_count, VALIDATION_FNO_STOCK_MAX_COUNT,
+            "test setup: stock count must equal max boundary"
+        );
+
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "stock count exactly at maximum must pass: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_equity_instrument_info_wrong_variant_fails() {
+        let mut universe = build_valid_universe();
+
+        // Replace RELIANCE equity with an Index variant (wrong variant type)
+        let (symbol, security_id) = VALIDATION_MUST_EXIST_EQUITIES[0]; // ("RELIANCE", 2885)
+        universe.instrument_info.insert(
+            security_id,
+            InstrumentInfo::Index {
+                security_id,
+                symbol: symbol.to_string(),
+                exchange: Exchange::NationalStockExchange,
+            },
+        );
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not an Equity variant"),
+            "error must mention 'not an Equity variant': {}",
             err_msg
         );
     }
