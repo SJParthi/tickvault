@@ -327,6 +327,162 @@ mod tests {
     }
 
     #[test]
+    fn test_pool_single_instrument() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(1),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.total_instruments(), 1);
+    }
+
+    #[test]
+    fn test_pool_boundary_4999_one_connection() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(4999),
+            FeedMode::Quote,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 1);
+    }
+
+    #[test]
+    fn test_pool_boundary_10000_two_connections() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(10000),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 2);
+    }
+
+    #[test]
+    fn test_pool_boundary_15000_three_connections() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(15000),
+            FeedMode::Full,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 3);
+    }
+
+    #[test]
+    fn test_pool_boundary_20000_four_connections() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(20000),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 4);
+    }
+
+    #[test]
+    fn test_pool_take_frame_receiver_once() {
+        let mut pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        // First take succeeds — we get the real receiver
+        let _receiver = pool.take_frame_receiver();
+
+        // Second take gets a dummy channel (capacity 1, no senders)
+        let mut dummy_receiver = pool.take_frame_receiver();
+        // Dummy receiver should return None immediately since no sender exists
+        assert!(
+            dummy_receiver.try_recv().is_err(),
+            "Second take should return empty dummy receiver"
+        );
+    }
+
+    #[test]
+    fn test_pool_debug_impl() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(5001),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        let debug_str = format!("{pool:?}");
+        assert!(debug_str.contains("WebSocketConnectionPool"));
+        assert!(debug_str.contains("connection_count"));
+        assert!(debug_str.contains("2")); // 5001 instruments = 2 connections
+    }
+
+    #[test]
+    fn test_pool_config_override_smaller_max_per_connection() {
+        // Config says 2000 per connection instead of default 5000
+        let config = DhanConfig {
+            max_instruments_per_connection: 2000,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(5000),
+            FeedMode::Full,
+        )
+        .unwrap();
+        // 5000 / 2000 = 3 connections needed
+        assert_eq!(pool.connection_count(), 3);
+        assert_eq!(pool.total_instruments(), 5000);
+    }
+
+    #[test]
+    fn test_pool_total_instruments_matches_after_distribution() {
+        // Test that round-robin doesn't lose or gain instruments
+        for count in [
+            1, 100, 4999, 5000, 5001, 10000, 10001, 15000, 20000, 24999, 25000,
+        ] {
+            let pool = WebSocketConnectionPool::new(
+                make_test_token_handle(),
+                "test-client".to_string(),
+                make_test_dhan_config(),
+                make_test_ws_config(),
+                make_instruments(count),
+                FeedMode::Ticker,
+            )
+            .unwrap();
+            assert_eq!(
+                pool.total_instruments(),
+                count,
+                "Mismatch for {count} instruments"
+            );
+        }
+    }
+
+    #[test]
     fn test_pool_health_returns_all_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),

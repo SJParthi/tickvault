@@ -518,7 +518,9 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 1, // Fail fast
+                reconnect_max_attempts: 1,     // Fail fast
+                reconnect_initial_delay_ms: 1, // Don't wait
+                reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
             },
             vec![],
@@ -527,5 +529,192 @@ mod tests {
         );
         let result = conn.run().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connection_run_returns_reconnection_exhausted() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            2,
+            make_test_token_handle(), // No token → every attempt fails
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 3,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![],
+            FeedMode::Quote,
+            tx,
+        );
+        let result = conn.run().await;
+        match result {
+            Err(WebSocketError::ReconnectionExhausted {
+                connection_id,
+                attempts,
+            }) => {
+                assert_eq!(connection_id, 2);
+                assert_eq!(attempts, 3);
+            }
+            other => panic!("Expected ReconnectionExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_state_changes_reflected_in_health() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        assert_eq!(conn.health().state, ConnectionState::Disconnected);
+
+        conn.set_state(ConnectionState::Connecting);
+        assert_eq!(conn.health().state, ConnectionState::Connecting);
+
+        conn.set_state(ConnectionState::Connected);
+        assert_eq!(conn.health().state, ConnectionState::Connected);
+
+        conn.set_state(ConnectionState::Reconnecting);
+        assert_eq!(conn.health().state, ConnectionState::Reconnecting);
+
+        conn.set_state(ConnectionState::Disconnected);
+        assert_eq!(conn.health().state, ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn test_health_tracks_pong_failure_increments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        assert_eq!(conn.health().consecutive_pong_failures, 0);
+
+        conn.consecutive_pong_failures
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(conn.health().consecutive_pong_failures, 3);
+    }
+
+    #[test]
+    fn test_health_tracks_reconnection_count() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        assert_eq!(conn.health().total_reconnections, 0);
+
+        conn.total_reconnections
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(conn.health().total_reconnections, 7);
+    }
+
+    #[test]
+    fn test_connection_max_id_4() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            4,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Full,
+            tx,
+        );
+        assert_eq!(conn.connection_id(), 4);
+        assert_eq!(conn.health().connection_id, 4);
+    }
+
+    #[test]
+    fn test_connection_all_feed_modes() {
+        for feed_mode in [FeedMode::Ticker, FeedMode::Quote, FeedMode::Full] {
+            let (tx, _rx) = mpsc::channel(100);
+            let conn = WebSocketConnection::new(
+                0,
+                make_test_token_handle(),
+                "test-client".to_string(),
+                make_test_dhan_config(),
+                make_test_ws_config(),
+                vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 1000)],
+                feed_mode,
+                tx,
+            );
+            // All feed modes should create successfully with 1 instrument
+            assert_eq!(conn.health().subscribed_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wait_with_backoff_returns_false_when_exhausted() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 3,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+
+        // Simulate 3 reconnections already happened
+        conn.total_reconnections
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let result = conn.wait_with_backoff().await;
+        assert!(!result, "Should return false when max attempts exhausted");
+    }
+
+    #[tokio::test]
+    async fn test_wait_with_backoff_returns_true_when_under_limit() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 10,
+                reconnect_initial_delay_ms: 1, // 1ms for fast test
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+
+        // Only 2 reconnections — well under limit of 10
+        conn.total_reconnections
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let result = conn.wait_with_backoff().await;
+        assert!(result, "Should return true when under limit");
     }
 }

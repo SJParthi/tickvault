@@ -205,6 +205,80 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_size_one_creates_one_per_message() {
+        let instruments = make_instruments(5);
+        let messages = build_subscription_messages(&instruments, FeedMode::Ticker, 1);
+        assert_eq!(messages.len(), 5);
+        for msg in &messages {
+            assert!(msg.contains("\"InstrumentCount\":1"));
+        }
+    }
+
+    #[test]
+    fn test_batch_size_exact_100_single_batch() {
+        let instruments = make_instruments(100);
+        // batch_size = 100 = SUBSCRIPTION_BATCH_SIZE
+        let messages = build_subscription_messages(&instruments, FeedMode::Full, 100);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("\"InstrumentCount\":100"));
+    }
+
+    #[test]
+    fn test_unsubscription_batch_size_clamped_above_100() {
+        let instruments = make_instruments(200);
+        // batch_size = 999 clamped to 100
+        let messages = build_unsubscription_messages(&instruments, 999);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].contains("\"RequestCode\":12"));
+    }
+
+    #[test]
+    fn test_mixed_exchange_segments_in_batch() {
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+            InstrumentSubscription::new(ExchangeSegment::BseFno, 2000),
+            InstrumentSubscription::new(ExchangeSegment::NseEquity, 2885),
+        ];
+        let messages = build_subscription_messages(&instruments, FeedMode::Quote, 100);
+        assert_eq!(messages.len(), 1);
+        let json = &messages[0];
+        assert!(json.contains("NSE_FNO"));
+        assert!(json.contains("IDX_I"));
+        assert!(json.contains("BSE_FNO"));
+        assert!(json.contains("NSE_EQ"));
+    }
+
+    #[test]
+    fn test_large_security_id_u32_max_as_string() {
+        let instruments = vec![InstrumentSubscription::new(
+            ExchangeSegment::NseFno,
+            u32::MAX,
+        )];
+        let messages = build_subscription_messages(&instruments, FeedMode::Ticker, 100);
+        assert!(messages[0].contains(&format!("\"SecurityId\":\"{}\"", u32::MAX)));
+    }
+
+    #[test]
+    fn test_all_exchange_segments_serialize_correctly() {
+        let segments = [
+            (ExchangeSegment::IdxI, "IDX_I"),
+            (ExchangeSegment::NseEquity, "NSE_EQ"),
+            (ExchangeSegment::NseFno, "NSE_FNO"),
+            (ExchangeSegment::BseEquity, "BSE_EQ"),
+            (ExchangeSegment::BseFno, "BSE_FNO"),
+        ];
+        for (segment, expected_str) in &segments {
+            let instruments = vec![InstrumentSubscription::new(*segment, 100)];
+            let messages = build_subscription_messages(&instruments, FeedMode::Full, 100);
+            assert!(
+                messages[0].contains(expected_str),
+                "Expected {expected_str} in JSON for segment {segment:?}",
+            );
+        }
+    }
+
+    #[test]
     fn test_valid_json_parse() {
         let instruments = make_instruments(3);
         let messages = build_subscription_messages(&instruments, FeedMode::Full, 100);

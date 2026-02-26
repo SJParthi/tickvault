@@ -217,12 +217,12 @@ ConnectionHealth {
 }
 ```
 
-## Test Counts (301 total)
+## Test Counts (346 total)
 
 | Crate | Module | Tests |
 |-------|--------|-------|
 | common | types | 18 |
-| common | config | 15 |
+| common | config | 21 |
 | common | error | 13 |
 | common | instrument_types | 17 |
 | core | auth/secret_manager | 10 |
@@ -233,12 +233,12 @@ ConnectionHealth {
 | core | instrument/csv_parser | 53 |
 | core | instrument/universe_builder | 54 |
 | core | instrument/validation | 12 |
-| core | websocket/types | 17 |
-| core | websocket/subscription_builder | 15 |
-| core | websocket/connection | 4 |
-| core | websocket/connection_pool | 8 |
+| core | websocket/types | 30 |
+| core | websocket/subscription_builder | 22 |
+| core | websocket/connection | 12 |
+| core | websocket/connection_pool | 18 |
 | storage | instrument_persistence | 25 |
-| **Total** | | **301** |
+| **Total** | | **346** |
 
 ## QuestDB Tables (4) — DEDUP UPSERT KEYS enabled on all
 
@@ -283,3 +283,4 @@ ConnectionHealth {
 - **BSE filter fix**: BSE stock derivatives filtered in Pass 3 + Pass 5, 7 new tests (250 → 257)
 - **Bible fix**: Section 1 Frontend corrected to SolidJS (not Grafana), total 113 components
 - **Block 03**: WebSocket Connection Manager (types, subscription builder, connection lifecycle, connection pool) — 44 new tests (257 → 301)
+- **Block 03 hardening**: 45 coverage gaps closed — types, subscription, connection, pool, config validation (301 → 346)

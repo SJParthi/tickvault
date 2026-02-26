@@ -386,6 +386,66 @@ mod tests {
         assert_ne!(ConnectionState::Connected, ConnectionState::Disconnected);
     }
 
+    #[test]
+    fn test_connection_state_clone_and_copy() {
+        let state = ConnectionState::Connected;
+        let cloned = state.clone();
+        let copied = state; // Copy trait
+        assert_eq!(state, cloned);
+        assert_eq!(state, copied);
+    }
+
+    // --- DisconnectCode (additional) ---
+
+    #[test]
+    fn test_disconnect_code_clone_and_copy() {
+        let code = DisconnectCode::TokenExpired;
+        let cloned = code.clone();
+        let copied = code; // Copy trait
+        assert_eq!(code, cloned);
+        assert_eq!(code, copied);
+    }
+
+    #[test]
+    fn test_disconnect_code_display_all_non_reconnectable() {
+        assert!(
+            DisconnectCode::ExceededMaxConnections
+                .to_string()
+                .contains("801")
+        );
+        assert!(
+            DisconnectCode::ExceededMaxInstruments
+                .to_string()
+                .contains("802")
+        );
+        assert!(
+            DisconnectCode::InvalidSubscription
+                .to_string()
+                .contains("807")
+        );
+        assert!(
+            DisconnectCode::SubscriptionLimitExceeded
+                .to_string()
+                .contains("808")
+        );
+        assert!(DisconnectCode::InvalidClientId.to_string().contains("814"));
+    }
+
+    #[test]
+    fn test_disconnect_code_unknown_zero_roundtrip() {
+        let code = DisconnectCode::from_u16(0);
+        assert_eq!(code, DisconnectCode::Unknown(0));
+        assert_eq!(code.as_u16(), 0);
+        assert!(code.is_reconnectable()); // unknown = assume transient
+    }
+
+    #[test]
+    fn test_disconnect_code_unknown_u16_max_roundtrip() {
+        let code = DisconnectCode::from_u16(u16::MAX);
+        assert_eq!(code, DisconnectCode::Unknown(u16::MAX));
+        assert_eq!(code.as_u16(), u16::MAX);
+    }
+
     // --- InstrumentSubscription ---
 
     #[test]
@@ -403,11 +463,34 @@ mod tests {
     }
 
     #[test]
+    fn test_instrument_subscription_bse_fno_segment() {
+        let sub = InstrumentSubscription::new(ExchangeSegment::BseFno, 99999);
+        assert_eq!(sub.exchange_segment, "BSE_FNO");
+        assert_eq!(sub.security_id, "99999");
+    }
+
+    #[test]
+    fn test_instrument_subscription_nse_equity_segment() {
+        let sub = InstrumentSubscription::new(ExchangeSegment::NseEquity, 2885);
+        assert_eq!(sub.exchange_segment, "NSE_EQ");
+        assert_eq!(sub.security_id, "2885");
+    }
+
+    #[test]
     fn test_instrument_subscription_serialize_json() {
         let sub = InstrumentSubscription::new(ExchangeSegment::NseFno, 52432);
         let json = serde_json::to_string(&sub).unwrap();
         assert!(json.contains("\"ExchangeSegment\":\"NSE_FNO\""));
         assert!(json.contains("\"SecurityId\":\"52432\""));
+    }
+
+    #[test]
+    fn test_instrument_subscription_deserialize_roundtrip() {
+        let sub = InstrumentSubscription::new(ExchangeSegment::IdxI, 13);
+        let json = serde_json::to_string(&sub).unwrap();
+        let deserialized: InstrumentSubscription = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.exchange_segment, "IDX_I");
+        assert_eq!(deserialized.security_id, "13");
     }
 
     // --- SubscriptionRequest ---
@@ -426,6 +509,21 @@ mod tests {
         assert!(json.contains("\"RequestCode\":15"));
         assert!(json.contains("\"InstrumentCount\":2"));
         assert!(json.contains("\"InstrumentList\""));
+    }
+
+    #[test]
+    fn test_subscription_request_deserialize_roundtrip() {
+        let request = SubscriptionRequest {
+            request_code: 17,
+            instrument_count: 1,
+            instrument_list: vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 5000)],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let deserialized: SubscriptionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.request_code, 17);
+        assert_eq!(deserialized.instrument_count, 1);
+        assert_eq!(deserialized.instrument_list.len(), 1);
+        assert_eq!(deserialized.instrument_list[0].security_id, "5000");
     }
 
     #[test]
@@ -472,7 +570,82 @@ mod tests {
         assert!(err.to_string().contains("connection 2"));
     }
 
+    #[test]
+    fn test_websocket_error_connection_failed_display() {
+        let err = WebSocketError::ConnectionFailed {
+            url: "wss://api-feed.dhan.co/v2".to_string(),
+            source: tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection timed out",
+            )),
+        };
+        assert!(err.to_string().contains("wss://api-feed.dhan.co/v2"));
+    }
+
+    #[test]
+    fn test_websocket_error_dhan_disconnect_display() {
+        let err = WebSocketError::DhanDisconnect {
+            code: DisconnectCode::ServerMaintenance,
+        };
+        assert!(err.to_string().contains("805"));
+    }
+
+    #[test]
+    fn test_websocket_error_non_reconnectable_display() {
+        let err = WebSocketError::NonReconnectableDisconnect {
+            code: DisconnectCode::InvalidClientId,
+        };
+        assert!(err.to_string().contains("814"));
+    }
+
+    #[test]
+    fn test_websocket_error_subscription_failed_display() {
+        let err = WebSocketError::SubscriptionFailed {
+            connection_id: 1,
+            reason: "write error".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("connection 1"));
+        assert!(msg.contains("write error"));
+    }
+
+    #[test]
+    fn test_websocket_error_ping_send_failed_display() {
+        let err = WebSocketError::PingSendFailed {
+            connection_id: 3,
+            reason: "broken pipe".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("connection 3"));
+        assert!(msg.contains("broken pipe"));
+    }
+
+    #[test]
+    fn test_websocket_error_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        // This compiles only if WebSocketError implements Send + Sync
+        // (required for tokio::spawn across await points)
+        assert_send_sync::<WebSocketError>();
+    }
+
     // --- ConnectionHealth ---
+
+    #[test]
+    fn test_connection_health_clone() {
+        let health = ConnectionHealth {
+            connection_id: 2,
+            state: ConnectionState::Connected,
+            subscribed_count: 500,
+            consecutive_pong_failures: 1,
+            total_reconnections: 3,
+        };
+        let cloned = health.clone();
+        assert_eq!(cloned.connection_id, 2);
+        assert_eq!(cloned.state, ConnectionState::Connected);
+        assert_eq!(cloned.subscribed_count, 500);
+        assert_eq!(cloned.consecutive_pong_failures, 1);
+        assert_eq!(cloned.total_reconnections, 3);
+    }
 
     #[test]
     fn test_connection_health_default_values() {

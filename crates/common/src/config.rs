@@ -477,4 +477,52 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("daily_download_time"));
     }
+
+    // --- WebSocket Config Validation ---
+
+    #[test]
+    fn test_websocket_zero_ping_interval_fails() {
+        let mut config = make_valid_config();
+        config.websocket.ping_interval_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("ping_interval_secs"));
+    }
+
+    #[test]
+    fn test_websocket_zero_subscription_batch_size_fails() {
+        let mut config = make_valid_config();
+        config.websocket.subscription_batch_size = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("subscription_batch_size"));
+    }
+
+    #[test]
+    fn test_websocket_subscription_batch_size_over_100_fails() {
+        let mut config = make_valid_config();
+        config.websocket.subscription_batch_size = 101;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("subscription_batch_size"));
+    }
+
+    #[test]
+    fn test_websocket_zero_reconnect_max_attempts_fails() {
+        let mut config = make_valid_config();
+        config.websocket.reconnect_max_attempts = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("reconnect_max_attempts"));
+    }
+
+    #[test]
+    fn test_websocket_subscription_batch_size_exactly_100_passes() {
+        let mut config = make_valid_config();
+        config.websocket.subscription_batch_size = 100;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_websocket_subscription_batch_size_exactly_1_passes() {
+        let mut config = make_valid_config();
+        config.websocket.subscription_batch_size = 1;
+        assert!(config.validate().is_ok());
+    }
 }
