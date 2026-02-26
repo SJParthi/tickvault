@@ -1,0 +1,177 @@
+# =============================================================================
+# dhan-live-trader — Development & Operations Makefile
+# =============================================================================
+# Usage: make <target>
+# Run `make help` to see all available targets.
+# =============================================================================
+
+.PHONY: help run stop build test check fmt clippy clean \
+        docker-up docker-down docker-restart docker-status docker-logs \
+        health status open grafana questdb jaeger prometheus \
+        logs app-pid
+
+# ---- Configuration ----
+APP_NAME       := dhan-live-trader
+APP_PORT       := 3001
+DOCKER_DIR     := deploy/docker
+COMPOSE_FILE   := $(DOCKER_DIR)/docker-compose.yml
+
+# ---- Help ----
+help: ## Show this help
+	@echo ""
+	@echo "  dhan-live-trader — Development & Operations"
+	@echo "  ════════════════════════════════════════════"
+	@echo ""
+	@echo "  APPLICATION:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(run|stop|build|health|status|logs|open)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "  QUALITY:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(test|check|fmt|clippy|clean)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "  DOCKER:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(docker)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "  MONITORING:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(grafana|questdb|jaeger|prometheus)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+
+# =============================================================================
+# APPLICATION
+# =============================================================================
+
+run: ## Run app in dev mode (pretty logs, localhost config)
+	@echo "🚀 Starting $(APP_NAME)..."
+	@cargo run
+
+stop: ## Stop running app
+	@echo "🛑 Stopping $(APP_NAME)..."
+	@-pkill -f "target/debug/$(APP_NAME)" 2>/dev/null && echo "  Stopped." || echo "  Not running."
+
+restart: stop ## Restart app (stop + run)
+	@sleep 1
+	@$(MAKE) run
+
+build: ## Build release binary
+	@echo "🔨 Building release..."
+	cargo build --release
+	@echo "  Binary: target/release/$(APP_NAME)"
+	@ls -lh target/release/$(APP_NAME) 2>/dev/null | awk '{print "  Size:", $$5}'
+
+# =============================================================================
+# QUALITY GATES
+# =============================================================================
+
+test: ## Run all tests
+	@echo "🧪 Running tests..."
+	cargo test
+	@echo ""
+	@echo "  ✅ All tests passed"
+
+check: fmt clippy test ## Full quality check (fmt + clippy + test)
+	@echo ""
+	@echo "  ✅ All quality gates passed"
+
+fmt: ## Format code
+	@cargo fmt
+	@echo "  ✅ Formatted"
+
+clippy: ## Lint with clippy (zero warnings)
+	@cargo clippy -- -D warnings
+	@echo "  ✅ Clippy clean"
+
+clean: ## Clean build artifacts
+	@cargo clean
+	@echo "  🧹 Cleaned"
+
+# =============================================================================
+# DOCKER INFRASTRUCTURE
+# =============================================================================
+
+docker-up: ## Start all Docker infrastructure (9 services)
+	@echo "🐳 Starting Docker infrastructure..."
+	docker compose -f $(COMPOSE_FILE) up -d
+	@echo ""
+	@$(MAKE) docker-status
+
+docker-down: ## Stop all Docker infrastructure
+	@echo "🐳 Stopping Docker infrastructure..."
+	docker compose -f $(COMPOSE_FILE) down
+
+docker-restart: ## Restart all Docker infrastructure
+	@echo "🐳 Restarting Docker infrastructure..."
+	docker compose -f $(COMPOSE_FILE) down
+	docker compose -f $(COMPOSE_FILE) up -d
+	@echo ""
+	@$(MAKE) docker-status
+
+docker-status: ## Show Docker container health
+	@echo ""
+	@echo "  Docker Container Status"
+	@echo "  ───────────────────────"
+	@docker ps --format "  {{.Names}}\t{{.Status}}" --filter "name=dlt-" | sort
+	@echo ""
+
+docker-logs: ## Tail Docker logs (all services)
+	docker compose -f $(COMPOSE_FILE) logs -f --tail 50
+
+# =============================================================================
+# HEALTH & STATUS
+# =============================================================================
+
+health: ## Check app health endpoint
+	@echo "❤️  Health check:"
+	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
+
+status: ## Full system status (Docker + App + QuestDB + Valkey)
+	@echo ""
+	@echo "  ╔════════════════════════════════════════╗"
+	@echo "  ║   dhan-live-trader — System Status     ║"
+	@echo "  ╚════════════════════════════════════════╝"
+	@echo ""
+	@echo "  📦 Docker Services:"
+	@docker ps --format "     {{.Names}}\t{{.Status}}" --filter "name=dlt-" 2>/dev/null | sort || echo "     ⚠️  Docker not running"
+	@echo ""
+	@echo "  🚀 Application:"
+	@if curl -s http://localhost:$(APP_PORT)/health > /dev/null 2>&1; then \
+		echo "     ✅ Running on port $(APP_PORT)"; \
+		echo "     $$(curl -s http://localhost:$(APP_PORT)/health)"; \
+	else \
+		echo "     ⚠️  Not running"; \
+	fi
+	@echo ""
+	@echo "  📊 QuestDB:"
+	@curl -sf --max-time 2 http://localhost:9000/exec?query=SHOW+TABLES > /dev/null 2>&1 \
+		&& echo "     ✅ Console: http://localhost:9000" \
+		|| echo "     ⚠️  Not reachable on port 9000"
+	@echo ""
+	@echo "  💾 Valkey:"
+	@docker exec dlt-valkey valkey-cli ping 2>/dev/null | grep -q PONG \
+		&& echo "     ✅ PONG — connected" \
+		|| echo "     ⚠️  Not reachable"
+	@echo ""
+	@echo "  📈 Monitoring URLs:"
+	@echo "     Grafana:    http://localhost:3000"
+	@echo "     Prometheus: http://localhost:9090"
+	@echo "     Jaeger:     http://localhost:16686"
+	@echo "     QuestDB:    http://localhost:9000"
+	@echo "     App:        http://localhost:$(APP_PORT)"
+	@echo ""
+
+open: ## Open TradingView chart in browser
+	@open http://localhost:$(APP_PORT)
+
+# =============================================================================
+# MONITORING — Open dashboards in browser
+# =============================================================================
+
+grafana: ## Open Grafana dashboard (localhost:3000)
+	@open http://localhost:3000
+
+questdb: ## Open QuestDB console (localhost:9000)
+	@open http://localhost:9000
+
+jaeger: ## Open Jaeger UI (localhost:16686)
+	@open http://localhost:16686
+
+prometheus: ## Open Prometheus UI (localhost:9090)
+	@open http://localhost:9090

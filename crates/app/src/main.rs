@@ -44,8 +44,12 @@ use dhan_live_trader_api::state::SharedAppState;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Config file path (relative to working directory).
-const CONFIG_FILE_PATH: &str = "config/base.toml";
+/// Base config file path (relative to working directory).
+const CONFIG_BASE_PATH: &str = "config/base.toml";
+
+/// Local override config file path (git-ignored, optional).
+/// Overrides Docker hostnames with localhost for `cargo run` on host.
+const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 
 // ---------------------------------------------------------------------------
 // Main
@@ -57,7 +61,8 @@ async fn main() -> Result<()> {
     // Step 1: Load and validate configuration
     // -----------------------------------------------------------------------
     let config: ApplicationConfig = Figment::new()
-        .merge(Toml::file(CONFIG_FILE_PATH))
+        .merge(Toml::file(CONFIG_BASE_PATH))
+        .merge(Toml::file(CONFIG_LOCAL_PATH))
         .extract()
         .context("failed to load configuration from config/base.toml")?;
 
@@ -87,7 +92,7 @@ async fn main() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        config_file = CONFIG_FILE_PATH,
+        config_file = CONFIG_BASE_PATH,
         "dhan-live-trader starting"
     );
 

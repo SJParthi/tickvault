@@ -26,6 +26,7 @@
 
 # ---- Config overrides (dev-only, not committed) ----
 config/local-overrides.toml
+config/local.toml
 
 # ---- Docker volumes (if mounted locally) ----
 docker-data/
