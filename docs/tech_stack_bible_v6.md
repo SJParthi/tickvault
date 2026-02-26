@@ -6,6 +6,9 @@
 >
 > Single source of truth for all versions, components, and architecture.
 > If CLAUDE.md and the Bible conflict, the Bible wins.
+>
+> **Versions reconciled with Cargo.toml on 2026-02-26.**
+> Cargo.toml is the executable truth — this file tracks it.
 
 ---
 
@@ -26,9 +29,9 @@
 |---|-----------|---------|---------|
 | 5 | Rust Edition | 2024 | Language edition (stable 1.85+) |
 | 6 | Rust Toolchain | 1.93.1 | Compiler version — pinned, no nightly |
-| 7 | tokio | 1.47.0 | Async runtime — full features |
-| 8 | tracing | 0.1.41 | Structured logging spans |
-| 9 | tracing-subscriber | 0.3.19 | Log formatting: JSON, filtering, layers |
+| 7 | tokio | 1.49.0 | Async runtime — full features |
+| 8 | tracing | 0.1.44 | Structured logging spans |
+| 9 | tracing-subscriber | 0.3.22 | Log formatting: JSON, filtering, layers |
 
 ---
 
@@ -37,11 +40,11 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 10 | tokio-tungstenite | 0.28.0 | WebSocket client for Dhan V2 binary feed |
-| 11 | zerocopy | 0.8.25 | Zero-allocation binary parsing of tick packets |
+| 11 | zerocopy | 0.8.39 | Zero-allocation binary parsing of tick packets |
 | 12 | rtrb | 0.3.1 | Lock-free SPSC ring buffer — tick pipeline |
 | 13 | crossbeam-channel | 0.5.15 | MPMC channel for fan-out routing |
 | 14 | arc-swap | 1.7.1 | O(1) atomic pointer swap for token/config |
-| 15 | papaya | 0.2.1 | Lock-free concurrent HashMap for hot-path lookups |
+| 15 | papaya | 0.2.3 | Lock-free concurrent HashMap for hot-path lookups |
 
 ---
 
@@ -61,19 +64,19 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 21 | Prometheus | 3.4.1 | Metrics store: tick latency, order counts, error rates |
-| 22 | metrics | 0.24.2 | Rust metrics facade (counters, gauges, histograms) |
-| 23 | metrics-exporter-prometheus | 0.16.2 | Prometheus /metrics HTTP endpoint |
-| 24 | Grafana Loki | 3.6.1 | Log aggregation — queryable via Grafana |
+| 21 | Prometheus | v3.9.1 | Metrics store: tick latency, order counts, error rates |
+| 22 | metrics | 0.24.3 | Rust metrics facade (counters, gauges, histograms) |
+| 23 | metrics-exporter-prometheus | 0.18.1 | Prometheus /metrics HTTP endpoint |
+| 24 | Grafana Loki | 3.6.6 | Log aggregation — queryable via Grafana |
 | 25 | Grafana Alloy | v1.8.0 | Log collector/shipper — replaces Promtail |
-| 26 | Jaeger v2 | 2.6.0 | Distributed tracing — trace every tick, order |
-| 27 | opentelemetry | 0.28.0 | OTel API — vendor-neutral tracing interface |
-| 28 | opentelemetry_sdk | 0.28.0 | OTel SDK — span processing, export |
-| 29 | opentelemetry-otlp | 0.28.0 | OTLP exporter — sends traces to Jaeger v2 |
-| 30 | tracing-opentelemetry | 0.29.0 | Bridge: tracing spans → OTel spans |
-| 31 | opentelemetry-semantic-conventions | 0.28.0 | Standard attribute names for spans |
+| 26 | Jaeger v2 | 2.15.0 | Distributed tracing — trace every tick, order |
+| 27 | opentelemetry | 0.31.0 | OTel API — vendor-neutral tracing interface |
+| 28 | opentelemetry_sdk | 0.31.0 | OTel SDK — span processing, export |
+| 29 | opentelemetry-otlp | 0.31.0 | OTLP exporter — sends traces to Jaeger v2 |
+| 30 | tracing-opentelemetry | 0.31.0 | Bridge: tracing spans → OTel spans |
+| 31 | opentelemetry-semantic-conventions | 0.31.0 | Standard attribute names for spans |
 | 32 | Grafana dashboards | Custom JSON | Pre-built panels for every metric |
-| 33 | Grafana | 12.0.1 | Observability dashboards: ticks, P&L, risk, OMS state |
+| 33 | Grafana | 12.3.3 | Observability dashboards: ticks, P&L, risk, OMS state |
 | 34 | Grafana Image Renderer | 3.12.1 | PNG snapshots for Telegram alerts |
 
 ---
@@ -83,9 +86,9 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 35 | yata | 0.7.0 | Technical indicators (EMA, RSI, MACD, etc.) |
-| 36 | blackscholes | 0.8.3 | Options pricing: Black-Scholes IV & greeks |
+| 36 | blackscholes | 0.24.0 | Options pricing: Black-Scholes IV & greeks |
 | 37 | statrs | 0.18.0 | Stats/probability: normal CDF for options |
-| 38 | governor | 0.8.0 | Rate limiter (GCRA): 10 orders/sec SEBI limit |
+| 38 | governor | 0.10.2 | Rate limiter (GCRA): 10 orders/sec SEBI limit |
 | 39 | statig | 0.3.0 | Type-safe state machine for OMS transitions |
 | 40 | arrayvec | 0.7.6 | Stack-allocated Vec: zero heap on hot path |
 | 41 | enum_dispatch | 0.3.13 | Zero-cost enum dispatch → vtable-free |
@@ -98,7 +101,7 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 44 | reqwest | 0.12.28 | Dhan REST API: auth, orders, positions |
+| 44 | reqwest | 0.12.15 | Dhan REST API: auth, orders, positions |
 
 ---
 
@@ -106,10 +109,10 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 45 | axum | 0.8.1 | HTTP framework: REST API, health, admin |
+| 45 | axum | 0.8.8 | HTTP framework: REST API, health, admin |
 | 46 | tower | 0.5.2 | Middleware: rate limit, timeout, compression |
-| 47 | tower-http | 0.6.6 | HTTP-specific middleware: CORS, tracing, auth |
-| 48 | Traefik | 3.4.0 | Reverse proxy, TLS termination, blue-green deploy |
+| 47 | tower-http | 0.6.5 | HTTP-specific middleware: CORS, tracing, auth |
+| 48 | Traefik | v3.6.8 | Reverse proxy, TLS termination, blue-green deploy |
 
 ---
 
@@ -117,7 +120,7 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 49 | toml (crate) | 0.8.23 | Parse base.toml + local-overrides.toml |
+| 49 | toml (crate) | 1.0.2 | Parse base.toml + local-overrides.toml |
 
 ---
 
@@ -135,9 +138,9 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 52 | serde | 1.0.228 | Serialize/deserialize: JSON, TOML, binary |
-| 53 | serde_json | 1.0.147 | JSON parsing: Dhan API responses |
-| 54 | thiserror | 2.0.17 | Enum-based error types with Display |
-| 55 | anyhow | 1.0.98 | Error context chains for propagation |
+| 53 | serde_json | 1.0.149 | JSON parsing: Dhan API responses |
+| 54 | thiserror | 2.0.18 | Enum-based error types with Display |
+| 55 | anyhow | 1.0.99 | Error context chains for propagation |
 
 ---
 
@@ -146,16 +149,16 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 56 | signal-hook | 0.3.18 | Unix signal handlers: SIGTERM, SIGINT |
-| 57 | signal-hook-tokio | 0.3.2 | Async signal streams for tokio runtime |
-| 58 | sd-notify | 0.4.3 | systemd watchdog: heartbeat, ready notification |
+| 57 | signal-hook-tokio | 0.3.1 | Async signal streams for tokio runtime (0.3.2 never published) |
+| 58 | sd-notify | 0.4.5 | systemd watchdog: heartbeat, ready notification |
 | 59 | backon | 1.6.0 | Retry with exponential backoff |
 | 60 | failsafe | 1.3.0 | Circuit breaker: trip on N consecutive failures |
-| 61 | memmap2 | 0.9.5 | Memory-mapped files: crash recovery state |
+| 61 | memmap2 | 0.9.9 | Memory-mapped files: crash recovery state |
 | 62 | parking_lot | 0.12.3 | Faster Mutex/RwLock than std (cold path only) |
 | 63 | once_cell | 1.21.3 | Lazy static initialization — thread-safe |
 | 64 | bytes | 1.10.1 | Zero-copy byte buffer for network I/O |
 
-> **Known discrepancy:** signal-hook-tokio 0.3.2 was never published to crates.io. We use 0.3.1.
+> signal-hook-tokio version updated to 0.3.1 (0.3.2 was never published to crates.io).
 
 ---
 
@@ -163,7 +166,7 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 65 | criterion | 0.5.1 | Microbenchmarks: tick parse, pipeline latency |
+| 65 | criterion | 0.8.2 | Microbenchmarks: tick parse, pipeline latency |
 | 66 | proptest | 1.6.0 | Property-based testing: random input generation |
 | 67 | loom | 0.7.2 | Concurrency testing: thread interleaving |
 | 68 | dhat | 0.3.3 | Heap profiler: verify zero allocation |
@@ -181,7 +184,7 @@
 | 73 | clippy | Built-in | Lint: -D warnings, perf group enforced |
 | 74 | rustfmt | Built-in | Code formatting: cargo fmt --check in CI |
 | 75 | totp-rs | 5.7.0 | TOTP 2FA: Dhan mandatory login |
-| 76 | bitcode | 0.6.6 | Binary serialization: compact state snapshots |
+| 76 | bitcode | 0.6.9 | Binary serialization: compact state snapshots |
 
 > **API note:** secrecy 0.10.3 uses `SecretString` (= `SecretBox<str>`), NOT `Secret<T>`.
 > Create via `SecretString::from(string)`. `expose_secret()` returns `&str`.
@@ -214,36 +217,21 @@
 All images pinned by SHA256 digest. See `deploy/docker/docker-compose.yml` for
 the exact digests in use (deployment versions may differ from Bible originals).
 
-| # | Component | Bible Version | Docker Image |
-|---|-----------|--------------|--------------|
-| 84 | QuestDB | 8.3.3 | `questdb/questdb:8.3.3@sha256:...` |
-| 85 | Valkey | 8.1.1-alpine | `valkey/valkey:8.1.1-alpine@sha256:...` |
-| 86 | Grafana | 12.0.1 | `grafana/grafana-oss:12.0.1@sha256:...` |
+| # | Component | Version | Docker Image |
+|---|-----------|---------|--------------|
+| 84 | QuestDB | 9.3.2 | `questdb/questdb:9.3.2@sha256:...` |
+| 85 | Valkey | 9.0.2-alpine | `valkey/valkey:9.0.2-alpine@sha256:...` |
+| 86 | Grafana | 12.3.3 | `grafana/grafana-oss:12.3.3@sha256:...` |
 | 87 | Grafana Image Renderer | 3.12.1 | `grafana/grafana-image-renderer:3.12.1@sha256:...` |
-| 88 | Prometheus | v3.4.1 | `prom/prometheus:v3.4.1@sha256:...` |
-| 89 | Grafana Loki | 3.6.1 | `grafana/loki:3.6.1@sha256:...` |
+| 88 | Prometheus | v3.9.1 | `prom/prometheus:v3.9.1@sha256:...` |
+| 89 | Grafana Loki | 3.6.6 | `grafana/loki:3.6.6@sha256:...` |
 | 90 | Grafana Alloy | v1.8.0 | `grafana/alloy:v1.8.0@sha256:...` |
-| 91 | Jaeger v2 | 2.6.0 | `jaegertracing/jaeger:2.6.0@sha256:...` |
-| 92 | Traefik | 3.4.0 | `traefik:v3.4.0@sha256:...` |
-| 93 | LocalStack | 4.4.0 | `localstack/localstack:4.4.0@sha256:...` |
+| 91 | Jaeger v2 | 2.15.0 | `jaegertracing/jaeger:2.15.0@sha256:...` |
+| 92 | Traefik | v3.6.8 | `traefik:v3.6.8@sha256:...` |
+| 93 | LocalStack | 4.3.0 | `localstack/localstack:4.3.0@sha256:...` |
 | 94 | Rust (builder) | 1.93.1-slim | `rust:1.93.1-slim@sha256:...` |
 
-> **Deployment reality:** docker-compose.yml has been updated beyond Bible V6
-> during development. Actual running versions (from docker-compose.yml):
->
-> | Component | Bible V6 | Deployed |
-> |-----------|----------|----------|
-> | QuestDB | 8.3.3 | 9.3.2 |
-> | Valkey | 8.1.1 | 9.0.2 |
-> | Grafana | 12.0.1 | 12.3.3 |
-> | Prometheus | v3.4.1 | v3.9.1 |
-> | Loki | 3.6.1 | 3.6.6 |
-> | Alloy | v1.8.0 | v1.8.0 (match) |
-> | Jaeger v2 | 2.6.0 | 2.15.0 |
-> | Traefik | 3.4.0 | v3.6.8 |
-> | LocalStack | 4.4.0 | 4.3.0 |
->
-> These should be reconciled in a future Bible update (V7).
+> All versions now match `deploy/docker/docker-compose.yml` (reconciled 2026-02-26).
 
 ---
 

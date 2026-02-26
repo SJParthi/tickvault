@@ -1,6 +1,7 @@
 # Codebase Map — dhan-live-trader
 
-> Session start: read THIS + `bible_versions.md`. Skip CLAUDE.md (auto-loads), skip PDFs.
+> Session start: read THIS file only. Skip CLAUDE.md (auto-loads), skip PDFs.
+> Bible: `tech_stack_bible_v6.md` — read ONLY when adding a new dependency.
 > Updated: 2026-02-26 after Block 03 — WebSocket Connection Manager.
 
 ## File Tree
@@ -62,7 +63,7 @@ dhan-live-trader/
 │   └── seed-localstack-secrets.sh      # Seeds 5 SSM params in LocalStack
 └── docs/
     ├── tech_stack_bible_v6.md          # 113 components (converted from PDF)
-    ├── bible_versions.md               # Quick-ref version table (read this first)
+    ├── tech_stack_bible_v6.md          # Single source of truth — 113 components + versions
     ├── codebase_map.md                 # THIS FILE
     └── phases/
         └── PHASE_1_LIVE_TRADING.md     # Full Phase 1 spec (1,412 lines)
