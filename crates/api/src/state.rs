@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::tick_types::CandleBroadcastMessage;
+use dhan_live_trader_storage::candle_query::QuestDbCandleQuerier;
 
 /// Shared state available to all API handlers via axum's `State` extractor.
 #[derive(Clone)]
@@ -18,6 +19,8 @@ struct AppStateInner {
     candle_broadcast: broadcast::Sender<CandleBroadcastMessage>,
     /// QuestDB config for historical candle queries.
     questdb_config: QuestDbConfig,
+    /// QuestDB HTTP candle querier (None if QuestDB unavailable).
+    candle_querier: Option<QuestDbCandleQuerier>,
 }
 
 impl SharedAppState {
@@ -26,10 +29,21 @@ impl SharedAppState {
         candle_broadcast: broadcast::Sender<CandleBroadcastMessage>,
         questdb_config: QuestDbConfig,
     ) -> Self {
+        let candle_querier = QuestDbCandleQuerier::new(&questdb_config)
+            .map_err(|err| {
+                tracing::warn!(
+                    ?err,
+                    "failed to create QuestDB candle querier — historical queries unavailable"
+                );
+                err
+            })
+            .ok();
+
         Self {
             inner: Arc::new(AppStateInner {
                 candle_broadcast,
                 questdb_config,
+                candle_querier,
             }),
         }
     }
@@ -42,5 +56,10 @@ impl SharedAppState {
     /// Returns the QuestDB config for making SQL queries.
     pub fn questdb_config(&self) -> &QuestDbConfig {
         &self.inner.questdb_config
+    }
+
+    /// Returns the candle querier (None if QuestDB is unavailable).
+    pub fn candle_querier(&self) -> Option<&QuestDbCandleQuerier> {
+        self.inner.candle_querier.as_ref()
     }
 }

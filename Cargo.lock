@@ -979,6 +979,7 @@ dependencies = [
  "chrono",
  "dhan-live-trader-common",
  "dhan-live-trader-core",
+ "dhan-live-trader-storage",
  "reqwest",
  "serde",
  "serde_json",

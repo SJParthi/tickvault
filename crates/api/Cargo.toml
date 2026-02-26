@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 dhan-live-trader-common = { path = "../common" }
 dhan-live-trader-core = { path = "../core" }
+dhan-live-trader-storage = { path = "../storage" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
