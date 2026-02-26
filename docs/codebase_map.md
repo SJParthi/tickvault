@@ -1,7 +1,7 @@
 # Codebase Map — dhan-live-trader
 
 > Session start: read THIS + `bible_versions.md`. Skip CLAUDE.md (auto-loads), skip PDFs.
-> Updated: 2026-02-26 after Block 02 + 107-issue hardening.
+> Updated: 2026-02-26 after Block 02 + hardening + BSE filter fix + test audit.
 
 ## File Tree
 
@@ -55,7 +55,7 @@ dhan-live-trader/
 ├── scripts/
 │   └── seed-localstack-secrets.sh      # Seeds 5 SSM params in LocalStack
 └── docs/
-    ├── tech_stack_bible_v6.md          # 109 components (converted from PDF)
+    ├── tech_stack_bible_v6.md          # 113 components (converted from PDF)
     ├── bible_versions.md               # Quick-ref version table (read this first)
     ├── codebase_map.md                 # THIS FILE
     └── phases/
@@ -141,8 +141,8 @@ validation::validate_fno_universe(universe: &FnoUniverse) -> Result<()>
 ### storage
 ```rust
 instrument_persistence::persist_instrument_snapshot(
-    questdb_host, questdb_port, universe: &FnoUniverse, metadata: &UniverseBuildMetadata
-) -> Result<()>
+    universe: &FnoUniverse, questdb_config: &QuestDbConfig
+) -> Result<()>  // async — ensures DEDUP UPSERT KEYS before ILP write
 ```
 
 ## Key Types
@@ -173,33 +173,33 @@ TokenState {
 }
 ```
 
-## Test Counts (211 total)
+## Test Counts (257 total)
 
 | Crate | Module | Tests |
 |-------|--------|-------|
 | common | types | 18 |
-| common | config | 16 |
+| common | config | 15 |
 | common | error | 13 |
 | common | instrument_types | 17 |
-| core | auth/secret_manager | 4 |
+| core | auth/secret_manager | 10 |
 | core | auth/totp_generator | 4 |
-| core | auth/token_manager | 4 |
-| core | auth/types | 11 |
-| core | instrument/csv_downloader | 7 |
-| core | instrument/csv_parser | 48 |
-| core | instrument/universe_builder | 47 |
-| core | instrument/validation | 8 |
-| storage | instrument_persistence | 17 |
-| **Total** | | **211** |
+| core | auth/token_manager | 8 |
+| core | auth/types | 23 |
+| core | instrument/csv_downloader | 5 |
+| core | instrument/csv_parser | 53 |
+| core | instrument/universe_builder | 54 |
+| core | instrument/validation | 12 |
+| storage | instrument_persistence | 25 |
+| **Total** | | **257** |
 
-## QuestDB Tables (4)
+## QuestDB Tables (4) — DEDUP UPSERT KEYS enabled on all
 
-| Table | Key Columns | Purpose |
-|-------|-------------|---------|
-| instrument_build_metadata | csv_source, csv_row_count, build_duration_ms | Build audit trail |
-| fno_underlyings | security_id, trading_symbol, underlying_kind, lot_size | 215 underlyings |
-| derivative_contracts | security_id, trading_symbol, expiry_date, strike_price | ~138K contracts |
-| subscribed_indices | security_id, trading_symbol, index_category | 31 indices |
+| Table | UPSERT KEYS | Row Count | Purpose |
+|-------|-------------|-----------|---------|
+| instrument_build_metadata | timestamp, csv_source | 1 per run | Build audit trail |
+| fno_underlyings | timestamp, underlying_symbol | 214 (5 NSE idx + 3 BSE idx + 206 stocks) | F&O underlyings |
+| derivative_contracts | timestamp, security_id | 96,948 (zero BSE stock derivatives) | All derivative contracts |
+| subscribed_indices | timestamp, security_id | 31 (8 FNO + 23 display) | Index subscriptions |
 
 ## Docker Services (9 running)
 
@@ -228,6 +228,9 @@ TokenState {
 ## Completed Blocks
 
 - **Block 01**: Instrument download, CSV parse, 5-pass universe build, validation
-- **Block 01.1**: QuestDB persistence (4 tables via ILP)
+- **Block 01.1**: QuestDB persistence (4 tables via ILP, DEDUP UPSERT KEYS)
 - **Block 02**: Auth pipeline (SSM → TOTP → JWT → arc-swap → auto-renew)
 - **Hardening**: 107 audit issues fixed, 92 new tests added (119 → 211)
+- **Test audit**: 37 coverage gaps closed (211 → 250)
+- **BSE filter fix**: BSE stock derivatives filtered in Pass 3 + Pass 5, 7 new tests (250 → 257)
+- **Bible fix**: Section 1 Frontend corrected to SolidJS (not Grafana), total 113 components
