@@ -8,7 +8,7 @@
 #   1. Compile    — cargo build --release
 #   2. Lint       — cargo fmt --check + cargo clippy -D warnings
 #   3. Test       — cargo test --workspace
-#   4. Security   — cargo audit + cargo deny check  (parallel after test)
+#   4. Security   — cargo deny check (advisories, licenses, bans, sources)
 #   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
 #   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
 # =============================================================================
@@ -117,8 +117,17 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
 
-      - name: Supply chain check (CVEs + licenses + bans + sources + duplicates)
-        run: cargo deny check
+      - name: Check advisories (CVEs)
+        run: cargo deny check advisories
+
+      - name: Check licenses
+        run: cargo deny check licenses
+
+      - name: Check bans (banned crates + duplicate versions)
+        run: cargo deny check bans
+
+      - name: Check sources (registry provenance)
+        run: cargo deny check sources
 
   # ---- Stage 5: Performance (parallel after test) ----
   performance:
