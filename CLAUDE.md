@@ -30,19 +30,6 @@ Every file, every function, every config decision must pass all three. No except
 - **IDE (Parthiban's):** IntelliJ IDEA Ultimate 2025.3 — for code review, debugging, manual edits when Parthiban wants. Claude Code never depends on or automates IntelliJ.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
-### Source of Truth — GITHUB IS EVERYTHING
-
-```
-RULE: GitHub is the ONLY source of truth. Local folders are disposable working copies.
-
-- ALL code lives on GitHub: https://github.com/SJParthi/dhan-live-trader
-- Local clones are temporary — delete and re-clone anytime, zero loss
-- Every session: git pull from GitHub FIRST, git push to GitHub LAST
-- Claude Code operates on the GitHub clone — GitHub is the canonical reference
-- NEVER reference local absolute paths in code, config, or documentation
-- If local and GitHub diverge, GitHub wins — re-clone and rebuild
-```
-
 ---
 
 ## MARKET HOURS & DATA COLLECTION
@@ -137,15 +124,16 @@ When Claude Code starts a new session on the dhan-live-trader project, it MUST f
 Step 0: Ensure GitHub clone exists    → gh repo clone SJParthi/dhan-live-trader (if needed)
 Step 1: Pull latest from GitHub       → git pull origin main (always start from GitHub state)
 Step 2: Read THIS file                → CLAUDE.md (rules, behavior, quality gates)
-Step 3: Read the Tech Stack Bible     → docs/tech_stack_bible_v6.pdf (versions, components)
-Step 4: Read the current phase doc    → docs/phases/PHASE_<N>_<NAME>.md (what to build)
-Step 5: Read recent git log           → git log --oneline -20 (where did we leave off)
-Step 6: Read Cargo.toml               → Verify dependency versions match Bible
-Step 7: Run cargo check               → Confirm project compiles clean
-Step 8: Run cargo test                → Confirm all tests pass
+Step 3: Read the current phase doc    → docs/phases/PHASE_<N>_<NAME>.md (what to build)
+Step 4: Read recent git log           → git log --oneline -20 (where did we leave off)
+Step 5: Read Cargo.toml               → Verify dependency versions match Bible
+Step 6: Run cargo check               → Confirm project compiles clean
+Step 7: Run cargo test                → Confirm all tests pass
 ```
 
-**Only after all 9 steps does Claude Code begin working.**
+**DO NOT read the Tech Stack Bible (PDF or MD) at startup.** Read it ONLY when adding or updating a dependency.
+
+**Only after all 8 steps does Claude Code begin working.**
 
 If any step fails (compilation error, test failure, version mismatch), Claude Code MUST fix the issue BEFORE proceeding to new work. Existing breakage takes priority over new features.
 
@@ -160,6 +148,33 @@ Step 6: Show Parthiban a summary      → What was done, what's next
 ```
 
 **CRITICAL:** A session is NOT complete until code is pushed to GitHub. Local-only commits are incomplete work.
+
+---
+
+## TOKEN EFFICIENCY — ZERO WASTE
+
+Tokens cost money and time. Every wasted token is wasted budget. Claude Code must be surgically efficient.
+
+### Forbidden Reads — NEVER read unless triggered:
+```
+docs/pdf/*                    → NEVER. PDFs are for Parthiban only.
+docs/tech_stack_bible_v6.md   → ONLY when adding/updating a dependency
+docs/templates/*              → ONLY when an incident or release actually happens
+docs/reference/*              → ONLY when implementing the specific topic (logging, tests, data integrity, failures)
+```
+
+### Rules:
+
+1. **NEVER re-read files already read in the current session** — remember what you read
+2. **NEVER read the Tech Stack Bible unless adding/updating a dependency** — versions don't change between sessions unless Parthiban says so
+3. **NEVER read large files (>200 lines) in full when you only need a specific section** — use offset+limit or grep first
+4. **Keep responses short** — say what was done, show proof, stop. No essays.
+5. **Don't repeat CLAUDE.md rules back** — Parthiban wrote them, he knows them
+6. **Don't explain obvious decisions** — if the Bible says tokio 1.44.1, just use it, don't explain why
+7. **Parallelize tool calls** — if 3 files need reading, read all 3 in one round, not 3 separate rounds
+8. **Skip redundant verification** — if cargo check passed, don't also manually inspect for syntax errors
+9. **One commit message, not a paragraph** — follow the format, keep it tight
+10. **No filler phrases** — skip "Let me...", "I'll now...", "Great, now I'll..." — just do it
 
 ---
 
@@ -213,93 +228,18 @@ No IDE. No manual steps. No local-only state. Claude Code does everything.
 
 Parthiban has NO visibility into what Claude Code is doing unless Claude Code explicitly tells him. Without precise, clear notifications, work is invisible. This protocol is mandatory.
 
-### Status Markers — Use These Exact Labels
-
+### Status Markers
 ```
-PLAN READY         → "Here is my plan. Is this fine?"
-AWAITING APPROVAL  → "I need your go-ahead before I proceed."
-IN PROGRESS        → "Working on [specific task]..."
-DONE               → "Finished. Here's what was built + proof."
-BLOCKED            → "Cannot proceed. Here's the issue + options."
-DECISION NEEDED    → "I have multiple approaches. Which one?"
+PLAN READY / AWAITING APPROVAL / IN PROGRESS / DONE / BLOCKED / DECISION NEEDED
 ```
 
-### When Claude Code MUST Notify Parthiban
-
-**Before ANY work begins:**
-- Present the plan with every file, command, and approach
-- Ask explicitly: **"Is this fine?"**
-- Wait for "go ahead" — silence is NOT approval
-
-**At every decision point:**
-- When choosing between 2+ valid approaches → present options, ask which one
-- When a dependency is not in the Bible → propose it, wait for approval
-- When an architectural pattern choice matters → present trade-offs, ask
-- NEVER make silent decisions — every choice Parthiban would care about gets surfaced
-
-**After implementation completes:**
-- Show exactly what was done (files created/modified, commands run)
-- Show proof (command output, test results, Docker health checks)
-- State clearly: **"DONE. Here's what was built."**
-- State what comes next
-
-**When blocked:**
-- Describe what was attempted
-- Show the exact error or failure output
-- Propose 2-3 possible solutions with trade-offs
-- Ask: **"Which direction should I take?"**
-- NEVER silently retry the same failing approach more than once
-
-**When something unexpected happens:**
-- Alert immediately — don't bury surprises in a summary
-- Example: "A dependency version conflict appeared that wasn't expected."
-- Example: "Docker service X failed health check after 3 retries."
-
-### Post-Approval Automation — Full End-to-End
-
-Once Parthiban says **"go ahead"**, Claude Code executes the ENTIRE approved plan without stopping:
-
-```
-1. Create/modify all files in the plan
-2. Run cargo fmt → cargo clippy → cargo test (fix any failures)
-3. Verify Docker services if infrastructure was changed
-4. Git add → commit → push to GitHub
-5. Report back: "DONE. Here's the summary + proof."
-```
-
-**Rules for post-approval execution:**
-- Do NOT stop mid-way to ask again (unless genuinely blocked by an error)
-- Do NOT ask "should I continue?" after each sub-step — the approval covers the whole plan
-- If a genuine blocker appears mid-execution, stop and escalate with BLOCKED status
-- Small implementation details within the approved plan are Claude Code's call — don't ask about indentation, variable names within conventions, or obvious patterns
-
-### Blocker Escalation Protocol
-
-When Claude Code cannot proceed, it MUST escalate with this exact format:
-
-```
-BLOCKED: [one-line summary]
-
-What I tried:
-  1. [First attempt + result]
-  2. [Second attempt + result]
-
-Error output:
-  [exact error message or relevant output]
-
-Proposed solutions:
-  A. [Option A] — [trade-off]
-  B. [Option B] — [trade-off]
-  C. [Option C if applicable] — [trade-off]
-
-Which direction should I take?
-```
-
-**Rules:**
-- NEVER silently skip a failing step — escalate it
-- NEVER suppress errors — show the full error message
-- NEVER guess a fix without telling Parthiban what happened
-- Always propose at least 2 solutions — never just say "it's broken"
+### Core Rules:
+- **Before work:** Present plan → wait for "go ahead" (silence ≠ approval)
+- **At decisions:** Present options with trade-offs → ask which one
+- **After work:** Show what was done + proof → state what's next
+- **When blocked:** Show error + 2-3 solutions → ask direction
+- **Post-approval:** Execute entire plan without stopping. Only stop if genuinely blocked.
+- NEVER make silent decisions. NEVER suppress errors. NEVER silently retry failures.
 
 ---
 
@@ -388,26 +328,7 @@ These rules govern EVERY phase, EVERY file, EVERY line of code, EVERY config. Th
 - No host-specific paths. No OS detection.
 - Config injected at container startup, not baked in.
 
-**Local-AWS Parity Checklist — Claude Code MUST verify after every infrastructure change:**
-
-```
-BEFORE committing any Docker, config, or infrastructure change, verify ALL:
-
-[ ] No hardcoded hostnames — all services use Docker DNS names (dlt-questdb, dlt-valkey, etc.)
-[ ] No host-dependent volume mounts — no /Users/..., no /home/..., only named Docker volumes
-[ ] No platform-specific code paths — no if-mac/if-linux branching
-[ ] No localhost in application code — Docker DNS only
-[ ] Docker Compose is identical for both environments — same file, zero changes
-[ ] Config TOML uses Docker service names, not localhost or 127.0.0.1
-[ ] Secrets use SSM Parameter Store API — same code path for LocalStack and real AWS
-[ ] The ONLY env difference is AWS_ENDPOINT_URL — nothing else changes
-[ ] No architecture-specific Docker images — use multi-arch images or verify amd64 + arm64
-[ ] Health checks work in both environments — no curl/wget dependencies that differ
-```
-
-**If ANY item fails, the change does NOT ship. Fix parity BEFORE committing.**
-
-**The Golden Test:** If you deleted the local clone right now, cloned fresh on an AWS EC2 instance, ran `docker compose up -d`, would EVERYTHING work identically? If no → fix it. If yes → ship it.
+**Local-AWS Parity — Golden Test:** Clone fresh on AWS EC2, `docker compose up -d` → everything works identically? No hardcoded hostnames, no host volume mounts, no platform branching, no localhost, Docker DNS only, same compose file, only `AWS_ENDPOINT_URL` differs. If parity fails, the change does NOT ship.
 
 ### Principle 4: ZERO HARDCODED VALUES. ANYWHERE. EVER.
 No magic numbers. No inline strings. No embedded values.
@@ -417,31 +338,11 @@ No magic numbers. No inline strings. No embedded values.
 - Config file (for values that change between environments)
 - AWS SSM Parameter Store (for sensitive values)
 
-**Rules:**
+**Examples:**
 ```
-WRONG: thread::sleep(Duration::from_secs(10));
-RIGHT: thread::sleep(Duration::from_secs(PING_INTERVAL_SECS));
-
-WRONG: if depth.len() > 5 {
-RIGHT: if depth.len() > MARKET_DEPTH_LEVELS {
-
-WRONG: let url = "wss://api-feed.dhan.co/v2";
-RIGHT: let url = config.dhan.websocket_url;  // from config TOML
-
-WRONG: .max_connections(16)
-RIGHT: .max_connections(config.valkey.max_connections)
-
-WRONG: "dlt/dhan-credentials"
-RIGHT: secrets::DHAN_SECRET_NAME  // named constant
-
-WRONG: vec![0u8; 162]
-RIGHT: vec![0u8; FULL_QUOTE_PACKET_SIZE]
-
-WRONG: if hour >= 9 && minute >= 15 {
-RIGHT: if current_time >= config.trading.market_open_time {
-
-WRONG: .timeout(Duration::from_millis(500))
-RIGHT: .timeout(Duration::from_millis(config.network.request_timeout_ms))
+WRONG: thread::sleep(Duration::from_secs(10));     RIGHT: Duration::from_secs(PING_INTERVAL_SECS)
+WRONG: let url = "wss://api-feed.dhan.co/v2";      RIGHT: config.dhan.websocket_url
+WRONG: if hour >= 9 && minute >= 15 {               RIGHT: current_time >= config.trading.market_open_time
 ```
 
 **Where constants live:**
@@ -466,44 +367,12 @@ Crate names:     kebab-case    → dhan-live-trader-common, dhan-live-trader-pip
 Enum variants:   PascalCase    → Exchange::NationalStockExchange, FeedType::FullMarketDepth
 ```
 
-**Naming rules:**
+**Examples:**
 ```
-WRONG: fn parse(b: &[u8]) -> Res<T>
-RIGHT: fn parse_ticker_packet(raw_bytes: &[u8]) -> Result<TickData>
-
-WRONG: let ws = connect();
-RIGHT: let websocket_connection = establish_dhan_websocket();
-
-WRONG: struct Cfg { db_h: String }
-RIGHT: struct QuestDBConfig { host: String, http_port: u16, pg_port: u16 }
-
-WRONG: const MAX: usize = 5000;
-RIGHT: const MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION: usize = 5000;
-
-WRONG: let t = Instant::now();
-RIGHT: let tick_received_at = Instant::now();
-
-WRONG: fn handle(msg: Msg) {
-RIGHT: fn handle_websocket_message(message: WebSocketMessage) {
-```
-
-**File and directory naming:**
-```
-WRONG: src/ws.rs, src/db.rs, src/cfg.rs
-RIGHT: src/websocket_client.rs, src/questdb_writer.rs, src/config_loader.rs
-
-WRONG: deploy/docker/dc.yml
-RIGHT: deploy/docker/docker-compose.yml
-
-WRONG: scripts/init.sh
-RIGHT: scripts/seed-localstack-secrets.sh
-```
-
-**Docker container naming:**
-```
-WRONG: container_name: db, cache, proxy
-RIGHT: container_name: dlt-questdb, dlt-valkey, dlt-traefik
-(dlt = dhan-live-trader prefix for containers, logs, docker exec commands.)
+WRONG: fn parse(b: &[u8])          RIGHT: fn parse_ticker_packet(raw_bytes: &[u8])
+WRONG: let ws = connect();         RIGHT: let websocket_connection = establish_dhan_websocket();
+WRONG: src/ws.rs                   RIGHT: src/websocket_client.rs
+WRONG: container_name: db          RIGHT: container_name: dlt-questdb (dlt = dhan-live-trader prefix)
 ```
 
 ### Principle 6: O(1) IS NON-NEGOTIABLE
@@ -561,233 +430,33 @@ Examples:
 
 ## LOGGING STANDARDS
 
-Every log line is a diagnostic tool. Bad logging is worse than no logging — it creates noise that hides real problems.
-
-### Structured JSON Format (enforced by tracing-subscriber)
-```json
-{
-  "timestamp": "2026-03-15T10:30:45.123456789+05:30",
-  "level": "INFO",
-  "target": "dhan_live_trader::websocket_client",
-  "span": "process_tick",
-  "message": "Tick processed successfully",
-  "fields": {
-    "security_id": 12345,
-    "exchange": "NSE",
-    "latency_ns": 8500,
-    "sequence_number": 98765
-  }
-}
-```
-
-### What to Log (with level)
-```
-ERROR:  System failures requiring immediate attention
-        → WebSocket disconnect, QuestDB write failure, OMS invalid state
-        → Secret rotation failure, circuit breaker trip
-        → MUST trigger Telegram alert
-
-WARN:   Degraded conditions that may need attention
-        → Tick latency above threshold, retry attempts, rate limit approaching
-        → Duplicate tick received, out-of-order timestamp detected
-        → Valkey connection pool exhausted (serving from fallback)
-
-INFO:   Normal operational events (sparse — not every tick)
-        → Application startup/shutdown, config loaded, WebSocket connected
-        → Token refreshed, deployment completed, phase milestone reached
-        → Market open/close detected, holiday detected
-
-DEBUG:  Detailed diagnostic info (disabled in production by default)
-        → Individual tick processing steps, cache hit/miss
-        → Channel buffer utilization, thread scheduling events
-
-TRACE:  Extremely verbose (never in production)
-        → Raw packet bytes, full struct dumps, memory allocation details
-```
-
-### What NEVER to Log — VIOLATIONS ARE SECURITY INCIDENTS
-```
-NEVER LOG:
-  - API keys, tokens, passwords, TOTP secrets (use secrecy crate)
-  - Raw JWT token values (log token expiry time only)
-  - SSM Parameter Store values
-  - Full order payloads with credentials
-  - Customer/user personal information
-  - Raw binary WebSocket frames (log parsed summary only)
-
-If secrecy crate is used correctly, Secret<T> will print [REDACTED] automatically.
-Any raw secret in logs = SECURITY INCIDENT → fix immediately + rotate credential.
-```
-
-### Log Context Requirements
-Every log message in production code MUST include enough context to debug WITHOUT reproducing the issue:
-- **What** happened (the event)
-- **Where** it happened (module + function via `#[instrument]`)
-- **When** it happened (timestamp with IST, automatic via tracing)
-- **Which** entity it relates to (security_id, order_id, connection_id)
-- **Why** it matters (for errors: the error chain via anyhow context)
-
-### Log Retention
-```
-Hot logs (Loki):     30 days — queryable via Grafana
-Cold logs (S3):      5 years — SEBI audit compliance
-Log rotation:        Managed by Alloy + Loki retention policies
-```
+Full reference: `docs/reference/logging_standards.md`
+Key rules: Use tracing macros only. NEVER log secrets (secrecy crate enforces `[REDACTED]`). Every log includes What/Where/When/Which/Why context. ERROR triggers Telegram alert. Any raw secret in logs = security incident.
 
 ---
 
 ## CARGO.TOML & WORKSPACE CONVENTIONS
 
-### Workspace Structure
-```
-dhan-live-trader/                     ← Project root (top-level has the full name)
-├── Cargo.toml                        ← Workspace root — ALL versions pinned here
-├── crates/
-│   ├── common/                       ← Shared types, constants, config
-│   ├── core/                         ← WebSocket, parsing, pipeline
-│   ├── trading/                      ← OMS, risk, order execution
-│   ├── storage/                      ← QuestDB, Valkey, persistence
-│   ├── api/                          ← axum HTTP server, REST endpoints
-│   └── app/                          ← Binary entry point, orchestration
-├── config/
-│   ├── base.toml                     ← Shared config (non-secret)
-│   └── local-overrides.toml          ← Dev-only overrides (git-ignored)
-├── docs/
-│   ├── tech_stack_bible_v6.pdf
-│   ├── phases/
-│   ├── adr/
-│   └── incidents/
-├── deploy/
-│   └── docker/
-│       └── docker-compose.yml
-├── scripts/
-└── CLAUDE.md                         ← This file
-```
-
-**Note:** Directory names under `crates/` are SHORT — no `dhan-live-trader-` prefix on folders. The full prefix lives in each crate's `[package] name` inside Cargo.toml (e.g., `name = "dhan-live-trader-core"`). This keeps the filesystem clean while Rust's module system gets the fully qualified name.
-
-### Version Pinning Rules (Cargo.toml)
-
-**ALL version numbers come from the Tech Stack Bible. Never type a version from memory.**
-
-```toml
-# CORRECT — exact version from Bible, no range operators
-some-crate = "x.y.z"
-
-# WRONG — range operators allow uncontrolled updates
-some-crate = "^x.y"       # BANNED — caret allows minor bumps
-some-crate = "~x.y"       # BANNED — tilde allows patch bumps
-some-crate = "*"           # BANNED — wildcard = chaos
-some-crate = ">=x.y"      # BANNED — open-ended range
-```
-
-### Workspace Cargo.toml Pattern
-```toml
-[workspace]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.dependencies]
-# ALL shared dependencies pinned here with exact versions from the Bible
-# Crates inherit via { workspace = true } — no version in crate-level Cargo.toml
-# Example pattern (use ACTUAL versions from Bible, not these):
-# some-crate = { version = "x.y.z", features = ["..."] }
-```
-
-### Crate-Level Cargo.toml Pattern
-```toml
-[package]
-name = "dhan-live-trader-core"       # Full prefix in package name
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.93.1"
-
-[dependencies]
-# Inherit from workspace — no version numbers here
-tokio = { workspace = true }
-serde = { workspace = true }
-```
-
-**Rules:**
-- ALL dependency versions defined in workspace root — crates use `{ workspace = true }`
-- ONE place to update versions, ONE place to audit
-- `edition = "2024"` and `rust-version = "1.93.1"` in every crate
-- No `[patch]` section unless explicitly approved by Parthiban
-- `cargo update` is BANNED — versions change only via Bible updates
+- Crate folders under `crates/` are SHORT names (common, core, trading, storage, api, app). Full `dhan-live-trader-` prefix is in each crate's `[package] name`.
+- ALL dependency versions pinned in workspace root Cargo.toml — crates use `{ workspace = true }`
+- Exact versions ONLY from the Bible — `^`, `~`, `*`, `>=` are BANNED
+- `edition = "2024"`, `rust-version = "1.93.1"` in every crate
+- No `[patch]` without Parthiban's approval. `cargo update` is BANNED.
 
 ---
 
 ## BOOT → SHUTDOWN SEQUENCE
 
-Claude Code must understand the full runtime flow. Every component has a role in this chain:
+`Config → Auth → WebSocket → Parse → Route → Indicators → State → OMS → Persist → Cache → HTTP → Metrics → Logs → Traces → Dashboards → Alerts → TLS → Secrets → Recovery → Shutdown`
 
-```
-Boot
-→ Config            (toml)
-→ Auth              (reqwest + JWT + arc-swap)
-→ WebSocket         (tokio-tungstenite)
-→ Parse             (zerocopy)
-→ Route             (rtrb SPSC)
-→ Indicators        (yata + blackscholes)
-→ IST               (chrono + chrono-tz)
-→ State             (papaya + DashMap)
-→ OMS               (statig + governor)
-→ Persist           (QuestDB)
-→ Cache             (Valkey)
-→ HTTP              (axum + tower)
-→ Metrics           (Prometheus)
-→ Logs              (Loki/Alloy)
-→ Traces            (Jaeger v2)
-→ Dashboards        (Grafana/WireGuard)
-→ Alerts            (Telegram → Grafana → SNS)
-→ TLS               (Let's Encrypt)
-→ Secrets           (SSM + secrecy + zeroize)
-→ Recovery          (CloudWatch + memmap2)
-→ Shutdown          (signal-hook + sd-notify)
-```
-
-When building any component, Claude Code must know where it sits in this chain and what it connects to upstream and downstream.
+When building any component, know where it sits in this chain and what connects upstream/downstream.
 
 ---
 
-## VERSIONS & INFRASTRUCTURE — SINGLE SOURCE OF TRUTH
+## VERSIONS & INFRASTRUCTURE
 
-**All versions, Docker images, AWS config, and alerting chains live in the Tech Stack Bible V6 ONLY.**
-
-Claude Code must:
-1. Open and read `docs/tech_stack_bible_v6.pdf` at the start of every session
-2. Use ONLY the versions specified in the Bible — no exceptions
-3. If a component is not in the Bible, ASK Parthiban before choosing a version
-4. NEVER duplicate Bible content into this file
-
-**The Bible covers:** 109 components across 22 sections — Rust crates, Docker images (SHA256 pinned), AWS production stack, alerting chain, observability, testing tools, and more.
-
-### Dependency Update Process — When Bible Changes
-
-`cargo update` is BANNED for ad-hoc updates. Dependency versions change ONLY through this formal process:
-
-```
-TRIGGER: Parthiban updates the Tech Stack Bible (e.g., V6 → V7)
-
-Step 1: Parthiban provides updated Bible document
-Step 2: Claude Code reads the new Bible, identifies changed versions
-Step 3: Claude Code presents a diff:
-        "These versions changed: tokio 1.44.1 → 1.45.0, serde 1.0.219 → 1.0.225"
-Step 4: Parthiban approves the update batch
-Step 5: Claude Code updates workspace Cargo.toml with new versions
-Step 6: Run FULL CI pipeline (all 6 stages)
-Step 7: Run Criterion benchmarks — compare before/after
-Step 8: If any benchmark regresses >5% → ROLLBACK the update, investigate
-Step 9: If all gates pass → commit, push, tag
-
-CRITICAL RULES:
-- NEVER update a single dependency outside this process
-- NEVER run `cargo update` — it updates Cargo.lock with unpinned transitive deps
-- If a CVE is found (cargo audit), escalate to Parthiban immediately
-- Emergency CVE fix follows hotfix branch protocol, not this process
-- Transitive dependency updates happen ONLY via `cargo update -p <specific-crate>`
-  and ONLY after Parthiban approves the specific transitive crate
-```
+All versions live in Tech Stack Bible V6 ONLY. Read `docs/tech_stack_bible_v6.md` ONLY when adding/updating a dependency. If not in Bible, ASK Parthiban.
+`cargo update` is BANNED. Versions change only when Parthiban provides an updated Bible → Claude Code diffs → Parthiban approves → update Cargo.toml → full CI + benchmarks → rollback if >5% regression. CVE found → escalate to Parthiban immediately.
 
 ---
 
@@ -826,331 +495,45 @@ Local-only commits        → Every commit MUST be pushed to GitHub immediately
 
 This is a financial system that trades REAL MONEY. A single uncaught bug can lose lakhs in seconds. Build like lives depend on it. No shortcuts. No "good enough." No "we'll add tests later."
 
-### Quick Reference — Before Every Action
-
-```
-Before writing code → Read Bible for versions. If not in Bible, ASK Parthiban.
-Before committing   → cargo fmt + clippy (zero warnings) + test (100% pass)
-Adding dependency   → Bible has it? Use it. Bible doesn't? Propose to Parthiban.
-Encountering error  → Read FULL message. Fix root cause. Never suppress.
-                      Never add #[allow(...)] without Parthiban's approval.
-```
+### Quick Reference
+Before writing code: check Bible for versions. Before committing: `cargo fmt` + `clippy` (zero warnings) + `test` (100% pass). Adding dependency: Bible has it? Use it. Not in Bible? Propose to Parthiban. Error: fix root cause, never suppress, never `#[allow(...)]` without approval.
 
 ### Gate 1: CODE REVIEW — Every Line, Every Time
 
-Claude Code performs a **self-review** before presenting ANY code to Parthiban:
+Self-review before presenting code: single responsibility, no `.unwrap()`/`.expect()`/`todo!()` in prod, `Result` propagated with context, `// SAFETY:` on every `unsafe`, zero `.clone()` on hot path, zero heap allocation on hot path, explicit numeric types, config-driven timeouts, doc comments on every `pub` item, no commented-out code.
 
-**Checklist (must pass ALL):**
-- [ ] Every function has a clear single responsibility
-- [ ] Every error path is explicitly handled — no `.unwrap()` in production code
-- [ ] Every `Result` is propagated with context via `anyhow`/`thiserror` — not silently dropped
-- [ ] Every `unsafe` block has a `// SAFETY:` comment justifying why it's needed
-- [ ] Zero `.clone()` on hot path — verified by inspection
-- [ ] Zero heap allocation on hot path — verified by `dhat` in tests
-- [ ] All numeric types are explicitly sized (`u32`, `i64`, not platform-dependent)
-- [ ] All timeout/retry logic uses values from config, never hardcoded
-- [ ] All log messages include enough context to debug without reproducing
-- [ ] No `todo!()`, `unimplemented!()`, or placeholder code in production modules
-- [ ] No commented-out code — delete it or don't write it
-- [ ] Every public function has a doc comment explaining what it does, not how
-
-**Automated Enforcement — Compile-Time Lint Gates:**
-
-These lints are MANDATORY in every library crate's `lib.rs`. They turn CLAUDE.md rules into compiler errors:
-
-```rust
-// Top of every lib.rs in production crates (common, core, trading, storage, api)
-#![deny(clippy::unwrap_used)]          // .unwrap() → compiler error
-#![deny(clippy::print_stdout)]         // println! → compiler error
-#![deny(clippy::print_stderr)]         // eprintln! → compiler error
-#![deny(clippy::dbg_macro)]            // dbg! → compiler error
-#![deny(clippy::todo)]                 // todo!() → compiler error
-#![deny(clippy::unimplemented)]        // unimplemented!() → compiler error
-#![deny(clippy::expect_used)]          // .expect() → compiler error (use ? instead)
-#![deny(clippy::panic)]               // panic!() → compiler error
-#![deny(clippy::large_futures)]        // Catch accidentally large futures
-#![deny(clippy::large_stack_arrays)]   // Stack overflow protection
-#![warn(clippy::pedantic)]             // Pedantic lints as warnings
-#![warn(clippy::nursery)]              // Nursery lints as warnings
-#![warn(missing_docs)]                 // Missing doc comments as warnings
-```
-
-**Exceptions:**
-- `app` crate (binary): `#![allow(clippy::unwrap_used)]` ONLY in `main.rs` for initial setup where panicking is acceptable (before trading starts)
-- Test modules: `#[cfg(test)]` modules may use `.unwrap()` and `panic!()`
-- No other exceptions without Parthiban's explicit approval
-
-**If any item fails, fix it before showing code to Parthiban.**
+Compile-time lint gates are in every lib.rs — see `docs/reference/quality_gates.md` for the full list.
 
 ### Gate 2: TEST COVERAGE — Sniper Level
 
-**Minimum coverage: 90%+ line coverage on all production code.**
-**Target: 95%+ on critical paths (OMS, risk, order execution, WebSocket parsing).**
-
-**Per-Crate Coverage Thresholds — Enforced in CI:**
-
-| Crate | Minimum Coverage | Justification |
-|---|---|---|
-| `core` | **95%** | Binary parser, WebSocket, tick pipeline — hot path, financial data |
-| `trading` | **95%** | OMS, risk management, order execution — money at stake |
-| `common` | **90%** | Types, config, constants — foundational correctness |
-| `storage` | **90%** | QuestDB, Valkey — data persistence integrity |
-| `api` | **90%** | HTTP endpoints — external-facing correctness |
-| `app` | **80%** | Orchestration, boot/shutdown — harder to unit test, integration-tested |
-
-**Coverage tool:** `cargo-tarpaulin` with `--out Xml` for CI integration.
-**CI gate:** If ANY crate falls below its threshold, the build is RED.
-**Coverage exclusions:** Only `#[cfg(not(tarpaulin_include))]` on generated code or FFI bindings — NEVER on business logic.
-
-**Required test types per module:**
-
-| Test Type | What It Covers | When Required |
-|---|---|---|
-| Unit tests | Individual functions, pure logic | EVERY function |
-| Integration tests | Cross-module interactions | EVERY module boundary |
-| Property-based tests | Random input fuzzing | Parsers, serializers, math |
-| Boundary tests | Edge cases, min/max, empty, overflow | ALL numeric operations |
-| Error path tests | Every `Err` variant is tested | EVERY Result-returning function |
-| Concurrency tests (Loom) | Thread safety, data races | ALL shared state |
-| Benchmark tests (Criterion) | Performance regression detection | ALL hot-path functions |
-| Fuzz tests (cargo-fuzz) | Crash discovery from malformed input | Dhan binary parser, all external input |
-| Heap allocation tests (dhat) | Verify zero allocation on hot path | ALL hot-path functions |
-
-**Test naming convention:**
-```
-#[test]
-fn test_<module>_<function>_<scenario>_<expected_outcome>()
-
-Examples:
-fn test_binary_parser_parse_ticker_packet_valid_full_quote_returns_tick_data()
-fn test_binary_parser_parse_ticker_packet_truncated_buffer_returns_error()
-fn test_oms_state_machine_new_order_submitted_transitions_to_submitted()
-fn test_oms_state_machine_filled_order_cancel_attempt_returns_invalid_transition()
-fn test_websocket_reconnect_after_disconnect_resumes_within_backoff_limit()
-```
-
-**What Claude Code must NEVER do:**
-- Write a function without writing its tests in the same session
-- Write a test that only covers the happy path
-- Use `#[ignore]` without Parthiban's explicit approval and a TODO to un-ignore
-- Skip testing error paths because "they probably won't happen"
-- Write tests that depend on external services without mocking/stubbing
+Coverage: core/trading 95%, common/storage/api 90%, app 80%. Tool: cargo-tarpaulin.
+Test naming: `fn test_<module>_<function>_<scenario>_<expected_outcome>()`
+NEVER: write code without tests, test only happy path, skip error paths, use `#[ignore]` without approval.
+Full test types table: `docs/reference/quality_gates.md`
 
 ### Gate 3: END-TO-END — ZERO BREAKAGE TOLERANCE
 
-**The system must survive every failure scenario without losing money or data.**
+The system must survive every failure scenario without losing money or data.
+Full scenario checklist: `docs/reference/failure_scenarios.md` (read ONLY when writing tests for a specific failure).
+Claude Code must write tests for each scenario as it becomes relevant to the current phase.
 
-**Failure scenarios Claude Code MUST test:**
+### Gate 4: CI PIPELINE — 6 stages, any failure = RED
 
-```
-NETWORK FAILURES:
-- WebSocket disconnects mid-tick           → Must reconnect + resume
-- Dhan API returns 429 (rate limited)      → Must back off per governor
-- Dhan API returns 500/502/503             → Must retry per backon
-- DNS resolution fails                     → Must use circuit breaker (failsafe)
-- TLS handshake timeout                    → Must retry, not crash
-- Internet goes down completely            → Must alert via SMS (SNS), pause trading
+Compile → Lint → Test → Security → Performance → Coverage. Details in `.github/workflows/ci.yml` and `docs/reference/quality_gates.md`.
+Main branch: requires all checks + PR review. Develop: compile+lint+test, direct push allowed.
 
-DATA FAILURES:
-- Malformed binary packet from Dhan        → Must reject + log, not crash
-- Zero-length WebSocket frame              → Must handle gracefully
-- Duplicate tick data                      → Must deduplicate, not double-count
-- Out-of-order timestamps                  → Must detect + handle
-- QuestDB write fails                      → Must buffer + retry, not lose data
-- Valkey connection drops                  → Must reconnect via deadpool, serve stale if needed
+### Gate 5: PRE-DEPLOYMENT
 
-STATE FAILURES:
-- Application crash mid-processing         → Must recover state from memmap2
-- OMS in invalid state                     → Must reject order + alert, not proceed
-- Config file corrupted/missing            → Must fail fast with clear error, not use defaults
-- Secrets not available in SSM             → Must fail fast, not start with empty credentials
-- Market holiday not in calendar           → Must refuse to trade, not submit orders
+All CI green + Docker image builds (<15MB scratch) + health checks pass + smoke test (1 tick end-to-end) + Parthiban approves.
 
-INFRASTRUCTURE FAILURES:
-- Docker container OOM killed              → Must restart via Docker restart policy
-- EBS volume full                          → Must alert before 90%, stop writes at 95%
-- EC2 instance hardware failure            → Must auto-recover via CloudWatch
-- Process hangs (no heartbeat)             → Must auto-restart via sd-notify watchdog
+### Gate 5a: BENCHMARK BASELINES
 
-TRADING SAFEGUARDS:
-- Position size exceeds risk limit         → Must reject order + alert
-- P&L drawdown exceeds daily limit         → Must halt all trading + alert
-- Order rejected by exchange               → Must update OMS state + log reason
-- Partial fill received                    → Must track correctly, not treat as full fill
-- Market closes while order pending        → Must cancel open orders + reconcile
-```
-
-**Claude Code must write tests for EVERY scenario above as they become relevant to the current phase.**
-
-### Gate 4: CI PIPELINE GATES — AUTOMATED ENFORCEMENT
-
-Every push to the repository must pass ALL of these in CI (GitHub Actions):
-
-```
-Stage 1 — Compile:
-  cargo build --release                    → Zero errors
-  cargo build --release --target x86_64    → Cross-compile check for AWS
-
-Stage 2 — Lint:
-  cargo fmt --check                        → Zero formatting issues
-  cargo clippy -- -D warnings              → Zero warnings (warnings = errors)
-  cargo clippy -- -W clippy::perf          → Performance lint group enforced
-
-Stage 3 — Test:
-  cargo test                               → 100% pass
-  cargo test -- --ignored                  → Explicitly ignored tests tracked
-
-Stage 4 — Security:
-  cargo audit                              → Zero known CVEs
-  git-secrets --scan                       → Zero leaked secrets
-
-Stage 5 — Performance:
-  cargo bench (Criterion)                  → >5% regression = FAIL the build
-  dhat heap check                          → >0 allocations on hot path = FAIL
-
-Stage 6 — Coverage:
-  cargo-tarpaulin or llvm-cov              → <90% coverage = FAIL the build
-                                           → <95% on critical modules = WARNING
-```
-
-**If ANY stage fails, the build is RED. No merging. No deploying. No exceptions.**
-
-**GitHub Actions Configuration — Exact Requirements:**
-
-```yaml
-# .github/workflows/ci.yml structure requirements:
-name: CI
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
-
-# MANDATORY: All 6 stages as separate jobs with dependency chain
-# compile → lint → test → security → performance → coverage
-# Later stages depend on earlier stages passing
-```
-
-**Branch Protection Rules — MANDATORY on GitHub:**
-
-```
-main branch:
-  ✓ Require status checks to pass before merging
-  ✓ Required checks: compile, lint, test, security, coverage
-  ✓ Require branches to be up to date before merging
-  ✓ Require pull request reviews (at least 1 — Parthiban)
-  ✓ Do not allow bypassing the above settings
-  ✓ Restrict who can push: only via PR merge
-
-develop branch:
-  ✓ Require status checks to pass before merging
-  ✓ Required checks: compile, lint, test
-  ✓ Allow direct push from Claude Code (for approved work)
-```
-
-**CI Caching — Performance:**
-- Cache `~/.cargo/registry`, `~/.cargo/git`, `target/` between runs
-- Key on `Cargo.lock` hash — invalidate on dependency change
-- Saves 3-5 minutes per CI run
-
-**Auto-Cancel — Stale Workflows:**
-- If a new push arrives while CI is running on the same branch, cancel the old run
-- Prevents wasted compute on superseded commits
-- Configured via `concurrency` group in GitHub Actions
-
-### Gate 5: PRE-DEPLOYMENT VERIFICATION
-
-Before ANY deployment to AWS production:
-
-1. **All CI gates pass** (Stage 1-6 above)
-2. **Docker image builds successfully** with multi-stage (scratch base, <15MB)
-3. **Docker Compose health checks pass** for ALL services
-4. **Smoke test** — connect to Dhan WebSocket, receive 1 tick, parse it, store it
-5. **Rollback plan confirmed** — Traefik blue-green ready, previous version tagged
-6. **Parthiban gives explicit "deploy" approval**
-
-### Gate 5a: BENCHMARK BASELINES — REGRESSION KILLS THE BUILD
-
-Every hot-path function has a baseline latency. CI compares against the baseline. >5% regression = build FAILS.
-
-**Baseline Performance Budgets:**
-
-| Operation | Budget | Tool | Crate |
-|---|---|---|---|
-| Tick binary parse (zerocopy) | **<10ns** | Criterion | core |
-| Tick pipeline routing (rtrb) | **<100ns** | Criterion | core |
-| papaya hash map lookup | **<50ns** | Criterion | core |
-| Full tick processing (parse→route→store) | **<10μs** | Criterion | core |
-| Valkey cache read (deadpool) | **<100μs** | Criterion | storage |
-| QuestDB ILP write (single row) | **<1ms** | Criterion | storage |
-| OMS state transition (statig) | **<100ns** | Criterion | trading |
-| Market hour validation | **<50ns** | Criterion | common |
-| Config TOML load (cold, one-time) | **<10ms** | Criterion | common |
-| REST API round-trip (Dhan) | **5-50ms** | Integration test | core |
-
-**Rules:**
-- Benchmarks run on EVERY PR in CI
-- Results compared against `main` branch baseline
-- >5% regression on ANY benchmark = automatic build failure
-- Baselines updated ONLY when intentional optimization is merged
-- All benchmarks use `criterion::black_box` to prevent dead code elimination
-- Benchmarks run with `--release` profile (optimized, like production)
-
-**Benchmark Directory Structure:**
-
-```
-crates/core/benches/
-  tick_parsing.rs          ← parse_ticker_packet, parse_market_depth
-  tick_pipeline.rs         ← rtrb push/pop, papaya lookup
-
-crates/trading/benches/
-  oms_transitions.rs       ← state machine transitions
-
-crates/storage/benches/
-  questdb_write.rs         ← ILP line protocol write
-  valkey_lookup.rs         ← cache get/set
-
-crates/common/benches/
-  market_hours.rs          ← validation checks
-  config_load.rs           ← TOML deserialization
-```
+>5% regression on any benchmark = build FAILS. Key budgets: tick parse <10ns, pipeline routing <100ns, full processing <10μs, OMS transition <100ns.
+Full benchmark table and directory structure: `docs/reference/quality_gates.md`
 
 ### Gate 5b: RELEASE CHECKLIST — BEFORE EVERY VERSION BUMP
 
-No release happens without completing this entire checklist. Claude Code fills it out, Parthiban reviews.
-
-```
-RELEASE CHECKLIST for v<X.Y.Z>
-
-PRE-RELEASE:
-  [ ] All CI gates pass on `develop` (6 stages green)
-  [ ] All benchmarks within budget (zero regressions >5%)
-  [ ] Coverage meets per-crate thresholds
-  [ ] cargo audit: zero known CVEs
-  [ ] No TODO/FIXME/HACK in production code (grep verified)
-  [ ] CHANGELOG.md updated with all changes since last release
-  [ ] Version bumped in workspace Cargo.toml
-
-BUILD & TAG:
-  [ ] Merge develop → main via PR (with CI passing)
-  [ ] Tag: git tag -a v<X.Y.Z> -m "Release v<X.Y.Z>: <summary>"
-  [ ] Docker image built: docker build -t dlt:v<X.Y.Z> .
-  [ ] Docker image tagged: dlt:v<X.Y.Z> (NEVER :latest)
-  [ ] Push tag to GitHub: git push origin v<X.Y.Z>
-
-DEPLOY:
-  [ ] Traefik blue-green: new version behind canary route
-  [ ] Smoke test passes on canary
-  [ ] Swap traffic to new version
-  [ ] Old version kept running for 30 minutes (instant rollback window)
-  [ ] All Gate 6 runtime checks pass (dashboards, metrics, traces, alerts)
-
-POST-RELEASE:
-  [ ] Telegram notification: "v<X.Y.Z> deployed successfully"
-  [ ] Grafana annotation: release marker on dashboards
-  [ ] Old version containers stopped after 30-minute window
-  [ ] Git tag pushed, GitHub release created with changelog
-```
+Full checklist: `docs/templates/release_checklist.md` (read ONLY at release time).
 
 ### Gate 6: RUNTIME MONITORING — POST-DEPLOYMENT
 
@@ -1167,201 +550,16 @@ After deployment, Claude Code must verify:
 
 ## DATA INTEGRITY — ZERO DATA LOSS TOLERANCE
 
-This system processes financial data. Every tick, every order, every state transition is a financial record. Losing or corrupting data can mean incorrect P&L, missed trades, or regulatory violations.
-
-### Idempotency Rules
-```
-RULE: Every write operation must be idempotent — running it twice produces the same result.
-
-QuestDB writes (tick data):
-  - Use designated timestamp + security_id as natural dedup key
-  - QuestDB's out-of-order tolerance handles late-arriving ticks
-  - NEVER rely on insert order — always use explicit timestamps
-
-Instrument persistence (daily snapshots):
-  - Call persist_instrument_snapshot() AT MOST ONCE per calendar day (IST)
-  - Caller must guard against double invocation (scheduler, not the writer)
-  - ILP auto-created tables have NO dedup keys — duplicate rows if called twice
-  - If dedup needed at DB level: use QuestDB DEDUP UPSERT KEYS via PG wire protocol
-  - expiry_date is a STRING (YYYY-MM-DD), NOT a TIMESTAMP — calendar dates are never timestamps
-  - Futures have option_type = '' (empty string), strike_price = 0.0 — NOT NULL
-  - Partial snapshot (mid-batch flush failure) is acceptable — non-critical observability data
-
-Valkey writes:
-  - Use SET with explicit keys — naturally idempotent
-  - For counters, use atomic INCR, never GET + SET
-
-OMS state transitions:
-  - Use statig state machine — invalid transitions rejected at type level
-  - Every transition logged with before/after state + timestamp
-  - State changes are append-only in QuestDB — full audit trail
-
-Order submission:
-  - Generate idempotency key BEFORE sending to Dhan API
-  - Store key in Valkey BEFORE submission
-  - On retry, check Valkey for existing key — prevent duplicate orders
-  - This is CRITICAL — duplicate orders = double the financial exposure
-```
-
-### Deduplication
-```
-Tick data:
-  - Dhan may send duplicate ticks on reconnect
-  - Deduplicate by: (security_id, exchange_timestamp, sequence_number)
-  - Keep a bounded ring buffer of recent tick hashes (rtrb) for O(1) lookup
-  - Log duplicates at WARN level — they indicate reconnection overlap
-
-Instrument snapshots:
-  - Deduplicate at caller level: scheduler calls persist once per IST day
-  - Guard: check last_persisted_date before calling persist_instrument_snapshot()
-  - If accidentally called twice: duplicate rows in QuestDB (non-fatal, query still works)
-  - Recovery: SELECT DISTINCT on (snapshot_date, security_id) always returns correct data
-  - Future hardening: QuestDB DEDUP UPSERT KEYS(snapshot_date, security_id) via PG wire
-
-Orders:
-  - Deduplicate by idempotency key (generated client-side)
-  - NEVER submit an order without checking for existing idempotency key
-  - On Dhan API timeout: CHECK order status before retrying
-  - Assume the order WENT THROUGH until confirmed otherwise
-```
-
-### Reconciliation
-```
-End-of-day reconciliation (automated, runs at 15:35 IST):
-  1. Fetch all orders from Dhan API for the day
-  2. Compare with OMS internal state
-  3. Flag any mismatches:
-     - Orders in Dhan but not in OMS → CRITICAL alert
-     - Orders in OMS but not in Dhan → investigate timeout/rejection
-     - Fill quantity mismatches → CRITICAL alert
-     - Price mismatches → log for review
-  4. Generate reconciliation report → store in QuestDB
-  5. Alert if ANY mismatches found
-
-Position reconciliation:
-  - Current positions MUST match Dhan's reported positions
-  - Run after every fill, not just end-of-day
-  - Mismatch = halt trading + alert immediately
-```
-
-### Data Retention
-```
-Hot data (QuestDB):  90 days of tick data, all orders forever
-Cold data (S3):      All tick data archived, 5-year minimum retention
-Audit logs (Loki):   30 days hot, 5 years cold (SEBI requirement)
-Backups (EBS):       Daily automated snapshots, 30-day retention
-```
-
-### Extreme Scenario Coverage — 100% Rule
-```
-RULE: Every module must handle ALL scenarios — expected, unexpected, edge cases,
-      race conditions, double invocations, corrupt input, partial failures,
-      out-of-order events, and conditions not yet imagined.
-
-Approach:
-  1. Happy path tested — obvious
-  2. Every error variant tested — every Err() arm has a test
-  3. Boundary conditions tested — min, max, zero, overflow, empty, full
-  4. Race conditions tested — Loom for shared state, concurrent access patterns
-  5. Double invocation tested — what happens if called twice? Must be safe.
-  6. Corrupt/malformed input tested — fuzz tests for all external data
-  7. Partial failure tested — what if step 3 of 5 fails? Cleanup? Rollback? Safe state?
-  8. Resource exhaustion tested — disk full, memory pressure, connection pool drained
-  9. Time-based edge cases tested — midnight IST, DST-like transitions, market holidays
-  10. Network edge cases tested — timeout, partial response, connection reset mid-transfer
-
-If a scenario CAN happen, it MUST have a test.
-If a scenario MIGHT happen, it MUST have a test.
-If a scenario SEEMS IMPOSSIBLE, document WHY it's impossible — or write a test.
-
-Claude Code must proactively identify edge cases during implementation,
-not wait for Parthiban to discover them in review.
-```
+Full reference: `docs/reference/data_integrity.md`
+Key rules: Every write is idempotent. Orders use idempotency keys in Valkey BEFORE submission (duplicate orders = double exposure). Ticks deduplicate by (security_id, exchange_timestamp, sequence_number). Position reconciliation runs after every fill — mismatch = halt trading. Data retained 5 years (SEBI).
+Every module must handle ALL scenarios. If it CAN happen, it MUST have a test.
 
 ---
 
 ## INCIDENT RESPONSE — WHEN PRODUCTION BREAKS
 
-When something goes wrong in production, speed and clarity matter. Claude Code must follow this exact protocol.
-
-### Severity Levels
-```
-SEV-1 (CRITICAL): Money at risk. Trading halted. Data loss.
-  → Response time: IMMEDIATE
-  → Examples: OMS stuck, duplicate orders, position mismatch, data corruption
-  → Action: Halt trading → diagnose → fix → verify → resume
-
-SEV-2 (HIGH): System degraded but trading safe.
-  → Response time: Within 15 minutes
-  → Examples: WebSocket reconnecting, elevated latency, Valkey down (stale cache)
-  → Action: Diagnose → fix → verify monitoring
-
-SEV-3 (MEDIUM): Non-critical component down.
-  → Response time: Within 1 hour
-  → Examples: Grafana dashboard stale, Jaeger not receiving traces, log gap
-  → Action: Diagnose → fix → verify in next session
-
-SEV-4 (LOW): Cosmetic or non-urgent.
-  → Response time: Next session
-  → Examples: Dashboard formatting, log verbosity too high, unused metric
-```
-
-### Rollback Protocol
-```
-Step 1: Confirm the issue (check Grafana, Loki, Telegram alerts)
-Step 2: Decide: rollback or hotfix?
-  - If uncertain → ROLLBACK (safe default)
-  - If root cause is clear and fix is <10 lines → hotfix
-
-ROLLBACK:
-  1. Traefik blue-green switch to previous version (tagged in Docker registry)
-  2. Verify previous version is healthy (health checks, smoke test)
-  3. Notify Parthiban with: what broke, what was rolled back, next steps
-
-HOTFIX:
-  1. Branch: hotfix/<description> from main
-  2. Fix + test (ALL quality gates still apply — no shortcuts)
-  3. Deploy via Traefik blue-green
-  4. Verify fix in production
-  5. Merge hotfix to main AND develop
-```
-
-### Post-Mortem Format
-After every SEV-1 or SEV-2 incident, Claude Code creates a post-mortem document:
-
-```markdown
-# Incident Post-Mortem: <Title>
-**Date:** YYYY-MM-DD
-**Severity:** SEV-X
-**Duration:** HH:MM (from detection to resolution)
-**Impact:** What was affected (trading, data, monitoring)
-
-## Timeline
-- HH:MM IST — First alert received
-- HH:MM IST — Investigation started
-- HH:MM IST — Root cause identified
-- HH:MM IST — Fix deployed
-- HH:MM IST — Verified resolved
-
-## Root Cause
-What actually broke and why.
-
-## Fix Applied
-What was changed to resolve it.
-
-## What Went Well
-Detection, response, tooling that helped.
-
-## What Went Wrong
-Gaps in testing, monitoring, or process.
-
-## Action Items
-- [ ] Concrete fix to prevent recurrence (with owner and deadline)
-- [ ] Test added for this failure scenario
-- [ ] Monitoring gap closed
-```
-
-Store in `docs/incidents/YYYY-MM-DD-<title>.md` and commit to git.
+Full protocol, severity levels, rollback steps, and post-mortem template: `docs/templates/incident_response.md`
+Read that file ONLY when an actual incident occurs. Key rule: SEV-1/SEV-2 = halt trading first, diagnose second.
 
 ---
 
@@ -1370,64 +568,16 @@ Store in `docs/incidents/YYYY-MM-DD-<title>.md` and commit to git.
 Code without documentation is a liability. In a financial system, undocumented behavior is a risk.
 
 ### Doc Comments — Every Public Item
-```rust
-/// Parses a raw binary frame from the Dhan WebSocket V2 protocol into a structured TickData.
-///
-/// # Arguments
-/// * `raw_bytes` - The raw binary frame received from the WebSocket connection.
-///   Must be at least `FULL_QUOTE_PACKET_SIZE` bytes for full quote packets.
-///
-/// # Returns
-/// * `Ok(TickData)` - Successfully parsed tick data with all fields populated.
-/// * `Err(ParseError::InsufficientBytes)` - Frame shorter than minimum required size.
-/// * `Err(ParseError::InvalidExchangeCode)` - Unrecognized exchange byte value.
-///
-/// # Performance
-/// O(1) — uses zerocopy for zero-allocation struct cast from buffer.
-/// Benchmark: ~8ns on x86-64 (Criterion, c7i.2xlarge).
-pub fn parse_ticker_packet(raw_bytes: &[u8]) -> Result<TickData, ParseError> {
-```
-
-**Rules:**
-- Every `pub fn`, `pub struct`, `pub enum`, `pub trait` gets a doc comment
-- Doc comments describe WHAT and WHY, not HOW (the code shows how)
-- Include `# Arguments`, `# Returns`, `# Errors` sections for public functions
-- Include `# Performance` for hot-path functions (O-notation + benchmark result)
-- Include `# Panics` section if the function can panic (should be rare)
+- Every `pub fn/struct/enum/trait` gets a doc comment (WHAT and WHY, not HOW)
+- Include `# Arguments`, `# Returns`, `# Errors` for public functions
+- Include `# Performance` for hot-path functions (O-notation + benchmark)
 - `cargo doc --no-deps` must build with zero warnings
 
 ### README Per Crate
-Every crate in the workspace gets a `README.md`:
-```markdown
-# dhan-live-trader-core
+Every crate gets a README.md: Purpose, Key Modules, Dependencies, Boot Sequence Position.
 
-## Purpose
-WebSocket connection management, binary frame parsing, and tick data pipeline.
-
-## Key Modules
-- `websocket_client` — Dhan WebSocket V2 connection lifecycle
-- `binary_parser` — Zero-copy tick data parsing via zerocopy
-- `tick_pipeline` — SPSC ring buffer routing to downstream consumers
-
-## Dependencies on Other Crates
-- `dhan-live-trader-common` — shared types, constants, config
-
-## Boot Sequence Position
-Auth → **WebSocket → Parse → Route** → Indicators
-```
-
-### Architecture Decision Records (ADRs)
-When Claude Code makes a non-obvious technical decision, document it:
-```
-Location: docs/adr/YYYY-MM-DD-<title>.md
-Format:
-  # ADR: <Title>
-  **Status:** Accepted / Superseded / Deprecated
-  **Context:** What situation required a decision
-  **Decision:** What we chose and why
-  **Consequences:** Trade-offs, what we gain, what we lose
-  **Alternatives considered:** What else we evaluated and why we rejected it
-```
+### Architecture Decision Records
+Non-obvious decisions → `docs/adr/YYYY-MM-DD-<title>.md` (Status, Context, Decision, Consequences, Alternatives).
 
 ---
 
@@ -1453,24 +603,8 @@ Crates added by Claude Code during development that are NOT in the Tech Stack Bi
 
 ## DEPLOYMENT TIMELINE
 
-```
-March 2026     → MacBook (Docker host): Build live system (monitoring + debug, NO orders)
-                  Docker stack runs on MacBook. Dhan WebSocket connected.
-                  Data collection 9:00-16:00 IST into Docker QuestDB.
-                  Code always on GitHub — MacBook is just a Docker host.
-
-April-June 2026 → MacBook (Docker host): Backtesting engine development
-                   Historical data from Dhan API + collected tick data.
-                   Strategy optimization, walk-forward validation.
-                   Paper trading (simulated orders, no real money).
-
-July 2026+      → AWS c7i.2xlarge Mumbai: Real money trading begins
-                   Migrate Docker stack to EC2.
-                   SEBI compliance activated (static IP, server in India).
-                   All quality gates, monitoring, alerting MUST be production-ready.
-```
-
-**Key rule:** The code is written ONCE to work in BOTH environments. Docker + config TOML + SSM/LocalStack ensures zero code changes between MacBook and AWS. The ONLY difference is `AWS_ENDPOINT_URL` pointing to LocalStack vs real AWS. Code always lives on GitHub — MacBook and AWS are just Docker hosts that clone from GitHub.
+Mar 2026: MacBook (data collection, no orders) → Apr-Jun: backtesting + paper trading → Jul 2026+: AWS Mumbai (real money).
+Code works identically in both — only `AWS_ENDPOINT_URL` changes (LocalStack vs real AWS).
 
 ---
 
@@ -1488,11 +622,9 @@ Read: `docs/phases/PHASE_1_ENVIRONMENT.md`
 
 ## TECH STACK BIBLE REFERENCE
 
-- **Document:** Tech Stack Bible V6
-- **Components:** 109 total across 22 sections
-- **Location:** `docs/tech_stack_bible_v6.pdf` (in GitHub repo)
-- **Authority:** This is the SINGLE SOURCE OF TRUTH for all versions and components
-- **Update process:** Only Parthiban updates the Bible. Claude Code proposes changes, Parthiban approves and updates.
+- **PDF (Parthiban only):** `docs/pdf/tech_stack_bible_v6.pdf` — NEVER read by Claude Code
+- **Markdown (Claude Code):** `docs/tech_stack_bible_v6.md` — read ONLY when adding/updating dependencies
+- **Authority:** Single source of truth for all 109 components. Only Parthiban updates it.
 
 ---
 
