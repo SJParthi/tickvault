@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
-    <data-source source="LOCAL" name="QuestDB (dlt-questdb)" uuid="dlt-questdb-pg-wire">
+    <data-source source="LOCAL" name="QuestDB (dlt-questdb)" uuid="94793225-8fab-4a4d-97c2-84e489d862fc">
       <driver-ref>postgresql</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.postgresql.Driver</jdbc-driver>

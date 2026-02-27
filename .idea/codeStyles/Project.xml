@@ -4,7 +4,6 @@
     <option name="RIGHT_MARGIN" value="100" />
     <option name="FORMATTER_TAGS_ENABLED" value="true" />
     <Rust>
-      <option name="INDENT" value="4" />
       <option name="MIN_NUMBER_OF_BLANKS_BETWEEN_ITEMS" value="1" />
     </Rust>
     <codeStyleSettings language="Rust">

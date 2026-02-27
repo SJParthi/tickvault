@@ -21,7 +21,8 @@ fi
 
 # Conventional commit pattern: type(scope): description
 # Also allows type: description (without scope) for simple commits
-PATTERN="^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_-]+\))?: .+"
+# Optional [Phase N] prefix per CLAUDE.md convention
+PATTERN="^(\[Phase [0-9]+\] )?(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_-]+\))?: .+"
 
 if ! echo "$COMMIT_MSG" | head -1 | grep -qE "$PATTERN"; then
     echo ""

@@ -57,7 +57,7 @@ SECRET_FOUND=false
 
 if [ -n "${STAGED_FILES}" ]; then
     for pattern in "${SECRET_PATTERNS[@]}"; do
-        if echo "${STAGED_FILES}" | xargs grep -lE "${pattern}" 2>/dev/null | grep -v '.git' > /dev/null 2>&1; then
+        if echo "${STAGED_FILES}" | xargs grep -lE -- "${pattern}" 2>/dev/null | grep -v '.git' > /dev/null 2>&1; then
             if [ "${SECRET_FOUND}" = false ]; then
                 echo -e "${RED}FAILED${NC}"
                 echo ""
@@ -65,7 +65,7 @@ if [ -n "${STAGED_FILES}" ]; then
                 SECRET_FOUND=true
             fi
             echo "  Pattern: ${pattern}"
-            echo "${STAGED_FILES}" | xargs grep -lE "${pattern}" 2>/dev/null | grep -v '.git' | while read -r file; do
+            echo "${STAGED_FILES}" | xargs grep -lE -- "${pattern}" 2>/dev/null | grep -v '.git' | while read -r file; do
                 echo "    -> ${file}"
             done
         fi
