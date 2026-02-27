@@ -9,4 +9,4 @@
 
 [toolchain]
 channel = "1.93.1"
-components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src", "llvm-tools-preview"]

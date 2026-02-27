@@ -53,7 +53,7 @@ run_stage "1/6" "Compile" "cargo build --release"
 
 # Stage 2: Lint
 run_stage "2/6" "Format Check" "cargo fmt --all -- --check"
-run_stage "2/6" "Clippy" "cargo clippy --workspace -- -D warnings"
+run_stage "2/6" "Clippy" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
 
 # Stage 3: Test
 run_stage "3/6" "Tests" "cargo test --workspace"

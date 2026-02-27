@@ -69,6 +69,7 @@ install_tool "cargo-audit" "cargo-audit"
 install_tool "cargo-deny" "cargo-deny"
 install_tool "cargo-tarpaulin" "cargo-tarpaulin"
 install_tool "cargo-machete" "cargo-machete"
+install_tool "cargo-nextest" "cargo-nextest"
 install_tool "typos" "typos-cli"
 echo ""
 

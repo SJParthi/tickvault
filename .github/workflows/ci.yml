@@ -8,9 +8,9 @@
 #   1. Compile    — cargo build --release
 #   2. Lint       — cargo fmt --check + cargo clippy -D warnings
 #   3. Test       — cargo test --workspace
-#   4. Security   — cargo audit + cargo deny check
-#   5. Perf       — cargo bench (compare against main baseline)
-#   6. Coverage   — cargo tarpaulin (enforce per-crate thresholds)
+#   4. Security   — cargo audit + cargo deny check  (parallel after test)
+#   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
+#   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
 # =============================================================================
 
 name: CI
@@ -20,6 +20,10 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+
+# Least-privilege: read-only by default
+permissions:
+  contents: read
 
 # Cancel stale runs on the same branch
 concurrency:
@@ -39,21 +43,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.1"
           components: rustfmt, clippy
 
       - name: Cache cargo registry + build
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-on-failure: true
 
       - name: Build (release)
         run: cargo build --release --workspace
@@ -67,25 +65,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.1"
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy (warnings = errors)
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
 
   # ---- Stage 3: Test ----
   test:
@@ -96,23 +88,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.1"
 
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: cargo test --workspace
 
-  # ---- Stage 4: Security ----
+  # ---- Stage 4: Security (parallel after test) ----
   security:
     name: "Stage 4 — Security"
     needs: test
@@ -121,24 +107,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.1"
 
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@cargo-audit
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        uses: taiki-e/install-action@cargo-deny
 
       - name: Security audit (CVEs)
         run: cargo audit
@@ -146,27 +126,21 @@ jobs:
       - name: Deny check (licenses, bans, duplicates)
         run: cargo deny check
 
-  # ---- Stage 5: Performance ----
+  # ---- Stage 5: Performance (parallel after test) ----
   performance:
     name: "Stage 5 — Performance"
-    needs: security
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.1"
 
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        uses: Swatinem/rust-cache@v2
 
       - name: Run benchmarks (if any exist)
         run: |
@@ -177,30 +151,24 @@ jobs:
             echo "No benchmark files found — skipping."
           fi
 
-  # ---- Stage 6: Coverage ----
+  # ---- Stage 6: Coverage (parallel after test) ----
   coverage:
     name: "Stage 6 — Coverage"
-    needs: performance
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.1"
 
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+        uses: taiki-e/install-action@cargo-tarpaulin
 
       - name: Run coverage
         run: cargo tarpaulin --workspace --out Xml --output-dir target/tarpaulin

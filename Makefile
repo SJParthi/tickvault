@@ -77,7 +77,7 @@ fmt: ## Format code
 	@echo "  ✅ Formatted"
 
 clippy: ## Lint with clippy (zero warnings)
-	@cargo clippy -- -D warnings
+	@cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
 	@echo "  ✅ Clippy clean"
 
 clean: ## Clean build artifacts

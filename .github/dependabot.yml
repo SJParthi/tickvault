@@ -25,10 +25,10 @@ updates:
       - "security"
     reviewers:
       - "SJParthi"
-    # Only create PRs for security updates, not version bumps
-    # Version bumps go through Tech Stack Bible process
-    allow:
-      - dependency-type: "all"
+    # Dependabot will only auto-create PRs for security advisories.
+    # Version bumps go through Tech Stack Bible process (cargo update is BANNED).
+    # Note: Dependabot security updates are enabled separately in GitHub settings
+    # and do not require an `allow` block here.
 
   # GitHub Actions
   - package-ecosystem: "github-actions"

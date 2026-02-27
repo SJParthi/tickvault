@@ -30,12 +30,12 @@ fi
 
 # --- Stage 2: Clippy Lint ---
 echo -n "  Running clippy... "
-if cargo clippy --workspace -- -D warnings > /dev/null 2>&1; then
+if cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"
 else
     echo -e "${RED}FAILED${NC}"
     echo ""
-    echo "  Clippy found issues. Run: cargo clippy --workspace -- -D warnings"
+    echo "  Clippy found issues. Run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
     echo ""
     exit 1
 fi

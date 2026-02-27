@@ -6,7 +6,7 @@
 
 [alias]
 t = "test --workspace"
-c = "clippy --workspace -- -D warnings"
+c = "clippy --workspace --all-targets -- -D warnings -W clippy::perf"
 b = "build --release"
 r = "run --package dhan-live-trader-app"
 d = "doc --workspace --no-deps --open"
