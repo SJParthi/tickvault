@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn test_tick_buffer_single_row() {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        let tick = make_test_tick(13, 24500.50);
+        let tick = make_test_tick(13, 24_500.5);
 
         let ts_nanos = TimestampNanos::new(i64::from(tick.exchange_timestamp) * 1_000_000_000);
         let received_nanos = TimestampNanos::new(tick.received_at_nanos);
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_tick_buffer_contains_expected_fields() {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        let tick = make_test_tick(13, 24500.50);
+        let tick = make_test_tick(13, 24_500.5);
 
         let ts_nanos = TimestampNanos::new(i64::from(tick.exchange_timestamp) * 1_000_000_000);
         let received_nanos = TimestampNanos::new(tick.received_at_nanos);

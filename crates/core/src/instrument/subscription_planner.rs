@@ -653,8 +653,10 @@ mod tests {
     #[test]
     fn test_disable_stock_derivatives() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.subscribe_stock_derivatives = false;
+        let config = SubscriptionConfig {
+            subscribe_stock_derivatives: false,
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -666,8 +668,10 @@ mod tests {
     #[test]
     fn test_disable_display_indices() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.subscribe_display_indices = false;
+        let config = SubscriptionConfig {
+            subscribe_display_indices: false,
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -678,8 +682,10 @@ mod tests {
     #[test]
     fn test_disable_index_derivatives() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.subscribe_index_derivatives = false;
+        let config = SubscriptionConfig {
+            subscribe_index_derivatives: false,
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -691,8 +697,10 @@ mod tests {
     #[test]
     fn test_disable_stock_equities() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.subscribe_stock_equities = false;
+        let config = SubscriptionConfig {
+            subscribe_stock_equities: false,
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -748,8 +756,10 @@ mod tests {
     #[test]
     fn test_feed_mode_from_config() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.feed_mode = "Quote".to_string();
+        let config = SubscriptionConfig {
+            feed_mode: "Quote".to_string(),
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -763,8 +773,10 @@ mod tests {
     #[test]
     fn test_feed_mode_full() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.feed_mode = "Full".to_string();
+        let config = SubscriptionConfig {
+            feed_mode: "Full".to_string(),
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -775,8 +787,10 @@ mod tests {
     #[test]
     fn test_feed_mode_invalid_falls_back_to_ticker() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.feed_mode = "Invalid".to_string();
+        let config = SubscriptionConfig {
+            feed_mode: "Invalid".to_string(),
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -788,9 +802,11 @@ mod tests {
     #[test]
     fn test_atm_strike_range_narrow() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.stock_atm_strikes_above = 1;
-        config.stock_atm_strikes_below = 1;
+        let config = SubscriptionConfig {
+            stock_atm_strikes_above: 1,
+            stock_atm_strikes_below: 1,
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);
@@ -802,9 +818,11 @@ mod tests {
     #[test]
     fn test_atm_strike_range_zero() {
         let universe = make_test_universe();
-        let mut config = SubscriptionConfig::default();
-        config.stock_atm_strikes_above = 0;
-        config.stock_atm_strikes_below = 0;
+        let config = SubscriptionConfig {
+            stock_atm_strikes_above: 0,
+            stock_atm_strikes_below: 0,
+            ..Default::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(&universe, &config, today);

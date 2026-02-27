@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn test_connection_state_clone_and_copy() {
         let state = ConnectionState::Connected;
-        let cloned = state.clone();
+        let cloned = state;
         let copied = state; // Copy trait
         assert_eq!(state, cloned);
         assert_eq!(state, copied);
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn test_disconnect_code_clone_and_copy() {
         let code = DisconnectCode::AccessTokenExpired;
-        let cloned = code.clone();
+        let cloned = code;
         let copied = code; // Copy trait
         assert_eq!(code, cloned);
         assert_eq!(code, copied);

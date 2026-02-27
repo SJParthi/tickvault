@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn test_dispatch_previous_close() {
         let mut buf = make_minimal_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
-        buf[8..12].copy_from_slice(&24300.50f32.to_le_bytes());
+        buf[8..12].copy_from_slice(&24_300.5_f32.to_le_bytes());
         buf[12..16].copy_from_slice(&120000u32.to_le_bytes());
         match dispatch_frame(&buf, 0).unwrap() {
             ParsedFrame::PreviousClose {
@@ -171,7 +171,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(security_id, 42);
-                assert!((previous_close - 24300.50).abs() < 0.01);
+                assert!((previous_close - 24_300.5).abs() < 0.01);
                 assert_eq!(previous_oi, 120000);
             }
             other => panic!("expected PreviousClose, got {other:?}"),

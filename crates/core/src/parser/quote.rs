@@ -89,6 +89,7 @@ mod tests {
     use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     /// Builds a complete 50-byte Quote packet with all fields.
+    #[allow(clippy::too_many_arguments)]
     fn make_quote_packet(
         segment: u8,
         security_id: u32,
@@ -137,7 +138,7 @@ mod tests {
         let (buf, hdr) = make_quote_packet(
             EXCHANGE_SEGMENT_NSE_FNO,
             13,
-            24500.50,
+            24_500.5,
             100,
             1740556500,
             24450.25,
@@ -153,7 +154,7 @@ mod tests {
 
         assert_eq!(tick.security_id, 13);
         assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
-        assert!((tick.last_traded_price - 24500.50).abs() < 0.01);
+        assert!((tick.last_traded_price - 24_500.5).abs() < 0.01);
         assert_eq!(tick.last_trade_quantity, 100);
         assert_eq!(tick.exchange_timestamp, 1740556500);
         assert_eq!(tick.received_at_nanos, 888);

@@ -72,9 +72,9 @@ mod tests {
 
     #[test]
     fn test_parse_previous_close_valid() {
-        let (buf, hdr) = make_prev_close_packet(13, 24300.50, 120000);
+        let (buf, hdr) = make_prev_close_packet(13, 24_300.5, 120000);
         let data = parse_previous_close_packet(&buf, &hdr).unwrap();
-        assert!((data.previous_close - 24300.50).abs() < 0.01);
+        assert!((data.previous_close - 24_300.5).abs() < 0.01);
         assert_eq!(data.previous_oi, 120000);
     }
 
