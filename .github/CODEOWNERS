@@ -1,0 +1,9 @@
+# =============================================================================
+# dhan-live-trader — Code Owners
+# =============================================================================
+# GitHub enforces review from code owners before PR merge.
+# All code changes require Parthiban's review.
+# =============================================================================
+
+# Default: all files require review from Parthiban
+* @SJParthi

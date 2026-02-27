@@ -6,8 +6,21 @@
 /target/
 **/*.rs.bk
 
-# ---- IDE ----
-.idea/
+# ---- IDE: IntelliJ IDEA (share project configs, ignore personal files) ----
+# Shared configs (.idea/runConfigurations/, dataSources.xml, vcs.xml, codeStyles/,
+# inspectionProfiles/) are tracked in Git so cloning = fully configured IDE.
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/dictionaries/
+.idea/shelf/
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.ids
+.idea/dataSources.local.xml
+.idea/dynamic.xml
+.idea/sonarlint/
+.idea/copilot/
 *.iml
 .vscode/
 *.swp

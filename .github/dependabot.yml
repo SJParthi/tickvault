@@ -1,0 +1,44 @@
+# =============================================================================
+# dhan-live-trader — Dependabot Configuration
+# =============================================================================
+# Automated security alerts for dependency vulnerabilities.
+# Creates PRs for security fixes.
+#
+# NOTE: Per CLAUDE.md, `cargo update` is BANNED for ad-hoc updates.
+# Dependabot PRs for SECURITY fixes only — version bumps go through
+# the Tech Stack Bible update process.
+# =============================================================================
+
+version: 2
+updates:
+  # Rust dependencies (Cargo)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "security"
+    reviewers:
+      - "SJParthi"
+    # Only create PRs for security updates, not version bumps
+    # Version bumps go through Tech Stack Bible process
+    allow:
+      - dependency-type: "all"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "ci"
+      - "dependencies"
+    reviewers:
+      - "SJParthi"

@@ -1,0 +1,17 @@
+# =============================================================================
+# dhan-live-trader — cargo-vet Supply Chain Configuration
+# =============================================================================
+# Tracks which dependency versions have been audited/reviewed.
+# Provides supply chain security (Mozilla-grade).
+#
+# Run: cargo vet
+# Docs: https://mozilla.github.io/cargo-vet/
+#
+# Note: cargo-vet creates additional files in this directory as audits
+# are performed. Those files are also committed to Git.
+# =============================================================================
+
+[cargo-vet]
+version = "0.9"
+
+[imports]

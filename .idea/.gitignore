@@ -1,0 +1,36 @@
+# =============================================================================
+# dhan-live-trader — IntelliJ IDEA .gitignore
+# =============================================================================
+# User-specific and sensitive files that must NOT be committed.
+# Project-wide configs (runConfigurations, codeStyles, etc.) ARE committed.
+# =============================================================================
+
+# User-specific workspace
+workspace.xml
+tasks.xml
+usage.statistics.xml
+
+# Personal dictionaries and shelved changes
+dictionaries/
+shelf/
+
+# Sensitive — database credentials
+dataSources.local.xml
+dataSources/
+dataSources.ids
+sqlDataSources.xml
+
+# Generated / transient
+contentModel.xml
+dynamic.xml
+dbnavigator.xml
+aws.xml
+uiDesigner.xml
+mongoSettings.xml
+
+# Plugin-specific state
+sonarlint/
+httpRequests/
+copilot/
+replstate.xml
+caches/

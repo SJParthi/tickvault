@@ -8,7 +8,8 @@
 .PHONY: help run stop build test check fmt clippy clean \
         docker-up docker-down docker-restart docker-status docker-logs \
         health status open grafana questdb jaeger prometheus \
-        logs app-pid
+        logs app-pid \
+        audit coverage bench geiger typos quality doc bootstrap
 
 # ---- Configuration ----
 APP_NAME       := dhan-live-trader
@@ -26,7 +27,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(run|stop|build|health|status|logs|open)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  QUALITY:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(test|check|fmt|clippy|clean)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(test|check|fmt|clippy|clean|audit|coverage|bench|geiger|typos|quality|doc)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  DOCKER:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(docker)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -175,3 +176,42 @@ jaeger: ## Open Jaeger UI (localhost:16686)
 
 prometheus: ## Open Prometheus UI (localhost:9090)
 	@open http://localhost:9090
+
+# =============================================================================
+# QUALITY GATES — Extended tools
+# =============================================================================
+
+audit: ## Security audit (cargo audit + cargo deny)
+	@echo "🔒 Running security audit..."
+	cargo audit
+	cargo deny check
+	@echo "  ✅ Security audit clean"
+
+coverage: ## Code coverage report (HTML)
+	@echo "📊 Running coverage..."
+	cargo tarpaulin --workspace --out Html --output-dir target/tarpaulin
+	@echo "  📊 Report: target/tarpaulin/tarpaulin-report.html"
+
+bench: ## Run benchmarks (Criterion)
+	@echo "⚡ Running benchmarks..."
+	cargo bench --workspace
+
+geiger: ## Unsafe code audit (cargo geiger)
+	@echo "☢️  Scanning for unsafe code..."
+	cargo geiger --all-features --all-targets
+
+typos: ## Spell check code and docs
+	@echo "📝 Checking for typos..."
+	typos .
+	@echo "  ✅ No typos found"
+
+quality: ## Full quality gates (all 6 CI stages)
+	@./scripts/quality-full.sh
+
+doc: ## Build documentation
+	@echo "📖 Building docs..."
+	cargo doc --workspace --no-deps
+	@echo "  📖 Open: target/doc/index.html"
+
+bootstrap: ## First-time setup (run once after cloning)
+	@./scripts/bootstrap.sh
