@@ -224,13 +224,6 @@ pub const FEED_UNSUBSCRIBE_FULL: u8 = 22;
 pub const MARKET_DEPTH_LEVELS: usize = 5;
 
 // ---------------------------------------------------------------------------
-// Trading Candles
-// ---------------------------------------------------------------------------
-
-/// Number of 1-minute trading candles per day (9:15 to 15:30).
-pub const TRADING_CANDLES_PER_DAY: usize = 375;
-
-// ---------------------------------------------------------------------------
 // SEBI Compliance
 // ---------------------------------------------------------------------------
 
@@ -645,14 +638,11 @@ pub const PREV_CLOSE_OFFSET_OI: usize = 12;
 pub const DISCONNECT_OFFSET_CODE: usize = 8;
 
 // ---------------------------------------------------------------------------
-// QuestDB ILP — Tick & Candle Table Names
+// QuestDB ILP — Table Names
 // ---------------------------------------------------------------------------
 
 /// QuestDB table: raw tick data from WebSocket feed.
 pub const QUESTDB_TABLE_TICKS: &str = "ticks";
-
-/// QuestDB table: 1-second candles aggregated by Rust.
-pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants
@@ -674,10 +664,10 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 
 // ---------------------------------------------------------------------------
-// Candle — IST Timezone Offset
+// IST Timezone Offset (i64)
 // ---------------------------------------------------------------------------
 
-/// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for candle boundary math.
+/// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for tick timestamp conversion.
 pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 
 // ---------------------------------------------------------------------------

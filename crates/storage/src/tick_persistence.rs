@@ -231,8 +231,7 @@ const TICKS_CREATE_DDL: &str = "\
 /// Creates the `ticks` table (if not exists) and enables DEDUP UPSERT KEYS.
 ///
 /// Best-effort: if QuestDB is unreachable, logs a warning and continues.
-/// The table must exist BEFORE ILP writes for predictable schema, and BEFORE
-/// candle queries to avoid "table does not exist" errors from SAMPLE BY.
+/// The table must exist BEFORE ILP writes for predictable schema.
 pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",

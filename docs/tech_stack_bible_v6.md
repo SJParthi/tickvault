@@ -2,24 +2,13 @@
 
 > **O(1) ALGOTRADING**
 >
-> 113 Components · 22 Sections
+> 109 Components · 21 Sections
 >
 > Single source of truth for all versions, components, and architecture.
 > If CLAUDE.md and the Bible conflict, the Bible wins.
 >
 > **Versions reconciled with Cargo.toml on 2026-02-26.**
 > Cargo.toml is the executable truth — this file tracks it.
-
----
-
-## Section 1 — FRONTEND (4 components)
-
-| # | Component | Version | Purpose |
-|---|-----------|---------|---------|
-| 1 | SolidJS | 1.9.11 | O(1) signal-to-DOM per field change, no virtual DOM diffing |
-| 2 | TradingView LW Charts | v5.1.0 | O(1) candle append, viewport culling, ~45 KB gzip |
-| 3 | @dschz/solid-lwcharts | 0.4.0 | SolidJS reactive wrapper for TradingView charts |
-| 4 | DataView + SharedArrayBuffer | ES2020 | O(1) field reads from Dhan binary WebSocket frames |
 
 ---
 

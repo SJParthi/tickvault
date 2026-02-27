@@ -157,8 +157,8 @@ status: ## Full system status (Docker + App + QuestDB + Valkey)
 	@echo "     App:        http://localhost:$(APP_PORT)"
 	@echo ""
 
-open: ## Open TradingView chart in browser
-	@open http://localhost:$(APP_PORT)
+open: ## Open DLT Control Panel in browser
+	@open http://localhost:$(APP_PORT)/portal
 
 # =============================================================================
 # MONITORING — Open dashboards in browser

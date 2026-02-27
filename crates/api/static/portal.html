@@ -216,10 +216,6 @@
                 <span id="questdbStatus">QuestDB</span>
             </div>
             <div class="status-item">
-                <span class="status-dot" id="wsDot"></span>
-                <span id="wsStatus">WebSocket</span>
-            </div>
-            <div class="status-item">
                 <span class="clock" id="clock"></span>
                 <span style="color: var(--text-dim)">IST</span>
             </div>
@@ -232,35 +228,10 @@
         <div class="stat-card"><div class="stat-value" id="statDerivatives">—</div><div class="stat-label">Derivatives</div></div>
         <div class="stat-card"><div class="stat-value" id="statIndices">—</div><div class="stat-label">Subscribed Indices</div></div>
         <div class="stat-card"><div class="stat-value" id="statTicks">—</div><div class="stat-label">Ticks Stored</div></div>
-        <div class="stat-card"><div class="stat-value" id="statIntervals">—</div><div class="stat-label">Chart Intervals</div></div>
     </div>
 
     <div class="grid">
-        <div class="section-title">📊 Trading & Charts</div>
-
-        <a class="card" href="/" target="_blank">
-            <div class="card-icon">📈</div>
-            <div class="card-title">TradingView Chart</div>
-            <div class="card-desc">Live candlestick chart with 31 intervals (27 time + 4 tick). Real-time WebSocket updates from Dhan.</div>
-            <div class="card-url">http://localhost:3001/</div>
-            <span class="card-badge badge-live">LIVE</span>
-        </a>
-
-        <a class="card" href="/api/intervals" target="_blank">
-            <div class="card-icon">⏱️</div>
-            <div class="card-title">Available Intervals</div>
-            <div class="card-desc">JSON API listing all supported chart intervals: 1s to 1Y time-based, 1T to 1000T tick-based, custom.</div>
-            <div class="card-url">http://localhost:3001/api/intervals</div>
-            <span class="card-badge badge-live">API</span>
-        </a>
-
-        <a class="card" href="/api/candles/13?timeframe=5m" target="_blank">
-            <div class="card-icon">🕯️</div>
-            <div class="card-title">Candle Data API</div>
-            <div class="card-desc">Historical OHLCV candles from QuestDB via SAMPLE BY. Example: NIFTY (sid=13) 5-minute candles.</div>
-            <div class="card-url">http://localhost:3001/api/candles/13?timeframe=5m</div>
-            <span class="card-badge badge-live">API</span>
-        </a>
+        <div class="section-title">📊 Application</div>
 
         <a class="card" href="/health" target="_blank">
             <div class="card-icon">❤️</div>
@@ -275,7 +246,7 @@
         <a class="card" href="http://localhost:9000" target="_blank">
             <div class="card-icon">🗄️</div>
             <div class="card-title">QuestDB Console</div>
-            <div class="card-desc">SQL query editor for tick data, candle queries, instrument metadata. Run SAMPLE BY queries interactively.</div>
+            <div class="card-desc">SQL query editor for tick data, instrument metadata. Run queries interactively.</div>
             <div class="card-url">http://localhost:9000</div>
             <span class="card-badge badge-db">DATABASE</span>
         </a>
@@ -296,7 +267,7 @@
         <a class="card" href="http://localhost:3000" target="_blank">
             <div class="card-icon">📊</div>
             <div class="card-title">Grafana</div>
-            <div class="card-desc">Dashboards for tick latency, candle throughput, WebSocket health, system metrics.<br><strong style="color:#ffab00">Login: admin / admin</strong></div>
+            <div class="card-desc">Dashboards for tick latency, WebSocket health, system metrics.<br><strong style="color:#ffab00">Login: admin / admin</strong></div>
             <div class="card-url">http://localhost:3000</div>
             <span class="card-badge badge-monitor">MONITORING</span>
         </a>
@@ -375,8 +346,8 @@
 
     <div class="footer">
         dhan-live-trader v0.1.0 &nbsp;·&nbsp; Phase 1: Environment Readiness &nbsp;·&nbsp;
-        <span id="testCount">528</span> tests passing &nbsp;·&nbsp;
-        Blocks 01-06 + API + Frontend complete
+        <span id="testCount">463</span> tests passing &nbsp;·&nbsp;
+        Pure tick capture backend
     </div>
 
     <script>
@@ -417,24 +388,6 @@
                 });
         }
 
-        function checkWS() {
-            try {
-                var ws = new WebSocket('ws://localhost:3001/ws/live');
-                ws.onopen = function() {
-                    setDot('wsDot', 'green');
-                    document.getElementById('wsStatus').textContent = 'WebSocket: OK';
-                    ws.close();
-                };
-                ws.onerror = function() {
-                    setDot('wsDot', 'red');
-                    document.getElementById('wsStatus').textContent = 'WebSocket: DOWN';
-                };
-                setTimeout(function() { ws.close(); }, 3000);
-            } catch(e) {
-                setDot('wsDot', 'red');
-            }
-        }
-
         // ── Live Stats (via /api/stats — server-side proxy, no CORS) ──
         function loadStats() {
             fetch('/api/stats')
@@ -445,7 +398,6 @@
                     document.getElementById('statDerivatives').textContent = d.derivatives ? d.derivatives.toLocaleString() : '—';
                     document.getElementById('statIndices').textContent = d.subscribed_indices ? d.subscribed_indices.toLocaleString() : '—';
                     document.getElementById('statTicks').textContent = d.ticks ? d.ticks.toLocaleString() : '0';
-                    document.getElementById('statIntervals').textContent = d.time_intervals + d.tick_intervals;
                 }).catch(function() {});
         }
 
@@ -462,13 +414,11 @@
         // ── Init ────────────────────────────────────────────────────────
         checkHealth();
         checkQuestDB();
-        checkWS();
         loadStats();
         updateClock();
 
         setInterval(checkHealth, 10000);
         setInterval(checkQuestDB, 30000);
-        setInterval(checkWS, 15000);
         setInterval(loadStats, 30000);
         setInterval(updateClock, 1000);
     </script>
