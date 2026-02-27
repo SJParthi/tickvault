@@ -1,11 +1,9 @@
-//! Tick pipeline — connects WebSocket frames to parser, storage, and candle aggregator.
+//! Tick pipeline — pure capture: receives raw binary frames from WebSocket,
+//! parses them, filters junk ticks, and persists to QuestDB via ILP.
 //!
 //! # Flow
 //! `WebSocket Pool → mpsc::Receiver<Vec<u8>> → dispatch_frame → ParsedTick`
-//! Then for each tick:
-//! 1. `TickPersistenceWriter::append_tick()` — batched QuestDB write
-//! 2. `CandleManager::process_tick()` — O(1) candle updates
-//! 3. For each finalized candle → `broadcast::Sender::send()` to API clients
+//! → junk filter (LTP > 0, valid timestamp) → `TickPersistenceWriter` → QuestDB
 
 pub mod tick_processor;
 

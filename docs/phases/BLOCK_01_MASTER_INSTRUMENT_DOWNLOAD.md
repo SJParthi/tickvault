@@ -1,7 +1,7 @@
 # BLOCK 01 — MASTER INSTRUMENT DOWNLOAD & F&O UNIVERSE BUILDER
 
 ## Status: ✅ COMPLETE & RUNNING
-## Last Verified: 2026-02-26 (568 system tests pass, zero clippy warnings)
+## Last Verified: 2026-02-27 (463 system tests pass, zero clippy warnings)
 
 ---
 
@@ -496,12 +496,12 @@ stock_default_atm_fallback_enabled = true
 
 The planner runs as Step 5 in main.rs (between QuestDB persistence and WebSocket pool creation). It replaces the previously hardcoded 5-instrument list with dynamic subscription planning from the full FnoUniverse.
 
-### Test Counts (as of 2026-02-26)
+### Test Counts (as of 2026-02-27)
 
 | Crate | Tests |
 |-------|-------|
-| common | 123 |
-| core | 373 |
-| storage | 64 |
-| api | 8 |
-| **Total** | **568** |
+| common | 88 |
+| core | 335 |
+| storage | 37 |
+| api | 3 |
+| **Total** | **463** |
