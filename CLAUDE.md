@@ -137,15 +137,16 @@ When Claude Code starts a new session on the dhan-live-trader project, it MUST f
 Step 0: Ensure GitHub clone exists    → gh repo clone SJParthi/dhan-live-trader (if needed)
 Step 1: Pull latest from GitHub       → git pull origin main (always start from GitHub state)
 Step 2: Read THIS file                → CLAUDE.md (rules, behavior, quality gates)
-Step 3: Read the Tech Stack Bible     → docs/tech_stack_bible_v6.pdf (versions, components)
-Step 4: Read the current phase doc    → docs/phases/PHASE_<N>_<NAME>.md (what to build)
-Step 5: Read recent git log           → git log --oneline -20 (where did we leave off)
-Step 6: Read Cargo.toml               → Verify dependency versions match Bible
-Step 7: Run cargo check               → Confirm project compiles clean
-Step 8: Run cargo test                → Confirm all tests pass
+Step 3: Read the current phase doc    → docs/phases/PHASE_<N>_<NAME>.md (what to build)
+Step 4: Read recent git log           → git log --oneline -20 (where did we leave off)
+Step 5: Read Cargo.toml               → Verify dependency versions match Bible
+Step 6: Run cargo check               → Confirm project compiles clean
+Step 7: Run cargo test                → Confirm all tests pass
 ```
 
-**Only after all 9 steps does Claude Code begin working.**
+**DO NOT read the Tech Stack Bible (PDF or MD) at startup.** Read it ONLY when adding or updating a dependency.
+
+**Only after all 8 steps does Claude Code begin working.**
 
 If any step fails (compilation error, test failure, version mismatch), Claude Code MUST fix the issue BEFORE proceeding to new work. Existing breakage takes priority over new features.
 
@@ -160,6 +161,25 @@ Step 6: Show Parthiban a summary      → What was done, what's next
 ```
 
 **CRITICAL:** A session is NOT complete until code is pushed to GitHub. Local-only commits are incomplete work.
+
+---
+
+## TOKEN EFFICIENCY — ZERO WASTE
+
+Tokens cost money and time. Every wasted token is wasted budget. Claude Code must be surgically efficient.
+
+### Rules:
+
+1. **NEVER re-read files already read in the current session** — remember what you read
+2. **NEVER read the Tech Stack Bible unless adding/updating a dependency** — versions don't change between sessions unless Parthiban says so
+3. **NEVER read large files (>200 lines) in full when you only need a specific section** — use offset+limit or grep first
+4. **Keep responses short** — say what was done, show proof, stop. No essays.
+5. **Don't repeat CLAUDE.md rules back** — Parthiban wrote them, he knows them
+6. **Don't explain obvious decisions** — if the Bible says tokio 1.44.1, just use it, don't explain why
+7. **Parallelize tool calls** — if 3 files need reading, read all 3 in one round, not 3 separate rounds
+8. **Skip redundant verification** — if cargo check passed, don't also manually inspect for syntax errors
+9. **One commit message, not a paragraph** — follow the format, keep it tight
+10. **No filler phrases** — skip "Let me...", "I'll now...", "Great, now I'll..." — just do it
 
 ---
 
@@ -755,10 +775,11 @@ When building any component, Claude Code must know where it sits in this chain a
 **All versions, Docker images, AWS config, and alerting chains live in the Tech Stack Bible V6 ONLY.**
 
 Claude Code must:
-1. Open and read `docs/tech_stack_bible_v6.pdf` at the start of every session
+1. Reference `docs/tech_stack_bible_v6.md` ONLY when adding or updating a dependency
 2. Use ONLY the versions specified in the Bible — no exceptions
 3. If a component is not in the Bible, ASK Parthiban before choosing a version
 4. NEVER duplicate Bible content into this file
+5. NEVER read the Bible PDF/MD at session start — it wastes tokens
 
 **The Bible covers:** 109 components across 22 sections — Rust crates, Docker images (SHA256 pinned), AWS production stack, alerting chain, observability, testing tools, and more.
 
