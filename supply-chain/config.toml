@@ -2,16 +2,20 @@
 # dhan-live-trader — cargo-vet Supply Chain Configuration
 # =============================================================================
 # Tracks which dependency versions have been audited/reviewed.
-# Provides supply chain security (Mozilla-grade).
+# Imports audit results from Mozilla, Google, and Bytecode Alliance.
 #
 # Run: cargo vet
 # Docs: https://mozilla.github.io/cargo-vet/
-#
-# Note: cargo-vet creates additional files in this directory as audits
-# are performed. Those files are also committed to Git.
 # =============================================================================
 
 [cargo-vet]
 version = "0.9"
 
-[imports]
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"

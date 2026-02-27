@@ -37,10 +37,7 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
 
-      - name: Security audit (CVEs)
-        run: cargo audit
-
-      - name: Deny check (licenses + bans)
+      - name: Supply chain check (CVEs + licenses + bans + sources)
         run: cargo deny check
 
       - name: Check for yanked crates

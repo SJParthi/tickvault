@@ -114,16 +114,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
-
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
 
-      - name: Security audit (CVEs)
-        run: cargo audit
-
-      - name: Deny check (licenses, bans, duplicates)
+      - name: Supply chain check (CVEs + licenses + bans + sources + duplicates)
         run: cargo deny check
 
   # ---- Stage 5: Performance (parallel after test) ----
