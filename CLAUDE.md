@@ -241,6 +241,29 @@ PLAN READY / AWAITING APPROVAL / IN PROGRESS / DONE / BLOCKED / DECISION NEEDED
 - **Post-approval:** Execute entire plan without stopping. Only stop if genuinely blocked.
 - NEVER make silent decisions. NEVER suppress errors. NEVER silently retry failures.
 
+### Telegram Notifications — MANDATORY on Task Completion
+Every time Claude Code completes a task, milestone, or session, it MUST send a Telegram notification to Parthiban. This is non-negotiable — Parthiban may not be watching the terminal.
+
+**When to notify:**
+- Task/subtask completed (e.g., "all 6 quality gates passed")
+- PR created or merged
+- Session end summary
+- Build/test failure that blocks progress
+- Any BLOCKED or DECISION NEEDED status
+
+**How:** Use the Telegram Bot API via `curl`:
+```
+curl -s -X POST "https://api.telegram.org/bot<TOKEN>/sendMessage" \
+  -d chat_id="<CHAT_ID>" -d parse_mode="Markdown" \
+  -d text="<message>"
+```
+- Bot token and chat ID are in AWS SSM Parameter Store:
+  - `/dlt/<env>/telegram/bot-token`
+  - `/dlt/<env>/telegram/chat-id`
+- During dev (LocalStack not yet set up), Claude Code fetches these from SSM when available. If SSM is not reachable, skip silently (do NOT block work on Telegram failures).
+- NEVER log or print the bot token. Use it only in the curl call.
+- Keep messages short: status + what was done + what's next.
+
 ---
 
 ## GIT CONVENTIONS
