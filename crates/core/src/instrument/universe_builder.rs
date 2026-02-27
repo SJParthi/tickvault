@@ -1096,9 +1096,9 @@ mod tests {
         let lookup = build_index_lookup(&rows);
 
         // Equities should not appear
-        assert!(lookup.get("RELIANCE").is_none());
+        assert!(!lookup.contains_key("RELIANCE"));
         // Derivatives should not appear
-        assert!(lookup.get("NIFTY-2026-03-30-FUT").is_none());
+        assert!(!lookup.contains_key("NIFTY-2026-03-30-FUT"));
     }
 
     #[test]
@@ -1136,8 +1136,8 @@ mod tests {
         let rows = build_test_rows();
         let lookup = build_equity_lookup(&rows);
 
-        assert!(lookup.get("NIFTY").is_none());
-        assert!(lookup.get("SENSEX").is_none());
+        assert!(!lookup.contains_key("NIFTY"));
+        assert!(!lookup.contains_key("SENSEX"));
     }
 
     #[test]
@@ -2064,7 +2064,7 @@ mod tests {
 
         // The BSE FUTSTK (security_id 80010) must NOT be in contracts
         assert!(
-            result.derivative_contracts.get(&80010).is_none(),
+            !result.derivative_contracts.contains_key(&80010),
             "BSE FUTSTK must be filtered from derivative contracts"
         );
     }
@@ -2088,7 +2088,7 @@ mod tests {
 
         // The BSE OPTSTK (security_id 80020) must NOT be in contracts
         assert!(
-            result.derivative_contracts.get(&80020).is_none(),
+            !result.derivative_contracts.contains_key(&80020),
             "BSE OPTSTK must be filtered from derivative contracts"
         );
     }
@@ -2102,19 +2102,19 @@ mod tests {
 
         // SENSEX future (security_id 60000) should be present
         assert!(
-            result.derivative_contracts.get(&60000).is_some(),
+            result.derivative_contracts.contains_key(&60000),
             "BSE FUTIDX (SENSEX) must be present in derivative contracts"
         );
 
         // BANKEX future (security_id 60001) should be present
         assert!(
-            result.derivative_contracts.get(&60001).is_some(),
+            result.derivative_contracts.contains_key(&60001),
             "BSE FUTIDX (BANKEX) must be present in derivative contracts"
         );
 
         // SENSEX50 future (security_id 60002) should be present
         assert!(
-            result.derivative_contracts.get(&60002).is_some(),
+            result.derivative_contracts.contains_key(&60002),
             "BSE FUTIDX (SENSEX50) must be present in derivative contracts"
         );
     }

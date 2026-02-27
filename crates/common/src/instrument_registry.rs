@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(grouped.get(&ExchangeSegment::IdxI).unwrap().len(), 1);
         assert_eq!(grouped.get(&ExchangeSegment::NseEquity).unwrap().len(), 1);
         assert_eq!(grouped.get(&ExchangeSegment::NseFno).unwrap().len(), 1);
-        assert!(grouped.get(&ExchangeSegment::BseFno).is_none());
+        assert!(!grouped.contains_key(&ExchangeSegment::BseFno));
     }
 
     #[test]
