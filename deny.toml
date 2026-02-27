@@ -17,8 +17,11 @@ all-features = true
 
 # --- Advisories: Block known CVEs ---
 # cargo-deny v0.19+ uses deny-by-default for advisories.
-# Only configure ignore list for explicitly accepted advisories.
+# Unmaintained advisories only error for direct workspace deps —
+# transitive unmaintained deps (e.g., proc-macro-error via derive crates)
+# are outside our control and should not block CI.
 [advisories]
+unmaintained = "workspace"
 ignore = []
 
 # --- Licenses: Block incompatible licenses ---

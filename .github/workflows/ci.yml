@@ -8,7 +8,7 @@
 #   1. Compile    — cargo build --release
 #   2. Lint       — cargo fmt --check + cargo clippy -D warnings
 #   3. Test       — cargo test --workspace
-#   4. Security   — cargo audit + cargo deny check  (parallel after test)
+#   4. Security   — cargo deny check (advisories, licenses, bans, sources)
 #   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
 #   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
 # =============================================================================
