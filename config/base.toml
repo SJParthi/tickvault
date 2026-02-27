@@ -77,11 +77,8 @@ csv_download_timeout_secs = 120
 host = "0.0.0.0"
 port = 3001
 
-[pipeline]
-candle_broadcast_capacity = 16384
-
 [subscription]
-feed_mode = "Ticker"
+feed_mode = "Full"
 subscribe_index_derivatives = true
 subscribe_stock_derivatives = true
 subscribe_display_indices = true

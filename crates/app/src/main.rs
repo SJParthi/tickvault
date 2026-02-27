@@ -10,8 +10,8 @@
 //! 4. Set up QuestDB tick persistence (best-effort)
 //! 5. Build F&O universe + subscription plan from instrument CSV
 //! 6. Build WebSocket connection pool with planned instruments
-//! 7. Spawn tick processing pipeline
-//! 8. Start axum API server with TradingView frontend
+//! 7. Spawn tick processing pipeline (pure capture — parse → filter → persist)
+//! 8. Start axum API server (health, stats, portal)
 //! 9. Spawn token renewal background task
 //! 10. Await shutdown signal (Ctrl+C)
 
@@ -22,12 +22,10 @@ use chrono::{FixedOffset, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
-use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
-use dhan_live_trader_common::tick_types::{PreSerializedCandleUpdate, TickInterval, Timeframe};
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
 use dhan_live_trader_core::instrument::{build_fno_universe, build_subscription_plan};
@@ -240,34 +238,13 @@ async fn main() -> Result<()> {
         };
 
     // -----------------------------------------------------------------------
-    // Step 7: Create candle broadcast channel + spawn tick processor
+    // Step 7: Spawn tick processor (pure capture — parse → filter → persist)
     // -----------------------------------------------------------------------
-    let (candle_tx, _candle_rx) =
-        broadcast::channel::<PreSerializedCandleUpdate>(config.pipeline.candle_broadcast_capacity);
-
-    let candle_tx_clone = candle_tx.clone();
-
-    // Use all standard timeframes + tick intervals
-    let timeframes: Vec<Timeframe> = Timeframe::all_standard().to_vec();
-    let tick_intervals: Vec<TickInterval> = TickInterval::all_standard().to_vec();
-
     let processor_handle = if let Some(receiver) = frame_receiver {
         let handle = tokio::spawn(async move {
-            run_tick_processor(
-                receiver,
-                candle_tx_clone,
-                tick_writer,
-                &timeframes,
-                &tick_intervals,
-            )
-            .await;
+            run_tick_processor(receiver, tick_writer).await;
         });
-
-        info!(
-            time_intervals = Timeframe::all_standard().len(),
-            tick_intervals = TickInterval::all_standard().len(),
-            "tick processor started"
-        );
+        info!("tick processor started");
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
@@ -277,7 +254,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 8: Start axum API server
     // -----------------------------------------------------------------------
-    let api_state = SharedAppState::new(candle_tx, config.questdb.clone());
+    let api_state = SharedAppState::new(config.questdb.clone());
 
     let router = build_router(api_state);
 
@@ -324,10 +301,9 @@ async fn main() -> Result<()> {
         mode,
         "system ready — press Ctrl+C to stop\n\
          \n\
-           📊 TradingView chart:  http://{bind_addr}\n\
-           🔌 WebSocket:          ws://{bind_addr}/ws/live\n\
-           ❤️  Health:             http://{bind_addr}/health\n\
-           📈 Intervals:          http://{bind_addr}/api/intervals\n"
+           Health:  http://{bind_addr}/health\n\
+           Stats:   http://{bind_addr}/api/stats\n\
+           Portal:  http://{bind_addr}/portal\n"
     );
 
     tokio::signal::ctrl_c()

@@ -213,6 +213,10 @@ pub enum WebSocketError {
     /// Capacity exceeded — too many instruments for available connections.
     #[error("Instrument count {requested} exceeds total capacity {capacity}")]
     CapacityExceeded { requested: usize, capacity: usize },
+
+    /// TLS configuration failed.
+    #[error("TLS configuration failed: {reason}")]
+    TlsConfigurationFailed { reason: String },
 }
 
 // ---------------------------------------------------------------------------

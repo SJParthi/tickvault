@@ -1,15 +1,12 @@
-//! HTTP API server — axum endpoints for health, candle data, and WebSocket streaming.
+//! HTTP API server — axum endpoints for health, stats, and portal.
 //!
 //! # Endpoints
 //! - `GET /health` — health check
-//! - `GET /api/candles/:security_id` — historical candles from QuestDB
-//! - `GET /api/intervals` — available chart intervals
-//! - `WS /ws/live` — live candle streaming via WebSocket
-//! - `GET /` — static HTML frontend (TradingView chart)
+//! - `GET /api/stats` — QuestDB table counts
 //! - `GET /portal` — DLT Control Panel (links to all monitoring services)
 //!
 //! # Boot Sequence Position
-//! Pipeline → **API Server** → Frontend
+//! Pipeline → **API Server**
 
 pub mod handlers;
 pub mod state;
@@ -31,20 +28,7 @@ pub fn build_router(state: SharedAppState) -> Router {
             "/health",
             axum::routing::get(handlers::health::health_check),
         )
-        .route(
-            "/api/candles/{security_id}",
-            axum::routing::get(handlers::candles::get_candles),
-        )
-        .route(
-            "/api/intervals",
-            axum::routing::get(handlers::candles::get_intervals),
-        )
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
-        .route(
-            "/ws/live",
-            axum::routing::get(handlers::websocket::ws_handler),
-        )
-        .route("/", axum::routing::get(handlers::static_file::index_html))
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .layer(cors)
         .with_state(state)

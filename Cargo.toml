@@ -112,6 +112,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
 rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs"] }
+rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
 aws-config = "1.6.3"

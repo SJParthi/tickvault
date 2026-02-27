@@ -15,6 +15,7 @@
 pub mod connection;
 pub mod connection_pool;
 pub mod subscription_builder;
+pub mod tls;
 pub mod types;
 
 pub use connection::WebSocketConnection;

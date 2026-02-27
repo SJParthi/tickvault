@@ -664,12 +664,14 @@ pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
 /// Default tick flush interval in milliseconds.
 pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 
-/// Default broadcast channel capacity for candle updates.
-///
-/// Sized for worst-case 1-second rollover: ~250 active securities × 31 intervals = 7750.
-/// 16384 provides ~2x headroom. With `PreSerializedCandleUpdate` (Arc<str>), each slot
-/// is ~28 bytes on stack + shared heap string, so total buffer ≈ 450KB.
-pub const CANDLE_BROADCAST_CAPACITY: usize = 16_384;
+// ---------------------------------------------------------------------------
+// Pipeline — Tick Validation Constants
+// ---------------------------------------------------------------------------
+
+/// Minimum valid exchange timestamp (epoch seconds).
+/// Any tick with exchange_timestamp below this is a junk/initialization frame.
+/// 946684800 = 2000-01-01T00:00:00Z — safely before any real market data.
+pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 
 // ---------------------------------------------------------------------------
 // Candle — IST Timezone Offset

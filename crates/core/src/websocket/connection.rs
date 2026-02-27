@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 use dhan_live_trader_common::constants::{WEBSOCKET_AUTH_TYPE, WEBSOCKET_PROTOCOL_VERSION};
 use tracing::{debug, error, info, warn};
@@ -27,6 +27,7 @@ use dhan_live_trader_common::types::FeedMode;
 
 use crate::auth::TokenHandle;
 use crate::websocket::subscription_builder::build_subscription_messages;
+use crate::websocket::tls::build_websocket_tls_connector;
 use crate::websocket::types::{
     ConnectionHealth, ConnectionId, ConnectionState, InstrumentSubscription, WebSocketError,
 };
@@ -213,13 +214,15 @@ impl WebSocketConnection {
         let access_token = token_state.access_token().expose_secret().to_string();
 
         // Build URL with auth query parameters (Dhan V2 protocol).
+        // CRITICAL: The base URL must have an explicit "/" path before the query
+        // string. Without it, http::Uri parses the path as empty, and tungstenite
+        // writes "GET ?version=2&... HTTP/1.1" which is invalid HTTP (RFC 7230
+        // requires the request-target to start with "/"). Proxies reject this
+        // with 400 Bad Request.
+        let base = self.websocket_base_url.trim_end_matches('/');
         let authenticated_url = format!(
-            "{}?version={}&token={}&clientId={}&authType={}",
-            self.websocket_base_url,
-            WEBSOCKET_PROTOCOL_VERSION,
-            access_token,
-            self.client_id,
-            WEBSOCKET_AUTH_TYPE,
+            "{base}/?version={}&token={}&clientId={}&authType={}",
+            WEBSOCKET_PROTOCOL_VERSION, access_token, self.client_id, WEBSOCKET_AUTH_TYPE,
         );
 
         let request = authenticated_url
@@ -232,34 +235,78 @@ impl WebSocketConnection {
 
         debug!(
             connection_id = self.connection_id,
-            url = %self.websocket_base_url,
+            uri = %request.uri(),
             "Connecting to Dhan WebSocket"
         );
+
+        // Build a TLS connector that forces HTTP/1.1 ALPN.
+        // Without explicit ALPN, some proxies (Cloudflare, nginx) may negotiate
+        // HTTP/2 which cannot be used for WebSocket upgrade. Forcing "http/1.1"
+        // ensures the upgrade handshake succeeds.
+        let tls_connector = build_websocket_tls_connector()?;
 
         // Connect with timeout.
         let connect_timeout = Duration::from_millis(
             self.dhan_config.max_instruments_per_connection as u64 * 10 + 10000,
         );
-        let (ws_stream, _response) = time::timeout(connect_timeout, connect_async(request))
-            .await
-            .map_err(|_| WebSocketError::ConnectionFailed {
-                url: self.websocket_base_url.clone(),
-                source: tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "WebSocket connection timed out",
-                )),
-            })?
-            .map_err(|err| WebSocketError::ConnectionFailed {
-                url: self.websocket_base_url.clone(),
-                source: err,
-            })?;
+        let connect_result = time::timeout(
+            connect_timeout,
+            connect_async_tls_with_config(request, None, false, Some(tls_connector)),
+        )
+        .await
+        .map_err(|_| WebSocketError::ConnectionFailed {
+            url: self.websocket_base_url.clone(),
+            source: tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "WebSocket connection timed out",
+            )),
+        })?;
 
-        // Send subscription messages (batched, max 100 per message).
-        let messages = build_subscription_messages(
-            &self.instruments,
+        let (ws_stream, _response) = match connect_result {
+            Ok(result) => result,
+            Err(tokio_tungstenite::tungstenite::Error::Http(ref response)) => {
+                error!(
+                    connection_id = self.connection_id,
+                    status = %response.status(),
+                    body = ?response.body().as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
+                    "WebSocket HTTP error"
+                );
+                return Err(WebSocketError::ConnectionFailed {
+                    url: self.websocket_base_url.clone(),
+                    source: connect_result.unwrap_err(),
+                });
+            }
+            Err(err) => {
+                return Err(WebSocketError::ConnectionFailed {
+                    url: self.websocket_base_url.clone(),
+                    source: err,
+                });
+            }
+        };
+
+        // IDX_I instruments only support Ticker mode — Dhan silently drops
+        // Full/Quote subscriptions for index value feeds. Partition instruments
+        // and send IDX_I with Ticker (request_code=15), rest with configured mode.
+        let (idx_instruments, non_idx_instruments): (Vec<_>, Vec<_>) = self
+            .instruments
+            .iter()
+            .cloned()
+            .partition(|inst| inst.exchange_segment == "IDX_I");
+
+        let mut messages = build_subscription_messages(
+            &non_idx_instruments,
             self.feed_mode,
             self.ws_config.subscription_batch_size,
         );
+
+        if !idx_instruments.is_empty() {
+            let idx_messages = build_subscription_messages(
+                &idx_instruments,
+                FeedMode::Ticker,
+                self.ws_config.subscription_batch_size,
+            );
+            messages.extend(idx_messages);
+        }
 
         let (mut write, read) = ws_stream.split();
 

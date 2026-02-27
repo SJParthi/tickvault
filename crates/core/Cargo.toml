@@ -34,3 +34,5 @@ aws-config = { workspace = true }
 aws-sdk-ssm = { workspace = true }
 failsafe = { workspace = true }
 serde_json = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }

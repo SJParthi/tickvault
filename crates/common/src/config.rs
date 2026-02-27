@@ -24,7 +24,6 @@ pub struct ApplicationConfig {
     pub logging: LoggingConfig,
     pub instrument: InstrumentConfig,
     pub api: ApiConfig,
-    pub pipeline: PipelineConfig,
     #[serde(default)]
     pub subscription: SubscriptionConfig,
 }
@@ -169,13 +168,6 @@ pub struct ApiConfig {
     pub host: String,
     /// HTTP server port.
     pub port: u16,
-}
-
-/// Pipeline processing configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PipelineConfig {
-    /// Broadcast channel capacity for candle updates to WebSocket clients.
-    pub candle_broadcast_capacity: usize,
 }
 
 /// Instrument CSV download and universe build configuration.
@@ -453,9 +445,6 @@ mod tests {
             api: ApiConfig {
                 host: "0.0.0.0".to_string(),
                 port: 3001,
-            },
-            pipeline: PipelineConfig {
-                candle_broadcast_capacity: 16_384,
             },
             subscription: SubscriptionConfig::default(),
         }

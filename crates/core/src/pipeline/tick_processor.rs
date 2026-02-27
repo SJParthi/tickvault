@@ -1,23 +1,20 @@
 //! Main tick processing loop — the heart of the pipeline.
 //!
-//! Consumes raw WebSocket binary frames, parses them, stores ticks,
-//! aggregates candles, and broadcasts finalized candles to API clients.
+//! Consumes raw WebSocket binary frames, parses them, and persists ticks
+//! to QuestDB. Pure capture — zero aggregation on the hot path.
 //!
 //! # Performance
-//! - O(1) per tick per interval
-//! - Zero heap allocation on hot path (ArrayVec for candles)
-//! - Batched QuestDB writes (flush every 1000 rows or 1 second)
+//! - O(1) per tick
+//! - Zero heap allocation on hot path
+//! - Batched QuestDB writes (flush every 1000 rows or 100ms)
 
 use std::time::Instant;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
-use dhan_live_trader_common::tick_types::{
-    CandleBroadcastMessage, PreSerializedCandleUpdate, TickInterval, Timeframe,
-};
+use dhan_live_trader_common::constants::MINIMUM_VALID_EXCHANGE_TIMESTAMP;
 
-use crate::candle::CandleManager;
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 
@@ -29,32 +26,19 @@ use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
 ///
 /// # Arguments
 /// * `frame_receiver` — raw binary frames from WebSocket pool
-/// * `candle_broadcast` — broadcast sender for finalized candles (to API WebSocket clients)
 /// * `tick_writer` — batched QuestDB ILP writer (None if QuestDB unavailable)
-/// * `timeframes` — active time-based intervals
-/// * `tick_intervals` — active tick-count-based intervals
 pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<Vec<u8>>,
-    candle_broadcast: broadcast::Sender<PreSerializedCandleUpdate>,
     mut tick_writer: Option<TickPersistenceWriter>,
-    timeframes: &[Timeframe],
-    tick_intervals: &[TickInterval],
 ) {
-    let mut candle_manager = CandleManager::new(timeframes, tick_intervals);
-
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
-    let mut candles_finalized: u64 = 0;
     let mut parse_errors: u64 = 0;
     let mut storage_errors: u64 = 0;
-    let mut broadcast_drops: u64 = 0;
+    let mut junk_ticks_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
 
-    info!(
-        time_intervals = timeframes.len(),
-        tick_intervals = tick_intervals.len(),
-        "tick processor started"
-    );
+    info!("tick processor started");
 
     while let Some(raw_frame) = frame_receiver.recv().await {
         frames_processed += 1;
@@ -82,7 +66,26 @@ pub async fn run_tick_processor(
             ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _) => {
                 ticks_processed += 1;
 
-                // 1. Persist tick to QuestDB
+                // Filter junk ticks: initialization/heartbeat frames from Dhan
+                // have LTP=0.0 and/or exchange_timestamp=0 (epoch 1970-01-01).
+                // These MUST NOT be persisted.
+                if tick.last_traded_price <= 0.0
+                    || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
+                {
+                    junk_ticks_filtered += 1;
+                    if junk_ticks_filtered <= 10 {
+                        debug!(
+                            security_id = tick.security_id,
+                            ltp = tick.last_traded_price,
+                            exchange_timestamp = tick.exchange_timestamp,
+                            total_filtered = junk_ticks_filtered,
+                            "junk tick filtered — LTP or timestamp invalid"
+                        );
+                    }
+                    continue;
+                }
+
+                // Persist tick to QuestDB
                 if let Some(ref mut writer) = tick_writer
                     && let Err(err) = writer.append_tick(&tick)
                 {
@@ -97,41 +100,9 @@ pub async fn run_tick_processor(
                     }
                 }
 
-                // 2. Feed tick to candle aggregator
-                let finalized_candles = candle_manager.process_tick(&tick);
-
-                // 3. Broadcast finalized candles to API subscribers
-                // Pre-serialize JSON ONCE here — all WebSocket clients share the Arc<str>.
-                // This eliminates per-client serde_json::to_string() on the hot path.
-                for &(candle, interval_id) in &finalized_candles {
-                    candles_finalized += 1;
-                    let msg = CandleBroadcastMessage {
-                        interval: interval_id,
-                        candle,
-                    };
-                    let pre_serialized = PreSerializedCandleUpdate::from_broadcast(&msg);
-                    // broadcast::send only fails if there are no receivers.
-                    // Track send failures for monitoring — silent drops hide backpressure.
-                    match candle_broadcast.send(pre_serialized) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            broadcast_drops += 1;
-                            if broadcast_drops <= 10 {
-                                debug!(
-                                    security_id = candle.security_id,
-                                    interval = %interval_id,
-                                    total_drops = broadcast_drops,
-                                    "candle broadcast dropped — no active subscribers"
-                                );
-                            }
-                        }
-                    }
-                }
-
                 trace!(
                     security_id = tick.security_id,
                     ltp = tick.last_traded_price,
-                    candles = finalized_candles.len(),
                     "tick processed"
                 );
             }
@@ -171,25 +142,6 @@ pub async fn run_tick_processor(
         }
     }
 
-    // Channel closed — force-finalize all in-progress candles (last candle of day)
-    let shutdown_candles = candle_manager.force_finalize_all();
-    let shutdown_candle_count = shutdown_candles.len();
-    for (candle, interval_id) in shutdown_candles {
-        candles_finalized += 1;
-        let msg = CandleBroadcastMessage {
-            interval: interval_id,
-            candle,
-        };
-        let pre_serialized = PreSerializedCandleUpdate::from_broadcast(&msg);
-        let _ = candle_broadcast.send(pre_serialized);
-    }
-    if shutdown_candle_count > 0 {
-        info!(
-            shutdown_candle_count,
-            "force-finalized in-progress candles on shutdown"
-        );
-    }
-
     // Final tick flush to QuestDB
     if let Some(ref mut writer) = tick_writer
         && let Err(err) = writer.force_flush()
@@ -200,10 +152,9 @@ pub async fn run_tick_processor(
     info!(
         frames_processed,
         ticks_processed,
-        candles_finalized,
+        junk_ticks_filtered,
         parse_errors,
         storage_errors,
-        broadcast_drops,
         "tick processor stopped"
     );
 }
@@ -237,37 +188,17 @@ mod tests {
     #[tokio::test]
     async fn test_tick_processor_processes_frames() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
-        let (candle_tx, mut candle_rx) = broadcast::channel(100);
 
-        let timeframes = vec![Timeframe::S1];
-        let tick_intervals = vec![TickInterval::T1];
-
-        // Spawn processor
         let handle = tokio::spawn(async move {
-            run_tick_processor(
-                frame_rx,
-                candle_tx,
-                None, // no QuestDB writer
-                &timeframes,
-                &tick_intervals,
-            )
-            .await;
+            run_tick_processor(frame_rx, None).await;
         });
 
-        // Send a ticker frame
+        // Send a valid ticker frame
         let frame = make_ticker_frame(13, 24500.0, 1772073900);
         frame_tx.send(frame).await.unwrap();
 
-        // T1 should produce a pre-serialized candle update
-        let update = tokio::time::timeout(std::time::Duration::from_secs(2), candle_rx.recv())
-            .await
-            .expect("should receive candle within 2s")
-            .expect("broadcast recv should not fail");
-
-        assert_eq!(update.security_id, 13);
-        // Verify the pre-serialized JSON contains expected data
-        assert!(update.json_payload.contains("\"security_id\":13"));
-        assert!(update.json_payload.contains("\"candle_update\""));
+        // Give processor time to process
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Close channel → processor exits
         drop(frame_tx);
@@ -277,13 +208,9 @@ mod tests {
     #[tokio::test]
     async fn test_tick_processor_handles_invalid_frame() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
-        let (candle_tx, _candle_rx) = broadcast::channel(100);
-
-        let timeframes = vec![Timeframe::M1];
-        let tick_intervals = vec![];
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, candle_tx, None, &timeframes, &tick_intervals).await;
+            run_tick_processor(frame_rx, None).await;
         });
 
         // Send a too-short frame
@@ -301,12 +228,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tick_processor_empty_channel_exits_cleanly() {
+    async fn test_tick_processor_filters_zero_ltp_tick() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
-        let (candle_tx, _) = broadcast::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, candle_tx, None, &[], &[]).await;
+            run_tick_processor(frame_rx, None).await;
+        });
+
+        // Send a ticker frame with LTP=0.0 — should be filtered (not crash)
+        let frame = make_ticker_frame(13, 0.0, 1772073900);
+        frame_tx.send(frame).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_filters_zero_timestamp_tick() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None).await;
+        });
+
+        // Send a ticker frame with LTT=0 (epoch 1970) — should be filtered
+        let frame = make_ticker_frame(13, 24500.0, 0);
+        frame_tx.send(frame).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_passes_valid_tick_after_junk() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None).await;
+        });
+
+        // Send junk tick first (LTP=0)
+        let junk = make_ticker_frame(13, 0.0, 1772073900);
+        frame_tx.send(junk).await.unwrap();
+
+        // Then send valid tick — processor should not crash
+        let valid = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(valid).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_empty_channel_exits_cleanly() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None).await;
         });
 
         // Close immediately

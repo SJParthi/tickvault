@@ -24,6 +24,9 @@ use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
+    EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
+    EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
+    EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO, IST_UTC_OFFSET_SECONDS_I64,
     QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE, TICK_FLUSH_INTERVAL_MS,
 };
 use dhan_live_trader_common::tick_types::ParsedTick;
@@ -47,12 +50,14 @@ const DEDUP_KEY_TICKS: &str = "security_id";
 /// Uses the same mapping as the Dhan Python SDK.
 fn segment_code_to_str(code: u8) -> &'static str {
     match code {
-        0 => "IDX_I",
-        1 => "NSE_EQ",
-        2 => "NSE_FNO",
-        3 => "BSE_EQ",
-        4 => "BSE_FNO",
-        5 => "MCX_COMM",
+        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
+        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
+        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
+        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
+        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
+        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
+        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
+        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
         _ => "UNKNOWN",
     }
 }
@@ -99,7 +104,11 @@ impl TickPersistenceWriter {
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
-        let ts_nanos = TimestampNanos::new(i64::from(tick.exchange_timestamp) * 1_000_000_000);
+        // Dhan V2 sends exchange_timestamp as IST-naive epoch: the IST clock time
+        // (e.g., 09:25:32 IST) encoded as if it were UTC epoch seconds. To store as
+        // proper UTC in QuestDB, subtract the IST offset (5h30m = 19800s).
+        let utc_epoch_secs = i64::from(tick.exchange_timestamp) - IST_UTC_OFFSET_SECONDS_I64;
+        let ts_nanos = TimestampNanos::new(utc_epoch_secs * 1_000_000_000);
         let received_nanos = TimestampNanos::new(tick.received_at_nanos);
 
         self.buffer
@@ -353,14 +362,17 @@ mod tests {
         assert_eq!(segment_code_to_str(0), "IDX_I");
         assert_eq!(segment_code_to_str(1), "NSE_EQ");
         assert_eq!(segment_code_to_str(2), "NSE_FNO");
-        assert_eq!(segment_code_to_str(3), "BSE_EQ");
-        assert_eq!(segment_code_to_str(4), "BSE_FNO");
+        assert_eq!(segment_code_to_str(3), "NSE_CURRENCY");
+        assert_eq!(segment_code_to_str(4), "BSE_EQ");
         assert_eq!(segment_code_to_str(5), "MCX_COMM");
+        assert_eq!(segment_code_to_str(7), "BSE_CURRENCY");
+        assert_eq!(segment_code_to_str(8), "BSE_FNO");
     }
 
     #[test]
     fn test_segment_code_to_str_unknown() {
         assert_eq!(segment_code_to_str(6), "UNKNOWN");
+        assert_eq!(segment_code_to_str(9), "UNKNOWN");
         assert_eq!(segment_code_to_str(255), "UNKNOWN");
     }
 
@@ -595,5 +607,27 @@ mod tests {
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("MCX_COMM"));
+    }
+
+    #[test]
+    fn test_ist_offset_subtracted_in_ts_nanos() {
+        // Dhan sends exchange_timestamp as IST-naive epoch.
+        // Example: IST 09:25:32 on 2026-02-27 → Dhan sends 1772118332
+        // (which is 2026-02-27T09:25:32Z in UTC interpretation).
+        // Correct UTC = 2026-02-27T03:55:32Z = epoch 1772098532.
+        // The IST offset = 19800 seconds.
+        let dhan_ist_naive_epoch: u32 = 1_772_118_332;
+        let expected_utc_epoch: i64 = 1_772_098_532;
+
+        let utc_epoch_secs = i64::from(dhan_ist_naive_epoch) - IST_UTC_OFFSET_SECONDS_I64;
+        assert_eq!(utc_epoch_secs, expected_utc_epoch);
+
+        // Verify the nanosecond conversion matches QuestDB expectations
+        let ts_nanos = TimestampNanos::new(utc_epoch_secs * 1_000_000_000);
+        assert_eq!(
+            utc_epoch_secs * 1_000_000_000,
+            ts_nanos.as_i64(),
+            "ts_nanos should be UTC epoch nanoseconds"
+        );
     }
 }

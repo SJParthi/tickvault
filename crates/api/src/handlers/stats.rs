@@ -1,7 +1,7 @@
 //! Stats endpoint — proxies QuestDB queries server-side to avoid CORS.
 //!
 //! Returns dashboard statistics in a single JSON response:
-//! table count, underlyings, derivatives, subscribed indices, ticks, intervals.
+//! table count, underlyings, derivatives, subscribed indices, ticks.
 
 use axum::Json;
 use axum::extract::State;
@@ -18,15 +18,10 @@ pub struct StatsResponse {
     pub derivatives: u64,
     pub subscribed_indices: u64,
     pub ticks: u64,
-    pub time_intervals: usize,
-    pub tick_intervals: usize,
 }
 
-/// `GET /api/stats` — fetch QuestDB counts + interval counts in one call.
+/// `GET /api/stats` — fetch QuestDB counts in one call.
 pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsResponse> {
-    let time_intervals = dhan_live_trader_common::tick_types::Timeframe::all_standard().len();
-    let tick_intervals = dhan_live_trader_common::tick_types::TickInterval::all_standard().len();
-
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
@@ -43,8 +38,6 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
                 derivatives: 0,
                 subscribed_indices: 0,
                 ticks: 0,
-                time_intervals,
-                tick_intervals,
             });
         }
     };
@@ -75,8 +68,6 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
         ticks: query_count(&client, &base_url, "SELECT count() FROM ticks")
             .await
             .unwrap_or(0),
-        time_intervals,
-        tick_intervals,
     })
 }
 
@@ -114,8 +105,6 @@ mod tests {
             derivatives: 96948,
             subscribed_indices: 31,
             ticks: 0,
-            time_intervals: 27,
-            tick_intervals: 4,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"tables\":5"));

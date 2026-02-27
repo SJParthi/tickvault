@@ -11,6 +11,5 @@
 //! # Boot Sequence Position
 //! OMS -> **QuestDB -> Valkey** -> HTTP API
 
-pub mod candle_query;
 pub mod instrument_persistence;
 pub mod tick_persistence;
