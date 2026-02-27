@@ -117,23 +117,8 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
 
-      - name: Check advisories (CVEs)
-        run: |
-          cargo deny check advisories 2>&1 | tee /tmp/deny-output.txt || true
-          echo "## cargo deny check advisories output" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat /tmp/deny-output.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cargo deny check advisories
-
-      - name: Check licenses
-        run: cargo deny check licenses
-
-      - name: Check bans (banned crates + duplicate versions)
-        run: cargo deny check bans
-
-      - name: Check sources (registry provenance)
-        run: cargo deny check sources
+      - name: Supply chain check (CVEs + licenses + bans + sources + duplicates)
+        run: cargo deny check
 
   # ---- Stage 5: Performance (parallel after test) ----
   performance:
