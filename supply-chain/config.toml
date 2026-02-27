@@ -1,0 +1,21 @@
+# =============================================================================
+# dhan-live-trader — cargo-vet Supply Chain Configuration
+# =============================================================================
+# Tracks which dependency versions have been audited/reviewed.
+# Imports audit results from Mozilla, Google, and Bytecode Alliance.
+#
+# Run: cargo vet
+# Docs: https://mozilla.github.io/cargo-vet/
+# =============================================================================
+
+[cargo-vet]
+version = "0.9"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"

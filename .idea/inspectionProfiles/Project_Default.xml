@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="RsExternalLinter" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="tool" value="Clippy" />
+    </inspection_tool>
+    <inspection_tool class="RsUnresolvedReference" enabled="true" level="ERROR" enabled_by_default="true" />
+    <inspection_tool class="RsFieldInitShorthand" enabled="true" level="WEAK WARNING" enabled_by_default="true" />
+    <inspection_tool class="RsLiveness" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="RsUnusedImport" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="SpellCheckingInspection" enabled="true" level="TYPO" enabled_by_default="true" />
+  </profile>
+</component>

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "Asia/Kolkata",
+  "schedule": ["after 3:45pm every weekday"],
+  "reviewers": ["SJParthi"],
+  "assignees": ["SJParthi"],
+  "labels": ["dependencies"],
+  "automerge": false,
+  "minimumReleaseAge": "3 days",
+  "prConcurrentLimit": 3,
+  "packageRules": [
+    {
+      "description": "Group all Cargo workspace dependencies into single PR",
+      "matchManagers": ["cargo"],
+      "groupName": "Cargo dependencies",
+      "groupSlug": "cargo-all",
+      "labels": ["dependencies", "rust"]
+    },
+    {
+      "description": "GitHub Actions updates grouped",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "groupSlug": "github-actions-all",
+      "labels": ["ci", "dependencies"]
+    },
+    {
+      "description": "Docker Compose image updates grouped",
+      "matchManagers": ["docker-compose"],
+      "groupName": "Docker images",
+      "groupSlug": "docker-compose-all",
+      "labels": ["dependencies", "docker"]
+    },
+    {
+      "description": "Security vulnerability fixes bypass schedule",
+      "matchCategories": ["rust"],
+      "matchUpdateTypes": ["patch"],
+      "minimumReleaseAge": "1 day"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "vulnerability"]
+  }
+}

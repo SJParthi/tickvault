@@ -1,0 +1,96 @@
+# =============================================================================
+# dhan-live-trader — cargo-deny Configuration
+# =============================================================================
+# Checks dependencies for: security advisories, banned licenses,
+# banned crates, and duplicate versions.
+#
+# Run: cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+# =============================================================================
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",    # AWS EC2 c7i.2xlarge (production)
+    "aarch64-apple-darwin",         # MacBook Pro M4 Pro (development)
+]
+all-features = true
+
+# --- Advisories: Block known CVEs ---
+# cargo-deny v0.19+ uses deny-by-default for advisories.
+# Only configure ignore list for explicitly accepted advisories.
+[advisories]
+ignore = []
+
+# --- Licenses: Block incompatible licenses ---
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "OpenSSL",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA cert data)
+]
+# GPL/AGPL/copyleft licenses are denied by default (not in allow list).
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# --- Bans: Block specific crates (CLAUDE.md banned list) ---
+[bans]
+multiple-versions = "deny"
+wildcards = "allow"  # workspace path deps don't have versions
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # CLAUDE.md BANNED crates
+    { crate = "bincode" },                              # TOMBSTONED upstream. Use bitcode.
+    { crate = "openssl" },  # Use rustls instead
+]
+skip = [
+    # --- AWS SDK transitive duplicates ---
+    # AWS SDK Rust uses older HTTP/TLS stack internally.
+    # These cannot be resolved until AWS SDK updates upstream.
+    { crate = "getrandom", reason = "AWS SDK + ring use 0.2.x/0.3.x, our deps use 0.4.x" },
+    { crate = "h2", reason = "AWS SDK uses h2 0.3.x, axum uses 0.4.x" },
+    { crate = "http", reason = "AWS SDK uses http 0.2.x, axum uses 1.x" },
+    { crate = "http-body", reason = "follows http version split" },
+    { crate = "hyper", reason = "AWS SDK uses hyper 0.14.x, axum uses 1.x" },
+    { crate = "hyper-rustls", reason = "follows hyper version split" },
+    { crate = "rustls", reason = "AWS SDK uses rustls 0.21.x, we pin 0.23.x" },
+    { crate = "rustls-webpki", reason = "follows rustls version split" },
+    { crate = "tokio-rustls", reason = "follows rustls version split" },
+    { crate = "socket2", reason = "AWS SDK + tokio version split" },
+    # --- Proc-macro ecosystem duplicates ---
+    { crate = "syn", reason = "proc-macro crates straddle syn 1.x and 2.x" },
+    # --- Other transitive duplicates ---
+    { crate = "hashbrown", reason = "different indexmap versions via transitive deps" },
+    { crate = "rand", reason = "failsafe uses rand 0.8.x via transitive deps" },
+    { crate = "rand_chacha", reason = "follows rand version split" },
+    { crate = "rand_core", reason = "follows rand version split" },
+    { crate = "redis", reason = "deadpool-redis may pull different redis version" },
+    { crate = "serde_spanned", reason = "figment + toml crate version split" },
+    { crate = "toml", reason = "figment uses older toml, we pin newer" },
+    { crate = "toml_datetime", reason = "follows toml version split" },
+]
+skip-tree = []
+
+# --- Sources: Only allow crates from crates.io ---
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+]
+allow-git = []

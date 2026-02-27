@@ -1,0 +1,17 @@
+# =============================================================================
+# dhan-live-trader — Cargo Configuration
+# =============================================================================
+# Build settings, aliases, and optimization flags.
+# =============================================================================
+
+[alias]
+t = "test --workspace"
+c = "clippy --workspace --all-targets -- -D warnings -W clippy::perf"
+b = "build --release"
+r = "run --package dhan-live-trader-app"
+d = "doc --workspace --no-deps --open"
+a = "audit"
+
+# NOTE: target-cpu=native is intentionally NOT set here.
+# It would make the binary non-portable (Mac build won't run on AWS x86_64).
+# Use --target flags explicitly when cross-compiling for production.

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+    <data-source source="LOCAL" name="QuestDB (dlt-questdb)" uuid="94793225-8fab-4a4d-97c2-84e489d862fc">
+      <driver-ref>postgresql</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>org.postgresql.Driver</jdbc-driver>
+      <jdbc-url>jdbc:postgresql://localhost:8812/qdb</jdbc-url>
+      <jdbc-additional-properties>
+        <property name="com.intellij.clouds.kubernetes.db.enabled" value="false" />
+      </jdbc-additional-properties>
+      <user-name>admin</user-name>
+      <remarks>QuestDB time-series database via PostgreSQL wire protocol.
+Port 8812 (PG wire). Docker service: dlt-questdb.
+Default password: quest (enter once, IntelliJ stores securely).</remarks>
+    </data-source>
+  </component>
+</project>

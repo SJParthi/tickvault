@@ -133,3 +133,17 @@ proptest = "1.6.0"
 loom = "0.7.2"
 dhat = "0.3.3"
 tokio-test = "0.4.4"
+
+# ===========================================================================
+# Build Profiles — Security-Hardened Release
+# ===========================================================================
+
+[profile.release]
+overflow-checks = true    # Integer overflow = panic (not silent wrap) — critical for financial math
+lto = "thin"              # Link-time optimization — smaller binary, dead code elimination
+codegen-units = 1         # Single codegen unit — better optimization at cost of compile time
+strip = "symbols"         # Strip debug symbols from release binary
+panic = "abort"           # No stack unwinding in production — smaller, faster, no catch_unwind
+
+[profile.dev]
+# Keep defaults for dev — fast compilation, debug symbols, overflow checks on by default

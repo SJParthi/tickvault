@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dhan-live-trader — Pre-Commit Hook
+# =============================================================================
+# Runs before every commit. Blocks commit if any check fails.
+# Checks: formatting, linting, secret scanning.
+# Install: git config core.hooksPath scripts/git-hooks
+# =============================================================================
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+echo "=== Pre-commit checks ==="
+
+# --- Stage 1: Format Check ---
+echo -n "  Checking formatting... "
+if cargo fmt --all -- --check > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+else
+    echo -e "${RED}FAILED${NC}"
+    echo ""
+    echo "  Code is not formatted. Run: cargo fmt"
+    echo ""
+    exit 1
+fi
+
+# --- Stage 2: Clippy Lint ---
+echo -n "  Running clippy... "
+if cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+else
+    echo -e "${RED}FAILED${NC}"
+    echo ""
+    echo "  Clippy found issues. Run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
+    echo ""
+    exit 1
+fi
+
+# --- Stage 3: Secret Scanning ---
+echo -n "  Scanning for secrets... "
+
+# Patterns that indicate leaked secrets
+SECRET_PATTERNS=(
+    'AKIA[0-9A-Z]{16}'                          # AWS Access Key
+    '-----BEGIN.*PRIVATE KEY-----'               # Private keys
+    'sk_live_[0-9a-zA-Z]{24,}'                   # Stripe-style live keys
+    'ghp_[0-9a-zA-Z]{36}'                        # GitHub personal access tokens
+    'xox[bporas]-[0-9a-zA-Z-]{10,}'              # Slack tokens
+)
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+SECRET_FOUND=false
+
+if [ -n "${STAGED_FILES}" ]; then
+    for pattern in "${SECRET_PATTERNS[@]}"; do
+        if echo "${STAGED_FILES}" | xargs grep -lE -- "${pattern}" 2>/dev/null | grep -v '.git' > /dev/null 2>&1; then
+            if [ "${SECRET_FOUND}" = false ]; then
+                echo -e "${RED}FAILED${NC}"
+                echo ""
+                echo "  Potential secrets detected in staged files!"
+                SECRET_FOUND=true
+            fi
+            echo "  Pattern: ${pattern}"
+            echo "${STAGED_FILES}" | xargs grep -lE -- "${pattern}" 2>/dev/null | grep -v '.git' | while read -r file; do
+                echo "    -> ${file}"
+            done
+        fi
+    done
+fi
+
+if [ "${SECRET_FOUND}" = true ]; then
+    echo ""
+    echo "  Remove secrets before committing. Use AWS SSM Parameter Store."
+    echo ""
+    exit 1
+fi
+echo -e "${GREEN}OK${NC}"
+
+echo -e "=== All pre-commit checks ${GREEN}PASSED${NC} ==="

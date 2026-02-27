@@ -1,0 +1,58 @@
+### =============================================================================
+### dhan-live-trader — QuestDB SQL Queries
+### =============================================================================
+### Run any query: click the green play button next to it.
+### QuestDB must be running (Docker Up) before testing.
+### Uses QuestDB REST API on port 9000.
+### =============================================================================
+
+### ---- Schema Discovery ----
+
+### Show all tables
+GET http://localhost:9000/exec?query=SHOW%20TABLES
+
+###
+
+### Show columns of tick_data table
+GET http://localhost:9000/exec?query=SHOW%20COLUMNS%20FROM%20tick_data
+
+###
+
+### Show columns of instrument_snapshots table
+GET http://localhost:9000/exec?query=SHOW%20COLUMNS%20FROM%20instrument_snapshots
+
+###
+
+### ---- Tick Data Queries ----
+
+### Latest 10 ticks (most recent first)
+GET http://localhost:9000/exec?query=SELECT%20*%20FROM%20tick_data%20ORDER%20BY%20timestamp%20DESC%20LIMIT%2010
+
+###
+
+### Tick count per day
+GET http://localhost:9000/exec?query=SELECT%20timestamp%3A%3Adate%20AS%20day%2C%20count()%20FROM%20tick_data%20SAMPLE%20BY%201d
+
+###
+
+### ---- Instrument Queries ----
+
+### Latest instrument snapshots
+GET http://localhost:9000/exec?query=SELECT%20*%20FROM%20instrument_snapshots%20ORDER%20BY%20snapshot_date%20DESC%20LIMIT%2020
+
+###
+
+### Distinct instruments per snapshot date
+GET http://localhost:9000/exec?query=SELECT%20snapshot_date%2C%20count(DISTINCT%20security_id)%20AS%20instrument_count%20FROM%20instrument_snapshots%20GROUP%20BY%20snapshot_date%20ORDER%20BY%20snapshot_date%20DESC
+
+###
+
+### ---- System Queries ----
+
+### QuestDB server version
+GET http://localhost:9000/exec?query=SELECT%20version()
+
+###
+
+### Table sizes (row counts)
+GET http://localhost:9000/exec?query=SELECT%20table_name%2C%20partitionBy%2C%20designatedTimestamp%20FROM%20tables()

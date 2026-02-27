@@ -1,0 +1,44 @@
+# =============================================================================
+# dhan-live-trader — Scheduled Security Audit
+# =============================================================================
+# Runs weekly to catch new CVEs discovered after code was committed.
+# Separate from CI — this catches vulnerabilities in existing dependencies.
+# =============================================================================
+
+name: Security Audit
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC (11:30 IST)
+    - cron: "0 6 * * 1"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: "Weekly Security Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Supply chain check (CVEs + licenses + bans + sources)
+        run: cargo deny check
+
+      - name: Check for yanked crates
+        run: cargo audit --deny yanked

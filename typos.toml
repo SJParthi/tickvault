@@ -1,0 +1,60 @@
+# =============================================================================
+# dhan-live-trader — Spell Checker Configuration (typos-cli)
+# =============================================================================
+# Catches typos in code, comments, docs, and variable names.
+# Run: typos .
+# Docs: https://github.com/crate-ci/typos
+# =============================================================================
+
+[default]
+extend-ignore-re = [
+    # Ignore hex strings and hashes (SHA256 digests in docker-compose.yml)
+    "[0-9a-f]{40,}",
+    # Ignore base64-encoded strings
+    "[A-Za-z0-9+/]{40,}={0,2}",
+]
+
+[default.extend-words]
+# Domain-specific words that are NOT typos
+dhan = "dhan"
+dlt = "dlt"
+valkey = "valkey"
+questdb = "questdb"
+nse = "nse"
+sebi = "sebi"
+totp = "totp"
+ilp = "ilp"
+oms = "oms"
+gcra = "gcra"
+spsc = "spsc"
+mpmc = "mpmc"
+rtrb = "rtrb"
+serde = "serde"
+reqwest = "reqwest"
+axum = "axum"
+tokio = "tokio"
+clippy = "clippy"
+rustfmt = "rustfmt"
+zerocopy = "zerocopy"
+deadpool = "deadpool"
+papaya = "papaya"
+statig = "statig"
+backon = "backon"
+tarpaulin = "tarpaulin"
+loki = "loki"
+alloy = "alloy"
+traefik = "traefik"
+jaeger = "jaeger"
+otlp = "otlp"
+grpc = "grpc"
+zeroize = "zeroize"
+localstack = "localstack"
+
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "target/",
+    ".git/",
+    "*.pdf",
+    "deploy/docker/",
+]

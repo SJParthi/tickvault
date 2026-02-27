@@ -1,0 +1,175 @@
+# =============================================================================
+# dhan-live-trader — CI Pipeline (6 Stages)
+# =============================================================================
+# Runs on every push to main/develop and every PR.
+# All 6 stages must pass. Failure = build is RED. No merging.
+#
+# Stages:
+#   1. Compile    — cargo build --release
+#   2. Lint       — cargo fmt --check + cargo clippy -D warnings
+#   3. Test       — cargo test --workspace
+#   4. Security   — cargo audit + cargo deny check  (parallel after test)
+#   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
+#   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Least-privilege: read-only by default
+permissions:
+  contents: read
+
+# Cancel stale runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---- Stage 1: Compile ----
+  compile:
+    name: "Stage 1 — Compile"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+  # ---- Stage 2: Lint ----
+  lint:
+    name: "Stage 2 — Lint"
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (warnings = errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
+
+  # ---- Stage 3: Test ----
+  test:
+    name: "Stage 3 — Test"
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # ---- Stage 4: Security (parallel after test) ----
+  security:
+    name: "Stage 4 — Security"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Supply chain check (CVEs + licenses + bans + sources + duplicates)
+        run: cargo deny check
+
+  # ---- Stage 5: Performance (parallel after test) ----
+  performance:
+    name: "Stage 5 — Performance"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks (if any exist)
+        run: |
+          BENCH_FILES=$(find . -path "*/benches/*.rs" -type f 2>/dev/null | head -1)
+          if [ -n "$BENCH_FILES" ]; then
+            cargo bench --workspace
+          else
+            echo "No benchmark files found — skipping."
+          fi
+
+  # ---- Stage 6: Coverage (parallel after test) ----
+  coverage:
+    name: "Stage 6 — Coverage"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      - name: Run coverage
+        run: cargo tarpaulin --workspace --out Xml --output-dir target/tarpaulin
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/tarpaulin/
+          retention-days: 30

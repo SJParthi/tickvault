@@ -1,0 +1,12 @@
+# =============================================================================
+# dhan-live-trader — Rust Toolchain Configuration
+# =============================================================================
+# Pins the exact Rust version + components for all developers and CI.
+# rustup reads this file automatically on any cargo/rustc command.
+# No manual `rustup install` needed — just clone and build.
+# Version from Tech Stack Bible V6.
+# =============================================================================
+
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src", "llvm-tools-preview"]

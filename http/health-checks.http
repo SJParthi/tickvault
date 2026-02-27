@@ -1,0 +1,82 @@
+### =============================================================================
+### dhan-live-trader — Service Health Checks
+### =============================================================================
+### Run any request: click the green play button next to it.
+### All services must be running (Docker Up) before testing.
+### =============================================================================
+
+### ---- Application ----
+
+### App Health Check
+GET http://localhost:3001/health
+
+###
+
+### ---- Databases ----
+
+### QuestDB Health (HTTP API)
+GET http://localhost:9000/exec?query=SELECT%201
+
+###
+
+### QuestDB Show Tables
+GET http://localhost:9000/exec?query=SHOW%20TABLES
+
+###
+
+### ---- Cache ----
+
+### Valkey Ping (via QuestDB proxy — direct test requires redis-cli)
+# Use Docker: docker exec dlt-valkey valkey-cli ping
+
+### ---- Monitoring ----
+
+### Prometheus Health
+GET http://localhost:9090/-/healthy
+
+###
+
+### Prometheus Targets (check scrape status)
+GET http://localhost:9090/api/v1/targets
+
+###
+
+### Grafana Health
+GET http://localhost:3000/api/health
+
+###
+
+### Jaeger Health
+GET http://localhost:16686/
+
+###
+
+### Jaeger Services List
+GET http://localhost:16686/api/services
+
+###
+
+### Loki Ready
+GET http://localhost:3100/ready
+
+###
+
+### Alloy UI
+GET http://localhost:12345
+
+###
+
+### ---- Infrastructure ----
+
+### LocalStack Health
+GET http://localhost:4566/_localstack/health
+
+###
+
+### LocalStack SSM — List Parameters
+GET http://localhost:4566/_aws/ssm/parameters
+
+###
+
+### Traefik Dashboard API
+GET http://localhost:8080/api/rawdata

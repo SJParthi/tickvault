@@ -1,0 +1,14 @@
+# =============================================================================
+# dhan-live-trader — Clippy Linter Configuration
+# =============================================================================
+# Used by `cargo clippy`. Thresholds for lint rules.
+# =============================================================================
+
+# Allow functions with up to 8 parameters before triggering too_many_arguments
+too-many-arguments-threshold = 8
+
+# Type complexity threshold before triggering type_complexity lint
+type-complexity-threshold = 300
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 30
