@@ -118,7 +118,13 @@ jobs:
         uses: taiki-e/install-action@cargo-deny
 
       - name: Check advisories (CVEs)
-        run: cargo deny check advisories
+        run: |
+          cargo deny check advisories 2>&1 | tee /tmp/deny-output.txt || true
+          echo "## cargo deny check advisories output" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/deny-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo deny check advisories
 
       - name: Check licenses
         run: cargo deny check licenses
