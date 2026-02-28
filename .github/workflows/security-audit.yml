@@ -3,6 +3,8 @@
 # =============================================================================
 # Runs weekly to catch new CVEs discovered after code was committed.
 # Separate from CI — this catches vulnerabilities in existing dependencies.
+#
+# Security: All actions pinned to SHA. No mutable tags.
 # =============================================================================
 
 name: Security Audit
@@ -24,18 +26,18 @@ jobs:
     name: "Weekly Security Scan"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: "1.93.1"
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@2096c74c99c2f065b14e98d9738b44dd2018c2b7 # cargo-audit
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-deny
 
       - name: Supply chain check (CVEs + licenses + bans + sources)
         run: cargo deny check
