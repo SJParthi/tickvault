@@ -1,0 +1,146 @@
+{
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "high",
+    "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE": "85",
+    "BASH_DEFAULT_TIMEOUT_MS": "300000",
+    "BASH_MAX_TIMEOUT_MS": "600000"
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(cargo check *)",
+      "Bash(cargo check)",
+      "Bash(cargo test *)",
+      "Bash(cargo test)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo fmt)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo clippy)",
+      "Bash(cargo doc *)",
+      "Bash(cargo build *)",
+      "Bash(cargo build)",
+      "Bash(cargo bench *)",
+      "Bash(git status *)",
+      "Bash(git status)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git diff)",
+      "Bash(git branch *)",
+      "Bash(git branch)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git pull *)",
+      "Bash(git fetch *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git tag *)",
+      "Bash(docker compose *)",
+      "Bash(docker build *)",
+      "Bash(docker ps *)",
+      "Bash(docker ps)",
+      "Bash(docker logs *)",
+      "Bash(gh *)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(rustfmt *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(find *)"
+    ],
+    "deny": [
+      "Bash(cargo update *)",
+      "Bash(cargo update)",
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(brew *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-commit-gate.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-push-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-env-files.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(cat | jq -r '.tool_input.file_path // empty'); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.rs$'; then rustfmt \"$FILE\" 2>/dev/null || true; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); ACTIVE=$(echo \"$INPUT\" | jq -r '.stop_hook_active // false'); if [ \"$ACTIVE\" = \"true\" ]; then exit 0; fi; LAST_MSG=$(echo \"$INPUT\" | jq -r '.last_assistant_message // empty'); if echo \"$LAST_MSG\" | grep -qi 'todo\\|in.progress\\|not yet\\|still need\\|remaining'; then echo 'Stop hook: detected incomplete work indicators in last message' >&2; exit 2; fi; exit 0"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'COMPACTION REMINDER: Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. Run cargo fmt + clippy + test before committing. Banned: .clone()/DashMap/dyn on hot path, cargo update, .env files, localhost, hardcoded values, println!/unwrap in prod. Check current phase doc for context.'"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'SUBAGENT CONTEXT: dhan-live-trader is a Rust 2024 O(1) latency trading system. Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. No .clone()/DashMap/dyn on hot path. Use papaya, enum_dispatch, zerocopy. All versions from Tech Stack Bible V6 only.'"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'PRE-COMPACTION: Preserve in summary: (1) current phase and what was built (2) list of all modified files (3) any failing tests or unresolved errors (4) the three principles (5) cargo/git commands that were run and their results'"
+          }
+        ]
+      }
+    ]
+  }
+}
