@@ -60,6 +60,10 @@ pub enum ApplicationError {
     /// Authentication circuit breaker tripped — too many consecutive failures.
     #[error("auth circuit breaker tripped after {failures} consecutive failures")]
     AuthCircuitBreakerTripped { failures: u32 },
+
+    /// Telegram notification send failed (non-fatal — logged as warn only).
+    #[error("notification send failed: {reason}")]
+    NotificationSendFailed { reason: String },
 }
 
 // ---------------------------------------------------------------------------
