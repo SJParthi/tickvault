@@ -36,6 +36,15 @@
 .env.*
 *.env
 
+# ---- Secrets / Credentials (NEVER commit) ----
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+*-secret*.json
+
 # ---- Config overrides (personal machine-specific, not committed) ----
 config/local-overrides.toml
 

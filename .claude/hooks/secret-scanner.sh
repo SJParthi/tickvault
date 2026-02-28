@@ -28,8 +28,13 @@ scan_secret() {
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
 
-    # Skip binary files, lock files, and the scanner itself
+    # Skip binary files, lock files, scanners, and CI scanner workflows
     if echo "$file" | grep -qE '\.(sh|md|lock)$'; then
+      continue
+    fi
+
+    # Skip CI workflows that contain detection patterns (not real secrets)
+    if echo "$file" | grep -qE '(secret-scan|security-audit)\.yml$'; then
       continue
     fi
 
