@@ -13,10 +13,13 @@
 #   1. Installs Rust toolchain (reads rust-toolchain.toml)
 #   2. Installs quality gate tools (cargo-audit, cargo-deny, etc.)
 #   3. Sets up git hooks (pre-commit, pre-push, commit-msg)
-#   4. Starts Docker infrastructure (9 services)
-#   5. Waits for services to be healthy
-#   6. Seeds LocalStack with dev secrets
-#   7. Verifies everything works
+#   4. Starts Docker infrastructure (9 services) — fails fast if Docker not running
+#   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana, LocalStack)
+#   6. Automated secret setup — prompts ONCE, stores forever:
+#        - Dhan credentials → LocalStack SSM
+#        - Telegram tokens → Real AWS SSM (auto-sends test notification)
+#        - AWS CLI installed + configured automatically if missing
+#   7. Verifies cargo check + cargo test
 #
 # After this: open IntelliJ and start working. Zero manual config.
 # =============================================================================
@@ -141,16 +144,12 @@ else
 fi
 echo ""
 
-# ---- Step 6: Seed LocalStack Secrets ----
-echo -e "${CYAN}[6/7]${NC} Seeding LocalStack with dev secrets..."
-if [ -f "scripts/seed-localstack-secrets.sh" ] && command -v docker > /dev/null 2>&1; then
-    if bash scripts/seed-localstack-secrets.sh 2>/dev/null; then
-        echo -e "  ${GREEN}Dev secrets seeded${NC}"
-    else
-        echo -e "  ${YELLOW}Seeding skipped${NC} (LocalStack may not be ready yet)"
-    fi
+# ---- Step 6: Automated Secret Setup (Dhan → LocalStack, Telegram → Real AWS) ----
+echo -e "${CYAN}[6/7]${NC} Setting up secrets..."
+if [ -f "scripts/setup-secrets.sh" ]; then
+    bash scripts/setup-secrets.sh
 else
-    echo -e "  ${YELLOW}Skipped${NC} (script not found or Docker not available)"
+    echo -e "  ${YELLOW}scripts/setup-secrets.sh not found — skipping${NC}"
 fi
 echo ""
 
