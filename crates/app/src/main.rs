@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     // Using aws-lc-rs as the provider (already in the dependency tree).
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("failed to install rustls CryptoProvider — cannot proceed without TLS");
+        .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration

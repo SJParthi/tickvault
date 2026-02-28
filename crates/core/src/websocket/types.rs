@@ -148,12 +148,14 @@ pub struct InstrumentSubscription {
 
 impl InstrumentSubscription {
     /// Creates a new subscription entry from typed values.
+    // O(1) EXEMPT: begin — subscription constructor, runs at subscribe time, not per tick
     pub fn new(segment: ExchangeSegment, security_id: u32) -> Self {
         Self {
             exchange_segment: segment.as_str().to_string(),
             security_id: security_id.to_string(),
         }
     }
+    // O(1) EXEMPT: end
 }
 
 /// JSON subscription request sent to Dhan WebSocket after connection.

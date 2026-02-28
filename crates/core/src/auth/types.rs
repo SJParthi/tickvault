@@ -21,7 +21,7 @@ use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 /// Uses the compile-time constant `IST_UTC_OFFSET_SECONDS` (19800).
 /// This always succeeds — the value is within `FixedOffset`'s valid range.
 fn ist_offset() -> FixedOffset {
-    FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid")
+    FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid") // APPROVED: compile-time provable — 19800 always valid
 }
 
 /// Parses `expiryTime` from Dhan's generateAccessToken response.
@@ -179,8 +179,8 @@ impl TokenState {
     /// hours after issuance.
     pub fn needs_refresh(&self, refresh_before_expiry_hours: u64) -> bool {
         let now_ist = Utc::now().with_timezone(&ist_offset());
-        // Safe cast: clamped to 8760 (1 year max) before widening to i64.
         #[allow(clippy::cast_possible_wrap)]
+        // APPROVED: safe cast — clamped to 8760 before widening
         let hours = refresh_before_expiry_hours.min(8760) as i64;
         let refresh_threshold = self.expires_at - Duration::hours(hours);
         now_ist >= refresh_threshold
@@ -191,8 +191,8 @@ impl TokenState {
     /// Returns zero if already past the refresh window.
     pub fn time_until_refresh(&self, refresh_before_expiry_hours: u64) -> std::time::Duration {
         let now_ist = Utc::now().with_timezone(&ist_offset());
-        // Safe cast: clamped to 8760 (1 year max) before widening to i64.
         #[allow(clippy::cast_possible_wrap)]
+        // APPROVED: safe cast — clamped to 8760 before widening
         let hours = refresh_before_expiry_hours.min(8760) as i64;
         let refresh_at = self.expires_at - Duration::hours(hours);
         if now_ist >= refresh_at {

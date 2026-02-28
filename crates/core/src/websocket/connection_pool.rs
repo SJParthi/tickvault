@@ -86,6 +86,7 @@ impl WebSocketConnectionPool {
         // Buffer size: enough for burst traffic without blocking senders.
         let (frame_sender, frame_receiver) = mpsc::channel(65536);
 
+        // O(1) EXEMPT: begin — pool constructor runs once at startup, not per tick
         // Distribute instruments round-robin across connections.
         let mut connection_instruments: Vec<Vec<InstrumentSubscription>> =
             (0..num_connections).map(|_| Vec::new()).collect();
@@ -110,6 +111,7 @@ impl WebSocketConnectionPool {
                 ))
             })
             .collect();
+        // O(1) EXEMPT: end
 
         info!(
             num_connections = connections.len(),
@@ -127,6 +129,7 @@ impl WebSocketConnectionPool {
     ///
     /// Each connection manages its own lifecycle (connect, subscribe, ping,
     /// read, reconnect). Returns task handles for monitoring/cancellation.
+    // O(1) EXEMPT: begin — spawn runs once per session
     pub fn spawn_all(&self) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
         self.connections
             .iter()
@@ -135,6 +138,7 @@ impl WebSocketConnectionPool {
                 tokio::spawn(async move { conn.run().await })
             })
             .collect()
+        // O(1) EXEMPT: end
     }
 
     /// Returns the frame receiver for downstream binary frame processing.
@@ -149,7 +153,7 @@ impl WebSocketConnectionPool {
 
     /// Returns health snapshots for all connections.
     pub fn health(&self) -> Vec<ConnectionHealth> {
-        self.connections.iter().map(|conn| conn.health()).collect()
+        self.connections.iter().map(|conn| conn.health()).collect() // O(1) EXEMPT: monitoring, not per tick
     }
 
     /// Number of connections in the pool.

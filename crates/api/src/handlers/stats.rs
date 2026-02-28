@@ -9,6 +9,9 @@ use serde::Serialize;
 
 use crate::state::SharedAppState;
 
+/// Timeout for QuestDB stats queries (cold path, not tick processing).
+const QUESTDB_STATS_TIMEOUT_SECS: u64 = 3;
+
 /// Dashboard statistics response.
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {
@@ -26,7 +29,7 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(QUESTDB_STATS_TIMEOUT_SECS))
         .build()
     {
         Ok(c) => c,

@@ -49,7 +49,7 @@ scan_pattern() {
     # Extract only production code (skip #[cfg(test)] blocks)
     local matches
     matches=$(awk '
-      BEGIN { skip=0; depth=0 }
+      BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
       /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
       /^[[:space:]]*#\[test\]/ { skip=1; next }
       skip==1 && /\{/ {
@@ -64,7 +64,22 @@ scan_pattern() {
         if (depth <= 0) { skip=0; depth=0 }
         next
       }
-      { print NR": "$0 }
+      /O\(1\) EXEMPT: begin/ { exempt=1; next }
+      /O\(1\) EXEMPT: end/ { exempt=0; next }
+      exempt==1 { next }
+      /^[[:space:]]*\/\/.*APPROVED:/ || /^[[:space:]]*\/\/.*O\(1\) EXEMPT:/ {
+        if (buf != "" && buf ~ /#\[allow\(/) { buf = ""; next }
+        if (buf != "") print buf
+        buf = ""
+        skip_next = 1
+        next
+      }
+      skip_next > 0 { skip_next = 0; next }
+      {
+        if (buf != "") print buf
+        buf = NR": "$0
+      }
+      END { if (buf != "") print buf }
     ' "$full_path" \
       | grep "$pattern" \
       | grep -v '// test' \

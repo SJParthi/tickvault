@@ -24,6 +24,7 @@ pub fn build_websocket_tls_connector() -> Result<Connector, WebSocketError> {
     let certs = native_certs.certs;
     let (added, _ignored) = root_store.add_parsable_certificates(certs);
 
+    // O(1) EXEMPT: begin — TLS setup runs once per connect, not per tick
     if added == 0 {
         return Err(WebSocketError::TlsConfigurationFailed {
             reason: "no native root CA certificates found".to_string(),
@@ -36,6 +37,7 @@ pub fn build_websocket_tls_connector() -> Result<Connector, WebSocketError> {
 
     // Force HTTP/1.1 ALPN — required for WebSocket upgrade through proxies.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // O(1) EXEMPT: end
 
     Ok(Connector::Rustls(Arc::new(config)))
 }

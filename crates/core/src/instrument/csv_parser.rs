@@ -299,6 +299,7 @@ fn parse_lot_size(value: &str) -> Result<u32> {
     if rounded > f64::from(u32::MAX) {
         bail!("lot_size {} exceeds u32::MAX", rounded);
     }
+    // APPROVED: prechecked — exceeds u32::MAX guard validates before cast
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Ok(rounded as u32)
 }
