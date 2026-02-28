@@ -2,8 +2,7 @@
 # dhan-live-trader — Base Configuration
 # =============================================================================
 # Non-secret runtime configuration. Same file on Mac and AWS.
-# Secrets come from AWS SSM Parameter Store (LocalStack for dev, real AWS for prod).
-# The ONLY env-level difference: AWS_ENDPOINT_URL for LocalStack vs real AWS.
+# Secrets come from real AWS SSM Parameter Store (ap-south-1) — dev and prod.
 # =============================================================================
 
 [trading]
