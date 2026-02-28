@@ -82,13 +82,26 @@ echo ""
 
 # ---- Step 4: Docker Infrastructure ----
 echo -e "${CYAN}[4/7]${NC} Starting Docker infrastructure..."
-if command -v docker > /dev/null 2>&1; then
-    docker compose -f deploy/docker/docker-compose.yml up -d
-    echo -e "  ${GREEN}Docker services starting${NC}"
-else
-    echo -e "  ${YELLOW}Docker not found — skipping infrastructure${NC}"
+if ! command -v docker > /dev/null 2>&1; then
+    echo -e "  ${RED}Docker CLI not found!${NC}"
     echo "  Install Docker Desktop: https://docker.com/products/docker-desktop"
+    exit 1
 fi
+
+if ! docker info > /dev/null 2>&1; then
+    echo -e "  ${RED}Docker daemon is not running!${NC}"
+    echo "  Start Docker Desktop first, then re-run this script."
+    exit 1
+fi
+
+if ! docker compose version > /dev/null 2>&1; then
+    echo -e "  ${RED}docker compose plugin not found!${NC}"
+    echo "  Update Docker Desktop to get the compose plugin."
+    exit 1
+fi
+
+docker compose -f deploy/docker/docker-compose.yml up -d
+echo -e "  ${GREEN}Docker services starting${NC}"
 echo ""
 
 # ---- Step 5: Wait for Health ----
@@ -113,11 +126,18 @@ wait_for_service() {
     return 0  # Don't fail bootstrap — services might need more time
 }
 
-if command -v docker > /dev/null 2>&1; then
-    wait_for_service "QuestDB" "http://localhost:9000"
-    wait_for_service "Prometheus" "http://localhost:9090/-/healthy"
-    wait_for_service "Grafana" "http://localhost:3000/api/health"
-    wait_for_service "LocalStack" "http://localhost:4566/_localstack/health"
+wait_for_service "QuestDB" "http://localhost:9000"
+wait_for_service "Valkey" "http://localhost:6379" || true  # Valkey has no HTTP — check via redis-cli below
+wait_for_service "Prometheus" "http://localhost:9090/-/healthy"
+wait_for_service "Grafana" "http://localhost:3000/api/health"
+wait_for_service "LocalStack" "http://localhost:4566/_localstack/health"
+
+# Verify QuestDB PostgreSQL wire protocol (port 8812 — used by IntelliJ Database tool)
+echo -n "  Checking QuestDB PG wire (port 8812)... "
+if docker exec dlt-questdb bash -c 'echo | nc -z localhost 8812' > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+else
+    echo -e "${YELLOW}NOT READY${NC} (may take a few more seconds)"
 fi
 echo ""
 

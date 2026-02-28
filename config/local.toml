@@ -1,0 +1,19 @@
+# =============================================================================
+# dhan-live-trader — Host Development Configuration
+# =============================================================================
+# Overrides base.toml for running from IntelliJ / host (outside Docker).
+# Docker-internal hostnames → localhost (where Docker exposes ports).
+# This is NOT demo data — these are real connection values for host development.
+# =============================================================================
+
+[questdb]
+host = "localhost"
+
+[valkey]
+host = "localhost"
+
+[prometheus]
+host = "localhost"
+
+[instrument]
+csv_cache_directory = "data/instrument-cache"

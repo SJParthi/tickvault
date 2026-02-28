@@ -67,8 +67,10 @@ pub struct NotificationService {
 impl NotificationService {
     /// Initializes the notification service by fetching Telegram credentials from SSM.
     ///
-    /// If SSM is unavailable (LocalStack not running, no IAM role, etc.), returns
+    /// If SSM is unavailable (no IAM role, tokens not in SSM, etc.), returns
     /// a no-op service. The caller is never blocked and boot continues normally.
+    /// In dev: Telegram tokens are NOT in LocalStack → no-op mode.
+    /// In prod: Telegram tokens in real AWS SSM → active mode.
     ///
     /// # Arguments
     ///
