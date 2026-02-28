@@ -2,15 +2,17 @@
 # =============================================================================
 # dhan-live-trader — Seed LocalStack SSM Parameter Store
 # =============================================================================
-# Populates SSM Parameter Store in LocalStack with Dhan API credentials for
-# offline development. Telegram tokens are NOT seeded here — they always come
-# from real AWS SSM (no placeholders, no fake data).
+# Copies ALL secrets from real AWS SSM (ap-south-1) into LocalStack SSM.
+# Real AWS SSM is the source of truth — Parthiban manages secrets via
+# the AWS Console. This script just mirrors them locally.
 #
-# Secret path convention: /dlt/<environment>/<service>/<key>
+# Usage:
+#   ./scripts/seed-localstack-secrets.sh
 #
-# IMPORTANT: Replace the Dhan credential values below with your real
-# credentials before running. These are SSM paths only — the actual secrets
-# are entered by the developer.
+# Prerequisites:
+#   - AWS CLI configured (aws configure — one-time)
+#   - Secrets already in real AWS SSM
+#   - LocalStack running (docker compose up dlt-localstack)
 # =============================================================================
 
 set -euo pipefail
@@ -19,25 +21,43 @@ LOCALSTACK_URL="http://localhost:4566"
 REGION="ap-south-1"
 ENVIRONMENT="dev"
 
-# LocalStack accepts any credentials — these are required by the AWS CLI
-export AWS_ACCESS_KEY_ID="test"
-export AWS_SECRET_ACCESS_KEY="test"
-
-echo "Seeding SSM Parameter Store in LocalStack..."
-echo "Endpoint: ${LOCALSTACK_URL}"
-echo "Region:   ${REGION}"
+echo "Seeding LocalStack SSM from real AWS SSM..."
+echo "Source:   Real AWS SSM (${REGION})"
+echo "Target:   LocalStack (${LOCALSTACK_URL})"
 echo ""
 
-# Helper function to put a SecureString parameter
-put_secret() {
-    local path="$1"
-    local value="$2"
+# Verify real AWS credentials
+if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' first."
+    exit 1
+fi
 
+# Helper: copy a secret from real AWS → LocalStack
+copy_secret() {
+    local path="$1"
+
+    # Read from real AWS SSM
+    VALUE=$(aws ssm get-parameter \
+        --region "${REGION}" \
+        --name "${path}" \
+        --with-decryption \
+        --output text \
+        --query "Parameter.Value" \
+        --no-cli-pager \
+        2>/dev/null)
+
+    if [ -z "${VALUE}" ]; then
+        echo "  [SKIP] ${path} — not found in real AWS SSM"
+        return 1
+    fi
+
+    # Write to LocalStack SSM
+    AWS_ACCESS_KEY_ID="test" AWS_SECRET_ACCESS_KEY="test" \
     aws ssm put-parameter \
         --endpoint-url "${LOCALSTACK_URL}" \
         --region "${REGION}" \
         --name "${path}" \
-        --value "${value}" \
+        --value "${VALUE}" \
         --type "SecureString" \
         --overwrite \
         --no-cli-pager \
@@ -49,60 +69,32 @@ put_secret() {
 # ---------------------------------------------------------------------------
 # Dhan API Credentials
 # ---------------------------------------------------------------------------
-# Set these environment variables before running, or the script will prompt.
-# Example:
-#   export DHAN_CLIENT_ID="your-real-client-id"
-#   export DHAN_CLIENT_SECRET="your-real-jwt-token"
-#   export DHAN_TOTP_SECRET="your-real-totp-secret"
-#   ./scripts/seed-localstack-secrets.sh
-# ---------------------------------------------------------------------------
 echo "--- Dhan Credentials ---"
-
-if [ -z "${DHAN_CLIENT_ID:-}" ]; then
-    echo -e "\n  DHAN_CLIENT_ID not set. Set it before running:"
-    echo "    export DHAN_CLIENT_ID=\"your-real-client-id\""
-    echo "    export DHAN_CLIENT_SECRET=\"your-real-jwt-token\""
-    echo "    export DHAN_TOTP_SECRET=\"your-real-totp-secret\""
-    echo ""
-    exit 1
-fi
-
-put_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "${DHAN_CLIENT_ID}"
-put_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "${DHAN_CLIENT_SECRET}"
-put_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "${DHAN_TOTP_SECRET}"
+copy_secret "/dlt/${ENVIRONMENT}/dhan/client-id"
+copy_secret "/dlt/${ENVIRONMENT}/dhan/client-secret"
+copy_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret"
 
 # ---------------------------------------------------------------------------
-# Telegram — NOT seeded in LocalStack
-# ---------------------------------------------------------------------------
-# Telegram bot token and chat ID always come from real AWS SSM.
-# To set them up (one-time):
-#   aws ssm put-parameter --region ap-south-1 \
-#     --name "/dlt/dev/telegram/bot-token" \
-#     --value "YOUR_REAL_BOT_TOKEN" \
-#     --type SecureString --overwrite
-#
-#   aws ssm put-parameter --region ap-south-1 \
-#     --name "/dlt/dev/telegram/chat-id" \
-#     --value "YOUR_REAL_CHAT_ID" \
-#     --type SecureString --overwrite
+# Telegram Tokens
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Telegram ---"
-echo "  [SKIP] Telegram tokens use real AWS SSM (not LocalStack)"
-echo "  Run 'aws ssm put-parameter' to set /dlt/dev/telegram/bot-token and chat-id"
+echo "--- Telegram Tokens ---"
+copy_secret "/dlt/${ENVIRONMENT}/telegram/bot-token"
+copy_secret "/dlt/${ENVIRONMENT}/telegram/chat-id"
 
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Verification ---"
-PARAM_COUNT=$(aws ssm describe-parameters \
+PARAM_COUNT=$(AWS_ACCESS_KEY_ID="test" AWS_SECRET_ACCESS_KEY="test" \
+    aws ssm describe-parameters \
     --endpoint-url "${LOCALSTACK_URL}" \
     --region "${REGION}" \
     --no-cli-pager \
     --query "length(Parameters)" \
     --output text 2>/dev/null)
 
-echo "Total parameters stored: ${PARAM_COUNT}"
+echo "Total parameters in LocalStack: ${PARAM_COUNT} (expected: 5)"
 echo ""
 echo "Seed complete."

@@ -15,11 +15,11 @@
 #   3. Sets up git hooks (pre-commit, pre-push, commit-msg)
 #   4. Starts Docker infrastructure (9 services) — fails fast if Docker not running
 #   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana, LocalStack)
-#   6. Automated secret setup — prompts ONCE, stores forever:
-#        - Dhan credentials → LocalStack SSM
-#        - Telegram tokens → Real AWS SSM (auto-sends test notification)
-#        - AWS CLI installed + configured automatically if missing
-#   7. Verifies cargo check + cargo test
+#   6. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
+#   7. Automated secret setup — zero interactive input:
+#        - Dhan credentials → LocalStack SSM (env vars or placeholders)
+#        - Telegram tokens → LocalStack SSM + Real AWS SSM (env vars or placeholders)
+#   8. Verifies cargo check + cargo test
 #
 # After this: open IntelliJ and start working. Zero manual config.
 # =============================================================================
@@ -39,7 +39,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # ---- Step 1: Rust Toolchain ----
-echo -e "${CYAN}[1/7]${NC} Installing Rust toolchain..."
+echo -e "${CYAN}[1/8]${NC} Installing Rust toolchain..."
 if command -v rustup > /dev/null 2>&1; then
     rustup show active-toolchain
     echo -e "  ${GREEN}Rust toolchain ready${NC}"
@@ -51,7 +51,7 @@ fi
 echo ""
 
 # ---- Step 2: Quality Tools ----
-echo -e "${CYAN}[2/7]${NC} Installing quality gate tools..."
+echo -e "${CYAN}[2/8]${NC} Installing quality gate tools..."
 
 install_tool() {
     local tool_name="$1"
@@ -77,14 +77,14 @@ install_tool "typos" "typos-cli"
 echo ""
 
 # ---- Step 3: Git Hooks ----
-echo -e "${CYAN}[3/7]${NC} Setting up git hooks..."
+echo -e "${CYAN}[3/8]${NC} Setting up git hooks..."
 git config core.hooksPath scripts/git-hooks
 chmod +x scripts/git-hooks/*
 echo -e "  ${GREEN}Git hooks configured${NC} (pre-commit, pre-push, commit-msg)"
 echo ""
 
 # ---- Step 4: Docker Infrastructure ----
-echo -e "${CYAN}[4/7]${NC} Starting Docker infrastructure..."
+echo -e "${CYAN}[4/8]${NC} Starting Docker infrastructure..."
 if ! command -v docker > /dev/null 2>&1; then
     echo -e "  ${RED}Docker CLI not found!${NC}"
     echo "  Install Docker Desktop: https://docker.com/products/docker-desktop"
@@ -103,12 +103,16 @@ if ! docker compose version > /dev/null 2>&1; then
     exit 1
 fi
 
+echo -n "  Pulling Docker images (first run downloads ~2GB)... "
+docker compose -f deploy/docker/docker-compose.yml pull --quiet 2>/dev/null
+echo -e "${GREEN}done${NC}"
+
 docker compose -f deploy/docker/docker-compose.yml up -d
 echo -e "  ${GREEN}Docker services starting${NC}"
 echo ""
 
 # ---- Step 5: Wait for Health ----
-echo -e "${CYAN}[5/7]${NC} Waiting for services to be healthy..."
+echo -e "${CYAN}[5/8]${NC} Waiting for services to be healthy..."
 
 wait_for_service() {
     local name="$1"
@@ -144,8 +148,27 @@ else
 fi
 echo ""
 
-# ---- Step 6: Automated Secret Setup (Dhan → LocalStack, Telegram → Real AWS) ----
-echo -e "${CYAN}[6/7]${NC} Setting up secrets..."
+# ---- Step 6: QuestDB Table Initialization ----
+echo -e "${CYAN}[6/8]${NC} Initializing QuestDB tables..."
+QUESTDB_EXEC_URL="http://localhost:9000/exec"
+
+init_questdb_table() {
+    local description="$1"
+    local ddl="$2"
+    echo -n "  Creating $description... "
+    if curl -sf --max-time 5 -G "${QUESTDB_EXEC_URL}" --data-urlencode "query=${ddl}" > /dev/null 2>&1; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}SKIPPED${NC} (QuestDB may still be starting — app creates tables at runtime)"
+    fi
+}
+
+TICKS_DDL="CREATE TABLE IF NOT EXISTS ticks (segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, received_at TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
+init_questdb_table "ticks" "${TICKS_DDL}"
+echo ""
+
+# ---- Step 7: Automated Secret Setup (Dhan + Telegram → LocalStack, Telegram → Real AWS) ----
+echo -e "${CYAN}[7/8]${NC} Setting up secrets..."
 if [ -f "scripts/setup-secrets.sh" ]; then
     bash scripts/setup-secrets.sh
 else
@@ -153,8 +176,8 @@ else
 fi
 echo ""
 
-# ---- Step 7: Verify ----
-echo -e "${CYAN}[7/7]${NC} Verifying build..."
+# ---- Step 8: Verify ----
+echo -e "${CYAN}[8/8]${NC} Verifying build..."
 echo -n "  Compiling workspace... "
 if cargo check --workspace > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"
