@@ -20,6 +20,30 @@ fi
 VIOLATIONS=0
 REPORT=""
 
+# Helper: extract ONLY production code from a Rust file (strips #[cfg(test)] modules and test functions)
+# Uses awk to track brace depth inside #[cfg(test)] and #[test] blocks
+extract_prod_code() {
+  local file="$1"
+  awk '
+    BEGIN { skip=0; depth=0 }
+    /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
+    /^[[:space:]]*#\[test\]/ { skip=1; next }
+    skip==1 && /\{/ {
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) { skip=0; depth=0 }
+      next
+    }
+    skip==1 {
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) { skip=0; depth=0 }
+      next
+    }
+    { print NR": "$0 }
+  ' "$file"
+}
+
 # Helper: scan staged files for a pattern, excluding test files and test modules
 scan_prod_code() {
   local pattern="$1"
@@ -36,10 +60,17 @@ scan_prod_code() {
       continue
     fi
 
-    # Scan only non-test code (exclude lines inside #[cfg(test)] and #[test] blocks)
-    # Use grep with line numbers, then filter out test sections
+    # Extract prod code (strips #[cfg(test)] blocks), then scan
     local matches
-    matches=$(grep -n "$pattern" "$full_path" 2>/dev/null | grep -v '#\[cfg(test)\]' | grep -v '#\[test\]' | grep -v '// test' | grep -v '// TODO' | grep -v '// SAFETY:' | grep -v '/// ' || true)
+    matches=$(extract_prod_code "$full_path" \
+      | grep "$pattern" \
+      | grep -v '// test' \
+      | grep -v '// TODO' \
+      | grep -v '// SAFETY:' \
+      | grep -v '// APPROVED:' \
+      | grep -v '/// ' \
+      | grep -v '//!' \
+      || true)
 
     if [ -n "$matches" ]; then
       REPORT="${REPORT}\n  [BANNED] $description in $file:"
@@ -51,14 +82,17 @@ scan_prod_code() {
   done <<< "$files"
 }
 
-# Helper: scan ONLY hot-path crates (core, trading, websocket, oms)
+# Helper: scan ONLY hot-path code
+# Hot path = crates/trading/, crates/websocket/, crates/oms/ (full crates)
+#          + crates/core/src/websocket/, crates/core/src/ticker/ (specific modules within core)
+# Cold path within core (auth/, instrument/, notification/, config/) is NOT hot path.
 scan_hot_path() {
   local pattern="$1"
   local description="$2"
   local files="$3"
   local hot_path_files
 
-  hot_path_files=$(echo "$files" | grep -E '^crates/(core|trading|websocket|oms)/' || true)
+  hot_path_files=$(echo "$files" | grep -E '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/' || true)
   if [ -z "$hot_path_files" ]; then
     return
   fi
@@ -74,6 +108,9 @@ echo "=== Banned Pattern Scanner ===" >&2
 
 # .unwrap() in production code
 scan_prod_code '\.unwrap()' '.unwrap() — use ? with anyhow/thiserror' "$STAGED_FILES"
+
+# .expect() in production code (same as .unwrap with a message)
+scan_prod_code '\.expect(' '.expect() — use ? with anyhow/thiserror' "$STAGED_FILES"
 
 # println! / dbg! / eprintln! in production code
 scan_prod_code 'println!' 'println! — use tracing macros' "$STAGED_FILES"
@@ -94,6 +131,17 @@ scan_prod_code 'mpsc::channel()' 'mpsc::channel() without capacity — use bound
 # bincode (banned, use bitcode)
 scan_prod_code 'bincode::' 'bincode — use bitcode instead' "$STAGED_FILES"
 
+# #[allow(...)] without approval
+scan_prod_code '#\[allow(' '#[allow()] — requires // APPROVED: comment on same/preceding line' "$STAGED_FILES"
+
+# unsafe blocks
+scan_prod_code 'unsafe {' 'unsafe block — requires // SAFETY: justification' "$STAGED_FILES"
+scan_prod_code 'unsafe fn ' 'unsafe fn — requires // SAFETY: justification' "$STAGED_FILES"
+
+# Banned infrastructure (use alternatives)
+scan_prod_code 'promtail' 'Promtail — use Grafana Alloy' "$STAGED_FILES"
+scan_prod_code 'jaeger' 'Jaeger v1 — use Jaeger v2 or OTLP' "$STAGED_FILES"
+
 # ─────────────────────────────────────────────
 # CATEGORY 2: Hot-path only bans (core/trading/websocket/oms)
 # ─────────────────────────────────────────────
@@ -111,6 +159,9 @@ scan_hot_path '\.to_string()' '.to_string() on hot path — use &str or pre-allo
 scan_hot_path '\.to_owned()' '.to_owned() on hot path — use references' "$STAGED_FILES"
 scan_hot_path 'format!' 'format!() on hot path — zero allocation required' "$STAGED_FILES"
 
+# .collect() on hot path (unbounded allocation)
+scan_hot_path '\.collect()' '.collect() on hot path — unbounded allocation' "$STAGED_FILES"
+
 # dyn Trait on hot path (use enum_dispatch)
 scan_hot_path 'dyn ' 'dyn Trait on hot path — use enum_dispatch' "$STAGED_FILES"
 
@@ -121,17 +172,17 @@ scan_hot_path 'HashMap::new()' 'HashMap::new() on hot path — use with_capacity
 # CATEGORY 3: Hardcoded values (all prod code)
 # ─────────────────────────────────────────────
 
-# Hardcoded Duration::from_secs with literal number
-scan_prod_code 'Duration::from_secs([0-9]' 'Hardcoded Duration — use named constant' "$STAGED_FILES"
-scan_prod_code 'Duration::from_millis([0-9]' 'Hardcoded Duration — use named constant' "$STAGED_FILES"
-scan_prod_code 'Duration::from_nanos([0-9]' 'Hardcoded Duration — use named constant' "$STAGED_FILES"
+# Hardcoded Duration::from_secs with literal number (digits-only inside parens)
+scan_prod_code 'Duration::from_secs([0-9][0-9]*)' 'Hardcoded Duration — use named constant' "$STAGED_FILES"
+scan_prod_code 'Duration::from_millis([0-9][0-9]*)' 'Hardcoded Duration — use named constant' "$STAGED_FILES"
+scan_prod_code 'Duration::from_nanos([0-9][0-9]*)' 'Hardcoded Duration — use named constant' "$STAGED_FILES"
 
 # Hardcoded port numbers
 scan_prod_code '":[0-9][0-9][0-9][0-9]"' 'Hardcoded port — use config' "$STAGED_FILES"
 
-# Hardcoded WebSocket/API URLs
-scan_prod_code '"wss://' 'Hardcoded WebSocket URL — use config' "$STAGED_FILES"
-scan_prod_code '"https://' 'Hardcoded HTTPS URL — use config' "$STAGED_FILES"
+# Hardcoded WebSocket/API URLs (exclude protocol validation like starts_with("https://"))
+scan_prod_code '"wss://[a-zA-Z]' 'Hardcoded WebSocket URL — use config' "$STAGED_FILES"
+scan_prod_code '"https://[a-zA-Z]' 'Hardcoded HTTPS URL — use config' "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
 # RESULT
