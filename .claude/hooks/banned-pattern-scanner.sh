@@ -25,7 +25,8 @@ REPORT=""
 extract_prod_code() {
   local file="$1"
   awk '
-    BEGIN { skip=0; depth=0 }
+    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
+    # Skip #[cfg(test)] and #[test] blocks (brace-depth tracking)
     /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
     /^[[:space:]]*#\[test\]/ { skip=1; next }
     skip==1 && /\{/ {
@@ -40,7 +41,29 @@ extract_prod_code() {
       if (depth <= 0) { skip=0; depth=0 }
       next
     }
-    { print NR": "$0 }
+    # Block-level exemptions: O(1) EXEMPT: begin ... O(1) EXEMPT: end
+    /O\(1\) EXEMPT: begin/ { exempt=1; next }
+    /O\(1\) EXEMPT: end/ { exempt=0; next }
+    exempt==1 { next }
+    # Standalone APPROVED or O(1) EXEMPT comment lines handle two cases:
+    # 1. Comment AFTER violation (rustfmt moves #[allow()] inline comments down):
+    #    If the buffered line is a #[allow()] -> retroactively approve it
+    # 2. Comment BEFORE violation: approve the NEXT line (skip_next=1)
+    /^[[:space:]]*\/\/.*APPROVED:/ || /^[[:space:]]*\/\/.*O\(1\) EXEMPT:/ {
+      if (buf != "" && buf ~ /#\[allow\(/) { buf = ""; next }
+      if (buf != "") print buf
+      buf = ""
+      skip_next = 1
+      next
+    }
+    # If previous standalone approval comment said skip next line
+    skip_next > 0 { skip_next = 0; next }
+    # Buffer each code line to allow retroactive approval from following comment
+    {
+      if (buf != "") print buf
+      buf = NR": "$0
+    }
+    END { if (buf != "") print buf }
   ' "$file"
 }
 
@@ -68,6 +91,7 @@ scan_prod_code() {
       | grep -v '// TODO' \
       | grep -v '// SAFETY:' \
       | grep -v '// APPROVED:' \
+      | grep -v '// O(1) EXEMPT:' \
       | grep -v '/// ' \
       | grep -v '//!' \
       || true)

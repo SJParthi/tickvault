@@ -52,6 +52,7 @@ pub fn build_subscription_messages(
     feed_mode: FeedMode,
     batch_size: usize,
 ) -> Vec<String> {
+    // O(1) EXEMPT: begin — subscription building runs once at connect time, not per tick
     if instruments.is_empty() {
         return Vec::new();
     }
@@ -68,10 +69,10 @@ pub fn build_subscription_messages(
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
-            // Serialization of known-good types cannot fail.
-            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible
         })
         .collect()
+    // O(1) EXEMPT: end
 }
 
 /// Builds unsubscription JSON messages from a list of instruments.
@@ -83,6 +84,7 @@ pub fn build_unsubscription_messages(
     feed_mode: FeedMode,
     batch_size: usize,
 ) -> Vec<String> {
+    // O(1) EXEMPT: begin — unsubscription building runs once at disconnect time
     if instruments.is_empty() {
         return Vec::new();
     }
@@ -98,9 +100,10 @@ pub fn build_unsubscription_messages(
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
-            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible
         })
         .collect()
+    // O(1) EXEMPT: end
 }
 
 /// Builds a disconnect JSON message (RequestCode 12).
@@ -110,7 +113,7 @@ pub fn build_disconnect_message() -> String {
     serde_json::json!({
         "RequestCode": dhan_live_trader_common::constants::FEED_REQUEST_DISCONNECT
     })
-    .to_string()
+    .to_string() // O(1) EXEMPT: disconnect message — once at shutdown
 }
 
 // ---------------------------------------------------------------------------

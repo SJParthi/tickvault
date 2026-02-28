@@ -200,6 +200,7 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
+            // APPROVED: config default — overridable via TOML config file
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             send_timeout_ms: 10_000,
         }

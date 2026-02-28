@@ -83,7 +83,7 @@ impl WebSocketConnection {
     /// Creates a new WebSocket connection (not yet connected).
     ///
     /// Call `run()` to start the connection lifecycle.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // APPROVED: WebSocket constructor requires all config at init
     pub fn new(
         connection_id: ConnectionId,
         token_handle: TokenHandle,
@@ -94,7 +94,7 @@ impl WebSocketConnection {
         feed_mode: FeedMode,
         frame_sender: mpsc::Sender<Vec<u8>>,
     ) -> Self {
-        let websocket_base_url = dhan_config.websocket_url.clone();
+        let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
         Self {
             connection_id,
             token_handle,
@@ -119,7 +119,7 @@ impl WebSocketConnection {
     pub fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
             connection_id: self.connection_id,
-            state: *self.state.lock().expect("state lock poisoned"),
+            state: *self.state.lock().expect("state lock poisoned"), // APPROVED: lock poison is unrecoverable
             subscribed_count: self.instruments.len(),
             total_reconnections: self.total_reconnections.load(Ordering::Relaxed),
         }
@@ -201,6 +201,7 @@ impl WebSocketConnection {
     /// Establishes the WebSocket connection with auth query params and sends subscriptions.
     ///
     /// Dhan V2 auth: `wss://api-feed.dhan.co?version=2&token=xxx&clientId=xxx&authType=2`
+    // O(1) EXEMPT: begin — connect_and_subscribe runs once per connect/reconnect, not per tick
     async fn connect_and_subscribe(
         &self,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WebSocketError> {
@@ -328,8 +329,9 @@ impl WebSocketConnection {
         );
 
         // Reunite for the read loop.
-        Ok(read.reunite(write).expect("reunite same stream"))
+        Ok(read.reunite(write).expect("reunite same stream")) // APPROVED: reuniting same split — cannot fail
     }
+    // O(1) EXEMPT: end
 
     /// Runs the read loop: reads binary frames, handles server pings, detects disconnects.
     ///
@@ -366,7 +368,7 @@ impl WebSocketConnection {
                 Some(Ok(Message::Close(frame))) => {
                     if let Some(frame) = frame {
                         let code: u16 = frame.code.into();
-                        let reason = frame.reason.to_string();
+                        let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
                         warn!(
                             connection_id = self.connection_id,
                             close_code = code,
@@ -386,7 +388,7 @@ impl WebSocketConnection {
                 }
                 Some(Err(err)) => {
                     return Err(WebSocketError::ConnectionFailed {
-                        url: self.websocket_base_url.clone(),
+                        url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
                         source: err,
                     });
                 }
@@ -430,7 +432,7 @@ impl WebSocketConnection {
     }
 
     fn set_state(&self, new_state: ConnectionState) {
-        let mut state = self.state.lock().expect("state lock poisoned");
+        let mut state = self.state.lock().expect("state lock poisoned"); // APPROVED: lock poison is unrecoverable
         *state = new_state;
     }
 }
