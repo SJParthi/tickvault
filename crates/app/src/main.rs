@@ -1,19 +1,20 @@
 //! Binary entry point for the dhan-live-trader application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Auth → Persist → Universe → WebSocket → Pipeline → HTTP → Shutdown
+//! Config → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → HTTP → Shutdown
 //!
 //! # Boot Sequence
 //! 1. Load and validate configuration from `config/base.toml`
 //! 2. Initialize structured logging (tracing)
-//! 3. Authenticate with Dhan API (SSM → TOTP → JWT)
-//! 4. Set up QuestDB tick persistence (best-effort)
-//! 5. Build F&O universe + subscription plan from instrument CSV
-//! 6. Build WebSocket connection pool with planned instruments
-//! 7. Spawn tick processing pipeline (pure capture — parse → filter → persist)
-//! 8. Start axum API server (health, stats, portal)
-//! 9. Spawn token renewal background task
-//! 10. Await shutdown signal (Ctrl+C)
+//! 3. Initialize Telegram notification service (best-effort)
+//! 4. Authenticate with Dhan API (SSM → TOTP → JWT)
+//! 5. Set up QuestDB tick persistence (best-effort)
+//! 6. Build F&O universe + subscription plan from instrument CSV
+//! 7. Build WebSocket connection pool with planned instruments
+//! 8. Spawn tick processing pipeline (pure capture — parse → filter → persist)
+//! 9. Start axum API server (health, stats, portal)
+//! 10. Spawn token renewal background task
+//! 11. Await shutdown signal (Ctrl+C)
 
 use std::net::SocketAddr;
 
@@ -29,6 +30,7 @@ use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
 use dhan_live_trader_core::instrument::{build_fno_universe, build_subscription_plan};
+use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::types::InstrumentSubscription;
@@ -107,7 +109,13 @@ async fn main() -> Result<()> {
     );
 
     // -----------------------------------------------------------------------
-    // Step 3: Authenticate with Dhan API (best-effort for development)
+    // Step 3: Initialize notification service (best-effort — no-op if SSM unavailable)
+    // -----------------------------------------------------------------------
+    info!("initializing Telegram notification service");
+    let notifier = NotificationService::initialize(&config.notification).await;
+
+    // -----------------------------------------------------------------------
+    // Step 4: Authenticate with Dhan API (best-effort for development)
     // -----------------------------------------------------------------------
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 
@@ -115,6 +123,7 @@ async fn main() -> Result<()> {
         match TokenManager::initialize(&config.dhan, &config.token, &config.network).await {
             Ok(manager) => {
                 info!("authentication successful — token acquired");
+                notifier.notify(NotificationEvent::AuthenticationSuccess);
                 Some(manager)
             }
             Err(err) => {
@@ -122,12 +131,15 @@ async fn main() -> Result<()> {
                     error = %err,
                     "authentication failed — starting in offline mode (no live data)"
                 );
+                notifier.notify(NotificationEvent::AuthenticationFailed {
+                    reason: err.to_string(),
+                });
                 None
             }
         };
 
     // -----------------------------------------------------------------------
-    // Step 4: Set up QuestDB tick persistence (best-effort)
+    // Step 5: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!("setting up QuestDB tick persistence");
 
@@ -148,7 +160,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 5: Build F&O universe + subscription plan (best-effort)
+    // Step 6: Build F&O universe + subscription plan (best-effort)
     // -----------------------------------------------------------------------
     info!("building F&O universe from instrument CSV");
 
@@ -187,7 +199,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6: Build WebSocket connection pool (only if authenticated + plan ready)
+    // Step 7: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let (frame_receiver, ws_handles) =
         if let (Some(tm), Some(plan)) = (&token_manager, &subscription_plan) {
@@ -238,7 +250,7 @@ async fn main() -> Result<()> {
         };
 
     // -----------------------------------------------------------------------
-    // Step 7: Spawn tick processor (pure capture — parse → filter → persist)
+    // Step 8: Spawn tick processor (pure capture — parse → filter → persist)
     // -----------------------------------------------------------------------
     let processor_handle = if let Some(receiver) = frame_receiver {
         let handle = tokio::spawn(async move {
@@ -252,7 +264,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 8: Start axum API server
+    // Step 9: Start axum API server
     // -----------------------------------------------------------------------
     let api_state = SharedAppState::new(config.questdb.clone());
 
@@ -279,7 +291,7 @@ async fn main() -> Result<()> {
     });
 
     // -----------------------------------------------------------------------
-    // Step 9: Spawn token renewal background task (only if authenticated)
+    // Step 10: Spawn token renewal background task (only if authenticated)
     // -----------------------------------------------------------------------
     let renewal_handle = if let Some(ref tm) = token_manager {
         let handle = tm.spawn_renewal_task();
@@ -290,7 +302,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 10: Await shutdown signal
+    // Step 11: Await shutdown signal
     // -----------------------------------------------------------------------
     let mode = if token_manager.is_some() {
         "LIVE"
@@ -306,11 +318,14 @@ async fn main() -> Result<()> {
            Portal:  http://{bind_addr}/portal\n"
     );
 
+    notifier.notify(NotificationEvent::StartupComplete { mode });
+
     tokio::signal::ctrl_c()
         .await
         .context("failed to listen for shutdown signal")?;
 
     info!("shutdown signal received — stopping gracefully");
+    notifier.notify(NotificationEvent::ShutdownInitiated);
 
     // Cancel background tasks
     if let Some(handle) = renewal_handle {

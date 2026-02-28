@@ -21,7 +21,6 @@
 .idea/dynamic.xml
 .idea/sonarlint/
 .idea/copilot/
-*.iml
 .vscode/
 *.swp
 *.swo
@@ -37,9 +36,8 @@
 .env.*
 *.env
 
-# ---- Config overrides (dev-only, not committed) ----
+# ---- Config overrides (personal machine-specific, not committed) ----
 config/local-overrides.toml
-config/local.toml
 
 # ---- Docker volumes (if mounted locally) ----
 docker-data/

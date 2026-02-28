@@ -240,10 +240,26 @@ pub const SEBI_AUDIT_RETENTION_YEARS: u32 = 5;
 /// Base path for all secrets in SSM Parameter Store.
 pub const SSM_SECRET_BASE_PATH: &str = "/dlt";
 
+/// SSM service path segment for Dhan credentials.
+pub const SSM_DHAN_SERVICE: &str = "dhan";
+
 /// Dhan credentials secret names.
 pub const DHAN_CLIENT_ID_SECRET: &str = "client-id";
 pub const DHAN_CLIENT_SECRET_SECRET: &str = "client-secret";
 pub const DHAN_TOTP_SECRET: &str = "totp-secret";
+
+// ---------------------------------------------------------------------------
+// SSM Parameter Store — Telegram Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for Telegram bot credentials.
+pub const SSM_TELEGRAM_SERVICE: &str = "telegram";
+
+/// SSM key for Telegram bot token.
+pub const TELEGRAM_BOT_TOKEN_SECRET: &str = "bot-token";
+
+/// SSM key for Telegram chat ID.
+pub const TELEGRAM_CHAT_ID_SECRET: &str = "chat-id";
 
 // ---------------------------------------------------------------------------
 // Docker Container Naming
@@ -512,9 +528,6 @@ pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 /// Default environment name for SSM path construction.
 /// Overridden by `ENVIRONMENT` env var if present.
 pub const DEFAULT_SSM_ENVIRONMENT: &str = "dev";
-
-/// SSM service path segment for Dhan credentials.
-pub const SSM_DHAN_SERVICE: &str = "dhan";
 
 // ---------------------------------------------------------------------------
 // Authentication — Circuit Breaker

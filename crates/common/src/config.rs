@@ -26,6 +26,8 @@ pub struct ApplicationConfig {
     pub api: ApiConfig,
     #[serde(default)]
     pub subscription: SubscriptionConfig,
+    #[serde(default)]
+    pub notification: NotificationConfig,
 }
 
 /// Trading session timing configuration.
@@ -181,6 +183,27 @@ pub struct InstrumentConfig {
     pub csv_cache_filename: String,
     /// Download timeout in seconds (overrides network timeout for this large file).
     pub csv_download_timeout_secs: u64,
+}
+
+/// Notification (Telegram alert) configuration.
+///
+/// Secrets (bot token, chat ID) come from SSM — never in config.
+/// This struct holds non-secret settings only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotificationConfig {
+    /// Telegram Bot API base URL.
+    pub telegram_api_base_url: String,
+    /// HTTP send timeout in milliseconds for notification POSTs.
+    pub send_timeout_ms: u64,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            send_timeout_ms: 10_000,
+        }
+    }
 }
 
 /// Subscription planner configuration.
@@ -357,6 +380,11 @@ impl ApplicationConfig {
             bail!("websocket.reconnect_max_attempts must be > 0");
         }
 
+        // Notification: send timeout must be positive.
+        if self.notification.send_timeout_ms == 0 {
+            bail!("notification.send_timeout_ms must be > 0");
+        }
+
         Ok(())
     }
 }
@@ -447,6 +475,7 @@ mod tests {
                 port: 3001,
             },
             subscription: SubscriptionConfig::default(),
+            notification: NotificationConfig::default(),
         }
     }
 

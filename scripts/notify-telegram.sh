@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
+# =============================================================================
 # dhan-live-trader — Send Telegram notification
-#
-# Reads bot token + chat ID from AWS SSM Parameter Store.
-# Uses LocalStack in dev (AWS_ENDPOINT_URL set), real AWS in prod.
+# =============================================================================
+# Reads bot token + chat ID from real AWS SSM Parameter Store.
+# Telegram credentials ALWAYS come from real AWS SSM — never LocalStack.
 #
 # Usage:
-#   ./scripts/notify-telegram.sh "✅ Task completed: Block 03 done"
-#   ./scripts/notify-telegram.sh "⏳ Approval needed: deploy to staging?"
-#   ./scripts/notify-telegram.sh "🚨 Error: QuestDB write failed"
+#   ./scripts/notify-telegram.sh "Task completed: environment setup done"
+#   ./scripts/notify-telegram.sh "Error: QuestDB write failed"
+#
+# Prerequisites (one-time setup):
+#   aws ssm put-parameter --region ap-south-1 \
+#     --name "/dlt/dev/telegram/bot-token" \
+#     --value "YOUR_BOT_TOKEN" --type SecureString --overwrite
+#   aws ssm put-parameter --region ap-south-1 \
+#     --name "/dlt/dev/telegram/chat-id" \
+#     --value "YOUR_CHAT_ID" --type SecureString --overwrite
 #
 # Environment:
-#   AWS_ENDPOINT_URL  — set for LocalStack, unset for real AWS
-#   ENVIRONMENT       — "dev" (default) or "prod"
+#   ENVIRONMENT — "dev" (default) or "prod"
+# =============================================================================
 
 set -euo pipefail
 
@@ -24,38 +32,46 @@ SSM_BOT_TOKEN="/dlt/${ENV}/telegram/bot-token"
 SSM_CHAT_ID="/dlt/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
 
-# LocalStack dev credentials (real AWS uses IAM role — no creds needed)
-if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
-    export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
-    export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
-fi
+# Telegram ALWAYS uses real AWS SSM — never LocalStack.
+# Unset AWS_ENDPOINT_URL to ensure we hit real AWS.
+unset AWS_ENDPOINT_URL 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Validate input
 # ---------------------------------------------------------------------------
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <message>"
-    echo "Example: $0 '✅ Task completed: Block 03 done'"
+    echo "Example: $0 'Task completed: environment setup done'"
     exit 1
 fi
 
 MESSAGE="$1"
 
 # ---------------------------------------------------------------------------
-# Fetch secrets from SSM (LocalStack or real AWS — same CLI)
+# Check AWS CLI is available
 # ---------------------------------------------------------------------------
-SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value"
-
-BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN}" ${SSM_ARGS} 2>/dev/null)
-if [ -z "${BOT_TOKEN}" ]; then
-    echo "ERROR: Failed to fetch bot token from SSM (${SSM_BOT_TOKEN})"
-    exit 1
+if ! command -v aws > /dev/null 2>&1; then
+    echo "SKIP: aws CLI not found — Telegram notification not sent"
+    exit 0
 fi
 
-CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID}" ${SSM_ARGS} 2>/dev/null)
+# ---------------------------------------------------------------------------
+# Fetch secrets from real AWS SSM
+# ---------------------------------------------------------------------------
+SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value --no-cli-pager"
+
+BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN}" ${SSM_ARGS} 2>/dev/null) || true
+if [ -z "${BOT_TOKEN}" ]; then
+    echo "SKIP: Bot token not found in SSM (${SSM_BOT_TOKEN})"
+    echo "  Set it up: aws ssm put-parameter --region ${REGION} --name '${SSM_BOT_TOKEN}' --value 'YOUR_TOKEN' --type SecureString --overwrite"
+    exit 0
+fi
+
+CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID}" ${SSM_ARGS} 2>/dev/null) || true
 if [ -z "${CHAT_ID}" ]; then
-    echo "ERROR: Failed to fetch chat ID from SSM (${SSM_CHAT_ID})"
-    exit 1
+    echo "SKIP: Chat ID not found in SSM (${SSM_CHAT_ID})"
+    echo "  Set it up: aws ssm put-parameter --region ${REGION} --name '${SSM_CHAT_ID}' --value 'YOUR_CHAT_ID' --type SecureString --overwrite"
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------

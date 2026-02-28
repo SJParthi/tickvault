@@ -15,6 +15,7 @@
 
 pub mod auth;
 pub mod instrument;
+pub mod notification;
 pub mod parser;
 pub mod pipeline;
 pub mod websocket;

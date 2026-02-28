@@ -23,11 +23,11 @@ use super::types::DhanCredentials;
 
 /// Constructs the full SSM parameter path.
 ///
-/// Format: `/dlt/<environment>/dhan/<secret_name>`
-fn build_ssm_path(environment: &str, secret_name: &str) -> String {
+/// Format: `/dlt/<environment>/<service>/<secret_name>`
+pub(crate) fn build_ssm_path(environment: &str, service: &str, secret_name: &str) -> String {
     format!(
         "{}/{}/{}/{}",
-        SSM_SECRET_BASE_PATH, environment, SSM_DHAN_SERVICE, secret_name
+        SSM_SECRET_BASE_PATH, environment, service, secret_name
     )
 }
 
@@ -57,7 +57,7 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
 ///
 /// If `AWS_ENDPOINT_URL` is set, uses that as the SSM endpoint (LocalStack).
 /// Otherwise, uses default AWS SDK configuration (real AWS SSM).
-async fn create_ssm_client() -> SsmClient {
+pub(crate) async fn create_ssm_client() -> SsmClient {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new("ap-south-1"))
         .load()
@@ -73,7 +73,7 @@ async fn create_ssm_client() -> SsmClient {
 /// Fetches a single secret value from SSM Parameter Store.
 ///
 /// Returns the raw string value wrapped in `SecretString`.
-async fn fetch_secret(
+pub(crate) async fn fetch_secret(
     ssm_client: &SsmClient,
     path: &str,
 ) -> Result<SecretString, ApplicationError> {
@@ -125,9 +125,10 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
 
     let ssm_client = create_ssm_client().await;
 
-    let client_id_path = build_ssm_path(&environment, DHAN_CLIENT_ID_SECRET);
-    let client_secret_path = build_ssm_path(&environment, DHAN_CLIENT_SECRET_SECRET);
-    let totp_secret_path = build_ssm_path(&environment, DHAN_TOTP_SECRET);
+    let client_id_path = build_ssm_path(&environment, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
+    let client_secret_path =
+        build_ssm_path(&environment, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET);
+    let totp_secret_path = build_ssm_path(&environment, SSM_DHAN_SERVICE, DHAN_TOTP_SECRET);
 
     info!(
         client_id_path = %client_id_path,
@@ -162,19 +163,19 @@ mod tests {
 
     #[test]
     fn test_build_ssm_path_dev() {
-        let path = build_ssm_path("dev", DHAN_CLIENT_ID_SECRET);
+        let path = build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
         assert_eq!(path, "/dlt/dev/dhan/client-id");
     }
 
     #[test]
     fn test_build_ssm_path_prod() {
-        let path = build_ssm_path("prod", DHAN_CLIENT_SECRET_SECRET);
+        let path = build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET);
         assert_eq!(path, "/dlt/prod/dhan/client-secret");
     }
 
     #[test]
     fn test_build_ssm_path_totp() {
-        let path = build_ssm_path("dev", DHAN_TOTP_SECRET);
+        let path = build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET);
         assert_eq!(path, "/dlt/dev/dhan/totp-secret");
     }
 
@@ -284,15 +285,15 @@ mod tests {
     #[test]
     fn test_build_ssm_path_all_secret_types_dev() {
         assert_eq!(
-            build_ssm_path("dev", DHAN_CLIENT_ID_SECRET),
+            build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
             "/dlt/dev/dhan/client-id"
         );
         assert_eq!(
-            build_ssm_path("dev", DHAN_CLIENT_SECRET_SECRET),
+            build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
             "/dlt/dev/dhan/client-secret"
         );
         assert_eq!(
-            build_ssm_path("dev", DHAN_TOTP_SECRET),
+            build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
             "/dlt/dev/dhan/totp-secret"
         );
     }
@@ -300,15 +301,15 @@ mod tests {
     #[test]
     fn test_build_ssm_path_all_secret_types_prod() {
         assert_eq!(
-            build_ssm_path("prod", DHAN_CLIENT_ID_SECRET),
+            build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
             "/dlt/prod/dhan/client-id"
         );
         assert_eq!(
-            build_ssm_path("prod", DHAN_CLIENT_SECRET_SECRET),
+            build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
             "/dlt/prod/dhan/client-secret"
         );
         assert_eq!(
-            build_ssm_path("prod", DHAN_TOTP_SECRET),
+            build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
             "/dlt/prod/dhan/totp-secret"
         );
     }
