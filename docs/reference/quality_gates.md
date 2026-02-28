@@ -77,3 +77,22 @@ Any stage fails = build is RED. No exceptions.
 | REST API round-trip | 5-50ms | core |
 
 >5% regression = automatic build failure. Benchmarks run with `--release` + `criterion::black_box`.
+
+## Gate 5: Pre-Deployment
+
+All CI green + Docker image builds (<15MB scratch) + health checks pass + smoke test (1 tick end-to-end) + Parthiban approves.
+
+## Gate 5b: Release Checklist
+
+Full checklist: `docs/templates/release_checklist.md` (read ONLY at release time).
+
+## Gate 6: Runtime Monitoring — Post-Deployment
+
+After deployment, verify:
+
+1. All Grafana dashboards showing data — no gaps, no stale panels
+2. Prometheus scrape targets all UP — zero down targets
+3. Jaeger traces flowing — spans visible for tick processing
+4. Loki logs streaming — application logs arriving via Alloy
+5. Telegram test alert fires — confirm alerting pipeline works
+6. Tick latency within budget — <10ns parse, <10μs processing confirmed in metrics
