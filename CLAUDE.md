@@ -70,6 +70,10 @@ cargo update                       → Bible updates only
 - No filler phrases. No repeating rules back. No essays.
 - Bible: read ONLY when adding deps. PDFs: NEVER. Reference docs: ONLY when implementing that topic.
 
+## COMPACTION
+
+When compacting, always preserve: (1) list of all modified files (2) test/build results (3) current phase progress (4) unresolved errors or blockers (5) the three principles.
+
 ## CURRENT CONTEXT
 
 **Phase:** Phase 1 — Environment Readiness → `docs/phases/PHASE_1_ENVIRONMENT.md`

@@ -1,4 +1,10 @@
 {
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "high",
+    "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE": "85",
+    "BASH_DEFAULT_TIMEOUT_MS": "300000",
+    "BASH_MAX_TIMEOUT_MS": "600000"
+  },
   "permissions": {
     "allow": [
       "Read",
@@ -41,7 +47,12 @@
       "Bash(ls *)",
       "Bash(ls)",
       "Bash(wc *)",
-      "Bash(mkdir *)"
+      "Bash(mkdir *)",
+      "Bash(rustfmt *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(find *)"
     ],
     "deny": [
       "Bash(cargo update *)",
@@ -50,7 +61,8 @@
       "Bash(sudo *)",
       "Bash(brew *)",
       "Bash(git push --force *)",
-      "Bash(git reset --hard *)"
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)"
     ]
   },
   "hooks": {
@@ -84,9 +96,8 @@
       {
         "hooks": [
           {
-            "type": "prompt",
-            "model": "opus",
-            "prompt": "Check if the user's task is complete. Verify: (1) Were all requested changes made? (2) If Rust code was modified, did cargo check/test/clippy pass? (3) Are there any TODO items still in_progress? If anything is incomplete, respond with {\"ok\": false, \"reason\": \"what remains to be done\"}. If everything looks done, respond with {\"ok\": true}."
+            "type": "command",
+            "command": "INPUT=$(cat); ACTIVE=$(echo \"$INPUT\" | jq -r '.stop_hook_active // false'); if [ \"$ACTIVE\" = \"true\" ]; then exit 0; fi; LAST_MSG=$(echo \"$INPUT\" | jq -r '.last_assistant_message // empty'); if echo \"$LAST_MSG\" | grep -qi 'todo\\|in.progress\\|not yet\\|still need\\|remaining'; then echo 'Stop hook: detected incomplete work indicators in last message' >&2; exit 2; fi; exit 0"
           }
         ]
       }
@@ -97,7 +108,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'COMPACTION REMINDER: Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. Run cargo fmt + clippy + test before committing. Check current phase doc for context.'"
+            "command": "echo 'COMPACTION REMINDER: Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. Run cargo fmt + clippy + test before committing. Banned: .clone()/DashMap/dyn on hot path, cargo update, .env files, localhost, hardcoded values, println!/unwrap in prod. Check current phase doc for context.'"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'SUBAGENT CONTEXT: dhan-live-trader is a Rust 2024 O(1) latency trading system. Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. No .clone()/DashMap/dyn on hot path. Use papaya, enum_dispatch, zerocopy. All versions from Tech Stack Bible V6 only.'"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'PRE-COMPACTION: Preserve in summary: (1) current phase and what was built (2) list of all modified files (3) any failing tests or unresolved errors (4) the three principles (5) cargo/git commands that were run and their results'"
           }
         ]
       }
