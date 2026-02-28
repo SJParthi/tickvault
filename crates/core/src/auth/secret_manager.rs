@@ -1,8 +1,8 @@
 //! AWS SSM Parameter Store credential retrieval.
 //!
 //! Fetches Dhan API credentials (client-id, client-secret, totp-secret)
-//! from SSM. Uses LocalStack in dev, real AWS SSM in prod — same code path.
-//! The ONLY difference: `AWS_ENDPOINT_URL` env var for LocalStack.
+//! and Telegram tokens from real AWS SSM (ap-south-1). Same code path
+//! in dev and prod — secrets are managed via AWS Console.
 
 use aws_config::Region;
 use aws_sdk_ssm::Client as SsmClient;
@@ -53,10 +53,10 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
 // SSM Client Initialization
 // ---------------------------------------------------------------------------
 
-/// Creates an AWS SSM client with automatic endpoint detection.
+/// Creates an AWS SSM client targeting real AWS SSM (ap-south-1).
 ///
-/// If `AWS_ENDPOINT_URL` is set, uses that as the SSM endpoint (LocalStack).
-/// Otherwise, uses default AWS SDK configuration (real AWS SSM).
+/// Uses default AWS SDK configuration — reads credentials from
+/// `~/.aws/credentials` (dev Mac) or IAM role (prod AWS).
 pub(crate) async fn create_ssm_client() -> SsmClient {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new("ap-south-1"))

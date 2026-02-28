@@ -16,9 +16,7 @@
 #   4. Starts Docker infrastructure (9 services) — fails fast if Docker not running
 #   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana, LocalStack)
 #   6. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
-#   7. Automated secret setup — zero interactive input:
-#        - Dhan credentials → LocalStack SSM (env vars or placeholders)
-#        - Telegram tokens → LocalStack SSM + Real AWS SSM (env vars or placeholders)
+#   7. Verifies secrets in real AWS SSM + sends test Telegram notification
 #   8. Verifies cargo check + cargo test
 #
 # After this: open IntelliJ and start working. Zero manual config.
@@ -167,8 +165,8 @@ TICKS_DDL="CREATE TABLE IF NOT EXISTS ticks (segment SYMBOL, security_id LONG, l
 init_questdb_table "ticks" "${TICKS_DDL}"
 echo ""
 
-# ---- Step 7: Automated Secret Setup (Dhan + Telegram → LocalStack, Telegram → Real AWS) ----
-echo -e "${CYAN}[7/8]${NC} Setting up secrets..."
+# ---- Step 7: Verify Secrets in Real AWS SSM ----
+echo -e "${CYAN}[7/8]${NC} Verifying secrets in AWS SSM..."
 if [ -f "scripts/setup-secrets.sh" ]; then
     bash scripts/setup-secrets.sh
 else
