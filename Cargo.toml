@@ -8,11 +8,7 @@ rust-version = "1.93.1"
 license = "MIT"
 
 [workspace.dependencies]
-# ===========================================================================
-# ALL versions from Tech Stack Bible V6 — SINGLE SOURCE OF TRUTH
-# Crates inherit via { workspace = true } — no version in crate-level Cargo.toml
-# cargo update is BANNED — versions change ONLY via Bible updates
-# ===========================================================================
+# Versions from Tech Stack Bible V6. See CLAUDE.md §CARGO & VERSIONS for rules.
 
 # ---- Section 2: Backend Core — Async Runtime ----
 tokio = { version = "1.49.0", features = ["full"] }
@@ -134,9 +130,7 @@ loom = "0.7.2"
 dhat = "0.3.3"
 tokio-test = "0.4.4"
 
-# ===========================================================================
-# Build Profiles — Security-Hardened Release
-# ===========================================================================
+# Build Profiles
 
 [profile.release]
 overflow-checks = true    # Integer overflow = panic (not silent wrap) — critical for financial math

@@ -973,9 +973,7 @@ Invalid transitions → log ERROR, trigger alert, reconciliation check
 
 ## 11. O(1) Component Scoring
 
-### What This Section Defines
-
-Every component in the system is scored for O(1) compliance. Score determines whether the component is on the hot path (must be O(1)) or cold path (can be O(n) with bounds).
+> Core O(1) principles in CLAUDE.md §Principle 6. This section provides Phase 1 scoring specifics.
 
 ### Scoring Matrix
 
@@ -1043,9 +1041,7 @@ app → api → trading → core → storage → common
 
 ## 13. Docker-First Stack
 
-### Container Architecture
-
-All infrastructure runs in Docker containers. The Rust application also runs in a Docker container for production. During local development, the Rust app can run natively while infrastructure is in Docker.
+> Core Docker principles in CLAUDE.md §Principle 1. This section provides Phase 1 container specifics.
 
 ### Docker Compose Services
 
@@ -1063,25 +1059,11 @@ All infrastructure runs in Docker containers. The Rust application also runs in 
 
 ### Health Check Strategy
 
-Every container has a health check. The Rust application waits for ALL infrastructure to be healthy before starting operations.
-
-```yaml
-healthcheck:
-  test: ["CMD", "appropriate-health-check-command"]
-  interval: 10s
-  timeout: 5s
-  retries: 5
-  start_period: 30s
-```
+Every container has a health check. The app waits for ALL infrastructure to be healthy before starting.
 
 ### Docker DNS
 
-All inter-container communication uses Docker DNS hostnames:
-- `dlt-questdb:9009` (not `localhost:9009`)
-- `dlt-valkey:6379` (not `localhost:6379`)
-- `dlt-localstack:4566` (not `localhost:4566`)
-
-Config TOML contains these hostnames. Application code never references `localhost`.
+All inter-container communication uses Docker DNS hostnames (see CLAUDE.md §Principle 1). Config TOML contains these hostnames — never `localhost`.
 
 ---
 
