@@ -76,9 +76,7 @@ dhan-live-trader/
 │   │   └── static/
 │   │       └── portal.html            # DLT Control Panel — nav dashboard with live status + stats
 │   └── app/
-│       ├── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → Universe → Subscription → WS → Parse → Persist → HTTP
-│       └── examples/
-│           └── persist_snapshot.rs      # Integration example: CSV → Universe → QuestDB
+│       └── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → Universe → Subscription → WS → Parse → Persist → HTTP
 ├── deploy/docker/
 │   ├── docker-compose.yml              # 9 services, all SHA256-pinned, health-checked
 │   ├── prometheus/prometheus.yml       # Scrape targets: app:9091, questdb:9003

@@ -69,7 +69,7 @@ impl NotificationService {
     ///
     /// If SSM is unavailable (no IAM role, tokens not in SSM, etc.), returns
     /// a no-op service. The caller is never blocked and boot continues normally.
-    /// In dev: Telegram tokens are NOT in LocalStack → no-op mode.
+    /// In dev: Telegram tokens in LocalStack SSM → active mode (if real tokens seeded).
     /// In prod: Telegram tokens in real AWS SSM → active mode.
     ///
     /// # Arguments

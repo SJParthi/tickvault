@@ -2,15 +2,20 @@
 # =============================================================================
 # dhan-live-trader — Seed LocalStack SSM Parameter Store
 # =============================================================================
-# Populates SSM Parameter Store in LocalStack with Dhan API credentials for
-# offline development. Telegram tokens are NOT seeded here — they always come
-# from real AWS SSM (no placeholders, no fake data).
+# Populates SSM Parameter Store in LocalStack with ALL credentials for
+# offline development: Dhan API credentials AND Telegram tokens.
 #
 # Secret path convention: /dlt/<environment>/<service>/<key>
 #
-# IMPORTANT: Replace the Dhan credential values below with your real
-# credentials before running. These are SSM paths only — the actual secrets
-# are entered by the developer.
+# Usage (with env vars):
+#   export DHAN_CLIENT_ID="your-real-client-id"
+#   export DHAN_CLIENT_SECRET="your-real-jwt-token"
+#   export DHAN_TOTP_SECRET="your-real-totp-secret"
+#   export TELEGRAM_BOT_TOKEN="your-bot-token-from-botfather"
+#   export TELEGRAM_CHAT_ID="your-chat-id-from-userinfobot"
+#   ./scripts/seed-localstack-secrets.sh
+#
+# Without env vars: seeds placeholder values. App boots in degraded mode.
 # =============================================================================
 
 set -euo pipefail
@@ -18,6 +23,7 @@ set -euo pipefail
 LOCALSTACK_URL="http://localhost:4566"
 REGION="ap-south-1"
 ENVIRONMENT="dev"
+PLACEHOLDER="PLACEHOLDER_REPLACE_ME"
 
 # LocalStack accepts any credentials — these are required by the AWS CLI
 export AWS_ACCESS_KEY_ID="test"
@@ -49,47 +55,37 @@ put_secret() {
 # ---------------------------------------------------------------------------
 # Dhan API Credentials
 # ---------------------------------------------------------------------------
-# Set these environment variables before running, or the script will prompt.
-# Example:
-#   export DHAN_CLIENT_ID="your-real-client-id"
-#   export DHAN_CLIENT_SECRET="your-real-jwt-token"
-#   export DHAN_TOTP_SECRET="your-real-totp-secret"
-#   ./scripts/seed-localstack-secrets.sh
-# ---------------------------------------------------------------------------
 echo "--- Dhan Credentials ---"
 
-if [ -z "${DHAN_CLIENT_ID:-}" ]; then
-    echo -e "\n  DHAN_CLIENT_ID not set. Set it before running:"
-    echo "    export DHAN_CLIENT_ID=\"your-real-client-id\""
-    echo "    export DHAN_CLIENT_SECRET=\"your-real-jwt-token\""
-    echo "    export DHAN_TOTP_SECRET=\"your-real-totp-secret\""
-    echo ""
-    exit 1
+DHAN_CID="${DHAN_CLIENT_ID:-${PLACEHOLDER}}"
+DHAN_CS="${DHAN_CLIENT_SECRET:-${PLACEHOLDER}}"
+DHAN_TS="${DHAN_TOTP_SECRET:-${PLACEHOLDER}}"
+
+if [ "${DHAN_CID}" = "${PLACEHOLDER}" ]; then
+    echo "  No DHAN_CLIENT_ID env var — seeding placeholders"
+    echo "  Set env vars and re-run to replace with real credentials"
 fi
 
-put_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "${DHAN_CLIENT_ID}"
-put_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "${DHAN_CLIENT_SECRET}"
-put_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "${DHAN_TOTP_SECRET}"
+put_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "${DHAN_CID}"
+put_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "${DHAN_CS}"
+put_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "${DHAN_TS}"
 
 # ---------------------------------------------------------------------------
-# Telegram — NOT seeded in LocalStack
-# ---------------------------------------------------------------------------
-# Telegram bot token and chat ID always come from real AWS SSM.
-# To set them up (one-time):
-#   aws ssm put-parameter --region ap-south-1 \
-#     --name "/dlt/dev/telegram/bot-token" \
-#     --value "YOUR_REAL_BOT_TOKEN" \
-#     --type SecureString --overwrite
-#
-#   aws ssm put-parameter --region ap-south-1 \
-#     --name "/dlt/dev/telegram/chat-id" \
-#     --value "YOUR_REAL_CHAT_ID" \
-#     --type SecureString --overwrite
+# Telegram Tokens
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Telegram ---"
-echo "  [SKIP] Telegram tokens use real AWS SSM (not LocalStack)"
-echo "  Run 'aws ssm put-parameter' to set /dlt/dev/telegram/bot-token and chat-id"
+echo "--- Telegram Tokens ---"
+
+TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${PLACEHOLDER}}"
+TG_CHAT="${TELEGRAM_CHAT_ID:-${PLACEHOLDER}}"
+
+if [ "${TG_TOKEN}" = "${PLACEHOLDER}" ]; then
+    echo "  No TELEGRAM_BOT_TOKEN env var — seeding placeholders"
+    echo "  Set env vars and re-run to replace with real tokens"
+fi
+
+put_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "${TG_TOKEN}"
+put_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "${TG_CHAT}"
 
 # ---------------------------------------------------------------------------
 # Verification

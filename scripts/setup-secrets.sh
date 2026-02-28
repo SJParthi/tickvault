@@ -1,26 +1,34 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Automated Secret Setup
+# dhan-live-trader — Automated Secret Setup (Zero Interactive Input)
 # =============================================================================
-# ONE-TIME fully automated secret provisioning. Run by bootstrap.sh.
-# Handles BOTH LocalStack (Dhan dev creds) AND real AWS SSM (Telegram).
+# Fully automated secret provisioning. Run by bootstrap.sh.
+# ZERO prompts — uses environment variables or seeds placeholders.
 #
 # What it does:
-#   1. Checks if AWS CLI is installed (installs via pip if missing)
-#   2. Checks if AWS credentials are configured (runs 'aws configure' if not)
-#   3. Seeds Dhan credentials into LocalStack SSM (prompts if not set)
-#   4. Seeds Telegram tokens into real AWS SSM (prompts if not already stored)
-#   5. Verifies everything works
+#   1. Ensures AWS CLI is installed (auto-installs via pip if missing)
+#   2. Seeds Dhan credentials into LocalStack SSM
+#   3. Seeds Telegram tokens into LocalStack SSM (so Rust app can read them)
+#   4. Optionally stores Telegram tokens in real AWS SSM (for notify-telegram.sh)
+#   5. Sends test notification if real Telegram tokens are available
 #
-# After first run: all secrets are in SSM. Every subsequent bootstrap/session
-# just reads from SSM — zero manual configuration ever again.
+# To provide real credentials, set env vars BEFORE running bootstrap:
+#   export DHAN_CLIENT_ID="your-real-client-id"
+#   export DHAN_CLIENT_SECRET="your-real-jwt-token"
+#   export DHAN_TOTP_SECRET="your-real-totp-secret"
+#   export TELEGRAM_BOT_TOKEN="your-bot-token-from-botfather"
+#   export TELEGRAM_CHAT_ID="your-chat-id-from-userinfobot"
+#   ./scripts/bootstrap.sh
+#
+# Without env vars: placeholders are seeded. App boots in degraded mode.
+# Run again with env vars set to replace placeholders with real values.
 #
 # Secret paths:
 #   /dlt/dev/dhan/client-id          → LocalStack SSM
 #   /dlt/dev/dhan/client-secret      → LocalStack SSM
 #   /dlt/dev/dhan/totp-secret        → LocalStack SSM
-#   /dlt/dev/telegram/bot-token      → Real AWS SSM
-#   /dlt/dev/telegram/chat-id        → Real AWS SSM
+#   /dlt/dev/telegram/bot-token      → LocalStack SSM + Real AWS SSM
+#   /dlt/dev/telegram/chat-id        → LocalStack SSM + Real AWS SSM
 # =============================================================================
 
 set -euo pipefail
@@ -34,6 +42,7 @@ NC='\033[0m'
 REGION="ap-south-1"
 ENVIRONMENT="dev"
 LOCALSTACK_URL="http://localhost:4566"
+PLACEHOLDER="PLACEHOLDER_REPLACE_ME"
 
 # ---------------------------------------------------------------------------
 # Helper: put a secret into SSM (LocalStack or real AWS)
@@ -86,19 +95,8 @@ ssm_secret_exists() {
         > /dev/null 2>&1
 }
 
-# ---------------------------------------------------------------------------
-# Helper: prompt for a secret value (hides input)
-# ---------------------------------------------------------------------------
-prompt_secret() {
-    local prompt_text="$1"
-    local result=""
-    echo -ne "  ${CYAN}${prompt_text}:${NC} "
-    read -r result
-    echo "${result}"
-}
-
 echo ""
-echo -e "${CYAN}--- Secret Setup ---${NC}"
+echo -e "${CYAN}--- Secret Setup (fully automated) ---${NC}"
 echo ""
 
 # ---- Step 1: AWS CLI ----
@@ -115,121 +113,91 @@ else
         exit 1
     fi
 fi
-
-# ---- Step 2: AWS Credentials (for real AWS SSM) ----
-echo -n "  Checking AWS credentials... "
-if aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
-    ACCOUNT=$(aws sts get-caller-identity --region "${REGION}" --query Account --output text 2>/dev/null)
-    echo -e "${GREEN}configured${NC} (account: ${ACCOUNT})"
-else
-    echo -e "${YELLOW}not configured${NC}"
-    echo ""
-    echo -e "  ${CYAN}AWS credentials are needed for Telegram notifications (real AWS SSM).${NC}"
-    echo -e "  ${CYAN}Running 'aws configure' — enter your AWS Access Key, Secret Key, region (ap-south-1):${NC}"
-    echo ""
-    aws configure --region "${REGION}"
-    echo ""
-    if aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
-        echo -e "  ${GREEN}AWS credentials configured successfully${NC}"
-    else
-        echo -e "  ${YELLOW}AWS credentials not configured — Telegram will be in no-op mode${NC}"
-        echo -e "  ${YELLOW}(You can run 'aws configure' later and re-run bootstrap)${NC}"
-    fi
-fi
 echo ""
 
-# ---- Step 3: Dhan Credentials → LocalStack SSM ----
+# ---- Step 2: Dhan Credentials → LocalStack SSM ----
 echo -e "${CYAN}--- Dhan Credentials (LocalStack SSM) ---${NC}"
 
-DHAN_NEEDS_SEED=false
 if ssm_secret_exists "/dlt/${ENVIRONMENT}/dhan/client-id" "localstack" 2>/dev/null; then
-    echo -e "  ${GREEN}Dhan credentials already in LocalStack${NC}"
+    echo -e "  ${GREEN}Dhan credentials already in LocalStack — no action needed${NC}"
 else
-    DHAN_NEEDS_SEED=true
-fi
+    DHAN_CID="${DHAN_CLIENT_ID:-${PLACEHOLDER}}"
+    DHAN_CS="${DHAN_CLIENT_SECRET:-${PLACEHOLDER}}"
+    DHAN_TS="${DHAN_TOTP_SECRET:-${PLACEHOLDER}}"
 
-if [ "${DHAN_NEEDS_SEED}" = true ]; then
-    echo -e "  Dhan credentials not found in LocalStack. Enter them now:"
-    echo ""
-
-    if [ -n "${DHAN_CLIENT_ID:-}" ]; then
-        echo -e "  ${GREEN}Using DHAN_CLIENT_ID from environment${NC}"
+    if [ "${DHAN_CID}" = "${PLACEHOLDER}" ]; then
+        echo -e "  ${YELLOW}No DHAN_CLIENT_ID env var — seeding placeholders${NC}"
+        echo -e "  ${YELLOW}To set real credentials later:${NC}"
+        echo -e "  ${YELLOW}  export DHAN_CLIENT_ID=\"your-id\" DHAN_CLIENT_SECRET=\"your-jwt\" DHAN_TOTP_SECRET=\"your-totp\"${NC}"
+        echo -e "  ${YELLOW}  ./scripts/setup-secrets.sh${NC}"
     else
-        DHAN_CLIENT_ID=$(prompt_secret "Dhan Client ID")
+        echo -e "  ${GREEN}Using Dhan credentials from environment variables${NC}"
     fi
 
-    if [ -n "${DHAN_CLIENT_SECRET:-}" ]; then
-        echo -e "  ${GREEN}Using DHAN_CLIENT_SECRET from environment${NC}"
-    else
-        DHAN_CLIENT_SECRET=$(prompt_secret "Dhan Access Token (JWT)")
-    fi
-
-    if [ -n "${DHAN_TOTP_SECRET:-}" ]; then
-        echo -e "  ${GREEN}Using DHAN_TOTP_SECRET from environment${NC}"
-    else
-        DHAN_TOTP_SECRET=$(prompt_secret "Dhan TOTP Secret")
-    fi
-
-    echo ""
-    put_ssm_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "${DHAN_CLIENT_ID}" "localstack"
-    put_ssm_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "${DHAN_CLIENT_SECRET}" "localstack"
-    put_ssm_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "${DHAN_TOTP_SECRET}" "localstack"
+    put_ssm_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "${DHAN_CID}" "localstack"
+    put_ssm_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "${DHAN_CS}" "localstack"
+    put_ssm_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "${DHAN_TS}" "localstack"
 fi
 echo ""
 
-# ---- Step 4: Telegram Tokens → Real AWS SSM ----
-echo -e "${CYAN}--- Telegram Notifications (Real AWS SSM) ---${NC}"
+# ---- Step 3: Telegram Tokens → LocalStack SSM (so Rust app can read them) ----
+echo -e "${CYAN}--- Telegram Tokens (LocalStack SSM) ---${NC}"
 
-# Check if AWS credentials work before attempting real SSM
-if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
-    echo -e "  ${YELLOW}AWS credentials not configured — skipping Telegram setup${NC}"
-    echo -e "  ${YELLOW}Run 'aws configure' and re-run bootstrap to enable Telegram${NC}"
-    echo ""
-    echo -e "${GREEN}Secret setup complete (Telegram deferred).${NC}"
-    exit 0
-fi
-
-TELEGRAM_NEEDS_SEED=false
-if ssm_secret_exists "/dlt/${ENVIRONMENT}/telegram/bot-token" "aws" 2>/dev/null; then
-    echo -e "  ${GREEN}Telegram tokens already in AWS SSM — no action needed${NC}"
+if ssm_secret_exists "/dlt/${ENVIRONMENT}/telegram/bot-token" "localstack" 2>/dev/null; then
+    echo -e "  ${GREEN}Telegram tokens already in LocalStack — no action needed${NC}"
 else
-    TELEGRAM_NEEDS_SEED=true
+    TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${PLACEHOLDER}}"
+    TG_CHAT="${TELEGRAM_CHAT_ID:-${PLACEHOLDER}}"
+
+    if [ "${TG_TOKEN}" = "${PLACEHOLDER}" ]; then
+        echo -e "  ${YELLOW}No TELEGRAM_BOT_TOKEN env var — seeding placeholders${NC}"
+        echo -e "  ${YELLOW}To set real Telegram tokens later:${NC}"
+        echo -e "  ${YELLOW}  export TELEGRAM_BOT_TOKEN=\"your-token\" TELEGRAM_CHAT_ID=\"your-chat-id\"${NC}"
+        echo -e "  ${YELLOW}  ./scripts/setup-secrets.sh${NC}"
+    else
+        echo -e "  ${GREEN}Using Telegram tokens from environment variables${NC}"
+    fi
+
+    put_ssm_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "${TG_TOKEN}" "localstack"
+    put_ssm_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "${TG_CHAT}" "localstack"
 fi
+echo ""
 
-if [ "${TELEGRAM_NEEDS_SEED}" = true ]; then
-    echo -e "  Telegram tokens not found in AWS SSM. Enter them now:"
-    echo -e "  (Get bot token from @BotFather on Telegram, chat ID from @userinfobot)"
-    echo ""
+# ---- Step 4: Telegram Tokens → Real AWS SSM (optional, for notify-telegram.sh) ----
+echo -e "${CYAN}--- Telegram Tokens (Real AWS SSM — optional) ---${NC}"
 
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-        echo -e "  ${GREEN}Using TELEGRAM_BOT_TOKEN from environment${NC}"
+TG_TOKEN_VALUE="${TELEGRAM_BOT_TOKEN:-${PLACEHOLDER}}"
+TG_CHAT_VALUE="${TELEGRAM_CHAT_ID:-${PLACEHOLDER}}"
+
+if [ "${TG_TOKEN_VALUE}" = "${PLACEHOLDER}" ]; then
+    echo -e "  ${YELLOW}Skipping real AWS — no real Telegram tokens available${NC}"
+elif ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
+    echo -e "  ${YELLOW}AWS credentials not configured — skipping real AWS SSM${NC}"
+    echo -e "  ${YELLOW}Run 'aws configure' to enable notify-telegram.sh from CLI${NC}"
+else
+    ACCOUNT=$(aws sts get-caller-identity --region "${REGION}" --query Account --output text 2>/dev/null)
+    echo -e "  ${GREEN}AWS credentials configured${NC} (account: ${ACCOUNT})"
+
+    if ssm_secret_exists "/dlt/${ENVIRONMENT}/telegram/bot-token" "aws" 2>/dev/null; then
+        echo -e "  ${GREEN}Telegram tokens already in real AWS SSM — no action needed${NC}"
     else
-        TELEGRAM_BOT_TOKEN=$(prompt_secret "Telegram Bot Token")
+        put_ssm_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "${TG_TOKEN_VALUE}" "aws"
+        put_ssm_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "${TG_CHAT_VALUE}" "aws"
     fi
 
-    if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        echo -e "  ${GREEN}Using TELEGRAM_CHAT_ID from environment${NC}"
-    else
-        TELEGRAM_CHAT_ID=$(prompt_secret "Telegram Chat ID")
-    fi
-
-    echo ""
-    put_ssm_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "${TELEGRAM_BOT_TOKEN}" "aws"
-    put_ssm_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "${TELEGRAM_CHAT_ID}" "aws"
-
-    # Verify Telegram works by sending a test message
+    # Send test notification
     echo ""
     echo -n "  Sending test notification... "
-    RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN_VALUE}/sendMessage" \
         -H "Content-Type: application/json" \
-        -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"dhan-live-trader: Bootstrap complete. Telegram notifications active.\", \"parse_mode\": \"HTML\"}" 2>/dev/null)
+        -d "{\"chat_id\": \"${TG_CHAT_VALUE}\", \"text\": \"dhan-live-trader: Bootstrap complete. Telegram notifications active.\", \"parse_mode\": \"HTML\"}" 2>/dev/null)
 
     OK=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
 
     if [ "${OK}" = "True" ]; then
         echo -e "${GREEN}sent! Check your Telegram.${NC}"
     else
-        echo -e "${YELLOW}failed (check token/chat ID)${NC}"
+        echo -e "${YELLOW}failed (check token/chat ID — notifications will retry at app startup)${NC}"
     fi
 fi
 echo ""
@@ -246,10 +214,12 @@ LOCALSTACK_COUNT=$(aws ssm describe-parameters \
 echo "  LocalStack SSM: ${LOCALSTACK_COUNT} parameters"
 
 AWS_TG_STATUS="not configured"
-if ssm_secret_exists "/dlt/${ENVIRONMENT}/telegram/bot-token" "aws" 2>/dev/null; then
-    AWS_TG_STATUS="configured"
+if aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
+    if ssm_secret_exists "/dlt/${ENVIRONMENT}/telegram/bot-token" "aws" 2>/dev/null; then
+        AWS_TG_STATUS="configured"
+    fi
 fi
-echo "  AWS SSM Telegram: ${AWS_TG_STATUS}"
+echo "  Real AWS SSM Telegram: ${AWS_TG_STATUS}"
 
 echo ""
 echo -e "${GREEN}Secret setup complete.${NC}"
