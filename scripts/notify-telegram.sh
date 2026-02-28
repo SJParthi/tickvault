@@ -9,13 +9,7 @@
 #   ./scripts/notify-telegram.sh "Task completed: environment setup done"
 #   ./scripts/notify-telegram.sh "Error: QuestDB write failed"
 #
-# Prerequisites (one-time setup):
-#   aws ssm put-parameter --region ap-south-1 \
-#     --name "/dlt/dev/telegram/bot-token" \
-#     --value "YOUR_BOT_TOKEN" --type SecureString --overwrite
-#   aws ssm put-parameter --region ap-south-1 \
-#     --name "/dlt/dev/telegram/chat-id" \
-#     --value "YOUR_CHAT_ID" --type SecureString --overwrite
+# Prerequisites: Run bootstrap.sh once — it handles all secret setup automatically.
 #
 # Environment:
 #   ENVIRONMENT — "dev" (default) or "prod"
@@ -48,11 +42,14 @@ fi
 MESSAGE="$1"
 
 # ---------------------------------------------------------------------------
-# Check AWS CLI is available
+# Ensure AWS CLI is available (auto-install if missing)
 # ---------------------------------------------------------------------------
 if ! command -v aws > /dev/null 2>&1; then
-    echo "SKIP: aws CLI not found — Telegram notification not sent"
-    exit 0
+    pip3 install awscli --quiet 2>/dev/null || pip install awscli --quiet 2>/dev/null || true
+    if ! command -v aws > /dev/null 2>&1; then
+        echo "SKIP: aws CLI not available — Telegram notification not sent"
+        exit 0
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -62,15 +59,13 @@ SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.V
 
 BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN}" ${SSM_ARGS} 2>/dev/null) || true
 if [ -z "${BOT_TOKEN}" ]; then
-    echo "SKIP: Bot token not found in SSM (${SSM_BOT_TOKEN})"
-    echo "  Set it up: aws ssm put-parameter --region ${REGION} --name '${SSM_BOT_TOKEN}' --value 'YOUR_TOKEN' --type SecureString --overwrite"
+    echo "SKIP: Bot token not in SSM — run bootstrap.sh to set up"
     exit 0
 fi
 
 CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID}" ${SSM_ARGS} 2>/dev/null) || true
 if [ -z "${CHAT_ID}" ]; then
-    echo "SKIP: Chat ID not found in SSM (${SSM_CHAT_ID})"
-    echo "  Set it up: aws ssm put-parameter --region ${REGION} --name '${SSM_CHAT_ID}' --value 'YOUR_CHAT_ID' --type SecureString --overwrite"
+    echo "SKIP: Chat ID not in SSM — run bootstrap.sh to set up"
     exit 0
 fi
 
