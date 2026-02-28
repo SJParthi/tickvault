@@ -3,24 +3,25 @@
 ### =============================================================================
 ### Run any request: click the green play button next to it.
 ### All services must be running (Docker Up) before testing.
+### Environment: select "dev" from the dropdown (top-right) before running.
 ### =============================================================================
 
 ### ---- Application ----
 
 ### App Health Check
-GET http://localhost:3001/health
+GET {{app_host}}/health
 
 ###
 
 ### ---- Databases ----
 
 ### QuestDB Health (HTTP API)
-GET http://localhost:9000/exec?query=SELECT%201
+GET {{questdb_host}}/exec?query=SELECT%201
 
 ###
 
 ### QuestDB Show Tables
-GET http://localhost:9000/exec?query=SHOW%20TABLES
+GET {{questdb_host}}/exec?query=SHOW%20TABLES
 
 ###
 
@@ -32,51 +33,51 @@ GET http://localhost:9000/exec?query=SHOW%20TABLES
 ### ---- Monitoring ----
 
 ### Prometheus Health
-GET http://localhost:9090/-/healthy
+GET {{prometheus_host}}/-/healthy
 
 ###
 
 ### Prometheus Targets (check scrape status)
-GET http://localhost:9090/api/v1/targets
+GET {{prometheus_host}}/api/v1/targets
 
 ###
 
 ### Grafana Health
-GET http://localhost:3000/api/health
+GET {{grafana_host}}/api/health
 
 ###
 
 ### Jaeger Health
-GET http://localhost:16686/
+GET {{jaeger_host}}/
 
 ###
 
 ### Jaeger Services List
-GET http://localhost:16686/api/services
+GET {{jaeger_host}}/api/services
 
 ###
 
 ### Loki Ready
-GET http://localhost:3100/ready
+GET {{loki_host}}/ready
 
 ###
 
 ### Alloy UI
-GET http://localhost:12345
+GET {{alloy_host}}
 
 ###
 
 ### ---- Infrastructure ----
 
 ### LocalStack Health
-GET http://localhost:4566/_localstack/health
+GET {{localstack_host}}/_localstack/health
 
 ###
 
 ### LocalStack SSM — List Parameters
-GET http://localhost:4566/_aws/ssm/parameters
+GET {{localstack_host}}/_aws/ssm/parameters
 
 ###
 
 ### Traefik Dashboard API
-GET http://localhost:8080/api/rawdata
+GET {{traefik_host}}/api/rawdata
