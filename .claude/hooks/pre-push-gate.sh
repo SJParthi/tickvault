@@ -60,11 +60,20 @@ else
 fi
 
 # Gate 3: cargo deny (advisory — only if installed)
+# Note: cargo deny needs network to fetch advisory DB. If it fails due to
+# network/proxy issues (exit code != 0 but stderr contains "fetch"), treat
+# as SKIP rather than FAIL. CI enforces this properly.
 echo "  [3/3] cargo deny..." >&2
 if command -v cargo-deny > /dev/null 2>&1; then
-  if ! cargo deny check 2> /dev/null; then
-    echo "  FAIL: cargo deny found issues. Review before pushing." >&2
-    FAILED=1
+  DENY_OUTPUT=$(cargo deny check 2>&1)
+  DENY_EXIT=$?
+  if [ "$DENY_EXIT" -ne 0 ]; then
+    if echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect'; then
+      echo "  SKIP: cargo deny cannot reach advisory DB (network/proxy). CI will enforce." >&2
+    else
+      echo "  FAIL: cargo deny found issues. Review before pushing." >&2
+      FAILED=1
+    fi
   else
     echo "  PASS: cargo deny (licenses + advisories clean)" >&2
   fi
