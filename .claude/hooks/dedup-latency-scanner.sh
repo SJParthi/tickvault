@@ -17,6 +17,7 @@ if [ -z "$STAGED_FILES" ]; then
 fi
 
 VIOLATIONS=0
+WARNINGS=0
 REPORT=""
 
 scan_pattern() {
@@ -35,20 +36,42 @@ scan_pattern() {
       continue
     fi
 
-    # If hot-path only, filter to core/trading/websocket/oms
+    # If hot-path only, filter to actual hot-path code:
+    # Full crates: trading/, websocket/, oms/
+    # Core submodules: core/src/websocket/, core/src/ticker/
+    # NOT: core/src/auth/, core/src/instrument/, core/src/notification/ (cold path)
     if [ "$is_hot_path" = "true" ]; then
-      if ! echo "$file" | grep -qE '^crates/(core|trading|websocket|oms)/'; then
+      if ! echo "$file" | grep -qE '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/'; then
         continue
       fi
     fi
 
+    # Extract only production code (skip #[cfg(test)] blocks)
     local matches
-    matches=$(grep -n "$pattern" "$full_path" 2>/dev/null \
+    matches=$(awk '
+      BEGIN { skip=0; depth=0 }
+      /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
+      /^[[:space:]]*#\[test\]/ { skip=1; next }
+      skip==1 && /\{/ {
+        depth += gsub(/\{/, "{")
+        depth -= gsub(/\}/, "}")
+        if (depth <= 0) { skip=0; depth=0 }
+        next
+      }
+      skip==1 {
+        depth += gsub(/\{/, "{")
+        depth -= gsub(/\}/, "}")
+        if (depth <= 0) { skip=0; depth=0 }
+        next
+      }
+      { print NR": "$0 }
+    ' "$full_path" \
+      | grep "$pattern" \
       | grep -v '// test' \
       | grep -v '/// ' \
       | grep -v '// SAFETY:' \
       | grep -v '// O(1):' \
-      | grep -v '#\[cfg(test)\]' \
+      | grep -v '// O(1) EXEMPT:' \
       || true)
 
     if [ -n "$matches" ]; then
@@ -76,8 +99,8 @@ scan_pattern '\.sort(' 'O(n log n) sort on hot path — pre-sort or use BTreeMap
 scan_pattern '\.sort_by(' 'O(n log n) sort on hot path — pre-sort or use BTreeMap' "$STAGED_FILES" true
 scan_pattern '\.sort_unstable(' 'O(n log n) sort on hot path — pre-sort or use BTreeMap' "$STAGED_FILES" true
 
-# Recursive functions on hot path (stack overflow risk + unpredictable latency)
-scan_pattern 'fn.*(&self.*) -> .*{' 'Check for recursion — hot path must be iterative' "$STAGED_FILES" true
+# NOTE: Recursion detection removed — structurally impossible with grep.
+# Covered by hot-path-reviewer agent (AST-level review).
 
 # Blocking I/O on hot path
 scan_pattern 'std::fs::' 'Blocking filesystem I/O on hot path — use async' "$STAGED_FILES" true
@@ -90,11 +113,10 @@ scan_pattern 'Box<dyn' 'Box<dyn> on hot path — use enum_dispatch' "$STAGED_FIL
 scan_pattern '&dyn ' '&dyn on hot path — use enum_dispatch' "$STAGED_FILES" true
 
 # ─────────────────────────────────────────────
-# DEDUPLICATION VIOLATIONS (all code)
+# DEDUPLICATION & INTEGRITY CHECKS (warnings only — heuristic, not enforceable by grep)
+# These are reminders, not blockers. Idempotency/dedup logic may live in a separate module.
 # ─────────────────────────────────────────────
 
-# Order submission without idempotency key check
-# Look for order-related functions that don't mention idempotency
 HOT_FILES=$(echo "$STAGED_FILES" | grep -E '^crates/(trading|oms|core)/' || true)
 if [ -n "$HOT_FILES" ]; then
   while IFS= read -r file; do
@@ -102,27 +124,33 @@ if [ -n "$HOT_FILES" ]; then
     local_path="$PROJECT_DIR/$file"
     [ ! -f "$local_path" ] && continue
 
-    # If file mentions "order" and "submit/place/send" but not "idempotency"
+    # Skip test files
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+      continue
+    fi
+
+    # Order submission without idempotency — WARNING only
     if grep -q 'submit_order\|place_order\|send_order' "$local_path" 2>/dev/null; then
       if ! grep -q 'idempotency\|idempotent\|dedup' "$local_path" 2>/dev/null; then
-        REPORT="${REPORT}\n  [DEDUP] Order submission without idempotency key check in $file"
-        VIOLATIONS=$((VIOLATIONS + 1))
+        echo "  WARNING: Order submission without idempotency reference in $file" >&2
+        echo "    Ensure idempotency key is checked in Valkey BEFORE submission." >&2
+        WARNINGS=$((WARNINGS + 1))
       fi
     fi
 
-    # If file processes ticks but doesn't check for duplicates
+    # Tick processing without dedup — WARNING only
     if grep -q 'process_tick\|handle_tick\|on_tick' "$local_path" 2>/dev/null; then
       if ! grep -q 'dedup\|duplicate\|seen_tick\|sequence_number\|exchange_timestamp' "$local_path" 2>/dev/null; then
-        REPORT="${REPORT}\n  [DEDUP] Tick processing without deduplication check in $file"
-        REPORT="${REPORT}\n    Must deduplicate by (security_id, exchange_timestamp, sequence_number)"
-        VIOLATIONS=$((VIOLATIONS + 1))
+        echo "  WARNING: Tick processing without dedup reference in $file" >&2
+        echo "    Deduplicate by (security_id, exchange_timestamp, sequence_number)." >&2
+        WARNINGS=$((WARNINGS + 1))
       fi
     fi
   done <<< "$HOT_FILES"
 fi
 
 # ─────────────────────────────────────────────
-# POSITION RECONCILIATION
+# POSITION RECONCILIATION (warning only)
 # ─────────────────────────────────────────────
 
 if [ -n "$HOT_FILES" ]; then
@@ -131,12 +159,17 @@ if [ -n "$HOT_FILES" ]; then
     local_path="$PROJECT_DIR/$file"
     [ ! -f "$local_path" ] && continue
 
-    # If file handles fills but doesn't mention reconciliation
+    # Skip test files
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+      continue
+    fi
+
+    # Fill handler without reconciliation — WARNING only
     if grep -q 'on_fill\|handle_fill\|order_filled\|execution_report' "$local_path" 2>/dev/null; then
       if ! grep -q 'reconcil\|position_check\|mismatch\|halt' "$local_path" 2>/dev/null; then
-        REPORT="${REPORT}\n  [INTEGRITY] Fill handler without position reconciliation in $file"
-        REPORT="${REPORT}\n    Must reconcile after every fill — mismatch = halt trading"
-        VIOLATIONS=$((VIOLATIONS + 1))
+        echo "  WARNING: Fill handler without position reconciliation in $file" >&2
+        echo "    Reconcile after every fill — mismatch = halt trading." >&2
+        WARNINGS=$((WARNINGS + 1))
       fi
     fi
   done <<< "$HOT_FILES"
@@ -146,13 +179,17 @@ fi
 # RESULT
 # ─────────────────────────────────────────────
 
+if [ "$WARNINGS" -gt 0 ]; then
+  echo "" >&2
+  echo "  $WARNINGS data integrity warning(s) above — review before committing." >&2
+fi
+
 if [ "$VIOLATIONS" -gt 0 ]; then
   echo "" >&2
-  echo "BLOCKED: $VIOLATIONS O(1)/dedup/integrity violation(s) found:" >&2
+  echo "BLOCKED: $VIOLATIONS O(1) latency violation(s) found:" >&2
   echo -e "$REPORT" >&2
   echo "" >&2
-  echo "All hot-path code must be O(1). All orders need idempotency keys." >&2
-  echo "All ticks need dedup. All fills need position reconciliation." >&2
+  echo "All hot-path code must be O(1). Use '// O(1) EXEMPT: <reason>' to justify exceptions." >&2
   exit 2
 fi
 

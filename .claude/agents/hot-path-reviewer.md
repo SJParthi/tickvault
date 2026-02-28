@@ -13,10 +13,27 @@ When invoked, scan the specified files (or recent git diff) for these violations
 - `Box::new()`, `Vec::new()`, `vec![]`, `String::new()`, `String::from()` on hot path
 - `format!()`, `to_string()`, `to_owned()` on hot path
 - `.clone()` on any non-Copy type
-- `dyn Trait` (use enum_dispatch instead)
+- `.collect()` on hot path (unbounded allocation)
+- `dyn Trait` / `Box<dyn>` / `&dyn` (use enum_dispatch instead)
 - `DashMap` (use papaya for hot path)
 - Unbounded channels or collections
 - `HashMap::new()` without `with_capacity()`
+- `.unwrap()` or `.expect()` in production code
+- `unsafe {}` or `unsafe fn` without `// SAFETY:` justification
+- `#[allow(...)]` without `// APPROVED:` justification
+
+## Blocking I/O Violations (must fix on hot path)
+- `std::fs::` — use async filesystem operations
+- `std::net::` — use tokio networking
+- `.read_to_string()` — blocking read
+- `std::thread::sleep` — never block the hot path
+
+## O(1) Violations (must fix on hot path)
+- `.iter().find()` — O(n) linear search, use HashMap/index
+- `.iter().position()` — O(n) linear search, use HashMap/index
+- `.iter().filter()` — O(n) filter, use pre-indexed structure
+- `.contains(&)` on Vec — O(n), use HashSet
+- `.sort()` / `.sort_by()` — O(n log n), pre-sort or use BTreeMap
 
 ## Warnings (should fix)
 - `Arc` where a reference would suffice

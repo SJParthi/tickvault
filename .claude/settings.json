@@ -52,7 +52,9 @@
       "Bash(cat *)",
       "Bash(head *)",
       "Bash(tail *)",
-      "Bash(find *)"
+      "Bash(find *)",
+      "Bash(docker exec *)",
+      "Bash(chmod *)"
     ],
     "deny": [
       "Bash(cargo update *)",

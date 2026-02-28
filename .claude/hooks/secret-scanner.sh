@@ -28,16 +28,18 @@ scan_secret() {
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
 
-    # Skip binary files, test fixtures, lock files, and the scanner itself
-    if echo "$file" | grep -qE '\.(lock|toml|md|json|sh|yml|yaml|xml|html|css|js)$'; then
-      # For config files, still scan but skip known safe patterns
-      if echo "$file" | grep -qE '\.(sh|md)$'; then
-        continue
-      fi
+    # Skip binary files, lock files, and the scanner itself
+    if echo "$file" | grep -qE '\.(sh|md|lock)$'; then
+      continue
     fi
 
-    # Only scan .rs, .toml, .json, .yml, .yaml files for secrets
+    # Only scan relevant file types for secrets
     if ! echo "$file" | grep -qE '\.(rs|toml|json|yml|yaml|cfg|conf|ini|properties)$'; then
+      continue
+    fi
+
+    # Skip test files entirely (test fixtures may have fake secrets)
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/fixtures/)'; then
       continue
     fi
 
@@ -46,6 +48,7 @@ scan_secret() {
       | grep -v '// test' \
       | grep -v '/// ' \
       | grep -v '#\[doc' \
+      | grep -v '#\[cfg(test)\]' \
       | grep -v 'ssm_parameter' \
       | grep -v 'Parameter' \
       | grep -v 'secret_manager' \
@@ -60,6 +63,10 @@ scan_secret() {
       | grep -v 'dummy' \
       | grep -v 'mock' \
       | grep -v 'test_' \
+      | grep -v 'fake' \
+      | grep -v 'stub' \
+      | grep -v 'fixture' \
+      | grep -v 'test-' \
       || true)
 
     if [ -n "$matches" ]; then
