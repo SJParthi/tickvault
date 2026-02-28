@@ -1,0 +1,90 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(cargo check *)",
+      "Bash(cargo check)",
+      "Bash(cargo test *)",
+      "Bash(cargo test)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo fmt)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo clippy)",
+      "Bash(cargo doc *)",
+      "Bash(cargo build *)",
+      "Bash(cargo build)",
+      "Bash(cargo bench *)",
+      "Bash(git status *)",
+      "Bash(git status)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git diff)",
+      "Bash(git branch *)",
+      "Bash(git branch)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git pull *)",
+      "Bash(git fetch *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git tag *)",
+      "Bash(docker compose *)",
+      "Bash(docker build *)",
+      "Bash(docker ps *)",
+      "Bash(docker ps)",
+      "Bash(docker logs *)",
+      "Bash(gh *)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(wc *)",
+      "Bash(mkdir *)"
+    ],
+    "deny": [
+      "Bash(cargo update *)",
+      "Bash(cargo update)",
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(brew *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(cat | jq -r '.tool_input.file_path // empty'); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.rs$'; then rustfmt \"$FILE\" 2>/dev/null || true; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Check if the user's task is complete. Verify: (1) Were all requested changes made? (2) If Rust code was modified, did cargo check/test/clippy pass? (3) Are there any TODO items still in_progress? If anything is incomplete, respond with {\"ok\": false, \"reason\": \"what remains to be done\"}. If everything looks done, respond with {\"ok\": true}."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'COMPACTION REMINDER: Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. Run cargo fmt + clippy + test before committing. Check current phase doc for context.'"
+          }
+        ]
+      }
+    ]
+  }
+}
