@@ -70,6 +70,7 @@
         "hooks": [
           {
             "type": "prompt",
+            "model": "opus",
             "prompt": "Check if the user's task is complete. Verify: (1) Were all requested changes made? (2) If Rust code was modified, did cargo check/test/clippy pass? (3) Are there any TODO items still in_progress? If anything is incomplete, respond with {\"ok\": false, \"reason\": \"what remains to be done\"}. If everything looks done, respond with {\"ok\": true}."
           }
         ]
