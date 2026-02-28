@@ -1,0 +1,40 @@
+# =============================================================================
+# dhan-live-trader — Auto-Merge Workflow
+# =============================================================================
+# Automatically enables auto-merge on PRs when all CI checks pass.
+# Zero human intervention — CI is the sole gatekeeper.
+#
+# Flow: PR opened → CI runs → all checks green → auto-merge enabled → merged
+#
+# Security: All actions pinned to SHA. No mutable tags.
+# =============================================================================
+
+name: Auto-Merge
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    name: "Enable Auto-Merge"
+    runs-on: ubuntu-latest
+    # Only auto-merge for Renovate bot and Claude Code PRs
+    if: >-
+      github.actor == 'renovate[bot]' ||
+      github.actor == 'SJParthi' ||
+      startsWith(github.head_ref, 'claude/')
+    steps:
+      - name: Enable auto-merge (squash)
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
