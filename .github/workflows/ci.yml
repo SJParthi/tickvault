@@ -41,6 +41,7 @@ jobs:
   compile:
     name: "Stage 1 — Compile"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -63,6 +64,7 @@ jobs:
     name: "Stage 2 — Lint"
     needs: compile
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -81,11 +83,55 @@ jobs:
       - name: Run clippy (warnings = errors)
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
 
+      - name: Banned pattern scan (server-side enforcement)
+        run: |
+          echo "Scanning production .rs files for banned patterns..."
+          VIOLATIONS=0
+
+          # Find all .rs files excluding tests
+          PROD_FILES=$(find crates -name '*.rs' \
+            ! -path '*_test.rs' \
+            ! -path '*/tests/*' \
+            ! -path '*/benches/*' \
+            -type f)
+
+          for file in $PROD_FILES; do
+            # Strip #[cfg(test)] modules and lines with APPROVED/EXEMPT comments
+            PROD_CODE=$(awk '
+              BEGIN { skip=0; depth=0 }
+              /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
+              /^[[:space:]]*#\[test\]/ { skip=1; next }
+              skip==1 && /\{/ { depth += gsub(/\{/, "{"); depth -= gsub(/\}/, "}"); if (depth <= 0) { skip=0; depth=0 }; next }
+              skip==1 { depth += gsub(/\{/, "{"); depth -= gsub(/\}/, "}"); if (depth <= 0) { skip=0; depth=0 }; next }
+              /APPROVED:|O\(1\) EXEMPT:/ { next }
+              { print }
+            ' "$file")
+
+            # Universal bans
+            for pattern in '\.unwrap()' '\.expect(' 'println!' 'dbg!' 'eprintln!'; do
+              MATCHES=$(echo "$PROD_CODE" | grep -n "$pattern" || true)
+              if [ -n "$MATCHES" ]; then
+                echo "BANNED: $pattern in $file"
+                echo "$MATCHES" | head -5
+                VIOLATIONS=$((VIOLATIONS + 1))
+              fi
+            done
+          done
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo ""
+            echo "BLOCKED: $VIOLATIONS banned pattern violation(s) found."
+            echo "See CLAUDE.md BANNED section."
+            exit 1
+          fi
+          echo "Banned pattern scan: CLEAN"
+
   # ---- Stage 3: Test ----
   test:
     name: "Stage 3 — Test"
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -105,6 +151,7 @@ jobs:
     name: "Stage 4 — Security"
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -127,6 +174,7 @@ jobs:
     name: "Stage 5 — Performance"
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -152,6 +200,7 @@ jobs:
     name: "Stage 6 — Coverage"
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
