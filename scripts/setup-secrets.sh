@@ -8,7 +8,7 @@
 # What it does:
 #   1. Ensures AWS CLI is installed (auto-installs via pip if missing)
 #   2. Verifies AWS credentials are configured
-#   3. Verifies all 5 secrets exist in real AWS SSM
+#   3. Verifies all 9 secrets exist in real AWS SSM
 #   4. Sends test Telegram notification
 #
 # All secrets read from real AWS SSM directly.
@@ -79,6 +79,10 @@ verify_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "Dhan Access Token"
 verify_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "Dhan TOTP Secret"
 verify_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "Telegram Bot Token"
 verify_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "Telegram Chat ID"
+verify_secret "/dlt/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User"
+verify_secret "/dlt/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password"
+verify_secret "/dlt/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User"
+verify_secret "/dlt/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password"
 
 echo ""
 
@@ -88,7 +92,7 @@ if [ "${MISSING}" -gt 0 ]; then
     exit 0
 fi
 
-echo -e "  ${GREEN}All 5 secrets verified in AWS SSM${NC}"
+echo -e "  ${GREEN}All 9 secrets verified in AWS SSM${NC}"
 
 # ---- Step 4: Test Telegram notification ----
 echo ""
