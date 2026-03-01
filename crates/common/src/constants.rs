@@ -249,6 +249,32 @@ pub const DHAN_CLIENT_SECRET_SECRET: &str = "client-secret";
 pub const DHAN_TOTP_SECRET: &str = "totp-secret";
 
 // ---------------------------------------------------------------------------
+// SSM Parameter Store — QuestDB Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for QuestDB credentials.
+pub const SSM_QUESTDB_SERVICE: &str = "questdb";
+
+/// SSM key for QuestDB PG wire protocol username.
+pub const QUESTDB_PG_USER_SECRET: &str = "pg-user";
+
+/// SSM key for QuestDB PG wire protocol password.
+pub const QUESTDB_PG_PASSWORD_SECRET: &str = "pg-password";
+
+// ---------------------------------------------------------------------------
+// SSM Parameter Store — Grafana Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for Grafana credentials.
+pub const SSM_GRAFANA_SERVICE: &str = "grafana";
+
+/// SSM key for Grafana admin username.
+pub const GRAFANA_ADMIN_USER_SECRET: &str = "admin-user";
+
+/// SSM key for Grafana admin password.
+pub const GRAFANA_ADMIN_PASSWORD_SECRET: &str = "admin-password";
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — Telegram Service
 // ---------------------------------------------------------------------------
 

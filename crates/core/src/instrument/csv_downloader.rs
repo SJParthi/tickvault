@@ -305,9 +305,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_falls_back_to_cache() {
-        let temp_dir = env::temp_dir().join("dlt-test-fallback-cache");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-fallback-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "cached-instruments.csv";
+
+        // Ensure clean state before writing cache.
+        let _ = fs::remove_dir_all(&temp_dir).await;
 
         let fake_csv = "CACHED_DATA,".repeat(INSTRUMENT_CSV_MIN_BYTES);
         write_cache(cache_dir, cache_filename, &fake_csv).await;

@@ -11,11 +11,13 @@ use tracing::{info, instrument};
 
 use dhan_live_trader_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET, DHAN_TOTP_SECRET,
-    SSM_DHAN_SERVICE, SSM_SECRET_BASE_PATH,
+    GRAFANA_ADMIN_PASSWORD_SECRET, GRAFANA_ADMIN_USER_SECRET, QUESTDB_PG_PASSWORD_SECRET,
+    QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GRAFANA_SERVICE, SSM_QUESTDB_SERVICE,
+    SSM_SECRET_BASE_PATH,
 };
 use dhan_live_trader_common::error::ApplicationError;
 
-use super::types::DhanCredentials;
+use super::types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials};
 
 // ---------------------------------------------------------------------------
 // SSM Path Construction
@@ -150,6 +152,90 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
         client_id,
         client_secret,
         totp_secret,
+    })
+}
+
+/// Fetches QuestDB PG wire protocol credentials from AWS SSM Parameter Store.
+///
+/// Retrieves pg-user and pg-password, both wrapped in `SecretString`.
+/// Used for PostgreSQL wire protocol connections (port 8812) and
+/// injected into docker-compose via environment variables.
+///
+/// # Errors
+///
+/// Returns `ApplicationError::SecretRetrieval` if any secret cannot be fetched.
+#[instrument(skip_all, fields(environment))]
+pub async fn fetch_questdb_credentials() -> Result<QuestDbCredentials, ApplicationError> {
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+
+    let pg_user_path = build_ssm_path(&environment, SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET);
+    let pg_password_path = build_ssm_path(
+        &environment,
+        SSM_QUESTDB_SERVICE,
+        QUESTDB_PG_PASSWORD_SECRET,
+    );
+
+    info!(
+        pg_user_path = %pg_user_path,
+        pg_password_path = %pg_password_path,
+        "fetching QuestDB credentials from SSM"
+    );
+
+    let (pg_user, pg_password) = tokio::try_join!(
+        fetch_secret(&ssm_client, &pg_user_path),
+        fetch_secret(&ssm_client, &pg_password_path),
+    )?;
+
+    info!("all QuestDB credentials fetched successfully from SSM");
+
+    Ok(QuestDbCredentials {
+        pg_user,
+        pg_password,
+    })
+}
+
+/// Fetches Grafana admin credentials from AWS SSM Parameter Store.
+///
+/// Retrieves admin-user and admin-password, both wrapped in `SecretString`.
+/// Injected into docker-compose via environment variables.
+///
+/// # Errors
+///
+/// Returns `ApplicationError::SecretRetrieval` if any secret cannot be fetched.
+#[instrument(skip_all, fields(environment))]
+pub async fn fetch_grafana_credentials() -> Result<GrafanaCredentials, ApplicationError> {
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+
+    let admin_user_path =
+        build_ssm_path(&environment, SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET);
+    let admin_password_path = build_ssm_path(
+        &environment,
+        SSM_GRAFANA_SERVICE,
+        GRAFANA_ADMIN_PASSWORD_SECRET,
+    );
+
+    info!(
+        admin_user_path = %admin_user_path,
+        admin_password_path = %admin_password_path,
+        "fetching Grafana credentials from SSM"
+    );
+
+    let (admin_user, admin_password) = tokio::try_join!(
+        fetch_secret(&ssm_client, &admin_user_path),
+        fetch_secret(&ssm_client, &admin_password_path),
+    )?;
+
+    info!("all Grafana credentials fetched successfully from SSM");
+
+    Ok(GrafanaCredentials {
+        admin_user,
+        admin_password,
     })
 }
 
@@ -311,6 +397,62 @@ mod tests {
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
             "/dlt/prod/dhan/totp-secret"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ssm_path — QuestDB secret paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_questdb_dev() {
+        assert_eq!(
+            build_ssm_path("dev", SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET),
+            "/dlt/dev/questdb/pg-user"
+        );
+        assert_eq!(
+            build_ssm_path("dev", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
+            "/dlt/dev/questdb/pg-password"
+        );
+    }
+
+    #[test]
+    fn test_build_ssm_path_questdb_prod() {
+        assert_eq!(
+            build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET),
+            "/dlt/prod/questdb/pg-user"
+        );
+        assert_eq!(
+            build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
+            "/dlt/prod/questdb/pg-password"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ssm_path — Grafana secret paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_grafana_dev() {
+        assert_eq!(
+            build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
+            "/dlt/dev/grafana/admin-user"
+        );
+        assert_eq!(
+            build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
+            "/dlt/dev/grafana/admin-password"
+        );
+    }
+
+    #[test]
+    fn test_build_ssm_path_grafana_prod() {
+        assert_eq!(
+            build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
+            "/dlt/prod/grafana/admin-user"
+        );
+        assert_eq!(
+            build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
+            "/dlt/prod/grafana/admin-password"
         );
     }
 }
