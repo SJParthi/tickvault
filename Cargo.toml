@@ -112,6 +112,7 @@ rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
 aws-config = "1.6.3"
+aws-sdk-sns = "1.68.0"
 aws-sdk-ssm = "1.68.0"
 
 # ---- Section 16: CLI ----

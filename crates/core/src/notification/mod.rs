@@ -1,8 +1,9 @@
-//! Telegram notification module.
+//! Notification module — Telegram + SNS SMS.
 //!
 //! ONE source (AWS SSM), ONE code path, everywhere.
-//! Reads bot-token and chat-id from SSM Parameter Store, sends
-//! fire-and-forget alerts via the Telegram Bot API (reqwest POST).
+//! Reads credentials from SSM Parameter Store, sends fire-and-forget
+//! alerts via Telegram Bot API (all events) and AWS SNS SMS
+//! (Critical/High events only, when `sns_enabled`).
 //!
 //! # Boot Sequence Position
 //! Config → Logging → **Notification** → Auth → QuestDB → ...
@@ -16,5 +17,5 @@
 pub mod events;
 pub mod service;
 
-pub use events::NotificationEvent;
+pub use events::{NotificationEvent, Severity};
 pub use service::NotificationService;
