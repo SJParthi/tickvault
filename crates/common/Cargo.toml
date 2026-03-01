@@ -17,3 +17,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid"]

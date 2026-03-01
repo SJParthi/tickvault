@@ -206,6 +206,18 @@ init_questdb_table() {
 
 TICKS_DDL="CREATE TABLE IF NOT EXISTS ticks (segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, received_at TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
 init_questdb_table "ticks" "${TICKS_DDL}"
+
+BUILD_METADATA_DDL="CREATE TABLE IF NOT EXISTS instrument_build_metadata (csv_source SYMBOL, csv_row_count LONG, parsed_row_count LONG, index_count LONG, equity_count LONG, underlying_count LONG, derivative_count LONG, option_chain_count LONG, build_duration_ms LONG, build_timestamp TIMESTAMP, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
+init_questdb_table "instrument_build_metadata" "${BUILD_METADATA_DDL}"
+
+FNO_UNDERLYINGS_DDL="CREATE TABLE IF NOT EXISTS fno_underlyings (underlying_symbol SYMBOL, price_feed_segment SYMBOL, derivative_segment SYMBOL, kind SYMBOL, underlying_security_id LONG, price_feed_security_id LONG, lot_size LONG, contract_count LONG, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
+init_questdb_table "fno_underlyings" "${FNO_UNDERLYINGS_DDL}"
+
+DERIVATIVE_CONTRACTS_DDL="CREATE TABLE IF NOT EXISTS derivative_contracts (underlying_symbol SYMBOL, instrument_kind SYMBOL, exchange_segment SYMBOL, option_type SYMBOL, symbol_name SYMBOL, security_id LONG, expiry_date STRING, strike_price DOUBLE, lot_size LONG, tick_size DOUBLE, display_name STRING, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
+init_questdb_table "derivative_contracts" "${DERIVATIVE_CONTRACTS_DDL}"
+
+SUBSCRIBED_INDICES_DDL="CREATE TABLE IF NOT EXISTS subscribed_indices (symbol SYMBOL, exchange SYMBOL, category SYMBOL, subcategory SYMBOL, security_id LONG, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
+init_questdb_table "subscribed_indices" "${SUBSCRIBED_INDICES_DDL}"
 echo ""
 
 # ---- Step 7: Verify Secrets in Real AWS SSM ----

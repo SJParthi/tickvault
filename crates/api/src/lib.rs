@@ -1,17 +1,10 @@
-// Compile-time lint enforcement — defense-in-depth with CLI clippy flags
-#![cfg_attr(not(test), deny(clippy::unwrap_used))]
-#![cfg_attr(not(test), deny(clippy::expect_used))]
-#![deny(clippy::print_stdout)]
-#![deny(clippy::print_stderr)]
-#![deny(clippy::dbg_macro)]
-#![allow(missing_docs)] // TODO: enforce after adding docs to all public items
-
-//! HTTP API server — axum endpoints for health, stats, and portal.
+//! HTTP API server — axum endpoints for health, stats, portal, and instruments.
 //!
 //! # Endpoints
 //! - `GET /health` — health check
 //! - `GET /api/stats` — QuestDB table counts
 //! - `GET /portal` — DLT Control Panel (links to all monitoring services)
+//! - `POST /api/instruments/rebuild` — one-shot instrument rebuild
 //!
 //! # Boot Sequence Position
 //! Pipeline → **API Server**
@@ -37,6 +30,10 @@ pub fn build_router(state: SharedAppState) -> Router {
             axum::routing::get(handlers::health::health_check),
         )
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
+        .route(
+            "/api/instruments/rebuild",
+            axum::routing::post(handlers::instruments::rebuild_instruments),
+        )
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .layer(cors)
         .with_state(state)

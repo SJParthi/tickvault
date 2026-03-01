@@ -338,6 +338,10 @@ pub const INSTRUMENT_CSV_RETRY_INITIAL_DELAY_MS: u64 = 2000;
 /// Maximum backoff delay for instrument CSV download retry in milliseconds.
 pub const INSTRUMENT_CSV_RETRY_MAX_DELAY_MS: u64 = 8000;
 
+/// Filename for the instrument build freshness marker.
+/// Written on successful build; contains today's IST date as `YYYY-MM-DD`.
+pub const INSTRUMENT_FRESHNESS_MARKER_FILENAME: &str = "instrument-build-date.txt";
+
 // ---------------------------------------------------------------------------
 // Instrument CSV — Column Names (for auto-detection from header)
 // ---------------------------------------------------------------------------

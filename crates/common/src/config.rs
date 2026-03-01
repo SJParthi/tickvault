@@ -173,7 +173,7 @@ pub struct ApiConfig {
 }
 
 /// Instrument CSV download and universe build configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct InstrumentConfig {
     /// Time of day (IST) to download fresh instrument CSV. Format: "HH:MM:SS".
     pub daily_download_time: String,
@@ -183,6 +183,10 @@ pub struct InstrumentConfig {
     pub csv_cache_filename: String,
     /// Download timeout in seconds (overrides network timeout for this large file).
     pub csv_download_timeout_secs: u64,
+    /// Start of instrument build window (IST). Format: "HH:MM:SS".
+    pub build_window_start: String,
+    /// End of instrument build window (IST). Format: "HH:MM:SS".
+    pub build_window_end: String,
 }
 
 /// Notification (Telegram alert) configuration.
@@ -318,6 +322,14 @@ impl ApplicationConfig {
                 "instrument.daily_download_time",
                 &self.instrument.daily_download_time,
             ),
+            (
+                "instrument.build_window_start",
+                &self.instrument.build_window_start,
+            ),
+            (
+                "instrument.build_window_end",
+                &self.instrument.build_window_end,
+            ),
         ];
         for (field_name, value) in &time_fields {
             NaiveTime::parse_from_str(value, "%H:%M:%S").map_err(|_| {
@@ -362,6 +374,27 @@ impl ApplicationConfig {
         // Instrument: download timeout must be positive.
         if self.instrument.csv_download_timeout_secs == 0 {
             bail!("instrument.csv_download_timeout_secs must be > 0");
+        }
+
+        // Instrument: build window start must be before end.
+        let window_start =
+            NaiveTime::parse_from_str(&self.instrument.build_window_start, "%H:%M:%S").map_err(
+                |_| {
+                    anyhow::anyhow!(
+                        "instrument.build_window_start already validated above but failed again"
+                    )
+                },
+            )?;
+        let window_end = NaiveTime::parse_from_str(&self.instrument.build_window_end, "%H:%M:%S")
+            .map_err(|_| {
+            anyhow::anyhow!("instrument.build_window_end already validated above but failed again")
+        })?;
+        if window_start >= window_end {
+            bail!(
+                "instrument.build_window_start ({}) must be before build_window_end ({})",
+                self.instrument.build_window_start,
+                self.instrument.build_window_end
+            );
         }
 
         // WebSocket: ping interval must be positive.
@@ -484,6 +517,8 @@ mod tests {
                 csv_cache_directory: "/tmp/dlt-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
             },
             api: ApiConfig {
                 host: "0.0.0.0".to_string(),
@@ -674,5 +709,31 @@ mod tests {
         config.websocket.pong_timeout_secs = 0;
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("pong_timeout_secs"));
+    }
+
+    #[test]
+    fn test_build_window_start_after_end_fails() {
+        let mut config = make_valid_config();
+        config.instrument.build_window_start = "09:00:00".to_string();
+        config.instrument.build_window_end = "08:30:00".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("build_window_start"));
+    }
+
+    #[test]
+    fn test_build_window_start_equals_end_fails() {
+        let mut config = make_valid_config();
+        config.instrument.build_window_start = "08:30:00".to_string();
+        config.instrument.build_window_end = "08:30:00".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("build_window_start"));
+    }
+
+    #[test]
+    fn test_invalid_build_window_start_format_fails() {
+        let mut config = make_valid_config();
+        config.instrument.build_window_start = "8:25".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("build_window_start"));
     }
 }

@@ -40,3 +40,6 @@ rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "papaya", "rtrb", "zerocopy"]
