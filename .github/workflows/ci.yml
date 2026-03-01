@@ -166,8 +166,8 @@ jobs:
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@0e89f6b1568a820d57d5f00f4913ab2f19727afd # cargo-tarpaulin
 
-      - name: Run coverage
-        run: cargo tarpaulin --workspace --out Xml --output-dir target/tarpaulin
+      - name: Run coverage (99% minimum enforced)
+        run: cargo tarpaulin --workspace --fail-under 99 --out Xml --output-dir target/tarpaulin
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
