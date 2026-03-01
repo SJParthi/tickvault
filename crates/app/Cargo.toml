@@ -27,3 +27,6 @@ signal-hook = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 rustls = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["chrono-tz", "clap", "dhan-live-trader-trading", "signal-hook"]
