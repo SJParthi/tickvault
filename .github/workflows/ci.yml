@@ -292,5 +292,12 @@ jobs:
         with:
           tool: cargo-audit
 
-      - name: Audit (CVEs + yanked crates)
-        run: cargo audit --deny warnings --deny yanked
+      - name: Audit (yanked crates — hard block)
+        run: cargo audit --deny yanked
+
+      - name: Audit advisories (warn only — CVEs already checked by cargo deny in Stage 4)
+        run: |
+          cargo audit 2>&1 | tee /tmp/audit.txt || true
+          if grep -q 'warning\|vulnerability' /tmp/audit.txt; then
+            echo "::warning::Security advisories found — review and update dependencies"
+          fi
