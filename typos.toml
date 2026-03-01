@@ -48,6 +48,9 @@ jaeger = "jaeger"
 otlp = "otlp"
 grpc = "grpc"
 zeroize = "zeroize"
+ist = "ist"
+ine = "ine"
+ot = "ot"
 
 [files]
 extend-exclude = [

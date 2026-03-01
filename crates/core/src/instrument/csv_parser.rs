@@ -307,7 +307,7 @@ fn parse_lot_size(value: &str) -> Result<u32> {
 /// Parse strike price from CSV string.
 ///
 /// Returns 0.0 for empty, negative sentinel (Dhan uses -0.01 for futures),
-/// or unparseable values. Actual strike price validation happens in the
+/// or unparsable values. Actual strike price validation happens in the
 /// universe builder when attaching contracts to option chains.
 fn parse_strike_price(value: &str) -> f64 {
     if value.is_empty() {
@@ -346,7 +346,7 @@ fn parse_expiry_date(date_str: &str) -> Option<NaiveDate> {
     match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
         Ok(date) => Some(date),
         Err(error) => {
-            warn!(date_str, %error, "unparseable expiry date — treating as None");
+            warn!(date_str, %error, "unparsable expiry date — treating as None");
             None
         }
     }
@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_row_unparseable_security_id_returns_error() {
+    fn test_parse_row_unparsable_security_id_returns_error() {
         // Build a row where SEM_SMST_SECURITY_ID is "abc" (not a number).
         // parse_row should return an error about invalid security_id.
         let csv_text = format!(
