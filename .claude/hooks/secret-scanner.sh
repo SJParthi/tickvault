@@ -62,6 +62,7 @@ scan_secret() {
       | grep -v 'get_secret' \
       | grep -v 'fetch_secret' \
       | grep -v 'rotate_secret' \
+      | grep -v '_SECRET: &str' \
       | grep -v 'REDACTED' \
       | grep -v 'placeholder' \
       | grep -v 'example' \

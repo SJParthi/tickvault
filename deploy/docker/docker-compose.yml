@@ -44,6 +44,8 @@ services:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
+      QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+      QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9000' || exit 1"]
       interval: 10s
@@ -205,8 +207,8 @@ services:
       - dlt-grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: ${DLT_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
+      GF_SECURITY_ADMIN_PASSWORD: ${DLT_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
