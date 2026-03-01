@@ -61,6 +61,7 @@ pub fn build_subscription_messages(
     let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
     let request_code = feed_mode_to_subscribe_code(feed_mode);
 
+    #[allow(clippy::expect_used)] // APPROVED: SubscriptionRequest is infallible to serialize
     instruments
         .chunks(effective_batch)
         .map(|chunk| {
@@ -69,7 +70,7 @@ pub fn build_subscription_messages(
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
-            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
         })
         .collect()
     // O(1) EXEMPT: end
@@ -92,6 +93,7 @@ pub fn build_unsubscription_messages(
     let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
     let unsubscribe_code = feed_mode_to_unsubscribe_code(feed_mode);
 
+    #[allow(clippy::expect_used)] // APPROVED: SubscriptionRequest is infallible to serialize
     instruments
         .chunks(effective_batch)
         .map(|chunk| {
@@ -100,7 +102,7 @@ pub fn build_unsubscription_messages(
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
-            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
         })
         .collect()
     // O(1) EXEMPT: end

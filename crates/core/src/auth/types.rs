@@ -20,8 +20,9 @@ use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 ///
 /// Uses the compile-time constant `IST_UTC_OFFSET_SECONDS` (19800).
 /// This always succeeds — the value is within `FixedOffset`'s valid range.
+#[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
 fn ist_offset() -> FixedOffset {
-    FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid") // APPROVED: compile-time provable — 19800 always valid
+    FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid")
 }
 
 /// Parses `expiryTime` from Dhan's generateAccessToken response.

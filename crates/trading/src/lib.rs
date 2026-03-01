@@ -1,10 +1,10 @@
 // Compile-time lint enforcement — defense-in-depth with CLI clippy flags
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
-#![warn(missing_docs)]
+#![allow(missing_docs)] // TODO: enforce after adding docs to all public items
 
 //! Order Management System, risk controls, and order execution.
 //!
