@@ -198,6 +198,18 @@ jobs:
             echo "No benchmark files found — skipping."
           fi
 
+      - name: Benchmark budget gate (latency budgets + regression check)
+        run: bash scripts/bench-gate.sh
+
+      - name: DHAT zero-allocation check (if dhat tests exist)
+        run: |
+          DHAT_TESTS=$(grep -r 'dhat' crates/ --include='*.rs' -l 2>/dev/null | head -1)
+          if [ -n "$DHAT_TESTS" ]; then
+            cargo test --workspace -- --test-threads=1 dhat
+          else
+            echo "No DHAT tests found — skipping."
+          fi
+
   # ---- Stage 6: Coverage (parallel after test) ----
   coverage:
     name: "Stage 6 — Coverage"
