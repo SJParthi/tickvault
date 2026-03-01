@@ -69,15 +69,5 @@ GET {{alloy_host}}
 
 ### ---- Infrastructure ----
 
-### LocalStack Health
-GET {{localstack_host}}/_localstack/health
-
-###
-
-### LocalStack SSM — List Parameters
-GET {{localstack_host}}/_aws/ssm/parameters
-
-###
-
 ### Traefik Dashboard API
 GET {{traefik_host}}/api/rawdata

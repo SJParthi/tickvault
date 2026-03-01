@@ -17,7 +17,7 @@ Every write operation must be idempotent — running it twice produces the same 
 **Order submission:** Generate idempotency key BEFORE sending. Store in Valkey BEFORE submission. On retry, check Valkey first. CRITICAL: duplicate orders = double financial exposure.
 
 ## Deduplication
-- **Ticks:** Deduplicate by (security_id, exchange_timestamp, sequence_number). Bounded ring buffer for O(1) lookup. Log duplicates at WARN.
+- **Ticks:** Deduplicate by (security_id, exchange_timestamp, sequence_number). QuestDB uses designated timestamp (ts) + security_id as UPSERT KEYS. Bounded ring buffer for O(1) lookup. Log duplicates at WARN.
 - **Instrument snapshots:** Deduplicate at caller level (scheduler once per IST day). Guard: check last_persisted_date. Recovery: SELECT DISTINCT always correct.
 - **Orders:** Deduplicate by idempotency key. On API timeout: CHECK status before retrying. Assume order WENT THROUGH until confirmed otherwise.
 

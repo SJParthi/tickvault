@@ -35,7 +35,7 @@ Examples:
   /dlt/prod/dhan/client-id
   /dlt/prod/dhan/client-secret
   /dlt/prod/dhan/totp-secret
-  /dlt/dev/dhan/client-id        (LocalStack)
+  /dlt/dev/dhan/client-id
 ```
 
 ## Security Requirements

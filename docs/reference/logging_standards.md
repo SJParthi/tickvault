@@ -31,8 +31,8 @@
 - Raw binary WebSocket frames (log parsed summary only)
 - Any raw secret in logs = SECURITY INCIDENT → fix + rotate credential
 
-## Log Context (every production log message)
-- **What** (event) + **Where** (`#[instrument]`) + **When** (IST timestamp) + **Which** (security_id, order_id) + **Why** (error chain via anyhow)
+## Log Context
+See `.claude/rules/rust-code.md` for the 5W rule (What/Where/When/Which/Why). Enforcement is auto-loaded per path.
 
 ## Retention
 - Hot (Loki): 30 days | Cold (S3): 5 years (SEBI) | Rotation: Alloy + Loki policies

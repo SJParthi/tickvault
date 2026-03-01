@@ -1,8 +1,8 @@
 # Codebase Map — dhan-live-trader
 
-> Session start: read THIS file only. Skip CLAUDE.md (auto-loads), skip PDFs.
+> Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
 > Bible: `tech_stack_bible_v6.md` — read ONLY when adding a new dependency.
-> Updated: 2026-02-27 after frontend/candle stripping (463 tests).
+> Updated: 2026-03-01 (477 tests).
 
 ## File Tree
 
@@ -26,7 +26,7 @@ dhan-live-trader/
 │   │   ├── lib.rs                      # Re-exports: auth, instrument, websocket, parser, pipeline
 │   │   ├── auth/
 │   │   │   ├── mod.rs                  # Re-exports auth submodules
-│   │   │   ├── secret_manager.rs       # SSM fetch (LocalStack/AWS) → DhanCredentials
+│   │   │   ├── secret_manager.rs       # AWS SSM fetch → DhanCredentials
 │   │   │   ├── totp_generator.rs       # TOTP 6-digit code from base32 secret
 │   │   │   ├── token_manager.rs        # JWT lifecycle: acquire (auth.dhan.co), renew (api.dhan.co), arc-swap
 │   │   │   └── types.rs               # DhanCredentials, TokenState, DhanGenerateTokenResponse, parse_expiry_time()
@@ -86,7 +86,7 @@ dhan-live-trader/
 │   └── grafana/provisioning/
 │       └── datasources/datasources.yml # Prometheus + Loki datasources
 ├── scripts/
-│   ├── seed-localstack-secrets.sh      # Seeds 5 SSM params in LocalStack
+│   ├── setup-secrets.sh               # Seeds SSM params in AWS
 │   └── notify-telegram.sh             # Sends Telegram alerts via real AWS SSM
 └── docs/
     ├── tech_stack_bible_v6.md          # 113 components (converted from PDF)
@@ -100,7 +100,7 @@ dhan-live-trader/
 ```toml
 [trading]     # market_open "09:15", market_close "15:30", timezone "Asia/Kolkata"
 [dhan]        # websocket_url, rest_api_base_url, auth_base_url, instrument_csv_urls, max_instruments
-[questdb]     # host "localhost", http_port 9000, pg_port 8812, ilp_port 9009
+[questdb]     # host "dlt-questdb", http_port 9000, pg_port 8812, ilp_port 9009
 [valkey]      # host "dlt-valkey", port 6379, max_connections 16
 [prometheus]  # host "dlt-prometheus", port 9090
 [websocket]   # ping 10s, pong_timeout 10s, reconnect backoff, batch_size 100
@@ -243,15 +243,15 @@ Disconnect (10):      Header + [code:u16LE]
 CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT paise).
 ```
 
-## Test Counts (463 total)
+## Test Counts (477 total)
 
 | Crate | Tests |
 |-------|-------|
 | common | 88 |
-| core | 335 |
+| core | 349 |
 | storage | 37 |
 | api | 3 |
-| **Total** | **463** |
+| **Total** | **477** |
 
 ## QuestDB Tables (5) — DEDUP UPSERT KEYS enabled on all
 

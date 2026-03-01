@@ -19,11 +19,11 @@ paths:
 - Log duplicates at WARN
 
 ## Position Reconciliation
-- Run after every fill — mismatch = halt trading + alert immediately
-- End-of-day (15:35 IST): Dhan orders vs OMS, flag mismatches as CRITICAL
+- After every fill: mismatch = halt trading + alert. End-of-day 15:35 IST: full Dhan vs OMS reconciliation.
+- Both reconciliation types flag mismatches as CRITICAL
 
 ## Retention
-- 5 years minimum (SEBI). QuestDB hot: 90 days. S3 cold: 5 years.
+- 5 years minimum (SEBI). QuestDB hot: 90 days ticks, all orders forever. S3 cold: 5 years.
 
 ## Safety
 - SEV-1/SEV-2: halt trading FIRST, diagnose second

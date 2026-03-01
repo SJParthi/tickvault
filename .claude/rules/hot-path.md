@@ -7,7 +7,7 @@ paths:
 
 # Hot Path Rules — Zero Allocation Enforcement
 
-Violations are bugs. When `crates/websocket/` and `crates/oms/` are created, add them to paths above.
+Violations are bugs. When `crates/oms/` is created, add it to paths above.
 
 ## Mandatory (hooks enforce mechanically at commit)
 - Zero heap allocation: no Box, Vec::new(), String::new(), format!(), .collect() on hot path

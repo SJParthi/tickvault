@@ -66,4 +66,4 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 ## CURRENT CONTEXT
 
 **Phase:** Phase 1 — Live Trading System → `docs/phases/PHASE_1_LIVE_TRADING.md`
-**Boot sequence:** Config → Auth → WebSocket → Parse → Route → Indicators → State → OMS → Persist → Cache → HTTP → Metrics → Logs
+**Boot sequence:** CryptoProvider → Config → Logging → Auth → QuestDB → Universe → WebSocket → TickProcessor → API → TokenRenewal → Shutdown

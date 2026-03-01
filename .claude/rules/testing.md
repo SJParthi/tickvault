@@ -11,6 +11,11 @@ paths:
 1. `cargo fmt` — format all code
 2. `cargo clippy -- -D warnings` — zero warnings
 3. `cargo test` — 100% pass
+4. `cargo audit` — zero known CVEs
+
+## CI Pipeline Order
+Compile → Lint → Test → Security → Performance → Coverage
+Any failure = RED. No exceptions.
 
 ## Test Naming
 ```

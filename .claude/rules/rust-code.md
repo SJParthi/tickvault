@@ -27,8 +27,10 @@ paths:
 
 ## Secrets & Infrastructure
 - All secrets from AWS SSM Parameter Store (`Secret<String>`, zeroize on drop)
+- SSM naming: `/dlt/<env>/<service>/<key>` (always real AWS, never mocks)
+- Dhan JWT: 24h cycle, refresh at 23h, arc-swap atomic swap
 - No localhost — use Docker DNS hostnames
-- Failures = halt + alert, never fail silent
+- Failures = escalated response (alert → retry → halt), never fail silent. See reference docs for specific protocols.
 
 ## Deep Reference
 - Logging: `docs/reference/logging_standards.md`
