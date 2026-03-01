@@ -13,11 +13,12 @@
 #   1. Installs Rust toolchain (reads rust-toolchain.toml)
 #   2. Installs quality gate tools (cargo-audit, cargo-deny, etc.)
 #   3. Sets up git hooks (pre-commit, pre-push, commit-msg)
-#   4. Starts Docker infrastructure (8 services) — fails fast if Docker not running
-#   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana)
-#   6. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
-#   7. Verifies secrets in real AWS SSM + sends test Telegram notification
-#   8. Verifies cargo check + cargo test
+#   4. Provisions + fetches infrastructure credentials from AWS SSM (QuestDB, Grafana)
+#   5. Starts Docker infrastructure (8 services) — fails fast if Docker not running
+#   6. Waits for services to be healthy (QuestDB, Prometheus, Grafana)
+#   7. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
+#   8. Verifies secrets in real AWS SSM + sends test Telegram notification
+#   9. Verifies cargo check + cargo test
 #
 # After this: open IntelliJ and start working. Zero manual config.
 # =============================================================================
@@ -37,7 +38,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # ---- Step 1: Rust Toolchain ----
-echo -e "${CYAN}[1/8]${NC} Installing Rust toolchain..."
+echo -e "${CYAN}[1/9]${NC} Installing Rust toolchain..."
 if command -v rustup > /dev/null 2>&1; then
     rustup show active-toolchain
     echo -e "  ${GREEN}Rust toolchain ready${NC}"
@@ -49,7 +50,7 @@ fi
 echo ""
 
 # ---- Step 2: Quality Tools ----
-echo -e "${CYAN}[2/8]${NC} Installing quality gate tools..."
+echo -e "${CYAN}[2/9]${NC} Installing quality gate tools..."
 
 install_tool() {
     local tool_name="$1"
@@ -75,14 +76,56 @@ install_tool "typos" "typos-cli"
 echo ""
 
 # ---- Step 3: Git Hooks ----
-echo -e "${CYAN}[3/8]${NC} Setting up git hooks..."
+echo -e "${CYAN}[3/9]${NC} Setting up git hooks..."
 git config core.hooksPath scripts/git-hooks
 chmod +x scripts/git-hooks/*
 echo -e "  ${GREEN}Git hooks configured${NC} (pre-commit, pre-push, commit-msg)"
 echo ""
 
-# ---- Step 4: Docker Infrastructure ----
-echo -e "${CYAN}[4/8]${NC} Starting Docker infrastructure..."
+# ---- Step 4: Provision + Fetch Infrastructure Credentials from SSM ----
+echo -e "${CYAN}[4/9]${NC} Provisioning infrastructure credentials in AWS SSM..."
+
+REGION="ap-south-1"
+SSM_ENV="${ENVIRONMENT:-dev}"
+
+fetch_ssm_secret() {
+    local name="$1"
+    aws ssm get-parameter \
+        --region "${REGION}" \
+        --name "${name}" \
+        --with-decryption \
+        --output text \
+        --query "Parameter.Value" \
+        --no-cli-pager 2>/dev/null
+}
+
+if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
+    echo -e "  ${RED}AWS credentials not configured!${NC}"
+    echo -e "  ${RED}Run: aws configure --region ${REGION}${NC}"
+    echo -e "  ${RED}All credentials come from real AWS SSM. No exceptions.${NC}"
+    exit 1
+fi
+
+# Auto-create QuestDB + Grafana secrets if they don't exist (idempotent)
+ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
+
+# Fetch credentials and export for docker-compose
+echo -n "  Exporting QuestDB credentials... "
+DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
+DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
+export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD
+echo -e "${GREEN}OK${NC}"
+
+echo -n "  Exporting Grafana credentials... "
+DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
+DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
+export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
+echo -e "${GREEN}OK${NC}"
+
+echo ""
+
+# ---- Step 5: Docker Infrastructure ----
+echo -e "${CYAN}[5/9]${NC} Starting Docker infrastructure..."
 if ! command -v docker > /dev/null 2>&1; then
     echo -e "  ${RED}Docker CLI not found!${NC}"
     echo "  Install Docker Desktop: https://docker.com/products/docker-desktop"
@@ -110,7 +153,7 @@ echo -e "  ${GREEN}Docker services starting${NC}"
 echo ""
 
 # ---- Step 5: Wait for Health ----
-echo -e "${CYAN}[5/8]${NC} Waiting for services to be healthy..."
+echo -e "${CYAN}[6/9]${NC} Waiting for services to be healthy..."
 
 wait_for_service() {
     local name="$1"
@@ -146,7 +189,7 @@ fi
 echo ""
 
 # ---- Step 6: QuestDB Table Initialization ----
-echo -e "${CYAN}[6/8]${NC} Initializing QuestDB tables..."
+echo -e "${CYAN}[7/9]${NC} Initializing QuestDB tables..."
 QUESTDB_EXEC_URL="http://localhost:9000/exec"
 
 init_questdb_table() {
@@ -165,7 +208,7 @@ init_questdb_table "ticks" "${TICKS_DDL}"
 echo ""
 
 # ---- Step 7: Verify Secrets in Real AWS SSM ----
-echo -e "${CYAN}[7/8]${NC} Verifying secrets in AWS SSM..."
+echo -e "${CYAN}[8/9]${NC} Verifying secrets in AWS SSM..."
 if [ -f "scripts/setup-secrets.sh" ]; then
     bash scripts/setup-secrets.sh
 else
@@ -174,7 +217,7 @@ fi
 echo ""
 
 # ---- Step 8: Verify ----
-echo -e "${CYAN}[8/8]${NC} Verifying build..."
+echo -e "${CYAN}[9/9]${NC} Verifying build..."
 echo -n "  Compiling workspace... "
 if cargo check --workspace > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"

@@ -37,4 +37,4 @@ pub mod totp_generator;
 pub mod types;
 
 pub use token_manager::{TokenHandle, TokenManager};
-pub use types::{DhanCredentials, TokenState};
+pub use types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials, TokenState};
