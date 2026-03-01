@@ -381,6 +381,16 @@ impl ApplicationConfig {
             bail!("websocket.reconnect_max_attempts must be > 0");
         }
 
+        // Dhan: max_websocket_connections must be positive (prevents division-by-zero in pool).
+        if self.dhan.max_websocket_connections == 0 {
+            bail!("dhan.max_websocket_connections must be > 0");
+        }
+
+        // WebSocket: pong_timeout_secs must be positive (used in read timeout calculation).
+        if self.websocket.pong_timeout_secs == 0 {
+            bail!("websocket.pong_timeout_secs must be > 0");
+        }
+
         // Notification: send timeout must be positive.
         if self.notification.send_timeout_ms == 0 {
             bail!("notification.send_timeout_ms must be > 0");
@@ -644,5 +654,21 @@ mod tests {
         let mut config = make_valid_config();
         config.websocket.subscription_batch_size = 1;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dhan_zero_max_websocket_connections_fails() {
+        let mut config = make_valid_config();
+        config.dhan.max_websocket_connections = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_websocket_connections"));
+    }
+
+    #[test]
+    fn test_websocket_zero_pong_timeout_fails() {
+        let mut config = make_valid_config();
+        config.websocket.pong_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("pong_timeout_secs"));
     }
 }
