@@ -13,7 +13,7 @@
 #   1. Installs Rust toolchain (reads rust-toolchain.toml)
 #   2. Installs quality gate tools (cargo-audit, cargo-deny, etc.)
 #   3. Sets up git hooks (pre-commit, pre-push, commit-msg)
-#   4. Starts Docker infrastructure (9 services) — fails fast if Docker not running
+#   4. Starts Docker infrastructure (8 services) — fails fast if Docker not running
 #   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana)
 #   6. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
 #   7. Verifies secrets in real AWS SSM + sends test Telegram notification

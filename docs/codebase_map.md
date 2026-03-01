@@ -78,7 +78,7 @@ dhan-live-trader/
 │   └── app/
 │       └── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → Universe → Subscription → WS → Parse → Persist → HTTP
 ├── deploy/docker/
-│   ├── docker-compose.yml              # 9 services, all SHA256-pinned, health-checked
+│   ├── docker-compose.yml              # 8 services, all SHA256-pinned, health-checked
 │   ├── prometheus/prometheus.yml       # Scrape targets: app:9091, questdb:9003
 │   ├── loki/loki-config.yml            # TSDB schema, 30d retention
 │   ├── alloy/alloy-config.alloy        # Docker log discovery → Loki

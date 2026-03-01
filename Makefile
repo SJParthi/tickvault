@@ -88,7 +88,7 @@ clean: ## Clean build artifacts
 # DOCKER INFRASTRUCTURE
 # =============================================================================
 
-docker-up: ## Start all Docker infrastructure (9 services)
+docker-up: ## Start all Docker infrastructure (8 services)
 	@echo "🐳 Starting Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ""
