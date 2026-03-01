@@ -301,58 +301,6 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: "1.93.1"
-          components: llvm-tools-preview
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Run coverage (workspace — report + ratchet toward 99%)
-        run: |
-          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json 2>&1 || true
-          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info 2>&1 || true
-          # Extract line coverage percentage and report
-          COV_PCT=$(python3 -c "
-          import json, sys
-          try:
-              data = json.load(open('target/llvm-cov/coverage.json'))
-              totals = data['data'][0]['totals']['lines']
-              pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
-              print(f'{pct:.1f}')
-          except Exception as e:
-              print('0.0', file=sys.stderr)
-              print('0.0')
-          " 2>/dev/null)
-          echo "Workspace line coverage: ${COV_PCT}%"
-          if python3 -c "exit(0 if float('$COV_PCT') >= 99.0 else 1)" 2>/dev/null; then
-            echo "Coverage meets 99% target"
-          else
-            echo "::warning::Coverage ${COV_PCT}% is below 99% target — ratcheting up"
-          fi
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-report
-          path: target/llvm-cov/
-          retention-days: 30
-
-  # ---- Stage 7: Audit (parallel after test) ----
-  audit:
-    name: "Stage 7 — Audit"
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: "1.93.1"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
