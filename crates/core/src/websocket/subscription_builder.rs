@@ -70,7 +70,7 @@ pub fn build_subscription_messages(
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
-            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible serialize
         })
         .collect()
     // O(1) EXEMPT: end
@@ -102,7 +102,7 @@ pub fn build_unsubscription_messages(
                 instrument_count: chunk.len(),
                 instrument_list: chunk.to_vec(),
             };
-            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail")
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible serialize
         })
         .collect()
     // O(1) EXEMPT: end

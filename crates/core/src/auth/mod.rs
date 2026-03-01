@@ -27,7 +27,7 @@
 //!
 //! // In WebSocket client or REST caller (O(1) read):
 //! let guard = token_handle.load();
-//! let token = guard.as_ref().as_ref().expect("token must exist");
+//! let token = guard.as_ref().as_ref().expect("token must exist"); // APPROVED: doc example
 //! let auth_header = token.access_token().expose_secret();
 //! ```
 

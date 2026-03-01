@@ -333,7 +333,7 @@ impl WebSocketConnection {
         // Reunite for the read loop.
         // APPROVED: reuniting same split — cannot fail
         #[allow(clippy::expect_used)]
-        Ok(read.reunite(write).expect("reunite same stream"))
+        Ok(read.reunite(write).expect("reunite same stream")) // APPROVED: reuniting same split — cannot fail
     }
     // O(1) EXEMPT: end
 
