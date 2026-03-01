@@ -5,12 +5,13 @@
 # All 6 stages must pass. Failure = build is RED. No merging.
 #
 # Stages:
-#   1. Compile    — cargo build --release
-#   2. Lint       — cargo fmt --check + cargo clippy -D warnings
+#   1. Compile    — cargo build --release + binary size check
+#   2. Lint       — cargo fmt + clippy (trading safety) + docs + typos + unused deps
 #   3. Test       — cargo test --workspace
 #   4. Security   — cargo deny check (advisories, licenses, bans, sources)
-#   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
-#   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
+#   5. Perf       — cargo bench + budget gate + DHAT (parallel after test)
+#   6. Coverage   — cargo llvm-cov (enforce 99% threshold) (parallel after test)
+#   7. Audit      — cargo audit --deny yanked --deny warnings (parallel after test)
 #
 # Security: All actions pinned to SHA. No mutable tags.
 # =============================================================================
@@ -37,6 +38,37 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ---- Commit Lint (parallel, no deps) ----
+  commit-lint:
+    name: "Commit Lint"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate conventional commit messages
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          PATTERN='^(Merge|Revert) |^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+'
+          FAILED=0
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            if ! echo "$msg" | grep -qE "$PATTERN"; then
+              echo "BAD: $msg"
+              FAILED=1
+            fi
+          done < <(git log "$BASE".."$HEAD" --format='%s')
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "Commit messages must follow: <type>(<scope>): <description>"
+            echo "Valid types: feat, fix, refactor, test, docs, chore, perf, security"
+            exit 1
+          fi
+          echo "All commit messages follow conventional format."
+
   # ---- Stage 1: Compile ----
   compile:
     name: "Stage 1 — Compile"
@@ -58,6 +90,9 @@ jobs:
       - name: Build (release)
         run: cargo build --release --workspace
 
+      - name: Binary size gate (<15MB scratch Docker constraint)
+        run: bash scripts/binary-size-gate.sh
+
   # ---- Stage 2: Lint ----
   lint:
     name: "Stage 2 — Lint"
@@ -78,8 +113,36 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy (warnings = errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
+      - name: Run clippy (warnings = errors + trading safety lints)
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -D warnings \
+            -W clippy::perf \
+            -W clippy::arithmetic_side_effects \
+            -W clippy::indexing_slicing \
+            -W clippy::as_conversions
+
+      - name: Check docs compile (warnings = errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace
+
+      - name: Install typos-cli
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # typos-cli
+        with:
+          tool: typos-cli
+
+      - name: Spell check (typos)
+        run: typos .
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-machete
+        with:
+          tool: cargo-machete
+
+      - name: Unused dependency check
+        run: cargo machete
 
   # ---- Stage 3: Test ----
   test:
@@ -147,9 +210,61 @@ jobs:
             echo "No benchmark files found — skipping."
           fi
 
+      - name: Benchmark budget gate (latency budgets + regression check)
+        run: bash scripts/bench-gate.sh
+
+      - name: DHAT zero-allocation check (if dhat tests exist)
+        run: |
+          DHAT_TESTS=$(grep -r 'dhat' crates/ --include='*.rs' -l 2>/dev/null | head -1)
+          if [ -n "$DHAT_TESTS" ]; then
+            cargo test --workspace -- --test-threads=1 dhat
+          else
+            echo "No DHAT tests found — skipping."
+          fi
+
   # ---- Stage 6: Coverage (parallel after test) ----
   coverage:
     name: "Stage 6 — Coverage"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: "1.93.1"
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run coverage (workspace — 99% threshold)
+        run: cargo llvm-cov --workspace --fail-under-lines 99
+
+      - name: Generate coverage report (lcov + JSON)
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
+
+      - name: Per-crate coverage gate
+        run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-report
+          path: target/llvm-cov/
+          retention-days: 30
+
+  # ---- Stage 7: Audit (parallel after test) ----
+  audit:
+    name: "Stage 7 — Audit"
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -163,15 +278,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@0e89f6b1568a820d57d5f00f4913ab2f19727afd # cargo-tarpaulin
-
-      - name: Run coverage
-        run: cargo tarpaulin --workspace --out Xml --output-dir target/tarpaulin
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-audit
         with:
-          name: coverage-report
-          path: target/tarpaulin/
-          retention-days: 30
+          tool: cargo-audit
+
+      - name: Audit (CVEs + yanked crates)
+        run: cargo audit --deny warnings --deny yanked

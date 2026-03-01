@@ -211,10 +211,11 @@ while IFS= read -r msg; do
 done <<< "$COMMITS"
 
 if [ -n "$BAD_MSGS" ]; then
-  echo "  WARN: Non-conventional commit messages found:" >&2
+  echo "  FAIL: Non-conventional commit messages found:" >&2
   echo -e "$BAD_MSGS" >&2
   echo "  Expected: <type>(<scope>): <description>" >&2
-  # Warning only, not blocking — merge commits from syncs are common
+  echo "  Valid types: feat, fix, refactor, test, docs, chore, perf, security" >&2
+  FAILED=1
 else
   echo "  PASS: All commit messages follow convention" >&2
 fi

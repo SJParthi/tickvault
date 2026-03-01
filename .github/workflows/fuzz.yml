@@ -1,0 +1,89 @@
+# =============================================================================
+# dhan-live-trader — Fuzz Testing (Nightly Scheduled)
+# =============================================================================
+# Runs cargo-fuzz targets nightly. Creates GitHub issue on crash.
+# Catches panic/crash bugs from malformed input (WebSocket frames, configs).
+# =============================================================================
+
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily 2 AM UTC
+  workflow_dispatch:       # Allow manual trigger
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: "Fuzz Targets"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [tick_parser, config_parser]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly toolchain (required by cargo-fuzz)
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-fuzz
+        with:
+          tool: cargo-fuzz
+
+      - name: Check fuzz directory exists
+        id: check
+        run: |
+          if [ -d "fuzz" ] && [ -f "fuzz/Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No fuzz targets configured yet — skipping."
+          fi
+
+      - name: Run fuzz target (${{ matrix.target }})
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          # Run for 5 minutes per target
+          timeout 300 cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 || {
+            EXIT_CODE=$?
+            if [ "$EXIT_CODE" -eq 124 ]; then
+              echo "Fuzz run completed (timeout reached — no crashes found)"
+            else
+              echo "Fuzz run found a crash!"
+              exit 1
+            fi
+          }
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 90
+
+      - name: Create issue on crash
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔴 Fuzz: Crash in ${{ matrix.target }}`,
+              body: `Nightly fuzz testing found a crash in target \`${{ matrix.target }}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCrash artifacts uploaded — reproduce with:\n\`\`\`\ncargo +nightly fuzz run ${{ matrix.target }}\n\`\`\``,
+              labels: ['bug', 'fuzz', 'critical']
+            });

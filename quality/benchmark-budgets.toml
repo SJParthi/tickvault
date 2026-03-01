@@ -1,0 +1,27 @@
+# =============================================================================
+# dhan-live-trader — Benchmark Latency Budgets
+# =============================================================================
+# Used by: scripts/bench-gate.sh (CI Stage 5)
+# Source: docs/reference/quality_gates.md Gate 5a
+#
+# Each entry: benchmark_name = max_ns (nanoseconds)
+# >5% regression from previous baseline = FAIL
+# Exceeding absolute budget = FAIL
+# =============================================================================
+
+# Maximum allowed regression percentage from baseline
+max_regression_pct = 5.0
+
+[budgets]
+# Core crate — hot path
+tick_binary_parse        = 10           # <10ns
+tick_pipeline_routing    = 100          # <100ns
+papaya_lookup            = 50           # <50ns
+full_tick_processing     = 10000        # <10μs = 10,000ns
+
+# Trading crate — OMS
+oms_state_transition     = 100          # <100ns
+
+# Common crate
+market_hour_validation   = 50           # <50ns
+config_toml_load         = 10000000     # <10ms = 10,000,000ns
