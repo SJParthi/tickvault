@@ -8,8 +8,8 @@
 # Usage: ./scripts/quality-full.sh
 #
 # Stages:
-#   1. Compile     — cargo build --release
-#   2. Lint        — cargo fmt --check + cargo clippy
+#   1. Compile     — cargo build --release --workspace
+#   2. Lint        — cargo fmt --check + cargo clippy + banned-pattern scan
 #   3. Test        — cargo test --workspace
 #   4. Security    — cargo audit + cargo deny check
 #   5. Performance — cargo bench --workspace (if benchmarks exist)
@@ -49,7 +49,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # Stage 1: Compile
-run_stage "1/6" "Compile" "cargo build --release"
+run_stage "1/6" "Compile" "cargo build --release --workspace"
 
 # Stage 2: Lint
 run_stage "2/6" "Format Check" "cargo fmt --all -- --check"
