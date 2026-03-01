@@ -1,0 +1,138 @@
+# =============================================================================
+# dhan-live-trader — Safety Net (Weekly Scheduled)
+# =============================================================================
+# UB detection, memory safety, concurrency bugs.
+# Runs weekly (Monday 6 AM UTC). Creates GitHub issue on failure.
+# These checks are too slow for per-PR CI but catch deep bugs.
+#
+# Checks:
+#   1. cargo-careful test — extra debug checking with FFI support
+#   2. Sanitizers (ASan) — address sanitizer via nightly
+# =============================================================================
+
+name: Safety Net
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Monday 6 AM UTC
+  workflow_dispatch:       # Allow manual trigger
+
+permissions:
+  contents: read
+  issues: write            # Create issues on failure
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---- cargo-careful: Extra debug checks ----
+  careful:
+    name: "cargo-careful test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly toolchain (required by cargo-careful)
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-careful
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-careful
+        with:
+          tool: cargo-careful
+
+      - name: Run careful tests
+        run: cargo +nightly careful test --workspace
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔴 Safety Net: cargo-careful found issues',
+              body: `Weekly safety scan detected potential undefined behavior.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires investigation.`,
+              labels: ['bug', 'safety']
+            });
+
+  # ---- AddressSanitizer: Memory safety ----
+  sanitizer-asan:
+    name: "AddressSanitizer"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly toolchain (required by sanitizers)
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Run tests with AddressSanitizer
+        env:
+          RUSTFLAGS: "-Z sanitizer=address"
+        run: |
+          cargo +nightly test --workspace \
+            --target x86_64-unknown-linux-gnu \
+            -- --test-threads=1
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔴 Safety Net: AddressSanitizer found memory issues',
+              body: `Weekly safety scan detected memory safety issues (use-after-free, buffer overflow, etc.).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires immediate investigation.`,
+              labels: ['bug', 'safety', 'critical']
+            });
+
+  # ---- ThreadSanitizer: Data races ----
+  sanitizer-tsan:
+    name: "ThreadSanitizer"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Run tests with ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Z sanitizer=thread"
+        run: |
+          cargo +nightly test --workspace \
+            --target x86_64-unknown-linux-gnu \
+            -- --test-threads=1
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔴 Safety Net: ThreadSanitizer found data races',
+              body: `Weekly safety scan detected data race conditions.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires investigation — data races in trading systems can cause incorrect fills.`,
+              labels: ['bug', 'safety', 'critical']
+            });
