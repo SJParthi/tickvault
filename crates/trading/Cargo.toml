@@ -17,3 +17,6 @@ chrono-tz = { workspace = true }
 uuid = { workspace = true }
 governor = { workspace = true }
 statig = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "serde", "statig", "thiserror", "tokio", "tracing", "uuid"]

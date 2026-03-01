@@ -66,6 +66,24 @@ pub enum NotificationEvent {
     /// Application stopped.
     ShutdownComplete,
 
+    /// Instrument build succeeded (first build of the day).
+    InstrumentBuildSuccess {
+        /// CSV source: "primary", "fallback", or "cache".
+        source: String,
+        /// Total derivative contracts built.
+        derivative_count: usize,
+        /// Total F&O underlyings built.
+        underlying_count: usize,
+    },
+
+    /// Instrument build failed — includes manual trigger URL for retry.
+    InstrumentBuildFailed {
+        /// Error description.
+        reason: String,
+        /// URL for manual one-shot retry.
+        manual_trigger_url: String,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -100,6 +118,21 @@ impl NotificationEvent {
             Self::WebSocketReconnected { connection_index } => {
                 format!("<b>WebSocket #{connection_index} reconnected</b>")
             }
+            Self::InstrumentBuildSuccess {
+                source,
+                derivative_count,
+                underlying_count,
+            } => {
+                format!(
+                    "<b>Instruments OK</b>\nSource: {source}\nDerivatives: {derivative_count}\nUnderlyings: {underlying_count}"
+                )
+            }
+            Self::InstrumentBuildFailed {
+                reason,
+                manual_trigger_url,
+            } => {
+                format!("<b>Instruments FAILED</b>\n{reason}\n\nRetry: {manual_trigger_url}")
+            }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
             Self::Custom { message } => message.clone(),
@@ -115,6 +148,7 @@ impl NotificationEvent {
         match self {
             Self::AuthenticationFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
+            Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
             Self::Custom { .. } => Severity::High,
             Self::WebSocketReconnected { .. } => Severity::Medium,
@@ -122,6 +156,7 @@ impl NotificationEvent {
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::TokenRenewed => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,
+            Self::InstrumentBuildSuccess { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
         }
@@ -238,6 +273,32 @@ mod tests {
         };
         let msg = event.to_message();
         assert_eq!(msg, "custom alert payload");
+    }
+
+    #[test]
+    fn test_instrument_build_success_message() {
+        let event = NotificationEvent::InstrumentBuildSuccess {
+            source: "primary".to_string(),
+            derivative_count: 96948,
+            underlying_count: 214,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Instruments OK"));
+        assert!(msg.contains("primary"));
+        assert!(msg.contains("96948"));
+        assert!(msg.contains("214"));
+    }
+
+    #[test]
+    fn test_instrument_build_failed_message() {
+        let event = NotificationEvent::InstrumentBuildFailed {
+            reason: "HTTP 503 Service Unavailable".to_string(),
+            manual_trigger_url: "http://0.0.0.0:3001/api/instruments/rebuild".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Instruments FAILED"));
+        assert!(msg.contains("HTTP 503"));
+        assert!(msg.contains("/api/instruments/rebuild"));
     }
 
     // -- Severity tests --

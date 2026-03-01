@@ -29,12 +29,13 @@ use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
-use dhan_live_trader_core::instrument::{build_fno_universe, build_subscription_plan};
+use dhan_live_trader_core::instrument::{build_subscription_plan, load_or_build_instruments};
 use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::types::InstrumentSubscription;
 
+use dhan_live_trader_storage::instrument_persistence::ensure_instrument_tables;
 use dhan_live_trader_storage::tick_persistence::{
     TickPersistenceWriter, ensure_tick_table_dedup_keys,
 };
@@ -141,9 +142,10 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 5: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!("setting up QuestDB tick persistence");
+    info!("setting up QuestDB tables (ticks + instruments)");
 
     ensure_tick_table_dedup_keys(&config.questdb).await;
+    ensure_instrument_tables(&config.questdb).await;
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(writer) => {
@@ -160,18 +162,19 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6: Build F&O universe + subscription plan (best-effort)
+    // Step 6: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
-    info!("building F&O universe from instrument CSV");
+    info!("checking instrument build eligibility");
 
-    let subscription_plan = match build_fno_universe(
+    let subscription_plan = match load_or_build_instruments(
         &config.dhan.instrument_csv_url,
         &config.dhan.instrument_csv_fallback_url,
         &config.instrument,
+        &config.questdb,
     )
     .await
     {
-        Ok(universe) => {
+        Ok(Some((universe, was_fresh_build))) => {
             let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
                 .context("invalid IST offset constant")?;
             let today = Utc::now().with_timezone(&ist).date_naive();
@@ -185,15 +188,37 @@ async fn main() -> Result<()> {
                 stock_derivatives = plan.summary.stock_derivatives,
                 total = plan.summary.total,
                 feed_mode = %plan.summary.feed_mode,
+                fresh_build = was_fresh_build,
                 "subscription plan ready"
             );
+
+            if was_fresh_build {
+                notifier.notify(NotificationEvent::InstrumentBuildSuccess {
+                    source: universe.build_metadata.csv_source,
+                    derivative_count: universe.derivative_contracts.len(),
+                    underlying_count: universe.underlyings.len(),
+                });
+            }
             Some(plan)
         }
+        Ok(None) => {
+            // Time-gated skip — outside build window
+            info!("instruments: skipped (outside build window)");
+            None
+        }
         Err(err) => {
+            let trigger_url = format!(
+                "http://{}:{}/api/instruments/rebuild",
+                config.api.host, config.api.port
+            );
             warn!(
                 error = %err,
-                "F&O universe build failed — no instruments to subscribe"
+                "instrument build failed — no instruments to subscribe"
             );
+            notifier.notify(NotificationEvent::InstrumentBuildFailed {
+                reason: err.to_string(),
+                manual_trigger_url: trigger_url,
+            });
             None
         }
     };
@@ -266,7 +291,11 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9: Start axum API server
     // -----------------------------------------------------------------------
-    let api_state = SharedAppState::new(config.questdb.clone());
+    let api_state = SharedAppState::new(
+        config.questdb.clone(),
+        config.dhan.clone(),
+        config.instrument.clone(),
+    );
 
     let router = build_router(api_state);
 
@@ -313,9 +342,10 @@ async fn main() -> Result<()> {
         mode,
         "system ready — press Ctrl+C to stop\n\
          \n\
-           Health:  http://{bind_addr}/health\n\
-           Stats:   http://{bind_addr}/api/stats\n\
-           Portal:  http://{bind_addr}/portal\n"
+           Health:     http://{bind_addr}/health\n\
+           Stats:      http://{bind_addr}/api/stats\n\
+           Portal:     http://{bind_addr}/portal\n\
+           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n"
     );
 
     notifier.notify(NotificationEvent::StartupComplete { mode });
