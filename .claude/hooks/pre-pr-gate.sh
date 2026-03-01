@@ -34,10 +34,10 @@ echo "║        PRE-PR QUALITY GATE                    ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
 # ─────────────────────────────────────────────
-# Extract FIRST LINE only for flag parsing
-# (heredoc body content spans subsequent lines — must not be parsed as flags)
+# Extract first + last lines for flag parsing
+# (flags appear before --body heredoc and after its closing delimiter)
 # ─────────────────────────────────────────────
-CMD_FLAGS=$(echo "$COMMAND" | head -1)
+CMD_FLAGS=$(echo "$COMMAND" | sed -n '1p; $p' | tr '\n' ' ')
 
 # ─────────────────────────────────────────────
 # Detect --head and --base from command flags only
@@ -185,8 +185,9 @@ fi
 echo "  Checking commit message format..." >&2
 
 # Determine base branch from the PR command flags (--base flag) or default to develop
+# Re-extract CMD_FLAGS in case command was modified
 BASE_BRANCH="develop"
-BASE_FROM_CMD=$(echo "$CMD_FLAGS" | grep -oE '\-\-base[[:space:]]+([a-zA-Z0-9_/-]+)' | head -1 | awk '{print $2}')
+BASE_FROM_CMD=$(echo "$CMD_FLAGS" | grep -oE '\-\-base[[:space:]]+[a-zA-Z0-9_/-]+' | head -1 | awk '{print $2}')
 if [ -n "$BASE_FROM_CMD" ]; then
   BASE_BRANCH="$BASE_FROM_CMD"
 fi
