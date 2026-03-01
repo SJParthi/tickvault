@@ -13,7 +13,7 @@
 #   1. Installs Rust toolchain (reads rust-toolchain.toml)
 #   2. Installs quality gate tools (cargo-audit, cargo-deny, etc.)
 #   3. Sets up git hooks (pre-commit, pre-push, commit-msg)
-#   4. Fetches infrastructure credentials from AWS SSM (QuestDB, Grafana)
+#   4. Provisions + fetches infrastructure credentials from AWS SSM (QuestDB, Grafana)
 #   5. Starts Docker infrastructure (8 services) — fails fast if Docker not running
 #   6. Waits for services to be healthy (QuestDB, Prometheus, Grafana)
 #   7. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
@@ -82,8 +82,11 @@ chmod +x scripts/git-hooks/*
 echo -e "  ${GREEN}Git hooks configured${NC} (pre-commit, pre-push, commit-msg)"
 echo ""
 
-# ---- Step 4: Fetch Infrastructure Credentials from SSM ----
-echo -e "${CYAN}[4/9]${NC} Fetching infrastructure credentials from AWS SSM..."
+# ---- Step 4: Provision + Fetch Infrastructure Credentials from SSM ----
+echo -e "${CYAN}[4/9]${NC} Provisioning infrastructure credentials in AWS SSM..."
+
+REGION="ap-south-1"
+SSM_ENV="${ENVIRONMENT:-dev}"
 
 fetch_ssm_secret() {
     local name="$1"
@@ -96,28 +99,31 @@ fetch_ssm_secret() {
         --no-cli-pager 2>/dev/null
 }
 
-REGION="ap-south-1"
-SSM_ENV="${ENVIRONMENT:-dev}"
-
 if aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
-    echo -n "  Fetching QuestDB credentials... "
+    # Auto-create QuestDB + Grafana secrets if they don't exist (idempotent)
+    if [ -f "scripts/provision-infra-secrets.sh" ]; then
+        ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
+    fi
+
+    # Fetch credentials and export for docker-compose
+    echo -n "  Exporting QuestDB credentials... "
     DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user" || true)
     DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password" || true)
     if [ -n "${DLT_QUESTDB_PG_USER}" ] && [ -n "${DLT_QUESTDB_PG_PASSWORD}" ]; then
         export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD
         echo -e "${GREEN}OK${NC}"
     else
-        echo -e "${YELLOW}SKIPPED (secrets not in SSM yet — using QuestDB defaults)${NC}"
+        echo -e "${YELLOW}FALLBACK (using QuestDB defaults)${NC}"
     fi
 
-    echo -n "  Fetching Grafana credentials... "
+    echo -n "  Exporting Grafana credentials... "
     DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user" || true)
     DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password" || true)
     if [ -n "${DLT_GRAFANA_ADMIN_USER}" ] && [ -n "${DLT_GRAFANA_ADMIN_PASSWORD}" ]; then
         export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
         echo -e "${GREEN}OK${NC}"
     else
-        echo -e "${YELLOW}SKIPPED (secrets not in SSM yet — using Grafana defaults)${NC}"
+        echo -e "${YELLOW}FALLBACK (using Grafana defaults)${NC}"
     fi
 else
     echo -e "  ${YELLOW}AWS credentials not configured — using service defaults${NC}"
