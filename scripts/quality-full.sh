@@ -53,7 +53,17 @@ run_stage "1/6" "Compile" "cargo build --release"
 
 # Stage 2: Lint
 run_stage "2/6" "Format Check" "cargo fmt --all -- --check"
-run_stage "2/6" "Clippy" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
+run_stage "2/6" "Clippy (trading safety lints)" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf -W clippy::arithmetic_side_effects -W clippy::indexing_slicing -W clippy::as_conversions"
+run_stage "2/6" "Doc Warnings" "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps"
+run_stage "2/6" "Doc Tests" "cargo test --doc --workspace"
+
+if command -v typos > /dev/null 2>&1; then
+    run_stage "2/6" "Typos" "typos ."
+else
+    echo -e "${CYAN}[Stage 2/6]${NC} Typos"
+    echo -e "  ${YELLOW}SKIPPED${NC} — typos not installed"
+    echo ""
+fi
 
 # Stage 3: Test
 run_stage "3/6" "Tests" "cargo test --workspace"

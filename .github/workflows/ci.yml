@@ -37,6 +37,37 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ---- Commit Lint (parallel, no deps) ----
+  commit-lint:
+    name: "Commit Lint"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate conventional commit messages
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          PATTERN='^(Merge|Revert) |^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+'
+          FAILED=0
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            if ! echo "$msg" | grep -qE "$PATTERN"; then
+              echo "BAD: $msg"
+              FAILED=1
+            fi
+          done < <(git log "$BASE".."$HEAD" --format='%s')
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "Commit messages must follow: <type>(<scope>): <description>"
+            echo "Valid types: feat, fix, refactor, test, docs, chore, perf, security"
+            exit 1
+          fi
+          echo "All commit messages follow conventional format."
+
   # ---- Stage 1: Compile ----
   compile:
     name: "Stage 1 — Compile"
@@ -78,8 +109,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy (warnings = errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
+      - name: Run clippy (warnings = errors + trading safety lints)
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -D warnings \
+            -W clippy::perf \
+            -W clippy::arithmetic_side_effects \
+            -W clippy::indexing_slicing \
+            -W clippy::as_conversions
+
+      - name: Check docs compile (warnings = errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace
+
+      - name: Install typos-cli
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # typos-cli
+        with:
+          tool: typos-cli
+
+      - name: Spell check (typos)
+        run: typos .
 
   # ---- Stage 3: Test ----
   test:
