@@ -1025,4 +1025,181 @@ mod tests {
             "Duplicate security_ids after progressive fill"
         );
     }
+
+    #[test]
+    fn test_plan_stage2_nearest_expiry_prioritized() {
+        // Universe with 2 expiry dates — Stage 2 should fill nearest first
+        let mut universe = make_test_universe();
+        let near_expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+        let far_expiry = NaiveDate::from_ymd_opt(2026, 4, 24).unwrap();
+
+        // Add RELIANCE contracts for far expiry (new security IDs)
+        let far_future_id = 70001;
+        universe.derivative_contracts.insert(
+            far_future_id,
+            DerivativeContract {
+                security_id: far_future_id,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: far_expiry,
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-24APR26-FUT".to_string(),
+                display_name: "RELIANCE FUT Apr26".to_string(),
+            },
+        );
+        for i in 0..3u32 {
+            let ce_id = 70100 + i;
+            universe.derivative_contracts.insert(
+                ce_id,
+                DerivativeContract {
+                    security_id: ce_id,
+                    underlying_symbol: "RELIANCE".to_string(),
+                    instrument_kind: DhanInstrumentKind::OptionStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: far_expiry,
+                    strike_price: 2600.0 + (i as f64) * 50.0,
+                    option_type: Some(OptionType::Call),
+                    lot_size: 250,
+                    tick_size: 0.05,
+                    symbol_name: format!("RELIANCE-24APR26-{}-CE", 2600 + i * 50),
+                    display_name: format!("RELIANCE {} CE Apr26", 2600 + i * 50),
+                },
+            );
+        }
+
+        // Add far expiry to calendar
+        universe
+            .expiry_calendars
+            .get_mut("RELIANCE")
+            .unwrap()
+            .expiry_dates
+            .push(far_expiry);
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // Stage 1 subscribes near expiry ATM+-N (all 11 RELIANCE near contracts).
+        // Stage 2 should add far expiry contracts (future + 3 CE = 4).
+        // Verify far expiry contracts are present in plan.
+        assert!(
+            plan.registry.get(far_future_id).is_some(),
+            "Far expiry future should be in plan via Stage 2"
+        );
+        assert!(
+            plan.registry.get(70100).is_some(),
+            "Far expiry CE should be in plan via Stage 2"
+        );
+
+        // Total stock derivatives should include both near (11) + far (4) = 15
+        assert_eq!(plan.summary.stock_derivatives, 15);
+    }
+
+    #[test]
+    fn test_plan_stock_option_chain_calls_only() {
+        // Chain with calls but empty puts
+        let mut universe = make_test_universe();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+
+        // Add a new stock "INFY" with calls only (no puts)
+        universe.underlyings.insert(
+            "INFY".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "INFY".to_string(),
+                underlying_security_id: 26002,
+                price_feed_security_id: 1594,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 300,
+                contract_count: 3,
+            },
+        );
+
+        // INFY future
+        let infy_fut_id = 80001;
+        universe.derivative_contracts.insert(
+            infy_fut_id,
+            DerivativeContract {
+                security_id: infy_fut_id,
+                underlying_symbol: "INFY".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: expiry,
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 300,
+                tick_size: 0.05,
+                symbol_name: "INFY-27MAR26-FUT".to_string(),
+                display_name: "INFY FUT Mar26".to_string(),
+            },
+        );
+
+        // 3 INFY calls, NO puts
+        let mut infy_calls = Vec::new();
+        for i in 0..3u32 {
+            let ce_id = 80100 + i;
+            universe.derivative_contracts.insert(
+                ce_id,
+                DerivativeContract {
+                    security_id: ce_id,
+                    underlying_symbol: "INFY".to_string(),
+                    instrument_kind: DhanInstrumentKind::OptionStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: expiry,
+                    strike_price: 1500.0 + (i as f64) * 50.0,
+                    option_type: Some(OptionType::Call),
+                    lot_size: 300,
+                    tick_size: 0.05,
+                    symbol_name: format!("INFY-27MAR26-{}-CE", 1500 + i * 50),
+                    display_name: format!("INFY {} CE Mar26", 1500 + i * 50),
+                },
+            );
+            infy_calls.push(OptionChainEntry {
+                security_id: ce_id,
+                strike_price: 1500.0 + (i as f64) * 50.0,
+                lot_size: 300,
+            });
+        }
+
+        let infy_chain_key = OptionChainKey {
+            underlying_symbol: "INFY".to_string(),
+            expiry_date: expiry,
+        };
+        universe.option_chains.insert(
+            infy_chain_key,
+            OptionChain {
+                underlying_symbol: "INFY".to_string(),
+                expiry_date: expiry,
+                calls: infy_calls,
+                puts: vec![], // NO puts
+                future_security_id: Some(infy_fut_id),
+            },
+        );
+        universe.expiry_calendars.insert(
+            "INFY".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "INFY".to_string(),
+                expiry_dates: vec![expiry],
+            },
+        );
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // INFY: 1 future + 3 CE + 0 PE = 4 (Stage 1 ATM+-10 covers all 3 calls)
+        // Verify INFY instruments are in the plan
+        assert!(plan.registry.get(infy_fut_id).is_some(), "INFY future");
+        assert!(plan.registry.get(80100).is_some(), "INFY CE 1");
+        assert!(plan.registry.get(80101).is_some(), "INFY CE 2");
+        assert!(plan.registry.get(80102).is_some(), "INFY CE 3");
+
+        // INFY equity feed
+        assert!(plan.registry.get(1594).is_some(), "INFY equity");
+    }
 }

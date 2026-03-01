@@ -885,4 +885,37 @@ mod tests {
         );
         assert_eq!(conn.cached_subscription_messages.len(), 50);
     }
+
+    #[test]
+    fn test_cached_messages_mixed_idx_and_non_idx() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 26),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1001),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full, // Non-IDX gets Full (21), IDX_I gets Ticker (15)
+            tx,
+        );
+        // 2 non-IDX → 1 Full message, 2 IDX_I → 1 Ticker message = 2 total
+        assert_eq!(conn.cached_subscription_messages.len(), 2);
+        let has_full = conn
+            .cached_subscription_messages
+            .iter()
+            .any(|m| m.contains("\"RequestCode\":21"));
+        let has_ticker = conn
+            .cached_subscription_messages
+            .iter()
+            .any(|m| m.contains("\"RequestCode\":15"));
+        assert!(has_full, "Should have Full mode message for NseFno");
+        assert!(has_ticker, "Should have Ticker mode message for IdxI");
+    }
 }
