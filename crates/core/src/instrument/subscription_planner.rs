@@ -1030,7 +1030,7 @@ mod tests {
     fn test_plan_stage2_nearest_expiry_prioritized() {
         // Universe with 2 expiry dates — Stage 2 should fill nearest first
         let mut universe = make_test_universe();
-        let near_expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+        // near_expiry = 2026-03-27 is already in make_test_universe()
         let far_expiry = NaiveDate::from_ymd_opt(2026, 4, 24).unwrap();
 
         // Add RELIANCE contracts for far expiry (new security IDs)
