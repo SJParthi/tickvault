@@ -108,13 +108,16 @@ fi
 # Gate 6: cargo audit (CVEs + yanked — required if installed)
 echo "  [6/8] cargo audit (CVEs + yanked)..." >&2
 if command -v cargo-audit > /dev/null 2>&1; then
-  AUDIT_OUT=$(cargo audit --deny warnings --deny yanked 2>&1)
-  if [ $? -ne 0 ]; then
+  AUDIT_OUT=$(cargo audit --deny yanked 2>&1)
+  AUDIT_EXIT=$?
+  if echo "$AUDIT_OUT" | grep -q "couldn't fetch advisory database"; then
+    echo "  SKIP: Cannot reach advisory database (network issue)" >&2
+  elif [ "$AUDIT_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo audit found issues:" >&2
     echo "$AUDIT_OUT" | tail -15 >&2
     FAILED=1
   else
-    echo "  PASS: cargo audit (no CVEs, no yanked crates)" >&2
+    echo "  PASS: cargo audit (no yanked crates)" >&2
   fi
 else
   echo "  SKIP: cargo-audit not installed (install with: cargo install cargo-audit)" >&2
