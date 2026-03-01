@@ -1,6 +1,7 @@
 # Quality Gates — Full Reference
 
-> Extracted from CLAUDE.md. Reference when setting up CI, writing tests, or benchmarking.
+> Rules summary: `.claude/rules/testing.md` + `.claude/rules/hot-path.md` (auto-loaded).
+> This doc is for deep implementation detail only — CI pipeline, lint config, benchmark baselines.
 
 ## Gate 1: Compile-Time Lint Gates (every lib.rs)
 ```rust
@@ -20,32 +21,12 @@
 ```
 **Exceptions:** `app` crate main.rs may use `unwrap`. Test modules may use `unwrap`/`panic`.
 
-## Gate 2: Test Coverage Thresholds
-| Crate | Min Coverage |
-|-------|-------------|
-| core | 95% |
-| trading | 95% |
-| common | 90% |
-| storage | 90% |
-| api | 90% |
-| app | 80% |
+## Gate 2: Test Coverage & Types
+
+Coverage thresholds and required test types: see `.claude/rules/testing.md` (auto-loaded).
 
 **Tool:** cargo-tarpaulin with `--out Xml`. Coverage exclusions ONLY on generated code/FFI.
-
-## Required Test Types
-| Type | When Required |
-|------|---------------|
-| Unit | Every function |
-| Integration | Every module boundary |
-| Property-based | Parsers, serializers, math |
-| Boundary | All numeric operations |
-| Error path | Every Result-returning function |
-| Concurrency (Loom) | All shared state |
-| Benchmark (Criterion) | All hot-path functions |
-| Fuzz (cargo-fuzz) | All external input |
-| Heap (dhat) | All hot-path functions |
-
-**Test naming:** `fn test_<module>_<function>_<scenario>_<expected_outcome>()`
+**Heap profiling:** dhat for all hot-path functions (in addition to Criterion benchmarks).
 
 ## Gate 4: CI Pipeline (6 stages)
 ```

@@ -99,10 +99,6 @@
           {
             "type": "command",
             "command": "FILE=$(cat | jq -r '.tool_input.file_path // empty'); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.rs$'; then rustfmt \"$FILE\" 2>/dev/null || true; fi"
-          },
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/hot-path-guard.sh"
           }
         ]
       }
@@ -123,7 +119,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'COMPACTION REMINDER: Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. Run cargo fmt + clippy + test before committing. Banned: .clone()/DashMap/dyn on hot path, cargo update, .env files, localhost, hardcoded values, println!/unwrap in prod. Check current phase doc for context.'"
+            "command": "echo 'POST-COMPACTION: Re-read CLAUDE.md. Three principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned. Check current phase doc.'"
           }
         ]
       }
@@ -133,7 +129,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'SUBAGENT CONTEXT: dhan-live-trader is a Rust 2024 O(1) latency trading system. Three principles: (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned. No .clone()/DashMap/dyn on hot path. Use papaya, enum_dispatch, zerocopy. All versions from Tech Stack Bible V6 only.'"
+            "command": "echo 'SUBAGENT: Rust 2024 O(1) trading system. Principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned. Hooks enforce banned patterns at commit.'"
           }
         ]
       }
@@ -143,7 +139,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'PRE-COMPACTION: Preserve in summary: (1) current phase and what was built (2) list of all modified files (3) any failing tests or unresolved errors (4) the three principles (5) cargo/git commands that were run and their results'"
+            "command": "echo 'PRESERVE: (1) modified files list (2) test/build results (3) phase progress (4) unresolved errors (5) three principles'"
           }
         ]
       }

@@ -314,14 +314,6 @@
             <span class="card-badge badge-infra">PROXY</span>
         </a>
 
-        <a class="card" href="http://localhost:4566/_localstack/health" target="_blank">
-            <div class="card-icon">☁️</div>
-            <div class="card-title">LocalStack</div>
-            <div class="card-desc">AWS SSM Parameter Store emulator for dev. Stores Dhan credentials, Telegram tokens. Real AWS in prod.</div>
-            <div class="card-url">http://localhost:4566</div>
-            <span class="card-badge badge-infra">AWS</span>
-        </a>
-
         <div class="card">
             <div class="card-icon">💾</div>
             <div class="card-title">Valkey (Redis)</div>
@@ -336,7 +328,7 @@
         <div class="card" style="cursor:default">
             <div class="card-title" style="font-size:14px">Quick Reference</div>
             <div class="card-desc" style="line-height:2">
-                <strong style="color:var(--accent-green)">No login needed:</strong> QuestDB, Prometheus, Jaeger, Loki, Alloy, Traefik, LocalStack<br>
+                <strong style="color:var(--accent-green)">No login needed:</strong> QuestDB, Prometheus, Jaeger, Loki, Alloy, Traefik<br>
                 <strong style="color:var(--accent-yellow)">Grafana:</strong> <code style="color:#ffab00;background:#1a1a1a;padding:2px 6px;border-radius:3px">admin</code> / <code style="color:#ffab00;background:#1a1a1a;padding:2px 6px;border-radius:3px">admin</code> (change on first login)<br>
                 <strong style="color:var(--accent-blue)">Valkey (Redis):</strong> No auth (dev mode) — <code style="color:var(--accent-blue);background:#1a1a1a;padding:2px 6px;border-radius:3px">redis-cli -h localhost -p 6379</code><br>
                 <strong style="color:var(--accent-purple)">Dhan API:</strong> JWT from AWS SSM — auto-managed by app (24h rotation)
@@ -346,7 +338,7 @@
 
     <div class="footer">
         dhan-live-trader v0.1.0 &nbsp;·&nbsp; Phase 1: Environment Readiness &nbsp;·&nbsp;
-        <span id="testCount">463</span> tests passing &nbsp;·&nbsp;
+        <span id="testCount">477</span> tests passing &nbsp;·&nbsp;
         Pure tick capture backend
     </div>
 

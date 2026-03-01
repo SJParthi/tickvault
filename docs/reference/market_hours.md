@@ -1,6 +1,7 @@
 # Market Hours & Data Collection — Full Reference
 
-> Extracted from CLAUDE.md. Read when implementing time-dependent logic, trading windows, or instrument loading.
+> Rules summary: `.claude/rules/market-hours.md` (auto-loaded).
+> This doc is for deep implementation detail only — SEBI compliance, instrument build window, candle counts.
 
 ## Market Structure
 

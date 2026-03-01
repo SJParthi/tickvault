@@ -1054,7 +1054,6 @@ app → api → trading → core → storage → common
 | `dlt-loki` | Loki (Bible version) | 3100 | Log aggregation |
 | `dlt-alloy` | Grafana Alloy (Bible version) | 4317 | Log/trace collector (replaces Promtail) |
 | `dlt-jaeger` | Jaeger V2 (Bible version) | 16686, 4318 | Distributed tracing |
-| `dlt-localstack` | LocalStack (Bible version) | 4566 | AWS SSM emulation (dev only) |
 | `dlt-traefik` | Traefik (Bible version) | 80, 443, 8080 | Reverse proxy, TLS, blue-green |
 
 ### Health Check Strategy
