@@ -1,6 +1,7 @@
 # Quality Gates — Full Reference
 
-> Extracted from CLAUDE.md. Reference when setting up CI, writing tests, or benchmarking.
+> Rules summary: `.claude/rules/testing.md` + `.claude/rules/hot-path.md` (auto-loaded).
+> This doc is for deep implementation detail only — CI pipeline, lint config, benchmark baselines.
 
 ## Gate 1: Compile-Time Lint Gates (every lib.rs)
 ```rust

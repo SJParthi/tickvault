@@ -1,6 +1,7 @@
 # Secret Rotation & Token Lifecycle — Full Reference
 
-> Extracted from CLAUDE.md. Read when implementing auth, token management, or secret handling.
+> Rules summary: `.claude/rules/rust-code.md` (auto-loaded).
+> This doc is for deep implementation detail only — token lifecycle, rotation rules, SSM naming.
 
 ## Dhan Token Lifecycle
 

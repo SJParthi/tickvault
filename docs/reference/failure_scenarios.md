@@ -1,6 +1,7 @@
 # Failure Scenarios — End-to-End Test Checklist
 
-> Extracted from CLAUDE.md Gate 3. Claude Code must write tests for each scenario as it becomes relevant to the current phase.
+> No matching rules file — this is a standalone deep reference.
+> Write tests for each scenario as it becomes relevant to the current phase.
 
 ## Network Failures
 - WebSocket disconnects mid-tick → Must reconnect + resume

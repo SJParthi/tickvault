@@ -1,6 +1,7 @@
 # Data Integrity — Zero Data Loss
 
-> Extracted from CLAUDE.md. Reference when implementing persistence, orders, or reconciliation.
+> Rules summary: `.claude/rules/data-integrity.md` (auto-loaded).
+> This doc is for deep implementation detail only — QuestDB patterns, Valkey idempotency, reconciliation.
 
 ## Idempotency Rules
 Every write operation must be idempotent — running it twice produces the same result.

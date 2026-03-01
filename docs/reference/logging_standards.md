@@ -1,6 +1,7 @@
 # Logging Standards
 
-> Extracted from CLAUDE.md. Reference when implementing logging in any module.
+> Rules summary: `.claude/rules/rust-code.md` (auto-loaded).
+> This doc is for deep implementation detail only — JSON format, log levels, retention.
 
 ## Structured JSON Format (tracing-subscriber)
 ```json

@@ -1,6 +1,9 @@
 ---
 paths:
-  - "crates/**/*.rs"
+  - "crates/core/src/pipeline/**/*.rs"
+  - "crates/trading/**/*.rs"
+  - "crates/core/src/instrument/**/*.rs"
+  - "crates/app/src/main.rs"
   - "config/**/*.toml"
 ---
 
@@ -18,4 +21,6 @@ paths:
 - ALL timestamps include IST alongside any UTC
 - Market hour validation uses config values, NOT hardcoded times
 - Holiday calendar checked before every trading day
-- Full reference: `docs/reference/market_hours.md`
+
+## Deep Reference
+Read `docs/reference/market_hours.md` ONLY when implementing time-dependent logic or SEBI compliance.
