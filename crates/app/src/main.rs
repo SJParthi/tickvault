@@ -35,6 +35,7 @@ use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::types::InstrumentSubscription;
 
+use dhan_live_trader_storage::instrument_persistence::ensure_instrument_tables;
 use dhan_live_trader_storage::tick_persistence::{
     TickPersistenceWriter, ensure_tick_table_dedup_keys,
 };
@@ -141,9 +142,10 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 5: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!("setting up QuestDB tick persistence");
+    info!("setting up QuestDB tables (ticks + instruments)");
 
     ensure_tick_table_dedup_keys(&config.questdb).await;
+    ensure_instrument_tables(&config.questdb).await;
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(writer) => {
