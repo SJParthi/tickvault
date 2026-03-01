@@ -39,22 +39,6 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# EARLY EXIT: Allow --auto (GitHub enforces CI)
-# ─────────────────────────────────────────────
-if echo "$COMMAND" | grep -q '\-\-auto'; then
-  if [ "$FAILED" -ne 0 ]; then
-    echo "  BLOCKED: --admin + --auto is not allowed." >&2
-    exit 2
-  fi
-  echo "  INFO: Auto-merge requested — GitHub will enforce CI before merging." >&2
-  echo "" >&2
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  AUTO-MERGE ALLOWED — GitHub enforces CI     ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-  exit 0
-fi
-
-# ─────────────────────────────────────────────
 # GATE 2: Extract PR number
 # ─────────────────────────────────────────────
 PR_NUM=""

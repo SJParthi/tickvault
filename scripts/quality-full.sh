@@ -8,12 +8,12 @@
 # Usage: ./scripts/quality-full.sh
 #
 # Stages:
-#   1. Compile     — cargo build --release
-#   2. Lint        — cargo fmt --check + cargo clippy
+#   1. Compile     — cargo build --release --workspace
+#   2. Lint        — cargo fmt --check + cargo clippy + banned-pattern scan
 #   3. Test        — cargo test --workspace
 #   4. Security    — cargo audit + cargo deny check
 #   5. Performance — cargo bench --workspace (if benchmarks exist)
-#   6. Coverage    — cargo tarpaulin --workspace
+#   6. Coverage    — cargo tarpaulin --workspace --fail-under 99
 # =============================================================================
 
 set -euo pipefail
@@ -49,11 +49,12 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # Stage 1: Compile
-run_stage "1/6" "Compile" "cargo build --release"
+run_stage "1/6" "Compile" "cargo build --release --workspace"
 
 # Stage 2: Lint
 run_stage "2/6" "Format Check" "cargo fmt --all -- --check"
 run_stage "2/6" "Clippy" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
+run_stage "2/6" "Banned Patterns" "bash .claude/hooks/banned-pattern-scanner.sh . \"\$(find crates -name '*.rs' ! -path '*/tests/*' ! -path '*_test.rs' ! -path '*/benches/*' -type f | tr '\n' ' ')\""
 
 # Stage 3: Test
 run_stage "3/6" "Tests" "cargo test --workspace"
@@ -87,7 +88,7 @@ fi
 
 # Stage 6: Coverage
 if command -v cargo-tarpaulin > /dev/null 2>&1; then
-    run_stage "6/6" "Coverage" "cargo tarpaulin --workspace --out Html --output-dir target/tarpaulin"
+    run_stage "6/6" "Coverage (99% min)" "cargo tarpaulin --workspace --fail-under 99 --out Html --output-dir target/tarpaulin"
 else
     echo -e "${CYAN}[Stage 6/6]${NC} Coverage"
     echo -e "  ${YELLOW}SKIPPED${NC} — cargo-tarpaulin not installed"

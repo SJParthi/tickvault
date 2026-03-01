@@ -34,50 +34,22 @@ echo "║        PRE-PR QUALITY GATE                    ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
 # ─────────────────────────────────────────────
-# Extract first + last lines for flag parsing
-# (flags appear before --body heredoc and after its closing delimiter)
-# ─────────────────────────────────────────────
-CMD_FLAGS=$(echo "$COMMAND" | sed -n '1p; $p' | tr '\n' ' ')
-
-# ─────────────────────────────────────────────
-# Detect --head and --base from command flags only
-# ─────────────────────────────────────────────
-CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
-HEAD_BRANCH="$CURRENT_BRANCH"
-HEAD_FROM_CMD=$(echo "$CMD_FLAGS" | grep -oE '\-\-head[[:space:]]+([a-zA-Z0-9_/-]+)' | head -1 | awk '{print $2}')
-if [ -n "$HEAD_FROM_CMD" ]; then
-  HEAD_BRANCH="$HEAD_FROM_CMD"
-fi
-BASE_FROM_CMD_G1=$(echo "$CMD_FLAGS" | grep -oE '\-\-base[[:space:]]+([a-zA-Z0-9_/-]+)' | head -1 | awk '{print $2}')
-
-# ─────────────────────────────────────────────
-# EARLY EXIT: Allow develop→main release PRs
-# ─────────────────────────────────────────────
-if [ "$HEAD_BRANCH" = "develop" ] && [ "$BASE_FROM_CMD_G1" = "main" ]; then
-  echo "  INFO: Release PR (develop→main) — skipping branch gates." >&2
-  echo "" >&2
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  RELEASE PR ALLOWED — develop→main           ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-  exit 0
-fi
-
-# ─────────────────────────────────────────────
 # GATE 1: Branch check — can't PR from main/develop
 # ─────────────────────────────────────────────
-if [ "$HEAD_BRANCH" = "main" ] || [ "$HEAD_BRANCH" = "master" ] || [ "$HEAD_BRANCH" = "develop" ]; then
-  echo "  FAIL: Cannot create PR from '$HEAD_BRANCH'. Use a feature branch." >&2
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ] || [ "$CURRENT_BRANCH" = "develop" ]; then
+  echo "  FAIL: Cannot create PR from '$CURRENT_BRANCH'. Use a feature branch." >&2
   FAILED=1
 else
-  echo "  PASS: Not on protected branch ($HEAD_BRANCH)" >&2
+  echo "  PASS: Not on protected branch ($CURRENT_BRANCH)" >&2
 fi
 
 # ─────────────────────────────────────────────
 # GATE 2: Branch naming convention
 # ─────────────────────────────────────────────
-if [ -n "$HEAD_BRANCH" ]; then
-  if ! echo "$HEAD_BRANCH" | grep -qE '^(feature|fix|hotfix|chore|docs|refactor|test|perf|security|claude)/'; then
-    echo "  FAIL: Branch '$HEAD_BRANCH' doesn't follow naming convention." >&2
+if [ -n "$CURRENT_BRANCH" ]; then
+  if ! echo "$CURRENT_BRANCH" | grep -qE '^(feature|fix|hotfix|chore|docs|refactor|test|perf|security|claude)/'; then
+    echo "  FAIL: Branch '$CURRENT_BRANCH' doesn't follow naming convention." >&2
     echo "  Expected: feature/<name> | fix/<desc> | claude/<id>" >&2
     FAILED=1
   else
@@ -184,10 +156,9 @@ fi
 # ─────────────────────────────────────────────
 echo "  Checking commit message format..." >&2
 
-# Determine base branch from the PR command flags (--base flag) or default to develop
-# Re-extract CMD_FLAGS in case command was modified
+# Determine base branch from the PR command (--base flag) or default to develop
 BASE_BRANCH="develop"
-BASE_FROM_CMD=$(echo "$CMD_FLAGS" | grep -oE '\-\-base[[:space:]]+[a-zA-Z0-9_/-]+' | head -1 | awk '{print $2}')
+BASE_FROM_CMD=$(echo "$COMMAND" | grep -oE '\-\-base[[:space:]]+([a-zA-Z0-9_/-]+)' | awk '{print $2}')
 if [ -n "$BASE_FROM_CMD" ]; then
   BASE_BRANCH="$BASE_FROM_CMD"
 fi

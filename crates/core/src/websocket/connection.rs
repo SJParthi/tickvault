@@ -139,6 +139,7 @@ impl WebSocketConnection {
     }
 
     /// Returns a health snapshot for monitoring.
+    #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
     pub fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
             connection_id: self.connection_id,
@@ -288,19 +289,15 @@ impl WebSocketConnection {
 
         let (ws_stream, _response) = match connect_result {
             Ok(result) => result,
-            Err(tokio_tungstenite::tungstenite::Error::Http(ref response)) => {
-                error!(
-                    connection_id = self.connection_id,
-                    status = %response.status(),
-                    body = ?response.body().as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
-                    "WebSocket HTTP error"
-                );
-                return Err(WebSocketError::ConnectionFailed {
-                    url: self.websocket_base_url.clone(),
-                    source: connect_result.unwrap_err(),
-                });
-            }
             Err(err) => {
+                if let tokio_tungstenite::tungstenite::Error::Http(ref response) = err {
+                    error!(
+                        connection_id = self.connection_id,
+                        status = %response.status(),
+                        body = ?response.body().as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
+                        "WebSocket HTTP error"
+                    );
+                }
                 return Err(WebSocketError::ConnectionFailed {
                     url: self.websocket_base_url.clone(),
                     source: err,
@@ -334,6 +331,8 @@ impl WebSocketConnection {
         );
 
         // Reunite for the read loop.
+        // APPROVED: reuniting same split — cannot fail
+        #[allow(clippy::expect_used)]
         Ok(read.reunite(write).expect("reunite same stream")) // APPROVED: reuniting same split — cannot fail
     }
     // O(1) EXEMPT: end
@@ -459,6 +458,7 @@ impl WebSocketConnection {
         true
     }
 
+    #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
     fn set_state(&self, new_state: ConnectionState) {
         let mut state = self.state.lock().expect("state lock poisoned"); // APPROVED: lock poison is unrecoverable
         *state = new_state;
