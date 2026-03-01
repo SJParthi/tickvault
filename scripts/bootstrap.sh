@@ -99,35 +99,29 @@ fetch_ssm_secret() {
         --no-cli-pager 2>/dev/null
 }
 
-if aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
-    # Auto-create QuestDB + Grafana secrets if they don't exist (idempotent)
-    if [ -f "scripts/provision-infra-secrets.sh" ]; then
-        ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
-    fi
-
-    # Fetch credentials and export for docker-compose
-    echo -n "  Exporting QuestDB credentials... "
-    DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user" || true)
-    DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password" || true)
-    if [ -n "${DLT_QUESTDB_PG_USER}" ] && [ -n "${DLT_QUESTDB_PG_PASSWORD}" ]; then
-        export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD
-        echo -e "${GREEN}OK${NC}"
-    else
-        echo -e "${YELLOW}FALLBACK (using QuestDB defaults)${NC}"
-    fi
-
-    echo -n "  Exporting Grafana credentials... "
-    DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user" || true)
-    DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password" || true)
-    if [ -n "${DLT_GRAFANA_ADMIN_USER}" ] && [ -n "${DLT_GRAFANA_ADMIN_PASSWORD}" ]; then
-        export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
-        echo -e "${GREEN}OK${NC}"
-    else
-        echo -e "${YELLOW}FALLBACK (using Grafana defaults)${NC}"
-    fi
-else
-    echo -e "  ${YELLOW}AWS credentials not configured — using service defaults${NC}"
+if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
+    echo -e "  ${RED}AWS credentials not configured!${NC}"
+    echo -e "  ${RED}Run: aws configure --region ${REGION}${NC}"
+    echo -e "  ${RED}All credentials come from real AWS SSM. No exceptions.${NC}"
+    exit 1
 fi
+
+# Auto-create QuestDB + Grafana secrets if they don't exist (idempotent)
+ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
+
+# Fetch credentials and export for docker-compose
+echo -n "  Exporting QuestDB credentials... "
+DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
+DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
+export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD
+echo -e "${GREEN}OK${NC}"
+
+echo -n "  Exporting Grafana credentials... "
+DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
+DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
+export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
+echo -e "${GREEN}OK${NC}"
+
 echo ""
 
 # ---- Step 5: Docker Infrastructure ----
