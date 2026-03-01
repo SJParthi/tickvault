@@ -4,9 +4,15 @@
 # Exit 2 = BLOCK push.
 #
 # Gate order:
-#   1. cargo test (full workspace)
-#   2. cargo audit (known vulnerabilities) — if installed
-#   3. cargo deny check (license + advisory) — if installed
+#   1. cargo fmt --check
+#   2. cargo clippy -D warnings
+#   3. cargo test (full workspace)
+#   4. Banned pattern scan (full workspace, not just staged)
+#   5. Test count guard (ratcheting baseline)
+#   6. cargo audit (known vulnerabilities) — if installed
+#   7. cargo deny check (license + advisory) — if installed
+#
+# On success, writes state file for pre-PR gate optimization.
 
 set -uo pipefail
 
@@ -31,23 +37,75 @@ if [ -z "$RS_EXISTS" ]; then
   exit 0
 fi
 
+HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║        PRE-PUSH SAFETY NET                   ║" >&2
+echo "║        PRE-PUSH SAFETY NET                    ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
-# Gate 1: cargo test (mandatory)
-echo "  [1/3] cargo test..." >&2
-if ! cargo test --workspace > /dev/null 2>&1; then
-  echo "  FAIL: cargo test failed. Cannot push broken code." >&2
+# Gate 1: cargo fmt (show errors on failure)
+echo "  [1/7] cargo fmt --check..." >&2
+FMT_OUT=$(cargo fmt --all -- --check 2>&1)
+FMT_EXIT=$?
+if [ "$FMT_EXIT" -ne 0 ]; then
+  echo "  FAIL: Code not formatted:" >&2
+  echo "$FMT_OUT" | tail -10 >&2
+  FAILED=1
+else
+  echo "  PASS: cargo fmt" >&2
+fi
+
+# Gate 2: cargo clippy (show errors on failure)
+echo "  [2/7] cargo clippy..." >&2
+CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+CLIPPY_EXIT=$?
+if [ "$CLIPPY_EXIT" -ne 0 ]; then
+  echo "  FAIL: clippy warnings found:" >&2
+  echo "$CLIPPY_OUT" | tail -20 >&2
+  FAILED=1
+else
+  echo "  PASS: cargo clippy (zero warnings)" >&2
+fi
+
+# Gate 3: cargo test (mandatory, show errors on failure)
+echo "  [3/7] cargo test..." >&2
+TEST_OUT=$(cargo test --workspace 2>&1)
+TEST_EXIT=$?
+if [ "$TEST_EXIT" -ne 0 ]; then
+  echo "  FAIL: cargo test failed:" >&2
+  echo "$TEST_OUT" | tail -20 >&2
   FAILED=1
 else
   echo "  PASS: cargo test (100% pass)" >&2
 fi
 
-# Gate 2: cargo audit (advisory — only if installed)
-echo "  [2/3] cargo audit..." >&2
+# Gate 4: Banned pattern scan (full workspace, not just staged)
+echo "  [4/7] Banned pattern scan (full workspace)..." >&2
+ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
+if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+  if ! echo "$ALL_RS" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
+    echo "  FAIL: Banned patterns in workspace." >&2
+    FAILED=1
+  else
+    echo "  PASS: Banned pattern scan" >&2
+  fi
+else
+  echo "  SKIP: Scanner not available" >&2
+fi
+
+# Gate 5: Test count guard
+echo "  [5/7] Test count guard..." >&2
+if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
+  if ! "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
+    FAILED=1
+  fi
+else
+  echo "  SKIP: test-count-guard.sh not executable" >&2
+fi
+
+# Gate 6: cargo audit (advisory — only if installed)
+echo "  [6/7] cargo audit..." >&2
 if command -v cargo-audit > /dev/null 2>&1; then
   if ! cargo audit > /dev/null 2>&1; then
     echo "  FAIL: cargo audit found vulnerabilities. Review before pushing." >&2
@@ -59,11 +117,10 @@ else
   echo "  SKIP: cargo-audit not installed (install with: cargo install cargo-audit)" >&2
 fi
 
-# Gate 3: cargo deny (advisory — only if installed)
+# Gate 7: cargo deny (advisory — only if installed)
 # Note: cargo deny needs network to fetch advisory DB. If it fails due to
-# network/proxy issues (exit code != 0 but stderr contains "fetch"), treat
-# as SKIP rather than FAIL. CI enforces this properly.
-echo "  [3/3] cargo deny..." >&2
+# network/proxy issues, treat as SKIP rather than FAIL. CI enforces this properly.
+echo "  [7/7] cargo deny..." >&2
 if command -v cargo-deny > /dev/null 2>&1; then
   DENY_OUTPUT=$(cargo deny check 2>&1)
   DENY_EXIT=$?
@@ -89,7 +146,12 @@ if [ "$FAILED" -ne 0 ]; then
   exit 2
 fi
 
+# Write state file for pre-PR gate optimization
+HEAD_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
+echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
+
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  ALL GATES PASSED — Push allowed             ║" >&2
+echo "║  ALL 7 GATES PASSED — Push allowed            ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

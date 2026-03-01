@@ -67,6 +67,10 @@ criterion/
 fuzz/artifacts/
 fuzz/corpus/
 
+# ---- Quality gate state files (local machine state) ----
+.claude/hooks/.last-quality-pass
+.claude/hooks/.test-count-baseline
+
 # ---- Temporary files ----
 *.tmp
 *.bak

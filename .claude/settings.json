@@ -64,7 +64,10 @@
       "Bash(brew *)",
       "Bash(git push --force *)",
       "Bash(git reset --hard *)",
-      "Bash(git clean *)"
+      "Bash(git clean *)",
+      "Bash(git commit --no-verify *)",
+      "Bash(git push --no-verify *)",
+      "Bash(gh pr merge --admin *)"
     ]
   },
   "hooks": {
@@ -79,6 +82,14 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-push-gate.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-pr-gate.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-merge-gate.sh"
           }
         ]
       },
@@ -115,11 +126,10 @@
     ],
     "SessionStart": [
       {
-        "matcher": "compact",
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'POST-COMPACTION: Re-read CLAUDE.md. Three principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned. Check current phase doc.'"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-sanity.sh"
           }
         ]
       }
