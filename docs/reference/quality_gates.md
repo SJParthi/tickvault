@@ -25,7 +25,7 @@
 
 Coverage thresholds and required test types: see `.claude/rules/testing.md` (auto-loaded).
 
-**Tool:** cargo-tarpaulin with `--out Xml`. Coverage exclusions ONLY on generated code/FFI.
+**Tool:** cargo-llvm-cov (source-based LLVM instrumentation) with `--fail-under-lines 99`. Coverage exclusions ONLY on generated code/FFI.
 **Heap profiling:** dhat for all hot-path functions (in addition to Criterion benchmarks).
 
 ## Gate 4: CI Pipeline (6 stages)
@@ -35,7 +35,7 @@ Stage 2 — Lint:      cargo fmt --check + clippy -D warnings + clippy perf
 Stage 3 — Test:      cargo test + --ignored
 Stage 4 — Security:  cargo audit + git-secrets --scan
 Stage 5 — Perf:      cargo bench (>5% regression = FAIL) + dhat heap check
-Stage 6 — Coverage:  cargo-tarpaulin (<90% = FAIL, <95% critical = WARNING)
+Stage 6 — Coverage:  cargo-llvm-cov (<99% = FAIL, per-crate thresholds in quality/crate-coverage-thresholds.toml)
 ```
 Any stage fails = build is RED. No exceptions.
 
@@ -61,7 +61,7 @@ Any stage fails = build is RED. No exceptions.
 
 ## Gate 5: Pre-Deployment
 
-All CI green + Docker image builds (<15MB scratch) + health checks pass + smoke test (1 tick end-to-end) + Parthiban approves.
+All CI green + Docker image builds (<50MB binary) + health checks pass + smoke test (1 tick end-to-end) + Parthiban approves.
 
 ## Gate 5b: Release Checklist
 

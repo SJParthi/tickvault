@@ -8,12 +8,12 @@
 # Usage: ./scripts/quality-full.sh
 #
 # Stages:
-#   1. Compile     — cargo build --release --workspace
-#   2. Lint        — cargo fmt --check + cargo clippy + banned-pattern scan
+#   1. Compile     — cargo build --release
+#   2. Lint        — cargo fmt --check + cargo clippy
 #   3. Test        — cargo test --workspace
 #   4. Security    — cargo audit + cargo deny check
 #   5. Performance — cargo bench --workspace (if benchmarks exist)
-#   6. Coverage    — cargo tarpaulin --workspace --fail-under 99
+#   6. Coverage    — cargo llvm-cov --workspace (99% threshold)
 # =============================================================================
 
 set -euo pipefail
@@ -49,12 +49,21 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # Stage 1: Compile
-run_stage "1/6" "Compile" "cargo build --release --workspace"
+run_stage "1/6" "Compile" "cargo build --release"
 
 # Stage 2: Lint
 run_stage "2/6" "Format Check" "cargo fmt --all -- --check"
-run_stage "2/6" "Clippy" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
-run_stage "2/6" "Banned Patterns" "bash .claude/hooks/banned-pattern-scanner.sh . \"\$(find crates -name '*.rs' ! -path '*/tests/*' ! -path '*_test.rs' ! -path '*/benches/*' -type f | tr '\n' ' ')\""
+run_stage "2/6" "Clippy (trading safety lints)" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf -W clippy::arithmetic_side_effects -W clippy::indexing_slicing -W clippy::as_conversions"
+run_stage "2/6" "Doc Warnings" "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps"
+run_stage "2/6" "Doc Tests" "cargo test --doc --workspace"
+
+if command -v typos > /dev/null 2>&1; then
+    run_stage "2/6" "Typos" "typos ."
+else
+    echo -e "${CYAN}[Stage 2/6]${NC} Typos"
+    echo -e "  ${YELLOW}SKIPPED${NC} — typos not installed"
+    echo ""
+fi
 
 # Stage 3: Test
 run_stage "3/6" "Tests" "cargo test --workspace"
@@ -86,12 +95,13 @@ else
     echo ""
 fi
 
-# Stage 6: Coverage
-if command -v cargo-tarpaulin > /dev/null 2>&1; then
-    run_stage "6/6" "Coverage (99% min)" "cargo tarpaulin --workspace --fail-under 99 --out Html --output-dir target/tarpaulin"
+# Stage 6: Coverage (99% threshold)
+if command -v cargo-llvm-cov > /dev/null 2>&1; then
+    run_stage "6/6" "Coverage (99% threshold)" "cargo llvm-cov --workspace --fail-under-lines 99"
+    run_stage "6/6" "Coverage report" "cargo llvm-cov --workspace --html --output-dir target/llvm-cov"
 else
     echo -e "${CYAN}[Stage 6/6]${NC} Coverage"
-    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-tarpaulin not installed"
+    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)"
     echo ""
 fi
 

@@ -1,0 +1,20 @@
+# =============================================================================
+# dhan-live-trader — Per-Crate Coverage Thresholds
+# =============================================================================
+# Used by: scripts/coverage-gate.sh (CI Stage 6)
+# Used by: .claude/hooks/coverage-guard.sh (pre-push ratchet)
+#
+# All values are line coverage percentages.
+# Any crate not listed uses the default threshold.
+# =============================================================================
+
+# Default threshold for any crate not explicitly listed
+default = 99.0
+
+[crates]
+core    = 99.0
+trading = 99.0
+common  = 99.0
+storage = 99.0
+api     = 99.0
+app     = 99.0
