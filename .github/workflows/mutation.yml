@@ -1,0 +1,110 @@
+# =============================================================================
+# dhan-live-trader — Mutation Testing (PR Gate for Critical Crates)
+# =============================================================================
+# Runs cargo-mutants on PRs that touch .rs files in core/trading/common crates.
+# Mutation testing verifies that tests actually catch bugs — if a mutant survives,
+# it means there's a code path where tests don't detect a behavior change.
+#
+# This is a required status check — PR cannot merge if mutation score drops.
+# =============================================================================
+
+name: Mutation Testing
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'crates/core/**/*.rs'
+      - 'crates/trading/**/*.rs'
+      - 'crates/common/**/*.rs'
+
+permissions:
+  contents: read
+
+# Cancel stale runs
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: "Mutation Testing (critical crates)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-mutants
+        with:
+          tool: cargo-mutants
+
+      - name: Determine changed crates
+        id: changed
+        run: |
+          # Get list of changed .rs files in critical crates
+          CHANGED=$(gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          PACKAGES=""
+          if echo "$CHANGED" | grep -q '^crates/core/'; then
+            PACKAGES="$PACKAGES --package dhan-live-trader-core"
+          fi
+          if echo "$CHANGED" | grep -q '^crates/trading/'; then
+            PACKAGES="$PACKAGES --package dhan-live-trader-trading"
+          fi
+          if echo "$CHANGED" | grep -q '^crates/common/'; then
+            PACKAGES="$PACKAGES --package dhan-live-trader-common"
+          fi
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+          if [ -z "$PACKAGES" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run mutation testing
+        if: steps.changed.outputs.skip == 'false'
+        run: |
+          cargo mutants ${{ steps.changed.outputs.packages }} \
+            --test-threads=2 \
+            --timeout=120 \
+            --no-shuffle \
+            2>&1 | tee mutation-results.txt
+
+      - name: Check for survived mutants
+        if: steps.changed.outputs.skip == 'false'
+        run: |
+          if grep -q "SURVIVED" mutation-results.txt 2>/dev/null; then
+            echo ""
+            echo "╔══════════════════════════════════════════════╗"
+            echo "║  MUTATION TESTING FAILED                      ║"
+            echo "║  Survived mutants = untested code paths       ║"
+            echo "╚══════════════════════════════════════════════╝"
+            echo ""
+            grep "SURVIVED" mutation-results.txt
+            echo ""
+            echo "Add or improve tests to kill these mutants."
+            exit 1
+          else
+            echo "All mutants killed — tests are thorough."
+          fi
+
+      - name: Upload mutation results
+        if: always() && steps.changed.outputs.skip == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutation-results
+          path: mutation-results.txt
+          retention-days: 30

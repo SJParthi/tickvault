@@ -72,6 +72,7 @@ install_tool "cargo-deny" "cargo-deny"
 install_tool "cargo-llvm-cov" "cargo-llvm-cov"
 install_tool "cargo-machete" "cargo-machete"
 install_tool "cargo-nextest" "cargo-nextest"
+install_tool "cargo-mutants" "cargo-mutants"
 install_tool "typos" "typos-cli"
 echo ""
 
