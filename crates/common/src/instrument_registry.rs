@@ -12,7 +12,7 @@
 //! 2. **Index derivatives** (NSE_FNO/BSE_FNO): ALL expiries, ALL strikes for 5 major indices
 //! 3. **Display indices** (IDX_I): INDIA VIX, sectoral, broad market (23 total)
 //! 4. **Stock equities** (NSE_EQ): price feeds for ~206 F&O stocks
-//! 5. **Stock derivatives** (NSE_FNO): current expiry only, ATM ± N strikes
+//! 5. **Stock derivatives** (NSE_FNO): ATM ± N current expiry (priority) + progressive fill nearest-expiry-first to 25K capacity
 
 use std::collections::HashMap;
 use std::fmt;

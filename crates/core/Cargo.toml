@@ -36,3 +36,6 @@ failsafe = { workspace = true }
 serde_json = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

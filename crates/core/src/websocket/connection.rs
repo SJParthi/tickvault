@@ -66,9 +66,6 @@ pub struct WebSocketConnection {
     /// Instruments assigned to this connection.
     instruments: Vec<InstrumentSubscription>,
 
-    /// Feed mode for subscriptions.
-    feed_mode: FeedMode,
-
     /// Channel sender for forwarding raw binary frames to downstream.
     frame_sender: mpsc::Sender<Vec<u8>>,
 
@@ -77,6 +74,10 @@ pub struct WebSocketConnection {
 
     /// Total reconnection count since startup.
     total_reconnections: AtomicU64,
+
+    /// Pre-built subscription messages — built once in `new()`, reused on every reconnect.
+    /// IDX_I instruments use Ticker mode; all others use the configured feed mode.
+    cached_subscription_messages: Vec<String>,
 }
 
 impl WebSocketConnection {
@@ -95,6 +96,28 @@ impl WebSocketConnection {
         frame_sender: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
+
+        // Pre-build subscription messages once. IDX_I instruments only support Ticker mode —
+        // Dhan silently drops Full/Quote subscriptions for index value feeds.
+        // O(1) EXEMPT: constructor — runs once at startup, not per tick.
+        let (idx_instruments, non_idx_instruments): (Vec<_>, Vec<_>) = instruments
+            .iter()
+            .cloned()
+            .partition(|inst| inst.exchange_segment == "IDX_I");
+
+        let mut cached_subscription_messages = build_subscription_messages(
+            &non_idx_instruments,
+            feed_mode,
+            ws_config.subscription_batch_size,
+        );
+        if !idx_instruments.is_empty() {
+            cached_subscription_messages.extend(build_subscription_messages(
+                &idx_instruments,
+                FeedMode::Ticker,
+                ws_config.subscription_batch_size,
+            ));
+        }
+
         Self {
             connection_id,
             token_handle,
@@ -103,10 +126,10 @@ impl WebSocketConnection {
             dhan_config,
             ws_config,
             instruments,
-            feed_mode,
             frame_sender,
             state: std::sync::Mutex::new(ConnectionState::Disconnected),
             total_reconnections: AtomicU64::new(0),
+            cached_subscription_messages,
         }
     }
 
@@ -236,7 +259,7 @@ impl WebSocketConnection {
 
         debug!(
             connection_id = self.connection_id,
-            uri = %request.uri(),
+            url = %self.websocket_base_url,
             "Connecting to Dhan WebSocket"
         );
 
@@ -285,46 +308,28 @@ impl WebSocketConnection {
             }
         };
 
-        // IDX_I instruments only support Ticker mode — Dhan silently drops
-        // Full/Quote subscriptions for index value feeds. Partition instruments
-        // and send IDX_I with Ticker (request_code=15), rest with configured mode.
-        let (idx_instruments, non_idx_instruments): (Vec<_>, Vec<_>) = self
-            .instruments
-            .iter()
-            .cloned()
-            .partition(|inst| inst.exchange_segment == "IDX_I");
-
-        let mut messages = build_subscription_messages(
-            &non_idx_instruments,
-            self.feed_mode,
-            self.ws_config.subscription_batch_size,
-        );
-
-        if !idx_instruments.is_empty() {
-            let idx_messages = build_subscription_messages(
-                &idx_instruments,
-                FeedMode::Ticker,
-                self.ws_config.subscription_batch_size,
-            );
-            messages.extend(idx_messages);
-        }
-
+        // Send pre-built subscription messages (cached in new()) with yield pacing.
         let (mut write, read) = ws_stream.split();
 
-        for msg in &messages {
+        for (batch_index, message) in self.cached_subscription_messages.iter().enumerate() {
             write
-                .send(Message::Text(msg.clone().into()))
+                .send(Message::Text(message.clone().into()))
                 .await
                 .map_err(|err| WebSocketError::SubscriptionFailed {
                     connection_id: self.connection_id,
                     reason: err.to_string(),
                 })?;
+            // Yield between batches to avoid starving other tasks.
+            // Skip yield after the last batch (nothing to wait for).
+            if batch_index < self.cached_subscription_messages.len() - 1 {
+                tokio::task::yield_now().await;
+            }
         }
 
         info!(
             connection_id = self.connection_id,
             instruments = self.instruments.len(),
-            messages_sent = messages.len(),
+            messages_sent = self.cached_subscription_messages.len(),
             "Subscriptions sent"
         );
 
@@ -345,58 +350,81 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
+        // Dynamic read timeout: ping_interval × (max_failures + 1) + pong_timeout.
+        // Default: 10 × (2 + 1) + 10 = 40s. Matches SERVER_PING_TIMEOUT_SECS.
+        // Any received frame (Binary, Ping, Text) resets the timeout.
+        let read_timeout_secs = self
+            .ws_config
+            .ping_interval_secs
+            .saturating_mul(u64::from(self.ws_config.max_consecutive_pong_failures) + 1)
+            .saturating_add(self.ws_config.pong_timeout_secs);
+        let read_timeout = Duration::from_secs(read_timeout_secs);
+
         loop {
-            match read.next().await {
-                Some(Ok(Message::Binary(data))) => {
-                    // Forward raw binary frame to downstream.
-                    if self.frame_sender.send(data.to_vec()).await.is_err() {
-                        warn!(
-                            connection_id = self.connection_id,
-                            "Frame receiver dropped — stopping read loop"
-                        );
-                        return Ok(());
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    // Server ping — respond with pong to keep connection alive.
-                    let mut sink = write.lock().await;
-                    let _ = sink.send(Message::Pong(data)).await;
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    // Pong from server (e.g., echo of our pong). Ignore.
-                }
-                Some(Ok(Message::Close(frame))) => {
-                    if let Some(frame) = frame {
-                        let code: u16 = frame.code.into();
-                        let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
-                        warn!(
-                            connection_id = self.connection_id,
-                            close_code = code,
-                            reason = %reason,
-                            "WebSocket close frame received"
-                        );
-                    }
-                    return Ok(());
-                }
-                Some(Ok(Message::Text(text))) => {
-                    // Dhan may send text for disconnect messages.
-                    debug!(
+            match time::timeout(read_timeout, read.next()).await {
+                Err(_elapsed) => {
+                    warn!(
                         connection_id = self.connection_id,
-                        text_len = text.len(),
-                        "Received text message (unexpected)"
+                        timeout_secs = read_timeout_secs,
+                        "WebSocket read timeout — no data received, treating as dead connection"
                     );
-                }
-                Some(Err(err)) => {
-                    return Err(WebSocketError::ConnectionFailed {
-                        url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
-                        source: err,
+                    return Err(WebSocketError::ReadTimeout {
+                        connection_id: self.connection_id,
+                        timeout_secs: read_timeout_secs,
                     });
                 }
-                None => {
-                    // Stream ended.
-                    return Ok(());
-                }
-                _ => {}
+                Ok(frame_result) => match frame_result {
+                    Some(Ok(Message::Binary(data))) => {
+                        // Forward raw binary frame to downstream.
+                        if self.frame_sender.send(data.to_vec()).await.is_err() {
+                            warn!(
+                                connection_id = self.connection_id,
+                                "Frame receiver dropped — stopping read loop"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        // Server ping — respond with pong to keep connection alive.
+                        let mut sink = write.lock().await;
+                        let _ = sink.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        // Pong from server (e.g., echo of our pong). Ignore.
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        if let Some(frame) = frame {
+                            let code: u16 = frame.code.into();
+                            let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
+                            warn!(
+                                connection_id = self.connection_id,
+                                close_code = code,
+                                reason = %reason,
+                                "WebSocket close frame received"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        // Dhan may send text for disconnect messages.
+                        debug!(
+                            connection_id = self.connection_id,
+                            text_len = text.len(),
+                            "Received text message (unexpected)"
+                        );
+                    }
+                    Some(Err(err)) => {
+                        return Err(WebSocketError::ConnectionFailed {
+                            url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
+                            source: err,
+                        });
+                    }
+                    None => {
+                        // Stream ended.
+                        return Ok(());
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -718,5 +746,143 @@ mod tests {
             .store(2, std::sync::atomic::Ordering::Relaxed);
         let result = conn.wait_with_backoff().await;
         assert!(result, "Should return true when under limit");
+    }
+
+    // --- Read Timeout Formula Tests ---
+
+    /// Helper: computes read timeout from config values using the same formula as run_read_loop.
+    fn compute_read_timeout(ping_interval: u64, pong_timeout: u64, max_failures: u32) -> u64 {
+        ping_interval
+            .saturating_mul(u64::from(max_failures) + 1)
+            .saturating_add(pong_timeout)
+    }
+
+    #[test]
+    fn test_read_timeout_formula_default() {
+        // Default: 10 * (2 + 1) + 10 = 40s
+        assert_eq!(compute_read_timeout(10, 10, 2), 40);
+    }
+
+    #[test]
+    fn test_read_timeout_formula_custom() {
+        // Custom: 5 * (5 + 1) + 15 = 45s
+        assert_eq!(compute_read_timeout(5, 15, 5), 45);
+    }
+
+    #[test]
+    fn test_read_timeout_formula_zero_failures() {
+        // Zero failures: 10 * (0 + 1) + 10 = 20s
+        assert_eq!(compute_read_timeout(10, 10, 0), 20);
+    }
+
+    #[test]
+    fn test_read_timeout_formula_overflow_safe() {
+        // u32::MAX failures → saturating_mul prevents overflow
+        let result = compute_read_timeout(10, 10, u32::MAX);
+        assert!(result >= 10, "Should not overflow to zero");
+    }
+
+    // --- Cached Subscription Messages Tests ---
+
+    #[test]
+    fn test_cached_messages_empty_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Full,
+            tx,
+        );
+        assert!(
+            conn.cached_subscription_messages.is_empty(),
+            "0 instruments should produce 0 cached messages"
+        );
+    }
+
+    #[test]
+    fn test_cached_messages_built_at_construction() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1001),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
+        assert!(conn.cached_subscription_messages[0].contains("\"InstrumentCount\":2"));
+    }
+
+    #[test]
+    fn test_cached_messages_idx_i_uses_ticker() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 26),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full, // Configured as Full, but IDX_I should use Ticker
+            tx,
+        );
+        // All IDX_I → only Ticker messages (request_code 15), NOT Full (21)
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
+        assert!(!conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
+    }
+
+    #[test]
+    fn test_cached_messages_non_idx_uses_config_mode() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 1000)];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Quote,
+            tx,
+        );
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":17"));
+    }
+
+    #[test]
+    fn test_cached_messages_count_matches_batches() {
+        let (tx, _rx) = mpsc::channel(100);
+        // 5000 instruments / batch_size 100 = 50 messages
+        let instruments: Vec<_> = (0..5000)
+            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, i + 1000))
+            .collect();
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(), // batch_size = 100
+            instruments,
+            FeedMode::Ticker,
+            tx,
+        );
+        assert_eq!(conn.cached_subscription_messages.len(), 50);
     }
 }
