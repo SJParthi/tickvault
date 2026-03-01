@@ -89,3 +89,4 @@ stock_default_atm_fallback_enabled = true
 [notification]
 telegram_api_base_url = "https://api.telegram.org"
 send_timeout_ms = 10000
+sns_enabled = false

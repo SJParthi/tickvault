@@ -195,6 +195,9 @@ pub struct NotificationConfig {
     pub telegram_api_base_url: String,
     /// HTTP send timeout in milliseconds for notification POSTs.
     pub send_timeout_ms: u64,
+    /// Enable SMS alerts via AWS SNS for Critical/High severity events.
+    /// Phone number is fetched from SSM at `/dlt/{env}/sns/phone-number`.
+    pub sns_enabled: bool,
 }
 
 impl Default for NotificationConfig {
@@ -203,6 +206,7 @@ impl Default for NotificationConfig {
             // APPROVED: config default — overridable via TOML config file
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             send_timeout_ms: 10_000,
+            sns_enabled: false,
         }
     }
 }

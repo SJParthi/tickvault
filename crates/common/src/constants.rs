@@ -288,6 +288,17 @@ pub const TELEGRAM_BOT_TOKEN_SECRET: &str = "bot-token";
 pub const TELEGRAM_CHAT_ID_SECRET: &str = "chat-id";
 
 // ---------------------------------------------------------------------------
+// SSM Parameter Store — SNS Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for SNS configuration.
+pub const SSM_SNS_SERVICE: &str = "sns";
+
+/// SSM key for the phone number to send SNS SMS alerts to.
+/// Value must be in E.164 format: +<country_code><number> (e.g., "+919876543210").
+pub const SNS_PHONE_NUMBER_SECRET: &str = "phone-number";
+
+// ---------------------------------------------------------------------------
 // Docker Container Naming
 // ---------------------------------------------------------------------------
 
