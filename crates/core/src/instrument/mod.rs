@@ -1,7 +1,7 @@
 //! Master instrument download, parsing, and F&O universe building.
 //!
 //! Downloads Dhan's instrument master CSV daily, parses it, runs a 5-pass
-//! mapping algorithm, and produces a complete [`FnoUniverse`] with all lookup
+//! mapping algorithm, and produces a complete `FnoUniverse` with all lookup
 //! maps ready for downstream consumption.
 //!
 //! # Boot Sequence Position

@@ -295,7 +295,7 @@ pub const TELEGRAM_CHAT_ID_SECRET: &str = "chat-id";
 pub const SSM_SNS_SERVICE: &str = "sns";
 
 /// SSM key for the phone number to send SNS SMS alerts to.
-/// Value must be in E.164 format: +<country_code><number> (e.g., "+919876543210").
+/// Value must be in E.164 format: `+<country_code><number>` (e.g., "+919876543210").
 pub const SNS_PHONE_NUMBER_SECRET: &str = "phone-number";
 
 // ---------------------------------------------------------------------------
@@ -551,11 +551,11 @@ pub const TOTP_SKEW: u8 = 1;
 // ---------------------------------------------------------------------------
 
 /// Path for initial token generation (appended to auth_base_url).
-/// Endpoint: POST https://auth.dhan.co/app/generateAccessToken
+/// Endpoint: POST <https://auth.dhan.co/app/generateAccessToken>
 pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 
 /// Path for token renewal (appended to rest_api_base_url).
-/// Endpoint: GET https://api.dhan.co/v2/RenewToken
+/// Endpoint: GET <https://api.dhan.co/v2/RenewToken>
 pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 
 // ---------------------------------------------------------------------------

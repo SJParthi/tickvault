@@ -106,7 +106,7 @@
 | 4.9 | Cognitive complexity | Max 30 per function | Complex functions = guaranteed bug source | `ENFORCED` | clippy.toml threshold | `clippy.toml` |
 | 4.10 | Too-many-arguments | Max 8 parameters | Forces struct grouping, improves API design | `ENFORCED` | clippy.toml threshold | `clippy.toml` |
 | 4.11 | Type complexity | Max 300 | Prevents unreadable type signatures | `ENFORCED` | clippy.toml threshold | `clippy.toml` |
-| 4.12 | Spelling (typos) | Code/comment/doc typo detection | `securiy_id` vs `security_id` = silent field mismatch | `CONFIGURED` | typos.toml configured, manual run only | `typos.toml` |
+| 4.12 | Spelling (typos) | Code/comment/doc typo detection | `securi_id` vs `security_id` = silent field mismatch | `CONFIGURED` | typos.toml configured, manual run only | `typos.toml` |
 | 4.13 | Conventional commits | `<type>(<scope>): <description>` format | Automated changelog, clear audit trail | `ENFORCED` | commit-msg hook, pre-PR gate 5 | `scripts/git-hooks/commit-msg` |
 | 4.14 | Test count ratcheting | Test count can only increase, never decrease | Prevents accidental test deletion | `ENFORCED` | Pre-commit gate 8, pre-push gate 5 | `.claude/hooks/test-count-guard.sh` |
 
