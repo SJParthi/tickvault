@@ -217,8 +217,7 @@ the exact digests in use (deployment versions may differ from Bible originals).
 | 90 | Grafana Alloy | v1.8.0 | `grafana/alloy:v1.8.0@sha256:...` |
 | 91 | Jaeger v2 | 2.15.0 | `jaegertracing/jaeger:2.15.0@sha256:...` |
 | 92 | Traefik | v3.6.8 | `traefik:v3.6.8@sha256:...` |
-| 93 | LocalStack | 4.3.0 | `localstack/localstack:4.3.0@sha256:...` |
-| 94 | Rust (builder) | 1.93.1-slim | `rust:1.93.1-slim@sha256:...` |
+| 93 | Rust (builder) | 1.93.1-slim | `rust:1.93.1-slim@sha256:...` |
 
 > All versions now match `deploy/docker/docker-compose.yml` (reconciled 2026-02-26).
 

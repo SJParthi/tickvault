@@ -1,7 +1,7 @@
 # BLOCK 02 — AUTHENTICATION & TOKEN MANAGEMENT
 
 ## Status: ✅ COMPLETE
-## Last Verified: 2026-02-27 (463 system tests pass, zero clippy warnings)
+## Last Verified: 2026-03-01 (477 system tests pass, zero clippy warnings)
 ## Depends On: Block 01 (COMPLETE)
 ## Blocks: Block 03 (WebSocket Connection Manager)
 
@@ -35,18 +35,14 @@ Config (base.toml) → ★ AUTH (Block 02) ★ → Persist → Universe → WebS
 
 ```
 Source:     AWS SSM Parameter Store (SecureString type)
-Dev:        LocalStack at dlt-localstack:4566
-Prod:       Real AWS SSM in ap-south-1
+Region:     ap-south-1 (always real AWS, dev and prod)
 
 Paths:
   /dlt/<env>/dhan/client-id         → Dhan Client ID
   /dlt/<env>/dhan/client-secret     → Dhan password/secret
   /dlt/<env>/dhan/totp-secret       → TOTP Base32 secret
 
-Environment detection:
-  AWS_ENDPOINT_URL env var present  → LocalStack (dev)
-  AWS_ENDPOINT_URL absent           → Real AWS (prod)
-  Same SDK, same code path.
+Always real AWS SSM. Same SDK, same code path, same endpoint.
 ```
 
 ### Step 2: Generate TOTP Code
@@ -297,7 +293,7 @@ AuthCircuitBreakerTripped { failures: u32 },
 ///
 /// Returns credentials wrapped in Secret<String> for safety.
 /// Uses aws-sdk-ssm with automatic endpoint detection
-/// (LocalStack in dev, real AWS in prod).
+/// (AWS SSM Parameter Store).
 pub async fn fetch_dhan_credentials(
     environment: &str,
 ) -> Result<DhanCredentials, ApplicationError>
@@ -326,11 +322,7 @@ format!("{}/{}/{}/{}",
 ```rust
 let mut config_builder = aws_config::from_env().region(Region::new("ap-south-1"));
 
-// If AWS_ENDPOINT_URL is set, use LocalStack
-if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
-    config_builder = config_builder.endpoint_url(&endpoint);
-}
-
+// Always uses real AWS SSM in ap-south-1
 let aws_config = config_builder.load().await;
 let ssm_client = aws_sdk_ssm::Client::new(&aws_config);
 ```
@@ -565,11 +557,11 @@ Already present in core/Cargo.toml:
 | `test_arc_swap_store_makes_token_available` | Store → load returns Some |
 | `test_arc_swap_store_replaces_previous` | Second store replaces first |
 
-### Integration Tests (require LocalStack or mock)
+### Integration Tests (require AWS SSM access or mock)
 
 | Test | What It Validates |
 |------|------------------|
-| `test_fetch_credentials_from_localstack` | SSM → DhanCredentials with all 3 secrets |
+| `test_fetch_credentials_from_ssm` | SSM → DhanCredentials with all 3 secrets |
 | `test_fetch_credentials_missing_secret_returns_error` | Missing SSM key → SecretRetrieval |
 | `test_full_auth_flow_with_mock_dhan_api` | SSM → TOTP → API → TokenState |
 | `test_token_renewal_with_mock_api` | renewToken flow works end-to-end |
@@ -621,7 +613,7 @@ cargo test           → 100% pass (existing 96 + new auth tests)
 2. `cargo test` — all tests pass (96 existing + new auth tests)
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — clean
-5. Integration test: run against LocalStack container, verify SSM retrieval
+5. Integration test: run against AWS SSM, verify credential retrieval
 6. Mock test: mock Dhan API responses, verify full auth + renewal flow
 7. Security test: verify Secret<String> never leaks in Debug/Display
 8. Commit: `feat(auth): [Phase 1] implement Block 02 — authentication & token management`

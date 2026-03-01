@@ -14,37 +14,37 @@ GET {{questdb_host}}/exec?query=SHOW%20TABLES
 
 ###
 
-### Show columns of tick_data table
-GET {{questdb_host}}/exec?query=SHOW%20COLUMNS%20FROM%20tick_data
+### Show columns of ticks table
+GET {{questdb_host}}/exec?query=SHOW%20COLUMNS%20FROM%20ticks
 
 ###
 
-### Show columns of instrument_snapshots table
-GET {{questdb_host}}/exec?query=SHOW%20COLUMNS%20FROM%20instrument_snapshots
+### Show columns of derivative_contracts table
+GET {{questdb_host}}/exec?query=SHOW%20COLUMNS%20FROM%20derivative_contracts
 
 ###
 
-### ---- Tick Data Queries ----
+### ---- Tick Queries ----
 
 ### Latest 10 ticks (most recent first)
-GET {{questdb_host}}/exec?query=SELECT%20*%20FROM%20tick_data%20ORDER%20BY%20timestamp%20DESC%20LIMIT%2010
+GET {{questdb_host}}/exec?query=SELECT%20*%20FROM%20ticks%20ORDER%20BY%20ts%20DESC%20LIMIT%2010
 
 ###
 
 ### Tick count per day
-GET {{questdb_host}}/exec?query=SELECT%20timestamp%3A%3Adate%20AS%20day%2C%20count()%20FROM%20tick_data%20SAMPLE%20BY%201d
+GET {{questdb_host}}/exec?query=SELECT%20ts%3A%3Adate%20AS%20day%2C%20count()%20FROM%20ticks%20SAMPLE%20BY%201d
 
 ###
 
 ### ---- Instrument Queries ----
 
-### Latest instrument snapshots
-GET {{questdb_host}}/exec?query=SELECT%20*%20FROM%20instrument_snapshots%20ORDER%20BY%20snapshot_date%20DESC%20LIMIT%2020
+### Latest F&O underlyings
+GET {{questdb_host}}/exec?query=SELECT%20*%20FROM%20fno_underlyings%20ORDER%20BY%20timestamp%20DESC%20LIMIT%2020
 
 ###
 
-### Distinct instruments per snapshot date
-GET {{questdb_host}}/exec?query=SELECT%20snapshot_date%2C%20count(DISTINCT%20security_id)%20AS%20instrument_count%20FROM%20instrument_snapshots%20GROUP%20BY%20snapshot_date%20ORDER%20BY%20snapshot_date%20DESC
+### Derivative contracts count per snapshot
+GET {{questdb_host}}/exec?query=SELECT%20timestamp%3A%3Adate%20AS%20day%2C%20count(DISTINCT%20security_id)%20AS%20contract_count%20FROM%20derivative_contracts%20SAMPLE%20BY%201d
 
 ###
 

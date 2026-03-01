@@ -1,7 +1,7 @@
 # BLOCK 01 — MASTER INSTRUMENT DOWNLOAD & F&O UNIVERSE BUILDER
 
 ## Status: ✅ COMPLETE & RUNNING
-## Last Verified: 2026-02-27 (463 system tests pass, zero clippy warnings)
+## Last Verified: 2026-03-01 (477 system tests pass, zero clippy warnings)
 
 ---
 
@@ -501,7 +501,7 @@ The planner runs as Step 5 in main.rs (between QuestDB persistence and WebSocket
 | Crate | Tests |
 |-------|-------|
 | common | 88 |
-| core | 335 |
+| core | 349 |
 | storage | 37 |
 | api | 3 |
-| **Total** | **463** |
+| **Total** | **477** |

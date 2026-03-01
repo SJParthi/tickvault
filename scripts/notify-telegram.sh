@@ -2,8 +2,7 @@
 # =============================================================================
 # dhan-live-trader — Send Telegram notification
 # =============================================================================
-# Reads bot token + chat ID from real AWS SSM Parameter Store.
-# Telegram credentials ALWAYS come from real AWS SSM — never LocalStack.
+# Reads bot token + chat ID from AWS SSM Parameter Store.
 #
 # Usage:
 #   ./scripts/notify-telegram.sh "Task completed: environment setup done"
@@ -26,9 +25,7 @@ SSM_BOT_TOKEN="/dlt/${ENV}/telegram/bot-token"
 SSM_CHAT_ID="/dlt/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
 
-# Telegram ALWAYS uses real AWS SSM — never LocalStack.
-# Unset AWS_ENDPOINT_URL to ensure we hit real AWS.
-unset AWS_ENDPOINT_URL 2>/dev/null || true
+# Always uses real AWS SSM in ap-south-1.
 
 # ---------------------------------------------------------------------------
 # Validate input

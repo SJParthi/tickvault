@@ -48,7 +48,6 @@ jaeger = "jaeger"
 otlp = "otlp"
 grpc = "grpc"
 zeroize = "zeroize"
-localstack = "localstack"
 
 [files]
 extend-exclude = [

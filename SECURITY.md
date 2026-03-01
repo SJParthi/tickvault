@@ -29,7 +29,7 @@ If you discover a security vulnerability in this project, please report it respo
 This project follows strict security practices defined in `CLAUDE.md`:
 
 - **No secrets on disk** — All credentials via AWS SSM Parameter Store
-- **No `.env` files** — Banned. LocalStack for dev, real AWS for prod
+- **No `.env` files** — Banned. All secrets from AWS SSM Parameter Store
 - **Secret types use `secrecy` crate** — `Debug` prints `[REDACTED]`
 - **Memory wiped on drop** — `zeroize` crate for secret cleanup
 - **Rate limiting** — SEBI-compliant 10 orders/second maximum

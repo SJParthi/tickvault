@@ -17,13 +17,13 @@ Every file, function, config decision must pass all three. No exceptions.
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
 - **Language:** Rust 2024 Edition (stable 1.93.1)
 - **Repo:** `https://github.com/SJParthi/dhan-live-trader` (single source of truth)
-- **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Only `AWS_ENDPOINT_URL` differs.
+- **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Same containers, same code, always real AWS SSM.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
 ## SESSION PROTOCOL
 
 **Start:** git pull → read CLAUDE.md → read phase doc → git log -20 → Cargo.toml → cargo check → cargo test
-**End:** cargo fmt → cargo clippy (zero warnings) → cargo test (100% pass) → commit → push → summary
+**End:** Run `/quality` skill → commit → push → summary.
 
 Do NOT read Bible at startup. Read it ONLY when adding/updating a dependency.
 
@@ -50,19 +50,8 @@ Every commit compiles + passes tests. One logical change per commit.
 
 ## BANNED
 
-```
-.env files                         → SSM Parameter Store + LocalStack
-bincode / Promtail / Jaeger v1     → bitcode / Grafana Alloy / Jaeger v2
-:latest / ^ ~ * in Cargo.toml     → Exact pinned versions + SHA256
-brew install <infra>               → Docker containers only
-localhost in app code              → Docker DNS hostnames
-Hardcoded values                   → Named constants or config
-Abbreviated names                  → Full descriptive names
-.clone() / DashMap / dyn on hot    → papaya, enum_dispatch, Copy/refs
-unbounded channels                 → Bounded capacity always
-println! / .unwrap() in prod       → tracing + ? with anyhow/thiserror
-cargo update                       → Bible updates only
-```
+Enforcement: `.claude/hooks/` (mechanical, blocks at commit). Rules: `.claude/rules/` (auto-loaded per path).
+Quick ref: .env | bincode/Promtail/Jaeger-v1 | ^/~/\*/>=/:latest | brew | localhost | hardcoded values | .clone()/DashMap/dyn on hot | unbounded channels | println!/unwrap | cargo update
 
 ## TOKEN EFFICIENCY
 
@@ -76,5 +65,5 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 
 ## CURRENT CONTEXT
 
-**Phase:** Phase 1 — Environment Readiness → `docs/phases/PHASE_1_ENVIRONMENT.md`
-**Boot sequence:** Config → Auth → WebSocket → Parse → Route → Indicators → State → OMS → Persist → Cache → HTTP → Metrics → Logs
+**Phase:** Phase 1 — Live Trading System → `docs/phases/PHASE_1_LIVE_TRADING.md`
+**Boot sequence:** CryptoProvider → Config → Logging → Auth → QuestDB → Universe → WebSocket → TickProcessor → API → TokenRenewal → Shutdown
