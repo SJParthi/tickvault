@@ -10,7 +10,7 @@
 #   3. Test       — cargo test --workspace
 #   4. Security   — cargo deny check (advisories, licenses, bans, sources)
 #   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
-#   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
+#   6. Coverage   — cargo llvm-cov (enforce 99% threshold) (parallel after test)
 #
 # Security: All actions pinned to SHA. No mutable tags.
 # =============================================================================
@@ -159,19 +159,30 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: "1.93.1"
+          components: llvm-tools-preview
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@0e89f6b1568a820d57d5f00f4913ab2f19727afd # cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov
 
-      - name: Run coverage
-        run: cargo tarpaulin --workspace --out Xml --output-dir target/tarpaulin
+      - name: Run coverage (workspace — 99% threshold)
+        run: cargo llvm-cov --workspace --fail-under-lines 99
+
+      - name: Generate coverage report (lcov + JSON)
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
+
+      - name: Per-crate coverage gate
+        run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-report
-          path: target/tarpaulin/
+          path: target/llvm-cov/
           retention-days: 30

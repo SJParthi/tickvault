@@ -194,7 +194,7 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 79 | GitHub Actions | Hosted runners | CI/CD: build, test, lint, deploy |
-| 80 | cargo-tarpaulin | 0.32.7 | Code coverage: enforce 90%+ threshold |
+| 80 | cargo-llvm-cov | 0.8.4 | Code coverage: LLVM source-based instrumentation, enforce 99% threshold |
 | 81 | cargo-fuzz | 0.12.0 | Fuzz testing: crash discovery |
 | 82 | git-secrets | 1.3.0 | Pre-commit hook: prevent secret leaks |
 | 83 | Docker BuildKit | Enabled | Multi-stage builds: scratch base, <15MB images |

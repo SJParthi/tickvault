@@ -59,6 +59,7 @@ logs/
 tarpaulin-report.html
 lcov.info
 coverage/
+target/llvm-cov/
 
 # ---- Benchmark artifacts ----
 criterion/
@@ -70,6 +71,7 @@ fuzz/corpus/
 # ---- Quality gate state files (local machine state) ----
 .claude/hooks/.last-quality-pass
 .claude/hooks/.test-count-baseline
+.claude/hooks/.coverage-baseline
 
 # ---- Temporary files ----
 *.tmp

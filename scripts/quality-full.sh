@@ -13,7 +13,7 @@
 #   3. Test        — cargo test --workspace
 #   4. Security    — cargo audit + cargo deny check
 #   5. Performance — cargo bench --workspace (if benchmarks exist)
-#   6. Coverage    — cargo tarpaulin --workspace
+#   6. Coverage    — cargo llvm-cov --workspace (99% threshold)
 # =============================================================================
 
 set -euo pipefail
@@ -85,12 +85,13 @@ else
     echo ""
 fi
 
-# Stage 6: Coverage
-if command -v cargo-tarpaulin > /dev/null 2>&1; then
-    run_stage "6/6" "Coverage" "cargo tarpaulin --workspace --out Html --output-dir target/tarpaulin"
+# Stage 6: Coverage (99% threshold)
+if command -v cargo-llvm-cov > /dev/null 2>&1; then
+    run_stage "6/6" "Coverage (99% threshold)" "cargo llvm-cov --workspace --fail-under-lines 99"
+    run_stage "6/6" "Coverage report" "cargo llvm-cov --workspace --html --output-dir target/llvm-cov"
 else
     echo -e "${CYAN}[Stage 6/6]${NC} Coverage"
-    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-tarpaulin not installed"
+    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)"
     echo ""
 fi
 
