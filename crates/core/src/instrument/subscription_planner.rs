@@ -1,4 +1,4 @@
-//! Subscription planner: FnoUniverse → filtered instrument list.
+//! Subscription planner: FnoUniverse -> filtered instrument list.
 //!
 //! Takes the full FnoUniverse (~97K contracts) and produces the exact list of
 //! instruments to subscribe on the WebSocket, respecting:
@@ -6,14 +6,16 @@
 //! 1. **5 major indices** — ALL contracts (all expiries, all strikes, no filtering)
 //! 2. **Display indices** — index value only (IDX_I ticker)
 //! 3. **Stock equities** — NSE_EQ price feed for each F&O stock
-//! 4. **Stock derivatives** — current expiry only, ATM ± N strikes
+//! 4. **Stock derivatives Stage 1** — current expiry ATM +- N strikes (priority)
+//! 5. **Stock derivatives Stage 2** — progressive fill to 25K capacity,
+//!    nearest expiry first, deterministic sort order
 //!
 //! # Feed Mode
 //! All instruments start as Ticker mode. Quote and Full are supported in code
 //! but configured via `SubscriptionConfig.feed_mode`.
 //!
 //! # Capacity
-//! Total must fit within 25,000 (5 connections × 5,000 each).
+//! Total must fit within 25,000 (5 connections x 5,000 each).
 //! The planner logs a warning if capacity is exceeded.
 
 use std::collections::HashSet;
@@ -69,6 +71,12 @@ pub struct SubscriptionPlanSummary {
     pub exceeds_capacity: bool,
     /// Stocks skipped because no current-expiry option chain was found.
     pub stocks_skipped_no_chain: usize,
+    /// Total stock derivatives available before capacity cap (Stage 2 progressive fill).
+    pub stock_derivatives_available: usize,
+    /// Stock derivatives skipped due to 25K capacity cap.
+    pub stock_derivatives_skipped: usize,
+    /// Capacity utilization as percentage: (total / MAX_TOTAL_SUBSCRIPTIONS) * 100.
+    pub capacity_utilization_pct: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +275,68 @@ pub fn build_subscription_plan(
     }
 
     // -----------------------------------------------------------------------
+    // 5. Progressive fill — remaining stock derivatives to 25K capacity
+    //    Stage 2: ALL stock derivatives with expiry >= today, nearest first.
+    //    Stage 1 (ATM+-N above) already added priority instruments.
+    //    seen_ids ensures no duplicates.
+    // -----------------------------------------------------------------------
+    let mut stock_derivatives_available: usize = 0;
+    let mut stock_derivatives_skipped: usize = 0;
+
+    if config.subscribe_stock_derivatives {
+        // O(1) EXEMPT: begin — planner runs once at startup, not per tick
+        let count_before_stage2 = instruments.len();
+
+        let mut remaining_stock_derivatives: Vec<
+            &dhan_live_trader_common::instrument_types::DerivativeContract,
+        > = universe
+            .derivative_contracts
+            .values()
+            .filter(|c| {
+                matches!(
+                    c.instrument_kind,
+                    dhan_live_trader_common::instrument_types::DhanInstrumentKind::FutureStock
+                        | dhan_live_trader_common::instrument_types::DhanInstrumentKind::OptionStock
+                ) && c.expiry_date >= today
+                    && !seen_ids.contains(&c.security_id)
+            })
+            .collect();
+
+        // Deterministic sort: nearest expiry -> underlying -> security_id
+        remaining_stock_derivatives.sort_by(|a, b| {
+            a.expiry_date
+                .cmp(&b.expiry_date)
+                .then(a.underlying_symbol.cmp(&b.underlying_symbol))
+                .then(a.security_id.cmp(&b.security_id))
+        });
+
+        stock_derivatives_available = remaining_stock_derivatives.len();
+        for contract in &remaining_stock_derivatives {
+            if instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS {
+                break;
+            }
+            if seen_ids.insert(contract.security_id) {
+                instruments.push(make_derivative_instrument(
+                    contract,
+                    SubscriptionCategory::StockDerivative,
+                    feed_mode,
+                ));
+            }
+        }
+
+        let stage2_added = instruments.len() - count_before_stage2;
+        stock_derivatives_skipped = stock_derivatives_available.saturating_sub(stage2_added);
+
+        info!(
+            stage2_available = stock_derivatives_available,
+            stage2_added = stage2_added,
+            stage2_skipped = stock_derivatives_skipped,
+            "Progressive fill: Stage 2 stock derivatives"
+        );
+        // O(1) EXEMPT: end
+    }
+
+    // -----------------------------------------------------------------------
     // Build the registry and summary
     // -----------------------------------------------------------------------
     let registry = InstrumentRegistry::from_instruments(instruments);
@@ -280,16 +350,26 @@ pub fn build_subscription_plan(
         );
     }
 
+    let total = registry.len();
+    let capacity_utilization_pct = if MAX_TOTAL_SUBSCRIPTIONS > 0 {
+        (total as f64 / MAX_TOTAL_SUBSCRIPTIONS as f64) * 100.0
+    } else {
+        0.0
+    };
+
     let summary = SubscriptionPlanSummary {
         major_index_values: registry.category_count(SubscriptionCategory::MajorIndexValue),
         display_indices: registry.category_count(SubscriptionCategory::DisplayIndex),
         index_derivatives: registry.category_count(SubscriptionCategory::IndexDerivative),
         stock_equities: registry.category_count(SubscriptionCategory::StockEquity),
         stock_derivatives: registry.category_count(SubscriptionCategory::StockDerivative),
-        total: registry.len(),
+        total,
         feed_mode,
         exceeds_capacity,
         stocks_skipped_no_chain,
+        stock_derivatives_available,
+        stock_derivatives_skipped,
+        capacity_utilization_pct,
     };
 
     info!(
@@ -301,6 +381,7 @@ pub fn build_subscription_plan(
         total = summary.total,
         feed_mode = %feed_mode,
         stocks_skipped = summary.stocks_skipped_no_chain,
+        capacity_pct = format!("{:.1}%", summary.capacity_utilization_pct),
         "Subscription plan built"
     );
 
@@ -811,8 +892,11 @@ mod tests {
 
         let plan = build_subscription_plan(&universe, &config, today);
 
-        // RELIANCE: 1 future + 3 CE (mid±1) + 3 PE (mid±1) = 7
-        assert_eq!(plan.summary.stock_derivatives, 7);
+        // Stage 1: RELIANCE 1 future + 3 CE (mid+-1) + 3 PE (mid+-1) = 7
+        // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
+        // Total stock derivatives: 7 + 4 = 11 (all RELIANCE)
+        // But actually Stage 2 adds whatever wasn't in Stage 1
+        assert_eq!(plan.summary.stock_derivatives, 11);
     }
 
     #[test]
@@ -827,8 +911,10 @@ mod tests {
 
         let plan = build_subscription_plan(&universe, &config, today);
 
-        // RELIANCE: 1 future + 1 CE (ATM only) + 1 PE (ATM only) = 3
-        assert_eq!(plan.summary.stock_derivatives, 3);
+        // Stage 1: RELIANCE 1 future + 1 CE (ATM only) + 1 PE (ATM only) = 3
+        // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
+        // Total stock derivatives: 3 + 8 = 11 (all RELIANCE)
+        assert_eq!(plan.summary.stock_derivatives, 11);
     }
 
     #[test]
@@ -868,6 +954,75 @@ mod tests {
         assert_eq!(
             fno_count,
             plan.summary.index_derivatives + plan.summary.stock_derivatives
+        );
+    }
+
+    // --- Progressive Fill (Stage 2) Tests ---
+
+    #[test]
+    fn test_plan_capacity_utilization_percentage() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        let expected_pct = (plan.summary.total as f64 / 25000.0) * 100.0;
+        assert!(
+            (plan.summary.capacity_utilization_pct - expected_pct).abs() < 0.001,
+            "Capacity utilization: expected {expected_pct}, got {}",
+            plan.summary.capacity_utilization_pct
+        );
+    }
+
+    #[test]
+    fn test_plan_small_universe_no_skips() {
+        // Small test universe — all instruments fit, nothing skipped
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // Small universe: all RELIANCE contracts already in Stage 1 (ATM+-10)
+        // Stage 2 has 0 remaining → 0 available, 0 skipped
+        assert_eq!(plan.summary.stock_derivatives_skipped, 0);
+        assert!(!plan.summary.exceeds_capacity);
+    }
+
+    #[test]
+    fn test_plan_deterministic_sort() {
+        // Same input twice → identical set of instruments
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan1 = build_subscription_plan(&universe, &config, today);
+        let plan2 = build_subscription_plan(&universe, &config, today);
+
+        let mut ids1: Vec<u32> = plan1.registry.iter().map(|i| i.security_id).collect();
+        let mut ids2: Vec<u32> = plan2.registry.iter().map(|i| i.security_id).collect();
+        ids1.sort();
+        ids2.sort();
+        assert_eq!(ids1, ids2, "Plans should produce identical instrument sets");
+        assert_eq!(plan1.summary.total, plan2.summary.total);
+    }
+
+    #[test]
+    fn test_plan_no_duplicates_progressive_fill() {
+        // Verify Stage 2 doesn't duplicate Stage 1 instruments
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+        let unique: HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "Duplicate security_ids after progressive fill"
         );
     }
 }

@@ -1,7 +1,11 @@
 //! WebSocket connection pool for Dhan Live Market Feed.
 //!
-//! Distributes instruments across up to 5 WebSocket connections
-//! (Dhan limit: 5,000 instruments per connection, 25,000 total).
+//! Always creates the maximum allowed number of WebSocket connections
+//! (default 5, capped at `MAX_WEBSOCKET_CONNECTIONS`), distributing
+//! instruments round-robin across all connections. Empty connections
+//! stay alive for Phase 2 dynamic rebalancing.
+//!
+//! Dhan limit: 5,000 instruments per connection, 25,000 total.
 //! Each connection runs independently on its own tokio task.
 
 use std::sync::Arc;
@@ -11,7 +15,7 @@ use tracing::info;
 
 use dhan_live_trader_common::config::{DhanConfig, WebSocketConfig};
 use dhan_live_trader_common::constants::{
-    MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_TOTAL_SUBSCRIPTIONS,
+    MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_WEBSOCKET_CONNECTIONS,
 };
 use dhan_live_trader_common::types::FeedMode;
 
@@ -25,8 +29,9 @@ use crate::websocket::types::{ConnectionHealth, InstrumentSubscription, WebSocke
 
 /// Pool of WebSocket connections distributing instruments across connections.
 ///
-/// Creates the minimum number of connections needed to cover all instruments,
-/// respecting Dhan's 5,000-per-connection and 25,000-total limits.
+/// Always creates the maximum allowed number of connections (default 5),
+/// distributing instruments round-robin. Empty connections stay alive for
+/// Phase 2 dynamic rebalancing. Respects per-connection and total capacity.
 pub struct WebSocketConnectionPool {
     /// Active connections (up to 5).
     connections: Vec<Arc<WebSocketConnection>>,
@@ -55,7 +60,8 @@ impl WebSocketConnectionPool {
     /// * `feed_mode` — Desired feed granularity.
     ///
     /// # Errors
-    /// Returns `CapacityExceeded` if instruments exceed total capacity (25,000).
+    /// Returns `CapacityExceeded` if instruments exceed dynamic capacity
+    /// (`max_per_conn × num_connections`, default 5,000 × 5 = 25,000).
     pub fn new(
         token_handle: TokenHandle,
         client_id: String,
@@ -66,21 +72,23 @@ impl WebSocketConnectionPool {
     ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
-        if total > MAX_TOTAL_SUBSCRIPTIONS {
-            return Err(WebSocketError::CapacityExceeded {
-                requested: total,
-                capacity: MAX_TOTAL_SUBSCRIPTIONS,
-            });
-        }
-
+        // Compute connection parameters first — needed for dynamic capacity check.
         let max_per_conn = dhan_config
             .max_instruments_per_connection
             .min(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION);
-        let num_connections = if total == 0 {
-            1 // Always create at least one connection
-        } else {
-            total.div_ceil(max_per_conn)
-        };
+        let num_connections = dhan_config
+            .max_websocket_connections
+            .min(MAX_WEBSOCKET_CONNECTIONS);
+
+        // Dynamic capacity: effective limit depends on config, not hardcoded 25K.
+        // If max_per_conn=2000, num_connections=5 → effective capacity = 10,000.
+        let effective_capacity = max_per_conn * num_connections;
+        if total > effective_capacity {
+            return Err(WebSocketError::CapacityExceeded {
+                requested: total,
+                capacity: effective_capacity,
+            });
+        }
 
         // Shared channel: all connections send frames to a single receiver.
         // Buffer size: enough for burst traffic without blocking senders.
@@ -215,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_empty_instruments_creates_one_connection() {
+    fn test_pool_empty_instruments_creates_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -225,12 +233,12 @@ mod tests {
             FeedMode::Ticker,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.connection_count(), 5);
         assert_eq!(pool.total_instruments(), 0);
     }
 
     #[test]
-    fn test_pool_single_connection_under_5000() {
+    fn test_pool_under_5000_still_creates_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -240,12 +248,12 @@ mod tests {
             FeedMode::Quote,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.connection_count(), 5);
         assert_eq!(pool.total_instruments(), 3000);
     }
 
     #[test]
-    fn test_pool_exactly_5000_uses_one_connection() {
+    fn test_pool_exactly_5000_creates_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -255,11 +263,11 @@ mod tests {
             FeedMode::Full,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.connection_count(), 5);
     }
 
     #[test]
-    fn test_pool_5001_uses_two_connections() {
+    fn test_pool_5001_creates_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -269,7 +277,7 @@ mod tests {
             FeedMode::Ticker,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 2);
+        assert_eq!(pool.connection_count(), 5);
         assert_eq!(pool.total_instruments(), 5001);
     }
 
@@ -313,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_pool_round_robin_distribution() {
-        // 10001 instruments across 5000-per-conn = 3 connections
+        // 10001 instruments distributed round-robin across 5 connections
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -323,12 +331,16 @@ mod tests {
             FeedMode::Ticker,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 3);
+        assert_eq!(pool.connection_count(), 5);
 
         let healths = pool.health();
-        // Round-robin: 3334 + 3334 + 3333
+        // Round-robin across 5: 2001 + 2000 + 2000 + 2000 + 2000
         let total: usize = healths.iter().map(|h| h.subscribed_count).sum();
         assert_eq!(total, 10001);
+        // Verify no connection exceeds max_per_conn (5000)
+        for h in &healths {
+            assert!(h.subscribed_count <= 5000);
+        }
     }
 
     #[test]
@@ -342,12 +354,12 @@ mod tests {
             FeedMode::Ticker,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.connection_count(), 5);
         assert_eq!(pool.total_instruments(), 1);
     }
 
     #[test]
-    fn test_pool_boundary_4999_one_connection() {
+    fn test_pool_boundary_4999_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -357,11 +369,11 @@ mod tests {
             FeedMode::Quote,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.connection_count(), 5);
     }
 
     #[test]
-    fn test_pool_boundary_10000_two_connections() {
+    fn test_pool_boundary_10000_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -371,11 +383,11 @@ mod tests {
             FeedMode::Ticker,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 2);
+        assert_eq!(pool.connection_count(), 5);
     }
 
     #[test]
-    fn test_pool_boundary_15000_three_connections() {
+    fn test_pool_boundary_15000_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -385,11 +397,11 @@ mod tests {
             FeedMode::Full,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 3);
+        assert_eq!(pool.connection_count(), 5);
     }
 
     #[test]
-    fn test_pool_boundary_20000_four_connections() {
+    fn test_pool_boundary_20000_max_connections() {
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -399,7 +411,7 @@ mod tests {
             FeedMode::Ticker,
         )
         .unwrap();
-        assert_eq!(pool.connection_count(), 4);
+        assert_eq!(pool.connection_count(), 5);
     }
 
     #[test]
@@ -440,7 +452,7 @@ mod tests {
         let debug_str = format!("{pool:?}");
         assert!(debug_str.contains("WebSocketConnectionPool"));
         assert!(debug_str.contains("connection_count"));
-        assert!(debug_str.contains("2")); // 5001 instruments = 2 connections
+        assert!(debug_str.contains("5")); // Always 5 connections
     }
 
     #[test]
@@ -459,8 +471,8 @@ mod tests {
             FeedMode::Full,
         )
         .unwrap();
-        // 5000 / 2000 = 3 connections needed
-        assert_eq!(pool.connection_count(), 3);
+        // Always max connections (5), instruments distributed round-robin
+        assert_eq!(pool.connection_count(), 5);
         assert_eq!(pool.total_instruments(), 5000);
     }
 
@@ -503,6 +515,99 @@ mod tests {
         for (idx, health) in healths.iter().enumerate() {
             assert_eq!(health.connection_id, idx as u8);
             assert_eq!(health.state, ConnectionState::Disconnected);
+        }
+    }
+
+    // --- New tests for always-max-connections + dynamic capacity ---
+
+    #[test]
+    fn test_pool_config_max_connections_3() {
+        // Config limits to 3 connections
+        let config = DhanConfig {
+            max_websocket_connections: 3,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(5000),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 3);
+        assert_eq!(pool.total_instruments(), 5000);
+    }
+
+    #[test]
+    fn test_pool_config_max_per_conn_2000_exceeds() {
+        // max_per_conn=2000, max_conns=5 → effective capacity = 10,000
+        let config = DhanConfig {
+            max_instruments_per_connection: 2000,
+            ..make_test_dhan_config()
+        };
+        let result = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(15000),
+            FeedMode::Ticker,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WebSocketError::CapacityExceeded {
+                requested,
+                capacity,
+            } => {
+                assert_eq!(requested, 15000);
+                assert_eq!(capacity, 10000); // 2000 × 5
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_pool_config_max_conns_100_capped_at_5() {
+        // Config says 100, but MAX_WEBSOCKET_CONNECTIONS caps at 5
+        let config = DhanConfig {
+            max_websocket_connections: 100,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(5000),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 5);
+    }
+
+    // --- Property-based test ---
+
+    mod proptest_pool {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn test_pool_no_instrument_loss_any_count(count in 0usize..=25000) {
+                let instruments = make_instruments(count);
+                let pool = WebSocketConnectionPool::new(
+                    make_test_token_handle(),
+                    "test".to_string(),
+                    make_test_dhan_config(),
+                    make_test_ws_config(),
+                    instruments,
+                    FeedMode::Ticker,
+                ).unwrap();
+                prop_assert_eq!(pool.total_instruments(), count);
+                prop_assert_eq!(pool.connection_count(), 5);
+            }
         }
     }
 }

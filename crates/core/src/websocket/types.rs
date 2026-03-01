@@ -219,6 +219,14 @@ pub enum WebSocketError {
     /// TLS configuration failed.
     #[error("TLS configuration failed: {reason}")]
     TlsConfigurationFailed { reason: String },
+
+    /// WebSocket read timed out — no data received within the expected interval.
+    /// Indicates a zombie connection (TCP alive but no frames from server).
+    #[error("WebSocket read timeout on connection {connection_id} after {timeout_secs}s")]
+    ReadTimeout {
+        connection_id: ConnectionId,
+        timeout_secs: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +570,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("connection 1"));
         assert!(msg.contains("write error"));
+    }
+
+    #[test]
+    fn test_websocket_error_read_timeout_display() {
+        let err = WebSocketError::ReadTimeout {
+            connection_id: 3,
+            timeout_secs: 40,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("connection 3"));
+        assert!(msg.contains("40s"));
     }
 
     #[test]
