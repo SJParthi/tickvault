@@ -5,12 +5,13 @@
 # All 6 stages must pass. Failure = build is RED. No merging.
 #
 # Stages:
-#   1. Compile    — cargo build --release
-#   2. Lint       — cargo fmt --check + cargo clippy -D warnings
+#   1. Compile    — cargo build --release + binary size check
+#   2. Lint       — cargo fmt + clippy (trading safety) + docs + typos + unused deps
 #   3. Test       — cargo test --workspace
 #   4. Security   — cargo deny check (advisories, licenses, bans, sources)
-#   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
+#   5. Perf       — cargo bench + budget gate + DHAT (parallel after test)
 #   6. Coverage   — cargo llvm-cov (enforce 99% threshold) (parallel after test)
+#   7. Audit      — cargo audit --deny yanked --deny warnings (parallel after test)
 #
 # Security: All actions pinned to SHA. No mutable tags.
 # =============================================================================
@@ -89,6 +90,9 @@ jobs:
       - name: Build (release)
         run: cargo build --release --workspace
 
+      - name: Binary size gate (<15MB scratch Docker constraint)
+        run: bash scripts/binary-size-gate.sh
+
   # ---- Stage 2: Lint ----
   lint:
     name: "Stage 2 — Lint"
@@ -131,6 +135,14 @@ jobs:
 
       - name: Spell check (typos)
         run: typos .
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-machete
+        with:
+          tool: cargo-machete
+
+      - name: Unused dependency check
+        run: cargo machete
 
   # ---- Stage 3: Test ----
   test:
@@ -249,3 +261,27 @@ jobs:
           name: coverage-report
           path: target/llvm-cov/
           retention-days: 30
+
+  # ---- Stage 7: Audit (parallel after test) ----
+  audit:
+    name: "Stage 7 — Audit"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-audit
+        with:
+          tool: cargo-audit
+
+      - name: Audit (CVEs + yanked crates)
+        run: cargo audit --deny warnings --deny yanked
