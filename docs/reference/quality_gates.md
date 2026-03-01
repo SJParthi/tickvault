@@ -61,7 +61,7 @@ Any stage fails = build is RED. No exceptions.
 
 ## Gate 5: Pre-Deployment
 
-All CI green + Docker image builds (<15MB scratch) + health checks pass + smoke test (1 tick end-to-end) + Parthiban approves.
+All CI green + Docker image builds (<50MB binary) + health checks pass + smoke test (1 tick end-to-end) + Parthiban approves.
 
 ## Gate 5b: Release Checklist
 
