@@ -97,6 +97,53 @@ impl fmt::Debug for DhanCredentials {
 }
 
 // ---------------------------------------------------------------------------
+// QuestDB Credentials (from SSM)
+// ---------------------------------------------------------------------------
+
+/// QuestDB PG wire protocol credentials fetched from AWS SSM Parameter Store.
+///
+/// Used for PostgreSQL wire protocol connections (port 8812).
+/// All fields are `Secret<String>` — Debug/Display never leak raw values.
+pub struct QuestDbCredentials {
+    /// QuestDB PG wire protocol username.
+    pub pg_user: SecretString,
+    /// QuestDB PG wire protocol password.
+    pub pg_password: SecretString,
+}
+
+impl fmt::Debug for QuestDbCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuestDbCredentials")
+            .field("pg_user", &"[REDACTED]")
+            .field("pg_password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grafana Credentials (from SSM)
+// ---------------------------------------------------------------------------
+
+/// Grafana admin credentials fetched from AWS SSM Parameter Store.
+///
+/// All fields are `Secret<String>` — Debug/Display never leak raw values.
+pub struct GrafanaCredentials {
+    /// Grafana admin username.
+    pub admin_user: SecretString,
+    /// Grafana admin password.
+    pub admin_password: SecretString,
+}
+
+impl fmt::Debug for GrafanaCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrafanaCredentials")
+            .field("admin_user", &"[REDACTED]")
+            .field("admin_password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token State (stored in ArcSwap)
 // ---------------------------------------------------------------------------
 
@@ -408,6 +455,34 @@ mod tests {
         assert!(!debug_output.contains("my-client-id"));
         assert!(!debug_output.contains("my-secret"));
         assert!(!debug_output.contains("base32secret"));
+    }
+
+    #[test]
+    fn test_questdb_credentials_debug_redacted() {
+        let creds = QuestDbCredentials {
+            pg_user: SecretString::from("questdb-admin".to_string()),
+            pg_password: SecretString::from("super-secret-pw".to_string()),
+        };
+
+        let debug_output = format!("{creds:?}");
+
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("questdb-admin"));
+        assert!(!debug_output.contains("super-secret-pw"));
+    }
+
+    #[test]
+    fn test_grafana_credentials_debug_redacted() {
+        let creds = GrafanaCredentials {
+            admin_user: SecretString::from("grafana-admin".to_string()),
+            admin_password: SecretString::from("grafana-secret-pw".to_string()),
+        };
+
+        let debug_output = format!("{creds:?}");
+
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("grafana-admin"));
+        assert!(!debug_output.contains("grafana-secret-pw"));
     }
 
     #[test]
