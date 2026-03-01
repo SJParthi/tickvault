@@ -143,7 +143,7 @@ impl WebSocketConnection {
     pub fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
             connection_id: self.connection_id,
-            state: *self.state.lock().expect("state lock poisoned"),
+            state: *self.state.lock().expect("state lock poisoned"), // APPROVED: lock poison is unrecoverable
             subscribed_count: self.instruments.len(),
             total_reconnections: self.total_reconnections.load(Ordering::Relaxed),
         }
@@ -460,7 +460,7 @@ impl WebSocketConnection {
 
     #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
     fn set_state(&self, new_state: ConnectionState) {
-        let mut state = self.state.lock().expect("state lock poisoned");
+        let mut state = self.state.lock().expect("state lock poisoned"); // APPROVED: lock poison is unrecoverable
         *state = new_state;
     }
 }
