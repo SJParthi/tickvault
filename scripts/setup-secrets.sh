@@ -11,7 +11,7 @@
 #   3. Verifies all 5 secrets exist in real AWS SSM
 #   4. Sends test Telegram notification
 #
-# No LocalStack needed for secrets. The app reads real AWS SSM directly.
+# All secrets read from real AWS SSM directly.
 # =============================================================================
 
 set -euo pipefail

@@ -14,7 +14,7 @@
 #   2. Installs quality gate tools (cargo-audit, cargo-deny, etc.)
 #   3. Sets up git hooks (pre-commit, pre-push, commit-msg)
 #   4. Starts Docker infrastructure (9 services) — fails fast if Docker not running
-#   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana, LocalStack)
+#   5. Waits for services to be healthy (QuestDB, Prometheus, Grafana)
 #   6. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
 #   7. Verifies secrets in real AWS SSM + sends test Telegram notification
 #   8. Verifies cargo check + cargo test
@@ -135,7 +135,6 @@ wait_for_service "QuestDB" "http://localhost:9000"
 wait_for_service "Valkey" "http://localhost:6379" || true  # Valkey has no HTTP — check via redis-cli below
 wait_for_service "Prometheus" "http://localhost:9090/-/healthy"
 wait_for_service "Grafana" "http://localhost:3000/api/health"
-wait_for_service "LocalStack" "http://localhost:4566/_localstack/health"
 
 # Verify QuestDB PostgreSQL wire protocol (port 8812 — used by IntelliJ Database tool)
 echo -n "  Checking QuestDB PG wire (port 8812)... "

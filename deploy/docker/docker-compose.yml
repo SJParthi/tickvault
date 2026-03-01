@@ -23,8 +23,6 @@ volumes:
     name: dlt-prometheus-data
   dlt-loki-data:
     name: dlt-loki-data
-  dlt-localstack-data:
-    name: dlt-localstack-data
 
 services:
   # ---------------------------------------------------------------------------
@@ -251,28 +249,3 @@ services:
     networks:
       - dlt-network
 
-  # ---------------------------------------------------------------------------
-  # LocalStack — AWS SSM Parameter Store (dev environment)
-  # Bible #89: localstack/localstack:4.3.0
-  # ---------------------------------------------------------------------------
-  dlt-localstack:
-    image: localstack/localstack:4.3.0@sha256:f3cb1a79f3add997575e859c3a2808e6dae4b0de836661de255baa2b576868f8
-    container_name: dlt-localstack
-    hostname: dlt-localstack
-    restart: unless-stopped
-    ports:
-      - "4566:4566"    # LocalStack gateway
-    volumes:
-      - dlt-localstack-data:/var/lib/localstack
-    environment:
-      SERVICES: ssm
-      DEFAULT_REGION: ap-south-1
-      EAGER_SERVICE_LOADING: "1"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-    networks:
-      - dlt-network

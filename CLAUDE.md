@@ -17,7 +17,7 @@ Every file, function, config decision must pass all three. No exceptions.
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
 - **Language:** Rust 2024 Edition (stable 1.93.1)
 - **Repo:** `https://github.com/SJParthi/dhan-live-trader` (single source of truth)
-- **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Only `AWS_ENDPOINT_URL` differs.
+- **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Same containers, same code, always real AWS SSM.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
 ## SESSION PROTOCOL
