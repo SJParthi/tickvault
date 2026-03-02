@@ -524,4 +524,28 @@ fi
 
 echo -e "${GREEN}Observability stack fully operational. Zero manual config needed.${NC}"
 echo ""
+
+# Remind about external health alarms (AWS only)
+# These cover the 2 scenarios local monitoring can't self-detect:
+# host death and Docker daemon crash.
+if curl -sf --max-time 1 "http://169.254.169.254/latest/meta-data/" >/dev/null 2>&1; then
+    # Running on EC2 — check if CloudWatch alarms exist
+    CW_ALARM=$(aws cloudwatch describe-alarms \
+        --alarm-name-prefix "dlt-${SSM_ENV}-ec2" \
+        --region "ap-south-1" \
+        --query 'MetricAlarms[0].AlarmName' \
+        --output text 2>/dev/null || echo "None")
+    if [ "$CW_ALARM" = "None" ] || [ -z "$CW_ALARM" ]; then
+        echo ""
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}  ACTION NEEDED: External health alarms not configured.${NC}"
+        echo -e "${YELLOW}  Run: ./scripts/setup-cloudwatch-alarms.sh --env ${SSM_ENV}${NC}"
+        echo -e "${YELLOW}  Covers: EC2 instance death + Docker daemon crash → SMS${NC}"
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+    else
+        ok "CloudWatch external health alarms: active"
+    fi
+fi
+
 exit 0
