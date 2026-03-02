@@ -1,20 +1,23 @@
 //! Binary entry point for the dhan-live-trader application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → HTTP → Shutdown
+//! Config → Observability → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → HTTP → Shutdown
 //!
 //! # Boot Sequence
 //! 1. Load and validate configuration from `config/base.toml`
-//! 2. Initialize structured logging (tracing)
-//! 3. Initialize Telegram notification service (best-effort)
-//! 4. Authenticate with Dhan API (SSM → TOTP → JWT)
-//! 5. Set up QuestDB tick persistence (best-effort)
-//! 6. Build F&O universe + subscription plan from instrument CSV
-//! 7. Build WebSocket connection pool with planned instruments
-//! 8. Spawn tick processing pipeline (pure capture — parse → filter → persist)
-//! 9. Start axum API server (health, stats, portal)
-//! 10. Spawn token renewal background task
-//! 11. Await shutdown signal (Ctrl+C)
+//! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
+//! 3. Initialize structured logging with OpenTelemetry layer
+//! 4. Initialize Telegram notification service (best-effort)
+//! 5. Authenticate with Dhan API (SSM → TOTP → JWT)
+//! 6. Set up QuestDB tick persistence (best-effort)
+//! 7. Build F&O universe + subscription plan from instrument CSV
+//! 8. Build WebSocket connection pool with planned instruments
+//! 9. Spawn tick processing pipeline (pure capture — parse → filter → persist)
+//! 10. Start axum API server (health, stats, portal)
+//! 11. Spawn token renewal background task
+//! 12. Await shutdown signal (Ctrl+C)
+
+mod observability;
 
 use std::net::SocketAddr;
 
@@ -24,6 +27,8 @@ use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
 use tracing::{error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
@@ -84,39 +89,62 @@ async fn main() -> Result<()> {
         .context("configuration validation failed")?;
 
     // -----------------------------------------------------------------------
-    // Step 2: Initialize structured logging
+    // Step 2: Initialize observability (Prometheus metrics exporter)
+    // -----------------------------------------------------------------------
+    observability::init_metrics(&config.observability)
+        .context("failed to initialize Prometheus metrics")?;
+
+    // -----------------------------------------------------------------------
+    // Step 3: Initialize structured logging + OpenTelemetry tracing layer
     // -----------------------------------------------------------------------
     let log_filter = config.logging.level.as_str();
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter)),
-        )
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter));
+
+    let (otel_layer, otel_provider) = match observability::init_tracing(&config.observability)
+        .context("failed to initialize OpenTelemetry tracing")?
+    {
+        Some((layer, provider)) => (Some(layer), Some(provider)),
+        None => (None, None),
+    };
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true)
         .with_file(false)
         .with_line_number(false);
 
-    if config.logging.format == "json" {
-        subscriber.json().init();
-    } else {
-        subscriber.init();
-    }
+    // Box the fmt layer so both JSON and text branches produce the same type,
+    // allowing a single subscriber chain (required for OpenTelemetryLayer<S> inference).
+    let fmt_boxed: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
+        if config.logging.format == "json" {
+            Box::new(fmt_layer.json())
+        } else {
+            Box::new(fmt_layer)
+        };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_boxed)
+        .with(otel_layer)
+        .init();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
         config_file = CONFIG_BASE_PATH,
+        metrics_port = config.observability.metrics_port,
+        tracing_enabled = config.observability.tracing_enabled,
         "dhan-live-trader starting"
     );
 
     // -----------------------------------------------------------------------
-    // Step 3: Initialize notification service (best-effort — no-op if SSM unavailable)
+    // Step 4: Initialize notification service (best-effort — no-op if SSM unavailable)
     // -----------------------------------------------------------------------
     info!("initializing Telegram notification service");
     let notifier = NotificationService::initialize(&config.notification).await;
 
     // -----------------------------------------------------------------------
-    // Step 4: Authenticate with Dhan API (infinite retry for transient errors)
+    // Step 5: Authenticate with Dhan API (infinite retry for transient errors)
     // -----------------------------------------------------------------------
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 
@@ -133,7 +161,7 @@ async fn main() -> Result<()> {
         };
 
     // -----------------------------------------------------------------------
-    // Step 5: Set up QuestDB tick persistence (best-effort)
+    // Step 6: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!("setting up QuestDB tables (ticks + instruments)");
 
@@ -155,7 +183,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6: Load or build instruments (three-layer defense)
+    // Step 7: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
     info!("checking instrument build eligibility");
 
@@ -217,7 +245,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 7: Build WebSocket connection pool (only if authenticated + plan ready)
+    // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let (frame_receiver, ws_handles) = if let Some(plan) = &subscription_plan {
         let tm = &token_manager;
@@ -268,7 +296,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 8: Spawn tick processor (pure capture — parse → filter → persist)
+    // Step 9: Spawn tick processor (pure capture — parse → filter → persist)
     // -----------------------------------------------------------------------
     let processor_handle = if let Some(receiver) = frame_receiver {
         let handle = tokio::spawn(async move {
@@ -282,7 +310,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 9: Start axum API server
+    // Step 10: Start axum API server
     // -----------------------------------------------------------------------
     let api_state = SharedAppState::new(
         config.questdb.clone(),
@@ -313,13 +341,13 @@ async fn main() -> Result<()> {
     });
 
     // -----------------------------------------------------------------------
-    // Step 10: Spawn token renewal background task
+    // Step 11: Spawn token renewal background task
     // -----------------------------------------------------------------------
     let renewal_handle = token_manager.spawn_renewal_task();
     info!("token renewal task started");
 
     // -----------------------------------------------------------------------
-    // Step 11: Await shutdown signal
+    // Step 12: Await shutdown signal
     // -----------------------------------------------------------------------
     let mode = "LIVE";
     info!(
@@ -352,6 +380,9 @@ async fn main() -> Result<()> {
     for handle in ws_handles {
         handle.abort();
     }
+
+    // Flush pending OpenTelemetry spans before exit (Drop triggers batch flush)
+    drop(otel_provider);
 
     info!("dhan-live-trader stopped");
     Ok(())

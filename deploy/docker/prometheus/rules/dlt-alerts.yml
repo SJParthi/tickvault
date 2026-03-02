@@ -1,0 +1,143 @@
+# =============================================================================
+# dhan-live-trader — Prometheus Alerting & Recording Rules
+# =============================================================================
+# Recording rules pre-compute expensive queries. Alert rules fire to
+# Prometheus Alertmanager (if configured) or are scraped by Grafana.
+# =============================================================================
+
+groups:
+  # -- Recording Rules (pre-aggregations for dashboard performance) -----------
+  - name: dlt-recording-rules
+    interval: 15s
+    rules:
+      - record: dlt:tick_rate:1m
+        expr: rate(dlt_ticks_processed_total[1m])
+
+      - record: dlt:tick_latency_p50:1m
+        expr: histogram_quantile(0.50, rate(dlt_tick_processing_duration_ns_bucket[1m]))
+
+      - record: dlt:tick_latency_p95:1m
+        expr: histogram_quantile(0.95, rate(dlt_tick_processing_duration_ns_bucket[1m]))
+
+      - record: dlt:tick_latency_p99:1m
+        expr: histogram_quantile(0.99, rate(dlt_tick_processing_duration_ns_bucket[1m]))
+
+      - record: dlt:traefik_request_rate:5m
+        expr: sum(rate(traefik_entrypoint_requests_total[5m])) by (entrypoint)
+
+      - record: dlt:traefik_error_rate:5m
+        expr: sum(rate(traefik_entrypoint_requests_total{code=~"5.."}[5m])) by (entrypoint)
+
+  # -- Alert Rules -------------------------------------------------------------
+  - name: dlt-infrastructure-alerts
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} target is DOWN"
+          description: "{{ $labels.instance }} (job={{ $labels.job }}) has been unreachable for 2+ minutes."
+
+      - alert: PrometheusHighMemory
+        expr: process_resident_memory_bytes{job="dlt-prometheus"} > 1073741824
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus RSS > 1GB"
+          description: "Prometheus is using {{ $value | humanizeBytes }} of memory."
+
+      - alert: PrometheusTSDBCompactionsFailing
+        expr: increase(prometheus_tsdb_compactions_failed_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus TSDB compaction failures"
+          description: "Prometheus has had {{ $value }} compaction failures in the last hour."
+
+      - alert: LokiHighIngestionRate
+        expr: rate(loki_distributor_bytes_received_total[5m]) > 10485760
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki ingestion rate > 10MB/s"
+          description: "Loki is ingesting {{ $value | humanizeBytes }}/s, which may cause ingestion limits to be hit."
+
+  - name: dlt-application-alerts
+    rules:
+      - alert: ApplicationDown
+        expr: up{job="dlt-application"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dhan-live-trader is DOWN"
+          description: "The trading application has been unreachable for 1+ minute."
+
+      - alert: WebSocketDisconnected
+        expr: dlt_websocket_connections_active == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "All WebSocket connections lost"
+          description: "No active feed connections. Market data is stale."
+
+      - alert: HighTickLatency
+        expr: dlt:tick_latency_p99:1m > 1000000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tick processing p99 latency > 1ms"
+          description: "p99 tick processing latency is {{ $value }}ns, exceeding 1ms budget."
+
+      - alert: PipelineStopped
+        expr: dlt_pipeline_active == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tick pipeline is STOPPED"
+          description: "The tick processing pipeline has been inactive for 1+ minute."
+
+      - alert: HighParseErrorRate
+        expr: rate(dlt_parse_errors_total[5m]) > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Parse error rate > 1/sec"
+          description: "Binary frame parse errors averaging {{ $value }}/sec over 5 minutes."
+
+      - alert: HighStorageErrorRate
+        expr: rate(dlt_storage_errors_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "QuestDB storage errors detected"
+          description: "Tick persistence is failing at {{ $value }}/sec. Check QuestDB connectivity."
+
+      - alert: NoTicksReceived
+        expr: dlt:tick_rate:1m == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No ticks received for 5 minutes"
+          description: "Tick processing rate has been zero for 5 minutes during market hours."
+
+      # Phase 2 (OMS) — metrics not yet emitted, alert will be inert until then
+      - alert: HighOrderRejectionRate
+        expr: rate(dlt_orders_rejected_total[5m]) / (rate(dlt_orders_placed_total[5m]) + 1e-10) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order rejection rate > 10%"
+          description: "More than 10% of placed orders are being rejected."

@@ -17,3 +17,6 @@ host = "localhost"
 
 [instrument]
 csv_cache_directory = "data/instrument-cache"
+
+[observability]
+otlp_endpoint = "http://localhost:4317"
