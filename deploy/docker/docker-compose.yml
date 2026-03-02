@@ -98,6 +98,7 @@ services:
     volumes:
       - dlt-prometheus-data:/prometheus
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -181,8 +182,11 @@ services:
       - "16686:16686"  # Jaeger UI
       - "4317:4317"    # OTLP gRPC
       - "4318:4318"    # OTLP HTTP
+    volumes:
+      - ./jaeger/jaeger-config.yml:/etc/jaeger/config.yml:ro
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+    command: ["--config", "/etc/jaeger/config.yml"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ || exit 1"]
       interval: 10s
@@ -206,12 +210,15 @@ services:
     volumes:
       - dlt-grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       GF_SECURITY_ADMIN_USER: ${DLT_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_SECURITY_ADMIN_PASSWORD: ${DLT_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_ALERTING_ENABLED: "false"
     depends_on:
       dlt-prometheus:
         condition: service_healthy
@@ -239,8 +246,10 @@ services:
       - "80:80"        # HTTP
       - "443:443"      # HTTPS
       - "8080:8080"    # Traefik Dashboard
+      - "8082:8082"    # Prometheus metrics
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]

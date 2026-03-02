@@ -7,7 +7,8 @@
 
 .PHONY: help run stop build test check fmt clippy clean \
         docker-up docker-down docker-restart docker-status docker-logs \
-        health status open grafana questdb jaeger prometheus \
+        health status open grafana questdb jaeger prometheus traefik alloy loki \
+        obs obs-verify obs-restart obs-open \
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap
 
@@ -32,8 +33,11 @@ help: ## Show this help
 	@echo "  DOCKER:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(docker)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
+	@echo "  OBSERVABILITY:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(obs)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
 	@echo "  MONITORING:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(grafana|questdb|jaeger|prometheus)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(grafana|questdb|jaeger|prometheus|traefik|alloy|loki)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 
 # =============================================================================
@@ -216,3 +220,37 @@ doc: ## Build documentation
 
 bootstrap: ## First-time setup (run once after cloning)
 	@./scripts/bootstrap.sh
+
+# =============================================================================
+# OBSERVABILITY STACK — Full automation
+# =============================================================================
+
+obs: ## Full auto-setup observability stack (zero-touch: pull, start, verify, open)
+	@./scripts/setup-observability.sh
+
+obs-verify: ## Verify observability stack health (no restart)
+	@./scripts/setup-observability.sh --verify
+
+obs-restart: ## Tear down + fresh restart of observability stack
+	@./scripts/setup-observability.sh --restart
+
+obs-open: ## Open all monitoring dashboards in browser
+	@./scripts/setup-observability.sh --verify --no-open
+	@echo "  Opening dashboards..."
+	@open http://localhost:3000/d/dlt-system-overview 2>/dev/null || xdg-open http://localhost:3000/d/dlt-system-overview 2>/dev/null || echo "  Open: http://localhost:3000/d/dlt-system-overview"
+	@open http://localhost:9090/targets 2>/dev/null || xdg-open http://localhost:9090/targets 2>/dev/null || true
+	@open http://localhost:16686 2>/dev/null || xdg-open http://localhost:16686 2>/dev/null || true
+	@open http://localhost:8080 2>/dev/null || xdg-open http://localhost:8080 2>/dev/null || true
+
+# =============================================================================
+# MONITORING — Open individual dashboards in browser
+# =============================================================================
+
+traefik: ## Open Traefik dashboard (localhost:8080)
+	@open http://localhost:8080 2>/dev/null || xdg-open http://localhost:8080 2>/dev/null || echo "  Open: http://localhost:8080"
+
+alloy: ## Open Alloy UI (localhost:12345)
+	@open http://localhost:12345 2>/dev/null || xdg-open http://localhost:12345 2>/dev/null || echo "  Open: http://localhost:12345"
+
+loki: ## Open Loki status (localhost:3100/ready)
+	@open http://localhost:3100/ready 2>/dev/null || xdg-open http://localhost:3100/ready 2>/dev/null || echo "  Open: http://localhost:3100/ready"

@@ -8,6 +8,7 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://dlt-prometheus:9090
@@ -15,17 +16,29 @@ datasources:
     editable: false
     jsonData:
       timeInterval: "15s"
+      httpMethod: POST
 
   - name: Loki
+    uid: loki
     type: loki
     access: proxy
     url: http://dlt-loki:3100
     editable: false
     jsonData:
       maxLines: 1000
+      derivedFields:
+        - datasourceUid: jaeger
+          matcherRegex: "\"trace_id\":\"(\\w+)\""
+          name: TraceID
+          url: "$${__value.raw}"
 
   - name: Jaeger
+    uid: jaeger
     type: jaeger
     access: proxy
     url: http://dlt-jaeger:16686
     editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        filterByTraceID: true

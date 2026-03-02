@@ -1,0 +1,181 @@
+# =============================================================================
+# dhan-live-trader — Grafana Alerting Provisioning
+# =============================================================================
+# Auto-configures alert rules, contact points, and notification policies.
+# Alerts fire to Grafana's built-in alertmanager. Integrate Telegram/SNS
+# via the Grafana UI or add contact points below.
+# =============================================================================
+
+apiVersion: 1
+
+# -- Contact Points ----------------------------------------------------------
+contactPoints:
+  - orgId: 1
+    name: dlt-default
+    receivers:
+      - uid: dlt-default-email
+        type: email
+        settings:
+          addresses: ""
+        disableResolveMessage: false
+
+# -- Notification Policies ----------------------------------------------------
+policies:
+  - orgId: 1
+    receiver: dlt-default
+    group_by: ["grafana_folder", "alertname"]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+
+# -- Alert Rules ---------------------------------------------------------------
+groups:
+  - orgId: 1
+    name: dlt-infrastructure
+    folder: dhan-live-trader
+    interval: 1m
+    rules:
+      - uid: dlt-target-down
+        title: "Service Target Down"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "up == 0"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: "{{ $labels.job }} target is DOWN"
+          description: "The Prometheus target {{ $labels.instance }} (job={{ $labels.job }}) has been down for more than 2 minutes."
+        labels:
+          severity: critical
+
+      - uid: dlt-high-error-rate
+        title: "High Traefik Error Rate"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "sum(rate(traefik_entrypoint_requests_total{code=~\"5..\"}[5m])) / sum(rate(traefik_entrypoint_requests_total[5m])) > 0.05"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "Traefik 5xx error rate above 5%"
+          description: "More than 5% of Traefik requests are returning 5xx errors over the last 5 minutes."
+        labels:
+          severity: warning
+
+  - orgId: 1
+    name: dlt-application
+    folder: dhan-live-trader
+    interval: 1m
+    rules:
+      - uid: dlt-app-down
+        title: "Application Down"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "up{job=\"dlt-application\"} == 0"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "dhan-live-trader application is DOWN"
+          description: "The main trading application has been unreachable for more than 1 minute. Immediate action required."
+        labels:
+          severity: critical
+
+      - uid: dlt-websocket-disconnect
+        title: "WebSocket Disconnected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_websocket_connections_active == 0"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: NoData
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: "All WebSocket connections lost"
+          description: "No active WebSocket connections to Dhan feed for 2+ minutes. Market data is stale."
+        labels:
+          severity: critical

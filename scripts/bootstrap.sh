@@ -19,6 +19,7 @@
 #   7. Initializes QuestDB tables (CREATE TABLE IF NOT EXISTS — idempotent)
 #   8. Verifies secrets in real AWS SSM + sends test Telegram notification
 #   9. Verifies cargo check + cargo test
+#   10. Verifies observability stack (Prometheus targets, Grafana dashboards, etc.)
 #
 # After this: open IntelliJ and start working. Zero manual config.
 # =============================================================================
@@ -38,7 +39,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # ---- Step 1: Rust Toolchain ----
-echo -e "${CYAN}[1/9]${NC} Installing Rust toolchain..."
+echo -e "${CYAN}[1/10]${NC} Installing Rust toolchain..."
 if command -v rustup > /dev/null 2>&1; then
     rustup show active-toolchain
     echo -e "  ${GREEN}Rust toolchain ready${NC}"
@@ -50,7 +51,7 @@ fi
 echo ""
 
 # ---- Step 2: Quality Tools ----
-echo -e "${CYAN}[2/9]${NC} Installing quality gate tools..."
+echo -e "${CYAN}[2/10]${NC} Installing quality gate tools..."
 
 install_tool() {
     local tool_name="$1"
@@ -77,14 +78,14 @@ install_tool "typos" "typos-cli"
 echo ""
 
 # ---- Step 3: Git Hooks ----
-echo -e "${CYAN}[3/9]${NC} Setting up git hooks..."
+echo -e "${CYAN}[3/10]${NC} Setting up git hooks..."
 git config core.hooksPath scripts/git-hooks
 chmod +x scripts/git-hooks/*
 echo -e "  ${GREEN}Git hooks configured${NC} (pre-commit, pre-push, commit-msg)"
 echo ""
 
 # ---- Step 4: Provision + Fetch Infrastructure Credentials from SSM ----
-echo -e "${CYAN}[4/9]${NC} Provisioning infrastructure credentials in AWS SSM..."
+echo -e "${CYAN}[4/10]${NC} Provisioning infrastructure credentials in AWS SSM..."
 
 REGION="ap-south-1"
 SSM_ENV="${ENVIRONMENT:-dev}"
@@ -126,7 +127,7 @@ echo -e "${GREEN}OK${NC}"
 echo ""
 
 # ---- Step 5: Docker Infrastructure ----
-echo -e "${CYAN}[5/9]${NC} Starting Docker infrastructure..."
+echo -e "${CYAN}[5/10]${NC} Starting Docker infrastructure..."
 if ! command -v docker > /dev/null 2>&1; then
     echo -e "  ${RED}Docker CLI not found!${NC}"
     echo "  Install Docker Desktop: https://docker.com/products/docker-desktop"
@@ -154,7 +155,7 @@ echo -e "  ${GREEN}Docker services starting${NC}"
 echo ""
 
 # ---- Step 5: Wait for Health ----
-echo -e "${CYAN}[6/9]${NC} Waiting for services to be healthy..."
+echo -e "${CYAN}[6/10]${NC} Waiting for services to be healthy..."
 
 wait_for_service() {
     local name="$1"
@@ -190,7 +191,7 @@ fi
 echo ""
 
 # ---- Step 6: QuestDB Table Initialization ----
-echo -e "${CYAN}[7/9]${NC} Initializing QuestDB tables..."
+echo -e "${CYAN}[7/10]${NC} Initializing QuestDB tables..."
 QUESTDB_EXEC_URL="http://localhost:9000/exec"
 
 init_questdb_table() {
@@ -221,7 +222,7 @@ init_questdb_table "subscribed_indices" "${SUBSCRIBED_INDICES_DDL}"
 echo ""
 
 # ---- Step 7: Verify Secrets in Real AWS SSM ----
-echo -e "${CYAN}[8/9]${NC} Verifying secrets in AWS SSM..."
+echo -e "${CYAN}[8/10]${NC} Verifying secrets in AWS SSM..."
 if [ -f "scripts/setup-secrets.sh" ]; then
     bash scripts/setup-secrets.sh
 else
@@ -230,7 +231,7 @@ fi
 echo ""
 
 # ---- Step 8: Verify ----
-echo -e "${CYAN}[9/9]${NC} Verifying build..."
+echo -e "${CYAN}[9/10]${NC} Verifying build..."
 echo -n "  Compiling workspace... "
 if cargo check --workspace > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"
@@ -247,25 +248,35 @@ else
     echo "  Run 'cargo test' to see details."
 fi
 
+# ---- Step 10: Verify Observability Stack ----
+echo -e "${CYAN}[10/10]${NC} Verifying observability stack..."
+if [ -f "scripts/verify-stack.sh" ]; then
+    bash scripts/verify-stack.sh || true
+else
+    echo -e "  ${YELLOW}scripts/verify-stack.sh not found — skipping${NC}"
+fi
 echo ""
+
 echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║   Bootstrap complete!                          ║${NC}"
 echo -e "${CYAN}╠════════════════════════════════════════════════╣${NC}"
 echo -e "${CYAN}║                                                ║${NC}"
-echo -e "${CYAN}║   Open IntelliJ IDEA and start working.       ║${NC}"
-echo -e "${CYAN}║                                                ║${NC}"
 echo -e "${CYAN}║   Useful commands:                             ║${NC}"
 echo -e "${CYAN}║     cargo r    — run the app                  ║${NC}"
 echo -e "${CYAN}║     cargo t    — run all tests                ║${NC}"
-echo -e "${CYAN}║     cargo c    — run clippy                   ║${NC}"
-echo -e "${CYAN}║     cargo b    — build release                ║${NC}"
 echo -e "${CYAN}║     make help  — see all Make targets          ║${NC}"
+echo -e "${CYAN}║                                                ║${NC}"
+echo -e "${CYAN}║   Observability:                               ║${NC}"
+echo -e "${CYAN}║     make obs          — full auto setup        ║${NC}"
+echo -e "${CYAN}║     make obs-verify   — verify stack only      ║${NC}"
+echo -e "${CYAN}║     make obs-restart  — tear down + restart    ║${NC}"
 echo -e "${CYAN}║                                                ║${NC}"
 echo -e "${CYAN}║   Monitoring URLs:                             ║${NC}"
 echo -e "${CYAN}║     Grafana:    http://localhost:3000          ║${NC}"
 echo -e "${CYAN}║     QuestDB:    http://localhost:9000          ║${NC}"
 echo -e "${CYAN}║     Prometheus: http://localhost:9090          ║${NC}"
 echo -e "${CYAN}║     Jaeger:     http://localhost:16686         ║${NC}"
+echo -e "${CYAN}║     Traefik:    http://localhost:8080          ║${NC}"
 echo -e "${CYAN}║                                                ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
 echo ""
