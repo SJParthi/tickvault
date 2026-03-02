@@ -220,9 +220,11 @@ services:
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_UNIFIED_ALERTING_ENABLED: "true"
-      # Telegram credentials for alert notifications (from SSM via bootstrap.sh)
-      DLT_TELEGRAM_BOT_TOKEN: ${DLT_TELEGRAM_BOT_TOKEN:?Run bootstrap.sh first — Telegram credentials must come from AWS SSM}
-      DLT_TELEGRAM_CHAT_ID: ${DLT_TELEGRAM_CHAT_ID:?Run bootstrap.sh first — Telegram credentials must come from AWS SSM}
+      # Telegram credentials for Grafana alert contact point (provisioned in alerts.yml).
+      # Fetched from AWS SSM by setup-observability.sh. Grafana expands $VAR in provisioning YAML.
+      # Uses :- (optional) — stack starts even if Telegram not in SSM; Rust-side alerts unaffected.
+      DLT_TELEGRAM_BOT_TOKEN: ${DLT_TELEGRAM_BOT_TOKEN:-}
+      DLT_TELEGRAM_CHAT_ID: ${DLT_TELEGRAM_CHAT_ID:-}
     depends_on:
       dlt-prometheus:
         condition: service_healthy

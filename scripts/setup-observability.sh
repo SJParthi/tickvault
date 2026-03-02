@@ -230,7 +230,19 @@ DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password"
 DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
 DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
 export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
-ok "All 4 infrastructure secrets ready"
+
+# Telegram credentials — used by Grafana alerting contact point (alerts.yml).
+# Same SSM path as the Rust app and notify-telegram.sh — ONE source, everywhere.
+DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token" 2>/dev/null || echo "")
+DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id" 2>/dev/null || echo "")
+export DLT_TELEGRAM_BOT_TOKEN DLT_TELEGRAM_CHAT_ID
+
+if [ -n "$DLT_TELEGRAM_BOT_TOKEN" ] && [ -n "$DLT_TELEGRAM_CHAT_ID" ]; then
+    ok "All 6 secrets ready (infra + Telegram)"
+else
+    ok "4 infrastructure secrets ready"
+    warn "Telegram secrets not in SSM — Grafana alerts will not reach Telegram (Rust-side alerts unaffected)"
+fi
 
 if [ "$VERIFY_ONLY" = true ]; then
     CURRENT_STEP=8
@@ -345,8 +357,8 @@ else
     warn "Could not verify dashboards (provisioning may need a moment)"
 fi
 
-# ---- Step 13: Grafana alert rules ----
-step "Validating Grafana alert rules"
+# ---- Step 13: Grafana alert rules + Telegram contact point ----
+step "Validating Grafana alert rules + Telegram contact point"
 ALERT_RULES=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/alert-rules" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$ALERT_RULES" ] && [ "$ALERT_RULES" != "[]" ]; then
@@ -354,6 +366,19 @@ if [ -n "$ALERT_RULES" ] && [ "$ALERT_RULES" != "[]" ]; then
     ok "${ALERT_COUNT} alert rules provisioned"
 else
     warn "Alert rules not yet loaded (Grafana unified alerting may need time)"
+fi
+
+# Verify Telegram contact point is provisioned
+CP_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/contact-points" \
+    -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
+if echo "$CP_JSON" | grep -q "telegram"; then
+    ok "Telegram contact point provisioned — Grafana alerts → your phone"
+else
+    if [ -n "$DLT_TELEGRAM_BOT_TOKEN" ]; then
+        warn "Telegram contact point not yet visible (Grafana may need restart)"
+    else
+        info "Telegram contact point skipped (no bot token in SSM)"
+    fi
 fi
 
 # ---- Step 14: Prometheus rules ----

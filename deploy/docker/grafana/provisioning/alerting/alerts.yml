@@ -2,8 +2,13 @@
 # dhan-live-trader — Grafana Alerting Provisioning
 # =============================================================================
 # Auto-configures alert rules, contact points, and notification policies.
-# Alerts fire to Grafana's built-in alertmanager. Integrate Telegram/SNS
-# via the Grafana UI or add contact points below.
+# Alerts fire to Grafana's built-in alertmanager → Telegram.
+#
+# Telegram credentials come from AWS SSM via environment variables:
+#   DLT_TELEGRAM_BOT_TOKEN  — injected by setup-observability.sh
+#   DLT_TELEGRAM_CHAT_ID    — injected by setup-observability.sh
+#
+# Grafana expands $VAR / ${VAR} in provisioning YAML automatically.
 # =============================================================================
 
 apiVersion: 1
@@ -13,21 +18,28 @@ apiVersion: 1
 # (sourced from AWS SSM: /dlt/<env>/telegram/bot-token and /dlt/<env>/telegram/chat-id)
 contactPoints:
   - orgId: 1
-    name: dlt-default
+    name: dlt-telegram
     receivers:
-      - uid: dlt-telegram
+      - uid: dlt-telegram-receiver
         type: telegram
         settings:
           bottoken: $DLT_TELEGRAM_BOT_TOKEN
           chatid: $DLT_TELEGRAM_CHAT_ID
+          message: |
+            {{ if gt (len .Alerts.Firing) 0 }}🔴 FIRING{{ end }}{{ if gt (len .Alerts.Resolved) 0 }}🟢 RESOLVED{{ end }}
+            {{ range .Alerts }}
+            <b>{{ .Labels.alertname }}</b>
+            {{ .Annotations.summary }}
+            {{ .Annotations.description }}
+            Severity: {{ .Labels.severity }}
+            {{ end }}
           parse_mode: HTML
-          disable_notifications: false
         disableResolveMessage: false
 
 # -- Notification Policies ----------------------------------------------------
 policies:
   - orgId: 1
-    receiver: dlt-default
+    receiver: dlt-telegram
     group_by: ["grafana_folder", "alertname"]
     group_wait: 30s
     group_interval: 5m
