@@ -1310,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_row_underlying_security_id_unparseable_defaults_to_zero() {
+    fn test_parse_row_underlying_security_id_unparsable_defaults_to_zero() {
         // When underlying_security_id cannot be parsed, it defaults to 0
         let csv_text = format!(
             "{}\n{}",
@@ -1331,7 +1331,7 @@ mod tests {
 
         assert_eq!(
             row.underlying_security_id, 0,
-            "unparseable underlying_security_id should default to 0"
+            "unparsable underlying_security_id should default to 0"
         );
     }
 
@@ -1456,7 +1456,7 @@ mod tests {
     #[test]
     fn test_parse_instrument_csv_with_parse_errors_in_rows() {
         // CSV with valid header but rows that will fail parse_row
-        // (e.g., unparseable security_id)
+        // (e.g., unparsable security_id)
         let header = build_mock_csv_header();
         let valid_row = build_nse_index_row(13, "NIFTY");
         // Row with bad security_id
