@@ -38,12 +38,14 @@ services:
       - "9000:9000"    # HTTP API + Web Console
       - "8812:8812"    # PostgreSQL wire protocol
       - "9009:9009"    # InfluxDB Line Protocol (high-speed ingestion)
+      - "9003:9003"    # Prometheus metrics (min HTTP server)
     volumes:
       - dlt-questdb-data:/var/lib/questdb
     environment:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
+      QDB_METRICS_ENABLED: "TRUE"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     healthcheck:
@@ -161,11 +163,11 @@ services:
       dlt-loki:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/12345' || exit 1"]
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:12345/-/ready || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 20s
+      start_period: 30s
     networks:
       - dlt-network
 
@@ -182,13 +184,13 @@ services:
       - "16686:16686"  # Jaeger UI
       - "4317:4317"    # OTLP gRPC
       - "4318:4318"    # OTLP HTTP
+      - "8888:8888"    # Internal metrics (Prometheus)
+      - "13133:13133"  # Healthcheck (healthcheckv2 extension)
     volumes:
       - ./jaeger/jaeger-config.yml:/etc/jaeger/config.yml:ro
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
     command: ["--config", "/etc/jaeger/config.yml"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/health/status || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -218,7 +220,6 @@ services:
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_UNIFIED_ALERTING_ENABLED: "true"
-      GF_ALERTING_ENABLED: "false"
     depends_on:
       dlt-prometheus:
         condition: service_healthy
