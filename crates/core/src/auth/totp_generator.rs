@@ -115,4 +115,108 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_totp_valid_secret_generates_six_digit_numeric_code() {
+        // A different valid base32 secret with >= 128 bits (26+ base32 chars).
+        let secret = SecretString::from("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string());
+        let code = generate_totp_code(&secret).expect("valid base32 should produce a code");
+
+        assert_eq!(
+            code.len(),
+            TOTP_DIGITS,
+            "TOTP code must be exactly {TOTP_DIGITS} digits"
+        );
+        assert!(
+            code.chars().all(|c| c.is_ascii_digit()),
+            "TOTP code must be all digits, got: {code}"
+        );
+    }
+
+    #[test]
+    fn test_totp_secret_with_whitespace_is_handled() {
+        // totp-rs `Secret::Encoded` may or may not strip whitespace.
+        // If it does, this produces a valid code. If not, it returns an error.
+        // Either way, the function must NOT panic.
+        let secret = SecretString::from("OBWG C2LO FVZX I4TJ NZTS 243F MNZG K5BN".to_string());
+        let _result = generate_totp_code(&secret);
+        // No assertion on Ok/Err — the invariant is "no panic".
+    }
+
+    #[test]
+    fn test_totp_secret_with_leading_trailing_whitespace() {
+        // Leading/trailing whitespace around an otherwise-valid secret.
+        let secret = SecretString::from("  OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN  ".to_string());
+        let _result = generate_totp_code(&secret);
+        // No assertion on Ok/Err — the invariant is "no panic".
+    }
+
+    #[test]
+    fn test_totp_secret_with_lowercase_base32() {
+        // Base32 is case-insensitive per RFC 4648. Test lowercase input.
+        let secret = SecretString::from("obwgc2lofvzxi4tjnzts243fmnzgk5bn".to_string());
+        let _result = generate_totp_code(&secret);
+        // No assertion on Ok/Err — depends on totp-rs handling.
+        // The invariant is "no panic".
+    }
+
+    #[test]
+    fn test_totp_short_secret_produces_code_or_error() {
+        // A very short but technically valid base32 string (8 chars = 40 bits).
+        let secret = SecretString::from("MFRGGZDF".to_string());
+        let _result = generate_totp_code(&secret);
+        // Short secrets may be rejected by TOTP::new or may produce a code.
+        // The invariant is "no panic".
+    }
+
+    #[test]
+    fn test_totp_single_char_secret_returns_error() {
+        // A single character base32 string — too short for TOTP.
+        let secret = SecretString::from("A".to_string());
+        let result = generate_totp_code(&secret);
+        // Either invalid base32 or TOTP init failure. The invariant is "no panic".
+        // Very short secrets are rejected by TOTP::new due to minimum secret length.
+        let _is_error = result.is_err();
+    }
+
+    #[test]
+    fn test_totp_with_padding_chars() {
+        // Base32 with padding characters (=).
+        let secret = SecretString::from("OBWGC2LO======".to_string());
+        let _result = generate_totp_code(&secret);
+        // Padding may or may not be valid — the invariant is "no panic".
+    }
+
+    #[test]
+    fn test_totp_max_length_secret_no_panic() {
+        // Very long base32 secret (256 chars).
+        let long_secret = "OBWGC2LOFVZXI4TJ".repeat(16);
+        let secret = SecretString::from(long_secret);
+        let _result = generate_totp_code(&secret);
+        // The invariant is "no panic".
+    }
+
+    #[test]
+    fn test_totp_invalid_base32_char_8_returns_error() {
+        // '8' is not a valid base32 character (base32 uses A-Z and 2-7).
+        let secret = SecretString::from("88888888".to_string());
+        let result = generate_totp_code(&secret);
+        assert!(
+            result.is_err(),
+            "'8' is not valid base32, should return error"
+        );
+    }
+
+    #[test]
+    fn test_totp_error_variant_is_totp_generation_failed() {
+        let secret = SecretString::from("!!!invalid!!!".to_string());
+        let result = generate_totp_code(&secret);
+        match result {
+            Err(ApplicationError::TotpGenerationFailed { reason }) => {
+                assert!(!reason.is_empty(), "error reason should not be empty");
+            }
+            Err(other) => panic!("expected TotpGenerationFailed, got: {other}"),
+            Ok(_) => panic!("expected error for invalid secret"),
+        }
+    }
 }

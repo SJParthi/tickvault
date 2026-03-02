@@ -829,4 +829,144 @@ mod tests {
         );
         assert!(response.data.is_some());
     }
+
+    // -----------------------------------------------------------------------
+    // parse_expiry_time tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_expiry_time_epoch_millis_number() {
+        // 1772113432557 > 10_000_000_000 -> millis -> divides by 1000
+        let val = serde_json::json!(1772113432557_i64);
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_epoch_seconds_number() {
+        let val = serde_json::json!(1772113432_i64);
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_iso8601_string() {
+        let val = serde_json::json!("2026-02-27T13:45:00+05:30");
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_naive_datetime_string() {
+        let val = serde_json::json!("2026-02-27T13:45:00");
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_epoch_millis_as_string() {
+        let val = serde_json::json!("1772113432557");
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_epoch_seconds_as_string() {
+        let val = serde_json::json!("1772113432");
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_invalid_string_returns_none() {
+        let val = serde_json::json!("not-a-date");
+        assert!(parse_expiry_time(&val).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_null_returns_none() {
+        let val = serde_json::Value::Null;
+        assert!(parse_expiry_time(&val).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_bool_returns_none() {
+        let val = serde_json::json!(true);
+        assert!(parse_expiry_time(&val).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // from_generate_response tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_from_generate_response_with_epoch_millis_expiry() {
+        // Use a future timestamp (2027-03-01T12:00:00 UTC) so is_valid() holds
+        let response = DhanGenerateTokenResponse {
+            dhan_client_id: "test-client".to_string(),
+            access_token: "test-jwt".to_string(),
+            expiry_time: serde_json::json!(1803902400000_i64),
+        };
+        let state = TokenState::from_generate_response(&response);
+        assert_eq!(state.access_token().expose_secret(), "test-jwt");
+        assert!(state.is_valid());
+    }
+
+    #[test]
+    fn test_from_generate_response_with_unparseable_expiry_defaults_24h() {
+        let response = DhanGenerateTokenResponse {
+            dhan_client_id: "test-client".to_string(),
+            access_token: "test-jwt".to_string(),
+            expiry_time: serde_json::json!("garbage"),
+        };
+        let state = TokenState::from_generate_response(&response);
+        assert_eq!(state.access_token().expose_secret(), "test-jwt");
+        assert!(state.is_valid());
+        // Should have ~24 hour validity
+        let duration = state.expires_at() - state.issued_at();
+        let hours = duration.num_hours();
+        assert!((23..=25).contains(&hours), "Expected ~24h, got {hours}h");
+    }
+
+    #[test]
+    fn test_from_generate_response_with_null_expiry_defaults_24h() {
+        let response = DhanGenerateTokenResponse {
+            dhan_client_id: "test-client".to_string(),
+            access_token: "test-jwt".to_string(),
+            expiry_time: serde_json::Value::Null,
+        };
+        let state = TokenState::from_generate_response(&response);
+        assert!(state.is_valid());
+        let duration = state.expires_at() - state.issued_at();
+        let hours = duration.num_hours();
+        assert!((23..=25).contains(&hours));
+    }
+
+    // -----------------------------------------------------------------------
+    // DhanGenerateTokenResponse deserialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhan_generate_token_response_deserialize() {
+        let json = r#"{
+            "dhanClientId": "1234567890",
+            "accessToken": "jwt-token-value",
+            "expiryTime": 1772113432557
+        }"#;
+        let response: DhanGenerateTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.dhan_client_id, "1234567890");
+        assert_eq!(response.access_token, "jwt-token-value");
+    }
+
+    #[test]
+    fn test_dhan_generate_token_response_debug_redacted() {
+        let response = DhanGenerateTokenResponse {
+            dhan_client_id: "client-123".to_string(),
+            access_token: "super-secret-token".to_string(),
+            expiry_time: serde_json::json!(1772113432557_i64),
+        };
+        let debug = format!("{response:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret-token"));
+    }
 }

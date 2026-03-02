@@ -743,6 +743,14 @@ mod tests {
     }
 
     #[test]
+    fn test_notification_zero_send_timeout_fails() {
+        let mut config = make_valid_config();
+        config.notification.send_timeout_ms = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("notification.send_timeout_ms"));
+    }
+
+    #[test]
     fn test_build_window_start_after_end_fails() {
         let mut config = make_valid_config();
         config.instrument.build_window_start = "09:00:00".to_string();

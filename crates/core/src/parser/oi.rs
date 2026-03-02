@@ -77,12 +77,12 @@ mod tests {
             security_id: 1,
         };
         let err = parse_oi_packet(&buf, &hdr).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes {
-                expected: 12,
-                actual: 11,
-            } => {}
-            _ => panic!("wrong error: {err:?}"),
-        }
+        let ParseError::InsufficientBytes {
+            expected: 12,
+            actual: 11,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
     }
 }

@@ -150,6 +150,14 @@ mod tests {
 
     use dhan_live_trader_common::types::{Exchange, ExchangeSegment};
 
+    // Extraction helper — panic arm appears only once.
+    fn unwrap_equity_security_id(info: &InstrumentInfo) -> u32 {
+        match info {
+            InstrumentInfo::Equity { security_id, .. } => *security_id,
+            other => panic!("expected Equity variant, got {other:?}"),
+        }
+    }
+
     /// Build a minimal valid FnoUniverse for testing validation.
     fn build_valid_universe() -> FnoUniverse {
         let mut underlyings = HashMap::new();
@@ -609,6 +617,589 @@ mod tests {
         assert!(
             err_msg.contains("not an Equity variant"),
             "error must mention 'not an Equity variant': {}",
+            err_msg
+        );
+    }
+
+    // --- Additional edge case tests for coverage ---
+
+    #[test]
+    fn test_equity_instrument_info_derivative_variant_fails() {
+        let mut universe = build_valid_universe();
+
+        // Replace RELIANCE equity with a Derivative variant (wrong variant type)
+        let (symbol, security_id) = VALIDATION_MUST_EXIST_EQUITIES[0]; // ("RELIANCE", 2885)
+        universe.instrument_info.insert(
+            security_id,
+            InstrumentInfo::Derivative {
+                security_id,
+                underlying_symbol: symbol.to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+            },
+        );
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not an Equity variant"),
+            "Derivative in place of Equity must fail: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_missing_second_must_exist_index_fails() {
+        let mut universe = build_valid_universe();
+        // Remove BANKNIFTY instead of NIFTY (tests second iteration of the loop)
+        universe.underlyings.remove("BANKNIFTY");
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("BANKNIFTY"),
+            "error must mention BANKNIFTY: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_wrong_price_id_for_non_nifty_index_fails() {
+        let mut universe = build_valid_universe();
+        // Corrupt BANKNIFTY price_feed_security_id
+        universe
+            .underlyings
+            .get_mut("BANKNIFTY")
+            .unwrap()
+            .price_feed_security_id = 12345;
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("BANKNIFTY") && err_msg.contains("mismatch"),
+            "error must mention BANKNIFTY mismatch: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_missing_second_must_exist_equity_fails() {
+        let mut universe = build_valid_universe();
+        // Find the second must-exist equity and remove it
+        if VALIDATION_MUST_EXIST_EQUITIES.len() >= 2 {
+            let (_, security_id) = VALIDATION_MUST_EXIST_EQUITIES[1];
+            universe.instrument_info.remove(&security_id);
+
+            let result = validate_fno_universe(&universe);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_missing_second_must_exist_fno_stock_fails() {
+        let mut universe = build_valid_universe();
+        // Remove a different F&O stock than TCS
+        if VALIDATION_MUST_EXIST_FNO_STOCKS.len() >= 2 {
+            let symbol = VALIDATION_MUST_EXIST_FNO_STOCKS[1];
+            universe.underlyings.remove(symbol);
+
+            let result = validate_fno_universe(&universe);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains(symbol),
+                "error must mention {}: {}",
+                symbol,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_universe_runs_all_info_logs() {
+        // This test ensures the full happy path runs completely (all 5 checks pass).
+        // The build_valid_universe() helper sets up a universe that passes all checks.
+        let universe = build_valid_universe();
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_ok());
+
+        // Verify the universe has the expected counts to confirm we exercised all code paths
+        assert!(
+            !universe.underlyings.is_empty(),
+            "underlyings should not be empty"
+        );
+        assert!(
+            !universe.derivative_contracts.is_empty(),
+            "derivative_contracts should not be empty"
+        );
+    }
+
+    #[test]
+    fn test_stock_count_one_below_minimum_fails() {
+        let mut universe = build_valid_universe();
+
+        // Remove all stocks
+        let stock_symbols: Vec<String> = universe
+            .underlyings
+            .iter()
+            .filter(|(_, u)| u.kind == UnderlyingKind::Stock)
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in &stock_symbols {
+            universe.underlyings.remove(symbol);
+        }
+
+        // Re-add must-exist F&O stocks
+        for symbol in VALIDATION_MUST_EXIST_FNO_STOCKS {
+            universe.underlyings.insert(
+                symbol.to_string(),
+                FnoUnderlying {
+                    underlying_symbol: symbol.to_string(),
+                    underlying_security_id: 9000,
+                    price_feed_security_id: 9000,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 500,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        // Add exactly VALIDATION_FNO_STOCK_MIN_COUNT - 1 stocks total
+        let must_exist_count = VALIDATION_MUST_EXIST_FNO_STOCKS.len();
+        if VALIDATION_FNO_STOCK_MIN_COUNT > must_exist_count {
+            let target = VALIDATION_FNO_STOCK_MIN_COUNT - 1;
+            if target > must_exist_count {
+                for i in 0..(target - must_exist_count) {
+                    let symbol = format!("BELOWMINSTOCK{}", i);
+                    universe.underlyings.insert(
+                        symbol.clone(),
+                        FnoUnderlying {
+                            underlying_symbol: symbol,
+                            underlying_security_id: 30000 + i as u32,
+                            price_feed_security_id: 30000 + i as u32,
+                            price_feed_segment: ExchangeSegment::NseEquity,
+                            derivative_segment: ExchangeSegment::NseFno,
+                            kind: UnderlyingKind::Stock,
+                            lot_size: 100,
+                            contract_count: 5,
+                        },
+                    );
+                }
+            }
+        }
+
+        let stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+
+        // Only assert if we actually got below minimum
+        if stock_count < VALIDATION_FNO_STOCK_MIN_COUNT {
+            let result = validate_fno_universe(&universe);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_stock_count_one_above_maximum_fails() {
+        let mut universe = build_valid_universe();
+
+        // Remove all stocks, then add back VALIDATION_FNO_STOCK_MAX_COUNT + 1
+        let stock_symbols: Vec<String> = universe
+            .underlyings
+            .iter()
+            .filter(|(_, u)| u.kind == UnderlyingKind::Stock)
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in &stock_symbols {
+            universe.underlyings.remove(symbol);
+        }
+
+        // Re-add must-exist F&O stocks
+        for symbol in VALIDATION_MUST_EXIST_FNO_STOCKS {
+            universe.underlyings.insert(
+                symbol.to_string(),
+                FnoUnderlying {
+                    underlying_symbol: symbol.to_string(),
+                    underlying_security_id: 9000,
+                    price_feed_security_id: 9000,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 500,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        let must_exist_count = VALIDATION_MUST_EXIST_FNO_STOCKS.len();
+        for i in 0..(VALIDATION_FNO_STOCK_MAX_COUNT + 1 - must_exist_count) {
+            let symbol = format!("ABOVEMAXSTOCK{}", i);
+            universe.underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol,
+                    underlying_security_id: 60000 + i as u32,
+                    price_feed_security_id: 60000 + i as u32,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 5,
+                },
+            );
+        }
+
+        let stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert_eq!(stock_count, VALIDATION_FNO_STOCK_MAX_COUNT + 1);
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("outside expected range"));
+    }
+
+    #[test]
+    fn test_both_underlyings_and_derivatives_empty_fails_on_underlyings() {
+        let mut universe = build_valid_universe();
+        universe.underlyings.clear();
+        universe.derivative_contracts.clear();
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        // Should fail on must-exist index check (first check), not the empty check
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "should fail on must-exist check: {}",
+            err_msg
+        );
+    }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_valid_universe_has_correct_metadata() {
+        let universe = build_valid_universe();
+        assert_eq!(universe.build_metadata.csv_source, "test");
+        assert_eq!(universe.build_metadata.csv_row_count, 200_000);
+        assert!(universe.build_metadata.build_duration.as_millis() > 0);
+    }
+
+    #[test]
+    fn test_valid_universe_build_metadata_timestamp() {
+        let universe = build_valid_universe();
+        // Verify the build timestamp was set (IST offset = +5:30)
+        let offset = universe.build_metadata.build_timestamp.offset();
+        let total_secs = offset.local_minus_utc();
+        assert_eq!(total_secs, 5 * 3600 + 30 * 60, "should be IST offset");
+    }
+
+    #[test]
+    fn test_all_must_exist_indices_present_in_valid_universe() {
+        let universe = build_valid_universe();
+        for (symbol, expected_id) in VALIDATION_MUST_EXIST_INDICES {
+            let underlying = universe.underlyings.get(*symbol);
+            assert!(
+                underlying.is_some(),
+                "must-exist index '{}' missing",
+                symbol
+            );
+            assert_eq!(
+                underlying.unwrap().price_feed_security_id,
+                *expected_id,
+                "price_feed_security_id mismatch for {}",
+                symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_must_exist_equities_present_in_valid_universe() {
+        let universe = build_valid_universe();
+        for (symbol, expected_id) in VALIDATION_MUST_EXIST_EQUITIES {
+            let info = universe.instrument_info.get(expected_id);
+            assert!(
+                info.is_some(),
+                "must-exist equity '{}' (id={}) missing",
+                symbol,
+                expected_id
+            );
+            let sid = unwrap_equity_security_id(info.unwrap());
+            assert_eq!(sid, *expected_id);
+        }
+    }
+
+    #[test]
+    fn test_all_must_exist_fno_stocks_present_in_valid_universe() {
+        let universe = build_valid_universe();
+        for symbol in VALIDATION_MUST_EXIST_FNO_STOCKS {
+            assert!(
+                universe.underlyings.contains_key(*symbol),
+                "must-exist F&O stock '{}' missing",
+                symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_stock_count_in_valid_universe_within_range() {
+        let universe = build_valid_universe();
+        let stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert!(
+            stock_count >= VALIDATION_FNO_STOCK_MIN_COUNT,
+            "stock count {} below min {}",
+            stock_count,
+            VALIDATION_FNO_STOCK_MIN_COUNT
+        );
+        assert!(
+            stock_count <= VALIDATION_FNO_STOCK_MAX_COUNT,
+            "stock count {} above max {}",
+            stock_count,
+            VALIDATION_FNO_STOCK_MAX_COUNT
+        );
+    }
+
+    #[test]
+    fn test_wrong_price_id_for_third_must_exist_index_fails() {
+        if VALIDATION_MUST_EXIST_INDICES.len() >= 3 {
+            let mut universe = build_valid_universe();
+            let (symbol, _) = VALIDATION_MUST_EXIST_INDICES[2];
+            universe
+                .underlyings
+                .get_mut(symbol)
+                .unwrap()
+                .price_feed_security_id = 77777;
+
+            let result = validate_fno_universe(&universe);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains(symbol) && err_msg.contains("mismatch"),
+                "error must mention {} mismatch: {}",
+                symbol,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_third_must_exist_equity_fails() {
+        if VALIDATION_MUST_EXIST_EQUITIES.len() >= 3 {
+            let mut universe = build_valid_universe();
+            let (symbol, security_id) = VALIDATION_MUST_EXIST_EQUITIES[2];
+            universe.instrument_info.remove(&security_id);
+
+            let result = validate_fno_universe(&universe);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains(symbol),
+                "error must mention {}: {}",
+                symbol,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_third_must_exist_fno_stock_fails() {
+        if VALIDATION_MUST_EXIST_FNO_STOCKS.len() >= 3 {
+            let mut universe = build_valid_universe();
+            let symbol = VALIDATION_MUST_EXIST_FNO_STOCKS[2];
+            universe.underlyings.remove(symbol);
+
+            let result = validate_fno_universe(&universe);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains(symbol),
+                "error must mention {}: {}",
+                symbol,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_replace_all_equities_with_index_variant_fails() {
+        let mut universe = build_valid_universe();
+        // Replace ALL must-exist equities with Index variant
+        for (symbol, security_id) in VALIDATION_MUST_EXIST_EQUITIES {
+            universe.instrument_info.insert(
+                *security_id,
+                InstrumentInfo::Index {
+                    security_id: *security_id,
+                    symbol: symbol.to_string(),
+                    exchange: Exchange::NationalStockExchange,
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not an Equity variant"),
+            "error must mention 'not an Equity variant': {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_valid_universe_non_empty_collections() {
+        let universe = build_valid_universe();
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_ok());
+
+        // After passing validation, verify the universe has expected non-empty collections
+        assert!(!universe.underlyings.is_empty());
+        assert!(!universe.derivative_contracts.is_empty());
+        assert!(!universe.instrument_info.is_empty());
+    }
+
+    #[test]
+    fn test_only_underlyings_empty_fails_before_derivatives_check() {
+        let mut universe = build_valid_universe();
+        universe.underlyings.clear();
+        // derivative_contracts still has data
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        // Should fail at must-exist indices check (before empty check)
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Unconditional tests for 2nd/3rd must-exist entries
+    // (Replacing guarded `if len >= N` tests with direct asserts)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_second_must_exist_fno_stock_removal_fails() {
+        // VALIDATION_MUST_EXIST_FNO_STOCKS has 4 entries, so index 1 is valid.
+        assert!(
+            VALIDATION_MUST_EXIST_FNO_STOCKS.len() >= 2,
+            "test requires at least 2 must-exist FNO stocks"
+        );
+        let mut universe = build_valid_universe();
+        let symbol = VALIDATION_MUST_EXIST_FNO_STOCKS[1];
+        universe.underlyings.remove(symbol);
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(symbol),
+            "error must mention {}: {}",
+            symbol,
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_third_must_exist_fno_stock_removal_fails() {
+        assert!(
+            VALIDATION_MUST_EXIST_FNO_STOCKS.len() >= 3,
+            "test requires at least 3 must-exist FNO stocks"
+        );
+        let mut universe = build_valid_universe();
+        let symbol = VALIDATION_MUST_EXIST_FNO_STOCKS[2];
+        universe.underlyings.remove(symbol);
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(symbol),
+            "error must mention {}: {}",
+            symbol,
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_third_must_exist_index_wrong_price_id_fails() {
+        assert!(
+            VALIDATION_MUST_EXIST_INDICES.len() >= 3,
+            "test requires at least 3 must-exist indices"
+        );
+        let mut universe = build_valid_universe();
+        let (symbol, _) = VALIDATION_MUST_EXIST_INDICES[2];
+        universe
+            .underlyings
+            .get_mut(symbol)
+            .expect("must-exist index should be present")
+            .price_feed_security_id = 77777;
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(symbol) && err_msg.contains("mismatch"),
+            "error must mention {} mismatch: {}",
+            symbol,
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_fourth_must_exist_fno_stock_removal_fails() {
+        assert!(
+            VALIDATION_MUST_EXIST_FNO_STOCKS.len() >= 4,
+            "test requires at least 4 must-exist FNO stocks"
+        );
+        let mut universe = build_valid_universe();
+        let symbol = VALIDATION_MUST_EXIST_FNO_STOCKS[3];
+        universe.underlyings.remove(symbol);
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(symbol),
+            "error must mention {}: {}",
+            symbol,
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: empty derivative_contracts (with valid underlyings)
+    // Since checks 1-4 require underlyings, we can only reach the empty
+    // derivatives check (lines 121-124) by clearing derivatives AFTER passing
+    // the stock count check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_derivatives_with_valid_underlyings_fails() {
+        let mut universe = build_valid_universe();
+        universe.derivative_contracts.clear();
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("derivative_contracts map is empty"),
+            "error must mention empty derivatives: {}",
             err_msg
         );
     }

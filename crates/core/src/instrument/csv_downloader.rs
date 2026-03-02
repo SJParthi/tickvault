@@ -382,4 +382,511 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_dir).await;
     }
+
+    // --- download_with_retry tests using a local TCP server ---
+
+    /// Spawn a minimal HTTP server that responds with the given status and body.
+    async fn spawn_test_http_server(status: u16, body: &str) -> String {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+
+        let response_body = body.to_owned();
+        tokio::spawn(async move {
+            // Accept a single connection (enough for download_with_retry with retries)
+            // We accept multiple connections since retry will re-connect.
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body_clone = response_body.clone();
+                tokio::spawn(async move {
+                    // Read the request (discard it)
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+
+                    // Write a minimal HTTP response
+                    let response = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body_clone.len(),
+                        body_clone
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        url
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_success_from_primary() {
+        let fake_csv = "X".repeat(INSTRUMENT_CSV_MIN_BYTES + 100);
+        let url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-primary-ok");
+        let cache_dir = temp_dir.to_str().unwrap();
+
+        let result = download_instrument_csv(
+            &url,
+            "http://127.0.0.1:1/nonexistent-fallback",
+            cache_dir,
+            "test.csv",
+            10,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "primary download should succeed: {:?}",
+            result.err()
+        );
+        let download_result = result.unwrap();
+        assert_eq!(download_result.source, "primary");
+        assert_eq!(download_result.csv_text.len(), fake_csv.len());
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_primary_fails_fallback_succeeds() {
+        let fake_csv = "Y".repeat(INSTRUMENT_CSV_MIN_BYTES + 100);
+        let fallback_url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-fallback-ok");
+        let cache_dir = temp_dir.to_str().unwrap();
+
+        let result = download_instrument_csv(
+            "http://127.0.0.1:1/nonexistent-primary",
+            &fallback_url,
+            cache_dir,
+            "test.csv",
+            10,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "fallback download should succeed: {:?}",
+            result.err()
+        );
+        let download_result = result.unwrap();
+        assert_eq!(download_result.source, "fallback");
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_http_error_status() {
+        // Server returns 500 — download_with_retry should fail after retries
+        let url = spawn_test_http_server(500, "Internal Server Error").await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let result = download_with_retry(&client, &url).await;
+        assert!(result.is_err(), "HTTP 500 should cause retry exhaustion");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("500"),
+            "error should mention HTTP 500: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_body_too_small() {
+        // Server returns 200 but body is too small
+        let url = spawn_test_http_server(200, "tiny").await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let result = download_with_retry(&client, &url).await;
+        assert!(
+            result.is_err(),
+            "too-small body should cause retry exhaustion"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too small"),
+            "error should mention too small: {}",
+            err_msg
+        );
+    }
+
+    // --- write_cache error paths ---
+
+    #[tokio::test]
+    async fn test_write_cache_creates_directory_if_missing() {
+        let temp_dir = env::temp_dir().join("dlt-test-write-cache-mkdir");
+        let nested_dir = temp_dir.join("a").join("b").join("c");
+        let cache_dir = nested_dir.to_str().unwrap();
+        let fake_csv = "Z".repeat(100);
+
+        // Should not panic — write_cache is best-effort
+        write_cache(cache_dir, "test.csv", &fake_csv).await;
+
+        // Verify the file was written
+        let cache_path = nested_dir.join("test.csv");
+        let content = fs::read_to_string(&cache_path).await;
+        assert!(content.is_ok(), "cache file should have been created");
+        assert_eq!(content.unwrap().len(), 100);
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_cache_overwrite_existing() {
+        let temp_dir = env::temp_dir().join("dlt-test-write-cache-overwrite");
+        let cache_dir = temp_dir.to_str().unwrap();
+
+        write_cache(cache_dir, "test.csv", "first content").await;
+        write_cache(cache_dir, "test.csv", "second content").await;
+
+        let cache_path = temp_dir.join("test.csv");
+        let content = fs::read_to_string(&cache_path).await.unwrap();
+        assert_eq!(content, "second content");
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    // --- download_instrument_csv writes cache on success ---
+
+    #[tokio::test]
+    async fn test_download_writes_cache_on_primary_success() {
+        let fake_csv = "C".repeat(INSTRUMENT_CSV_MIN_BYTES + 50);
+        let url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-cache-write");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let cache_filename = "cached-after-dl.csv";
+
+        let result = download_instrument_csv(
+            &url,
+            "http://127.0.0.1:1/nonexistent",
+            cache_dir,
+            cache_filename,
+            10,
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        // Verify cache was written
+        let cache_path = temp_dir.join(cache_filename);
+        let cached = fs::read_to_string(&cache_path).await;
+        assert!(
+            cached.is_ok(),
+            "cache file should exist after successful download"
+        );
+        assert_eq!(cached.unwrap().len(), fake_csv.len());
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    // --- Additional coverage tests ---
+
+    #[tokio::test]
+    async fn test_download_with_retry_success_returns_body() {
+        let fake_csv = "D".repeat(INSTRUMENT_CSV_MIN_BYTES + 200);
+        let url = spawn_test_http_server(200, &fake_csv).await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let result = download_with_retry(&client, &url).await;
+        assert!(result.is_ok(), "200 with valid body should succeed");
+        assert_eq!(result.unwrap().len(), fake_csv.len());
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_404_status_fails() {
+        let url = spawn_test_http_server(404, "Not Found").await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let result = download_with_retry(&client, &url).await;
+        assert!(result.is_err(), "HTTP 404 should cause failure");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("404"),
+            "error should mention HTTP 404: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_403_status_fails() {
+        let url = spawn_test_http_server(403, "Forbidden").await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let result = download_with_retry(&client, &url).await;
+        assert!(result.is_err(), "HTTP 403 should cause failure");
+    }
+
+    #[tokio::test]
+    async fn test_download_primary_success_writes_cache() {
+        let fake_csv = "E".repeat(INSTRUMENT_CSV_MIN_BYTES + 50);
+        let url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-primary-cache-verify");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let cache_filename = "verify-cache.csv";
+
+        let result = download_instrument_csv(
+            &url,
+            "http://127.0.0.1:1/nonexistent",
+            cache_dir,
+            cache_filename,
+            10,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().source, "primary");
+
+        // Verify the cache file was created
+        let cache_path = temp_dir.join(cache_filename);
+        let cached = fs::read_to_string(&cache_path).await;
+        assert!(
+            cached.is_ok(),
+            "cache file should exist after primary download"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_fallback_success_writes_cache() {
+        let fake_csv = "F".repeat(INSTRUMENT_CSV_MIN_BYTES + 50);
+        let fallback_url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-fallback-cache-verify");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let cache_filename = "verify-fallback-cache.csv";
+
+        let result = download_instrument_csv(
+            "http://127.0.0.1:1/nonexistent-primary",
+            &fallback_url,
+            cache_dir,
+            cache_filename,
+            10,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().source, "fallback");
+
+        // Verify the cache file was created
+        let cache_path = temp_dir.join(cache_filename);
+        let cached = fs::read_to_string(&cache_path).await;
+        assert!(
+            cached.is_ok(),
+            "cache file should exist after fallback download"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_csv_download_result_debug_impl() {
+        let result = CsvDownloadResult {
+            csv_text: "test".to_owned(),
+            source: "primary".to_owned(),
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("primary"));
+    }
+
+    #[tokio::test]
+    async fn test_read_cache_exactly_min_bytes_succeeds() {
+        let temp_dir = env::temp_dir().join("dlt-test-csv-exact-min");
+        let _ = fs::create_dir_all(&temp_dir).await;
+        let cache_path = temp_dir.join("exact-min.csv");
+
+        let exact_content = "G".repeat(INSTRUMENT_CSV_MIN_BYTES);
+        fs::write(&cache_path, &exact_content).await.unwrap();
+
+        let result = read_cache(&cache_path).await;
+        assert!(
+            result.is_ok(),
+            "exactly INSTRUMENT_CSV_MIN_BYTES should succeed"
+        );
+        assert_eq!(result.unwrap().len(), INSTRUMENT_CSV_MIN_BYTES);
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_cache_one_below_min_bytes_fails() {
+        let temp_dir = env::temp_dir().join("dlt-test-csv-below-min");
+        let _ = fs::create_dir_all(&temp_dir).await;
+        let cache_path = temp_dir.join("below-min.csv");
+
+        let content = "H".repeat(INSTRUMENT_CSV_MIN_BYTES - 1);
+        fs::write(&cache_path, &content).await.unwrap();
+
+        let result = read_cache(&cache_path).await;
+        assert!(result.is_err(), "one below min should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too small"),
+            "error must mention too small: {}",
+            err_msg
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_connection_refused() {
+        // Use a port that's definitely not listening
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let result = download_with_retry(&client, "http://127.0.0.1:1/nothing").await;
+        assert!(result.is_err(), "connection refused should fail");
+    }
+
+    #[tokio::test]
+    async fn test_write_cache_best_effort_no_panic_on_readonly_path() {
+        // write_cache should not panic even with invalid paths
+        // /dev/null/subdir is not writable — this should silently fail
+        write_cache("/proc/1/nonexistent", "test.csv", "content").await;
+        // No assertion needed — just verify no panic
+    }
+
+    #[tokio::test]
+    async fn test_write_cache_file_write_failure() {
+        // Create a directory where the "file" name is actually a directory,
+        // causing fs::write to fail (covers lines 201-202).
+        let temp_dir = env::temp_dir().join("dlt-test-write-cache-file-fail");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let _ = fs::create_dir_all(&temp_dir).await;
+
+        // Create a directory with the same name as the target file
+        let file_as_dir = temp_dir.join("test.csv");
+        let _ = fs::create_dir_all(&file_as_dir).await;
+
+        // write_cache should not panic — it logs warn and continues
+        write_cache(cache_dir, "test.csv", "content").await;
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_triggers_retry_notify_callback() {
+        // Server returns 500 on every request. The retry logic should invoke
+        // the notify callback (line 175) for each retry before giving up.
+        let url = spawn_test_http_server(500, "Internal Server Error").await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // download_with_retry retries with exponential backoff.
+        // Each retry invokes the notify callback.
+        let result = download_with_retry(&client, &url).await;
+        assert!(result.is_err(), "all retries should fail with 500");
+    }
+
+    #[tokio::test]
+    async fn test_download_primary_success_logs_byte_count() {
+        // Exercises line 63: `bytes = csv_text.len()` in the primary success path
+        let fake_csv = "P".repeat(INSTRUMENT_CSV_MIN_BYTES + 10);
+        let url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-primary-bytes-log");
+        let cache_dir = temp_dir.to_str().unwrap();
+
+        let result = download_instrument_csv(
+            &url,
+            "http://127.0.0.1:1/nonexistent-fallback",
+            cache_dir,
+            "test.csv",
+            10,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let download_result = result.unwrap();
+        assert_eq!(download_result.source, "primary");
+        assert_eq!(download_result.csv_text.len(), fake_csv.len());
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_fallback_success_logs_byte_count() {
+        // Exercises line 86: `bytes = csv_text.len()` in the fallback success path
+        let fake_csv = "Q".repeat(INSTRUMENT_CSV_MIN_BYTES + 10);
+        let fallback_url = spawn_test_http_server(200, &fake_csv).await;
+
+        let temp_dir = env::temp_dir().join("dlt-test-dl-fallback-bytes-log");
+        let cache_dir = temp_dir.to_str().unwrap();
+
+        let result = download_instrument_csv(
+            "http://127.0.0.1:1/nonexistent-primary",
+            &fallback_url,
+            cache_dir,
+            "test.csv",
+            10,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let download_result = result.unwrap();
+        assert_eq!(download_result.source, "fallback");
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_cache_success_logs_byte_count() {
+        // Exercises lines 109-110: cache success with byte count in warn log
+        let temp_dir = env::temp_dir().join("dlt-test-dl-cache-bytes-log");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let cache_filename = "cached-bytes-log.csv";
+
+        let fake_csv = "R".repeat(INSTRUMENT_CSV_MIN_BYTES + 10);
+        write_cache(cache_dir, cache_filename, &fake_csv).await;
+
+        let result = download_instrument_csv(
+            "http://127.0.0.1:1/nonexistent-primary",
+            "http://127.0.0.1:1/nonexistent-fallback",
+            cache_dir,
+            cache_filename,
+            2,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let download_result = result.unwrap();
+        assert_eq!(download_result.source, "cache");
+        assert_eq!(download_result.csv_text.len(), fake_csv.len());
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
 }

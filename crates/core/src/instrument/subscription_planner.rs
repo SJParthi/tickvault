@@ -1202,4 +1202,551 @@ mod tests {
         // INFY equity feed
         assert!(plan.registry.get(1594).is_some(), "INFY equity");
     }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_stock_with_no_option_chain_for_expiry_skipped() {
+        // Stock has an expiry calendar entry but no option chain for that date
+        let mut universe = make_test_universe();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+
+        // Add stock SBIN with expiry calendar but no option chain
+        universe.underlyings.insert(
+            "SBIN".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "SBIN".to_string(),
+                underlying_security_id: 26003,
+                price_feed_security_id: 5258,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 1500,
+                contract_count: 0,
+            },
+        );
+        universe.expiry_calendars.insert(
+            "SBIN".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "SBIN".to_string(),
+                expiry_dates: vec![expiry],
+            },
+        );
+        // Deliberately NOT adding an option chain for SBIN
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // SBIN equity should still be subscribed
+        assert!(
+            plan.registry.get(5258).is_some(),
+            "SBIN equity feed should be subscribed"
+        );
+
+        // stocks_skipped_no_chain should be >= 1 (SBIN has no chain)
+        assert!(
+            plan.summary.stocks_skipped_no_chain >= 1,
+            "SBIN should count as skipped (no chain): {}",
+            plan.summary.stocks_skipped_no_chain
+        );
+    }
+
+    #[test]
+    fn test_stock_with_no_expiry_calendar_skipped() {
+        // Stock has no expiry calendar at all — should skip derivatives
+        let mut universe = make_test_universe();
+
+        universe.underlyings.insert(
+            "HDFC".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "HDFC".to_string(),
+                underlying_security_id: 26004,
+                price_feed_security_id: 7777,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 300,
+                contract_count: 0,
+            },
+        );
+        // No expiry_calendar for HDFC
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // HDFC equity should be subscribed
+        assert!(
+            plan.registry.get(7777).is_some(),
+            "HDFC equity feed should be subscribed"
+        );
+        // Should increment stocks_skipped_no_chain
+        assert!(plan.summary.stocks_skipped_no_chain >= 1);
+    }
+
+    #[test]
+    fn test_plan_with_all_subscriptions_disabled() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig {
+            subscribe_index_derivatives: false,
+            subscribe_display_indices: false,
+            subscribe_stock_equities: false,
+            subscribe_stock_derivatives: false,
+            ..Default::default()
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // Only major index values should remain
+        assert_eq!(plan.summary.display_indices, 0);
+        assert_eq!(plan.summary.index_derivatives, 0);
+        assert_eq!(plan.summary.stock_equities, 0);
+        assert_eq!(plan.summary.stock_derivatives, 0);
+        // Major index values are always subscribed
+        assert!(plan.summary.major_index_values > 0);
+    }
+
+    #[test]
+    fn test_plan_summary_capacity_utilization_non_negative() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        assert!(
+            plan.summary.capacity_utilization_pct >= 0.0,
+            "capacity utilization should be non-negative"
+        );
+        assert!(
+            plan.summary.capacity_utilization_pct <= 100.0,
+            "small test universe should be within capacity"
+        );
+    }
+
+    #[test]
+    fn test_plan_stock_derivatives_available_counts() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // stock_derivatives_available + stock_derivatives_skipped >= 0
+        // and stock_derivatives_skipped is always consistent
+        assert!(
+            plan.summary.stock_derivatives_available >= plan.summary.stock_derivatives_skipped,
+            "available >= skipped"
+        );
+    }
+
+    #[test]
+    fn test_plan_subscription_plan_debug() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        let debug_str = format!("{:?}", plan);
+        assert!(
+            !debug_str.is_empty(),
+            "SubscriptionPlan should have Debug output"
+        );
+    }
+
+    #[test]
+    fn test_plan_summary_debug() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        let debug_str = format!("{:?}", plan.summary);
+        assert!(
+            debug_str.contains("major_index_values"),
+            "summary debug should contain field names"
+        );
+    }
+
+    #[test]
+    fn test_plan_stock_derivatives_with_future_only_no_options() {
+        // Stock with future but no option chain — future should still be subscribed
+        let mut universe = make_test_universe();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+
+        universe.underlyings.insert(
+            "TATA".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "TATA".to_string(),
+                underlying_security_id: 26005,
+                price_feed_security_id: 8888,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 100,
+                contract_count: 1,
+            },
+        );
+
+        let tata_fut_id = 90001;
+        universe.derivative_contracts.insert(
+            tata_fut_id,
+            DerivativeContract {
+                security_id: tata_fut_id,
+                underlying_symbol: "TATA".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: expiry,
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 100,
+                tick_size: 0.05,
+                symbol_name: "TATA-27MAR26-FUT".to_string(),
+                display_name: "TATA FUT Mar26".to_string(),
+            },
+        );
+
+        // Chain with future but empty calls/puts
+        let tata_chain_key = OptionChainKey {
+            underlying_symbol: "TATA".to_string(),
+            expiry_date: expiry,
+        };
+        universe.option_chains.insert(
+            tata_chain_key,
+            OptionChain {
+                underlying_symbol: "TATA".to_string(),
+                expiry_date: expiry,
+                calls: vec![],
+                puts: vec![],
+                future_security_id: Some(tata_fut_id),
+            },
+        );
+        universe.expiry_calendars.insert(
+            "TATA".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "TATA".to_string(),
+                expiry_dates: vec![expiry],
+            },
+        );
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // TATA future should be subscribed
+        assert!(
+            plan.registry.get(tata_fut_id).is_some(),
+            "TATA future should be subscribed even with empty chain"
+        );
+        // TATA equity should be subscribed
+        assert!(
+            plan.registry.get(8888).is_some(),
+            "TATA equity should be subscribed"
+        );
+    }
+
+    #[test]
+    fn test_plan_stock_expired_all_expiries_skipped() {
+        // Stock where ALL expiries are in the past — should skip derivatives
+        let mut universe = make_test_universe();
+        let past_expiry = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        universe.underlyings.insert(
+            "EXPIRED".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "EXPIRED".to_string(),
+                underlying_security_id: 26006,
+                price_feed_security_id: 9999,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 200,
+                contract_count: 0,
+            },
+        );
+        universe.expiry_calendars.insert(
+            "EXPIRED".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "EXPIRED".to_string(),
+                expiry_dates: vec![past_expiry],
+            },
+        );
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // EXPIRED stock should increment stocks_skipped_no_chain
+        assert!(plan.summary.stocks_skipped_no_chain >= 1);
+    }
+
+    #[test]
+    fn test_plan_non_full_chain_index_not_subscribed_as_index_derivative() {
+        // An index underlying that is NOT in FULL_CHAIN_INDEX_SYMBOLS
+        // should not have its derivatives subscribed as index derivatives
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // INDIA VIX is a display index, not a major index
+        // Its derivatives (if any) should NOT be in IndexDerivative category
+        let display_idx = plan.registry.get(21);
+        assert!(display_idx.is_some(), "INDIA VIX display index");
+        assert_eq!(
+            display_idx.unwrap().category,
+            SubscriptionCategory::DisplayIndex,
+            "INDIA VIX should be DisplayIndex, not MajorIndexValue"
+        );
+    }
+
+    #[test]
+    fn test_plan_today_equals_expiry_still_included() {
+        // When today == expiry date, the contract should still be included
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        // Set today to the exact expiry date
+        let today = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // RELIANCE derivatives should still be subscribed (expiry >= today)
+        assert!(
+            plan.summary.stock_derivatives > 0,
+            "derivatives with expiry == today should be included"
+        );
+    }
+
+    #[test]
+    fn test_plan_today_after_expiry_stock_derivatives_zero() {
+        // When today > all expiries, no stock derivatives should be subscribed
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // RELIANCE has expiry 2026-03-27, which is < today
+        // All stock derivatives should be skipped
+        assert_eq!(
+            plan.summary.stock_derivatives, 0,
+            "no stock derivatives when all expiries are past"
+        );
+    }
+
+    #[test]
+    fn test_plan_empty_universe() {
+        // Completely empty universe — no instruments
+        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let universe = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: Utc::now().with_timezone(&ist),
+            },
+        };
+
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        assert_eq!(plan.summary.total, 0);
+        assert_eq!(plan.summary.major_index_values, 0);
+        assert_eq!(plan.summary.display_indices, 0);
+        assert_eq!(plan.summary.index_derivatives, 0);
+        assert_eq!(plan.summary.stock_equities, 0);
+        assert_eq!(plan.summary.stock_derivatives, 0);
+        assert!(!plan.summary.exceeds_capacity);
+    }
+
+    #[test]
+    fn test_plan_exceeds_capacity_triggers_warning() {
+        // Build a universe with > 25,000 stock derivative contracts to trigger
+        // the capacity limit (line 316: break) and warning (lines 346-347).
+        let ist = FixedOffset::east_opt(19_800).unwrap();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let mut underlyings = HashMap::new();
+        let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> = HashMap::new();
+        let mut option_chains = HashMap::new();
+        let mut expiry_calendars = HashMap::new();
+
+        // Create 50 stocks, each with 600 options (300 CE + 300 PE)
+        // Total: 50 stocks * 600 options = 30,000 + 50 futures = 30,050
+        // Plus 50 equity feeds = 30,100 → exceeds MAX_TOTAL_SUBSCRIPTIONS (25,000)
+        let mut base_id: u32 = 100_000;
+        for stock_idx in 0..50u32 {
+            let symbol = format!("STOCK{stock_idx}");
+            let underlying_id = 90_000 + stock_idx;
+            let equity_id = 80_000 + stock_idx;
+
+            underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol.clone(),
+                    underlying_security_id: underlying_id,
+                    price_feed_security_id: equity_id,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 601,
+                },
+            );
+
+            // Future
+            let fut_id = base_id;
+            base_id += 1;
+            derivative_contracts.insert(
+                fut_id,
+                DerivativeContract {
+                    security_id: fut_id,
+                    underlying_symbol: symbol.clone(),
+                    instrument_kind: DhanInstrumentKind::FutureStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: expiry,
+                    strike_price: 0.0,
+                    option_type: None,
+                    lot_size: 100,
+                    tick_size: 0.05,
+                    symbol_name: format!("{symbol}-FUT"),
+                    display_name: format!("{symbol} FUT"),
+                },
+            );
+
+            let mut calls = Vec::new();
+            let mut puts = Vec::new();
+            for strike_idx in 0..300u32 {
+                let ce_id = base_id;
+                base_id += 1;
+                let pe_id = base_id;
+                base_id += 1;
+                let strike = 1000.0 + (strike_idx as f64) * 10.0;
+
+                derivative_contracts.insert(
+                    ce_id,
+                    DerivativeContract {
+                        security_id: ce_id,
+                        underlying_symbol: symbol.clone(),
+                        instrument_kind: DhanInstrumentKind::OptionStock,
+                        exchange_segment: ExchangeSegment::NseFno,
+                        expiry_date: expiry,
+                        strike_price: strike,
+                        option_type: Some(OptionType::Call),
+                        lot_size: 100,
+                        tick_size: 0.05,
+                        symbol_name: format!("{symbol}-{strike}-CE"),
+                        display_name: format!("{symbol} {strike} CE"),
+                    },
+                );
+                calls.push(OptionChainEntry {
+                    security_id: ce_id,
+                    strike_price: strike,
+                    lot_size: 100,
+                });
+
+                derivative_contracts.insert(
+                    pe_id,
+                    DerivativeContract {
+                        security_id: pe_id,
+                        underlying_symbol: symbol.clone(),
+                        instrument_kind: DhanInstrumentKind::OptionStock,
+                        exchange_segment: ExchangeSegment::NseFno,
+                        expiry_date: expiry,
+                        strike_price: strike,
+                        option_type: Some(OptionType::Put),
+                        lot_size: 100,
+                        tick_size: 0.05,
+                        symbol_name: format!("{symbol}-{strike}-PE"),
+                        display_name: format!("{symbol} {strike} PE"),
+                    },
+                );
+                puts.push(OptionChainEntry {
+                    security_id: pe_id,
+                    strike_price: strike,
+                    lot_size: 100,
+                });
+            }
+
+            let chain_key = OptionChainKey {
+                underlying_symbol: symbol.clone(),
+                expiry_date: expiry,
+            };
+            option_chains.insert(
+                chain_key,
+                OptionChain {
+                    underlying_symbol: symbol.clone(),
+                    expiry_date: expiry,
+                    calls,
+                    puts,
+                    future_security_id: Some(fut_id),
+                },
+            );
+            expiry_calendars.insert(
+                symbol.clone(),
+                ExpiryCalendar {
+                    underlying_symbol: symbol,
+                    expiry_dates: vec![expiry],
+                },
+            );
+        }
+
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts,
+            instrument_info: HashMap::new(),
+            option_chains,
+            expiry_calendars,
+            subscribed_indices: vec![],
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test-capacity".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 50,
+                derivative_count: 30050,
+                option_chain_count: 50,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: Utc::now().with_timezone(&ist),
+            },
+        };
+
+        let config = SubscriptionConfig::default();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // The plan should be capped at MAX_TOTAL_SUBSCRIPTIONS
+        assert!(
+            plan.summary.total <= MAX_TOTAL_SUBSCRIPTIONS,
+            "plan total ({}) should be capped at MAX_TOTAL_SUBSCRIPTIONS ({})",
+            plan.summary.total,
+            MAX_TOTAL_SUBSCRIPTIONS
+        );
+
+        // Stock derivatives should have been partially skipped
+        assert!(
+            plan.summary.stock_derivatives_skipped > 0,
+            "some stock derivatives should be skipped due to capacity limit"
+        );
+    }
 }

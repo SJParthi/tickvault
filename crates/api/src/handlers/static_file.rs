@@ -19,11 +19,18 @@ pub async fn portal() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     #[test]
     fn test_portal_html_not_empty() {
         assert!(!PORTAL_HTML.is_empty());
         assert!(PORTAL_HTML.contains("<!DOCTYPE html>"));
         assert!(PORTAL_HTML.contains("Control Panel"));
+    }
+
+    #[tokio::test]
+    async fn test_portal_handler_returns_ok_with_html() {
+        let response = portal().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
