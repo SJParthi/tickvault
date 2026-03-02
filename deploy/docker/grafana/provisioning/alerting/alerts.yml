@@ -9,14 +9,19 @@
 apiVersion: 1
 
 # -- Contact Points ----------------------------------------------------------
+# Telegram bot token and chat ID are injected as container env vars by bootstrap.sh
+# (sourced from AWS SSM: /dlt/<env>/telegram/bot-token and /dlt/<env>/telegram/chat-id)
 contactPoints:
   - orgId: 1
     name: dlt-default
     receivers:
-      - uid: dlt-default-email
-        type: email
+      - uid: dlt-telegram
+        type: telegram
         settings:
-          addresses: ""
+          bottoken: $DLT_TELEGRAM_BOT_TOKEN
+          chatid: $DLT_TELEGRAM_CHAT_ID
+          parse_mode: HTML
+          disable_notifications: false
         disableResolveMessage: false
 
 # -- Notification Policies ----------------------------------------------------
@@ -142,6 +147,41 @@ groups:
         annotations:
           summary: "dhan-live-trader application is DOWN"
           description: "The main trading application has been unreachable for more than 1 minute. Immediate action required."
+        labels:
+          severity: critical
+
+      - uid: dlt-pipeline-stopped
+        title: "Pipeline Stopped"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_pipeline_active == 0"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "Tick processing pipeline is STOPPED"
+          description: "The pipeline has been inactive for 1+ minute. No ticks are being processed."
         labels:
           severity: critical
 

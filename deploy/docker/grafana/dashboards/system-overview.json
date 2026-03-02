@@ -249,6 +249,73 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 104,
+      "title": "Pipeline Diagnostics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "red", "text": "STOPPED" }, "1": { "color": "green", "text": "RUNNING" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 4, "x": 0, "y": 23 },
+      "id": 40,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Pipeline Status",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_pipeline_active", "legendFormat": "", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisLabel": "frames/sec", "drawStyle": "line", "fillOpacity": 20, "gradientMode": "scheme", "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "none" } },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 23 },
+      "id": 41,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "title": "Frame Processing Rate",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(dlt_frames_processed_total[1m])", "legendFormat": "frames/sec", "refId": "A" },
+        { "expr": "rate(dlt_ticks_processed_total[1m])", "legendFormat": "ticks/sec", "refId": "B" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisLabel": "errors/sec", "drawStyle": "line", "fillOpacity": 30, "gradientMode": "scheme", "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "normal" } },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 23 },
+      "id": 42,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "title": "Error & Filter Rates",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(dlt_parse_errors_total[5m])", "legendFormat": "parse errors", "refId": "A" },
+        { "expr": "rate(dlt_storage_errors_total[5m])", "legendFormat": "storage errors", "refId": "B" },
+        { "expr": "rate(dlt_junk_ticks_filtered_total[5m])", "legendFormat": "junk filtered", "refId": "C" }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "id": 102,
       "title": "Infrastructure Metrics",
       "type": "row"
@@ -263,7 +330,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
       "id": 20,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Prometheus Ingestion Rate",
@@ -280,7 +347,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
       "id": 21,
       "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Traefik Requests",
@@ -299,7 +366,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
       "id": 22,
       "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Loki Ingestion",
@@ -310,14 +377,14 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
       "id": 103,
       "title": "Logs",
       "type": "row"
     },
     {
       "datasource": { "type": "loki", "uid": "loki" },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 41 },
       "id": 30,
       "options": {
         "dedupStrategy": "none",

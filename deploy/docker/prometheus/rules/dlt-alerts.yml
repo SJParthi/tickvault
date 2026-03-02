@@ -96,6 +96,33 @@ groups:
           summary: "Tick processing p99 latency > 1ms"
           description: "p99 tick processing latency is {{ $value }}ns, exceeding 1ms budget."
 
+      - alert: PipelineStopped
+        expr: dlt_pipeline_active == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tick pipeline is STOPPED"
+          description: "The tick processing pipeline has been inactive for 1+ minute."
+
+      - alert: HighParseErrorRate
+        expr: rate(dlt_parse_errors_total[5m]) > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Parse error rate > 1/sec"
+          description: "Binary frame parse errors averaging {{ $value }}/sec over 5 minutes."
+
+      - alert: HighStorageErrorRate
+        expr: rate(dlt_storage_errors_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "QuestDB storage errors detected"
+          description: "Tick persistence is failing at {{ $value }}/sec. Check QuestDB connectivity."
+
       - alert: NoTicksReceived
         expr: dlt:tick_rate:1m == 0
         for: 5m

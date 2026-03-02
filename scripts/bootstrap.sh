@@ -124,6 +124,12 @@ DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-pas
 export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
+echo -n "  Exporting Telegram credentials for Grafana alerts... "
+DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token")
+DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id")
+export DLT_TELEGRAM_BOT_TOKEN DLT_TELEGRAM_CHAT_ID
+echo -e "${GREEN}OK${NC}"
+
 echo ""
 
 # ---- Step 5: Docker Infrastructure ----
