@@ -41,3 +41,67 @@ pub fn build_router(state: SharedAppState) -> Router {
         .layer(cors)
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use dhan_live_trader_common::config::QuestDbConfig;
+    use tower::ServiceExt;
+
+    fn make_test_state() -> SharedAppState {
+        SharedAppState::new(QuestDbConfig {
+            host: "localhost".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_build_router_health_endpoint() {
+        let router = build_router(make_test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_build_router_portal_endpoint() {
+        let router = build_router(make_test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/portal")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_build_router_stats_endpoint_returns_response() {
+        let router = build_router(make_test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Stats endpoint will try to connect to QuestDB and fail, but should still return JSON
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

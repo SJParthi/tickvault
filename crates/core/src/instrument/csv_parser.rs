@@ -1154,4 +1154,341 @@ mod tests {
             error_message
         );
     }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_parse_instrument_csv_empty_string_returns_error() {
+        // Completely empty CSV — no header
+        let result = parse_instrument_csv("");
+        assert!(result.is_err(), "empty CSV should fail");
+    }
+
+    #[test]
+    fn test_parse_instrument_csv_header_only_returns_error() {
+        // Header only, no data rows — row count = 0 < INSTRUMENT_CSV_MIN_ROWS
+        let csv_text = build_mock_csv_header();
+        let result = parse_instrument_csv(&csv_text);
+        assert!(
+            result.is_err(),
+            "header-only CSV should fail due to min rows"
+        );
+    }
+
+    #[test]
+    fn test_parse_instrument_csv_missing_required_column_returns_error() {
+        // Header missing SECURITY_ID column
+        let bad_header = "EXCH_ID,SEGMENT,MISSING_COL,ISIN";
+        let csv_text = format!("{}\nNSE,I,13,NA", bad_header);
+        let result = parse_instrument_csv(&csv_text);
+        assert!(result.is_err(), "missing required column should fail");
+    }
+
+    #[test]
+    fn test_parse_row_bse_exchange_parsed_correctly() {
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "BSE,I,51,NA,INDEX,51,SENSEX,SENSEX,S&P BSE SENSEX,INDEX,NA,1.0,0001-01-01,,XX,0.0100,N,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let row = parse_row(&record, &indices).unwrap();
+
+        assert_eq!(row.exchange, Exchange::BombayStockExchange);
+        assert_eq!(row.segment, 'I');
+        assert_eq!(row.security_id, 51);
+    }
+
+    #[test]
+    fn test_parse_row_invalid_lot_size_returns_error() {
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "NSE,I,13,NA,INDEX,13,NIFTY,NIFTY,NIFTY Index,INDEX,NA,abc,0001-01-01,,XX,0.0500,N,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let result = parse_row(&record, &indices);
+        assert!(result.is_err(), "invalid lot_size should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("lot_size"),
+            "error should mention lot_size: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_row_invalid_tick_size_returns_error() {
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "NSE,I,13,NA,INDEX,13,NIFTY,NIFTY,NIFTY Index,INDEX,NA,1.0,0001-01-01,,XX,xyz,N,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let result = parse_row(&record, &indices);
+        assert!(result.is_err(), "invalid tick_size should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("tick_size"),
+            "error should mention tick_size: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_row_put_option_type() {
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            build_nse_optidx_row(70002, 26000, "NIFTY", "2026-03-30", 22000.0, "PE", 75)
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let row = parse_row(&record, &indices).unwrap();
+
+        assert_eq!(row.option_type, Some(OptionType::Put));
+    }
+
+    #[test]
+    fn test_parse_row_unknown_option_type_is_none() {
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "NSE,D,70099,NA,OPTIDX,26000,NIFTY,NIFTY-2026-03-30-22000-XX,NIFTY OPT,OP,NA,75.0,2026-03-30,22000.00000,XX,5.0000,M,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let row = parse_row(&record, &indices).unwrap();
+
+        assert_eq!(
+            row.option_type, None,
+            "XX is not CE or PE, so option_type should be None"
+        );
+    }
+
+    #[test]
+    fn test_parse_row_underlying_security_id_unparseable_defaults_to_zero() {
+        // When underlying_security_id cannot be parsed, it defaults to 0
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            "NSE,E,2885,INE000A00000,EQUITY,abc,RELIANCE,RELIANCE LTD,RELIANCE,ES,EQ,1.0,,,,5.0000,NA,"
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let row = parse_row(&record, &indices).unwrap();
+
+        assert_eq!(
+            row.underlying_security_id, 0,
+            "unparseable underlying_security_id should default to 0"
+        );
+    }
+
+    #[test]
+    fn test_parse_row_expiry_date_parsed_correctly() {
+        let csv_text = format!(
+            "{}\n{}",
+            build_mock_csv_header(),
+            build_nse_futidx_row(51700, 26000, "NIFTY", "2026-03-30", 75)
+        );
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_text.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        let record = reader.records().next().unwrap().unwrap();
+        let row = parse_row(&record, &indices).unwrap();
+
+        assert_eq!(
+            row.expiry_date,
+            Some(NaiveDate::from_ymd_opt(2026, 3, 30).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_row_zero_strike_returns_zero() {
+        assert_eq!(parse_strike_price("0"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_row_negative_one_strike_returns_zero() {
+        assert_eq!(parse_strike_price("-1.0"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_lot_size_negative_inf_fails() {
+        assert!(parse_lot_size("-inf").is_err());
+    }
+
+    #[test]
+    fn test_detect_column_indices_all_columns_found() {
+        let header_str = build_mock_csv_header();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(header_str.as_bytes());
+
+        let headers = reader.headers().unwrap().clone();
+        let indices = detect_column_indices(&headers).unwrap();
+
+        // Verify all expected column indices
+        assert_eq!(indices.exch_id, 0);
+        assert_eq!(indices.segment, 1);
+        assert_eq!(indices.security_id, 2);
+        assert_eq!(indices.instrument, 4);
+        assert_eq!(indices.underlying_security_id, 5);
+        assert_eq!(indices.underlying_symbol, 6);
+        assert_eq!(indices.symbol_name, 7);
+        assert_eq!(indices.display_name, 8);
+        assert_eq!(indices.series, 10);
+        assert_eq!(indices.lot_size, 11);
+        assert_eq!(indices.expiry_date, 12);
+        assert_eq!(indices.strike_price, 13);
+        assert_eq!(indices.option_type, 14);
+        assert_eq!(indices.tick_size, 15);
+        assert_eq!(indices.expiry_flag, 16);
+    }
+
+    #[test]
+    fn test_should_include_row_nse_unknown_segment_returns_false() {
+        assert!(!should_include_row("NSE", "X"));
+    }
+
+    #[test]
+    fn test_should_include_row_bse_unknown_segment_returns_false() {
+        assert!(!should_include_row("BSE", "X"));
+    }
+
+    #[test]
+    fn test_should_include_row_empty_exchange_returns_false() {
+        assert!(!should_include_row("", "I"));
+    }
+
+    #[test]
+    fn test_should_include_row_empty_segment_returns_false() {
+        assert!(!should_include_row("NSE", ""));
+    }
+
+    #[test]
+    fn test_parse_expiry_date_partial_date_returns_none() {
+        assert_eq!(parse_expiry_date("2026-03"), None);
+    }
+
+    #[test]
+    fn test_parse_expiry_date_wrong_format_dd_mm_yyyy_returns_none() {
+        assert_eq!(parse_expiry_date("30-03-2026"), None);
+    }
+
+    #[test]
+    fn test_parse_lot_size_small_positive_rounds_to_one() {
+        assert_eq!(parse_lot_size("0.5").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_tick_size_very_small_positive() {
+        assert_eq!(parse_tick_size("0.001").unwrap(), 0.001);
+    }
+
+    #[test]
+    fn test_parse_strike_price_positive_negative_boundary() {
+        // Positive value should return the value
+        assert!(parse_strike_price("0.01") > 0.0);
+        // Exactly zero returns 0
+        assert_eq!(parse_strike_price("0.0"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_instrument_csv_with_parse_errors_in_rows() {
+        // CSV with valid header but rows that will fail parse_row
+        // (e.g., unparseable security_id)
+        let header = build_mock_csv_header();
+        let valid_row = build_nse_index_row(13, "NIFTY");
+        // Row with bad security_id
+        let bad_row =
+            "NSE,I,abc,NA,INDEX,13,NIFTY,NIFTY,NIFTY Index,INDEX,NA,1.0,0001-01-01,,XX,0.05,N,";
+        let csv_text = format!("{}\n{}\n{}", header, valid_row, bad_row);
+
+        // Should not panic — error in parse_row is handled gracefully
+        let result = parse_instrument_csv(&csv_text);
+        // Will still fail due to < INSTRUMENT_CSV_MIN_ROWS
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_instrument_csv_malformed_csv_record_triggers_warn_and_skip() {
+        // Trigger a csv::Error in the records() iterator (lines 118-121).
+        // A field starting with a double-quote that is never closed before
+        // the record delimiter causes the csv crate to produce an error.
+        let header = build_mock_csv_header();
+        let valid_row = build_nse_index_row(13, "NIFTY");
+
+        // The segment field starts with `"` but never closes — this causes
+        // a csv parse error when the parser expects a closing quote.
+        let malformed =
+            "NSE,\"I,13,NA,INDEX,13,NIFTY,NIFTY,NIFTY,INDEX,NA,1.0,0001-01-01,,XX,0.05,N,";
+        let another_valid = build_nse_index_row(25, "BANKNIFTY");
+
+        let csv_text = format!("{header}\n{valid_row}\n{malformed}\n{another_valid}");
+
+        // parse_instrument_csv should handle gracefully (not panic).
+        let result = parse_instrument_csv(&csv_text);
+        // Returns Err due to row count < INSTRUMENT_CSV_MIN_ROWS
+        assert!(result.is_err(), "expected error due to insufficient rows");
+    }
 }

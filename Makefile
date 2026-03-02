@@ -189,8 +189,8 @@ audit: ## Security audit (cargo audit + cargo deny)
 
 coverage: ## Code coverage report (HTML, 99% minimum)
 	@echo "📊 Running coverage..."
-	cargo tarpaulin --workspace --fail-under 99 --out Html --output-dir target/tarpaulin
-	@echo "  📊 Report: target/tarpaulin/tarpaulin-report.html"
+	cargo llvm-cov --workspace --fail-under-lines 99 --html --output-dir target/llvm-cov
+	@echo "  📊 Report: target/llvm-cov/html/index.html"
 
 bench: ## Run benchmarks (Criterion)
 	@echo "⚡ Running benchmarks..."

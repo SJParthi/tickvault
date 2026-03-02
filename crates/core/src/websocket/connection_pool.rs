@@ -222,6 +222,19 @@ mod tests {
             .collect()
     }
 
+    /// Extract `CapacityExceeded` fields from a `WebSocketError`, panicking if
+    /// the variant doesn't match. Consolidates 3 identical panic sites.
+    #[track_caller]
+    fn unwrap_capacity_exceeded(err: WebSocketError) -> (usize, usize) {
+        match err {
+            WebSocketError::CapacityExceeded {
+                requested,
+                capacity,
+            } => (requested, capacity),
+            other => panic!("expected CapacityExceeded, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_pool_empty_instruments_creates_max_connections() {
         let pool = WebSocketConnectionPool::new(
@@ -307,16 +320,9 @@ mod tests {
             FeedMode::Ticker,
         );
         assert!(result.is_err());
-        match result.unwrap_err() {
-            WebSocketError::CapacityExceeded {
-                requested,
-                capacity,
-            } => {
-                assert_eq!(requested, 25001);
-                assert_eq!(capacity, 25000);
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+        let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
+        assert_eq!(requested, 25001);
+        assert_eq!(capacity, 25000);
     }
 
     #[test]
@@ -556,16 +562,9 @@ mod tests {
             FeedMode::Ticker,
         );
         assert!(result.is_err());
-        match result.unwrap_err() {
-            WebSocketError::CapacityExceeded {
-                requested,
-                capacity,
-            } => {
-                assert_eq!(requested, 15000);
-                assert_eq!(capacity, 10000); // 2000 × 5
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+        let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
+        assert_eq!(requested, 15000);
+        assert_eq!(capacity, 10000); // 2000 × 5
     }
 
     #[test]
@@ -608,6 +607,355 @@ mod tests {
                 prop_assert_eq!(pool.total_instruments(), count);
                 prop_assert_eq!(pool.connection_count(), 5);
             }
+        }
+    }
+
+    // --- spawn_all() Tests ---
+
+    #[tokio::test]
+    async fn test_spawn_all_returns_correct_number_of_handles() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(), // No token → connections will fail
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 0, // Fail immediately
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            make_instruments(100),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let handles = pool.spawn_all();
+        assert_eq!(
+            handles.len(),
+            pool.connection_count(),
+            "spawn_all must return one handle per connection"
+        );
+
+        // All tasks should complete (with errors, since no token)
+        for handle in handles {
+            let result = handle.await;
+            assert!(result.is_ok(), "JoinHandle must not panic");
+            // The inner result is an error (no token → reconnection exhausted)
+            assert!(result.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_empty_pool_returns_handles() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 0,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![], // no instruments
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let handles = pool.spawn_all();
+        assert_eq!(handles.len(), 5, "empty pool still has 5 connections");
+
+        for handle in handles {
+            let result = handle.await;
+            assert!(result.is_ok(), "JoinHandle must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_tasks_return_reconnection_exhausted() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 2,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            make_instruments(10),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let handles = pool.spawn_all();
+
+        for handle in handles {
+            let join_result = handle.await.unwrap();
+            match join_result {
+                Err(WebSocketError::ReconnectionExhausted { attempts, .. }) => {
+                    assert_eq!(attempts, 2);
+                }
+                other => panic!("Expected ReconnectionExhausted, got {other:?}"),
+            }
+        }
+    }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_pool_config_max_connections_1() {
+        // Config limits to 1 connection — all instruments on one connection.
+        let config = DhanConfig {
+            max_websocket_connections: 1,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.total_instruments(), 100);
+
+        let healths = pool.health();
+        assert_eq!(healths.len(), 1);
+        assert_eq!(healths[0].subscribed_count, 100);
+        assert_eq!(healths[0].connection_id, 0);
+    }
+
+    #[test]
+    fn test_pool_config_max_per_conn_1() {
+        // max_per_conn=1 means effective capacity = 1 * 5 = 5.
+        let config = DhanConfig {
+            max_instruments_per_connection: 1,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(5),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 5);
+        assert_eq!(pool.total_instruments(), 5);
+        // Each connection should have exactly 1 instrument
+        for h in pool.health() {
+            assert_eq!(h.subscribed_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_pool_config_max_per_conn_1_exceeds() {
+        // max_per_conn=1, max_conns=5 → capacity=5. 6 instruments should fail.
+        let config = DhanConfig {
+            max_instruments_per_connection: 1,
+            ..make_test_dhan_config()
+        };
+        let result = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(6),
+            FeedMode::Ticker,
+        );
+        assert!(result.is_err());
+        let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
+        assert_eq!(requested, 6);
+        assert_eq!(capacity, 5);
+    }
+
+    #[test]
+    fn test_pool_health_initial_state_all_disconnected() {
+        // All connections start in Disconnected state.
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(500),
+            FeedMode::Full,
+        )
+        .unwrap();
+        for h in pool.health() {
+            assert_eq!(h.state, ConnectionState::Disconnected);
+            assert_eq!(h.total_reconnections, 0);
+        }
+    }
+
+    #[test]
+    fn test_pool_health_connection_ids_sequential() {
+        // Connection IDs should be 0, 1, 2, 3, 4.
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        let healths = pool.health();
+        for (idx, h) in healths.iter().enumerate() {
+            assert_eq!(h.connection_id, idx as u8);
+        }
+    }
+
+    #[test]
+    fn test_pool_take_frame_receiver_returns_working_receiver() {
+        // The first take should return a receiver connected to the real senders.
+        let mut pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(10),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let mut receiver = pool.take_frame_receiver();
+        // No data has been sent yet, so try_recv should return Empty (not Disconnected)
+        match receiver.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {} // expected
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // Also acceptable — senders may not be held open
+            }
+            Ok(_) => panic!("Should not receive data before connection starts"),
+        }
+    }
+
+    #[test]
+    fn test_pool_debug_format_with_various_sizes() {
+        for count in [0, 1, 100, 5000] {
+            let config = DhanConfig {
+                max_websocket_connections: 3,
+                ..make_test_dhan_config()
+            };
+            let pool = WebSocketConnectionPool::new(
+                make_test_token_handle(),
+                "test-client".to_string(),
+                config,
+                make_test_ws_config(),
+                make_instruments(count),
+                FeedMode::Ticker,
+            )
+            .unwrap();
+            let debug_str = format!("{pool:?}");
+            assert!(debug_str.contains("3"));
+            assert!(debug_str.contains("WebSocketConnectionPool"));
+        }
+    }
+
+    #[test]
+    fn test_pool_round_robin_even_distribution() {
+        // 10 instruments across 5 connections → 2 each.
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(10),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        for h in pool.health() {
+            assert_eq!(h.subscribed_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_pool_round_robin_uneven_distribution() {
+        // 7 instruments across 5 connections → 2, 2, 1, 1, 1.
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(7),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        let healths = pool.health();
+        let counts: Vec<usize> = healths.iter().map(|h| h.subscribed_count).collect();
+        assert_eq!(counts, vec![2, 2, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_pool_config_exceeds_max_websocket_connections_constant() {
+        // MAX_WEBSOCKET_CONNECTIONS is 5. Config of 10 should be capped.
+        let config = DhanConfig {
+            max_websocket_connections: 10,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 5);
+    }
+
+    #[test]
+    fn test_pool_config_exceeds_max_instruments_per_connection_constant() {
+        // MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION is 5000. Config of 10000 should be capped.
+        let config = DhanConfig {
+            max_instruments_per_connection: 10000,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            make_test_ws_config(),
+            make_instruments(25000),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+        assert_eq!(pool.connection_count(), 5);
+        // Effective capacity is still 25000 (5000 * 5), not 50000 (10000 * 5)
+        assert_eq!(pool.total_instruments(), 25000);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_with_single_connection() {
+        let config = DhanConfig {
+            max_websocket_connections: 1,
+            ..make_test_dhan_config()
+        };
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            config,
+            WebSocketConfig {
+                reconnect_max_attempts: 0,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            make_instruments(5),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let handles = pool.spawn_all();
+        assert_eq!(handles.len(), 1);
+
+        for handle in handles {
+            let result = handle.await;
+            assert!(result.is_ok(), "JoinHandle must not panic");
         }
     }
 }

@@ -46,12 +46,12 @@ mod tests {
     fn test_validate_market_status_truncated() {
         let buf = vec![0u8; 7];
         let err = validate_market_status_packet(&buf).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes {
-                expected: 8,
-                actual: 7,
-            } => {}
-            _ => panic!("wrong error: {err:?}"),
-        }
+        let ParseError::InsufficientBytes {
+            expected: 8,
+            actual: 7,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
     }
 }

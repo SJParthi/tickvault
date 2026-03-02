@@ -61,9 +61,9 @@
 
 | # | Dimension | Description | Trading Relevance | Status | Enforcement | File/Tool |
 |---|-----------|-------------|-------------------|--------|-------------|-----------|
-| 2.1 | Line coverage | % of source lines executed | Untested error paths in order submission could panic | `CONFIGURED` | cargo-tarpaulin in CI stage 6, Xml output | `.github/workflows/ci.yml` |
-| 2.2 | Branch coverage | % of if/else/match arms taken | 8-variant OrderState match with only 5 tested = 3 blind spots | `CONFIGURED` | tarpaulin `--branch` available, not enabled | Upgrade to llvm-cov for accuracy |
-| 2.3 | Function coverage | % of functions called at least once | Dead code detection — uncalled functions are attack surface | `CONFIGURED` | Implied by tarpaulin default output | CI stage 6 |
+| 2.1 | Line coverage | % of source lines executed | Untested error paths in order submission could panic | `CONFIGURED` | cargo-llvm-cov in CI stage 6, --fail-under-lines 99 | `.github/workflows/ci.yml` |
+| 2.2 | Branch coverage | % of if/else/match arms taken | 8-variant OrderState match with only 5 tested = 3 blind spots | `CONFIGURED` | cargo-llvm-cov --branch available | `.github/workflows/ci.yml` |
+| 2.3 | Function coverage | % of functions called at least once | Dead code detection — uncalled functions are attack surface | `CONFIGURED` | cargo-llvm-cov --fail-under-functions | CI stage 6 |
 | 2.4 | Condition coverage | Each boolean sub-expression T/F | `if size > limit && drawdown > max` — each condition independent | `GAP` | Not standard in Rust ecosystem | See Gap #6 (partial via llvm-cov) |
 | 2.5 | Path coverage | All execution paths through function | 5 sequential ifs = 32 paths — approximated by proptest | `DOCUMENTED` | Approximated by property-based testing | Infeasible for full coverage |
 | 2.6 | MC/DC | Modified Condition/Decision Coverage | Aviation/safety-critical standard — partial relevance for risk checks | `N/A` | Overkill for this system | DO-178C level, not required |
@@ -276,21 +276,14 @@ cargo mutants -p dlt-core -p dlt-trading --timeout 120
 
 **Why:** Coverage % ratcheting prevents regression. Thresholds defined (core 95%) but not enforced in CI.
 
-**Tool:** `cargo-tarpaulin` with threshold flags OR `cargo-llvm-cov` for branch accuracy
+**Tool:** `cargo-llvm-cov` 0.8.4 — LLVM source-based instrumentation coverage
 
 **Implementation:**
 ```
-# Option A: tarpaulin with threshold enforcement
-cargo tarpaulin --workspace --fail-under 90
-
-# Option B: upgrade to llvm-cov for branch coverage
-cargo install cargo-llvm-cov
-cargo llvm-cov --workspace --branch --fail-under-lines 90
-
-# Per-crate thresholds would need a custom script
+cargo llvm-cov --workspace --fail-under-lines 99 --codecov --output-path target/llvm-cov/codecov.json
 ```
 
-**CI integration:** CI stage 6 — add `--fail-under` flag to tarpaulin command.
+**CI integration:** CI stage 6 — `--fail-under-lines 99` enforced. **RESOLVED** (migrated from tarpaulin).
 
 ---
 

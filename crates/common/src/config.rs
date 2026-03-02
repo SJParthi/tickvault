@@ -671,4 +671,12 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("pong_timeout_secs"));
     }
+
+    #[test]
+    fn test_notification_zero_send_timeout_fails() {
+        let mut config = make_valid_config();
+        config.notification.send_timeout_ms = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("notification.send_timeout_ms"));
+    }
 }

@@ -56,9 +56,9 @@ docker-data/
 logs/
 
 # ---- Coverage reports ----
-tarpaulin-report.html
 lcov.info
 coverage/
+llvm-cov/
 
 # ---- Benchmark artifacts ----
 criterion/

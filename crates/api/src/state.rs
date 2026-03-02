@@ -28,3 +28,36 @@ impl SharedAppState {
         &self.inner.questdb_config
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dhan_live_trader_common::config::QuestDbConfig;
+
+    #[test]
+    fn test_shared_app_state_new_and_questdb_config() {
+        let config = QuestDbConfig {
+            host: "test-host".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state = SharedAppState::new(config);
+        assert_eq!(state.questdb_config().host, "test-host");
+        assert_eq!(state.questdb_config().ilp_port, 9009);
+        assert_eq!(state.questdb_config().http_port, 9000);
+    }
+
+    #[test]
+    fn test_shared_app_state_clone_shares_data() {
+        let config = QuestDbConfig {
+            host: "clone-test".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state1 = SharedAppState::new(config);
+        let state2 = state1.clone();
+        assert_eq!(state2.questdb_config().host, "clone-test");
+    }
+}

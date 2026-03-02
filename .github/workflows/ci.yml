@@ -10,7 +10,7 @@
 #   3. Test       — cargo test --workspace
 #   4. Security   — cargo deny check (advisories, licenses, bans, sources)
 #   5. Perf       — cargo bench (if benchmarks exist) (parallel after test)
-#   6. Coverage   — cargo tarpaulin (enforce thresholds) (parallel after test)
+#   6. Coverage   — cargo llvm-cov (enforce thresholds) (parallel after test)
 #
 # Security: All actions pinned to SHA. No mutable tags.
 # =============================================================================
@@ -212,15 +212,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@0e89f6b1568a820d57d5f00f4913ab2f19727afd # cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@68675c5a5f1a6950c3975d33f3ae0ef155e5bf3d # v2.68.15 cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov
 
       - name: Run coverage (99% minimum enforced)
-        run: cargo tarpaulin --workspace --fail-under 99 --out Xml --output-dir target/tarpaulin
+        run: cargo llvm-cov --workspace --fail-under-lines 99 --codecov --output-path target/llvm-cov/codecov.json
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-report
-          path: target/tarpaulin/
+          path: target/llvm-cov/
           retention-days: 30

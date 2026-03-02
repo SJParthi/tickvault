@@ -105,12 +105,12 @@ mod tests {
             security_id: 0,
         };
         let err = parse_disconnect_packet(&buf, &hdr).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes {
-                expected: 10,
-                actual: 9,
-            } => {}
-            _ => panic!("wrong error: {err:?}"),
-        }
+        let ParseError::InsufficientBytes {
+            expected: 10,
+            actual: 9,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
     }
 }
