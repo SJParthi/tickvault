@@ -28,6 +28,8 @@ pub struct ApplicationConfig {
     pub subscription: SubscriptionConfig,
     #[serde(default)]
     pub notification: NotificationConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 /// Trading session timing configuration.
@@ -211,6 +213,34 @@ impl Default for NotificationConfig {
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             send_timeout_ms: 10_000,
             sns_enabled: false,
+        }
+    }
+}
+
+/// Observability stack configuration.
+///
+/// Controls Prometheus metrics export and OpenTelemetry tracing.
+/// Metrics are served via an HTTP endpoint for Prometheus to scrape.
+/// Traces are exported via OTLP gRPC to Jaeger.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservabilityConfig {
+    /// Port for the Prometheus metrics HTTP endpoint served by the application.
+    pub metrics_port: u16,
+    /// OTLP gRPC endpoint for trace export (e.g., dlt-jaeger:4317).
+    pub otlp_endpoint: String,
+    /// Enable Prometheus metrics export.
+    pub metrics_enabled: bool,
+    /// Enable OpenTelemetry trace export to Jaeger.
+    pub tracing_enabled: bool,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_port: 9091,
+            otlp_endpoint: "http://dlt-jaeger:4317".to_string(), // APPROVED: Docker DNS hostname for OTLP collector
+            metrics_enabled: true,
+            tracing_enabled: true,
         }
     }
 }
@@ -526,6 +556,7 @@ mod tests {
             },
             subscription: SubscriptionConfig::default(),
             notification: NotificationConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 

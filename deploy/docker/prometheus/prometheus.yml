@@ -1,11 +1,17 @@
 # =============================================================================
 # dhan-live-trader — Prometheus Configuration
 # =============================================================================
+# Scrapes all dlt-* services. Recording & alert rules in ./rules/
+# =============================================================================
 
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
   scrape_timeout: 10s
+
+# Load recording rules and alert rules
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
 
 scrape_configs:
   # Application metrics (exposed by dhan-live-trader via metrics-exporter-prometheus)
@@ -28,4 +34,43 @@ scrape_configs:
       - targets: ["dlt-questdb:9003"]
         labels:
           service: "questdb"
+    metrics_path: "/metrics"
+
+  # Traefik metrics (via dedicated metrics entrypoint)
+  - job_name: "dlt-traefik"
+    static_configs:
+      - targets: ["dlt-traefik:8082"]
+        labels:
+          service: "traefik"
+
+  # Loki metrics
+  - job_name: "dlt-loki"
+    static_configs:
+      - targets: ["dlt-loki:3100"]
+        labels:
+          service: "loki"
+    metrics_path: "/metrics"
+
+  # Grafana metrics
+  - job_name: "dlt-grafana"
+    static_configs:
+      - targets: ["dlt-grafana:3000"]
+        labels:
+          service: "grafana"
+    metrics_path: "/metrics"
+
+  # Alloy metrics (log collector)
+  - job_name: "dlt-alloy"
+    static_configs:
+      - targets: ["dlt-alloy:12345"]
+        labels:
+          service: "alloy"
+    metrics_path: "/metrics"
+
+  # Jaeger metrics (OTEL Collector internal telemetry)
+  - job_name: "dlt-jaeger"
+    static_configs:
+      - targets: ["dlt-jaeger:8888"]
+        labels:
+          service: "jaeger"
     metrics_path: "/metrics"
