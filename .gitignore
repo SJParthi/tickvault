@@ -74,6 +74,10 @@ fuzz/corpus/
 .claude/hooks/.coverage-baseline
 quality/.binary-size-baseline
 
+# ---- Auto-save watchdog (runtime state) ----
+.claude/hooks/.watchdog.pid
+.claude/hooks/.watchdog.log
+
 # ---- Temporary files ----
 *.tmp
 *.bak

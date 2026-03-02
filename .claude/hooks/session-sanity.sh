@@ -41,6 +41,15 @@ if [ -f "$HOOKS_DIR/.test-count-baseline" ]; then
   echo "Test baseline: $BASELINE tests" >&2
 fi
 
+# Check 5: Launch auto-save watchdog in background
+WATCHDOG="$CWD/.claude/hooks/auto-save-watchdog.sh"
+if [ -x "$WATCHDOG" ]; then
+  CLAUDE_PROJECT_DIR="$CWD" nohup "$WATCHDOG" >/dev/null 2>&1 &
+  echo "Auto-save watchdog: started (PID $!)" >&2
+else
+  echo "Auto-save watchdog: not found, skipping" >&2
+fi
+
 # Remind about principles and phase
 echo "" >&2
 echo "Three principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned" >&2
