@@ -71,6 +71,8 @@ daily_download_time = "08:45:00"
 csv_cache_directory = "/app/data/instrument-cache"
 csv_cache_filename = "api-scrip-master-detailed.csv"
 csv_download_timeout_secs = 120
+build_window_start = "08:25:00"
+build_window_end = "08:55:00"
 
 [api]
 host = "0.0.0.0"
@@ -89,3 +91,4 @@ stock_default_atm_fallback_enabled = true
 [notification]
 telegram_api_base_url = "https://api.telegram.org"
 send_timeout_ms = 10000
+sns_enabled = false

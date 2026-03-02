@@ -666,8 +666,6 @@ pub async fn build_fno_universe(
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
 ) -> Result<FnoUniverse> {
-    let build_start = Instant::now();
-
     // Step 1: Download CSV
     info!("starting instrument CSV download");
     let download_result = download_instrument_csv(
@@ -686,9 +684,23 @@ pub async fn build_fno_universe(
         "instrument CSV obtained"
     );
 
-    // Step 2: Parse CSV
+    // Step 2: Parse + build
+    build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+}
+
+/// Build the F&O universe from already-obtained CSV text.
+///
+/// Parses the CSV, runs the 5-pass mapping algorithm, validates the result,
+/// and returns the fully-built [`FnoUniverse`]. No network I/O.
+///
+/// Used by the instrument loader when the freshness marker confirms today's
+/// CSV is already cached — avoids redundant HTTP downloads.
+pub fn build_fno_universe_from_csv(csv_text: &str, source: &str) -> Result<FnoUniverse> {
+    let build_start = Instant::now();
+
+    // Parse CSV
     let (csv_row_count, parsed_rows) =
-        parse_instrument_csv(&download_result.csv_text).context("instrument CSV parsing failed")?;
+        parse_instrument_csv(csv_text).context("instrument CSV parsing failed")?;
 
     info!(
         csv_row_count,
@@ -696,26 +708,26 @@ pub async fn build_fno_universe(
         "instrument CSV parsed"
     );
 
-    // Step 3: Pass 1 — Index lookup
+    // Pass 1 — Index lookup
     let index_lookup = build_index_lookup(&parsed_rows);
 
-    // Step 4: Pass 2 — Equity lookup
+    // Pass 2 — Equity lookup
     let equity_lookup = build_equity_lookup(&parsed_rows);
 
-    // Step 5: Pass 3 — Discover F&O underlyings
+    // Pass 3 — Discover F&O underlyings
     let unlinked = discover_fno_underlyings(&parsed_rows);
 
-    // Step 6: Pass 4 — Link price IDs
+    // Pass 4 — Link price IDs
     let mut underlyings = link_price_ids(unlinked, &index_lookup, &equity_lookup);
 
-    // Step 7: Pass 5 — Build derivatives, option chains, expiry calendars
+    // Pass 5 — Build derivatives, option chains, expiry calendars
     let ist_offset =
         FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
     let today = Utc::now().with_timezone(&ist_offset).date_naive();
 
     let pass5_result = build_derivatives_and_chains(&parsed_rows, &mut underlyings, today);
 
-    // Step 7b: Build subscribed indices (8 F&O + 23 Display)
+    // Build subscribed indices (8 F&O + 23 Display)
     let subscribed_indices = build_subscribed_indices(&underlyings);
 
     // Assemble the universe
@@ -724,7 +736,7 @@ pub async fn build_fno_universe(
 
     let universe = FnoUniverse {
         build_metadata: UniverseBuildMetadata {
-            csv_source: download_result.source,
+            csv_source: source.to_owned(),
             csv_row_count,
             parsed_row_count: parsed_rows.len(),
             index_count: index_lookup.len(),
@@ -743,7 +755,7 @@ pub async fn build_fno_universe(
         subscribed_indices,
     };
 
-    // Step 8: Validate
+    // Validate
     validate_fno_universe(&universe).context("F&O universe validation failed")?;
 
     info!(
@@ -3581,6 +3593,8 @@ mod tests {
             csv_cache_directory: temp_dir.to_str().unwrap().to_owned(),
             csv_cache_filename: "e2e-test-instruments.csv".to_owned(),
             csv_download_timeout_secs: 30,
+            build_window_start: "08:25:00".to_owned(),
+            build_window_end: "08:55:00".to_owned(),
         };
 
         let result = build_fno_universe(&url, &url, &config).await;

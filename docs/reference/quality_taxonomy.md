@@ -61,9 +61,9 @@
 
 | # | Dimension | Description | Trading Relevance | Status | Enforcement | File/Tool |
 |---|-----------|-------------|-------------------|--------|-------------|-----------|
-| 2.1 | Line coverage | % of source lines executed | Untested error paths in order submission could panic | `CONFIGURED` | cargo-llvm-cov in CI stage 6, --fail-under-lines 99 | `.github/workflows/ci.yml` |
-| 2.2 | Branch coverage | % of if/else/match arms taken | 8-variant OrderState match with only 5 tested = 3 blind spots | `CONFIGURED` | cargo-llvm-cov --branch available | `.github/workflows/ci.yml` |
-| 2.3 | Function coverage | % of functions called at least once | Dead code detection — uncalled functions are attack surface | `CONFIGURED` | cargo-llvm-cov --fail-under-functions | CI stage 6 |
+| 2.1 | Line coverage | % of source lines executed | Untested error paths in order submission could panic | `CONFIGURED` | cargo-tarpaulin in CI stage 6, Xml output | `.github/workflows/ci.yml` |
+| 2.2 | Branch coverage | % of if/else/match arms taken | 8-variant OrderState match with only 5 tested = 3 blind spots | `CONFIGURED` | tarpaulin `--branch` available, not enabled | Upgrade to llvm-cov for accuracy |
+| 2.3 | Function coverage | % of functions called at least once | Dead code detection — uncalled functions are attack surface | `CONFIGURED` | Implied by tarpaulin default output | CI stage 6 |
 | 2.4 | Condition coverage | Each boolean sub-expression T/F | `if size > limit && drawdown > max` — each condition independent | `GAP` | Not standard in Rust ecosystem | See Gap #6 (partial via llvm-cov) |
 | 2.5 | Path coverage | All execution paths through function | 5 sequential ifs = 32 paths — approximated by proptest | `DOCUMENTED` | Approximated by property-based testing | Infeasible for full coverage |
 | 2.6 | MC/DC | Modified Condition/Decision Coverage | Aviation/safety-critical standard — partial relevance for risk checks | `N/A` | Overkill for this system | DO-178C level, not required |
@@ -106,7 +106,7 @@
 | 4.9 | Cognitive complexity | Max 30 per function | Complex functions = guaranteed bug source | `ENFORCED` | clippy.toml threshold | `clippy.toml` |
 | 4.10 | Too-many-arguments | Max 8 parameters | Forces struct grouping, improves API design | `ENFORCED` | clippy.toml threshold | `clippy.toml` |
 | 4.11 | Type complexity | Max 300 | Prevents unreadable type signatures | `ENFORCED` | clippy.toml threshold | `clippy.toml` |
-| 4.12 | Spelling (typos) | Code/comment/doc typo detection | `securiy_id` vs `security_id` = silent field mismatch | `CONFIGURED` | typos.toml configured, manual run only | `typos.toml` |
+| 4.12 | Spelling (typos) | Code/comment/doc typo detection | `securi_id` vs `security_id` = silent field mismatch | `CONFIGURED` | typos.toml configured, manual run only | `typos.toml` |
 | 4.13 | Conventional commits | `<type>(<scope>): <description>` format | Automated changelog, clear audit trail | `ENFORCED` | commit-msg hook, pre-PR gate 5 | `scripts/git-hooks/commit-msg` |
 | 4.14 | Test count ratcheting | Test count can only increase, never decrease | Prevents accidental test deletion | `ENFORCED` | Pre-commit gate 8, pre-push gate 5 | `.claude/hooks/test-count-guard.sh` |
 
@@ -276,14 +276,21 @@ cargo mutants -p dlt-core -p dlt-trading --timeout 120
 
 **Why:** Coverage % ratcheting prevents regression. Thresholds defined (core 95%) but not enforced in CI.
 
-**Tool:** `cargo-llvm-cov` 0.8.4 — LLVM source-based instrumentation coverage
+**Tool:** `cargo-tarpaulin` with threshold flags OR `cargo-llvm-cov` for branch accuracy
 
 **Implementation:**
 ```
-cargo llvm-cov --workspace --fail-under-lines 99 --codecov --output-path target/llvm-cov/codecov.json
+# Option A: tarpaulin with threshold enforcement
+cargo tarpaulin --workspace --fail-under 90
+
+# Option B: upgrade to llvm-cov for branch coverage
+cargo install cargo-llvm-cov
+cargo llvm-cov --workspace --branch --fail-under-lines 90
+
+# Per-crate thresholds would need a custom script
 ```
 
-**CI integration:** CI stage 6 — `--fail-under-lines 99` enforced. **RESOLVED** (migrated from tarpaulin).
+**CI integration:** CI stage 6 — add `--fail-under` flag to tarpaulin command.
 
 ---
 

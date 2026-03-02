@@ -249,6 +249,32 @@ pub const DHAN_CLIENT_SECRET_SECRET: &str = "client-secret";
 pub const DHAN_TOTP_SECRET: &str = "totp-secret";
 
 // ---------------------------------------------------------------------------
+// SSM Parameter Store — QuestDB Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for QuestDB credentials.
+pub const SSM_QUESTDB_SERVICE: &str = "questdb";
+
+/// SSM key for QuestDB PG wire protocol username.
+pub const QUESTDB_PG_USER_SECRET: &str = "pg-user";
+
+/// SSM key for QuestDB PG wire protocol password.
+pub const QUESTDB_PG_PASSWORD_SECRET: &str = "pg-password";
+
+// ---------------------------------------------------------------------------
+// SSM Parameter Store — Grafana Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for Grafana credentials.
+pub const SSM_GRAFANA_SERVICE: &str = "grafana";
+
+/// SSM key for Grafana admin username.
+pub const GRAFANA_ADMIN_USER_SECRET: &str = "admin-user";
+
+/// SSM key for Grafana admin password.
+pub const GRAFANA_ADMIN_PASSWORD_SECRET: &str = "admin-password";
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — Telegram Service
 // ---------------------------------------------------------------------------
 
@@ -260,6 +286,17 @@ pub const TELEGRAM_BOT_TOKEN_SECRET: &str = "bot-token";
 
 /// SSM key for Telegram chat ID.
 pub const TELEGRAM_CHAT_ID_SECRET: &str = "chat-id";
+
+// ---------------------------------------------------------------------------
+// SSM Parameter Store — SNS Service
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for SNS configuration.
+pub const SSM_SNS_SERVICE: &str = "sns";
+
+/// SSM key for the phone number to send SNS SMS alerts to.
+/// Value must be in E.164 format: `+<country_code><number>` (e.g., "+919876543210").
+pub const SNS_PHONE_NUMBER_SECRET: &str = "phone-number";
 
 // ---------------------------------------------------------------------------
 // Docker Container Naming
@@ -300,6 +337,10 @@ pub const INSTRUMENT_CSV_RETRY_INITIAL_DELAY_MS: u64 = 2000;
 
 /// Maximum backoff delay for instrument CSV download retry in milliseconds.
 pub const INSTRUMENT_CSV_RETRY_MAX_DELAY_MS: u64 = 8000;
+
+/// Filename for the instrument build freshness marker.
+/// Written on successful build; contains today's IST date as `YYYY-MM-DD`.
+pub const INSTRUMENT_FRESHNESS_MARKER_FILENAME: &str = "instrument-build-date.txt";
 
 // ---------------------------------------------------------------------------
 // Instrument CSV — Column Names (for auto-detection from header)
@@ -514,11 +555,11 @@ pub const TOTP_SKEW: u8 = 1;
 // ---------------------------------------------------------------------------
 
 /// Path for initial token generation (appended to auth_base_url).
-/// Endpoint: POST https://auth.dhan.co/app/generateAccessToken
+/// Endpoint: POST <https://auth.dhan.co/app/generateAccessToken>
 pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 
 /// Path for token renewal (appended to rest_api_base_url).
-/// Endpoint: GET https://api.dhan.co/v2/RenewToken
+/// Endpoint: GET <https://api.dhan.co/v2/RenewToken>
 pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 
 // ---------------------------------------------------------------------------

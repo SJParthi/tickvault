@@ -128,14 +128,33 @@ mod tests {
     async fn test_get_stats_returns_unreachable_when_questdb_down() {
         use crate::state::SharedAppState;
         use axum::extract::State;
-        use dhan_live_trader_common::config::QuestDbConfig;
+        use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
-        let state = SharedAppState::new(QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 1,
-            pg_port: 1,
-            ilp_port: 1,
-        });
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+        );
         let result = get_stats(State(state)).await;
         assert!(!result.questdb_reachable);
         assert_eq!(result.tables, 0);
@@ -474,12 +493,31 @@ mod tests {
         // We need to extract port from the mock server URL.
         let port: u16 = base_url.rsplit(':').next().unwrap().parse().unwrap();
 
-        let state = SharedAppState::new(dhan_live_trader_common::config::QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: 1,
-            ilp_port: 1,
-        });
+        let state = SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+        );
         let result = get_stats(axum::extract::State(state)).await;
         assert!(result.questdb_reachable);
         assert_eq!(result.tables, 2);

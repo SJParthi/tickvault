@@ -5,10 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[lib]
-name = "dhan_live_trader_app"
-path = "src/lib.rs"
-
 [[bin]]
 name = "dhan-live-trader"
 path = "src/main.rs"
@@ -31,3 +27,6 @@ signal-hook = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 rustls = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["chrono-tz", "clap", "dhan-live-trader-trading", "signal-hook"]

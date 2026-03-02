@@ -56,9 +56,10 @@ docker-data/
 logs/
 
 # ---- Coverage reports ----
+tarpaulin-report.html
 lcov.info
 coverage/
-llvm-cov/
+target/llvm-cov/
 
 # ---- Benchmark artifacts ----
 criterion/
@@ -70,6 +71,12 @@ fuzz/corpus/
 # ---- Quality gate state files (local machine state) ----
 .claude/hooks/.last-quality-pass
 .claude/hooks/.test-count-baseline
+.claude/hooks/.coverage-baseline
+quality/.binary-size-baseline
+
+# ---- Auto-save watchdog (runtime state) ----
+.claude/hooks/.watchdog.pid
+.claude/hooks/.watchdog.log
 
 # ---- Temporary files ----
 *.tmp

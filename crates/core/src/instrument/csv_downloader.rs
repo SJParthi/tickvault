@@ -212,6 +212,29 @@ async fn write_cache(cache_dir: &str, cache_filename: &str, csv_text: &str) {
     }
 }
 
+/// Load instrument CSV from local cache only (no HTTP download).
+///
+/// Used when the freshness marker confirms today's build already completed.
+/// Avoids network overhead by reading the cached copy from the last successful download.
+///
+/// # Errors
+/// Returns error if the cache file does not exist or is too small.
+pub async fn load_cached_csv(cache_dir: &str, cache_filename: &str) -> Result<CsvDownloadResult> {
+    let cache_path = PathBuf::from(cache_dir).join(cache_filename);
+    let csv_text = read_cache(&cache_path)
+        .await
+        .with_context(|| format!("failed to load cached CSV from {}", cache_path.display()))?;
+    info!(
+        path = %cache_path.display(),
+        bytes = csv_text.len(),
+        "instrument CSV loaded from cache (freshness marker = today)"
+    );
+    Ok(CsvDownloadResult {
+        csv_text,
+        source: "cache".to_owned(),
+    })
+}
+
 /// Read CSV text from a cached file.
 async fn read_cache(cache_path: &Path) -> Result<String> {
     let csv_text = fs::read_to_string(cache_path)
@@ -304,10 +327,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_cached_csv_success() {
+        let temp_dir = env::temp_dir().join("dlt-test-load-cached");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let cache_filename = "cached-load.csv";
+
+        let fake_csv = "CACHED,".repeat(INSTRUMENT_CSV_MIN_BYTES);
+        write_cache(cache_dir, cache_filename, &fake_csv).await;
+
+        let result = load_cached_csv(cache_dir, cache_filename).await;
+        assert!(result.is_ok());
+        let dr = result.unwrap();
+        assert_eq!(dr.source, "cache");
+        assert_eq!(dr.csv_text.len(), fake_csv.len());
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_load_cached_csv_missing_returns_error() {
+        let result = load_cached_csv("/tmp/dlt-nonexistent-cache-77777", "nonexistent.csv").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_download_falls_back_to_cache() {
-        let temp_dir = env::temp_dir().join("dlt-test-fallback-cache");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-fallback-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "cached-instruments.csv";
+
+        // Ensure clean state before writing cache.
+        let _ = fs::remove_dir_all(&temp_dir).await;
 
         let fake_csv = "CACHED_DATA,".repeat(INSTRUMENT_CSV_MIN_BYTES);
         write_cache(cache_dir, cache_filename, &fake_csv).await;

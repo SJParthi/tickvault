@@ -51,7 +51,7 @@ use dhan_live_trader_common::types::SecurityId;
 // Constants — QuestDB DDL
 // ---------------------------------------------------------------------------
 
-/// Timeout for QuestDB DDL HTTP requests (ALTER TABLE).
+/// Timeout for QuestDB DDL HTTP requests (CREATE TABLE / ALTER TABLE).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// DEDUP UPSERT KEY for `instrument_build_metadata` table.
@@ -65,6 +65,72 @@ const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id";
 
 /// DEDUP UPSERT KEY for `subscribed_indices` table.
 const DEDUP_KEY_SUBSCRIBED_INDICES: &str = "security_id";
+
+// ---------------------------------------------------------------------------
+// CREATE TABLE DDL — Explicit schemas for all 4 instrument tables
+// ---------------------------------------------------------------------------
+
+/// DDL for `instrument_build_metadata` — 1 row per daily build.
+const BUILD_METADATA_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS instrument_build_metadata (\
+        csv_source SYMBOL,\
+        csv_row_count LONG,\
+        parsed_row_count LONG,\
+        index_count LONG,\
+        equity_count LONG,\
+        underlying_count LONG,\
+        derivative_count LONG,\
+        option_chain_count LONG,\
+        build_duration_ms LONG,\
+        build_timestamp TIMESTAMP,\
+        timestamp TIMESTAMP\
+    ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
+";
+
+/// DDL for `fno_underlyings` — ~215 rows per day.
+const FNO_UNDERLYINGS_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS fno_underlyings (\
+        underlying_symbol SYMBOL,\
+        price_feed_segment SYMBOL,\
+        derivative_segment SYMBOL,\
+        kind SYMBOL,\
+        underlying_security_id LONG,\
+        price_feed_security_id LONG,\
+        lot_size LONG,\
+        contract_count LONG,\
+        timestamp TIMESTAMP\
+    ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
+";
+
+/// DDL for `derivative_contracts` — ~150K rows per day.
+const DERIVATIVE_CONTRACTS_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS derivative_contracts (\
+        underlying_symbol SYMBOL,\
+        instrument_kind SYMBOL,\
+        exchange_segment SYMBOL,\
+        option_type SYMBOL,\
+        symbol_name SYMBOL,\
+        security_id LONG,\
+        expiry_date STRING,\
+        strike_price DOUBLE,\
+        lot_size LONG,\
+        tick_size DOUBLE,\
+        display_name STRING,\
+        timestamp TIMESTAMP\
+    ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
+";
+
+/// DDL for `subscribed_indices` — 31 rows per day.
+const SUBSCRIBED_INDICES_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS subscribed_indices (\
+        symbol SYMBOL,\
+        exchange SYMBOL,\
+        category SYMBOL,\
+        subcategory SYMBOL,\
+        security_id LONG,\
+        timestamp TIMESTAMP\
+    ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
+";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -101,13 +167,114 @@ pub async fn persist_instrument_snapshot(
     }
 }
 
+/// Creates all 4 instrument tables (if not exist) and enables DEDUP UPSERT KEYS.
+///
+/// Called once at startup from `main.rs` — same pattern as `ensure_tick_table_dedup_keys`.
+/// Best-effort: if QuestDB is unreachable, logs warnings and continues.
+pub async fn ensure_instrument_tables(questdb_config: &QuestDbConfig) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(?err, "failed to build HTTP client for instrument table DDL");
+            return;
+        }
+    };
+
+    // Step 1: Create all 4 tables with explicit schemas.
+    let table_ddls: &[(&str, &str)] = &[
+        (QUESTDB_TABLE_BUILD_METADATA, BUILD_METADATA_CREATE_DDL),
+        (QUESTDB_TABLE_FNO_UNDERLYINGS, FNO_UNDERLYINGS_CREATE_DDL),
+        (
+            QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+            DERIVATIVE_CONTRACTS_CREATE_DDL,
+        ),
+        (
+            QUESTDB_TABLE_SUBSCRIBED_INDICES,
+            SUBSCRIBED_INDICES_CREATE_DDL,
+        ),
+    ];
+
+    for (table_name, ddl) in table_ddls {
+        match client.get(&base_url).query(&[("query", ddl)]).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    debug!(
+                        table = *table_name,
+                        "table ensured (CREATE TABLE IF NOT EXISTS)"
+                    );
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(
+                        table = *table_name,
+                        %status,
+                        body = body.chars().take(200).collect::<String>(),
+                        "CREATE TABLE DDL returned non-success"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(table = *table_name, ?err, "CREATE TABLE DDL request failed");
+            }
+        }
+    }
+
+    // Step 2: Enable DEDUP UPSERT KEYS on all 4 tables.
+    let dedup_statements: &[(&str, &str)] = &[
+        (QUESTDB_TABLE_BUILD_METADATA, DEDUP_KEY_BUILD_METADATA),
+        (QUESTDB_TABLE_FNO_UNDERLYINGS, DEDUP_KEY_FNO_UNDERLYINGS),
+        (
+            QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+            DEDUP_KEY_DERIVATIVE_CONTRACTS,
+        ),
+        (
+            QUESTDB_TABLE_SUBSCRIBED_INDICES,
+            DEDUP_KEY_SUBSCRIBED_INDICES,
+        ),
+    ];
+
+    for (table, key) in dedup_statements {
+        let sql = format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(timestamp, {key})");
+        match client.get(&base_url).query(&[("query", &sql)]).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    debug!(table, key, "DEDUP UPSERT KEY enabled");
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(
+                        table,
+                        key,
+                        %status,
+                        body = body.chars().take(200).collect::<String>(),
+                        "DEDUP DDL returned non-success"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(table, key, ?err, "DEDUP DDL request failed");
+            }
+        }
+    }
+
+    info!("instrument tables setup complete (DDL + DEDUP UPSERT KEYS)");
+}
+
 // ---------------------------------------------------------------------------
 // Internal Implementation
 // ---------------------------------------------------------------------------
 
 /// Inner persistence logic that propagates errors for the outer wrapper to catch.
 async fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -> Result<()> {
-    // Enable DEDUP UPSERT KEYS before writing — makes re-runs idempotent.
+    // Enable DEDUP UPSERT KEYS before writing — safety net (startup already did this).
     ensure_table_dedup_keys(questdb_config).await;
 
     let conf_string = format!(
