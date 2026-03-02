@@ -38,12 +38,14 @@ services:
       - "9000:9000"    # HTTP API + Web Console
       - "8812:8812"    # PostgreSQL wire protocol
       - "9009:9009"    # InfluxDB Line Protocol (high-speed ingestion)
+      - "9003:9003"    # Prometheus metrics (min HTTP server)
     volumes:
       - dlt-questdb-data:/var/lib/questdb
     environment:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
+      QDB_METRICS_ENABLED: "TRUE"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     healthcheck:
@@ -98,6 +100,7 @@ services:
     volumes:
       - dlt-prometheus-data:/prometheus
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -160,11 +163,11 @@ services:
       dlt-loki:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/12345' || exit 1"]
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:12345/-/ready || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 20s
+      start_period: 30s
     networks:
       - dlt-network
 
@@ -181,10 +184,13 @@ services:
       - "16686:16686"  # Jaeger UI
       - "4317:4317"    # OTLP gRPC
       - "4318:4318"    # OTLP HTTP
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
+      - "8888:8888"    # Internal metrics (Prometheus)
+      - "13133:13133"  # Healthcheck (healthcheckv2 extension)
+    volumes:
+      - ./jaeger/jaeger-config.yml:/etc/jaeger/config.yml:ro
+    command: ["--config", "/etc/jaeger/config.yml"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/health/status || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -206,12 +212,19 @@ services:
     volumes:
       - dlt-grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       GF_SECURITY_ADMIN_USER: ${DLT_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_SECURITY_ADMIN_PASSWORD: ${DLT_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      # Telegram credentials for Grafana alert contact point (provisioned in alerts.yml).
+      # Fetched from AWS SSM by setup-observability.sh. Grafana expands $VAR in provisioning YAML.
+      # Uses :- (optional) — stack starts even if Telegram not in SSM; Rust-side alerts unaffected.
+      DLT_TELEGRAM_BOT_TOKEN: ${DLT_TELEGRAM_BOT_TOKEN:-}
+      DLT_TELEGRAM_CHAT_ID: ${DLT_TELEGRAM_CHAT_ID:-}
     depends_on:
       dlt-prometheus:
         condition: service_healthy
@@ -239,8 +252,10 @@ services:
       - "80:80"        # HTTP
       - "443:443"      # HTTPS
       - "8080:8080"    # Traefik Dashboard
+      - "8082:8082"    # Prometheus metrics
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]

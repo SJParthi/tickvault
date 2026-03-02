@@ -1,0 +1,20 @@
+# =============================================================================
+# dhan-live-trader — Grafana Dashboard Provisioning
+# =============================================================================
+# Auto-loads JSON dashboards from /var/lib/grafana/dashboards on first boot.
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: "dlt-dashboards"
+    orgId: 1
+    folder: "dhan-live-trader"
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

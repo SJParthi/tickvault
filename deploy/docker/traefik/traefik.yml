@@ -1,7 +1,8 @@
 # =============================================================================
-# dhan-live-trader — Traefik Configuration
+# dhan-live-trader — Traefik Static Configuration
 # =============================================================================
 # Reverse proxy for routing. Dashboard enabled for dev only.
+# Dynamic routing defined in ./dynamic/services.yml
 # =============================================================================
 
 api:
@@ -10,17 +11,30 @@ api:
 
 ping: {}
 
+# Expose Prometheus metrics from Traefik itself
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addServicesLabels: true
+    addRoutersLabels: true
+
 entryPoints:
   web:
     address: ":80"
   websecure:
     address: ":443"
+  metrics:
+    address: ":8082"
 
 providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
     network: dlt-network
+    watch: true
+  file:
+    directory: "/etc/traefik/dynamic"
     watch: true
 
 log:

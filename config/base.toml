@@ -92,3 +92,9 @@ stock_default_atm_fallback_enabled = true
 telegram_api_base_url = "https://api.telegram.org"
 send_timeout_ms = 10000
 sns_enabled = false
+
+[observability]
+metrics_port = 9091
+otlp_endpoint = "http://dlt-jaeger:4317"
+metrics_enabled = true
+tracing_enabled = true

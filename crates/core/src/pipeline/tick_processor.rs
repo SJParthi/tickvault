@@ -10,6 +10,7 @@
 
 use std::time::Instant;
 
+use metrics::{counter, gauge, histogram};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -31,6 +32,16 @@ pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<Vec<u8>>,
     mut tick_writer: Option<TickPersistenceWriter>,
 ) {
+    // Grab metric handles once before the hot loop — O(1) per tick after this.
+    // These are no-ops if no metrics recorder is installed (e.g., in tests).
+    let m_frames = counter!("dlt_frames_processed_total");
+    let m_ticks = counter!("dlt_ticks_processed_total");
+    let m_parse_errors = counter!("dlt_parse_errors_total");
+    let m_storage_errors = counter!("dlt_storage_errors_total");
+    let m_junk_filtered = counter!("dlt_junk_ticks_filtered_total");
+    let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
+    let m_pipeline_active = gauge!("dlt_pipeline_active");
+
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
     let mut parse_errors: u64 = 0;
@@ -38,10 +49,13 @@ pub async fn run_tick_processor(
     let mut junk_ticks_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
 
+    m_pipeline_active.set(1.0);
     info!("tick processor started");
 
     while let Some(raw_frame) = frame_receiver.recv().await {
+        let tick_start = Instant::now();
         frames_processed += 1;
+        m_frames.increment(1);
         let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         // Parse the binary frame
@@ -49,6 +63,7 @@ pub async fn run_tick_processor(
             Ok(frame) => frame,
             Err(err) => {
                 parse_errors += 1;
+                m_parse_errors.increment(1);
                 if parse_errors <= 100 {
                     warn!(
                         ?err,
@@ -65,6 +80,7 @@ pub async fn run_tick_processor(
         match parsed {
             ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _) => {
                 ticks_processed += 1;
+                m_ticks.increment(1);
 
                 // Filter junk ticks: initialization/heartbeat frames from Dhan
                 // have LTP=0.0 and/or exchange_timestamp=0 (epoch 1970-01-01).
@@ -73,6 +89,7 @@ pub async fn run_tick_processor(
                     || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
                 {
                     junk_ticks_filtered += 1;
+                    m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
                         debug!(
                             security_id = tick.security_id,
@@ -90,6 +107,7 @@ pub async fn run_tick_processor(
                     && let Err(err) = writer.append_tick(&tick)
                 {
                     storage_errors += 1;
+                    m_storage_errors.increment(1);
                     if storage_errors <= 100 {
                         warn!(
                             ?err,
@@ -131,6 +149,8 @@ pub async fn run_tick_processor(
             }
         }
 
+        m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
+
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
             if let Some(ref mut writer) = tick_writer
@@ -149,6 +169,7 @@ pub async fn run_tick_processor(
         error!(?err, "final tick flush failed");
     }
 
+    m_pipeline_active.set(0.0);
     info!(
         frames_processed,
         ticks_processed,

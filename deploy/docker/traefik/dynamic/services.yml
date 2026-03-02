@@ -1,0 +1,107 @@
+# =============================================================================
+# dhan-live-trader — Traefik Dynamic Configuration (File Provider)
+# =============================================================================
+# Routes all dlt-* services through Traefik. Each service gets a path-based
+# route so everything is accessible through a single entry point.
+#
+# Access pattern:  http://localhost/<service>
+# Direct access:   Still works via individual ports (9000, 3000, etc.)
+# =============================================================================
+
+http:
+  # -- Routers ----------------------------------------------------------------
+  routers:
+    # Grafana: http://localhost/grafana
+    grafana:
+      rule: "PathPrefix(`/grafana`)"
+      service: grafana
+      entryPoints: [web]
+      middlewares: [grafana-stripprefix]
+
+    # Prometheus: http://localhost/prometheus
+    prometheus:
+      rule: "PathPrefix(`/prometheus`)"
+      service: prometheus
+      entryPoints: [web]
+      middlewares: [prometheus-stripprefix]
+
+    # QuestDB Console: http://localhost/questdb
+    questdb:
+      rule: "PathPrefix(`/questdb`)"
+      service: questdb
+      entryPoints: [web]
+      middlewares: [questdb-stripprefix]
+
+    # Jaeger UI: http://localhost/jaeger
+    jaeger:
+      rule: "PathPrefix(`/jaeger`)"
+      service: jaeger
+      entryPoints: [web]
+      middlewares: [jaeger-stripprefix]
+
+    # Application API: http://localhost/api
+    app-api:
+      rule: "PathPrefix(`/api`) || PathPrefix(`/health`) || PathPrefix(`/portal`)"
+      service: app
+      entryPoints: [web]
+
+    # Alloy UI: http://localhost/alloy
+    alloy:
+      rule: "PathPrefix(`/alloy`)"
+      service: alloy
+      entryPoints: [web]
+      middlewares: [alloy-stripprefix]
+
+  # -- Services ---------------------------------------------------------------
+  services:
+    grafana:
+      loadBalancer:
+        servers:
+          - url: "http://dlt-grafana:3000"
+
+    prometheus:
+      loadBalancer:
+        servers:
+          - url: "http://dlt-prometheus:9090"
+
+    questdb:
+      loadBalancer:
+        servers:
+          - url: "http://dlt-questdb:9000"
+
+    jaeger:
+      loadBalancer:
+        servers:
+          - url: "http://dlt-jaeger:16686"
+
+    app:
+      loadBalancer:
+        servers:
+          - url: "http://dlt-app:3001"
+
+    alloy:
+      loadBalancer:
+        servers:
+          - url: "http://dlt-alloy:12345"
+
+  # -- Middlewares -------------------------------------------------------------
+  middlewares:
+    grafana-stripprefix:
+      stripPrefix:
+        prefixes: ["/grafana"]
+
+    prometheus-stripprefix:
+      stripPrefix:
+        prefixes: ["/prometheus"]
+
+    questdb-stripprefix:
+      stripPrefix:
+        prefixes: ["/questdb"]
+
+    jaeger-stripprefix:
+      stripPrefix:
+        prefixes: ["/jaeger"]
+
+    alloy-stripprefix:
+      stripPrefix:
+        prefixes: ["/alloy"]

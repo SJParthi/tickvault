@@ -154,12 +154,18 @@ impl WebSocketConnection {
     /// On disconnect, attempts reconnection with exponential backoff.
     /// Returns only on non-reconnectable errors or exhausted retries.
     pub async fn run(&self) -> Result<(), WebSocketError> {
+        // O(1) EXEMPT: begin — metric handles grabbed once before loop, not per-message
+        let m_conn_active = metrics::gauge!("dlt_websocket_connections_active", "connection_id" => self.connection_id.to_string());
+        let m_reconnections = metrics::counter!("dlt_websocket_reconnections_total", "connection_id" => self.connection_id.to_string());
+        // O(1) EXEMPT: end
+
         loop {
             self.set_state(ConnectionState::Connecting);
 
             match self.connect_and_subscribe().await {
                 Ok(ws_stream) => {
                     self.set_state(ConnectionState::Connected);
+                    m_conn_active.set(1.0);
 
                     info!(
                         connection_id = self.connection_id,
@@ -178,6 +184,7 @@ impl WebSocketConnection {
                                 "WebSocket cleanly closed"
                             );
                             self.set_state(ConnectionState::Disconnected);
+                            m_conn_active.set(0.0);
                             return Ok(());
                         }
                         Err(WebSocketError::DhanDisconnect { code })
@@ -189,9 +196,11 @@ impl WebSocketConnection {
                                 "Non-reconnectable disconnect — stopping connection"
                             );
                             self.set_state(ConnectionState::Disconnected);
+                            m_conn_active.set(0.0);
                             return Err(WebSocketError::NonReconnectableDisconnect { code });
                         }
                         Err(err) => {
+                            m_conn_active.set(0.0);
                             warn!(
                                 connection_id = self.connection_id,
                                 error = %err,
@@ -212,6 +221,7 @@ impl WebSocketConnection {
             // Reconnect with exponential backoff.
             self.set_state(ConnectionState::Reconnecting);
             self.total_reconnections.fetch_add(1, Ordering::Relaxed);
+            m_reconnections.increment(1);
 
             if !self.wait_with_backoff().await {
                 return Err(WebSocketError::ReconnectionExhausted {
