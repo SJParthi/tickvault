@@ -192,12 +192,12 @@ if [ -n "$BASE_FROM_CMD" ]; then
   BASE_BRANCH="$BASE_FROM_CMD"
 fi
 
-# Get commits since divergence from base
+# Get commits since divergence from base (first-parent only to skip merged-in history)
 MERGE_BASE=$(git merge-base "origin/$BASE_BRANCH" HEAD 2>/dev/null || true)
 if [ -n "$MERGE_BASE" ]; then
-  COMMITS=$(git log "$MERGE_BASE"..HEAD --format='%s' 2>/dev/null)
+  COMMITS=$(git log --first-parent "$MERGE_BASE"..HEAD --format='%s' 2>/dev/null)
 else
-  COMMITS=$(git log -10 --format='%s' 2>/dev/null)
+  COMMITS=$(git log --first-parent -10 --format='%s' 2>/dev/null)
 fi
 
 BAD_MSGS=""
