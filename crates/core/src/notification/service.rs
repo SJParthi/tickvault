@@ -444,10 +444,118 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Active mode tests
+    // -----------------------------------------------------------------------
+
+    fn make_active_service() -> Arc<NotificationService> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        Arc::new(NotificationService {
+            mode: NotificationMode::Active {
+                bot_token: SecretString::from("test-bot-token".to_string()),
+                chat_id: "123456789".to_string(),
+                http_client,
+                telegram_api_base_url: "http://127.0.0.1:1".to_string(),
+                sns_client: None,
+                sns_phone_number: None,
+            },
+        })
+    }
+
+    #[test]
+    fn test_active_service_is_active() {
+        let service = make_active_service();
+        assert!(
+            service.is_active(),
+            "Active-mode service must return true from is_active()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_service_notify_does_not_panic() {
+        let service = make_active_service();
+
+        service.notify(NotificationEvent::StartupComplete { mode: "LIVE" });
+        service.notify(NotificationEvent::ShutdownComplete);
+        service.notify(NotificationEvent::AuthenticationSuccess);
+        service.notify(NotificationEvent::Custom {
+            message: "active-mode test".to_string(),
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — error path tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_telegram_message_connection_refused_does_not_panic() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        send_telegram_message(
+            &client,
+            "http://127.0.0.1:1",
+            &token,
+            "999999999",
+            "test message",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_send_telegram_message_invalid_url_does_not_panic() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        send_telegram_message(
+            &client,
+            "not-a-valid-url://garbage",
+            &token,
+            "999999999",
+            "test message",
+        )
+        .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // disabled() and mode checking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disabled_returns_noop_mode() {
+        let service = NotificationService::disabled();
+        assert!(
+            !service.is_active(),
+            "disabled() must create a NoOp-mode service"
+        );
+    }
+
+    #[test]
+    fn test_multiple_disabled_instances_are_independent() {
+        let s1 = NotificationService::disabled();
+        let s2 = NotificationService::disabled();
+        assert!(!s1.is_active());
+        assert!(!s2.is_active());
+        assert!(!Arc::ptr_eq(&s1, &s2));
+    }
+
     #[test]
     fn test_disabled_service_handles_critical_events() {
         let service = NotificationService::disabled();
-        // Critical events on no-op service must not panic (no SNS client).
         service.notify(NotificationEvent::AuthenticationFailed {
             reason: "timeout".to_string(),
         });
@@ -456,6 +564,138 @@ mod tests {
             reason: "timeout".to_string(),
         });
     }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — non-success HTTP status path
+    // -----------------------------------------------------------------------
+
+    async fn start_mock_telegram_server(status_code: u16) -> String {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = r#"{"ok":false,"description":"Unauthorized"}"#;
+                let response = format!(
+                    "HTTP/1.1 {} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_code,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        base_url
+    }
+
+    #[tokio::test]
+    async fn test_send_telegram_message_non_success_status_does_not_panic() {
+        let base_url = start_mock_telegram_server(401).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        send_telegram_message(&client, &base_url, &token, "999999999", "test message").await;
+    }
+
+    #[tokio::test]
+    async fn test_send_telegram_message_success_status_does_not_panic() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        send_telegram_message(&client, &base_url, &token, "999999999", "test message").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Active mode — notify with all event types
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_notify_all_event_types() {
+        let service = make_active_service();
+
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "test failure".to_string(),
+        });
+        service.notify(NotificationEvent::TokenRenewed);
+        service.notify(NotificationEvent::TokenRenewalFailed {
+            attempts: 3,
+            reason: "timeout".to_string(),
+        });
+        service.notify(NotificationEvent::WebSocketConnected {
+            connection_index: 0,
+        });
+        service.notify(NotificationEvent::WebSocketDisconnected {
+            connection_index: 1,
+            reason: "reset".to_string(),
+        });
+        service.notify(NotificationEvent::WebSocketReconnected {
+            connection_index: 2,
+        });
+        service.notify(NotificationEvent::ShutdownInitiated);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — falls back to no-op without real SSM
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_returns_noop_without_ssm() {
+        let config = NotificationConfig {
+            send_timeout_ms: 100,
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            sns_enabled: false,
+        };
+        let service = NotificationService::initialize(&config).await;
+        assert!(
+            !service.is_active(),
+            "without real SSM, service should be in no-op mode"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags and mask_phone
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_strip_html_tags_removes_bold() {

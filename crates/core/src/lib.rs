@@ -1,3 +1,11 @@
+// Compile-time lint enforcement — defense-in-depth with CLI clippy flags
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+#![deny(clippy::dbg_macro)]
+#![allow(missing_docs)] // TODO: enforce after adding docs to all public items
+
 //! Core engine: instrument universe, authentication, WebSocket management,
 //! binary parsing, tick pipeline.
 //!

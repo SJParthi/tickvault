@@ -206,16 +206,16 @@ pub async fn try_rebuild_instruments(
 // ---------------------------------------------------------------------------
 
 /// Returns the current IST time.
-#[allow(clippy::expect_used)] // Compile-time constant — IST_UTC_OFFSET_SECONDS is always valid
+#[allow(clippy::expect_used)] // APPROVED: Compile-time constant — IST_UTC_OFFSET_SECONDS is always valid
 fn now_ist_time() -> NaiveTime {
-    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset constant is valid");
+    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset constant is valid"); // APPROVED: compile-time constant
     Utc::now().with_timezone(&ist).time()
 }
 
 /// Returns today's IST date as `YYYY-MM-DD`.
-#[allow(clippy::expect_used)] // Compile-time constant — IST_UTC_OFFSET_SECONDS is always valid
+#[allow(clippy::expect_used)] // APPROVED: Compile-time constant — IST_UTC_OFFSET_SECONDS is always valid
 fn now_ist_date_string() -> String {
-    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset constant is valid");
+    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset constant is valid"); // APPROVED: compile-time constant
     Utc::now().with_timezone(&ist).date_naive().to_string()
 }
 

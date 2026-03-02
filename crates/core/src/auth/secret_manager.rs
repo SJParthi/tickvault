@@ -401,6 +401,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // resolve_environment — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_environment_with_valid_custom_value() {
+        with_environment_var(Some("staging"), || {
+            let env = resolve_environment().expect("'staging' should be valid");
+            assert_eq!(env, "staging");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_hyphenated_value() {
+        with_environment_var(Some("pre-prod"), || {
+            let env = resolve_environment().expect("'pre-prod' should be valid");
+            assert_eq!(env, "pre-prod");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_numeric_value() {
+        with_environment_var(Some("env1"), || {
+            let env = resolve_environment().expect("'env1' should be valid");
+            assert_eq!(env, "env1");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_uppercase() {
+        with_environment_var(Some("PROD"), || {
+            let env = resolve_environment().expect("'PROD' should be valid");
+            assert_eq!(env, "PROD");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_underscore_returns_error() {
+        with_environment_var(Some("pre_prod"), || {
+            let result = resolve_environment();
+            assert!(
+                result.is_err(),
+                "underscore in environment string must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_special_chars_returns_error() {
+        with_environment_var(Some("dev;rm -rf /"), || {
+            let result = resolve_environment();
+            assert!(result.is_err(), "special characters must be rejected");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_unicode_returns_error() {
+        with_environment_var(Some("dev\u{00e9}"), || {
+            let result = resolve_environment();
+            assert!(result.is_err(), "non-ASCII characters must be rejected");
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // create_ssm_client — smoke test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_ssm_client_returns_without_panic() {
+        let _client = create_ssm_client().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ssm_path — Telegram service paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_telegram_bot_token() {
+        use dhan_live_trader_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET};
+        let path = build_ssm_path("dev", SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET);
+        assert_eq!(path, "/dlt/dev/telegram/bot-token");
+    }
+
+    #[test]
+    fn test_build_ssm_path_telegram_chat_id() {
+        use dhan_live_trader_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET};
+        let path = build_ssm_path("prod", SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET);
+        assert_eq!(path, "/dlt/prod/telegram/chat-id");
+    }
+
+    // -----------------------------------------------------------------------
     // build_ssm_path — QuestDB secret paths
     // -----------------------------------------------------------------------
 
@@ -454,5 +544,99 @@ mod tests {
             build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
             "/dlt/prod/grafana/admin-password"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_secret — error path (no real SSM available)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_secret_returns_error_without_real_ssm() {
+        let ssm_client = create_ssm_client().await;
+        let result = fetch_secret(&ssm_client, "/dlt/test/nonexistent/secret").await;
+        assert!(
+            result.is_err(),
+            "fetch_secret must fail without real SSM connectivity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_dhan_credentials — error path (no real SSM available)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_dhan_credentials_returns_error_without_real_ssm() {
+        with_environment_var(Some("test-env"), || {});
+        let result = fetch_dhan_credentials().await;
+        assert!(
+            result.is_err(),
+            "fetch_dhan_credentials must fail without real SSM"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ssm_path — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_with_custom_environment() {
+        let path = build_ssm_path("staging-v2", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
+        assert_eq!(path, "/dlt/staging-v2/dhan/client-id");
+    }
+
+    #[test]
+    fn test_build_ssm_path_with_custom_service() {
+        let path = build_ssm_path("dev", "custom-svc", "api-key");
+        assert_eq!(path, "/dlt/dev/custom-svc/api-key");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_environment — more edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_environment_with_single_char() {
+        with_environment_var(Some("a"), || {
+            let env = resolve_environment().expect("single char should be valid");
+            assert_eq!(env, "a");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_all_digits() {
+        with_environment_var(Some("123"), || {
+            let env = resolve_environment().expect("all-digit string should be valid");
+            assert_eq!(env, "123");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_leading_hyphen() {
+        with_environment_var(Some("-dev"), || {
+            let env = resolve_environment().expect("leading hyphen should be valid");
+            assert_eq!(env, "-dev");
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_newline_returns_error() {
+        with_environment_var(Some("dev\ninjection"), || {
+            let result = resolve_environment();
+            assert!(
+                result.is_err(),
+                "newline in environment string must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_environment_with_tab_returns_error() {
+        with_environment_var(Some("dev\ttest"), || {
+            let result = resolve_environment();
+            assert!(
+                result.is_err(),
+                "tab in environment string must be rejected"
+            );
+        });
     }
 }

@@ -189,13 +189,11 @@ mod tests {
             security_id: 1,
         };
         let err = parse_quote_packet(&buf, &hdr, 0).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes { expected, actual } => {
-                assert_eq!(expected, 50);
-                assert_eq!(actual, 49);
-            }
-            _ => panic!("wrong error variant"),
-        }
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 50);
+        assert_eq!(actual, 49);
     }
 
     #[test]
@@ -269,12 +267,12 @@ mod tests {
             security_id: 1,
         };
         let err = parse_quote_packet(&buf, &hdr, 0).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes {
-                expected: 50,
-                actual: 8,
-            } => {}
-            _ => panic!("wrong error: {err:?}"),
-        }
+        let ParseError::InsufficientBytes {
+            expected: 50,
+            actual: 8,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
     }
 }

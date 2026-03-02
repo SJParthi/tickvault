@@ -100,25 +100,21 @@ mod tests {
     #[test]
     fn test_parse_header_too_short_empty() {
         let err = parse_header(&[]).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes { expected, actual } => {
-                assert_eq!(expected, 8);
-                assert_eq!(actual, 0);
-            }
-            _ => panic!("wrong error variant"),
-        }
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 0);
     }
 
     #[test]
     fn test_parse_header_too_short_seven_bytes() {
         let err = parse_header(&[0u8; 7]).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes { expected, actual } => {
-                assert_eq!(expected, 8);
-                assert_eq!(actual, 7);
-            }
-            _ => panic!("wrong error variant"),
-        }
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 7);
     }
 
     #[test]

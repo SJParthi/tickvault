@@ -127,13 +127,11 @@ mod tests {
             security_id: 1,
         };
         let err = parse_ticker_packet(&buf, &hdr, 0).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes { expected, actual } => {
-                assert_eq!(expected, 16);
-                assert_eq!(actual, 15);
-            }
-            _ => panic!("wrong error variant"),
-        }
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 16);
+        assert_eq!(actual, 15);
     }
 
     #[test]

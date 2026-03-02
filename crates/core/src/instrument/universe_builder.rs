@@ -2131,6 +2131,305 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Pass 5 Edge Case Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_skips_derivative_without_expiry_date() {
+        // Create a derivative row with expiry_date = None
+        let mut row = make_futidx_row(
+            51700,
+            26000,
+            "NIFTY",
+            "2026-03-30",
+            75,
+            Exchange::NationalStockExchange,
+        );
+        row.expiry_date = None; // force no expiry
+
+        // Also need the index row for pass 1-4
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51701,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            row,
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Only the row WITH expiry_date should be in contracts (51701), not the one without
+        assert!(result.derivative_contracts.contains_key(&51701));
+        // The row without expiry (51700 with forced None) should be skipped
+        assert!(
+            !result.derivative_contracts.contains_key(&51700),
+            "derivative without expiry_date must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_pass5_skips_option_without_option_type() {
+        // Create an option row with option_type = None (malformed data)
+        let mut option_row = make_optidx_row(
+            70099,
+            26000,
+            "NIFTY",
+            "2026-03-30",
+            22000.0,
+            OptionType::Call,
+            75,
+        );
+        option_row.option_type = None; // force no option_type
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            option_row,
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // The option IS in derivative_contracts (it has an expiry_date, underlying exists)
+        assert!(result.derivative_contracts.contains_key(&70099));
+
+        // But it should NOT appear in any option chain (no option_type to classify as call/put)
+        let march_key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_owned(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        if let Some(chain) = result.option_chains.get(&march_key) {
+            let found = chain.calls.iter().any(|e| e.security_id == 70099)
+                || chain.puts.iter().any(|e| e.security_id == 70099);
+            assert!(
+                !found,
+                "option without option_type must not appear in chain entries"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pass5_skips_unknown_instrument_kind() {
+        // Create a derivative row with an unknown instrument type
+        let mut row = make_futidx_row(
+            51700,
+            26000,
+            "NIFTY",
+            "2026-03-30",
+            75,
+            Exchange::NationalStockExchange,
+        );
+        row.instrument = "FUTCUR".to_owned(); // unknown instrument
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            row,
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // No derivatives should be built from unknown instrument type
+        assert!(
+            result.derivative_contracts.is_empty(),
+            "unknown instrument kind must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_pass5_empty_rows_produces_empty_result() {
+        let mut underlyings = HashMap::new();
+        let result = build_derivatives_and_chains(&[], &mut underlyings, test_today());
+
+        assert!(result.derivative_contracts.is_empty());
+        assert!(result.instrument_info.is_empty());
+        assert!(result.option_chains.is_empty());
+        assert!(result.expiry_calendars.is_empty());
+    }
+
+    #[test]
+    fn test_pass5_all_expired_produces_no_derivatives() {
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51600,
+                26000,
+                "NIFTY",
+                "2025-01-30", // expired
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Only the index row should be in instrument_info (no derivatives)
+        assert!(
+            result.derivative_contracts.is_empty(),
+            "all expired contracts must be filtered"
+        );
+    }
+
+    #[test]
+    fn test_pass5_skips_derivative_for_unknown_underlying() {
+        // A derivative row whose underlying is NOT in the underlyings map
+        let rows = vec![make_futidx_row(
+            51700,
+            26000,
+            "NONEXISTENT",
+            "2026-03-30",
+            75,
+            Exchange::NationalStockExchange,
+        )];
+
+        // Empty underlyings map — the derivative's underlying won't be found
+        let mut underlyings = HashMap::new();
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        assert!(
+            result.derivative_contracts.is_empty(),
+            "derivative for unknown underlying must be skipped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_subscribed_indices Edge Cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_empty_underlyings() {
+        let underlyings = HashMap::new();
+        let indices = build_subscribed_indices(&underlyings);
+
+        // Should only have display indices (no F&O indices)
+        let fno_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::FnoUnderlying)
+            .count();
+        assert_eq!(fno_count, 0);
+
+        let display_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .count();
+        assert_eq!(display_count, DISPLAY_INDEX_COUNT);
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_only_stocks() {
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_owned(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_owned(),
+                underlying_security_id: 2885,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 500,
+                contract_count: 10,
+            },
+        );
+
+        let indices = build_subscribed_indices(&underlyings);
+
+        // Stock underlyings are skipped — only display indices
+        let fno_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::FnoUnderlying)
+            .count();
+        assert_eq!(
+            fno_count, 0,
+            "stock underlyings must not become F&O indices"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // discover_fno_underlyings: Empty segments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_empty_input() {
+        let underlyings = discover_fno_underlyings(&[]);
+        assert!(underlyings.is_empty());
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_only_equity_rows() {
+        let rows = vec![
+            make_equity_row(2885, "RELIANCE"),
+            make_equity_row(1333, "HDFCBANK"),
+        ];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert!(
+            underlyings.is_empty(),
+            "equity-only input should yield no underlyings"
+        );
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_only_index_rows() {
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_index_row(25, "BANKNIFTY", Exchange::NationalStockExchange),
+        ];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert!(
+            underlyings.is_empty(),
+            "index-only input (no derivatives) should yield no underlyings"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // link_price_ids: Empty inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_link_price_ids_empty_unlinked() {
+        let index_lookup = HashMap::new();
+        let equity_lookup = HashMap::new();
+        let linked = link_price_ids(vec![], &index_lookup, &equity_lookup);
+        assert!(linked.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: BSE index exchange segment mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_bse_index_derivatives_use_bse_fno_segment() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // SENSEX future (60000) should have BSE_FNO segment
+        let sensex_fut = result
+            .derivative_contracts
+            .get(&60000)
+            .expect("SENSEX future must exist");
+        assert_eq!(sensex_fut.exchange_segment, ExchangeSegment::BseFno);
+    }
+
+    // -----------------------------------------------------------------------
+    // BSE Stock Derivative Filter — Test Helpers
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_no_bse_stock_underlyings_in_universe() {
         // Add BSE FUTSTK rows to the standard test data — they should be fully
@@ -2177,5 +2476,1214 @@ mod tests {
             bse_index_count, 3,
             "BSE index underlyings (SENSEX, BANKEX, SENSEX50) must still exist"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: empty inputs and edge cases for Pass 1-4
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_index_lookup_only_non_index_rows_returns_empty() {
+        let rows = vec![
+            make_equity_row(2885, "RELIANCE"),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+        ];
+        let lookup = build_index_lookup(&rows);
+        assert!(lookup.is_empty(), "no index rows means empty lookup");
+    }
+
+    #[test]
+    fn test_build_equity_lookup_only_non_equity_rows_returns_empty() {
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+        let lookup = build_equity_lookup(&rows);
+        assert!(lookup.is_empty(), "no equity rows means empty lookup");
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_bse_futstk_filtered_nse_futstk_kept() {
+        // BSE FUTSTK (should be skipped), NSE FUTSTK (should be kept)
+        let rows = vec![
+            make_futstk_row_bse(80001, 9001, "FORTIS", "2026-03-30", 200),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+        ];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1);
+        assert_eq!(underlyings[0].underlying_symbol, "RELIANCE");
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_unknown_instrument_kind_skipped() {
+        // A derivative row with instrument kind that doesn't match FUTIDX/FUTSTK
+        // The `_ => continue` at line 154 in discover_fno_underlyings
+        let mut row = make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500);
+        // Change the exchange to BSE — BSE + FUTSTK is skipped explicitly
+        // Instead, use a custom instrument name that hits the `_ => continue`
+        row.instrument = "OPTIDX".to_owned(); // options don't produce underlyings
+        let rows = vec![row];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert!(
+            underlyings.is_empty(),
+            "OPTIDX rows should not produce underlyings"
+        );
+    }
+
+    #[test]
+    fn test_link_price_ids_nse_index_uses_idx_i_segment() {
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+        let index_lookup = build_index_lookup(&rows);
+        let equity_lookup = build_equity_lookup(&rows);
+        let unlinked = discover_fno_underlyings(&rows);
+        let linked = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+
+        let nifty = linked.get("NIFTY").unwrap();
+        assert_eq!(nifty.price_feed_segment, ExchangeSegment::IdxI);
+        assert_eq!(nifty.derivative_segment, ExchangeSegment::NseFno);
+    }
+
+    #[test]
+    fn test_link_price_ids_bse_index_uses_bse_fno_segment() {
+        let rows = vec![
+            make_index_row(51, "SENSEX", Exchange::BombayStockExchange),
+            make_futidx_row(
+                60000,
+                1,
+                "SENSEX",
+                "2026-03-30",
+                20,
+                Exchange::BombayStockExchange,
+            ),
+        ];
+        let index_lookup = build_index_lookup(&rows);
+        let equity_lookup = build_equity_lookup(&rows);
+        let unlinked = discover_fno_underlyings(&rows);
+        let linked = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+
+        let sensex = linked.get("SENSEX").unwrap();
+        assert_eq!(sensex.price_feed_segment, ExchangeSegment::IdxI);
+        assert_eq!(sensex.derivative_segment, ExchangeSegment::BseFno);
+    }
+
+    #[test]
+    fn test_link_price_ids_stock_uses_nse_equity_segment() {
+        let rows = vec![
+            make_equity_row(2885, "RELIANCE"),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+        ];
+        let index_lookup = build_index_lookup(&rows);
+        let equity_lookup = build_equity_lookup(&rows);
+        let unlinked = discover_fno_underlyings(&rows);
+        let linked = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+
+        let reliance = linked.get("RELIANCE").unwrap();
+        assert_eq!(reliance.price_feed_segment, ExchangeSegment::NseEquity);
+        assert_eq!(reliance.derivative_segment, ExchangeSegment::NseFno);
+        assert_eq!(reliance.price_feed_security_id, 2885);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_equity_instrument_info_skips_non_eq_series() {
+        let mut rows = build_test_rows();
+        // Add a non-EQ series equity row — should NOT appear in instrument_info
+        let mut non_eq = make_equity_row(9999, "SPECIALSTOCK");
+        non_eq.series = "BE".to_owned();
+        rows.push(non_eq);
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // The non-EQ row should not be in instrument_info
+        assert!(
+            !result.instrument_info.contains_key(&9999),
+            "non-EQ series equity should not be in instrument_info"
+        );
+    }
+
+    #[test]
+    fn test_pass5_bse_equity_skipped_in_instrument_info() {
+        let mut rows = build_test_rows();
+        // Add a BSE equity row — BSE equities are segment 'E' but exchange=BSE
+        // build_derivatives_and_chains only includes NSE equities with EQ series
+        let mut bse_eq = make_equity_row(8888, "BSESTOCK");
+        bse_eq.exchange = Exchange::BombayStockExchange;
+        rows.push(bse_eq);
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        assert!(
+            !result.instrument_info.contains_key(&8888),
+            "BSE equity should not be in instrument_info"
+        );
+    }
+
+    #[test]
+    fn test_pass5_negative_strike_normalized_to_zero() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Futures have strike_price = -0.01 in CSV, should be normalized to 0.0
+        let nifty_fut = result.derivative_contracts.get(&51700).unwrap();
+        assert!(
+            nifty_fut.strike_price >= 0.0,
+            "negative strike should be normalized to 0.0"
+        );
+    }
+
+    #[test]
+    fn test_pass5_option_chain_calls_and_puts_sorted_ascending() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let march_key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_owned(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        let chain = result.option_chains.get(&march_key).unwrap();
+
+        // Verify calls are sorted ascending
+        for window in chain.calls.windows(2) {
+            assert!(
+                window[0].strike_price <= window[1].strike_price,
+                "calls must be sorted ascending"
+            );
+        }
+        // Verify puts are sorted ascending
+        for window in chain.puts.windows(2) {
+            assert!(
+                window[0].strike_price <= window[1].strike_price,
+                "puts must be sorted ascending"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pass5_expiry_calendar_dates_sorted() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_cal = result.expiry_calendars.get("NIFTY").unwrap();
+        for window in nifty_cal.expiry_dates.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "expiry dates must be sorted ascending"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pass5_bse_optstk_rows_skipped() {
+        let mut rows = build_test_rows();
+        // Add a BSE OPTSTK row — should be skipped
+        rows.push(make_optstk_row_bse(
+            90001,
+            2885,
+            "RELIANCE",
+            "2026-03-30",
+            2700.0,
+            OptionType::Call,
+            500,
+        ));
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        assert!(
+            !result.derivative_contracts.contains_key(&90001),
+            "BSE OPTSTK should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_pass5_unknown_instrument_kind_skipped() {
+        let mut rows = build_test_rows();
+        // Row with segment='D' but unknown instrument kind
+        let mut unknown = make_futstk_row(99990, 2885, "RELIANCE", "2026-03-30", 500);
+        unknown.instrument = "FUTCUR".to_owned(); // unknown instrument kind
+        rows.push(unknown);
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        assert!(
+            !result.derivative_contracts.contains_key(&99990),
+            "unknown instrument kind should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_pass5_derivative_without_expiry_skipped() {
+        let mut rows = build_test_rows();
+        let mut no_expiry = make_futstk_row(99991, 2885, "RELIANCE", "2026-03-30", 500);
+        no_expiry.expiry_date = None;
+        rows.push(no_expiry);
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        assert!(
+            !result.derivative_contracts.contains_key(&99991),
+            "derivative without expiry should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_pass5_option_without_option_type_not_in_chain() {
+        let mut rows = build_test_rows();
+        // An OPTIDX row without option_type — should still be in derivative_contracts
+        // but should NOT be added to option chain
+        let mut no_opt_type = make_optidx_row(
+            99992,
+            26000,
+            "NIFTY",
+            "2026-03-30",
+            23000.0,
+            OptionType::Call,
+            75,
+        );
+        no_opt_type.option_type = None;
+        rows.push(no_opt_type);
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // The contract IS added to derivative_contracts (it's still a valid contract)
+        assert!(
+            result.derivative_contracts.contains_key(&99992),
+            "contract should exist in derivative_contracts"
+        );
+
+        // But should NOT appear in any option chain entries
+        let march_key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_owned(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        let chain = result.option_chains.get(&march_key).unwrap();
+        let in_calls = chain.calls.iter().any(|e| e.security_id == 99992);
+        let in_puts = chain.puts.iter().any(|e| e.security_id == 99992);
+        assert!(
+            !in_calls && !in_puts,
+            "option without option_type should not be in chain"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_subscribed_indices: default subcategory branch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_all_categories_present() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        let fno_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::FnoUnderlying)
+            .count();
+        let display_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .count();
+
+        // We should have both FnoUnderlying and DisplayIndex categories
+        assert!(fno_count > 0, "should have FnoUnderlying indices");
+        assert!(display_count > 0, "should have DisplayIndex indices");
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_subcategory_coverage() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        // DISPLAY_INDEX_ENTRIES has subcategories: Volatility, BroadMarket, MidCap,
+        // SmallCap, Sectoral, Thematic
+        let display_indices: Vec<_> = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .collect();
+
+        // Check that we get indices with various subcategories
+        let volatility = display_indices
+            .iter()
+            .any(|i| i.subcategory == IndexSubcategory::Volatility);
+        let broad_market = display_indices
+            .iter()
+            .any(|i| i.subcategory == IndexSubcategory::BroadMarket);
+        let sectoral = display_indices
+            .iter()
+            .any(|i| i.subcategory == IndexSubcategory::Sectoral);
+
+        assert!(volatility, "should have Volatility display index");
+        assert!(broad_market, "should have BroadMarket display index");
+        assert!(sectoral, "should have Sectoral display index");
+    }
+
+    #[test]
+    fn test_pass5_full_pipeline_metadata_counts() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let initial_underlying_count = underlyings.len();
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Verify metadata-relevant counts
+        assert!(
+            !result.derivative_contracts.is_empty(),
+            "should have derivative contracts"
+        );
+        assert!(
+            !result.instrument_info.is_empty(),
+            "should have instrument info"
+        );
+        assert!(
+            !result.option_chains.is_empty(),
+            "should have option chains"
+        );
+        assert!(
+            !result.expiry_calendars.is_empty(),
+            "should have expiry calendars"
+        );
+
+        // contract_count should have been updated for at least some underlyings
+        let updated_count = underlyings
+            .values()
+            .filter(|u| u.contract_count > 0)
+            .count();
+        assert!(
+            updated_count > 0,
+            "at least some underlyings should have contract_count > 0"
+        );
+        assert_eq!(
+            underlyings.len(),
+            initial_underlying_count,
+            "underlying count should not change after Pass 5"
+        );
+    }
+
+    #[test]
+    fn test_pass5_all_derivative_rows_produce_instrument_info() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Every derivative contract should also have an instrument_info entry
+        for sec_id in result.derivative_contracts.keys() {
+            assert!(
+                result.instrument_info.contains_key(sec_id),
+                "derivative {} should have instrument_info entry",
+                sec_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_pass5_instrument_info_derivative_variant_fields() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Check a specific derivative in instrument_info
+        let info = result.instrument_info.get(&70001).unwrap();
+        match info {
+            InstrumentInfo::Derivative {
+                security_id,
+                underlying_symbol,
+                instrument_kind,
+                exchange_segment,
+                expiry_date,
+                strike_price,
+                option_type,
+            } => {
+                assert_eq!(*security_id, 70001);
+                assert_eq!(underlying_symbol, "NIFTY");
+                assert_eq!(*instrument_kind, DhanInstrumentKind::OptionIndex);
+                assert_eq!(*exchange_segment, ExchangeSegment::NseFno);
+                assert_eq!(*expiry_date, NaiveDate::from_ymd_opt(2026, 3, 30).unwrap());
+                assert_eq!(*strike_price, 22000.0);
+                assert_eq!(*option_type, Some(OptionType::Call));
+            }
+            other => panic!(
+                "expected Derivative variant, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_fno_bse_index_exchange() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        // BSE index underlyings should have BSE exchange
+        let sensex_idx = indices
+            .iter()
+            .find(|i| i.symbol == "SENSEX" && i.category == IndexCategory::FnoUnderlying);
+        assert!(
+            sensex_idx.is_some(),
+            "SENSEX should be in subscribed indices"
+        );
+        assert_eq!(sensex_idx.unwrap().exchange, Exchange::BombayStockExchange);
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_display_all_nse() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        // All display indices should be NSE
+        for idx in indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+        {
+            assert_eq!(
+                idx.exchange,
+                Exchange::NationalStockExchange,
+                "display index {} should be NSE",
+                idx.symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_discover_fno_underlyings_bse_futstk_is_filtered_but_bse_futidx_kept() {
+        // Verify that BSE + FUTSTK -> filtered, BSE + FUTIDX -> kept
+        let rows = vec![
+            make_futstk_row_bse(80001, 9001, "SOMESTOCK", "2026-03-30", 200),
+            make_futidx_row(
+                60000,
+                1,
+                "SENSEX",
+                "2026-03-30",
+                20,
+                Exchange::BombayStockExchange,
+            ),
+        ];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1);
+        assert_eq!(underlyings[0].underlying_symbol, "SENSEX");
+        assert_eq!(underlyings[0].kind, UnderlyingKind::BseIndex);
+    }
+
+    #[test]
+    fn test_link_price_ids_all_missing_lookups_use_fallback() {
+        // No index or equity lookups — all should fall back to underlying_security_id
+        let unlinked = vec![
+            UnlinkedUnderlying {
+                underlying_symbol: "UNKNOWN_INDEX".to_owned(),
+                underlying_security_id: 99001,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 50,
+                derivative_exchange: Exchange::NationalStockExchange,
+            },
+            UnlinkedUnderlying {
+                underlying_symbol: "UNKNOWN_STOCK".to_owned(),
+                underlying_security_id: 99002,
+                kind: UnderlyingKind::Stock,
+                lot_size: 100,
+                derivative_exchange: Exchange::NationalStockExchange,
+            },
+        ];
+        let empty_index = HashMap::new();
+        let empty_equity = HashMap::new();
+        let linked = link_price_ids(unlinked, &empty_index, &empty_equity);
+
+        let idx = linked.get("UNKNOWN_INDEX").unwrap();
+        assert_eq!(
+            idx.price_feed_security_id, 99001,
+            "should fall back to underlying_security_id"
+        );
+
+        let stk = linked.get("UNKNOWN_STOCK").unwrap();
+        assert_eq!(
+            stk.price_feed_security_id, 99002,
+            "should fall back to underlying_security_id"
+        );
+    }
+
+    #[test]
+    fn test_pass5_multiple_expiries_in_calendar() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // NIFTY has March and April expiry dates in build_test_rows
+        let nifty_cal = result.expiry_calendars.get("NIFTY").unwrap();
+        assert!(
+            nifty_cal.expiry_dates.len() >= 2,
+            "NIFTY should have at least 2 expiry dates"
+        );
+        assert_eq!(
+            nifty_cal.expiry_dates[0],
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap()
+        );
+        assert_eq!(
+            nifty_cal.expiry_dates[1],
+            NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pass5_contract_count_matches_derivatives_per_underlying() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // For each underlying with contracts, verify contract_count matches
+        for (symbol, underlying) in &underlyings {
+            let actual_count = result
+                .derivative_contracts
+                .values()
+                .filter(|c| c.underlying_symbol == *symbol)
+                .count();
+            assert_eq!(
+                underlying.contract_count, actual_count,
+                "contract_count mismatch for {}: expected {}, got {}",
+                symbol, actual_count, underlying.contract_count
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 3 — wildcard `_ => continue` at line 154
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_skips_bse_futstk_instrument() {
+        // A FUTSTK row from BSE should be skipped by the BSE stock filter,
+        // but a FUTIDX row from an unrecognized exchange combo (e.g., BSE FUTSTK)
+        // should also trigger the `_ => continue` arm (line 150-154).
+        // Actually, BSE FUTSTK is caught earlier (line 139). To hit the wildcard,
+        // we need an instrument+exchange combo that doesn't match any of the 3 arms:
+        // (FUTIDX, NSE), (FUTIDX, BSE), (FUTSTK, NSE). The only remaining combo
+        // that passes the is_futures check would not exist normally, but we can test
+        // that BSE FUTSTK rows are filtered at line 139 (already tested) and that
+        // only expected combos produce underlyings.
+
+        // This row has FUTIDX from NSE => NseIndex (covered)
+        // This row has FUTIDX from BSE => BseIndex (covered)
+        // This row has FUTSTK from NSE => Stock (covered)
+        // This row has FUTSTK from BSE => filtered at line 139, never reaches match
+
+        // To hit line 154 `_ => continue`, we need a FUTSTK from BSE that somehow
+        // bypasses the BSE stock filter. Since that's impossible with FUTSTK,
+        // the `_ => continue` catches any future instrument type we don't handle.
+        // Let's verify with standard data that only expected combos are discovered.
+        let rows = vec![
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            make_futidx_row(
+                60000,
+                1,
+                "SENSEX",
+                "2026-03-30",
+                20,
+                Exchange::BombayStockExchange,
+            ),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+            // BSE FUTSTK — skipped by BSE stock filter
+            make_futstk_row_bse(80001, 9001, "FORTIS", "2026-03-30", 200),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+
+        // NIFTY (NseIndex), SENSEX (BseIndex), RELIANCE (Stock) present
+        assert_eq!(underlyings.len(), 3);
+        // FORTIS (BSE FUTSTK) must NOT be present
+        assert!(
+            !underlyings.iter().any(|u| u.underlying_symbol == "FORTIS"),
+            "BSE FUTSTK must be skipped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: make_optstk_row_bse with OptionType::Put (line 1966)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_skips_bse_stock_put_options() {
+        // Exercise make_optstk_row_bse with OptionType::Put to cover line 1966
+        let mut rows = build_test_rows();
+        rows.push(make_optstk_row_bse(
+            80030,
+            2885,
+            "RELIANCE",
+            "2026-03-30",
+            2100.0,
+            OptionType::Put,
+            500,
+        ));
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // BSE OPTSTK Put (security_id 80030) must NOT be in contracts
+        assert!(
+            !result.derivative_contracts.contains_key(&80030),
+            "BSE OPTSTK Put must be skipped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 5 info! logs (lines 493, 533, 552)
+    // These are covered when build_derivatives_and_chains runs to completion.
+    // The existing tests already do this, but we add one that explicitly
+    // verifies the output data structures are populated (proving the code
+    // reached those info! lines).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_produces_chains_and_calendars_proving_log_lines_reached() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Line 493: info!(derivative_count = ...) — derivatives must be non-empty
+        assert!(
+            !result.derivative_contracts.is_empty(),
+            "derivatives must be produced (line 493 reached)"
+        );
+
+        // Line 533: info!(option_chain_count = ...) — option chains must be non-empty
+        assert!(
+            !result.option_chains.is_empty(),
+            "option chains must be produced (line 533 reached)"
+        );
+
+        // Line 552: info!(expiry_calendar_count = ...) — expiry calendars must be non-empty
+        assert!(
+            !result.expiry_calendars.is_empty(),
+            "expiry calendars must be produced (line 552 reached)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_subscribed_indices info! log (lines 630-638)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_returns_both_fno_and_display() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        let fno_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::FnoUnderlying)
+            .count();
+        let display_count = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .count();
+
+        // Proves lines 630-638 (the info! log with both counts) was reached
+        assert!(fno_count > 0, "must have F&O indices");
+        assert!(display_count > 0, "must have display indices");
+        assert_eq!(indices.len(), fno_count + display_count);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 5 with empty derivative rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_with_no_derivative_rows_produces_empty_results() {
+        // Only index and equity rows — no segment='D' rows at all
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_equity_row(2885, "RELIANCE"),
+        ];
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        assert!(result.derivative_contracts.is_empty());
+        assert!(result.option_chains.is_empty());
+        assert!(result.expiry_calendars.is_empty());
+        // instrument_info should still have index and equity entries
+        assert!(result.instrument_info.contains_key(&13));
+        assert!(result.instrument_info.contains_key(&2885));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 3 dedup — second FUTIDX for same symbol skipped
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_deduplicates_by_symbol() {
+        let rows = vec![
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            // Duplicate NIFTY with different expiry — should be deduped
+            make_futidx_row(
+                51701,
+                26000,
+                "NIFTY",
+                "2026-04-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1, "duplicate symbol must be deduped");
+        assert_eq!(underlyings[0].underlying_symbol, "NIFTY");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 3 TEST symbol skip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_skips_test_symbols() {
+        let rows = vec![
+            make_futstk_row(99998, 99999, "TESTSTOCK", "2026-03-30", 100),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1);
+        assert_eq!(underlyings[0].underlying_symbol, "RELIANCE");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_subscribed_indices with empty underlyings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_with_no_underlyings_only_display() {
+        let underlyings: HashMap<String, FnoUnderlying> = HashMap::new();
+        let indices = build_subscribed_indices(&underlyings);
+
+        // Only display indices (23), no F&O indices
+        assert_eq!(indices.len(), DISPLAY_INDEX_COUNT);
+        for idx in &indices {
+            assert_eq!(idx.category, IndexCategory::DisplayIndex);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_subscribed_indices display subcategory variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_all_display_subcategories_present() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        let display_indices: Vec<_> = indices
+            .iter()
+            .filter(|i| i.category == IndexCategory::DisplayIndex)
+            .collect();
+
+        // Verify each known subcategory is present
+        assert!(
+            display_indices
+                .iter()
+                .any(|i| i.subcategory == IndexSubcategory::Volatility),
+            "Volatility subcategory must be present"
+        );
+        assert!(
+            display_indices
+                .iter()
+                .any(|i| i.subcategory == IndexSubcategory::BroadMarket),
+            "BroadMarket subcategory must be present"
+        );
+        assert!(
+            display_indices
+                .iter()
+                .any(|i| i.subcategory == IndexSubcategory::MidCap),
+            "MidCap subcategory must be present"
+        );
+        assert!(
+            display_indices
+                .iter()
+                .any(|i| i.subcategory == IndexSubcategory::SmallCap),
+            "SmallCap subcategory must be present"
+        );
+        assert!(
+            display_indices
+                .iter()
+                .any(|i| i.subcategory == IndexSubcategory::Sectoral),
+            "Sectoral subcategory must be present"
+        );
+        assert!(
+            display_indices
+                .iter()
+                .any(|i| i.subcategory == IndexSubcategory::Thematic),
+            "Thematic subcategory must be present"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end test: build_fno_universe with mock HTTP server
+    // -----------------------------------------------------------------------
+
+    /// Build a complete instrument CSV string that satisfies all parsing and
+    /// validation requirements:
+    /// - >= INSTRUMENT_CSV_MIN_ROWS total rows (padded with filtered-out MCX rows)
+    /// - >= INSTRUMENT_CSV_MIN_BYTES total bytes
+    /// - 8 must-exist indices with correct security IDs
+    /// - RELIANCE(2885) equity for must-exist equity check
+    /// - RELIANCE, HDFCBANK, INFY, TCS as F&O stock underlyings
+    /// - >= VALIDATION_FNO_STOCK_MIN_COUNT stock underlyings
+    /// - At least one derivative contract with a future expiry date
+    fn build_end_to_end_csv() -> String {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,\
+                       UNDERLYING_SECURITY_ID,UNDERLYING_SYMBOL,SYMBOL_NAME,\
+                       DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,LOT_SIZE,\
+                       SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,\
+                       EXPIRY_FLAG,";
+
+        // Pre-allocate: ~100K rows × ~120 bytes each ≈ 12MB
+        let estimated_rows = INSTRUMENT_CSV_MIN_ROWS + 1000;
+        let mut lines: Vec<String> = Vec::with_capacity(estimated_rows + 1);
+        lines.push(header.to_owned());
+
+        // --- NSE Indices (Pass 1) ---
+        let nse_indices: &[(u32, &str)] = &[
+            (13, "NIFTY"),
+            (25, "BANKNIFTY"),
+            (27, "FINNIFTY"),
+            (442, "MIDCPNIFTY"),
+            (38, "NIFTY NEXT 50"),
+        ];
+        for &(sid, sym) in nse_indices {
+            lines.push(format!(
+                "NSE,I,{sid},NA,INDEX,{sid},{sym},{sym},{sym} Index,INDEX,NA,\
+                 1.0,0001-01-01,,XX,0.0500,N,"
+            ));
+        }
+
+        // --- BSE Indices (Pass 1) ---
+        let bse_indices: &[(u32, &str, &str)] = &[
+            (51, "SENSEX", "S&P BSE SENSEX"),
+            (69, "BANKEX", "S&P BSE BANKEX"),
+            (83, "SNSX50", "S&P BSE SENSEX 50"),
+        ];
+        for &(sid, sym, display) in bse_indices {
+            lines.push(format!(
+                "BSE,I,{sid},NA,INDEX,{sid},{sym},{sym},{display},INDEX,NA,\
+                 1.0,0001-01-01,,XX,0.0100,N,"
+            ));
+        }
+
+        // --- Must-exist equities (Pass 2) ---
+        let must_exist_equities: &[(u32, &str)] = &[
+            (2885, "RELIANCE"),
+            (1333, "HDFCBANK"),
+            (1594, "INFY"),
+            (11536, "TCS"),
+            (5258, "SBIN"),
+        ];
+        for &(sid, sym) in must_exist_equities {
+            lines.push(format!(
+                "NSE,E,{sid},INE000A00000,EQUITY,,{sym},{sym} LTD,{sym},\
+                 ES,EQ,1.0,,,,5.0000,NA,"
+            ));
+        }
+
+        // Use a far-future expiry so the test is not date-sensitive
+        let expiry = "2027-12-30";
+
+        // --- NSE FUTIDX rows (Pass 3 — index underlyings) ---
+        let nse_futidx: &[(u32, u32, &str, u32)] = &[
+            (51700, 26000, "NIFTY", 75),
+            (51701, 26009, "BANKNIFTY", 30),
+            (51712, 26037, "FINNIFTY", 60),
+            (51713, 26074, "MIDCPNIFTY", 120),
+            (51714, 26041, "NIFTYNXT50", 40),
+        ];
+        for &(sid, usid, sym, lot) in nse_futidx {
+            lines.push(format!(
+                "NSE,D,{sid},NA,FUTIDX,{usid},{sym},{sym}-{expiry}-FUT,\
+                 {sym} FUT,FUT,NA,{lot}.0,{expiry},-0.01000,XX,5.0000,M,"
+            ));
+        }
+
+        // --- BSE FUTIDX rows ---
+        let bse_futidx: &[(u32, u32, &str, u32)] = &[
+            (60000, 1, "SENSEX", 20),
+            (60001, 2, "BANKEX", 30),
+            (60002, 3, "SENSEX50", 25),
+        ];
+        for &(sid, usid, sym, lot) in bse_futidx {
+            lines.push(format!(
+                "BSE,D,{sid},NA,FUTIDX,{usid},{sym},{sym}-{expiry}-FUT,\
+                 {sym} FUT,FUT,NA,{lot}.0,{expiry},-0.01000,XX,5.0000,M,"
+            ));
+        }
+
+        // --- Must-exist F&O stocks: FUTSTK rows (Pass 3) ---
+        let must_exist_futstk: &[(u32, u32, &str, u32)] = &[
+            (52023, 2885, "RELIANCE", 500),
+            (52024, 1333, "HDFCBANK", 550),
+            (52025, 1594, "INFY", 400),
+            (52026, 11536, "TCS", 175),
+            (52027, 5258, "SBIN", 1500),
+        ];
+        for &(sid, usid, sym, lot) in must_exist_futstk {
+            lines.push(format!(
+                "NSE,D,{sid},NA,FUTSTK,{usid},{sym},{sym}-{expiry}-FUT,\
+                 {sym} FUT,FUT,NA,{lot}.0,{expiry},-0.01000,XX,10.0000,M,"
+            ));
+        }
+
+        // --- Generate 160 additional stock underlyings to exceed
+        //     VALIDATION_FNO_STOCK_MIN_COUNT (150) ---
+        // Each stock needs: 1 equity row + 1 FUTSTK row
+        let extra_stock_count: u32 = 160;
+        let equity_base_sid: u32 = 20000;
+        let futstk_base_sid: u32 = 55000;
+        for i in 0..extra_stock_count {
+            let sym = format!("STOCK{i:03}");
+            let eq_sid = equity_base_sid + i;
+            let fut_sid = futstk_base_sid + i;
+
+            // Equity row
+            lines.push(format!(
+                "NSE,E,{eq_sid},INE000B00000,EQUITY,,{sym},{sym} LTD,{sym},\
+                 ES,EQ,1.0,,,,5.0000,NA,"
+            ));
+            // FUTSTK row
+            lines.push(format!(
+                "NSE,D,{fut_sid},NA,FUTSTK,{eq_sid},{sym},{sym}-{expiry}-FUT,\
+                 {sym} FUT,FUT,NA,100.0,{expiry},-0.01000,XX,10.0000,M,"
+            ));
+        }
+
+        // --- OPTIDX rows (NIFTY options for option chain coverage) ---
+        let opt_rows: &[(u32, f64, &str)] = &[
+            (70001, 22000.0, "CE"),
+            (70002, 22000.0, "PE"),
+            (70003, 22500.0, "CE"),
+            (70004, 22500.0, "PE"),
+        ];
+        for &(sid, strike, ot) in opt_rows {
+            lines.push(format!(
+                "NSE,D,{sid},NA,OPTIDX,26000,NIFTY,NIFTY-{expiry}-{strike:.0}-{ot},\
+                 NIFTY {expiry} {strike:.0} {ot},OP,NA,75.0,{expiry},\
+                 {strike:.5},{ot},5.0000,M,"
+            ));
+        }
+
+        // --- Pad with MCX rows (filtered out) to reach INSTRUMENT_CSV_MIN_ROWS ---
+        let real_rows = lines.len() - 1; // Subtract header
+        let padding_needed = if real_rows < INSTRUMENT_CSV_MIN_ROWS {
+            INSTRUMENT_CSV_MIN_ROWS - real_rows + 1
+        } else {
+            1
+        };
+
+        for i in 0..padding_needed {
+            let pad_sid = 900_000 + i as u32;
+            lines.push(format!(
+                "MCX,D,{pad_sid},NA,FUTCOM,500,CRUDEOIL,CRUDEOIL-FUT,\
+                 CRUDE OIL FUT,FUT,NA,100.0,{expiry},-0.01,XX,1.0,M,"
+            ));
+        }
+
+        let csv = lines.join("\n");
+
+        // If the CSV is still under INSTRUMENT_CSV_MIN_BYTES, pad with
+        // comment-like MCX rows (safe because MCX rows are filtered out).
+        if csv.len() < INSTRUMENT_CSV_MIN_BYTES {
+            let extra_bytes = INSTRUMENT_CSV_MIN_BYTES - csv.len() + 1;
+            let pad_row = "MCX,D,999999,NA,FUTCOM,500,CRUDEOIL,CRUDEOIL-FUT,\
+                           CRUDE OIL FUT,FUT,NA,100.0,2027-12-30,-0.01,XX,1.0,M,";
+            let rows_needed = extra_bytes / pad_row.len() + 1;
+            let mut extra_lines = Vec::with_capacity(rows_needed);
+            for _ in 0..rows_needed {
+                extra_lines.push(pad_row.to_owned());
+            }
+            return format!("{}\n{}", csv, extra_lines.join("\n"));
+        }
+
+        csv
+    }
+
+    #[tokio::test]
+    async fn test_build_fno_universe_end_to_end() {
+        let csv_content = build_end_to_end_csv();
+
+        // Sanity: CSV must meet minimum size and row requirements
+        assert!(
+            csv_content.len() >= INSTRUMENT_CSV_MIN_BYTES,
+            "CSV must be >= {} bytes, got {}",
+            INSTRUMENT_CSV_MIN_BYTES,
+            csv_content.len()
+        );
+
+        // Start a mock HTTP server using TcpListener
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let csv = csv_content.clone();
+        let _server = tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let csv = csv.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        // Read the full HTTP request (may be >4KB for large headers,
+                        // but for our simple GET it fits easily)
+                        let mut buf = vec![0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/csv\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            csv.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(csv.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/instruments.csv");
+
+        let temp_dir = std::env::temp_dir().join("dlt-test-build-fno-universe-e2e");
+        let config = InstrumentConfig {
+            daily_download_time: "08:00:00".to_owned(),
+            csv_cache_directory: temp_dir.to_str().unwrap().to_owned(),
+            csv_cache_filename: "e2e-test-instruments.csv".to_owned(),
+            csv_download_timeout_secs: 30,
+            build_window_start: "08:25:00".to_owned(),
+            build_window_end: "08:55:00".to_owned(),
+        };
+
+        let result = build_fno_universe(&url, &url, &config).await;
+        assert!(
+            result.is_ok(),
+            "build_fno_universe should succeed: {:?}",
+            result.err()
+        );
+
+        let universe = result.unwrap();
+
+        // Verify universe is non-empty
+        assert!(
+            !universe.underlyings.is_empty(),
+            "underlyings must not be empty"
+        );
+        assert!(
+            !universe.derivative_contracts.is_empty(),
+            "derivative_contracts must not be empty"
+        );
+
+        // Verify must-exist indices are present with correct price IDs
+        for (symbol, expected_price_id) in VALIDATION_MUST_EXIST_INDICES {
+            let underlying = universe.underlyings.get(*symbol);
+            assert!(
+                underlying.is_some(),
+                "must-exist index '{}' not found in underlyings",
+                symbol
+            );
+            assert_eq!(
+                underlying.unwrap().price_feed_security_id,
+                *expected_price_id,
+                "price_feed_security_id mismatch for index '{}'",
+                symbol
+            );
+        }
+
+        // Verify must-exist F&O stocks
+        for symbol in VALIDATION_MUST_EXIST_FNO_STOCKS {
+            assert!(
+                universe.underlyings.contains_key(*symbol),
+                "must-exist F&O stock '{}' not found",
+                symbol
+            );
+        }
+
+        // Verify stock count within validation range
+        let stock_count = universe
+            .underlyings
+            .values()
+            .filter(|u| u.kind == UnderlyingKind::Stock)
+            .count();
+        assert!(
+            stock_count >= VALIDATION_FNO_STOCK_MIN_COUNT,
+            "stock count {} must be >= {}",
+            stock_count,
+            VALIDATION_FNO_STOCK_MIN_COUNT
+        );
+
+        // Verify build metadata
+        assert!(
+            universe.build_metadata.csv_row_count >= INSTRUMENT_CSV_MIN_ROWS,
+            "csv_row_count {} must be >= {}",
+            universe.build_metadata.csv_row_count,
+            INSTRUMENT_CSV_MIN_ROWS
+        );
+        assert_eq!(universe.build_metadata.csv_source, "primary");
+        assert!(universe.build_metadata.underlying_count > 0);
+        assert!(universe.build_metadata.derivative_count > 0);
+
+        // Verify subscribed indices are populated (8 F&O + 23 display = 31)
+        assert!(
+            !universe.subscribed_indices.is_empty(),
+            "subscribed_indices must not be empty"
+        );
+
+        // Verify RELIANCE equity is in instrument_info
+        assert!(
+            universe.instrument_info.contains_key(&2885),
+            "RELIANCE (2885) must be in instrument_info"
+        );
+
+        // Verify option chains were built (NIFTY options)
+        assert!(
+            !universe.option_chains.is_empty(),
+            "option_chains must not be empty"
+        );
+
+        // Clean up
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

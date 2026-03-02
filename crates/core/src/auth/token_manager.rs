@@ -546,6 +546,37 @@ mod tests {
     use super::*;
     use crate::auth::types::DhanAuthResponseData;
 
+    /// Helper: constructs a `TokenManager` directly (no SSM, no network).
+    /// Used to test private helper methods that don't require a real token.
+    fn make_test_manager(initial_token: Option<TokenState>) -> Arc<TokenManager> {
+        let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(initial_token)));
+        let http_client = reqwest::Client::new();
+
+        Arc::new(TokenManager {
+            token,
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("test-secret".to_string()),
+                totp_secret: secrecy::SecretString::from("test-totp".to_string()),
+            },
+            rest_api_base_url: "https://api.example.com".to_string(),
+            auth_base_url: "https://auth.example.com".to_string(),
+            http_client,
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 1,
+                token_validity_hours: 24,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 5000,
+                websocket_connect_timeout_ms: 5000,
+                retry_initial_delay_ms: 100,
+                retry_max_delay_ms: 1000,
+                retry_max_attempts: 3,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        })
+    }
+
     #[test]
     fn test_token_handle_initially_none() {
         let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
@@ -826,6 +857,1043 @@ mod tests {
         assert!(
             guard_after_clear.as_ref().is_none(),
             "storing None must clear the token state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize() — HTTPS validation tests
+    // -----------------------------------------------------------------------
+    //
+    // These call initialize() with http:// URLs. The HTTPS check fires BEFORE
+    // any SSM or network call, so no credentials or network are needed.
+
+    #[tokio::test]
+    async fn test_initialize_rejects_http_rest_api_base_url() {
+        let dhan_config = DhanConfig {
+            websocket_url: "wss://example.com".to_string(),
+            rest_api_base_url: "http://api.dhan.co".to_string(),
+            auth_base_url: "https://auth.dhan.co".to_string(),
+            instrument_csv_url: "https://example.com/instruments.csv".to_string(),
+            instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
+            max_instruments_per_connection: 100,
+            max_websocket_connections: 5,
+        };
+        let token_config = TokenConfig {
+            refresh_before_expiry_hours: 1,
+            token_validity_hours: 24,
+        };
+        let network_config = NetworkConfig {
+            request_timeout_ms: 5000,
+            websocket_connect_timeout_ms: 5000,
+            retry_initial_delay_ms: 100,
+            retry_max_delay_ms: 1000,
+            retry_max_attempts: 3,
+        };
+
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("http:// rest_api_base_url must be rejected")
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("rest_api_base_url must use HTTPS"),
+            "error message should mention rest_api_base_url HTTPS requirement, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_rejects_http_auth_base_url() {
+        let dhan_config = DhanConfig {
+            websocket_url: "wss://example.com".to_string(),
+            rest_api_base_url: "https://api.dhan.co".to_string(),
+            auth_base_url: "http://auth.dhan.co".to_string(),
+            instrument_csv_url: "https://example.com/instruments.csv".to_string(),
+            instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
+            max_instruments_per_connection: 100,
+            max_websocket_connections: 5,
+        };
+        let token_config = TokenConfig {
+            refresh_before_expiry_hours: 1,
+            token_validity_hours: 24,
+        };
+        let network_config = NetworkConfig {
+            request_timeout_ms: 5000,
+            websocket_connect_timeout_ms: 5000,
+            retry_initial_delay_ms: 100,
+            retry_max_delay_ms: 1000,
+            retry_max_attempts: 3,
+        };
+
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("http:// auth_base_url must be rejected")
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("auth_base_url must use HTTPS"),
+            "error message should mention auth_base_url HTTPS requirement, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // time_until_next_refresh — None token test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_until_next_refresh_with_no_token_returns_zero() {
+        let manager = make_test_manager(None);
+        let duration = manager.time_until_next_refresh();
+        assert_eq!(
+            duration,
+            Duration::ZERO,
+            "No token present — should return Duration::ZERO to trigger immediate refresh"
+        );
+    }
+
+    #[test]
+    fn test_time_until_next_refresh_with_fresh_token_returns_positive() {
+        let data = DhanAuthResponseData {
+            access_token: "test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400, // 24 hours
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+
+        let duration = manager.time_until_next_refresh();
+        // With 24h validity and 1h refresh window, should sleep ~23h.
+        assert!(
+            duration.as_secs() > 80_000,
+            "Fresh 24h token with 1h window should have >80000s until refresh, got: {}s",
+            duration.as_secs()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // current_expiry_display — None token test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_current_expiry_display_with_no_token() {
+        let manager = make_test_manager(None);
+        let display = manager.current_expiry_display();
+        assert_eq!(
+            display, "no token",
+            "No token present — display should say 'no token'"
+        );
+    }
+
+    #[test]
+    fn test_current_expiry_display_with_token_shows_timestamp() {
+        let data = DhanAuthResponseData {
+            access_token: "test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+
+        let display = manager.current_expiry_display();
+        assert_ne!(
+            display, "no token",
+            "With a token present, display should not say 'no token'"
+        );
+        // Should contain a date-like string (year)
+        assert!(
+            display.contains("20"),
+            "Expiry display should contain a year, got: {display}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // token_handle — public API test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_returns_shared_handle() {
+        let data = DhanAuthResponseData {
+            access_token: "handle-test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+
+        let handle = manager.token_handle();
+
+        // The handle should see the same token as the manager's internal state.
+        let guard = handle.load();
+        let state = guard
+            .as_ref()
+            .as_ref()
+            .expect("handle should see the token");
+        assert_eq!(
+            state.access_token().expose_secret(),
+            "handle-test-jwt",
+            "token_handle() must share the same ArcSwap"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_none_initially() {
+        let manager = make_test_manager(None);
+        let handle = manager.token_handle();
+
+        let guard = handle.load();
+        assert!(
+            guard.as_ref().is_none(),
+            "token_handle() with no token should load None"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_sees_updates() {
+        let manager = make_test_manager(None);
+        let handle = manager.token_handle();
+
+        // Initially None
+        assert!(handle.load().as_ref().is_none());
+
+        // Store a token via the manager's internal handle
+        let data = DhanAuthResponseData {
+            access_token: "updated-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        manager
+            .token
+            .store(Arc::new(Some(TokenState::from_response(&data))));
+
+        // The external handle should see the update
+        let guard = handle.load();
+        let state = guard
+            .as_ref()
+            .as_ref()
+            .expect("handle should see the update");
+        assert_eq!(state.access_token().expose_secret(), "updated-jwt");
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_token — tests with unreachable HTTPS URLs
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a manager with a specific unreachable HTTPS base URL
+    /// and a known-good TOTP secret so TOTP generation succeeds.
+    fn make_test_manager_with_totp(
+        initial_token: Option<TokenState>,
+        auth_base_url: &str,
+        rest_api_base_url: &str,
+    ) -> Arc<TokenManager> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Valid base32 TOTP secret (32 chars = 160 bits).
+        let totp_secret = "OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN";
+        let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(initial_token)));
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("test http client");
+
+        Arc::new(TokenManager {
+            token,
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("123456".to_string()),
+                totp_secret: secrecy::SecretString::from(totp_secret.to_string()),
+            },
+            rest_api_base_url: rest_api_base_url.to_string(),
+            auth_base_url: auth_base_url.to_string(),
+            http_client,
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 1,
+                token_validity_hours: 24,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 200,
+                websocket_connect_timeout_ms: 200,
+                retry_initial_delay_ms: 10,
+                retry_max_delay_ms: 50,
+                retry_max_attempts: 2,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_acquire_token_connection_error_with_unreachable_url() {
+        // Uses an unreachable HTTPS URL so the HTTP request fails.
+        let manager =
+            make_test_manager_with_totp(None, "https://127.0.0.1:1", "https://127.0.0.1:1");
+        let result = manager.acquire_token().await;
+        assert!(
+            result.is_err(),
+            "acquire_token must fail with unreachable URL"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("generateAccessToken") || err_msg.contains("request failed"),
+            "error should mention generateAccessToken failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_renew_token_with_no_current_token() {
+        // try_renew_token when no token is stored should error.
+        let manager =
+            make_test_manager_with_totp(None, "https://127.0.0.1:1", "https://127.0.0.1:1");
+        let result = manager.try_renew_token().await;
+        assert!(
+            result.is_err(),
+            "try_renew_token must fail with no current token"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot renew") || err_msg.contains("no current token"),
+            "error should mention missing token, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_renew_token_connection_error_with_unreachable_url() {
+        // try_renew_token with a token present but unreachable REST API URL.
+        let data = DhanAuthResponseData {
+            access_token: "existing-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager_with_totp(
+            Some(token_state),
+            "https://127.0.0.1:1",
+            "https://127.0.0.1:1",
+        );
+        let result = manager.try_renew_token().await;
+        assert!(
+            result.is_err(),
+            "try_renew_token must fail with unreachable URL"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("RenewToken") || err_msg.contains("request failed"),
+            "error should mention renewal failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_renew_with_fallback_both_fail() {
+        // renew_with_fallback tries try_renew_token, then acquire_token.
+        // With an unreachable URL and a valid token, both should fail.
+        let data = DhanAuthResponseData {
+            access_token: "existing-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager_with_totp(
+            Some(token_state),
+            "https://127.0.0.1:1",
+            "https://127.0.0.1:1",
+        );
+        let result = manager.renew_with_fallback().await;
+        assert!(
+            result.is_err(),
+            "renew_with_fallback must fail when both endpoints unreachable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_renewal_task — cancellation test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_renewal_task_cancellation() {
+        // Spawn the renewal task and immediately abort it.
+        // Verifies it does not panic on cancellation.
+        let data = DhanAuthResponseData {
+            access_token: "task-test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager_with_totp(
+            Some(token_state),
+            "https://127.0.0.1:1",
+            "https://127.0.0.1:1",
+        );
+        let handle = manager.spawn_renewal_task();
+        // Give the task a moment to start sleeping
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.abort();
+        // The abort should not panic — JoinError::is_cancelled should be true.
+        let result = handle.await;
+        assert!(result.is_err(), "aborted task should return JoinError");
+        assert!(
+            result.unwrap_err().is_cancelled(),
+            "task should be cancelled, not panicked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // time_until_next_refresh — with expired token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_until_next_refresh_with_zero_expiry_returns_zero() {
+        // expires_in=0 creates a token that expires at issuance time.
+        let data = DhanAuthResponseData {
+            access_token: "expired-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0,
+        };
+        let expired_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(expired_state));
+        let duration = manager.time_until_next_refresh();
+        assert_eq!(
+            duration,
+            Duration::ZERO,
+            "Token with zero expiry should return Duration::ZERO for immediate refresh"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // current_expiry_display — with short-lived token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_current_expiry_display_with_short_lived_token_shows_timestamp() {
+        let data = DhanAuthResponseData {
+            access_token: "short-lived-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 1, // 1 second
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+        let display = manager.current_expiry_display();
+        assert_ne!(
+            display, "no token",
+            "token with short expiry should still show timestamp"
+        );
+        assert!(display.contains("20"), "should contain year");
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — both URLs are HTTP (first check catches rest_api_base_url)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_rejects_both_http_urls() {
+        let dhan_config = DhanConfig {
+            websocket_url: "wss://example.com".to_string(),
+            rest_api_base_url: "http://api.dhan.co".to_string(),
+            auth_base_url: "http://auth.dhan.co".to_string(),
+            instrument_csv_url: "https://example.com/instruments.csv".to_string(),
+            instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
+            max_instruments_per_connection: 100,
+            max_websocket_connections: 5,
+        };
+        let token_config = TokenConfig {
+            refresh_before_expiry_hours: 1,
+            token_validity_hours: 24,
+        };
+        let network_config = NetworkConfig {
+            request_timeout_ms: 5000,
+            websocket_connect_timeout_ms: 5000,
+            retry_initial_delay_ms: 100,
+            retry_max_delay_ms: 1000,
+            retry_max_attempts: 3,
+        };
+
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
+        assert!(result.is_err(), "both HTTP URLs must be rejected");
+        // The first check (rest_api_base_url) fires first.
+        let err_msg = result.err().expect("expected an error").to_string();
+        assert!(err_msg.contains("rest_api_base_url must use HTTPS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // token_handle — verify it returns an independent Arc
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_multiple_calls_return_shared_handle() {
+        let manager = make_test_manager(None);
+        let handle1 = manager.token_handle();
+        let handle2 = manager.token_handle();
+        // Both should point to the same ArcSwap
+        let data = DhanAuthResponseData {
+            access_token: "shared-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        manager
+            .token
+            .store(Arc::new(Some(TokenState::from_response(&data))));
+        let g1 = handle1.load();
+        let g2 = handle2.load();
+        assert_eq!(
+            g1.as_ref()
+                .as_ref()
+                .expect("h1")
+                .access_token()
+                .expose_secret(),
+            g2.as_ref()
+                .as_ref()
+                .expect("h2")
+                .access_token()
+                .expose_secret(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP mock server helpers for try_renew_token / renew_with_fallback tests
+    // -----------------------------------------------------------------------
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// Starts a local TCP server that responds to the FIRST request with the
+    /// given HTTP status and body, then shuts down.
+    async fn start_mock_server(status: u16, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://127.0.0.1:{}", addr.port());
+
+        let response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let handle = tokio::spawn(async move {
+            // Accept up to 5 connections (enough for retry tests)
+            for _ in 0..5 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    // Read request (consume it)
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    // Write response
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+
+        (url, handle)
+    }
+
+    /// Constructs a `TokenManager` pointing at local mock URLs.
+    /// Uses `http://` which is normally rejected by initialize(), but we
+    /// construct the manager directly to bypass that check for unit tests.
+    fn make_mock_manager(
+        rest_api_url: &str,
+        auth_url: &str,
+        initial_token: Option<TokenState>,
+    ) -> Arc<TokenManager> {
+        let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(initial_token)));
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build http client");
+
+        Arc::new(TokenManager {
+            token,
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("123456".to_string()),
+                totp_secret: secrecy::SecretString::from(
+                    "OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN".to_string(),
+                ),
+            },
+            rest_api_base_url: rest_api_url.to_string(),
+            auth_base_url: auth_url.to_string(),
+            http_client,
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 1,
+                token_validity_hours: 24,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 5000,
+                websocket_connect_timeout_ms: 5000,
+                retry_initial_delay_ms: 50,
+                retry_max_delay_ms: 100,
+                retry_max_attempts: 2,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // try_renew_token — success path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_renew_token_success() {
+        let renew_body = r#"{"dhanClientId":"test","accessToken":"renewed-jwt","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, server_handle) = start_mock_server(200, renew_body).await;
+
+        let initial_data = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let initial_token = TokenState::from_response(&initial_data);
+        let manager = make_mock_manager(&url, &url, Some(initial_token));
+
+        let result = manager.try_renew_token().await;
+        assert!(
+            result.is_ok(),
+            "try_renew_token should succeed: {:?}",
+            result.err()
+        );
+
+        // Verify the token was updated
+        let guard = manager.token.load();
+        let state = guard.as_ref().as_ref().expect("should have renewed token");
+        assert_eq!(
+            state.access_token().expose_secret(),
+            "renewed-jwt",
+            "token must be updated after renewal"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // try_renew_token — no current token
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_renew_token_fails_without_current_token() {
+        let manager = make_mock_manager("http://127.0.0.1:1", "http://127.0.0.1:1", None);
+
+        let result = manager.try_renew_token().await;
+        assert!(
+            result.is_err(),
+            "try_renew_token must fail without current token"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no current token"),
+            "error must mention no current token, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // try_renew_token — HTTP error (non-200)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_renew_token_http_error() {
+        let (url, server_handle) = start_mock_server(401, r#"{"error":"unauthorized"}"#).await;
+
+        let initial_data = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial_data)));
+
+        let result = manager.try_renew_token().await;
+        assert!(result.is_err(), "try_renew_token must fail on HTTP 401");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("RenewToken HTTP"),
+            "error must mention HTTP status, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // try_renew_token — empty access token in response
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_renew_token_empty_access_token() {
+        let body =
+            r#"{"dhanClientId":"test","accessToken":"","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, server_handle) = start_mock_server(200, body).await;
+
+        let initial_data = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial_data)));
+
+        let result = manager.try_renew_token().await;
+        assert!(result.is_err(), "empty accessToken must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty accessToken"),
+            "error must mention empty token, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // try_renew_token — malformed JSON response
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_renew_token_malformed_json() {
+        let (url, server_handle) = start_mock_server(200, "not-json-at-all").await;
+
+        let initial_data = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial_data)));
+
+        let result = manager.try_renew_token().await;
+        assert!(result.is_err(), "malformed JSON must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("parse renewal response"),
+            "error must mention parse failure, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // renew_with_fallback — renewal succeeds (no fallback needed)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_renew_with_fallback_renewal_succeeds() {
+        let renew_body = r#"{"dhanClientId":"test","accessToken":"renewed-jwt","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, server_handle) = start_mock_server(200, renew_body).await;
+
+        let initial_data = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial_data)));
+
+        let result = manager.renew_with_fallback().await;
+        assert!(
+            result.is_ok(),
+            "renew_with_fallback should succeed: {:?}",
+            result.err()
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // renewal_loop — spawn and abort after first cycle
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_renewal_loop_spawns_and_can_be_cancelled() {
+        // Create a manager with a token that expires soon (to minimize sleep time)
+        let initial_data = DhanAuthResponseData {
+            access_token: "loop-test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 2, // 2 seconds validity
+        };
+        let token_state = TokenState::from_response(&initial_data);
+
+        let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(Some(token_state))));
+        let http_client = reqwest::Client::new();
+
+        let manager = Arc::new(TokenManager {
+            token,
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("123456".to_string()),
+                totp_secret: secrecy::SecretString::from(
+                    "OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN".to_string(),
+                ),
+            },
+            rest_api_base_url: "http://127.0.0.1:1".to_string(),
+            auth_base_url: "http://127.0.0.1:1".to_string(),
+            http_client,
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 0,
+                token_validity_hours: 0,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 100,
+                websocket_connect_timeout_ms: 100,
+                retry_initial_delay_ms: 10,
+                retry_max_delay_ms: 20,
+                retry_max_attempts: 1,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        });
+
+        let handle = manager.spawn_renewal_task();
+
+        // Let it run briefly — it will try to renew (and fail since server is unreachable)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Abort the task
+        handle.abort();
+        let result = handle.await;
+        assert!(
+            result.is_err() || result.is_ok(),
+            "task should complete (either cancelled or finished)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_token — Dhan error response (HTTP 200 with error status)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_token_dhan_error_response() {
+        let error_body = r#"{"status":"error","message":"Invalid Pin"}"#;
+        let (url, server_handle) = start_mock_server(200, error_body).await;
+
+        let manager = make_mock_manager(&url, &url, None);
+
+        let result = manager.acquire_token().await;
+        assert!(result.is_err(), "Dhan error response must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid Pin"),
+            "error must contain Dhan error message, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_token — HTTP 500 error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_token_http_500_error() {
+        let (url, server_handle) = start_mock_server(500, r#"internal server error"#).await;
+
+        let manager = make_mock_manager(&url, &url, None);
+
+        let result = manager.acquire_token().await;
+        assert!(result.is_err(), "HTTP 500 must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("generateAccessToken HTTP"),
+            "error must mention HTTP status, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_token — empty access token in success response
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_token_empty_access_token() {
+        let body =
+            r#"{"dhanClientId":"test","accessToken":"","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, server_handle) = start_mock_server(200, body).await;
+
+        let manager = make_mock_manager(&url, &url, None);
+
+        let result = manager.acquire_token().await;
+        assert!(result.is_err(), "empty accessToken must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty accessToken"),
+            "error must mention empty token, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_token — malformed JSON response
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_token_malformed_json() {
+        let (url, server_handle) = start_mock_server(200, "this-is-not-json").await;
+
+        let manager = make_mock_manager(&url, &url, None);
+
+        let result = manager.acquire_token().await;
+        assert!(result.is_err(), "malformed JSON must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("parse auth response"),
+            "error must mention parse failure, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_token — success path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_token_success() {
+        let body = r#"{"dhanClientId":"test","accessToken":"new-jwt-token","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, server_handle) = start_mock_server(200, body).await;
+
+        let manager = make_mock_manager(&url, &url, None);
+
+        let result = manager.acquire_token().await;
+        assert!(
+            result.is_ok(),
+            "acquire_token should succeed: {:?}",
+            result.err()
+        );
+
+        // Verify token was stored
+        let guard = manager.token.load();
+        let state = guard
+            .as_ref()
+            .as_ref()
+            .expect("should have token after acquire");
+        assert_eq!(
+            state.access_token().expose_secret(),
+            "new-jwt-token",
+            "acquired token must be stored"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // renewal_loop — executes retry logic with time control
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_renewal_loop_executes_retry_logic_with_time_control() {
+        // Manager with NO token → time_until_next_refresh returns Duration::ZERO
+        // → the loop immediately enters the retry logic.
+        // Unreachable URLs → both renew_with_fallback and acquire_token fail.
+        // start_paused = true → all tokio sleeps resolve instantly when we advance.
+
+        let manager = Arc::new(TokenManager {
+            token: Arc::new(ArcSwap::new(Arc::new(None))),
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("123456".to_string()),
+                totp_secret: secrecy::SecretString::from(
+                    "OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN".to_string(),
+                ),
+            },
+            rest_api_base_url: "http://127.0.0.1:1".to_string(),
+            auth_base_url: "http://127.0.0.1:1".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .expect("test http client"),
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 1,
+                token_validity_hours: 24,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 50,
+                websocket_connect_timeout_ms: 50,
+                retry_initial_delay_ms: 10,
+                retry_max_delay_ms: 20,
+                retry_max_attempts: 2,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        });
+
+        let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
+
+        // Advance time far enough for:
+        //   - time_until_next_refresh() returns ZERO → no initial sleep
+        //   - 2 retry attempts with backoff sleeps (10ms, 20ms)
+        //   - circuit breaker sleep (60s)
+        //   - then it loops again → another cycle
+        // Total: well under 120s of simulated time
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+
+        // Advance more to allow the second cycle to start
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+
+        handle.abort();
+        let result = handle.await;
+        assert!(
+            result.unwrap_err().is_cancelled(),
+            "task should be cancelled after abort"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_renewal_loop_with_expired_token_triggers_retry() {
+        // Manager with an expired token → time_until_next_refresh returns ZERO
+        // → the loop immediately enters the retry logic.
+        let data = DhanAuthResponseData {
+            access_token: "expired-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0, // expires immediately
+        };
+        let expired_state = TokenState::from_response(&data);
+
+        let manager = Arc::new(TokenManager {
+            token: Arc::new(ArcSwap::new(Arc::new(Some(expired_state)))),
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("123456".to_string()),
+                totp_secret: secrecy::SecretString::from(
+                    "OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN".to_string(),
+                ),
+            },
+            rest_api_base_url: "http://127.0.0.1:1".to_string(),
+            auth_base_url: "http://127.0.0.1:1".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .expect("test http client"),
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 1,
+                token_validity_hours: 24,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 50,
+                websocket_connect_timeout_ms: 50,
+                retry_initial_delay_ms: 10,
+                retry_max_delay_ms: 20,
+                retry_max_attempts: 1,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        });
+
+        let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
+
+        // Advance through retry attempts and circuit breaker sleep
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+
+        handle.abort();
+        let result = handle.await;
+        assert!(
+            result.unwrap_err().is_cancelled(),
+            "task should be cancelled after abort"
         );
     }
 

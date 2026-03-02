@@ -59,3 +59,61 @@ impl SharedAppState {
         &self.inner.rebuild_in_progress
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+
+    fn test_dhan_config() -> DhanConfig {
+        DhanConfig {
+            websocket_url: "wss://api-feed.dhan.co".to_string(),
+            rest_api_base_url: "https://api.dhan.co/v2".to_string(),
+            auth_base_url: "https://auth.dhan.co".to_string(),
+            instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+                .to_string(),
+            instrument_csv_fallback_url: "https://images.dhan.co/api-data/api-scrip-master.csv"
+                .to_string(),
+            max_instruments_per_connection: 5000,
+            max_websocket_connections: 5,
+        }
+    }
+
+    fn test_instrument_config() -> InstrumentConfig {
+        InstrumentConfig {
+            daily_download_time: "08:55:00".to_string(),
+            csv_cache_directory: "/tmp/dlt-cache".to_string(),
+            csv_cache_filename: "instruments.csv".to_string(),
+            csv_download_timeout_secs: 120,
+            build_window_start: "08:25:00".to_string(),
+            build_window_end: "08:55:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_shared_app_state_new_and_questdb_config() {
+        let config = QuestDbConfig {
+            host: "test-host".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state = SharedAppState::new(config, test_dhan_config(), test_instrument_config());
+        assert_eq!(state.questdb_config().host, "test-host");
+        assert_eq!(state.questdb_config().ilp_port, 9009);
+        assert_eq!(state.questdb_config().http_port, 9000);
+    }
+
+    #[test]
+    fn test_shared_app_state_clone_shares_data() {
+        let config = QuestDbConfig {
+            host: "clone-test".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state1 = SharedAppState::new(config, test_dhan_config(), test_instrument_config());
+        let state2 = state1.clone();
+        assert_eq!(state2.questdb_config().host, "clone-test");
+    }
+}

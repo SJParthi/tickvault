@@ -284,13 +284,13 @@ mod tests {
             security_id: 1,
         };
         let err = parse_full_packet(&buf, &hdr, 0).unwrap_err();
-        match err {
-            ParseError::InsufficientBytes {
-                expected: 162,
-                actual: 161,
-            } => {}
-            _ => panic!("wrong error: {err:?}"),
-        }
+        let ParseError::InsufficientBytes {
+            expected: 162,
+            actual: 161,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
     }
 
     #[test]
