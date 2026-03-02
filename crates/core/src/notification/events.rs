@@ -3,6 +3,12 @@
 //! Every system event that should produce a Telegram alert is represented
 //! here. Callers pass events to `NotificationService::notify` — message
 //! formatting lives in this module, not at callsites.
+//!
+//! Defense-in-depth: `to_message()` redacts URL query parameters from
+//! `AuthenticationFailed` and `TokenRenewalFailed` reasons to prevent
+//! credential leaks in Telegram even if callers pass unsanitized strings.
+
+use dhan_live_trader_common::sanitize::redact_url_params;
 
 /// Alert severity level — determines which notification channels fire.
 ///
@@ -100,11 +106,17 @@ impl NotificationEvent {
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
             Self::AuthenticationFailed { reason } => {
-                format!("<b>Auth FAILED</b> — offline mode\n{reason}")
+                format!(
+                    "<b>Auth FAILED</b> — offline mode\n{}",
+                    redact_url_params(reason)
+                )
             }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
-                format!("<b>Token renewal FAILED</b> (attempt {attempts})\n{reason}")
+                format!(
+                    "<b>Token renewal FAILED</b> (attempt {attempts})\n{}",
+                    redact_url_params(reason)
+                )
             }
             Self::WebSocketConnected { connection_index } => {
                 format!("<b>WebSocket #{connection_index} connected</b>")
@@ -201,6 +213,30 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("HTTP 401 Unauthorized"));
         assert!(msg.contains("FAILED"));
+    }
+
+    #[test]
+    fn test_auth_failed_redacts_credentials_in_url() {
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "generateAccessToken request failed: error sending request for url (https://auth.dhan.co/app/generateAccessToken?dhanClientId=1106656882&pin=785478&totp=772509)".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("1106656882"), "client ID leaked: {msg}");
+        assert!(!msg.contains("785478"), "PIN leaked: {msg}");
+        assert!(!msg.contains("772509"), "TOTP leaked: {msg}");
+        assert!(msg.contains("FAILED"));
+        assert!(msg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_token_renewal_failed_redacts_credentials() {
+        let event = NotificationEvent::TokenRenewalFailed {
+            attempts: 3,
+            reason: "request for url (https://auth.dhan.co/app/generateAccessToken?pin=123456&totp=654321)".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("123456"), "PIN leaked: {msg}");
+        assert!(!msg.contains("654321"), "TOTP leaked: {msg}");
     }
 
     #[test]

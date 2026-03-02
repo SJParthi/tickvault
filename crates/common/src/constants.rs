@@ -580,6 +580,18 @@ pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 /// Circuit breaker reset timeout in seconds (try again after this).
 pub const TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS: u64 = 60;
 
+/// Dhan `generateAccessToken` cooldown in seconds.
+///
+/// Dhan enforces an undocumented 2-minute cooldown between token generation
+/// requests. We use 125 seconds (2 min + 5 sec safety margin) to ensure
+/// we never hit the rate limit on retry.
+pub const DHAN_TOKEN_GENERATION_COOLDOWN_SECS: u64 = 125;
+
+/// Maximum backoff delay for boot-time auth retry in seconds.
+///
+/// Exponential backoff is capped at this value to prevent unbounded waits.
+pub const AUTH_RETRY_MAX_BACKOFF_SECS: u64 = 300;
+
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Binary Packet Byte Offsets
 // Source: SDK struct.unpack format strings, verified against Python SDK.

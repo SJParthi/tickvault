@@ -20,12 +20,18 @@ use secrecy::ExposeSecret;
 use tracing::{error, info, instrument, warn};
 
 use dhan_live_trader_common::config::{DhanConfig, NetworkConfig, TokenConfig};
-use dhan_live_trader_common::constants::{DHAN_GENERATE_TOKEN_PATH, DHAN_RENEW_TOKEN_PATH};
+use dhan_live_trader_common::constants::{
+    AUTH_RETRY_MAX_BACKOFF_SECS, DHAN_GENERATE_TOKEN_PATH, DHAN_RENEW_TOKEN_PATH,
+    DHAN_TOKEN_GENERATION_COOLDOWN_SECS,
+};
 use dhan_live_trader_common::error::ApplicationError;
+use dhan_live_trader_common::sanitize::redact_url_params;
 
 use super::secret_manager;
 use super::totp_generator::generate_totp_code;
 use super::types::{DhanCredentials, DhanGenerateTokenResponse, TokenState};
+use crate::notification::events::NotificationEvent;
+use crate::notification::service::NotificationService;
 
 // ---------------------------------------------------------------------------
 // Token Handle (shared with downstream consumers)
@@ -68,25 +74,29 @@ pub struct TokenManager {
 
     /// Network retry configuration.
     network_config: NetworkConfig,
+
+    /// Notification service for Telegram/SNS alerts on auth events.
+    notifier: Arc<NotificationService>,
 }
 
 impl TokenManager {
     /// Creates a new `TokenManager` and performs initial authentication.
     ///
-    /// 1. Fetches credentials from AWS SSM Parameter Store
-    /// 2. Generates TOTP code
-    /// 3. Calls `generateAccessToken` to acquire JWT
+    /// 1. Fetches credentials from AWS SSM Parameter Store (3 retries)
+    /// 2. Calls `generateAccessToken` with infinite retry for transient errors
+    /// 3. Fails fast on permanent errors (wrong PIN, invalid TOTP, blocked)
     /// 4. Stores token in ArcSwap for O(1) reads
     ///
     /// # Errors
     ///
-    /// Returns error if SSM retrieval, TOTP generation, or Dhan API call fails.
-    /// This is a fatal error — the system cannot start without authentication.
+    /// Returns error only for permanent credential failures or shutdown (Ctrl+C).
+    /// Transient errors (network, timeout, rate limit) are retried indefinitely.
     #[instrument(skip_all)]
     pub async fn initialize(
         dhan_config: &DhanConfig,
         token_config: &TokenConfig,
         network_config: &NetworkConfig,
+        notifier: &Arc<NotificationService>,
     ) -> Result<Arc<Self>, ApplicationError> {
         info!("initializing authentication — fetching credentials from SSM");
 
@@ -108,7 +118,25 @@ impl TokenManager {
             });
         }
 
-        let credentials = secret_manager::fetch_dhan_credentials().await?;
+        // SSM credential fetch with retry (3 attempts, exponential backoff).
+        let credentials = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match secret_manager::fetch_dhan_credentials().await {
+                    Ok(creds) => break creds,
+                    Err(err) if attempt >= 3 => return Err(err),
+                    Err(err) => {
+                        warn!(
+                            attempt,
+                            error = %err,
+                            "SSM credential fetch failed, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(u64::from(2u32.pow(attempt)))).await;
+                    }
+                }
+            }
+        };
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(network_config.request_timeout_ms))
@@ -127,17 +155,82 @@ impl TokenManager {
             http_client,
             token_config: token_config.clone(),
             network_config: network_config.clone(),
+            notifier: Arc::clone(notifier),
         });
 
-        // Perform initial authentication
-        manager.acquire_token().await?;
+        // Infinite retry for transient errors, fail fast for permanent errors.
+        let mut attempt = 0u32;
+        let mut delay = Duration::from_millis(network_config.retry_initial_delay_ms);
+        let max_delay = Duration::from_secs(AUTH_RETRY_MAX_BACKOFF_SECS);
 
-        info!(
-            expires_at = %manager.current_expiry_display(),
-            "initial authentication successful"
-        );
+        loop {
+            attempt += 1;
+            match manager.acquire_token().await {
+                Ok(()) => {
+                    info!(
+                        attempt,
+                        expires_at = %manager.current_expiry_display(),
+                        "initial authentication successful"
+                    );
+                    notifier.notify(NotificationEvent::AuthenticationSuccess);
+                    return Ok(manager);
+                }
+                Err(err) => {
+                    let reason = err.to_string();
 
-        Ok(manager)
+                    // Permanent errors — fail fast with clear notification.
+                    if is_permanent_auth_error(&reason) {
+                        error!(attempt, error = %reason, "permanent auth error — cannot retry");
+                        notifier.notify(NotificationEvent::AuthenticationFailed {
+                            reason: format!("PERMANENT: {reason} — check SSM credentials"),
+                        });
+                        return Err(err);
+                    }
+
+                    // Dhan rate limit — use the 125-second cooldown.
+                    let wait_duration = if is_dhan_rate_limited(&reason) {
+                        warn!(
+                            attempt,
+                            "Dhan rate limit hit — waiting {} seconds",
+                            DHAN_TOKEN_GENERATION_COOLDOWN_SECS
+                        );
+                        Duration::from_secs(DHAN_TOKEN_GENERATION_COOLDOWN_SECS)
+                    } else {
+                        warn!(
+                            attempt,
+                            error = %reason,
+                            delay_secs = delay.as_secs(),
+                            "auth attempt failed (transient) — retrying"
+                        );
+                        delay
+                    };
+
+                    // Notify on each transient failure.
+                    notifier.notify(NotificationEvent::AuthenticationFailed {
+                        reason: format!(
+                            "attempt {attempt}: {reason} — retrying in {}s",
+                            wait_duration.as_secs()
+                        ),
+                    });
+
+                    // Sleep with Ctrl+C awareness.
+                    tokio::select! {
+                        () = tokio::time::sleep(wait_duration) => {}
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("shutdown signal received during auth retry");
+                            return Err(ApplicationError::AuthenticationFailed {
+                                reason: "shutdown during auth retry".to_string(),
+                            });
+                        }
+                    }
+
+                    // Exponential backoff (capped), skip if we used rate-limit delay.
+                    if !is_dhan_rate_limited(&reason) {
+                        delay = (delay * 2).min(max_delay);
+                    }
+                }
+            }
+        }
     }
 
     /// Returns a `TokenHandle` for O(1) atomic token reads.
@@ -188,7 +281,10 @@ impl TokenManager {
             .send()
             .await
             .map_err(|err| ApplicationError::AuthenticationFailed {
-                reason: format!("generateAccessToken request failed: {err}"),
+                reason: format!(
+                    "generateAccessToken request failed: {}",
+                    redact_url_params(&err.to_string())
+                ),
             })?;
 
         let status = response.status();
@@ -196,7 +292,10 @@ impl TokenManager {
 
         if !status.is_success() {
             return Err(ApplicationError::AuthenticationFailed {
-                reason: format!("generateAccessToken HTTP {status}: {body_text}"),
+                reason: format!(
+                    "generateAccessToken HTTP {status}: {}",
+                    redact_url_params(&body_text)
+                ),
             });
         }
 
@@ -214,13 +313,14 @@ impl TokenManager {
             });
         }
 
-        let body: DhanGenerateTokenResponse =
-            serde_json::from_str(&body_text)
-                .map_err(|err| ApplicationError::AuthenticationFailed {
-                    reason: format!(
-                        "failed to parse auth response (HTTP {status}): {err}\nResponse body: {body_text}"
-                    ),
-                })?;
+        let body: DhanGenerateTokenResponse = serde_json::from_str(&body_text).map_err(|err| {
+            ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "failed to parse auth response (HTTP {status}): {err}\nResponse body: {}",
+                    redact_url_params(&body_text)
+                ),
+            }
+        })?;
 
         if body.access_token.is_empty() {
             return Err(ApplicationError::AuthenticationFailed {
@@ -260,7 +360,10 @@ impl TokenManager {
             .await
             .map_err(|err| ApplicationError::TokenRenewalFailed {
                 attempts: 0,
-                reason: format!("RenewToken request failed: {err}"),
+                reason: format!(
+                    "RenewToken request failed: {}",
+                    redact_url_params(&err.to_string())
+                ),
             })?;
 
         let status = response.status();
@@ -268,7 +371,10 @@ impl TokenManager {
             let body_text = response.text().await.unwrap_or_default();
             return Err(ApplicationError::TokenRenewalFailed {
                 attempts: 0,
-                reason: format!("RenewToken HTTP {status}: {body_text}"),
+                reason: format!(
+                    "RenewToken HTTP {status}: {}",
+                    redact_url_params(&body_text)
+                ),
             });
         }
 
@@ -279,7 +385,10 @@ impl TokenManager {
                 .await
                 .map_err(|err| ApplicationError::TokenRenewalFailed {
                     attempts: 0,
-                    reason: format!("failed to parse renewal response (HTTP {status}): {err}"),
+                    reason: format!(
+                        "failed to parse renewal response (HTTP {status}): {}",
+                        redact_url_params(&err.to_string())
+                    ),
                 })?;
 
         if body.access_token.is_empty() {
@@ -368,10 +477,12 @@ impl TokenManager {
             if !succeeded {
                 error!(
                     attempts,
-                    "ALL token renewal attempts exhausted — system should halt"
+                    "ALL token renewal attempts exhausted — token may expire"
                 );
-                // Future: trigger Telegram alert + SNS (Block 13)
-                // For now: log CRITICAL and sleep before retrying the entire cycle
+                self.notifier.notify(NotificationEvent::TokenRenewalFailed {
+                    attempts,
+                    reason: "all renewal attempts exhausted — token may expire".to_string(),
+                });
                 tokio::time::sleep(Duration::from_secs(
                     dhan_live_trader_common::constants::TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS,
                 ))
@@ -401,6 +512,29 @@ impl TokenManager {
             None => "no token".to_string(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Error Classification
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the auth error is permanent (retrying won't help).
+///
+/// Permanent errors indicate wrong credentials in SSM or a blocked account.
+/// The system should notify the user and exit, not retry indefinitely.
+fn is_permanent_auth_error(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    lower.contains("invalid pin")
+        || lower.contains("invalid client")
+        || lower.contains("totp") && (lower.contains("invalid") || lower.contains("failed"))
+        || lower.contains("blocked")
+        || lower.contains("suspended")
+        || lower.contains("disabled")
+}
+
+/// Returns `true` if the error is Dhan's token generation rate limit.
+fn is_dhan_rate_limited(reason: &str) -> bool {
+    reason.contains("every 2 minutes") || reason.contains("once every")
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +573,7 @@ mod tests {
                 retry_max_delay_ms: 1000,
                 retry_max_attempts: 3,
             },
+            notifier: crate::notification::service::NotificationService::disabled(),
         })
     }
 
@@ -755,7 +890,13 @@ mod tests {
             retry_max_attempts: 3,
         };
 
-        let result = TokenManager::initialize(&dhan_config, &token_config, &network_config).await;
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
         let Err(err) = result else {
             panic!("http:// rest_api_base_url must be rejected")
         };
@@ -789,7 +930,13 @@ mod tests {
             retry_max_attempts: 3,
         };
 
-        let result = TokenManager::initialize(&dhan_config, &token_config, &network_config).await;
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
         let Err(err) = result else {
             panic!("http:// auth_base_url must be rejected")
         };
@@ -979,6 +1126,7 @@ mod tests {
                 retry_max_delay_ms: 50,
                 retry_max_attempts: 2,
             },
+            notifier: crate::notification::service::NotificationService::disabled(),
         })
     }
 
@@ -1166,7 +1314,13 @@ mod tests {
             retry_max_attempts: 3,
         };
 
-        let result = TokenManager::initialize(&dhan_config, &token_config, &network_config).await;
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
         assert!(result.is_err(), "both HTTP URLs must be rejected");
         // The first check (rest_api_base_url) fires first.
         let err_msg = result.err().expect("expected an error").to_string();
@@ -1283,6 +1437,7 @@ mod tests {
                 retry_max_delay_ms: 100,
                 retry_max_attempts: 2,
             },
+            notifier: crate::notification::service::NotificationService::disabled(),
         })
     }
 
@@ -1488,6 +1643,7 @@ mod tests {
                 retry_max_delay_ms: 20,
                 retry_max_attempts: 1,
             },
+            notifier: crate::notification::service::NotificationService::disabled(),
         });
 
         let handle = manager.spawn_renewal_task();
@@ -1661,6 +1817,7 @@ mod tests {
                 retry_max_delay_ms: 20,
                 retry_max_attempts: 2,
             },
+            notifier: crate::notification::service::NotificationService::disabled(),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -1723,6 +1880,7 @@ mod tests {
                 retry_max_delay_ms: 20,
                 retry_max_attempts: 1,
             },
+            notifier: crate::notification::service::NotificationService::disabled(),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -1737,5 +1895,63 @@ mod tests {
             result.unwrap_err().is_cancelled(),
             "task should be cancelled after abort"
         );
+    }
+
+    // -- Error classification tests --
+
+    #[test]
+    fn test_invalid_pin_is_permanent() {
+        assert!(is_permanent_auth_error("Dhan auth error: Invalid Pin"));
+    }
+
+    #[test]
+    fn test_invalid_client_is_permanent() {
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: Invalid Client ID"
+        ));
+    }
+
+    #[test]
+    fn test_totp_invalid_is_permanent() {
+        assert!(is_permanent_auth_error("TOTP verification failed"));
+        assert!(is_permanent_auth_error("Dhan auth error: Invalid TOTP"));
+    }
+
+    #[test]
+    fn test_blocked_account_is_permanent() {
+        assert!(is_permanent_auth_error("account blocked"));
+        assert!(is_permanent_auth_error("account suspended"));
+        assert!(is_permanent_auth_error("account disabled"));
+    }
+
+    #[test]
+    fn test_network_error_is_not_permanent() {
+        assert!(!is_permanent_auth_error(
+            "generateAccessToken request failed: error sending request"
+        ));
+    }
+
+    #[test]
+    fn test_timeout_is_not_permanent() {
+        assert!(!is_permanent_auth_error("operation timed out"));
+    }
+
+    #[test]
+    fn test_rate_limit_is_not_permanent() {
+        assert!(!is_permanent_auth_error(
+            "Token can be generated once every 2 minutes"
+        ));
+    }
+
+    #[test]
+    fn test_rate_limit_detected() {
+        assert!(is_dhan_rate_limited(
+            "Dhan auth error: Token can be generated once every 2 minutes"
+        ));
+    }
+
+    #[test]
+    fn test_network_error_not_rate_limited() {
+        assert!(!is_dhan_rate_limited("error sending request"));
     }
 }
