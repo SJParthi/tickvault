@@ -30,6 +30,26 @@ pub enum Severity {
     Critical,
 }
 
+/// Alert severity level — determines which notification channels fire.
+///
+/// `Critical` and `High` → Telegram + SNS SMS.
+/// `Medium`, `Low`, `Info` → Telegram only.
+///
+/// Ordered for comparison: `Info < Low < Medium < High < Critical`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Lifecycle events — startup complete, shutdown complete.
+    Info,
+    /// Normal operations — auth success, token renewed, WS connected.
+    Low,
+    /// Notable state changes — WS reconnected, shutdown initiated.
+    Medium,
+    /// Degraded state — WS disconnected, custom alerts.
+    High,
+    /// System cannot trade — auth failure, token renewal exhausted.
+    Critical,
+}
+
 /// All events that produce a Telegram alert.
 ///
 /// Adding a new event: add a variant here, add its message arm in
