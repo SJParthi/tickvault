@@ -116,26 +116,19 @@ async fn main() -> Result<()> {
     let notifier = NotificationService::initialize(&config.notification).await;
 
     // -----------------------------------------------------------------------
-    // Step 4: Authenticate with Dhan API (best-effort for development)
+    // Step 4: Authenticate with Dhan API (infinite retry for transient errors)
     // -----------------------------------------------------------------------
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 
     let token_manager =
-        match TokenManager::initialize(&config.dhan, &config.token, &config.network).await {
-            Ok(manager) => {
-                info!("authentication successful — token acquired");
-                notifier.notify(NotificationEvent::AuthenticationSuccess);
-                Some(manager)
-            }
+        match TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier)
+            .await
+        {
+            Ok(manager) => manager,
             Err(err) => {
-                warn!(
-                    error = %err,
-                    "authentication failed — starting in offline mode (no live data)"
-                );
-                notifier.notify(NotificationEvent::AuthenticationFailed {
-                    reason: err.to_string(),
-                });
-                None
+                // Only reaches here on permanent auth error or Ctrl+C.
+                error!(error = %err, "authentication failed permanently — exiting");
+                return Ok(());
             }
         };
 
@@ -226,53 +219,53 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 7: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
-    let (frame_receiver, ws_handles) =
-        if let (Some(tm), Some(plan)) = (&token_manager, &subscription_plan) {
-            info!("building WebSocket connection pool");
+    let (frame_receiver, ws_handles) = if let Some(plan) = &subscription_plan {
+        let tm = &token_manager;
+        info!("building WebSocket connection pool");
 
-            let token_handle = tm.token_handle();
-            let client_id = {
-                let credentials = secret_manager::fetch_dhan_credentials()
-                    .await
-                    .context("failed to fetch Dhan client ID for WebSocket")?;
-                credentials.client_id.expose_secret().to_string()
-            };
-
-            // Convert registry instruments → WebSocket subscription entries
-            let instruments: Vec<InstrumentSubscription> = plan
-                .registry
-                .iter()
-                .map(|inst| InstrumentSubscription::new(inst.exchange_segment, inst.security_id))
-                .collect();
-
-            let feed_mode = plan.summary.feed_mode;
-            let instrument_count = instruments.len();
-
-            let mut pool = WebSocketConnectionPool::new(
-                token_handle,
-                client_id,
-                config.dhan.clone(),
-                config.websocket.clone(),
-                instruments,
-                feed_mode,
-            )
-            .context("failed to create WebSocket connection pool")?;
-
-            let receiver = pool.take_frame_receiver();
-            let handles = pool.spawn_all();
-
-            info!(
-                connections = handles.len(),
-                instruments = instrument_count,
-                feed_mode = %feed_mode,
-                "WebSocket pool started"
-            );
-
-            (Some(receiver), handles)
-        } else {
-            warn!("WebSocket pool skipped — running in offline mode");
-            (None, Vec::new())
+        let token_handle = tm.token_handle();
+        let client_id = {
+            let credentials = secret_manager::fetch_dhan_credentials()
+                .await
+                .context("failed to fetch Dhan client ID for WebSocket")?;
+            credentials.client_id.expose_secret().to_string()
         };
+
+        // Convert registry instruments → WebSocket subscription entries
+        let instruments: Vec<InstrumentSubscription> = plan
+            .registry
+            .iter()
+            .map(|inst| InstrumentSubscription::new(inst.exchange_segment, inst.security_id))
+            .collect();
+
+        let feed_mode = plan.summary.feed_mode;
+        let instrument_count = instruments.len();
+
+        let mut pool = WebSocketConnectionPool::new(
+            token_handle,
+            client_id,
+            config.dhan.clone(),
+            config.websocket.clone(),
+            instruments,
+            feed_mode,
+        )
+        .context("failed to create WebSocket connection pool")?;
+
+        let receiver = pool.take_frame_receiver();
+        let handles = pool.spawn_all();
+
+        info!(
+            connections = handles.len(),
+            instruments = instrument_count,
+            feed_mode = %feed_mode,
+            "WebSocket pool started"
+        );
+
+        (Some(receiver), handles)
+    } else {
+        warn!("WebSocket pool skipped — running in offline mode");
+        (None, Vec::new())
+    };
 
     // -----------------------------------------------------------------------
     // Step 8: Spawn tick processor (pure capture — parse → filter → persist)
@@ -320,24 +313,15 @@ async fn main() -> Result<()> {
     });
 
     // -----------------------------------------------------------------------
-    // Step 10: Spawn token renewal background task (only if authenticated)
+    // Step 10: Spawn token renewal background task
     // -----------------------------------------------------------------------
-    let renewal_handle = if let Some(ref tm) = token_manager {
-        let handle = tm.spawn_renewal_task();
-        info!("token renewal task started");
-        Some(handle)
-    } else {
-        None
-    };
+    let renewal_handle = token_manager.spawn_renewal_task();
+    info!("token renewal task started");
 
     // -----------------------------------------------------------------------
     // Step 11: Await shutdown signal
     // -----------------------------------------------------------------------
-    let mode = if token_manager.is_some() {
-        "LIVE"
-    } else {
-        "OFFLINE"
-    };
+    let mode = "LIVE";
     info!(
         mode,
         "system ready — press Ctrl+C to stop\n\
@@ -358,9 +342,7 @@ async fn main() -> Result<()> {
     notifier.notify(NotificationEvent::ShutdownInitiated);
 
     // Cancel background tasks
-    if let Some(handle) = renewal_handle {
-        handle.abort();
-    }
+    renewal_handle.abort();
     if let Some(handle) = processor_handle {
         handle.abort();
     }
