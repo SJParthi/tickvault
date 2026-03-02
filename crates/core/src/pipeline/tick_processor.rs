@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -39,6 +39,7 @@ pub async fn run_tick_processor(
     let m_parse_errors = counter!("dlt_parse_errors_total");
     let m_storage_errors = counter!("dlt_storage_errors_total");
     let m_junk_filtered = counter!("dlt_junk_ticks_filtered_total");
+    let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
     let m_pipeline_active = gauge!("dlt_pipeline_active");
 
     let mut frames_processed: u64 = 0;
@@ -52,6 +53,7 @@ pub async fn run_tick_processor(
     info!("tick processor started");
 
     while let Some(raw_frame) = frame_receiver.recv().await {
+        let tick_start = Instant::now();
         frames_processed += 1;
         m_frames.increment(1);
         let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -146,6 +148,8 @@ pub async fn run_tick_processor(
                 warn!(?code, "disconnect frame received from Dhan");
             }
         }
+
+        m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {

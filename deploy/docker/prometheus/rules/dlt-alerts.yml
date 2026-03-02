@@ -105,6 +105,7 @@ groups:
           summary: "No ticks received for 5 minutes"
           description: "Tick processing rate has been zero for 5 minutes during market hours."
 
+      # Phase 2 (OMS) — metrics not yet emitted, alert will be inert until then
       - alert: HighOrderRejectionRate
         expr: rate(dlt_orders_rejected_total[5m]) / (rate(dlt_orders_placed_total[5m]) + 1e-10) > 0.10
         for: 5m

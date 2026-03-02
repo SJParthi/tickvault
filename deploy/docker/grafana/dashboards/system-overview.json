@@ -202,7 +202,7 @@
       "type": "timeseries",
       "targets": [
         { "expr": "dlt_websocket_connections_active", "legendFormat": "active", "refId": "A" },
-        { "expr": "rate(dlt_websocket_reconnects_total[5m])", "legendFormat": "reconnects/5m", "refId": "B" }
+        { "expr": "rate(dlt_websocket_reconnections_total[5m])", "legendFormat": "reconnections/5m", "refId": "B" }
       ]
     },
     {
