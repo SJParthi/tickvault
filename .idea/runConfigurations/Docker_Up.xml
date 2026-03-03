@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="Docker Up" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="docker compose -f deploy/docker/docker-compose.yml up -d" />
+    <option name="SCRIPT_TEXT" value="./scripts/setup-observability.sh --no-open" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="SCRIPT_PATH" value="" />
     <option name="SCRIPT_OPTIONS" value="" />
