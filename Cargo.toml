@@ -58,7 +58,7 @@ jsonwebtoken = "10.3.0"
 totp-rs = { version = "5.7.0", features = ["gen_secret", "otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
-statig = "0.3.0"
+statig = "0.4.1"
 blackscholes = "0.24.0"
 governor = "0.10.2"
 failsafe = "1.3.0"
