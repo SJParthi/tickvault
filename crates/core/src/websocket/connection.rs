@@ -145,7 +145,7 @@ impl WebSocketConnection {
             connection_id: self.connection_id,
             state: *self.state.lock().expect("state lock poisoned"), // APPROVED: lock poison is unrecoverable
             subscribed_count: self.instruments.len(),
-            total_reconnections: self.total_reconnections.load(Ordering::Relaxed),
+            total_reconnections: self.total_reconnections.load(Ordering::Acquire),
         }
     }
 
@@ -220,7 +220,7 @@ impl WebSocketConnection {
 
             // Reconnect with exponential backoff.
             self.set_state(ConnectionState::Reconnecting);
-            self.total_reconnections.fetch_add(1, Ordering::Relaxed);
+            self.total_reconnections.fetch_add(1, Ordering::Release);
             m_reconnections.increment(1);
 
             if !self.wait_with_backoff().await {
@@ -440,7 +440,7 @@ impl WebSocketConnection {
 
     /// Waits with exponential backoff. Returns false if max attempts exhausted.
     async fn wait_with_backoff(&self) -> bool {
-        let attempt = self.total_reconnections.load(Ordering::Relaxed);
+        let attempt = self.total_reconnections.load(Ordering::Acquire);
         if attempt >= self.ws_config.reconnect_max_attempts as u64 {
             error!(
                 connection_id = self.connection_id,
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(conn.health().total_reconnections, 0);
 
         conn.total_reconnections
-            .store(7, std::sync::atomic::Ordering::Relaxed);
+            .store(7, std::sync::atomic::Ordering::Release);
         assert_eq!(conn.health().total_reconnections, 7);
     }
 
@@ -759,7 +759,7 @@ mod tests {
 
         // Simulate 3 reconnections already happened
         conn.total_reconnections
-            .store(3, std::sync::atomic::Ordering::Relaxed);
+            .store(3, std::sync::atomic::Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(!result, "Should return false when max attempts exhausted");
     }
@@ -785,7 +785,7 @@ mod tests {
 
         // Only 2 reconnections — well under limit of 10
         conn.total_reconnections
-            .store(2, std::sync::atomic::Ordering::Relaxed);
+            .store(2, std::sync::atomic::Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(result, "Should return true when under limit");
     }
@@ -1077,7 +1077,7 @@ mod tests {
 
         // Simulate reconnecting state with accumulated reconnections
         conn.set_state(ConnectionState::Reconnecting);
-        conn.total_reconnections.store(5, Ordering::Relaxed);
+        conn.total_reconnections.store(5, Ordering::Release);
 
         let health = conn.health();
         assert_eq!(health.connection_id, 3);
@@ -1108,7 +1108,7 @@ mod tests {
         );
 
         // attempt=0 → delay = initial * 2^0 = initial
-        conn.total_reconnections.store(0, Ordering::Relaxed);
+        conn.total_reconnections.store(0, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(result, "attempt 0 should succeed (under limit)");
     }
@@ -1135,7 +1135,7 @@ mod tests {
         );
 
         // attempt=63 → 2^63 would overflow, but saturating_mul + min caps at max_delay
-        conn.total_reconnections.store(63, Ordering::Relaxed);
+        conn.total_reconnections.store(63, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(result, "large attempt should succeed if under max_attempts");
     }
@@ -1162,12 +1162,12 @@ mod tests {
         );
 
         // attempt 4 (last allowed when max=5) should succeed
-        conn.total_reconnections.store(4, Ordering::Relaxed);
+        conn.total_reconnections.store(4, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(result, "attempt at max-1 should succeed");
 
         // attempt 5 (equals max) should fail
-        conn.total_reconnections.store(5, Ordering::Relaxed);
+        conn.total_reconnections.store(5, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(!result, "attempt at max should fail");
     }
@@ -1194,7 +1194,7 @@ mod tests {
         );
 
         // Even attempt 0 should fail when max_attempts is 0
-        conn.total_reconnections.store(0, Ordering::Relaxed);
+        conn.total_reconnections.store(0, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(!result, "zero max_attempts should always fail");
     }
@@ -1537,13 +1537,13 @@ mod tests {
         );
 
         for attempt in 0..5u64 {
-            conn.total_reconnections.store(attempt, Ordering::Relaxed);
+            conn.total_reconnections.store(attempt, Ordering::Release);
             let result = conn.wait_with_backoff().await;
             assert!(result, "attempt {attempt} should succeed");
         }
 
         // attempt 5 should fail (>= max_attempts)
-        conn.total_reconnections.store(5, Ordering::Relaxed);
+        conn.total_reconnections.store(5, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(!result, "attempt 5 should fail at max_attempts=5");
     }
@@ -1571,12 +1571,12 @@ mod tests {
         );
 
         // attempt=64 → checked_shl(64) returns None → unwrap_or(u64::MAX)
-        conn.total_reconnections.store(64, Ordering::Relaxed);
+        conn.total_reconnections.store(64, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(result, "attempt 64 with max_attempts=200 should succeed");
 
         // attempt=128 → also overflows
-        conn.total_reconnections.store(128, Ordering::Relaxed);
+        conn.total_reconnections.store(128, Ordering::Release);
         let result = conn.wait_with_backoff().await;
         assert!(result, "attempt 128 with max_attempts=200 should succeed");
     }
