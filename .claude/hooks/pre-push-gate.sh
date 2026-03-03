@@ -171,6 +171,17 @@ HEAD_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
+# Clean up auto-save refs on successful push (non-blocking)
+BRANCH_NOW=$(git branch --show-current 2>/dev/null || echo "")
+BRANCH_SAFE_NOW=$(echo "$BRANCH_NOW" | tr '/' '-' | tr -cd 'a-zA-Z0-9_-')
+if [ -n "$BRANCH_SAFE_NOW" ]; then
+  for ref in $(git for-each-ref --format='%(refname)' "refs/auto-save/${BRANCH_SAFE_NOW}-" 2>/dev/null); do
+    git push origin --delete "$ref" 2>/dev/null || true
+    git update-ref -d "$ref" 2>/dev/null || true
+  done
+  echo "  Auto-save refs cleaned up for ${BRANCH_NOW}" >&2
+fi
+
 echo "╔══════════════════════════════════════════════╗" >&2
 echo "║  ALL 8 GATES PASSED — Push allowed            ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2

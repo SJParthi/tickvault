@@ -41,13 +41,46 @@ if [ -f "$HOOKS_DIR/.test-count-baseline" ]; then
   echo "Test baseline: $BASELINE tests" >&2
 fi
 
-# Check 5: Launch auto-save watchdog in background
+# Check 5: Launch auto-save watchdog in background (local stashes)
 WATCHDOG="$CWD/.claude/hooks/auto-save-watchdog.sh"
 if [ -x "$WATCHDOG" ]; then
   CLAUDE_PROJECT_DIR="$CWD" nohup "$WATCHDOG" >/dev/null 2>&1 &
   echo "Auto-save watchdog: started (PID $!)" >&2
 else
   echo "Auto-save watchdog: not found, skipping" >&2
+fi
+
+# Check 6: Verify current branch is pushed to remote
+if [ "$BRANCH" != "detached" ]; then
+  REMOTE_REF=$(git -C "$CWD" ls-remote --heads origin "$BRANCH" 2>/dev/null | head -1)
+  if [ -z "$REMOTE_REF" ]; then
+    echo "Pushing branch to remote..." >&2
+    git -C "$CWD" push -u origin "$BRANCH" 2>/dev/null && \
+      echo "Branch pushed: $BRANCH -> origin" >&2 || \
+      echo "WARNING: Could not push branch to remote" >&2
+  fi
+fi
+
+# Check 7: Detect orphan WIP snapshots from previous crashed sessions
+ORPHAN_REFS=$(git -C "$CWD" ls-remote origin 'refs/auto-save/*' 2>/dev/null | head -5)
+if [ -n "$ORPHAN_REFS" ]; then
+  echo "" >&2
+  echo "WARNING: RECOVERY AVAILABLE — Found auto-save snapshots from a previous session:" >&2
+  echo "$ORPHAN_REFS" | while read -r sha ref; do
+    echo "  $ref (${sha:0:7})" >&2
+  done
+  echo "Run: .claude/hooks/recover-wip.sh to list/restore" >&2
+  echo "" >&2
+fi
+
+# Check 8: Launch auto-save REMOTE watchdog in background (pushes to GitHub)
+REMOTE_WATCHDOG="$CWD/.claude/hooks/auto-save-remote.sh"
+if [ -x "$REMOTE_WATCHDOG" ]; then
+  CLAUDE_PROJECT_DIR="$CWD" CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)}" \
+    nohup "$REMOTE_WATCHDOG" >/dev/null 2>&1 &
+  echo "Auto-save remote watchdog: started (PID $!)" >&2
+else
+  echo "Auto-save remote watchdog: not found, skipping" >&2
 fi
 
 # Remind about principles and phase

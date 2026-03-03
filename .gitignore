@@ -78,6 +78,11 @@ quality/.binary-size-baseline
 .claude/hooks/.watchdog.pid
 .claude/hooks/.watchdog.log
 
+# ---- Auto-save remote watchdog (runtime state) ----
+.claude/hooks/.remote-watchdog.pid
+.claude/hooks/.remote-watchdog.log
+.claude/hooks/.auto-save-index
+
 # ---- Temporary files ----
 *.tmp
 *.bak
