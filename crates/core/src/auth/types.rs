@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_generate_response_with_unparseable_expiry_defaults_24h() {
+    fn test_from_generate_response_with_unparsable_expiry_defaults_24h() {
         let response = DhanGenerateTokenResponse {
             dhan_client_id: "test-client".to_string(),
             access_token: "test-jwt".to_string(),
