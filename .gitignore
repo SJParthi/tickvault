@@ -82,6 +82,8 @@ quality/.binary-size-baseline
 .claude/hooks/.remote-watchdog.pid
 .claude/hooks/.remote-watchdog.log
 .claude/hooks/.auto-save-index
+.claude/hooks/.conflict-warning
+.claude/hooks/.collision-detected
 
 # ---- Temporary files ----
 *.tmp

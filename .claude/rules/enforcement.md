@@ -43,6 +43,11 @@ Background daemon (`auto-save-remote.sh`) launched at SessionStart via `session-
 
 Worst-case data loss: ≤6 minutes (machine SIGKILL with no trap).
 
+### Session Collision Detection
+- **At startup:** `session-sanity.sh` fetches remote `refs/auto-save/*`, compares branch names, warns if another session is active on same branch with file overlap
+- **Continuous:** `auto-save-remote.sh` scans for other sessions' refs on each push cycle. If file overlap detected, writes `.claude/hooks/.conflict-warning` marker
+- **Resolution:** `recover-wip.sh --apply` to merge other session's work, or `recover-wip.sh --clean` to discard
+
 ## Rules
 - Never suppress cargo output on failure — show errors so they can be fixed
 - Never skip hooks via --no-verify (banned in settings.json deny list)

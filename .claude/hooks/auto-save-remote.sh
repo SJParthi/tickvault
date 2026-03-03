@@ -102,6 +102,73 @@ prune_timestamped() {
   fi
 }
 
+# ── Session collision scan ──────────────────────────────────────
+# Checks if another session's auto-save refs exist for the same branch.
+# If overlap detected, writes a warning file that Claude Code can read.
+CONFLICT_FILE="$CWD/.claude/hooks/.conflict-warning"
+
+scan_for_collisions() {
+  rm -f "$CONFLICT_FILE"
+
+  # Fetch remote auto-save refs for our branch (different session IDs)
+  local remote_refs
+  remote_refs=$(git -C "$CWD" ls-remote origin "refs/auto-save/${BRANCH_SAFE}-*" 2>/dev/null || echo "")
+  [ -z "$remote_refs" ] && return
+
+  local collision_sessions=""
+  local collision_files=""
+
+  while read -r sha ref; do
+    [ -z "$ref" ] && continue
+    # Extract session part: refs/auto-save/<branch-safe>-<session-id>/...
+    local ref_session
+    ref_session=$(echo "$ref" | sed "s|refs/auto-save/${BRANCH_SAFE}-||" | sed 's|/.*||')
+
+    # Skip our own session
+    [ "$ref_session" = "$SESSION_ID" ] && continue
+
+    # Only check /latest refs (not every timestamp)
+    echo "$ref" | grep -q '/latest$' || continue
+
+    # Found another session — fetch and compare files
+    git -C "$CWD" fetch origin "$ref:$ref" 2>/dev/null || continue
+    local other_files
+    other_files=$(git -C "$CWD" diff --name-only HEAD "$ref" 2>/dev/null)
+
+    if [ -n "$other_files" ]; then
+      # Check overlap with OUR modified files
+      local our_files
+      our_files=$(git -C "$CWD" status --porcelain 2>/dev/null | awk '{print $NF}')
+
+      local overlap=""
+      while IFS= read -r f; do
+        if echo "$our_files" | grep -qF "$f"; then
+          overlap="${overlap}  ${f}\n"
+        fi
+      done <<< "$other_files"
+
+      if [ -n "$overlap" ]; then
+        collision_sessions="${collision_sessions}session=${ref_session} "
+        collision_files="${collision_files}${overlap}"
+      fi
+    fi
+  done <<< "$remote_refs"
+
+  if [ -n "$collision_sessions" ]; then
+    log "COLLISION: Another session on branch ${BRANCH}: ${collision_sessions}"
+    log "COLLISION: Overlapping files: $(echo -e "$collision_files" | tr '\n' ', ')"
+    # Write warning file for session-sanity.sh / human to detect
+    {
+      echo "COLLISION DETECTED at $(date '+%Y-%m-%d %H:%M:%S')"
+      echo "Branch: ${BRANCH}"
+      echo "This session: ${SESSION_ID}"
+      echo "Other sessions: ${collision_sessions}"
+      echo "Overlapping files:"
+      echo -e "$collision_files"
+    } > "$CONFLICT_FILE"
+  fi
+}
+
 # ── Cleanup on exit ─────────────────────────────────────────────
 cleanup() {
   rm -f "$PID_FILE" "$TEMP_INDEX"
@@ -188,9 +255,10 @@ while true; do
   snapshot_count=$((snapshot_count + 1))
   log "SNAPSHOT #${snapshot_count}: ${COMMIT_SHA:0:7} (${CHANGED_FILES} files) -> ${REF_BASE}/latest + ${REF_BASE}/${TIMESTAMP}"
 
-  # Step 8: Push to remote every Nth snapshot
+  # Step 8: Push to remote every Nth snapshot + scan for collisions
   if [ $((snapshot_count % PUSH_EVERY_NTH)) -eq 0 ]; then
     push_to_remote
     prune_timestamped
+    scan_for_collisions
   fi
 done

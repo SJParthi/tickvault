@@ -61,16 +61,61 @@ if [ "$BRANCH" != "detached" ]; then
   fi
 fi
 
-# Check 7: Detect orphan WIP snapshots from previous crashed sessions
-ORPHAN_REFS=$(git -C "$CWD" ls-remote origin 'refs/auto-save/*' 2>/dev/null | head -5)
-if [ -n "$ORPHAN_REFS" ]; then
+# Check 7: Detect orphan WIP snapshots + SESSION COLLISION DETECTION
+BRANCH_SAFE=$(echo "$BRANCH" | tr '/' '-' | tr -cd 'a-zA-Z0-9_-')
+MY_SESSION="${CLAUDE_SESSION_ID:-notset}"
+REMOTE_REFS=$(git -C "$CWD" ls-remote origin 'refs/auto-save/*' 2>/dev/null)
+if [ -n "$REMOTE_REFS" ]; then
+  # Check for orphan recovery snapshots
   echo "" >&2
   echo "WARNING: RECOVERY AVAILABLE — Found auto-save snapshots from a previous session:" >&2
-  echo "$ORPHAN_REFS" | while read -r sha ref; do
+  echo "$REMOTE_REFS" | head -5 | while read -r sha ref; do
     echo "  $ref (${sha:0:7})" >&2
   done
   echo "Run: .claude/hooks/recover-wip.sh to list/restore" >&2
   echo "" >&2
+
+  # SESSION COLLISION DETECTION: check if another session is working on the same branch
+  COLLISION_FOUND=0
+  echo "$REMOTE_REFS" | while read -r sha ref; do
+    # Extract branch-safe name from ref: refs/auto-save/<branch-safe>-<session-id>/...
+    REF_BRANCH_PART=$(echo "$ref" | sed 's|refs/auto-save/||' | sed 's|/[^/]*$||')
+    # Check if this ref is for our branch but a DIFFERENT session
+    if echo "$REF_BRANCH_PART" | grep -q "^${BRANCH_SAFE}-" && ! echo "$REF_BRANCH_PART" | grep -q "${MY_SESSION}$"; then
+      OTHER_SESSION=$(echo "$REF_BRANCH_PART" | sed "s/^${BRANCH_SAFE}-//")
+      if [ "$COLLISION_FOUND" -eq 0 ]; then
+        echo "!!! SESSION COLLISION DETECTED !!!" >&2
+        echo "================================================" >&2
+        echo "Another session is/was working on branch: ${BRANCH}" >&2
+        COLLISION_FOUND=1
+      fi
+      # Fetch and show which files the other session modified
+      git -C "$CWD" fetch origin "$ref:$ref" 2>/dev/null || true
+      OTHER_FILES=$(git -C "$CWD" diff --name-only HEAD "$ref" 2>/dev/null | head -20)
+      if [ -n "$OTHER_FILES" ]; then
+        echo "  Session ${OTHER_SESSION} modified:" >&2
+        echo "$OTHER_FILES" | sed 's/^/    /' >&2
+      fi
+    fi
+  done
+  # Re-check collision flag (subshell issue — use file marker)
+  COLLISION_MARKER="$CWD/.claude/hooks/.collision-detected"
+  rm -f "$COLLISION_MARKER"
+  echo "$REMOTE_REFS" | while read -r sha ref; do
+    REF_BRANCH_PART=$(echo "$ref" | sed 's|refs/auto-save/||' | sed 's|/[^/]*$||')
+    if echo "$REF_BRANCH_PART" | grep -q "^${BRANCH_SAFE}-" && ! echo "$REF_BRANCH_PART" | grep -q "${MY_SESSION}$"; then
+      touch "$COLLISION_MARKER"
+    fi
+  done
+  if [ -f "$COLLISION_MARKER" ]; then
+    echo "" >&2
+    echo "ACTION REQUIRED: Review or clean up the other session's work before proceeding." >&2
+    echo "  recover-wip.sh --apply   # apply the other session's changes" >&2
+    echo "  recover-wip.sh --clean   # discard the other session's snapshots" >&2
+    echo "================================================" >&2
+    echo "" >&2
+    rm -f "$COLLISION_MARKER"
+  fi
 fi
 
 # Check 8: Launch auto-save REMOTE watchdog in background (pushes to GitHub)
