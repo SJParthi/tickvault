@@ -3,7 +3,7 @@
 -- =============================================================================
 -- Run these in QuestDB Web Console (localhost:9000) or via psql
 -- Connection: PostgreSQL wire protocol → localhost:8812 → database: qdb
--- Credentials: admin / quest (dev defaults)
+-- Credentials: from AWS SSM (auto-configured in ~/.pgpass by ensure-ready.sh)
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
