@@ -88,6 +88,8 @@ async fn query_count(client: &reqwest::Client, base_url: &str, sql: &str) -> Opt
 
     // SHOW TABLES returns rows of [table_name], count them
     if sql.starts_with("SHOW") {
+        // APPROVED: usize → u64 is lossless on 64-bit targets
+        #[allow(clippy::as_conversions)]
         return Some(dataset.len() as u64);
     }
 

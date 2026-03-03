@@ -250,6 +250,12 @@ pub struct ConnectionHealth {
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -122,7 +122,7 @@ impl TokenManager {
         let credentials = {
             let mut attempt = 0u32;
             loop {
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
                 match secret_manager::fetch_dhan_credentials().await {
                     Ok(creds) => break creds,
                     Err(err) if attempt >= 3 => return Err(err),
@@ -164,7 +164,7 @@ impl TokenManager {
         let max_delay = Duration::from_secs(AUTH_RETRY_MAX_BACKOFF_SECS);
 
         loop {
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             match manager.acquire_token().await {
                 Ok(()) => {
                     info!(
@@ -226,7 +226,7 @@ impl TokenManager {
 
                     // Exponential backoff (capped), skip if we used rate-limit delay.
                     if !is_dhan_rate_limited(&reason) {
-                        delay = (delay * 2).min(max_delay);
+                        delay = delay.saturating_mul(2).min(max_delay);
                     }
                 }
             }
@@ -444,7 +444,7 @@ impl TokenManager {
             let mut succeeded = false;
 
             while attempts < max_attempts {
-                attempts += 1;
+                attempts = attempts.saturating_add(1);
 
                 match self.renew_with_fallback().await {
                     Ok(()) => {
@@ -469,7 +469,7 @@ impl TokenManager {
                         }
 
                         tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(max_delay);
+                        delay = delay.saturating_mul(2).min(max_delay);
                     }
                 }
             }

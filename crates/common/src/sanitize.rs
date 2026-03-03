@@ -60,16 +60,14 @@ fn redact_urls(input: &str) -> String {
 
     while i < len {
         // Look for URL start: "http://" or "https://"
-        if i + 7 < len && &input[i..i + 7] == "http://" {
-            // Found http:// — find the `?` and redact
-            let url_start = i;
-            i = copy_url_and_redact_params(input, url_start, &mut result);
-        } else if i + 8 < len && &input[i..i + 8] == "https://" {
-            let url_start = i;
-            i = copy_url_and_redact_params(input, url_start, &mut result);
+        let remaining = input.get(i..).unwrap_or("");
+        if remaining.starts_with("http://") || remaining.starts_with("https://") {
+            i = copy_url_and_redact_params(input, i, &mut result);
+        } else if let Some(&b) = bytes.get(i) {
+            result.push(char::from(b));
+            i = i.saturating_add(1);
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            break;
         }
     }
 
@@ -85,18 +83,20 @@ fn copy_url_and_redact_params(input: &str, start: usize, result: &mut String) ->
 
     // Copy everything up to `?` or end-of-URL
     while i < len {
-        let ch = bytes[i] as char;
+        let Some(&b) = bytes.get(i) else { break };
+        let ch = char::from(b);
         if ch == '?' {
             // Found query string — redact everything after `?`
             result.push_str("?[REDACTED]");
-            i += 1;
+            i = i.saturating_add(1);
             // Skip until whitespace, `)`, or end-of-string
             while i < len {
-                let skip_ch = bytes[i] as char;
+                let Some(&skip_b) = bytes.get(i) else { break };
+                let skip_ch = char::from(skip_b);
                 if skip_ch.is_whitespace() || skip_ch == ')' {
                     break;
                 }
-                i += 1;
+                i = i.saturating_add(1);
             }
             return i;
         }
@@ -105,7 +105,7 @@ fn copy_url_and_redact_params(input: &str, start: usize, result: &mut String) ->
             return i;
         }
         result.push(ch);
-        i += 1;
+        i = i.saturating_add(1);
     }
 
     i
@@ -119,29 +119,32 @@ fn redact_param_value(input: &str, key: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut search_from = 0;
 
-    while let Some(pos) = input[search_from..].find(key) {
-        let abs_pos = search_from + pos;
+    while let Some(pos) = input.get(search_from..).and_then(|s| s.find(key)) {
+        let abs_pos = search_from.saturating_add(pos);
         // Copy everything before this match
-        result.push_str(&input[search_from..abs_pos]);
+        result.push_str(input.get(search_from..abs_pos).unwrap_or(""));
         result.push_str(key);
         result.push_str("[REDACTED]");
 
         // Skip past the value
-        let value_start = abs_pos + key.len();
+        let value_start = abs_pos.saturating_add(key.len());
         let mut value_end = value_start;
         let bytes = input.as_bytes();
         while value_end < bytes.len() {
-            let ch = bytes[value_end] as char;
+            let Some(&b) = bytes.get(value_end) else {
+                break;
+            };
+            let ch = char::from(b);
             if ch == '&' || ch.is_whitespace() || ch == ')' || ch == '\n' {
                 break;
             }
-            value_end += 1;
+            value_end = value_end.saturating_add(1);
         }
         search_from = value_end;
     }
 
     // Copy any remaining text after the last match
-    result.push_str(&input[search_from..]);
+    result.push_str(input.get(search_from..).unwrap_or(""));
     result
 }
 

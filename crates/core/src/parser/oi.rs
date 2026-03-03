@@ -2,6 +2,16 @@
 //!
 //! Format: `<BHBII>` — Header(8) + OI(u32).
 
+// SAFETY: Binary protocol parser — byte offsets, indexing, and type conversions are
+// inherent to parsing fixed-layout binary packets. Bounds are validated at the packet
+// entry point by header length checks before individual field parsers execute.
+// APPROVED: binary parser requires indexing, arithmetic, and type conversions by design
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
+
 use dhan_live_trader_common::constants::{OI_OFFSET_VALUE, OI_PACKET_SIZE};
 
 use super::types::{PacketHeader, ParseError};
@@ -28,6 +38,12 @@ pub fn parse_oi_packet(raw: &[u8], header: &PacketHeader) -> Result<u32, ParseEr
     Ok(oi)
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

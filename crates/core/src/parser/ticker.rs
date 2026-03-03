@@ -3,6 +3,16 @@
 //! Format: `<BHBIfI>` — Header(8) + LTP(f32) + LTT(u32).
 //! Used for both Index Ticker (response_code 1) and Ticker (response_code 2).
 
+// SAFETY: Binary protocol parser — byte offsets, indexing, and type conversions are
+// inherent to parsing fixed-layout binary packets. Bounds are validated at the packet
+// entry point by header length checks before individual field parsers execute.
+// APPROVED: binary parser requires indexing, arithmetic, and type conversions by design
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
+
 use dhan_live_trader_common::constants::{
     TICKER_OFFSET_LTP, TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
 };
@@ -51,6 +61,12 @@ pub fn parse_ticker_packet(
     })
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

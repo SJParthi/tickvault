@@ -10,7 +10,7 @@
 set -uo pipefail
 
 PROJECT_DIR="${1:-.}"
-cd "$PROJECT_DIR" || exit 0
+cd "$PROJECT_DIR" || { echo "FAIL: cannot cd to $PROJECT_DIR" >&2; exit 2; }
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASELINE_FILE="$HOOKS_DIR/.coverage-baseline"
@@ -24,8 +24,8 @@ fi
 # Get current workspace coverage percentage
 COV_JSON=$(cargo llvm-cov --workspace --json 2>/dev/null)
 if [ $? -ne 0 ] || [ -z "$COV_JSON" ]; then
-  echo "  SKIP: cargo llvm-cov failed — coverage guard skipped" >&2
-  exit 0
+  echo "  FAIL: cargo llvm-cov failed — blocking for safety" >&2
+  exit 2
 fi
 
 CURRENT_PCT=$(echo "$COV_JSON" | python3 -c "
@@ -40,9 +40,9 @@ else:
     print(f'{(covered / count) * 100.0:.1f}')
 " 2>/dev/null)
 
-if [ -z "$CURRENT_PCT" ]; then
-  echo "  SKIP: Could not parse coverage — guard skipped" >&2
-  exit 0
+if [ -z "$CURRENT_PCT" ] || ! echo "$CURRENT_PCT" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+  echo "  FAIL: Cannot parse coverage output — blocking for safety" >&2
+  exit 2
 fi
 
 if [ ! -f "$BASELINE_FILE" ]; then

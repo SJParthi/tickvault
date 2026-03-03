@@ -14,6 +14,7 @@
 #   8. Test count guard (ratcheting baseline — count can only go up)
 #   9. Commit message format (conventional commits)
 #  10. Typos check (staged files)
+#  11. Enforcement file integrity (deny list + hook script content)
 #
 # ALL gates must pass. One failure = commit blocked.
 # On success, writes state file for pre-PR gate optimization.
@@ -33,7 +34,7 @@ if [ -z "$CWD" ]; then
   CWD="."
 fi
 
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "FAIL: cannot cd to $CWD" >&2; exit 2; }
 
 # Check if any .rs files are staged
 RS_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\.rs$' || true)
@@ -48,7 +49,7 @@ HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║        PRE-COMMIT QUALITY GATE (10 Gates)    ║" >&2
+echo "║        PRE-COMMIT QUALITY GATE (11 Gates)    ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
 # ─────────────────────────────────────────────
@@ -71,7 +72,7 @@ if [ -n "$RS_STAGED" ]; then
 
   # Gate 2: cargo clippy (show errors on failure)
   echo "  [2/10] cargo clippy..." >&2
-  CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+  CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings -D clippy::arithmetic_side_effects -D clippy::indexing_slicing -D clippy::as_conversions 2>&1)
   CLIPPY_EXIT=$?
   if [ "$CLIPPY_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo clippy has warnings:" >&2
@@ -225,7 +226,46 @@ if command -v typos > /dev/null 2>&1; then
     echo "  SKIP: No checkable files staged" >&2
   fi
 else
-  echo "  SKIP: typos not installed (install: cargo install typos-cli)" >&2
+  echo "  FAIL: typos-cli not installed (install: cargo install typos-cli)" >&2
+  FAILED=1
+fi
+
+# ─────────────────────────────────────────────
+# GATE 11: Enforcement file integrity
+# Prevents weakening of settings.json deny list or hook scripts
+# ─────────────────────────────────────────────
+echo "  [11/11] Enforcement integrity check..." >&2
+ENFORCEMENT_FILES=$(git diff --cached --name-only | grep -E '^\.claude/(settings\.json|hooks/.*\.sh)$|^scripts/git-hooks/' || true)
+if [ -n "$ENFORCEMENT_FILES" ]; then
+  # Check that settings.json deny list hasn't shrunk
+  if echo "$ENFORCEMENT_FILES" | grep -q 'settings.json'; then
+    OLD_DENY=$(git show HEAD:.claude/settings.json 2>/dev/null | jq '.permissions.deny | length' 2>/dev/null || echo 0)
+    NEW_DENY=$(jq '.permissions.deny | length' .claude/settings.json 2>/dev/null || echo 0)
+    if [ "$NEW_DENY" -lt "$OLD_DENY" ]; then
+      echo "  FAIL: .claude/settings.json deny list shrunk ($OLD_DENY -> $NEW_DENY). Enforcement weakened." >&2
+      FAILED=1
+    else
+      echo "  PASS: settings.json deny list intact ($OLD_DENY -> $NEW_DENY)" >&2
+    fi
+  fi
+  # Check that no hook script had gates removed (line count shouldn't drop >20%)
+  while IFS= read -r ef; do
+    [ -z "$ef" ] && continue
+    if echo "$ef" | grep -qE '\.sh$'; then
+      OLD_LINES=$(git show "HEAD:$ef" 2>/dev/null | wc -l || echo 0)
+      NEW_LINES=$(wc -l < "$ef" 2>/dev/null || echo 0)
+      THRESHOLD=$(( OLD_LINES * 80 / 100 ))
+      if [ "$OLD_LINES" -gt 0 ] && [ "$NEW_LINES" -lt "$THRESHOLD" ]; then
+        echo "  FAIL: $ef lost >20% of content ($OLD_LINES -> $NEW_LINES lines). Possible gate removal." >&2
+        FAILED=1
+      fi
+    fi
+  done <<< "$ENFORCEMENT_FILES"
+  if [ "$FAILED" -eq 0 ]; then
+    echo "  PASS: Enforcement files intact" >&2
+  fi
+else
+  echo "  PASS: No enforcement files staged" >&2
 fi
 
 # ─────────────────────────────────────────────
@@ -245,6 +285,6 @@ TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | 
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  ALL 10 GATES PASSED — Commit allowed         ║" >&2
+echo "║  ALL 11 GATES PASSED — Commit allowed         ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

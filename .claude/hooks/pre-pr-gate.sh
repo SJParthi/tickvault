@@ -23,7 +23,7 @@ fi
 
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 if [ -z "$CWD" ]; then CWD="."; fi
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "FAIL: cannot cd to $CWD" >&2; exit 2; }
 
 HOOKS_DIR="$(dirname "$0")"
 STATE_FILE="$HOOKS_DIR/.last-quality-pass"

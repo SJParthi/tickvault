@@ -144,21 +144,25 @@ if [ -n "$HOT_FILES" ]; then
       continue
     fi
 
-    # Order submission without idempotency — WARNING only
+    # Order submission without idempotency — HARD BLOCK
     if grep -q 'submit_order\|place_order\|send_order' "$local_path" 2>/dev/null; then
-      if ! grep -q 'idempotency\|idempotent\|dedup' "$local_path" 2>/dev/null; then
-        echo "  WARNING: Order submission without idempotency reference in $file" >&2
+      if ! grep -q 'idempotency\|idempotent\|dedup\|// DEDUP EXEMPT:' "$local_path" 2>/dev/null; then
+        echo "  FAIL: Order submission without idempotency reference in $file" >&2
         echo "    Ensure idempotency key is checked in Valkey BEFORE submission." >&2
-        WARNINGS=$((WARNINGS + 1))
+        echo "    Use '// DEDUP EXEMPT: <reason>' to justify exceptions." >&2
+        VIOLATIONS=$((VIOLATIONS + 1))
+        REPORT="${REPORT}  - $file: order submission without idempotency\n"
       fi
     fi
 
-    # Tick processing without dedup — WARNING only
+    # Tick processing without dedup — HARD BLOCK
     if grep -q 'process_tick\|handle_tick\|on_tick' "$local_path" 2>/dev/null; then
-      if ! grep -q 'dedup\|duplicate\|seen_tick\|sequence_number\|exchange_timestamp' "$local_path" 2>/dev/null; then
-        echo "  WARNING: Tick processing without dedup reference in $file" >&2
+      if ! grep -q 'dedup\|duplicate\|seen_tick\|sequence_number\|exchange_timestamp\|// DEDUP EXEMPT:' "$local_path" 2>/dev/null; then
+        echo "  FAIL: Tick processing without dedup reference in $file" >&2
         echo "    Deduplicate by (security_id, exchange_timestamp, sequence_number)." >&2
-        WARNINGS=$((WARNINGS + 1))
+        echo "    Use '// DEDUP EXEMPT: <reason>' to justify exceptions." >&2
+        VIOLATIONS=$((VIOLATIONS + 1))
+        REPORT="${REPORT}  - $file: tick processing without dedup\n"
       fi
     fi
   done <<< "$HOT_FILES"
@@ -179,12 +183,14 @@ if [ -n "$HOT_FILES" ]; then
       continue
     fi
 
-    # Fill handler without reconciliation — WARNING only
+    # Fill handler without reconciliation — HARD BLOCK
     if grep -q 'on_fill\|handle_fill\|order_filled\|execution_report' "$local_path" 2>/dev/null; then
-      if ! grep -q 'reconcil\|position_check\|mismatch\|halt' "$local_path" 2>/dev/null; then
-        echo "  WARNING: Fill handler without position reconciliation in $file" >&2
+      if ! grep -q 'reconcil\|position_check\|mismatch\|halt\|// DEDUP EXEMPT:' "$local_path" 2>/dev/null; then
+        echo "  FAIL: Fill handler without position reconciliation in $file" >&2
         echo "    Reconcile after every fill — mismatch = halt trading." >&2
-        WARNINGS=$((WARNINGS + 1))
+        echo "    Use '// DEDUP EXEMPT: <reason>' to justify exceptions." >&2
+        VIOLATIONS=$((VIOLATIONS + 1))
+        REPORT="${REPORT}  - $file: fill handler without reconciliation\n"
       fi
     fi
   done <<< "$HOT_FILES"

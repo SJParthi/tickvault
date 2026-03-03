@@ -54,7 +54,7 @@ pub async fn run_tick_processor(
 
     while let Some(raw_frame) = frame_receiver.recv().await {
         let tick_start = Instant::now();
-        frames_processed += 1;
+        frames_processed = frames_processed.saturating_add(1);
         m_frames.increment(1);
         let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -62,7 +62,7 @@ pub async fn run_tick_processor(
         let parsed = match dispatch_frame(&raw_frame, received_at_nanos) {
             Ok(frame) => frame,
             Err(err) => {
-                parse_errors += 1;
+                parse_errors = parse_errors.saturating_add(1);
                 m_parse_errors.increment(1);
                 if parse_errors <= 100 {
                     warn!(
@@ -79,7 +79,7 @@ pub async fn run_tick_processor(
         // Process based on frame type
         match parsed {
             ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _) => {
-                ticks_processed += 1;
+                ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
                 // Filter junk ticks: initialization/heartbeat frames from Dhan
@@ -88,7 +88,7 @@ pub async fn run_tick_processor(
                 if tick.last_traded_price <= 0.0
                     || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
                 {
-                    junk_ticks_filtered += 1;
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
                         debug!(
@@ -106,7 +106,7 @@ pub async fn run_tick_processor(
                 if let Some(ref mut writer) = tick_writer
                     && let Err(err) = writer.append_tick(&tick)
                 {
-                    storage_errors += 1;
+                    storage_errors = storage_errors.saturating_add(1);
                     m_storage_errors.increment(1);
                     if storage_errors <= 100 {
                         warn!(
@@ -149,7 +149,12 @@ pub async fn run_tick_processor(
             }
         }
 
-        m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
+        // u128 → f64 lossy cast is acceptable for histogram recording;
+        // nanosecond precision loss in f64 mantissa is irrelevant for metrics.
+        // APPROVED: u128 → f64 lossy cast acceptable for histogram recording
+        #[allow(clippy::as_conversions)]
+        let elapsed_ns = tick_start.elapsed().as_nanos() as f64;
+        m_tick_duration.record(elapsed_ns);
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
@@ -184,6 +189,12 @@ pub async fn run_tick_processor(
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,12 @@ pub fn build_websocket_tls_connector() -> Result<Connector, WebSocketError> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

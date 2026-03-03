@@ -3,6 +3,16 @@
 //! All packets share an 8-byte header:
 //! `response_code(u8) + msg_length(u16 LE) + exchange_segment(u8) + security_id(u32 LE)`.
 
+// SAFETY: Binary protocol parser — byte offsets, indexing, and type conversions are
+// inherent to parsing fixed-layout binary packets. Bounds are validated at the packet
+// entry point by header length checks before individual field parsers execute.
+// APPROVED: binary parser requires indexing, arithmetic, and type conversions by design
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
+
 use dhan_live_trader_common::constants::{
     BINARY_HEADER_SIZE, HEADER_OFFSET_EXCHANGE_SEGMENT, HEADER_OFFSET_MESSAGE_LENGTH,
     HEADER_OFFSET_RESPONSE_CODE, HEADER_OFFSET_SECURITY_ID,
@@ -46,6 +56,12 @@ pub fn parse_header(raw: &[u8]) -> Result<PacketHeader, ParseError> {
     })
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

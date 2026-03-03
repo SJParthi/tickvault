@@ -53,8 +53,9 @@
       "Bash(head *)",
       "Bash(tail *)",
       "Bash(find *)",
-      "Bash(docker exec *)",
-      "Bash(chmod *)"
+      "Bash(docker exec dlt-valkey valkey-cli *)",
+      "Bash(docker exec dlt-questdb *)",
+      "Bash(chmod +x *)"
     ],
     "deny": [
       "Bash(cargo update *)",
@@ -67,7 +68,16 @@
       "Bash(git clean *)",
       "Bash(git commit --no-verify *)",
       "Bash(git push --no-verify *)",
-      "Bash(gh pr merge --admin *)"
+      "Bash(gh pr merge --admin *)",
+      "Bash(git push -f *)",
+      "Bash(git push --force-with-lease *)",
+      "Bash(git push origin +*)",
+      "Bash(gh api -X DELETE *)",
+      "Bash(gh api -X PUT *protection*)",
+      "Bash(gh api --method DELETE *)",
+      "Bash(chmod -x *)",
+      "Bash(chmod 000 *)",
+      "Bash(chmod a-x *)"
     ]
   },
   "hooks": {

@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Pre-Commit Hook
+# dhan-live-trader — Pre-Commit Hook (Real Git Hook)
 # =============================================================================
-# Runs before every commit. Blocks commit if any check fails.
-# Checks: formatting, linting, secret scanning.
+# Runs before every commit via git (terminal, IDE, CI).
+# This is the REAL git hook — catches ALL users, not just Claude Code.
 # Install: git config core.hooksPath scripts/git-hooks
+#
+# Checks (mirrors .claude/hooks/pre-commit-gate.sh):
+#   1. cargo fmt --check
+#   2. cargo clippy -D warnings
+#   3. cargo test
+#   4. Banned pattern scan (staged .rs files)
+#   5. Secret scan (staged files)
+#   6. Cargo.toml version pinning
+#   7. Test count guard (ratchet)
+#   8. Typos check
 # =============================================================================
 
 set -euo pipefail
@@ -12,72 +22,165 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo "=== Pre-commit checks ==="
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HOOKS_DIR="$REPO_ROOT/.claude/hooks"
+FAILED=0
 
-# --- Stage 1: Format Check ---
-echo -n "  Checking formatting... "
-if cargo fmt --all -- --check > /dev/null 2>&1; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FAILED${NC}"
-    echo ""
-    echo "  Code is not formatted. Run: cargo fmt"
-    echo ""
-    exit 1
+echo "╔══════════════════════════════════════════════╗"
+echo "║        PRE-COMMIT GATE (git hook)             ║"
+echo "╚══════════════════════════════════════════════╝"
+
+# Staged files
+RS_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\.rs$' || true)
+ALL_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
+
+if [ -z "$ALL_STAGED" ]; then
+  echo "  No files staged — skipping checks"
+  exit 0
 fi
 
-# --- Stage 2: Clippy Lint ---
-echo -n "  Running clippy... "
-if cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf > /dev/null 2>&1; then
+# ── Gate 1-3: Rust checks (only if .rs files staged) ──
+if [ -n "$RS_STAGED" ]; then
+  echo -n "  [1/8] cargo fmt --check... "
+  if cargo fmt --all -- --check > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"
-else
+  else
     echo -e "${RED}FAILED${NC}"
-    echo ""
-    echo "  Clippy found issues. Run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
-    echo ""
-    exit 1
+    echo "    Run: cargo fmt --all"
+    FAILED=1
+  fi
+
+  echo -n "  [2/8] cargo clippy... "
+  if cargo clippy --workspace --all-targets -- -D warnings > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+  else
+    echo -e "${RED}FAILED${NC}"
+    echo "    Run: cargo clippy --workspace --all-targets -- -D warnings"
+    FAILED=1
+  fi
+
+  echo -n "  [3/8] cargo test... "
+  if cargo test --workspace > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+  else
+    echo -e "${RED}FAILED${NC}"
+    echo "    Run: cargo test --workspace"
+    FAILED=1
+  fi
+
+  # Gate 4: Banned pattern scan (call scanner if available)
+  echo -n "  [4/8] Banned pattern scan... "
+  if [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+    if echo "$RS_STAGED" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$REPO_ROOT" "$RS_STAGED" > /dev/null 2>&1; then
+      echo -e "${GREEN}OK${NC}"
+    else
+      echo -e "${RED}FAILED${NC}"
+      FAILED=1
+    fi
+  else
+    echo -e "${YELLOW}SKIP${NC} (scanner not found)"
+  fi
+else
+  echo "  [1-4/8] No .rs files staged — skipping Rust checks"
 fi
 
-# --- Stage 3: Secret Scanning ---
-echo -n "  Scanning for secrets... "
-
-# Patterns that indicate leaked secrets
+# ── Gate 5: Secret scan ──
+echo -n "  [5/8] Secret scan... "
 SECRET_PATTERNS=(
-    'AKIA[0-9A-Z]{16}'                          # AWS Access Key
-    '-----BEGIN.*PRIVATE KEY-----'               # Private keys
-    'sk_live_[0-9a-zA-Z]{24,}'                   # Stripe-style live keys
-    'ghp_[0-9a-zA-Z]{36}'                        # GitHub personal access tokens
-    'xox[bporas]-[0-9a-zA-Z-]{10,}'              # Slack tokens
+  'AKIA[0-9A-Z]{16}'
+  '-----BEGIN.*PRIVATE KEY-----'
+  'sk_live_[0-9a-zA-Z]{24,}'
+  'ghp_[0-9a-zA-Z]{36}'
+  'xox[bporas]-[0-9a-zA-Z-]{10,}'
 )
-
-STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
 SECRET_FOUND=false
-
-if [ -n "${STAGED_FILES}" ]; then
-    for pattern in "${SECRET_PATTERNS[@]}"; do
-        if echo "${STAGED_FILES}" | xargs grep -lE -- "${pattern}" 2>/dev/null | grep -v '.git' > /dev/null 2>&1; then
-            if [ "${SECRET_FOUND}" = false ]; then
-                echo -e "${RED}FAILED${NC}"
-                echo ""
-                echo "  Potential secrets detected in staged files!"
-                SECRET_FOUND=true
-            fi
-            echo "  Pattern: ${pattern}"
-            echo "${STAGED_FILES}" | xargs grep -lE -- "${pattern}" 2>/dev/null | grep -v '.git' | while read -r file; do
-                echo "    -> ${file}"
-            done
-        fi
-    done
+if [ -n "$ALL_STAGED" ]; then
+  for pattern in "${SECRET_PATTERNS[@]}"; do
+    if echo "$ALL_STAGED" | xargs grep -lE -- "$pattern" 2>/dev/null | grep -v '.git' > /dev/null 2>&1; then
+      SECRET_FOUND=true
+      break
+    fi
+  done
+fi
+if [ "$SECRET_FOUND" = true ]; then
+  echo -e "${RED}FAILED${NC}"
+  echo "    Potential secrets in staged files! Use AWS SSM."
+  FAILED=1
+else
+  echo -e "${GREEN}OK${NC}"
 fi
 
-if [ "${SECRET_FOUND}" = true ]; then
-    echo ""
-    echo "  Remove secrets before committing. Use AWS SSM Parameter Store."
-    echo ""
-    exit 1
+# ── Gate 6: Cargo.toml version pinning ──
+TOML_STAGED=$(echo "$ALL_STAGED" | grep 'Cargo\.toml$' || true)
+if [ -n "$TOML_STAGED" ]; then
+  echo -n "  [6/8] Version pinning... "
+  PIN_FAIL=0
+  while IFS= read -r toml_file; do
+    [ -z "$toml_file" ] && continue
+    [ ! -f "$REPO_ROOT/$toml_file" ] && continue
+    if grep -qE 'version\s*=\s*"[\^~*>]' "$REPO_ROOT/$toml_file" 2>/dev/null; then
+      PIN_FAIL=1
+    fi
+  done <<< "$TOML_STAGED"
+  if [ "$PIN_FAIL" -ne 0 ]; then
+    echo -e "${RED}FAILED${NC}"
+    echo "    Unpinned versions found. Use exact versions only."
+    FAILED=1
+  else
+    echo -e "${GREEN}OK${NC}"
+  fi
+else
+  echo "  [6/8] No Cargo.toml staged — skipping"
 fi
-echo -e "${GREEN}OK${NC}"
 
-echo -e "=== All pre-commit checks ${GREEN}PASSED${NC} ==="
+# ── Gate 7: Test count guard ──
+if [ -n "$RS_STAGED" ] && [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
+  echo -n "  [7/8] Test count guard... "
+  if "$HOOKS_DIR/test-count-guard.sh" "$REPO_ROOT" > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+  else
+    echo -e "${RED}FAILED${NC}"
+    FAILED=1
+  fi
+else
+  echo "  [7/8] Skipping test count guard"
+fi
+
+# ── Gate 8: Typos check ──
+echo -n "  [8/8] Typos check... "
+if command -v typos > /dev/null 2>&1; then
+  TYPO_FILES=$(echo "$ALL_STAGED" | grep -E '\.(rs|toml|md|yml|yaml|sh)$' || true)
+  TYPO_FAIL=0
+  if [ -n "$TYPO_FILES" ]; then
+    while IFS= read -r tf; do
+      [ -z "$tf" ] && continue
+      [ ! -f "$REPO_ROOT/$tf" ] && continue
+      if ! typos "$REPO_ROOT/$tf" > /dev/null 2>&1; then
+        TYPO_FAIL=1
+      fi
+    done <<< "$TYPO_FILES"
+  fi
+  if [ "$TYPO_FAIL" -ne 0 ]; then
+    echo -e "${RED}FAILED${NC}"
+    FAILED=1
+  else
+    echo -e "${GREEN}OK${NC}"
+  fi
+else
+  echo -e "${YELLOW}SKIP${NC} (typos not installed)"
+fi
+
+# ── Verdict ──
+echo ""
+if [ "$FAILED" -ne 0 ]; then
+  echo "╔══════════════════════════════════════════════╗"
+  echo "║  COMMIT BLOCKED — Fix violations above       ║"
+  echo "╚══════════════════════════════════════════════╝"
+  exit 1
+fi
+
+echo -e "╔══════════════════════════════════════════════╗"
+echo -e "║  ALL GATES ${GREEN}PASSED${NC} — Commit allowed            ║"
+echo -e "╚══════════════════════════════════════════════╝"

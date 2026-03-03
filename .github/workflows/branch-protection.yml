@@ -44,9 +44,9 @@ jobs:
                   "Stage 5 — Performance",
                   "Stage 6 — Coverage",
                   "Stage 7 — Audit",
-                  "Secret Scan",
+                  "Commit Lint",
                   "Mutation Testing (critical crates)",
-                  "Commit Lint"
+                  "Secret Scan"
                 ]
               },
               "enforce_admins": true,
@@ -85,13 +85,16 @@ jobs:
                   "Stage 5 — Performance",
                   "Stage 6 — Coverage",
                   "Stage 7 — Audit",
-                  "Secret Scan",
+                  "Commit Lint",
                   "Mutation Testing (critical crates)",
-                  "Commit Lint"
+                  "Secret Scan"
                 ]
               },
               "enforce_admins": true,
-              "required_pull_request_reviews": null,
+              "required_pull_request_reviews": {
+                "required_approving_review_count": 1,
+                "dismiss_stale_reviews": true
+              },
               "restrictions": null,
               "allow_force_pushes": false,
               "allow_deletions": false,

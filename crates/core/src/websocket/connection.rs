@@ -281,8 +281,12 @@ impl WebSocketConnection {
         let tls_connector = build_websocket_tls_connector()?;
 
         // Connect with timeout.
+        // APPROVED: usize → u64 is lossless on 64-bit targets (our deployment target).
+        #[allow(clippy::as_conversions)]
         let connect_timeout = Duration::from_millis(
-            self.dhan_config.max_instruments_per_connection as u64 * 10 + 10000,
+            (self.dhan_config.max_instruments_per_connection as u64)
+                .saturating_mul(10)
+                .saturating_add(10000),
         );
         let connect_result = time::timeout(
             connect_timeout,
@@ -328,7 +332,7 @@ impl WebSocketConnection {
                 })?;
             // Yield between batches to avoid starving other tasks.
             // Skip yield after the last batch (nothing to wait for).
-            if batch_index < self.cached_subscription_messages.len() - 1 {
+            if batch_index < self.cached_subscription_messages.len().saturating_sub(1) {
                 tokio::task::yield_now().await;
             }
         }
@@ -441,7 +445,7 @@ impl WebSocketConnection {
     /// Waits with exponential backoff. Returns false if max attempts exhausted.
     async fn wait_with_backoff(&self) -> bool {
         let attempt = self.total_reconnections.load(Ordering::Relaxed);
-        if attempt >= self.ws_config.reconnect_max_attempts as u64 {
+        if attempt >= u64::from(self.ws_config.reconnect_max_attempts) {
             error!(
                 connection_id = self.connection_id,
                 attempts = attempt,
@@ -451,10 +455,15 @@ impl WebSocketConnection {
         }
 
         // Exponential backoff: initial * 2^attempt, capped at max.
+        // u64 → u32 narrowing is safe — attempt count never exceeds u32::MAX
+        // (reconnect_max_attempts is u32, and we return false when exceeded).
+        // APPROVED: u64 → u32 narrowing safe — attempt count capped at u32::MAX
+        #[allow(clippy::as_conversions)]
+        let shift_amount = attempt as u32;
         let delay_ms = self
             .ws_config
             .reconnect_initial_delay_ms
-            .saturating_mul(1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX))
+            .saturating_mul(1u64.checked_shl(shift_amount).unwrap_or(u64::MAX))
             .min(self.ws_config.reconnect_max_delay_ms);
 
         info!(
@@ -479,6 +488,12 @@ impl WebSocketConnection {
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

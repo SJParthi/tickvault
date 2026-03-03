@@ -28,8 +28,8 @@ scan_secret() {
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
 
-    # Skip binary files, lock files, scanners, and CI scanner workflows
-    if echo "$file" | grep -qE '\.(sh|md|lock)$'; then
+    # Skip binary files, lock files, markdown (no secrets in docs)
+    if echo "$file" | grep -qE '\.(md|lock)$'; then
       continue
     fi
 

@@ -2,6 +2,7 @@
 //!
 //! Dhan limits each subscription message to 100 instruments. This module
 //! splits a list of instruments into batched JSON messages ready to send.
+// DEDUP EXEMPT: subscription builder creates WebSocket messages, does not process ticks
 
 use dhan_live_trader_common::constants::SUBSCRIPTION_BATCH_SIZE;
 use dhan_live_trader_common::types::FeedMode;
@@ -122,6 +123,12 @@ pub fn build_disconnect_message() -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

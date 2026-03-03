@@ -20,7 +20,7 @@ fi
 
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 if [ -z "$CWD" ]; then CWD="."; fi
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "FAIL: cannot cd to $CWD" >&2; exit 2; }
 
 FAILED=0
 
@@ -101,9 +101,10 @@ if [ "$CHECKS_EXIT" -ne 0 ]; then
     FAILED=1
   else
     # gh pr checks might fail for other reasons (no PR, auth issues)
-    echo "  WARN: Could not verify CI status:" >&2
+    # Fail closed — do NOT proceed when CI status is unknown
+    echo "  FAIL: Cannot verify CI status — blocking merge for safety." >&2
     echo "  $CHECKS_OUTPUT" | head -5 >&2
-    echo "  Proceeding with caution — CI status unknown." >&2
+    FAILED=1
   fi
 else
   echo "  PASS: All CI checks passed" >&2

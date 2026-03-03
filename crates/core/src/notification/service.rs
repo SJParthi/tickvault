@@ -408,14 +408,17 @@ fn mask_phone(phone: &str) -> String {
     if phone.len() <= 8 {
         return "***".to_string();
     }
-    let keep_prefix = 3;
-    let keep_suffix = 5;
-    let mask_len = phone.len().saturating_sub(keep_prefix + keep_suffix);
+    let keep_prefix: usize = 3;
+    let keep_suffix: usize = 5;
+    let mask_len = phone
+        .len()
+        .saturating_sub(keep_prefix.saturating_add(keep_suffix));
+    let suffix_start = phone.len().saturating_sub(keep_suffix);
     format!(
         "{}{}{}",
-        &phone[..keep_prefix],
+        phone.get(..keep_prefix).unwrap_or(""),
         "X".repeat(mask_len),
-        &phone[phone.len() - keep_suffix..]
+        phone.get(suffix_start..).unwrap_or("")
     )
 }
 

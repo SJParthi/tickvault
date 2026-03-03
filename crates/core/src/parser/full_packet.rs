@@ -3,6 +3,16 @@
 //! Format: `<BHBIfHIfIIIIIIffff100s>` — Header(8) + common fields + OI(3×u32) + OHLC(4×f32) + Depth(100 bytes).
 //! CRITICAL: Diverges from Quote at offset 34. Full has OI fields where Quote has OHLC.
 
+// SAFETY: Binary protocol parser — byte offsets, indexing, and type conversions are
+// inherent to parsing fixed-layout binary packets. Bounds are validated at the packet
+// entry point by header length checks before individual field parsers execute.
+// APPROVED: binary parser requires indexing, arithmetic, and type conversions by design
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
+
 use dhan_live_trader_common::constants::{
     FULL_OFFSET_CLOSE, FULL_OFFSET_DEPTH_START, FULL_OFFSET_HIGH, FULL_OFFSET_LOW, FULL_OFFSET_OI,
     FULL_OFFSET_OI_DAY_HIGH, FULL_OFFSET_OI_DAY_LOW, FULL_OFFSET_OPEN, FULL_QUOTE_PACKET_SIZE,
@@ -128,12 +138,19 @@ pub fn parse_full_packet(
     Ok((tick, depth))
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     /// Builds a complete 162-byte Full packet.
+    // APPROVED: test code — relaxed lint rules for test fixtures
     #[allow(clippy::too_many_arguments)]
     fn make_full_packet(
         segment: u8,

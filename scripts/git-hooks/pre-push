@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Pre-Push Hook
+# dhan-live-trader — Pre-Push Hook (Real Git Hook)
 # =============================================================================
-# Runs before every push. Blocks push if any check fails.
-# Checks: compilation, tests, security audit.
-# Heavier than pre-commit — ensures nothing broken reaches GitHub.
+# Runs before every push via git (terminal, IDE, CI).
+# This is the REAL git hook — catches ALL users, not just Claude Code.
 # Install: git config core.hooksPath scripts/git-hooks
+#
+# Checks (mirrors .claude/hooks/pre-push-gate.sh):
+#   1. cargo fmt --check
+#   2. cargo clippy -D warnings
+#   3. cargo test (full workspace)
+#   4. Banned pattern scan (full workspace)
+#   5. Test count guard (ratchet)
+#   6. cargo audit (hard fail if installed)
+#   7. cargo deny check (hard fail if installed)
 # =============================================================================
 
 set -euo pipefail
@@ -13,44 +21,117 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo "=== Pre-push checks ==="
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HOOKS_DIR="$REPO_ROOT/.claude/hooks"
+FAILED=0
 
-# --- Stage 1: Compile ---
-echo -n "  Compiling workspace... "
-if cargo check --workspace > /dev/null 2>&1; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FAILED${NC}"
-    echo ""
-    echo "  Compilation failed. Fix errors before pushing."
-    echo ""
-    exit 1
+# Check if any .rs files exist
+RS_EXISTS=$(find "$REPO_ROOT/crates" -name '*.rs' 2>/dev/null | head -1)
+if [ -z "$RS_EXISTS" ]; then
+  exit 0
 fi
 
-# --- Stage 2: Tests ---
-echo -n "  Running tests... "
+echo "╔══════════════════════════════════════════════╗"
+echo "║        PRE-PUSH GATE (git hook)               ║"
+echo "╚══════════════════════════════════════════════╝"
+
+# Gate 1: cargo fmt
+echo -n "  [1/7] cargo fmt --check... "
+if cargo fmt --all -- --check > /dev/null 2>&1; then
+  echo -e "${GREEN}OK${NC}"
+else
+  echo -e "${RED}FAILED${NC}"
+  FAILED=1
+fi
+
+# Gate 2: cargo clippy
+echo -n "  [2/7] cargo clippy... "
+if cargo clippy --workspace --all-targets -- -D warnings > /dev/null 2>&1; then
+  echo -e "${GREEN}OK${NC}"
+else
+  echo -e "${RED}FAILED${NC}"
+  FAILED=1
+fi
+
+# Gate 3: cargo test
+echo -n "  [3/7] cargo test... "
 if cargo test --workspace > /dev/null 2>&1; then
+  echo -e "${GREEN}OK${NC}"
+else
+  echo -e "${RED}FAILED${NC}"
+  FAILED=1
+fi
+
+# Gate 4: Banned pattern scan (full workspace)
+echo -n "  [4/7] Banned pattern scan... "
+ALL_RS=$(find "$REPO_ROOT/crates" -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
+if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+  if echo "$ALL_RS" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$REPO_ROOT" "$ALL_RS" > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"
-else
+  else
     echo -e "${RED}FAILED${NC}"
-    echo ""
-    echo "  Tests failed. Fix failing tests before pushing."
-    echo ""
-    exit 1
-fi
-
-# --- Stage 3: Security Audit (if cargo-audit is installed) ---
-echo -n "  Security audit... "
-if command -v cargo-audit > /dev/null 2>&1; then
-    if cargo audit > /dev/null 2>&1; then
-        echo -e "${GREEN}OK${NC}"
-    else
-        echo -e "${YELLOW}WARNINGS${NC} (check cargo audit output)"
-    fi
+    FAILED=1
+  fi
 else
-    echo -e "${YELLOW}SKIPPED${NC} (cargo-audit not installed — run bootstrap.sh)"
+  echo -e "${YELLOW}SKIP${NC}"
 fi
 
-echo -e "=== All pre-push checks ${GREEN}PASSED${NC} ==="
+# Gate 5: Test count guard
+echo -n "  [5/7] Test count guard... "
+if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
+  if "$HOOKS_DIR/test-count-guard.sh" "$REPO_ROOT" > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+  else
+    echo -e "${RED}FAILED${NC}"
+    FAILED=1
+  fi
+else
+  echo -e "${YELLOW}SKIP${NC}"
+fi
+
+# Gate 6: cargo audit (REQUIRED if installed)
+echo -n "  [6/7] cargo audit... "
+if command -v cargo-audit > /dev/null 2>&1; then
+  if cargo audit --deny yanked > /dev/null 2>&1; then
+    echo -e "${GREEN}OK${NC}"
+  else
+    echo -e "${RED}FAILED${NC}"
+    FAILED=1
+  fi
+else
+  echo -e "${RED}FAIL${NC} (cargo-audit not installed — run: cargo install cargo-audit)"
+  FAILED=1
+fi
+
+# Gate 7: cargo deny (REQUIRED if installed)
+echo -n "  [7/7] cargo deny... "
+if command -v cargo-deny > /dev/null 2>&1; then
+  DENY_OUTPUT=$(cargo deny check 2>&1)
+  DENY_EXIT=$?
+  if [ "$DENY_EXIT" -eq 0 ]; then
+    echo -e "${GREEN}OK${NC}"
+  elif echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect'; then
+    echo -e "${YELLOW}SKIP${NC} (network issue — CI will enforce)"
+  else
+    echo -e "${RED}FAILED${NC}"
+    FAILED=1
+  fi
+else
+  echo -e "${RED}FAIL${NC} (cargo-deny not installed — run: cargo install cargo-deny)"
+  FAILED=1
+fi
+
+# Verdict
+echo ""
+if [ "$FAILED" -ne 0 ]; then
+  echo "╔══════════════════════════════════════════════╗"
+  echo "║  PUSH BLOCKED — Fix issues above             ║"
+  echo "╚══════════════════════════════════════════════╝"
+  exit 1
+fi
+
+echo -e "╔══════════════════════════════════════════════╗"
+echo -e "║  ALL GATES ${GREEN}PASSED${NC} — Push allowed              ║"
+echo -e "╚══════════════════════════════════════════════╝"

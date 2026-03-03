@@ -28,11 +28,9 @@ jobs:
     name: "Enable Auto-Merge"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only auto-merge for Renovate bot and Claude Code PRs
-    if: >-
-      github.actor == 'renovate[bot]' ||
-      github.actor == 'SJParthi' ||
-      startsWith(github.head_ref, 'claude/')
+    # Only auto-merge for Renovate bot (dependency updates)
+    # Claude Code PRs require manual merge/approval for safety
+    if: github.actor == 'renovate[bot]'
     steps:
       - name: Enable auto-merge (squash)
         run: gh pr merge --auto --squash "$PR_URL"

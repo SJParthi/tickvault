@@ -82,7 +82,7 @@ impl WebSocketConnectionPool {
 
         // Dynamic capacity: effective limit depends on config, not hardcoded 25K.
         // If max_per_conn=2000, num_connections=5 → effective capacity = 10,000.
-        let effective_capacity = max_per_conn * num_connections;
+        let effective_capacity = max_per_conn.saturating_mul(num_connections);
         if total > effective_capacity {
             return Err(WebSocketError::CapacityExceeded {
                 requested: total,
@@ -100,13 +100,20 @@ impl WebSocketConnectionPool {
             (0..num_connections).map(|_| Vec::new()).collect();
 
         for (idx, instrument) in instruments.into_iter().enumerate() {
-            connection_instruments[idx % num_connections].push(instrument);
+            // num_connections is always >= 1 (capped at MAX_WEBSOCKET_CONNECTIONS = 5).
+            // checked_rem guards against theoretical zero-division.
+            let bucket_idx = idx.checked_rem(num_connections).unwrap_or(0);
+            if let Some(bucket) = connection_instruments.get_mut(bucket_idx) {
+                bucket.push(instrument);
+            }
         }
 
         let connections: Vec<Arc<WebSocketConnection>> = connection_instruments
             .into_iter()
             .enumerate()
             .map(|(id, assigned_instruments)| {
+                // APPROVED: Connection ID fits in u8 — max connections capped at MAX_WEBSOCKET_CONNECTIONS (< 256)
+                #[allow(clippy::as_conversions)]
                 Arc::new(WebSocketConnection::new(
                     id as u8,
                     token_handle.clone(),
@@ -182,6 +189,12 @@ impl WebSocketConnectionPool {
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

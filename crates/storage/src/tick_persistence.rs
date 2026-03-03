@@ -106,7 +106,7 @@ impl TickPersistenceWriter {
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
         build_tick_row(&mut self.buffer, tick)?;
 
-        self.pending_count += 1;
+        self.pending_count = self.pending_count.saturating_add(1);
 
         if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
             self.force_flush()?;
@@ -167,8 +167,9 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     // Dhan V2 sends exchange_timestamp as IST-naive epoch: the IST clock time
     // (e.g., 09:25:32 IST) encoded as if it were UTC epoch seconds. To store as
     // proper UTC in QuestDB, subtract the IST offset (5h30m = 19800s).
-    let utc_epoch_secs = i64::from(tick.exchange_timestamp) - IST_UTC_OFFSET_SECONDS_I64;
-    let ts_nanos = TimestampNanos::new(utc_epoch_secs * 1_000_000_000);
+    let utc_epoch_secs =
+        i64::from(tick.exchange_timestamp).saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+    let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
     let received_nanos = TimestampNanos::new(tick.received_at_nanos);
 
     buffer
@@ -333,16 +334,25 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 
 /// Returns current wall-clock time in milliseconds since Unix epoch.
 fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
+    // APPROVED: u128 → u64 safe for ~584M years
+    #[allow(clippy::as_conversions)]
+    let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis() as u64;
+    ms
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

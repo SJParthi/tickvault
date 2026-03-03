@@ -38,10 +38,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ---- Commit Lint (parallel, no deps) ----
+  # ---- Commit Lint (parallel, no deps — always posts status) ----
   commit-lint:
     name: "Commit Lint"
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -50,6 +49,10 @@ jobs:
 
       - name: Validate conventional commit messages
         run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Push event — commit lint runs on PRs only. Passing."
+            exit 0
+          fi
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           PATTERN='^(Merge|Revert) |^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+'
@@ -115,19 +118,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy (warnings = errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
-
-      - name: Run clippy (trading safety lints — arithmetic overflow = HARD FAIL)
+      - name: Run clippy (warnings = errors, trading safety lints enforced)
         run: |
           cargo clippy --workspace --all-targets -- \
+            -D warnings \
             -D clippy::arithmetic_side_effects \
-            -W clippy::indexing_slicing \
-            -W clippy::as_conversions \
-            2>&1 | tee /tmp/clippy-trading.txt
-          if grep -q 'warning:' /tmp/clippy-trading.txt; then
-            echo "::warning::Trading safety lints (indexing/as_conversions) — promote to -D after cleanup"
-          fi
+            -D clippy::indexing_slicing \
+            -D clippy::as_conversions \
+            -W clippy::perf
 
       - name: Check docs compile (warnings = errors)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
@@ -148,12 +146,8 @@ jobs:
         with:
           tool: cargo-machete
 
-      - name: Unused dependency check (warn only — Phase 1 deps declared ahead of use)
-        run: |
-          cargo machete 2>&1 | tee /tmp/machete.txt || true
-          if grep -q 'unused dependencies' /tmp/machete.txt; then
-            echo "::warning::Unused dependencies found — cleanup when crate code is complete"
-          fi
+      - name: Unused dependency check (hard fail)
+        run: cargo machete --with-metadata
 
   # ---- Stage 3: Test ----
   test:
@@ -259,25 +253,27 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Run coverage (workspace — collect JSON + LCOV)
+      - name: Run coverage (workspace — hard fail below 99%)
         run: |
-          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
-          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
-
-      - name: Enforce 99% workspace coverage (HARD FAIL)
-        run: |
+          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json 2>&1
+          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info 2>&1
+          # Extract line coverage percentage
           COV_PCT=$(python3 -c "
           import json, sys
-          data = json.load(open('target/llvm-cov/coverage.json'))
-          totals = data['data'][0]['totals']['lines']
-          pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
-          print(f'{pct:.1f}')
+          try:
+              data = json.load(open('target/llvm-cov/coverage.json'))
+              totals = data['data'][0]['totals']['lines']
+              pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
+              print(f'{pct:.1f}')
+          except Exception as e:
+              print('ERROR: Cannot parse coverage JSON', file=sys.stderr)
+              sys.exit(1)
           ")
           echo "Workspace line coverage: ${COV_PCT}%"
-          if python3 -c "import sys; sys.exit(0 if float('$COV_PCT') >= 99.0 else 1)"; then
+          if python3 -c "exit(0 if float('$COV_PCT') >= 99.0 else 1)"; then
             echo "Coverage meets 99% target"
           else
-            echo "BLOCKED: Coverage ${COV_PCT}% is below 99% threshold"
+            echo "FAIL: Coverage ${COV_PCT}% is below 99% target"
             exit 1
           fi
 
@@ -348,9 +344,5 @@ jobs:
       - name: Audit (yanked crates — hard block)
         run: cargo audit --deny yanked
 
-      - name: Audit advisories (warn only — CVEs already checked by cargo deny in Stage 4)
-        run: |
-          cargo audit 2>&1 | tee /tmp/audit.txt || true
-          if grep -q 'warning\|vulnerability' /tmp/audit.txt; then
-            echo "::warning::Security advisories found — review and update dependencies"
-          fi
+      - name: Audit advisories (hard fail — zero known CVEs)
+        run: cargo audit --deny warnings

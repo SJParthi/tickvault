@@ -137,7 +137,8 @@ impl InstrumentRegistry {
         // Count categories from the deduplicated map (handles duplicate security_ids correctly).
         let mut category_counts: HashMap<SubscriptionCategory, usize> = HashMap::new();
         for instrument in map.values() {
-            *category_counts.entry(instrument.category).or_insert(0) += 1;
+            let count = category_counts.entry(instrument.category).or_insert(0);
+            *count = count.saturating_add(1);
         }
 
         let total_count = map.len();

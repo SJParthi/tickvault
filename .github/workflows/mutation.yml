@@ -5,7 +5,8 @@
 # Mutation testing verifies that tests actually catch bugs — if a mutant survives,
 # it means there's a code path where tests don't detect a behavior change.
 #
-# This is a required status check — PR cannot merge if mutation score drops.
+# Always runs (no paths: filter) so branch protection gets a status check.
+# Skips actual mutation work when no critical crate files changed.
 # =============================================================================
 
 name: Mutation Testing
@@ -13,10 +14,6 @@ name: Mutation Testing
 on:
   pull_request:
     branches: [main, develop]
-    paths:
-      - 'crates/core/**/*.rs'
-      - 'crates/trading/**/*.rs'
-      - 'crates/common/**/*.rs'
 
 permissions:
   contents: read
@@ -53,7 +50,7 @@ jobs:
       - name: Determine changed crates
         id: changed
         run: |
-          # Get list of changed .rs files in critical crates
+          # Get list of changed files
           CHANGED=$(gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || git diff --name-only origin/${{ github.base_ref }}...HEAD)
           PACKAGES=""
           if echo "$CHANGED" | grep -q '^crates/core/'; then
@@ -68,6 +65,7 @@ jobs:
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
           if [ -z "$PACKAGES" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No critical crate changes — skipping mutation testing."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi

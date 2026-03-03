@@ -2,6 +2,16 @@
 //!
 //! Format: `<BHBIH>` — Header(8) + DisconnectCode(u16).
 
+// SAFETY: Binary protocol parser — byte offsets, indexing, and type conversions are
+// inherent to parsing fixed-layout binary packets. Bounds are validated at the packet
+// entry point by header length checks before individual field parsers execute.
+// APPROVED: binary parser requires indexing, arithmetic, and type conversions by design
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
+
 use dhan_live_trader_common::constants::{DISCONNECT_OFFSET_CODE, DISCONNECT_PACKET_SIZE};
 
 use crate::websocket::types::DisconnectCode;
@@ -28,6 +38,12 @@ pub fn parse_disconnect_packet(
     Ok(DisconnectCode::from_u16(code))
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

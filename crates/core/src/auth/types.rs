@@ -165,6 +165,10 @@ pub struct TokenState {
     issued_at: DateTime<FixedOffset>,
 }
 
+// Chrono DateTime +/- Duration cannot overflow for any reasonable date (current time ± days).
+// The `as` casts below are clamped to safe ranges before conversion.
+// APPROVED: chrono DateTime arithmetic safe for reasonable dates, casts clamped
+#[allow(clippy::arithmetic_side_effects, clippy::as_conversions)]
 impl TokenState {
     /// Creates a new `TokenState` from a Dhan auth response (renewal/legacy).
     pub fn from_response(response: &DhanAuthResponseData) -> Self {
@@ -227,8 +231,8 @@ impl TokenState {
     /// hours after issuance.
     pub fn needs_refresh(&self, refresh_before_expiry_hours: u64) -> bool {
         let now_ist = Utc::now().with_timezone(&ist_offset());
-        #[allow(clippy::cast_possible_wrap)]
         // APPROVED: safe cast — clamped to 8760 before widening
+        #[allow(clippy::cast_possible_wrap)]
         let hours = refresh_before_expiry_hours.min(8760) as i64;
         let refresh_threshold = self.expires_at - Duration::hours(hours);
         now_ist >= refresh_threshold
@@ -239,8 +243,8 @@ impl TokenState {
     /// Returns zero if already past the refresh window.
     pub fn time_until_refresh(&self, refresh_before_expiry_hours: u64) -> std::time::Duration {
         let now_ist = Utc::now().with_timezone(&ist_offset());
-        #[allow(clippy::cast_possible_wrap)]
         // APPROVED: safe cast — clamped to 8760 before widening
+        #[allow(clippy::cast_possible_wrap)]
         let hours = refresh_before_expiry_hours.min(8760) as i64;
         let refresh_at = self.expires_at - Duration::hours(hours);
         if now_ist >= refresh_at {
@@ -360,6 +364,12 @@ impl fmt::Debug for DhanAuthResponseData {
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use secrecy::{ExposeSecret, SecretString};

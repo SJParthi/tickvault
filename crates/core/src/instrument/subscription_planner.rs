@@ -198,7 +198,7 @@ pub fn build_subscription_plan(
                 underlying = %underlying.underlying_symbol,
                 "No current expiry found — skipping stock derivatives"
             );
-            stocks_skipped_no_chain += 1;
+            stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
             continue;
         };
 
@@ -232,8 +232,11 @@ pub fn build_subscription_plan(
             if call_count > 0 {
                 let mid_idx = call_count / 2;
                 let start = mid_idx.saturating_sub(atm_below);
-                let end = (mid_idx + atm_above + 1).min(call_count);
-                for entry in &chain.calls[start..end] {
+                let end = mid_idx
+                    .saturating_add(atm_above)
+                    .saturating_add(1)
+                    .min(call_count);
+                for entry in chain.calls.get(start..end).unwrap_or_default() {
                     if let Some(contract) = universe.derivative_contracts.get(&entry.security_id)
                         && seen_ids.insert(entry.security_id)
                     {
@@ -251,8 +254,11 @@ pub fn build_subscription_plan(
             if put_count > 0 {
                 let mid_idx = put_count / 2;
                 let start = mid_idx.saturating_sub(atm_below);
-                let end = (mid_idx + atm_above + 1).min(put_count);
-                for entry in &chain.puts[start..end] {
+                let end = mid_idx
+                    .saturating_add(atm_above)
+                    .saturating_add(1)
+                    .min(put_count);
+                for entry in chain.puts.get(start..end).unwrap_or_default() {
                     if let Some(contract) = universe.derivative_contracts.get(&entry.security_id)
                         && seen_ids.insert(entry.security_id)
                     {
@@ -270,7 +276,7 @@ pub fn build_subscription_plan(
                 expiry = %expiry,
                 "No option chain found for current expiry — skipping"
             );
-            stocks_skipped_no_chain += 1;
+            stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
         }
     }
 
@@ -324,7 +330,7 @@ pub fn build_subscription_plan(
             }
         }
 
-        let stage2_added = instruments.len() - count_before_stage2;
+        let stage2_added = instruments.len().saturating_sub(count_before_stage2);
         stock_derivatives_skipped = stock_derivatives_available.saturating_sub(stage2_added);
 
         info!(
@@ -351,6 +357,8 @@ pub fn build_subscription_plan(
     }
 
     let total = registry.len();
+    // APPROVED: usize → f64 for percentage display (cold path)
+    #[allow(clippy::as_conversions)]
     let capacity_utilization_pct = if MAX_TOTAL_SUBSCRIPTIONS > 0 {
         (total as f64 / MAX_TOTAL_SUBSCRIPTIONS as f64) * 100.0
     } else {
@@ -392,6 +400,12 @@ pub fn build_subscription_plan(
 // Tests
 // ---------------------------------------------------------------------------
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

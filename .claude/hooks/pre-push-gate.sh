@@ -30,7 +30,7 @@ if [ -z "$CWD" ]; then
   CWD="."
 fi
 
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "FAIL: cannot cd to $CWD" >&2; exit 2; }
 
 # Check if any .rs files exist in the project
 RS_EXISTS=$(find crates -name '*.rs' 2>/dev/null | head -1)
@@ -59,7 +59,7 @@ fi
 
 # Gate 2: cargo clippy (show errors on failure)
 echo "  [2/8] cargo clippy..." >&2
-CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings -D clippy::arithmetic_side_effects -D clippy::indexing_slicing -D clippy::as_conversions 2>&1)
 CLIPPY_EXIT=$?
 if [ "$CLIPPY_EXIT" -ne 0 ]; then
   echo "  FAIL: clippy warnings found:" >&2
@@ -120,7 +120,8 @@ if command -v cargo-audit > /dev/null 2>&1; then
     echo "  PASS: cargo audit (no yanked crates)" >&2
   fi
 else
-  echo "  SKIP: cargo-audit not installed (install with: cargo install cargo-audit)" >&2
+  echo "  FAIL: cargo-audit not installed (install: cargo install cargo-audit)" >&2
+  FAILED=1
 fi
 
 # Gate 7: cargo deny (advisory — only if installed)
@@ -141,7 +142,8 @@ if command -v cargo-deny > /dev/null 2>&1; then
     echo "  PASS: cargo deny (licenses + advisories clean)" >&2
   fi
 else
-  echo "  SKIP: cargo-deny not installed (install with: cargo install cargo-deny)" >&2
+  echo "  FAIL: cargo-deny not installed (install: cargo install cargo-deny)" >&2
+  FAILED=1
 fi
 
 # Gate 8: Coverage ratchet guard (only if cargo-llvm-cov installed)
@@ -152,10 +154,12 @@ if [ -x "$HOOKS_DIR/coverage-guard.sh" ]; then
       FAILED=1
     fi
   else
-    echo "  SKIP: cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)" >&2
+    echo "  FAIL: cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)" >&2
+    FAILED=1
   fi
 else
-  echo "  SKIP: coverage-guard.sh not executable" >&2
+  echo "  FAIL: coverage-guard.sh not executable" >&2
+  FAILED=1
 fi
 
 echo "" >&2

@@ -3,6 +3,16 @@
 //! Format: `<BHBIfHIfIIIffff>` — Header(8) + LTP + LTQ + LTT + ATP + Vol + TSQ + TBQ + OHLC.
 //! CRITICAL: OHLC starts at offset 34 (diverges from Full packet at this point).
 
+// SAFETY: Binary protocol parser — byte offsets, indexing, and type conversions are
+// inherent to parsing fixed-layout binary packets. Bounds are validated at the packet
+// entry point by header length checks before individual field parsers execute.
+// APPROVED: binary parser requires indexing, arithmetic, and type conversions by design
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
+
 use dhan_live_trader_common::constants::{
     QUOTE_OFFSET_ATP, QUOTE_OFFSET_CLOSE, QUOTE_OFFSET_HIGH, QUOTE_OFFSET_LOW, QUOTE_OFFSET_LTP,
     QUOTE_OFFSET_LTQ, QUOTE_OFFSET_LTT, QUOTE_OFFSET_OPEN, QUOTE_OFFSET_TOTAL_BUY_QTY,
@@ -83,12 +93,19 @@ pub fn parse_quote_packet(
     })
 }
 
+// APPROVED: test code — relaxed lint rules for test fixtures
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     /// Builds a complete 50-byte Quote packet with all fields.
+    // APPROVED: test code — relaxed lint rules for test fixtures
     #[allow(clippy::too_many_arguments)]
     fn make_quote_packet(
         segment: u8,
