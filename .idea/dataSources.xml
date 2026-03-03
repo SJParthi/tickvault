@@ -9,11 +9,12 @@
       <jdbc-additional-properties>
         <property name="com.intellij.clouds.kubernetes.db.enabled" value="false" />
       </jdbc-additional-properties>
+      <auth-provider>pgpass</auth-provider>
       <user-name>admin</user-name>
       <remarks>QuestDB time-series database via PostgreSQL wire protocol.
 Port 8812 (PG wire). Docker service: dlt-questdb.
-Password: from AWS SSM. Run App once (auto-setup fetches it).
-IntelliJ prompts for password on first connect — stores it securely after.</remarks>
+Credentials: auto-configured from AWS SSM via ~/.pgpass (ensure-ready.sh handles this).
+Just click Run App once — everything is automatic.</remarks>
     </data-source>
   </component>
 </project>

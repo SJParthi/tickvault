@@ -21,6 +21,28 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
+# Reads credentials from the running dlt-questdb container (set via AWS SSM).
+# pgpass format: hostname:port:database:username:password
+ensure_pgpass() {
+    local qdb_user qdb_pass pgpass_entry
+    qdb_user=$(docker exec dlt-questdb printenv QDB_PG_USER 2>/dev/null) || return 0
+    qdb_pass=$(docker exec dlt-questdb printenv QDB_PG_PASSWORD 2>/dev/null) || return 0
+    [ -z "${qdb_pass}" ] && return 0
+
+    pgpass_entry="localhost:8812:qdb:${qdb_user}:${qdb_pass}"
+
+    if [ -f ~/.pgpass ]; then
+        # Preserve other entries, replace QuestDB line
+        grep -v "^localhost:8812:qdb:" ~/.pgpass > ~/.pgpass.tmp 2>/dev/null || true
+        echo "${pgpass_entry}" >> ~/.pgpass.tmp
+        mv ~/.pgpass.tmp ~/.pgpass
+    else
+        echo "${pgpass_entry}" > ~/.pgpass
+    fi
+    chmod 600 ~/.pgpass
+}
+
 # ---- Fast path: check if all 8 containers are running ----
 REQUIRED_CONTAINERS=(
     "dlt-questdb"
@@ -44,6 +66,7 @@ all_running() {
 
 # Quick check — if everything is already running, exit immediately
 if all_running; then
+    ensure_pgpass
     echo -e "${GREEN}All 8 infrastructure containers running. Ready.${NC}"
     exit 0
 fi
@@ -138,7 +161,9 @@ for i in $(seq 1 30); do
     sleep 1
 done
 if [ "${PG_READY}" -eq 1 ]; then
-    echo -e "  ${GREEN}QuestDB PG wire ready — IntelliJ database tool can connect${NC}"
+    echo -e "  ${GREEN}QuestDB PG wire ready${NC}"
+    ensure_pgpass
+    echo -e "  ${GREEN}QuestDB credentials auto-configured for IntelliJ${NC}"
 else
     echo -e "  ${YELLOW}QuestDB PG wire not ready yet — IntelliJ may need a manual refresh${NC}"
 fi
