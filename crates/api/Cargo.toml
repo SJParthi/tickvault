@@ -21,5 +21,8 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "dhan-live-trader-storage", "thiserror", "tower"]

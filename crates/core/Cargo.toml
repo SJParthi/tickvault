@@ -41,7 +41,16 @@ rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "tick_parser"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "papaya", "rtrb", "zerocopy"]

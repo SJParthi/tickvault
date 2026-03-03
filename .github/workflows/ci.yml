@@ -120,15 +120,15 @@ jobs:
       - name: Run clippy (warnings = errors)
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
 
-      - name: Run clippy (trading safety lints — warn only until code cleanup)
+      - name: Run clippy (trading safety lints — arithmetic overflow = HARD FAIL)
         run: |
           cargo clippy --workspace --all-targets -- \
-            -W clippy::arithmetic_side_effects \
+            -D clippy::arithmetic_side_effects \
             -W clippy::indexing_slicing \
             -W clippy::as_conversions \
             2>&1 | tee /tmp/clippy-trading.txt
           if grep -q 'warning:' /tmp/clippy-trading.txt; then
-            echo "::warning::Trading safety lints found — cleanup needed before promoting to errors"
+            echo "::warning::Trading safety lints (indexing/as_conversions) — promote to -D after cleanup"
           fi
 
       - name: Check docs compile (warnings = errors)
@@ -245,30 +245,65 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Run coverage (workspace — report + ratchet toward 99%)
+      - name: Run coverage (workspace — collect JSON + LCOV)
         run: |
-          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json 2>&1 || true
-          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info 2>&1 || true
-          # Extract line coverage percentage and report
+          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
+          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
+
+      - name: Enforce 99% workspace coverage (HARD FAIL)
+        run: |
           COV_PCT=$(python3 -c "
           import json, sys
-          try:
-              data = json.load(open('target/llvm-cov/coverage.json'))
-              totals = data['data'][0]['totals']['lines']
-              pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
-              print(f'{pct:.1f}')
-          except Exception as e:
-              print('0.0', file=sys.stderr)
-              print('0.0')
-          " 2>/dev/null)
+          data = json.load(open('target/llvm-cov/coverage.json'))
+          totals = data['data'][0]['totals']['lines']
+          pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
+          print(f'{pct:.1f}')
+          ")
           echo "Workspace line coverage: ${COV_PCT}%"
-          if python3 -c "exit(0 if float('$COV_PCT') >= 99.0 else 1)" 2>/dev/null; then
+          if python3 -c "import sys; sys.exit(0 if float('$COV_PCT') >= 99.0 else 1)"; then
             echo "Coverage meets 99% target"
           else
-            echo "::warning::Coverage ${COV_PCT}% is below 99% target — ratcheting up"
+            echo "BLOCKED: Coverage ${COV_PCT}% is below 99% threshold"
+            exit 1
           fi
 
+      - name: Enforce per-crate coverage thresholds (HARD FAIL)
+        run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
+
+      - name: Coverage summary (PR annotation)
+        if: always()
+        run: |
+          python3 -c "
+          import json, re
+          data = json.load(open('target/llvm-cov/coverage.json'))
+          totals = data['data'][0]['totals']['lines']
+          ws_pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
+          # Per-crate breakdown
+          crate_lines = {}
+          for entry in data.get('data', []):
+              for f in entry.get('files', []):
+                  m = re.match(r'crates/([^/]+)/', f.get('filename', ''))
+                  if m:
+                      c = m.group(1)
+                      s = f.get('summary', {}).get('lines', {})
+                      if c not in crate_lines:
+                          crate_lines[c] = {'count': 0, 'covered': 0}
+                      crate_lines[c]['count'] += s.get('count', 0)
+                      crate_lines[c]['covered'] += s.get('covered', 0)
+          print('## Coverage Report')
+          print(f'**Workspace: {ws_pct:.1f}%** (threshold: 99.0%)')
+          print('')
+          print('| Crate | Coverage | Threshold | Status |')
+          print('|-------|----------|-----------|--------|')
+          for name in sorted(crate_lines):
+              i = crate_lines[name]
+              pct = (i['covered'] / i['count'] * 100) if i['count'] > 0 else 100.0
+              status = ':white_check_mark:' if pct >= 99.0 else ':x:'
+              print(f'| {name} | {pct:.1f}% | 99.0% | {status} |')
+          " >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
       - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: coverage-report
