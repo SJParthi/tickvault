@@ -387,3 +387,37 @@ async fn main() -> Result<()> {
     info!("dhan-live-trader stopped");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn config_base_path_is_toml() {
+        assert!(
+            CONFIG_BASE_PATH.ends_with(".toml"),
+            "config path must be a TOML file"
+        );
+    }
+
+    #[test]
+    fn config_local_path_is_toml() {
+        assert!(
+            CONFIG_LOCAL_PATH.ends_with(".toml"),
+            "local config path must be a TOML file"
+        );
+    }
+
+    #[test]
+    fn socket_addr_parses_valid_host_port() {
+        let addr: Result<SocketAddr, _> = "0.0.0.0:8080".parse();
+        assert!(addr.is_ok(), "valid host:port must parse");
+    }
+
+    #[test]
+    fn socket_addr_rejects_invalid() {
+        let addr: Result<SocketAddr, _> = "not_a_socket".parse();
+        assert!(addr.is_err(), "invalid address must fail");
+    }
+}

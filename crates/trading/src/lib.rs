@@ -15,3 +15,27 @@
 //!
 //! # Boot Sequence Position
 //! State -> **OMS -> Risk -> Execute** -> Persist
+
+#[cfg(test)]
+mod tests {
+    //! Skeleton tests — establishes ratchet baseline for the trading crate.
+    //! These verify crate-level invariants. Module-specific tests will be
+    //! added alongside OMS, risk manager, and order executor implementations.
+
+    /// Verifies that compile-time lint attributes don't conflict.
+    /// If this test compiles, the deny/allow attributes in lib.rs are consistent.
+    #[test]
+    fn lint_attributes_compile() {
+        // Intentionally empty — compilation IS the test.
+        // The #![deny(...)] attributes at crate root are validated by rustc
+        // when this test binary is built.
+    }
+
+    /// Verifies the crate links into the workspace without unresolved deps.
+    /// If this test runs, it means cargo resolved all workspace deps for this crate.
+    #[test]
+    fn crate_links_in_workspace() {
+        let crate_name = env!("CARGO_PKG_NAME");
+        assert_eq!(crate_name, "dhan-live-trader-trading");
+    }
+}

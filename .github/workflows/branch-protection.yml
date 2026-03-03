@@ -41,8 +41,12 @@ jobs:
                   "Stage 2 — Lint",
                   "Stage 3 — Test",
                   "Stage 4 — Security",
+                  "Stage 5 — Performance",
                   "Stage 6 — Coverage",
-                  "Secret Scan"
+                  "Stage 7 — Audit",
+                  "Secret Scan",
+                  "Mutation Testing (critical crates)",
+                  "Commit Lint"
                 ]
               },
               "enforce_admins": true,
@@ -78,8 +82,12 @@ jobs:
                   "Stage 2 — Lint",
                   "Stage 3 — Test",
                   "Stage 4 — Security",
+                  "Stage 5 — Performance",
                   "Stage 6 — Coverage",
-                  "Secret Scan"
+                  "Stage 7 — Audit",
+                  "Secret Scan",
+                  "Mutation Testing (critical crates)",
+                  "Commit Lint"
                 ]
               },
               "enforce_admins": true,

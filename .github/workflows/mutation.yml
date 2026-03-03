@@ -101,6 +101,31 @@ jobs:
             echo "All mutants killed — tests are thorough."
           fi
 
+      - name: Mutation score summary
+        if: always() && steps.changed.outputs.skip == 'false'
+        run: |
+          if [ -f mutation-results.txt ]; then
+            TOTAL=$(grep -cE '(KILLED|SURVIVED|TIMEOUT)' mutation-results.txt 2>/dev/null || echo 0)
+            KILLED=$(grep -c 'KILLED' mutation-results.txt 2>/dev/null || echo 0)
+            SURVIVED=$(grep -c 'SURVIVED' mutation-results.txt 2>/dev/null || echo 0)
+            TIMEOUT=$(grep -c 'TIMEOUT' mutation-results.txt 2>/dev/null || echo 0)
+            if [ "$TOTAL" -gt 0 ]; then
+              SCORE=$(python3 -c "print(f'{$KILLED / $TOTAL * 100:.1f}')")
+            else
+              SCORE="N/A"
+            fi
+            {
+              echo "## Mutation Testing Results"
+              echo "| Metric | Count |"
+              echo "|--------|-------|"
+              echo "| Total mutants | $TOTAL |"
+              echo "| Killed | $KILLED |"
+              echo "| Survived | $SURVIVED |"
+              echo "| Timeout | $TIMEOUT |"
+              echo "| **Score** | **${SCORE}%** |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload mutation results
         if: always() && steps.changed.outputs.skip == 'false'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
