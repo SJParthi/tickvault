@@ -125,7 +125,25 @@ init_table "derivative_contracts" "CREATE TABLE IF NOT EXISTS derivative_contrac
 
 init_table "subscribed_indices" "CREATE TABLE IF NOT EXISTS subscribed_indices (symbol SYMBOL, exchange SYMBOL, category SYMBOL, subcategory SYMBOL, security_id LONG, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
 
-# 5. Final check
+# 5. Verify QuestDB PG wire protocol (port 8812) is accepting connections
+#    IntelliJ database tool uses this port. HTTP (9000) can be ready before PG wire (8812).
+echo ""
+echo -e "${CYAN}Waiting for QuestDB PG wire (port 8812)...${NC}"
+PG_READY=0
+for i in $(seq 1 30); do
+    if bash -c 'cat < /dev/null > /dev/tcp/localhost/8812' 2>/dev/null; then
+        PG_READY=1
+        break
+    fi
+    sleep 1
+done
+if [ "${PG_READY}" -eq 1 ]; then
+    echo -e "  ${GREEN}QuestDB PG wire ready — IntelliJ database tool can connect${NC}"
+else
+    echo -e "  ${YELLOW}QuestDB PG wire not ready yet — IntelliJ may need a manual refresh${NC}"
+fi
+
+# 6. Final check
 echo ""
 if all_running; then
     echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
