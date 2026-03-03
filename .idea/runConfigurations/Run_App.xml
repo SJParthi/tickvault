@@ -11,8 +11,10 @@
     <option name="backtrace" value="SHORT" />
     <envs>
       <env name="RUST_LOG" value="info" />
+      <env name="RUST_BACKTRACE" value="1" />
     </envs>
     <method v="2">
+      <option name="RunConfigurationTask" enabled="true" run_configuration_name="_Ensure Ready" run_configuration_type="ShConfigurationType" />
       <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
     </method>
   </configuration>
