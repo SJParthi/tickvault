@@ -47,6 +47,7 @@ service-account*.json
 
 # ---- Config overrides (personal machine-specific, not committed) ----
 config/local-overrides.toml
+.claude/settings.local.json
 
 # ---- Docker volumes (if mounted locally) ----
 docker-data/
@@ -77,6 +78,13 @@ quality/.binary-size-baseline
 # ---- Auto-save watchdog (runtime state) ----
 .claude/hooks/.watchdog.pid
 .claude/hooks/.watchdog.log
+
+# ---- Auto-save remote watchdog (runtime state) ----
+.claude/hooks/.remote-watchdog.pid
+.claude/hooks/.remote-watchdog.log
+.claude/hooks/.auto-save-index
+.claude/hooks/.conflict-warning
+.claude/hooks/.collision-detected
 
 # ---- Temporary files ----
 *.tmp
