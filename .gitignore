@@ -47,6 +47,7 @@ service-account*.json
 
 # ---- Config overrides (personal machine-specific, not committed) ----
 config/local-overrides.toml
+.claude/settings.local.json
 
 # ---- Docker volumes (if mounted locally) ----
 docker-data/

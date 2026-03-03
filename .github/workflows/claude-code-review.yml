@@ -1,0 +1,46 @@
+# =============================================================================
+# Claude Code GitHub Action — Automated PR Review
+# =============================================================================
+# Triggers on @claude mentions in PR comments and optionally on PR open.
+# Uses Anthropic's official Claude Code GitHub Action.
+#
+# Setup required:
+#   1. Add ANTHROPIC_API_KEY secret to repo Settings > Secrets
+#   2. Enable GitHub Actions for the repo
+#
+# Usage:
+#   Comment "@claude review this PR" on any PR
+#   Comment "@claude update CLAUDE.md with <rule>" to add rules
+# =============================================================================
+
+name: Claude Code Review
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    # Only run on PR comments that mention @claude
+    if: |
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "@claude"
+          timeout_minutes: 30
