@@ -1,0 +1,37 @@
+name: Create PR
+on:
+  push:
+    branches:
+      - 'claude/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-pr:
+    if: github.ref == 'refs/heads/claude/auto-configure-observability-stack-XheLb'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create PR if not exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          EXISTING=$(gh pr list --head "${{ github.ref_name }}" --base main --json number --jq 'length')
+          if [ "$EXISTING" -gt "0" ]; then
+            echo "PR already exists, skipping"
+            exit 0
+          fi
+          gh pr create \
+            --title "chore(observability): auto-configure observability stack" \
+            --base main \
+            --head "${{ github.ref_name }}" \
+            --body "## Summary
+          - Full observability stack: Prometheus, Grafana, OpenTelemetry, CloudWatch, Telegram alerts
+          - Quality gates + CI enforcement + comprehensive tests
+          - Security: credential redaction, auth retry logic
+          - All cargo check + cargo test pass
+
+          https://claude.ai/code/session_01GxSkGAaivTJAYbVG7uD9Mj"
