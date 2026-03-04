@@ -3,7 +3,7 @@
 //! `POST /api/instruments/rebuild` — bypasses time gate, respects freshness marker.
 //! Concurrent requests guarded by `AtomicBool` (only one rebuild at a time).
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::State;
@@ -23,6 +23,20 @@ pub struct RebuildResponse {
     pub derivative_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underlying_count: Option<usize>,
+}
+
+/// RAII guard that clears `rebuild_in_progress` on drop.
+///
+/// Guarantees the flag is released even if `do_rebuild` panics or the
+/// tokio task is cancelled at an `.await` point.
+struct RebuildGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for RebuildGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
 }
 
 /// `POST /api/instruments/rebuild` — one-shot instrument rebuild.
@@ -46,10 +60,11 @@ pub async fn rebuild_instruments(State(state): State<SharedAppState>) -> Json<Re
         });
     }
 
-    // Ensure we always release the guard
-    let result = do_rebuild(&state).await;
-    state.rebuild_in_progress().store(false, Ordering::SeqCst);
-    result
+    // RAII guard: flag is cleared on drop (panic, cancellation, or normal return)
+    let _guard = RebuildGuard {
+        flag: state.rebuild_in_progress(),
+    };
+    do_rebuild(&state).await
 }
 
 /// Inner rebuild logic — separated for clean guard release.

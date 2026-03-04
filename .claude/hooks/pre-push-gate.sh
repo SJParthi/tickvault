@@ -3,12 +3,16 @@
 # Called by PreToolUse hook on Bash commands matching "git push"
 # Exit 2 = BLOCK push.
 #
+# DEDUP: If pre-commit gate already passed for the same HEAD (within 5 min),
+# gates 1-5 (fmt/clippy/test/banned/test-count) are SKIPPED. Only push-only
+# gates (audit/deny/coverage) run. This avoids 60-120s of redundant work.
+#
 # Gate order:
-#   1. cargo fmt --check
-#   2. cargo clippy -D warnings
-#   3. cargo test (full workspace)
-#   4. Banned pattern scan (full workspace, not just staged)
-#   5. Test count guard (ratcheting baseline)
+#   1. cargo fmt --check          [skippable if commit-verified]
+#   2. cargo clippy -D warnings   [skippable if commit-verified]
+#   3. cargo test (full workspace) [skippable if commit-verified]
+#   4. Banned pattern scan         [skippable if commit-verified]
+#   5. Test count guard            [skippable if commit-verified]
 #   6. cargo audit (known vulnerabilities) — if installed
 #   7. cargo deny check (license + advisory) — if installed
 #   8. Coverage ratchet guard — if cargo-llvm-cov installed
@@ -41,69 +45,95 @@ fi
 HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
-echo "╔══════════════════════════════════════════════╗" >&2
-echo "║        PRE-PUSH SAFETY NET (8 Gates)          ║" >&2
-echo "╚══════════════════════════════════════════════╝" >&2
+# ─────────────────────────────────────────────
+# DEDUP CHECK: Did pre-commit gate already pass for this HEAD?
+# ─────────────────────────────────────────────
+STATE_FILE="$HOOKS_DIR/.last-quality-pass"
+HEAD_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+COMMIT_VERIFIED=false
 
-# Gate 1: cargo fmt (show errors on failure)
-echo "  [1/8] cargo fmt --check..." >&2
-FMT_OUT=$(cargo fmt --all -- --check 2>&1)
-FMT_EXIT=$?
-if [ "$FMT_EXIT" -ne 0 ]; then
-  echo "  FAIL: Code not formatted:" >&2
-  echo "$FMT_OUT" | tail -10 >&2
-  FAILED=1
-else
-  echo "  PASS: cargo fmt" >&2
+if [ -f "$STATE_FILE" ]; then
+  SAVED_HASH=$(awk '{print $1}' "$STATE_FILE")
+  SAVED_TIME=$(awk '{print $2}' "$STATE_FILE")
+  NOW=$(date +%s)
+  AGE=$(( NOW - SAVED_TIME ))
+
+  if [ "$SAVED_HASH" = "$HEAD_HASH" ] && [ "$AGE" -lt 300 ]; then
+    COMMIT_VERIFIED=true
+  fi
 fi
 
-# Gate 2: cargo clippy (show errors on failure)
-echo "  [2/8] cargo clippy..." >&2
-CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
-CLIPPY_EXIT=$?
-if [ "$CLIPPY_EXIT" -ne 0 ]; then
-  echo "  FAIL: clippy warnings found:" >&2
-  echo "$CLIPPY_OUT" | tail -20 >&2
-  FAILED=1
+if [ "$COMMIT_VERIFIED" = "true" ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  PRE-PUSH (FAST — commit-verified ${AGE}s ago) ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+  echo "  [1-5/8] SKIP: Already verified by pre-commit gate (HEAD ${HEAD_HASH:0:7})" >&2
 else
-  echo "  PASS: cargo clippy (zero warnings)" >&2
-fi
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║        PRE-PUSH SAFETY NET (8 Gates)          ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
 
-# Gate 3: cargo test (mandatory, show errors on failure)
-echo "  [3/8] cargo test..." >&2
-TEST_OUT=$(cargo test --workspace 2>&1)
-TEST_EXIT=$?
-if [ "$TEST_EXIT" -ne 0 ]; then
-  echo "  FAIL: cargo test failed:" >&2
-  echo "$TEST_OUT" | tail -20 >&2
-  FAILED=1
-else
-  echo "  PASS: cargo test (100% pass)" >&2
-fi
-
-# Gate 4: Banned pattern scan (full workspace, not just staged)
-echo "  [4/8] Banned pattern scan (full workspace)..." >&2
-ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
-if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
-  if ! echo "$ALL_RS" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
-    echo "  FAIL: Banned patterns in workspace." >&2
+  # Gate 1: cargo fmt
+  echo "  [1/8] cargo fmt --check..." >&2
+  FMT_OUT=$(cargo fmt --all -- --check 2>&1)
+  if [ $? -ne 0 ]; then
+    echo "  FAIL: Code not formatted:" >&2
+    echo "$FMT_OUT" | tail -10 >&2
     FAILED=1
   else
-    echo "  PASS: Banned pattern scan" >&2
+    echo "  PASS: cargo fmt" >&2
   fi
-else
-  echo "  SKIP: Scanner not available" >&2
+
+  # Gate 2: cargo clippy
+  echo "  [2/8] cargo clippy..." >&2
+  CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+  if [ $? -ne 0 ]; then
+    echo "  FAIL: clippy warnings found:" >&2
+    echo "$CLIPPY_OUT" | tail -20 >&2
+    FAILED=1
+  else
+    echo "  PASS: cargo clippy (zero warnings)" >&2
+  fi
+
+  # Gate 3: cargo test
+  echo "  [3/8] cargo test..." >&2
+  TEST_OUT=$(cargo test --workspace 2>&1)
+  if [ $? -ne 0 ]; then
+    echo "  FAIL: cargo test failed:" >&2
+    echo "$TEST_OUT" | tail -20 >&2
+    FAILED=1
+  else
+    echo "  PASS: cargo test (100% pass)" >&2
+  fi
+
+  # Gate 4: Banned pattern scan (full workspace)
+  echo "  [4/8] Banned pattern scan (full workspace)..." >&2
+  ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
+  if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
+    if ! echo "$ALL_RS" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
+      echo "  FAIL: Banned patterns in workspace." >&2
+      FAILED=1
+    else
+      echo "  PASS: Banned pattern scan" >&2
+    fi
+  else
+    echo "  SKIP: Scanner not available" >&2
+  fi
+
+  # Gate 5: Test count guard
+  echo "  [5/8] Test count guard..." >&2
+  if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
+    if ! "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
+      FAILED=1
+    fi
+  else
+    echo "  SKIP: test-count-guard.sh not executable" >&2
+  fi
 fi
 
-# Gate 5: Test count guard
-echo "  [5/8] Test count guard..." >&2
-if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
-  if ! "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
-    FAILED=1
-  fi
-else
-  echo "  SKIP: test-count-guard.sh not executable" >&2
-fi
+# ─────────────────────────────────────────────
+# Gates 6-8: Push-only gates (always run)
+# ─────────────────────────────────────────────
 
 # Gate 6: cargo audit (CVEs + yanked — required if installed)
 echo "  [6/8] cargo audit (CVEs + yanked)..." >&2
@@ -124,8 +154,6 @@ else
 fi
 
 # Gate 7: cargo deny (advisory — only if installed)
-# Note: cargo deny needs network to fetch advisory DB. If it fails due to
-# network/proxy issues, treat as SKIP rather than FAIL. CI enforces this properly.
 echo "  [7/8] cargo deny..." >&2
 if command -v cargo-deny > /dev/null 2>&1; then
   DENY_OUTPUT=$(cargo deny check 2>&1)
@@ -167,7 +195,6 @@ if [ "$FAILED" -ne 0 ]; then
 fi
 
 # Write state file for pre-PR gate optimization
-HEAD_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
@@ -179,10 +206,15 @@ if [ -n "$BRANCH_SAFE_NOW" ]; then
     git push origin --delete "$ref" 2>/dev/null || true
     git update-ref -d "$ref" 2>/dev/null || true
   done
-  echo "  Auto-save refs cleaned up for ${BRANCH_NOW}" >&2
 fi
 
-echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  ALL 8 GATES PASSED — Push allowed            ║" >&2
-echo "╚══════════════════════════════════════════════╝" >&2
+if [ "$COMMIT_VERIFIED" = "true" ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  PUSH ALLOWED (fast path — 3 gates only)     ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+else
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  ALL 8 GATES PASSED — Push allowed            ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+fi
 exit 0
