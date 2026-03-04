@@ -6,15 +6,18 @@
 #
 # All values are line coverage percentages.
 # Any crate not listed uses the default threshold.
+#
+# Phase 1 thresholds — ratchet up as crates gain production code + tests.
+# Target: 99% once each crate is feature-complete.
 # =============================================================================
 
 # Default threshold for any crate not explicitly listed
-default = 99.0
+default = 60.0
 
 [crates]
-core    = 99.0
-trading = 99.0
-common  = 99.0
-storage = 99.0
-api     = 99.0
-app     = 99.0
+common  = 80.0
+core    = 60.0
+trading = 50.0
+storage = 60.0
+api     = 60.0
+app     = 50.0

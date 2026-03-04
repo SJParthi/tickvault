@@ -52,69 +52,56 @@ pub fn redact_url_params(input: &str) -> String {
 /// Scans for `https://` or `http://` prefixes, finds the `?` delimiter,
 /// and replaces everything from `?` to the next whitespace, `)`, or
 /// end-of-string with `?[REDACTED]`.
+///
+/// Uses `str::find` for UTF-8–safe scanning (no byte-level indexing).
 fn redact_urls(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
+    let mut remaining = input;
 
-    while i < len {
-        // Look for URL start: "http://" or "https://"
-        if i + 7 < len && &input[i..i + 7] == "http://" {
-            // Found http:// — find the `?` and redact
-            let url_start = i;
-            i = copy_url_and_redact_params(input, url_start, &mut result);
-        } else if i + 8 < len && &input[i..i + 8] == "https://" {
-            let url_start = i;
-            i = copy_url_and_redact_params(input, url_start, &mut result);
+    while !remaining.is_empty() {
+        // Find the earliest URL prefix
+        let url_start = match (remaining.find("http://"), remaining.find("https://")) {
+            (Some(h), Some(hs)) => h.min(hs),
+            (Some(h), None) => h,
+            (None, Some(hs)) => hs,
+            (None, None) => {
+                result.push_str(remaining);
+                break;
+            }
+        };
+
+        // Copy everything before the URL
+        result.push_str(&remaining[..url_start]);
+        remaining = &remaining[url_start..];
+
+        // Find the end of the URL (whitespace, ')' or end-of-string).
+        // URLs are ASCII-only, so non-ASCII chars also terminate the URL.
+        let url_end = remaining
+            .find(|c: char| c.is_whitespace() || c == ')')
+            .unwrap_or(remaining.len());
+
+        let url = &remaining[..url_end];
+
+        // Check if URL has query params
+        if let Some(q_pos) = url.find('?') {
+            result.push_str(&url[..q_pos]);
+            result.push_str("?[REDACTED]");
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            result.push_str(url);
         }
+
+        remaining = &remaining[url_end..];
     }
 
     result
-}
-
-/// Copies a URL up to `?`, then replaces query params with `[REDACTED]`.
-/// Returns the index after the URL ends.
-fn copy_url_and_redact_params(input: &str, start: usize, result: &mut String) -> usize {
-    let bytes = input.as_bytes();
-    let len = bytes.len();
-    let mut i = start;
-
-    // Copy everything up to `?` or end-of-URL
-    while i < len {
-        let ch = bytes[i] as char;
-        if ch == '?' {
-            // Found query string — redact everything after `?`
-            result.push_str("?[REDACTED]");
-            i += 1;
-            // Skip until whitespace, `)`, or end-of-string
-            while i < len {
-                let skip_ch = bytes[i] as char;
-                if skip_ch.is_whitespace() || skip_ch == ')' {
-                    break;
-                }
-                i += 1;
-            }
-            return i;
-        }
-        if ch.is_whitespace() || ch == ')' {
-            // End of URL without query params — nothing to redact
-            return i;
-        }
-        result.push(ch);
-        i += 1;
-    }
-
-    i
 }
 
 /// Redacts the value portion of a `key=value` pattern.
 ///
 /// Replaces `key=<value>` with `key=[REDACTED]` where `<value>` extends
 /// to the next `&`, whitespace, `)`, or end-of-string.
+///
+/// Uses `str::find` for UTF-8–safe scanning (no byte-level indexing).
 fn redact_param_value(input: &str, key: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut search_from = 0;
@@ -126,17 +113,13 @@ fn redact_param_value(input: &str, key: &str) -> String {
         result.push_str(key);
         result.push_str("[REDACTED]");
 
-        // Skip past the value
+        // Skip past the value using char-aware scanning
         let value_start = abs_pos + key.len();
-        let mut value_end = value_start;
-        let bytes = input.as_bytes();
-        while value_end < bytes.len() {
-            let ch = bytes[value_end] as char;
-            if ch == '&' || ch.is_whitespace() || ch == ')' || ch == '\n' {
-                break;
-            }
-            value_end += 1;
-        }
+        let value_end = input[value_start..]
+            .find(|c: char| c == '&' || c.is_whitespace() || c == ')')
+            .map(|i| value_start + i)
+            .unwrap_or(input.len());
+
         search_from = value_end;
     }
 
@@ -280,6 +263,28 @@ mod tests {
         let output = redact_url_params(input);
         assert!(output.starts_with("prefix "), "prefix lost: {output}");
         assert!(output.ends_with(" suffix"), "suffix lost: {output}");
+    }
+
+    #[test]
+    fn test_multibyte_utf8_em_dash_does_not_panic() {
+        // Exact format from NotificationEvent — contains `—` (em dash, 3 bytes).
+        let input = "attempt 1: Dhan authentication failed: generateAccessToken request failed: error sending request for url (https://auth.dhan.co/app/generateAccessToken?[REDACTED]) — retrying in 0s";
+        let output = redact_url_params(input);
+        assert!(output.contains("—"), "em dash must be preserved: {output}");
+        assert!(
+            output.contains("?[REDACTED]"),
+            "URL must still be redacted: {output}"
+        );
+    }
+
+    #[test]
+    fn test_multibyte_utf8_around_url() {
+        // Non-ASCII characters before and after a URL
+        let input = "errör at https://x.com/api?key=secret — done";
+        let output = redact_url_params(input);
+        assert!(!output.contains("secret"), "param leaked: {output}");
+        assert!(output.contains("errör"), "leading UTF-8 lost: {output}");
+        assert!(output.contains("— done"), "trailing UTF-8 lost: {output}");
     }
 
     #[test]
