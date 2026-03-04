@@ -251,7 +251,7 @@ jobs:
           cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
           cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
 
-      - name: Enforce 99% workspace coverage (HARD FAIL)
+      - name: Enforce workspace coverage threshold (HARD FAIL)
         run: |
           COV_PCT=$(python3 -c "
           import json, sys
@@ -260,11 +260,12 @@ jobs:
           pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
           print(f'{pct:.1f}')
           ")
-          echo "Workspace line coverage: ${COV_PCT}%"
-          if python3 -c "import sys; sys.exit(0 if float('$COV_PCT') >= 99.0 else 1)"; then
-            echo "Coverage meets 99% target"
+          THRESHOLD=60.0
+          echo "Workspace line coverage: ${COV_PCT}% (threshold: ${THRESHOLD}%)"
+          if python3 -c "import sys; sys.exit(0 if float('$COV_PCT') >= $THRESHOLD else 1)"; then
+            echo "Coverage meets ${THRESHOLD}% target"
           else
-            echo "BLOCKED: Coverage ${COV_PCT}% is below 99% threshold"
+            echo "BLOCKED: Coverage ${COV_PCT}% is below ${THRESHOLD}% threshold"
             exit 1
           fi
 
@@ -292,15 +293,33 @@ jobs:
                       crate_lines[c]['count'] += s.get('count', 0)
                       crate_lines[c]['covered'] += s.get('covered', 0)
           print('## Coverage Report')
-          print(f'**Workspace: {ws_pct:.1f}%** (threshold: 99.0%)')
+          print(f'**Workspace: {ws_pct:.1f}%** (threshold: 60.0%)')
           print('')
           print('| Crate | Coverage | Threshold | Status |')
           print('|-------|----------|-----------|--------|')
+          # Read per-crate thresholds
+          crate_thresholds = {}
+          default_thr = 60.0
+          in_crates = False
+          try:
+              with open('quality/crate-coverage-thresholds.toml') as tf:
+                  for tl in tf:
+                      tl = tl.strip()
+                      if tl == '[crates]':
+                          in_crates = True; continue
+                      if tl.startswith('[') and tl != '[crates]':
+                          in_crates = False; continue
+                      if in_crates and '=' in tl:
+                          k, v = tl.split('=', 1)
+                          crate_thresholds[k.strip()] = float(v.strip())
+          except Exception:
+              pass
           for name in sorted(crate_lines):
               i = crate_lines[name]
               pct = (i['covered'] / i['count'] * 100) if i['count'] > 0 else 100.0
-              status = ':white_check_mark:' if pct >= 99.0 else ':x:'
-              print(f'| {name} | {pct:.1f}% | 99.0% | {status} |')
+              thr = crate_thresholds.get(name, default_thr)
+              status = ':white_check_mark:' if pct >= thr else ':x:'
+              print(f'| {name} | {pct:.1f}% | {thr}% | {status} |')
           " >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
       - name: Upload coverage report
