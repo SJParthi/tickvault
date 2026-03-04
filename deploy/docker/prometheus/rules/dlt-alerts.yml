@@ -47,7 +47,7 @@ groups:
           severity: warning
         annotations:
           summary: "Prometheus RSS > 1GB"
-          description: "Prometheus is using {{ $value | humanizeBytes }} of memory."
+          description: "Prometheus is using {{ $value | humanize1024 }}B of memory."
 
       - alert: PrometheusTSDBCompactionsFailing
         expr: increase(prometheus_tsdb_compactions_failed_total[1h]) > 0
@@ -65,7 +65,7 @@ groups:
           severity: warning
         annotations:
           summary: "Loki ingestion rate > 10MB/s"
-          description: "Loki is ingesting {{ $value | humanizeBytes }}/s, which may cause ingestion limits to be hit."
+          description: "Loki is ingesting {{ $value | humanize1024 }}B/s, which may cause ingestion limits to be hit."
 
   - name: dlt-application-alerts
     rules:

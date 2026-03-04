@@ -251,7 +251,7 @@ else
     # ---- Step 6: Restart if requested ----
     if [ "$RESTART" = true ]; then
         step "Tearing down existing stack"
-        docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
+        docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>&1 || true
         ok "Stack torn down"
     else
         step "Checking existing stack state"
@@ -267,12 +267,37 @@ else
     # ---- Step 7: Pull images ----
     step "Pulling Docker images (8 services, SHA256-pinned)"
     info "This may take a few minutes on first run (~2GB)..."
-    docker compose -f "${COMPOSE_FILE}" pull --quiet 2>/dev/null
+    if ! docker compose -f "${COMPOSE_FILE}" pull --quiet 2>&1; then
+        fail "Docker image pull failed. Check network connectivity."
+        docker compose -f "${COMPOSE_FILE}" pull 2>&1 | tail -20
+        exit 1
+    fi
     ok "All images pulled"
 
     # ---- Step 8: Start stack ----
     step "Starting observability stack"
-    docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans 2>/dev/null
+    COMPOSE_OUTPUT=$(docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans 2>&1) || {
+        fail "docker compose up failed:"
+        echo "$COMPOSE_OUTPUT"
+        echo ""
+        info "Container status:"
+        docker compose -f "${COMPOSE_FILE}" ps --all 2>&1 || true
+        echo ""
+        info "Recent container logs (last 30 lines per failed service):"
+        for svc in dlt-questdb dlt-valkey dlt-prometheus dlt-grafana dlt-loki dlt-alloy dlt-jaeger dlt-traefik; do
+            STATUS=$(docker inspect --format='{{.State.Status}}' "$svc" 2>/dev/null || echo "not_found")
+            if [ "$STATUS" != "running" ]; then
+                echo -e "  ${RED}--- ${svc} (${STATUS}) ---${NC}"
+                docker logs "$svc" --tail 30 2>&1 || true
+                echo ""
+            fi
+        done
+        info "Common fixes:"
+        info "  Port conflict: lsof -i :9000 :8812 :3000 :6379 :80 :443"
+        info "  Clean restart: docker compose -f deploy/docker/docker-compose.yml down -v && re-run"
+        info "  Docker resources: Check Docker Desktop → Settings → Resources"
+        exit 1
+    }
     ok "docker compose up -d complete"
 fi
 
