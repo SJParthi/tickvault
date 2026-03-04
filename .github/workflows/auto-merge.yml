@@ -28,8 +28,9 @@ jobs:
     name: "Enable Auto-Merge"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only auto-merge for Renovate bot and Claude Code PRs
+    # Only auto-merge for trusted actors
     if: >-
+      github.actor == 'dependabot[bot]' ||
       github.actor == 'renovate[bot]' ||
       github.actor == 'SJParthi' ||
       startsWith(github.head_ref, 'claude/')
