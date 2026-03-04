@@ -953,13 +953,20 @@ mod tests {
         tokio::spawn(async move {
             // Accept multiple connections (retries)
             loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-                    body_clone.len(),
-                    body_clone
-                );
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body_ref = body_clone.clone();
+                tokio::spawn(async move {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_ref.len(),
+                        body_ref
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+                });
             }
         });
 
@@ -1016,9 +1023,15 @@ mod tests {
 
         tokio::spawn(async move {
             loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+                });
             }
         });
 
