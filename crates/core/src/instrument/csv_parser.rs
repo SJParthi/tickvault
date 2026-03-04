@@ -93,6 +93,9 @@ pub struct ParsedInstrumentRow {
 /// # Returns
 /// Tuple of (total_csv_rows, filtered_rows).
 pub fn parse_instrument_csv(csv_text: &str) -> Result<(usize, Vec<ParsedInstrumentRow>)> {
+    // Strip UTF-8 BOM if present (Windows editors / some HTTP servers prepend it)
+    let csv_text = csv_text.strip_prefix('\u{FEFF}').unwrap_or(csv_text);
+
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true) // Dhan CSV has trailing comma → extra empty field
@@ -1165,6 +1168,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_instrument_csv_with_bom_prefix_succeeds() {
+        // UTF-8 BOM (\xEF\xBB\xBF = U+FEFF) prepended to header — must be stripped
+        let csv_text = format!("\u{FEFF}{}", build_mock_csv_header());
+        let result = parse_instrument_csv(&csv_text);
+        // Header-only with 0 rows triggers min-row check, NOT column-missing error.
+        // This proves BOM was stripped (column detection succeeded).
+        assert!(result.is_err(), "should fail due to min rows, not BOM");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("rows"),
+            "error should be about row count (not missing column): {}",
+            err_msg
+        );
+    }
+
+    #[test]
     fn test_parse_instrument_csv_header_only_returns_error() {
         // Header only, no data rows — row count = 0 < INSTRUMENT_CSV_MIN_ROWS
         let csv_text = build_mock_csv_header();
@@ -1490,5 +1509,128 @@ mod tests {
         let result = parse_instrument_csv(&csv_text);
         // Returns Err due to row count < INSTRUMENT_CSV_MIN_ROWS
         assert!(result.is_err(), "expected error due to insufficient rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_strike_price / parse_tick_size: negative infinity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_strike_price_negative_inf_returns_zero() {
+        // -inf is not finite → returns 0.0
+        assert_eq!(parse_strike_price("-inf"), 0.0);
+    }
+
+    #[test]
+    fn test_parse_tick_size_negative_inf_fails() {
+        // -inf is not finite → error
+        assert!(parse_tick_size("-inf").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_expiry_date: leap year edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_expiry_date_leap_year_feb_29_valid() {
+        let result = parse_expiry_date("2024-02-29");
+        assert!(result.is_some(), "2024 is a leap year, Feb 29 is valid");
+        assert_eq!(chrono::Datelike::day(&result.unwrap()), 29);
+    }
+
+    #[test]
+    fn test_parse_expiry_date_non_leap_year_feb_29_returns_none() {
+        let result = parse_expiry_date("2023-02-29");
+        assert!(
+            result.is_none(),
+            "2023 is not a leap year, Feb 29 is invalid"
+        );
+    }
+
+    #[test]
+    fn test_parse_expiry_date_far_future_year_9999() {
+        let result = parse_expiry_date("9999-12-31");
+        assert!(result.is_some(), "year 9999 should parse");
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_column_indices: reordered columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_column_indices_reordered_columns_still_detected() {
+        // CSV header with columns in a different order than expected
+        let reordered_header = "SEGMENT,EXCH_ID,INSTRUMENT,SECURITY_ID,\
+             UNDERLYING_SYMBOL,UNDERLYING_SECURITY_ID,DISPLAY_NAME,SYMBOL_NAME,\
+             SERIES,TICK_SIZE,LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,\
+             OPTION_TYPE,EXPIRY_FLAG,";
+        let record = csv::StringRecord::from(reordered_header.split(',').collect::<Vec<&str>>());
+        let result = detect_column_indices(&record);
+        assert!(
+            result.is_ok(),
+            "reordered columns should still be detected: {:?}",
+            result.err()
+        );
+        let indices = result.unwrap();
+        // EXCH_ID is at position 1 (0-indexed) in reordered header
+        assert_eq!(indices.exch_id, 1);
+        // SEGMENT is at position 0
+        assert_eq!(indices.segment, 0);
+        // SECURITY_ID is at position 3
+        assert_eq!(indices.security_id, 3);
+    }
+
+    #[test]
+    fn test_detect_column_indices_header_with_whitespace_trimmed() {
+        // CSV reader trims, and detect_column_indices uses .trim()
+        let header_with_spaces = " EXCH_ID , SEGMENT , SECURITY_ID ,ISIN, INSTRUMENT ,\
+             UNDERLYING_SECURITY_ID , UNDERLYING_SYMBOL , SYMBOL_NAME , DISPLAY_NAME ,\
+             INSTRUMENT_TYPE, SERIES , LOT_SIZE , SM_EXPIRY_DATE , STRIKE_PRICE ,\
+             OPTION_TYPE , TICK_SIZE , EXPIRY_FLAG ,";
+        let record = csv::StringRecord::from(header_with_spaces.split(',').collect::<Vec<&str>>());
+        let result = detect_column_indices(&record);
+        assert!(
+            result.is_ok(),
+            "whitespace-padded headers should be trimmed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_detect_column_indices_duplicate_column_uses_first() {
+        // If a column name appears twice, position() returns the first occurrence
+        let dup_header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,\
+             UNDERLYING_SECURITY_ID,UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,\
+             INSTRUMENT_TYPE,SERIES,LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,\
+             OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,EXCH_ID,";
+        let record = csv::StringRecord::from(dup_header.split(',').collect::<Vec<&str>>());
+        let result = detect_column_indices(&record);
+        assert!(result.is_ok());
+        // EXCH_ID should resolve to index 0 (first occurrence), not 17
+        assert_eq!(result.unwrap().exch_id, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_lot_size: scientific notation & rounding edge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_lot_size_scientific_notation_1e2() {
+        // "1e2" = 100.0 → should parse to 100
+        assert_eq!(parse_lot_size("1e2").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_parse_lot_size_scientific_notation_exceeds_u32() {
+        // "1e10" = 10_000_000_000 → exceeds u32::MAX
+        assert!(parse_lot_size("1e10").is_err());
+    }
+
+    #[test]
+    fn test_parse_lot_size_half_rounds_away_from_zero() {
+        // 2.5 rounds to 3 (Rust f64::round uses ties-away-from-zero)
+        assert_eq!(parse_lot_size("2.5").unwrap(), 3);
+        // 3.5 rounds to 4
+        assert_eq!(parse_lot_size("3.5").unwrap(), 4);
     }
 }
