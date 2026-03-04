@@ -203,6 +203,8 @@ jobs:
   coverage-and-perf:
     name: "Coverage & Perf"
     needs: build-and-verify
+    # Skip on main — same code already passed on develop
+    if: github.base_ref == 'develop' || github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
