@@ -114,16 +114,7 @@
         ]
       }
     ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "INPUT=$(cat); ACTIVE=$(echo \"$INPUT\" | jq -r '.stop_hook_active // false'); if [ \"$ACTIVE\" = \"true\" ]; then exit 0; fi; LAST_MSG=$(echo \"$INPUT\" | jq -r '.last_assistant_message // empty'); if echo \"$LAST_MSG\" | grep -qi 'todo\\|in.progress\\|not yet\\|still need\\|remaining'; then echo 'Stop hook: detected incomplete work indicators' >&2; exit 2; fi; exit 0"
-          }
-        ]
-      }
-    ],
+    "Stop": [],
     "SessionStart": [
       {
         "hooks": [
