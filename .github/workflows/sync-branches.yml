@@ -30,6 +30,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---- Auto-sync: main → develop on every push to main ----
   sync-main-to-develop:
