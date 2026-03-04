@@ -1,0 +1,24 @@
+[package]
+name = "dhan-live-trader-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.9"
+toml = "1.0.2"
+dhan-live-trader-core = { path = "../crates/core" }
+dhan-live-trader-common = { path = "../crates/common" }
+
+[[bin]]
+name = "tick_parser"
+path = "fuzz_targets/tick_parser.rs"
+doc = false
+
+[[bin]]
+name = "config_parser"
+path = "fuzz_targets/config_parser.rs"
+doc = false
