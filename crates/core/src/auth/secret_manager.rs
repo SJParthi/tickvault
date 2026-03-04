@@ -33,14 +33,8 @@ pub(crate) fn build_ssm_path(environment: &str, service: &str, secret_name: &str
     )
 }
 
-/// Returns the SSM environment from the `ENVIRONMENT` env var,
-/// falling back to `DEFAULT_SSM_ENVIRONMENT` ("dev").
-///
-/// Validates that the environment string contains only alphanumeric
-/// characters and hyphens to prevent path traversal.
-pub fn resolve_environment() -> Result<String, ApplicationError> {
-    let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| DEFAULT_SSM_ENVIRONMENT.to_string());
-
+/// Validates an environment string. Only alphanumeric + hyphens allowed.
+fn validate_environment(env: &str) -> Result<String, ApplicationError> {
     if env.is_empty() || !env.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(ApplicationError::Configuration(format!(
             "ENVIRONMENT '{}' contains invalid characters (only alphanumeric and hyphen allowed)",
@@ -48,7 +42,17 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
         )));
     }
 
-    Ok(env)
+    Ok(env.to_string())
+}
+
+/// Returns the SSM environment from the `ENVIRONMENT` env var,
+/// falling back to `DEFAULT_SSM_ENVIRONMENT` ("dev").
+///
+/// Validates that the environment string contains only alphanumeric
+/// characters and hyphens to prevent path traversal.
+pub fn resolve_environment() -> Result<String, ApplicationError> {
+    let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| DEFAULT_SSM_ENVIRONMENT.to_string());
+    validate_environment(&env)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,103 +269,56 @@ mod tests {
         assert_eq!(path, "/dlt/dev/dhan/totp-secret");
     }
 
-    #[test]
-    fn test_resolve_environment_default() {
-        // When ENVIRONMENT env var is not set, should default to "dev"
-        // Uses the shared mutex to avoid races with other env-var tests.
-        with_environment_var(None, || {
-            let env = resolve_environment().expect("resolve_environment should succeed");
-            assert!(!env.is_empty());
-        });
-    }
-
     // -----------------------------------------------------------------------
-    // resolve_environment — validation & default value tests
+    // validate_environment — pure validation (no env var mutation needed)
     // -----------------------------------------------------------------------
-    //
-    // NOTE: These tests mutate process-wide env vars via `std::env::set_var`
-    // / `std::env::remove_var`. In Rust 2024, these are `unsafe` because
-    // concurrent threads may observe partial writes. `cargo test` by default
-    // runs tests in separate threads. A `serial_test` crate could enforce
-    // serial execution, but it is not in the Tech Stack Bible. We use a
-    // static Mutex instead so only one env-var test runs at a time.
 
-    use std::sync::Mutex;
-    static ENVIRONMENT_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// Helper: run a closure with `ENVIRONMENT` set to a specific value,
-    /// then restore it to unset. Holds `ENVIRONMENT_MUTEX` for the duration
-    /// to prevent parallel env-var tests from interfering.
-    fn with_environment_var<F, R>(value: Option<&str>, test_body: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let _guard = ENVIRONMENT_MUTEX.lock().expect("env mutex poisoned");
-        // SAFETY: env var mutation in test-only code. The Mutex ensures no
-        //         concurrent test touches ENVIRONMENT at the same time.
-        match value {
-            Some(val) => unsafe { std::env::set_var("ENVIRONMENT", val) },
-            None => unsafe { std::env::remove_var("ENVIRONMENT") },
-        }
-        let result = test_body();
-        // Always restore to unset after the test.
-        unsafe {
-            std::env::remove_var("ENVIRONMENT");
-        }
-        result
+    #[test]
+    fn test_validate_environment_dev() {
+        let env = validate_environment("dev").expect("'dev' should be valid");
+        assert_eq!(env, "dev");
     }
 
     #[test]
-    fn test_resolve_environment_default_value_is_dev() {
-        with_environment_var(None, || {
-            let env =
-                resolve_environment().expect("resolve_environment should succeed with default");
-            assert_eq!(env, "dev", "default environment must be \"dev\"");
-        });
+    fn test_validate_environment_prod() {
+        let env = validate_environment("prod").expect("'prod' should be valid");
+        assert_eq!(env, "prod");
     }
 
     #[test]
-    fn test_resolve_environment_with_empty_string_returns_error() {
-        with_environment_var(Some(""), || {
-            let result = resolve_environment();
-            assert!(result.is_err(), "empty ENVIRONMENT string must be rejected");
-            let err_msg = result.unwrap_err().to_string();
-            assert!(
-                err_msg.contains("invalid characters"),
-                "error message should mention invalid characters, got: {err_msg}"
-            );
-        });
+    fn test_validate_environment_empty_string_returns_error() {
+        let result = validate_environment("");
+        assert!(result.is_err(), "empty string must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid characters"),
+            "error message should mention invalid characters, got: {err_msg}"
+        );
     }
 
     #[test]
-    fn test_resolve_environment_with_path_traversal_returns_error() {
-        // "../../etc" contains dots and slashes — both rejected by validation.
-        with_environment_var(Some("../../etc"), || {
-            let result = resolve_environment();
-            assert!(result.is_err(), "path-traversal string must be rejected");
-            let err_msg = result.unwrap_err().to_string();
-            assert!(
-                err_msg.contains("invalid characters"),
-                "error message should mention invalid characters, got: {err_msg}"
-            );
-        });
+    fn test_validate_environment_path_traversal_returns_error() {
+        let result = validate_environment("../../etc");
+        assert!(result.is_err(), "path-traversal string must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid characters"),
+            "error message should mention invalid characters, got: {err_msg}"
+        );
     }
 
     #[test]
-    fn test_resolve_environment_with_spaces_returns_error() {
-        // "has spaces" contains space characters — rejected by validation.
-        with_environment_var(Some("has spaces"), || {
-            let result = resolve_environment();
-            assert!(
-                result.is_err(),
-                "environment string with spaces must be rejected"
-            );
-            let err_msg = result.unwrap_err().to_string();
-            assert!(
-                err_msg.contains("invalid characters"),
-                "error message should mention invalid characters, got: {err_msg}"
-            );
-        });
+    fn test_validate_environment_spaces_returns_error() {
+        let result = validate_environment("has spaces");
+        assert!(
+            result.is_err(),
+            "environment string with spaces must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid characters"),
+            "error message should mention invalid characters, got: {err_msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -401,66 +358,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_environment — additional edge cases
+    // validate_environment — additional edge cases
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_resolve_environment_with_valid_custom_value() {
-        with_environment_var(Some("staging"), || {
-            let env = resolve_environment().expect("'staging' should be valid");
-            assert_eq!(env, "staging");
-        });
+    fn test_validate_environment_staging() {
+        let env = validate_environment("staging").expect("'staging' should be valid");
+        assert_eq!(env, "staging");
     }
 
     #[test]
-    fn test_resolve_environment_with_hyphenated_value() {
-        with_environment_var(Some("pre-prod"), || {
-            let env = resolve_environment().expect("'pre-prod' should be valid");
-            assert_eq!(env, "pre-prod");
-        });
+    fn test_validate_environment_hyphenated() {
+        let env = validate_environment("pre-prod").expect("'pre-prod' should be valid");
+        assert_eq!(env, "pre-prod");
     }
 
     #[test]
-    fn test_resolve_environment_with_numeric_value() {
-        with_environment_var(Some("env1"), || {
-            let env = resolve_environment().expect("'env1' should be valid");
-            assert_eq!(env, "env1");
-        });
+    fn test_validate_environment_numeric() {
+        let env = validate_environment("env1").expect("'env1' should be valid");
+        assert_eq!(env, "env1");
     }
 
     #[test]
-    fn test_resolve_environment_with_uppercase() {
-        with_environment_var(Some("PROD"), || {
-            let env = resolve_environment().expect("'PROD' should be valid");
-            assert_eq!(env, "PROD");
-        });
+    fn test_validate_environment_uppercase() {
+        let env = validate_environment("PROD").expect("'PROD' should be valid");
+        assert_eq!(env, "PROD");
     }
 
     #[test]
-    fn test_resolve_environment_with_underscore_returns_error() {
-        with_environment_var(Some("pre_prod"), || {
-            let result = resolve_environment();
-            assert!(
-                result.is_err(),
-                "underscore in environment string must be rejected"
-            );
-        });
+    fn test_validate_environment_underscore_returns_error() {
+        let result = validate_environment("pre_prod");
+        assert!(
+            result.is_err(),
+            "underscore in environment string must be rejected"
+        );
     }
 
     #[test]
-    fn test_resolve_environment_with_special_chars_returns_error() {
-        with_environment_var(Some("dev;rm -rf /"), || {
-            let result = resolve_environment();
-            assert!(result.is_err(), "special characters must be rejected");
-        });
+    fn test_validate_environment_special_chars_returns_error() {
+        let result = validate_environment("dev;rm -rf /");
+        assert!(result.is_err(), "special characters must be rejected");
     }
 
     #[test]
-    fn test_resolve_environment_with_unicode_returns_error() {
-        with_environment_var(Some("dev\u{00e9}"), || {
-            let result = resolve_environment();
-            assert!(result.is_err(), "non-ASCII characters must be rejected");
-        });
+    fn test_validate_environment_unicode_returns_error() {
+        let result = validate_environment("dev\u{00e9}");
+        assert!(result.is_err(), "non-ASCII characters must be rejected");
     }
 
     // -----------------------------------------------------------------------
@@ -566,7 +509,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_dhan_credentials_returns_error_without_real_ssm() {
-        with_environment_var(Some("test-env"), || {});
         let result = fetch_dhan_credentials().await;
         assert!(
             result.is_err(),
@@ -595,48 +537,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_resolve_environment_with_single_char() {
-        with_environment_var(Some("a"), || {
-            let env = resolve_environment().expect("single char should be valid");
-            assert_eq!(env, "a");
-        });
+    fn test_validate_environment_single_char() {
+        let env = validate_environment("a").expect("single char should be valid");
+        assert_eq!(env, "a");
     }
 
     #[test]
-    fn test_resolve_environment_with_all_digits() {
-        with_environment_var(Some("123"), || {
-            let env = resolve_environment().expect("all-digit string should be valid");
-            assert_eq!(env, "123");
-        });
+    fn test_validate_environment_all_digits() {
+        let env = validate_environment("123").expect("all-digit string should be valid");
+        assert_eq!(env, "123");
     }
 
     #[test]
-    fn test_resolve_environment_with_leading_hyphen() {
-        with_environment_var(Some("-dev"), || {
-            let env = resolve_environment().expect("leading hyphen should be valid");
-            assert_eq!(env, "-dev");
-        });
+    fn test_validate_environment_leading_hyphen() {
+        let env = validate_environment("-dev").expect("leading hyphen should be valid");
+        assert_eq!(env, "-dev");
     }
 
     #[test]
-    fn test_resolve_environment_with_newline_returns_error() {
-        with_environment_var(Some("dev\ninjection"), || {
-            let result = resolve_environment();
-            assert!(
-                result.is_err(),
-                "newline in environment string must be rejected"
-            );
-        });
+    fn test_validate_environment_newline_returns_error() {
+        let result = validate_environment("dev\ninjection");
+        assert!(
+            result.is_err(),
+            "newline in environment string must be rejected"
+        );
     }
 
     #[test]
-    fn test_resolve_environment_with_tab_returns_error() {
-        with_environment_var(Some("dev\ttest"), || {
-            let result = resolve_environment();
-            assert!(
-                result.is_err(),
-                "tab in environment string must be rejected"
-            );
-        });
+    fn test_validate_environment_tab_returns_error() {
+        let result = validate_environment("dev\ttest");
+        assert!(
+            result.is_err(),
+            "tab in environment string must be rejected"
+        );
     }
 }
