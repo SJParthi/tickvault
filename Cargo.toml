@@ -42,15 +42,15 @@ hdrhistogram = "7.5.4"
 quanta = "0.12.5"
 
 # ---- Section 5: Observability — OpenTelemetry ----
-# Versions pinned to 0.30.0 to match tracing-opentelemetry 0.31.0 (which depends on opentelemetry 0.30.0)
+# Versions pinned to 0.31.0 to match tracing-opentelemetry 0.32.1 (which depends on opentelemetry 0.31.0)
 opentelemetry = "0.31.0"
-opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.30.0", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.31.0"
+tracing-opentelemetry = "0.32.1"
 
 # ---- Section 6: Trading Domain — Auth ----
 arc-swap = "1.7.1"
