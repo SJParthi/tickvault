@@ -95,3 +95,36 @@ where
 
     Ok(Some((layer, provider)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dhan_live_trader_common::config::ObservabilityConfig;
+
+    fn disabled_config() -> ObservabilityConfig {
+        ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: String::new(),
+            metrics_enabled: false,
+            tracing_enabled: false,
+        }
+    }
+
+    #[test]
+    fn init_metrics_disabled_returns_ok() {
+        let config = disabled_config();
+        let result = init_metrics(&config);
+        assert!(result.is_ok(), "disabled metrics should return Ok");
+    }
+
+    #[test]
+    fn init_tracing_disabled_returns_none() {
+        let config = disabled_config();
+        let result = init_tracing::<tracing_subscriber::Registry>(&config);
+        assert!(result.is_ok(), "disabled tracing should return Ok");
+        assert!(
+            result.unwrap().is_none(),
+            "disabled tracing should return None"
+        );
+    }
+}
