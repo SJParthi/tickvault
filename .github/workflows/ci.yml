@@ -159,7 +159,15 @@ jobs:
 
       # ---- Stage 3: Test ----
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace 2>&1 | tee /tmp/test-output.txt
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: test-output
+          path: /tmp/test-output.txt
+          retention-days: 7
 
   # ---- Job 2: Security & Audit (parallel after build-and-verify) ----
   security-and-audit:
