@@ -1749,4 +1749,136 @@ mod tests {
             "some stock derivatives should be skipped due to capacity limit"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Single-element option chain (call_count=1, put_count=1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_single_element_option_chain() {
+        let mut universe = make_test_universe();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 30).unwrap();
+
+        // Replace RELIANCE chain with single call + single put
+        let key = OptionChainKey {
+            underlying_symbol: "RELIANCE".to_owned(),
+            expiry_date: expiry,
+        };
+        universe.option_chains.insert(
+            key,
+            OptionChain {
+                underlying_symbol: "RELIANCE".to_owned(),
+                expiry_date: expiry,
+                calls: vec![OptionChainEntry {
+                    security_id: 80001,
+                    strike_price: 2500.0,
+                    lot_size: 500,
+                }],
+                puts: vec![OptionChainEntry {
+                    security_id: 80002,
+                    strike_price: 2500.0,
+                    lot_size: 500,
+                }],
+                future_security_id: Some(60001),
+            },
+        );
+
+        let config = SubscriptionConfig::default();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // Single call + single put should be subscribed (mid_idx=0 for both)
+        assert!(
+            plan.summary.stock_derivatives >= 3,
+            "future + 1 call + 1 put = at least 3 stock derivatives, got {}",
+            plan.summary.stock_derivatives
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Option chain with future_security_id = None
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_option_chain_without_future_still_has_options() {
+        let mut universe = make_test_universe();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 30).unwrap();
+
+        // Set future_security_id to None for RELIANCE chain
+        let key = OptionChainKey {
+            underlying_symbol: "RELIANCE".to_owned(),
+            expiry_date: expiry,
+        };
+        if let Some(chain) = universe.option_chains.get_mut(&key) {
+            chain.future_security_id = None;
+        }
+
+        let config = SubscriptionConfig::default();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // Should still include options even without a future linked in the chain
+        assert!(
+            plan.summary.stock_derivatives > 0,
+            "options should still be subscribed when future_security_id is None"
+        );
+        // The future may still be picked up from Stage 5 progressive fill
+        // (it exists in derivative_contracts). The key behavior is: no panic, options still work.
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants: DISPLAY_INDEX_ENTRIES subcategory strings are valid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_display_index_entries_all_subcategories_recognized() {
+        let valid = [
+            "Volatility",
+            "BroadMarket",
+            "MidCap",
+            "SmallCap",
+            "Sectoral",
+            "Thematic",
+        ];
+        use dhan_live_trader_common::constants::DISPLAY_INDEX_ENTRIES;
+        for &(name, _id, subcategory) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                valid.contains(&subcategory),
+                "DISPLAY_INDEX_ENTRIES has unrecognized subcategory '{}' for '{}'",
+                subcategory,
+                name
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants: DISPLAY_INDEX_ENTRIES security IDs are non-zero
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_display_index_entries_security_ids_non_zero() {
+        use dhan_live_trader_common::constants::DISPLAY_INDEX_ENTRIES;
+        for &(name, security_id, _) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                security_id > 0,
+                "DISPLAY_INDEX_ENTRIES has zero security_id for '{}'",
+                name
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants: DISPLAY_INDEX_ENTRIES names are non-empty
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_display_index_entries_names_non_empty() {
+        use dhan_live_trader_common::constants::DISPLAY_INDEX_ENTRIES;
+        for &(name, _, _) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                !name.trim().is_empty(),
+                "DISPLAY_INDEX_ENTRIES has empty name"
+            );
+        }
+    }
 }

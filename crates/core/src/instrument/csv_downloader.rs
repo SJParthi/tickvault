@@ -889,4 +889,162 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_dir).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Boundary: body exactly INSTRUMENT_CSV_MIN_BYTES
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_with_retry_body_exactly_min_bytes_succeeds() {
+        // Boundary: body.len() == INSTRUMENT_CSV_MIN_BYTES → should succeed
+        // (check is `<`, not `<=`)
+        let body = "X".repeat(INSTRUMENT_CSV_MIN_BYTES);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let body_clone = body.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body_clone.len(),
+                body_clone
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/test", addr);
+        let result = download_with_retry(&client, &url).await;
+
+        assert!(
+            result.is_ok(),
+            "body exactly MIN_BYTES should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), INSTRUMENT_CSV_MIN_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_body_one_below_min_bytes_fails() {
+        // Boundary: body.len() == INSTRUMENT_CSV_MIN_BYTES - 1 → should fail
+        let body = "X".repeat(INSTRUMENT_CSV_MIN_BYTES - 1);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let body_clone = body.clone();
+        tokio::spawn(async move {
+            // Accept multiple connections (retries)
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body_clone.len(),
+                    body_clone
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/test", addr);
+        let result = download_with_retry(&client, &url).await;
+
+        assert!(result.is_err(), "body one below MIN_BYTES should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too small"),
+            "error must mention too small: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // read_cache: invalid UTF-8
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_cache_invalid_utf8_returns_error() {
+        let temp_dir = env::temp_dir().join("dlt-test-csv-invalid-utf8");
+        let _ = fs::create_dir_all(&temp_dir).await;
+        let cache_path = temp_dir.join("bad-utf8.csv");
+
+        // Write invalid UTF-8 bytes (0xFF repeated) that exceed MIN_BYTES
+        let mut bad_bytes = vec![0xFF_u8; INSTRUMENT_CSV_MIN_BYTES + 100];
+        // Ensure it's actually invalid UTF-8
+        bad_bytes[0] = 0xC0;
+        bad_bytes[1] = 0x01; // Invalid continuation byte
+        fs::write(&cache_path, &bad_bytes).await.unwrap();
+
+        let result = read_cache(&cache_path).await;
+        assert!(
+            result.is_err(),
+            "invalid UTF-8 should produce an error from fs::read_to_string"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // download_with_retry: HTTP 502/503 variants
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_with_retry_http_502_bad_gateway_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/test", addr);
+        let result = download_with_retry(&client, &url).await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("502"),
+            "error must contain status code: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // load_cached_csv: source field is "cache"
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_load_cached_csv_source_field_is_cache() {
+        let temp_dir = env::temp_dir().join("dlt-test-load-cached-source");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let cache_filename = "source-check.csv";
+
+        let fake_csv = "S".repeat(INSTRUMENT_CSV_MIN_BYTES + 1);
+        write_cache(cache_dir, cache_filename, &fake_csv).await;
+
+        let result = load_cached_csv(cache_dir, cache_filename).await.unwrap();
+        assert_eq!(result.source, "cache");
+        assert_eq!(result.csv_text.len(), fake_csv.len());
+
+        let _ = fs::remove_dir_all(&temp_dir).await;
+    }
 }
