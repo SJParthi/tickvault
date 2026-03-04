@@ -13,6 +13,7 @@ use dhan_live_trader_common::constants::{
 use dhan_live_trader_core::parser::dispatcher::dispatch_frame;
 
 /// Build a minimal valid binary packet.
+#[allow(clippy::indexing_slicing, clippy::as_conversions)]
 fn build_packet(response_code: u8, size: usize, segment: u8, security_id: u32) -> Vec<u8> {
     let mut buf = vec![0u8; size];
     buf[0] = response_code;
