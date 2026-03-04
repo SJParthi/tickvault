@@ -120,7 +120,20 @@ install_tool_if_missing "typos" "typos-cli"
 # 3. Run the full observability setup (SSM + Docker + health checks)
 echo ""
 echo -e "${CYAN}Starting infrastructure (Docker + AWS SSM + health checks)...${NC}"
-bash "${SCRIPT_DIR}/setup-observability.sh" --no-open
+if ! bash "${SCRIPT_DIR}/setup-observability.sh" --no-open; then
+    echo ""
+    echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  Observability stack setup failed. See errors above.       ║${NC}"
+    echo -e "${RED}║                                                            ║${NC}"
+    echo -e "${RED}║  Quick checks:                                             ║${NC}"
+    echo -e "${RED}║  1. Docker running?  docker info                           ║${NC}"
+    echo -e "${RED}║  2. Port conflict?   lsof -i :9000 :8812 :3000 :80        ║${NC}"
+    echo -e "${RED}║  3. AWS creds?       aws sts get-caller-identity           ║${NC}"
+    echo -e "${RED}║  4. Clean restart?   docker compose \\                      ║${NC}"
+    echo -e "${RED}║       -f deploy/docker/docker-compose.yml down -v          ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
+    exit 1
+fi
 
 # 4. Create QuestDB tables (idempotent)
 echo ""
