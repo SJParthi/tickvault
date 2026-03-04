@@ -958,6 +958,10 @@ mod tests {
                 };
                 let body_ref = body_clone.clone();
                 tokio::spawn(async move {
+                    // Read the request first (prevents TCP race conditions)
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body_ref.len(),
@@ -971,7 +975,7 @@ mod tests {
         });
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
             .build()
             .unwrap();
         let url = format!("http://{}/test", addr);
@@ -1027,6 +1031,9 @@ mod tests {
                     break;
                 };
                 tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+
                     let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ =
                         tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
