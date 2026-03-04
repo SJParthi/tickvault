@@ -1,17 +1,20 @@
 # =============================================================================
-# dhan-live-trader — CI Pipeline (6 Stages)
+# dhan-live-trader — CI Pipeline (Optimized: 3 Jobs)
 # =============================================================================
-# Runs on every push to main/develop and every PR.
-# All 6 stages must pass. Failure = build is RED. No merging.
+# Runs on every push to main/develop and every PR — but ONLY for code changes.
+# All checks must pass. Failure = build is RED. No merging.
 #
-# Stages:
-#   1. Compile    — cargo build --release + binary size check
-#   2. Lint       — cargo fmt + clippy (trading safety) + docs + typos + unused deps
-#   3. Test       — cargo test --workspace
-#   4. Security   — cargo deny check (advisories, licenses, bans, sources)
-#   5. Perf       — cargo bench + budget gate + DHAT (parallel after test)
-#   6. Coverage   — cargo llvm-cov (enforce 99% threshold) (parallel after test)
-#   7. Audit      — cargo audit --deny yanked --deny warnings (parallel after test)
+# Jobs:
+#   1. Build & Verify — compile + fmt + clippy + docs + typos + machete + test
+#   2. Security & Audit — cargo deny + cargo audit (parallel after Job 1)
+#   3. Coverage & Perf — llvm-cov + bench + DHAT (parallel after Job 1)
+#   + Commit Lint (PR only, lightweight, parallel)
+#
+# Checks preserved (all 14):
+#   cargo build --release, binary size gate, cargo fmt, clippy (strict),
+#   clippy (trading safety), cargo doc, doc tests, typos, cargo machete,
+#   cargo test, cargo deny, cargo audit, benchmarks + budget gate,
+#   DHAT zero-alloc, llvm-cov 99% gate
 #
 # Security: All actions pinned to SHA. No mutable tags.
 # =============================================================================
@@ -21,8 +24,22 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'
+      - 'deny.toml'
+      - '.github/workflows/ci.yml'
   pull_request:
     branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'
+      - 'deny.toml'
+      - '.github/workflows/ci.yml'
 
 # Least-privilege: read-only by default
 permissions:
@@ -38,11 +55,12 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ---- Commit Lint (parallel, no deps) ----
+  # ---- Commit Lint (PR only, lightweight, parallel) ----
   commit-lint:
     name: "Commit Lint"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -69,11 +87,11 @@ jobs:
           fi
           echo "All commit messages follow conventional format."
 
-  # ---- Stage 1: Compile ----
-  compile:
-    name: "Stage 1 — Compile"
+  # ---- Job 1: Build & Verify (compile + lint + test — one runner) ----
+  build-and-verify:
+    name: "Build & Verify"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -88,30 +106,14 @@ jobs:
         with:
           cache-on-failure: true
 
+      # ---- Stage 1: Compile ----
       - name: Build (release)
         run: cargo build --release --workspace
 
       - name: Binary size gate (<15MB scratch Docker constraint)
         run: bash scripts/binary-size-gate.sh
 
-  # ---- Stage 2: Lint ----
-  lint:
-    name: "Stage 2 — Lint"
-    needs: compile
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: "1.93.1"
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
+      # ---- Stage 2: Lint ----
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -155,30 +157,14 @@ jobs:
             echo "::warning::Unused dependencies found — cleanup when crate code is complete"
           fi
 
-  # ---- Stage 3: Test ----
-  test:
-    name: "Stage 3 — Test"
-    needs: lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: "1.93.1"
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
+      # ---- Stage 3: Test ----
       - name: Run tests
         run: cargo test --workspace
 
-  # ---- Stage 4: Security (parallel after test) ----
-  security:
-    name: "Stage 4 — Security"
-    needs: test
+  # ---- Job 2: Security & Audit (parallel after build-and-verify) ----
+  security-and-audit:
+    name: "Security & Audit"
+    needs: build-and-verify
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -198,12 +184,27 @@ jobs:
       - name: Supply chain check (CVEs + licenses + bans + sources + duplicates)
         run: cargo deny check
 
-  # ---- Stage 5: Performance (parallel after test) ----
-  performance:
-    name: "Stage 5 — Performance"
-    needs: test
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-audit
+        with:
+          tool: cargo-audit
+
+      - name: Audit (yanked crates — hard block)
+        run: cargo audit --deny yanked
+
+      - name: Audit advisories (warn only — CVEs already checked by cargo deny)
+        run: |
+          cargo audit 2>&1 | tee /tmp/audit.txt || true
+          if grep -q 'warning\|vulnerability' /tmp/audit.txt; then
+            echo "::warning::Security advisories found — review and update dependencies"
+          fi
+
+  # ---- Job 3: Coverage & Performance (parallel after build-and-verify) ----
+  coverage-and-perf:
+    name: "Coverage & Perf"
+    needs: build-and-verify
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -211,10 +212,12 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: "1.93.1"
+          components: llvm-tools-preview
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
+      # ---- Performance ----
       - name: Run benchmarks (if any exist)
         run: |
           BENCH_FILES=$(find . -path "*/benches/*.rs" -type f 2>/dev/null | head -1)
@@ -236,24 +239,7 @@ jobs:
             echo "No DHAT tests found — skipping."
           fi
 
-  # ---- Stage 6: Coverage (parallel after test) ----
-  coverage:
-    name: "Stage 6 — Coverage"
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: "1.93.1"
-          components: llvm-tools-preview
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
+      # ---- Coverage ----
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-llvm-cov
         with:
@@ -288,34 +274,3 @@ jobs:
           name: coverage-report
           path: target/llvm-cov/
           retention-days: 30
-
-  # ---- Stage 7: Audit (parallel after test) ----
-  audit:
-    name: "Stage 7 — Audit"
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: "1.93.1"
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-audit
-        with:
-          tool: cargo-audit
-
-      - name: Audit (yanked crates — hard block)
-        run: cargo audit --deny yanked
-
-      - name: Audit advisories (warn only — CVEs already checked by cargo deny in Stage 4)
-        run: |
-          cargo audit 2>&1 | tee /tmp/audit.txt || true
-          if grep -q 'warning\|vulnerability' /tmp/audit.txt; then
-            echo "::warning::Security advisories found — review and update dependencies"
-          fi
