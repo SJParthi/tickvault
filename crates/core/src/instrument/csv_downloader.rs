@@ -56,7 +56,7 @@ pub async fn download_instrument_csv(
         .context("failed to build HTTP client for CSV download")?;
 
     // Try primary URL
-    match download_with_retry(&client, primary_url).await {
+    let primary_error = match download_with_retry(&client, primary_url).await {
         Ok(csv_text) => {
             info!(
                 url = primary_url,
@@ -69,17 +69,18 @@ pub async fn download_instrument_csv(
                 source: "primary".to_owned(),
             });
         }
-        Err(primary_error) => {
+        Err(err) => {
             warn!(
                 url = primary_url,
-                %primary_error,
+                %err,
                 "primary CSV download failed, trying fallback"
             );
+            err
         }
-    }
+    };
 
     // Try fallback URL
-    match download_with_retry(&client, fallback_url).await {
+    let fallback_error = match download_with_retry(&client, fallback_url).await {
         Ok(csv_text) => {
             info!(
                 url = fallback_url,
@@ -92,14 +93,15 @@ pub async fn download_instrument_csv(
                 source: "fallback".to_owned(),
             });
         }
-        Err(fallback_error) => {
+        Err(err) => {
             warn!(
                 url = fallback_url,
-                %fallback_error,
+                %err,
                 "fallback CSV download failed, trying cache"
             );
+            err
         }
-    }
+    };
 
     // Try cached file
     let cache_path = PathBuf::from(cache_dir).join(cache_filename);
@@ -118,8 +120,8 @@ pub async fn download_instrument_csv(
         Err(cache_error) => {
             bail!(ApplicationError::InstrumentDownloadFailed {
                 reason: format!(
-                    "all sources failed — primary, fallback, and cache ({})",
-                    cache_error
+                    "all sources failed — primary: {}, fallback: {}, cache: {}",
+                    primary_error, fallback_error, cache_error
                 ),
             });
         }

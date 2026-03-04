@@ -93,6 +93,9 @@ pub struct ParsedInstrumentRow {
 /// # Returns
 /// Tuple of (total_csv_rows, filtered_rows).
 pub fn parse_instrument_csv(csv_text: &str) -> Result<(usize, Vec<ParsedInstrumentRow>)> {
+    // Strip UTF-8 BOM if present (Windows editors / some HTTP servers prepend it)
+    let csv_text = csv_text.strip_prefix('\u{FEFF}').unwrap_or(csv_text);
+
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true) // Dhan CSV has trailing comma → extra empty field
@@ -1162,6 +1165,22 @@ mod tests {
         // Completely empty CSV — no header
         let result = parse_instrument_csv("");
         assert!(result.is_err(), "empty CSV should fail");
+    }
+
+    #[test]
+    fn test_parse_instrument_csv_with_bom_prefix_succeeds() {
+        // UTF-8 BOM (\xEF\xBB\xBF = U+FEFF) prepended to header — must be stripped
+        let csv_text = format!("\u{FEFF}{}", build_mock_csv_header());
+        let result = parse_instrument_csv(&csv_text);
+        // Header-only with 0 rows triggers min-row check, NOT column-missing error.
+        // This proves BOM was stripped (column detection succeeded).
+        assert!(result.is_err(), "should fail due to min rows, not BOM");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("rows"),
+            "error should be about row count (not missing column): {}",
+            err_msg
+        );
     }
 
     #[test]
