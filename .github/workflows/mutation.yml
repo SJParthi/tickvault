@@ -11,8 +11,11 @@
 name: Mutation Testing
 
 on:
+  schedule:
+    - cron: '0 3 * * *'  # Nightly at 3 AM UTC — catches untested code without blocking PRs
+  workflow_dispatch: # Manual trigger for on-demand mutation testing
   pull_request:
-    branches: [main, develop]
+    branches: [main]    # Only gate main merges, not develop (saves ~50% runs)
     paths:
       - 'crates/core/**/*.rs'
       - 'crates/trading/**/*.rs'

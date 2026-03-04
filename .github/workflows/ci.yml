@@ -247,8 +247,9 @@ jobs:
 
       - name: Run coverage (workspace — collect JSON + LCOV)
         run: |
+          mkdir -p target/llvm-cov
           cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
-          cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
 
       - name: Enforce 99% workspace coverage (HARD FAIL)
         run: |
