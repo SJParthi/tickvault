@@ -1,13 +1,13 @@
-//! Three-layer instrument defense: Time Gate + Freshness Marker + Manual API.
+//! Three-layer instrument defense: Freshness Marker + Time Gate + Manual API.
 //!
 //! Ensures instruments build ONCE at 8:30 AM boot. During trading-hours
-//! restarts, zero overhead — not even a file read.
+//! restarts, cache loads instantly — no time gate blocks recovery.
 //!
 //! # Three Layers
-//! 1. **Time Gate** — sub-nanosecond integer comparison. Outside [08:25, 08:55]
-//!    IST? Skip entirely.
-//! 2. **Freshness Marker** — one file read (~100μs). Already built today? Load
-//!    from cache, skip download + persist.
+//! 1. **Freshness Marker** — one file read (~100μs). Already built today? Load
+//!    from cache unconditionally. Crash at 10:30? Instant recovery.
+//! 2. **Time Gate** — sub-nanosecond integer comparison. Outside [08:25, 08:55]
+//!    IST? Try stale cache as fallback. Only gates fresh downloads.
 //! 3. **Manual API** — `POST /api/instruments/rebuild`. Bypasses time gate,
 //!    respects freshness marker (idempotent, one-shot).
 
@@ -29,7 +29,7 @@ use super::universe_builder::build_fno_universe_from_csv;
 use dhan_live_trader_storage::instrument_persistence::persist_instrument_snapshot;
 
 // ---------------------------------------------------------------------------
-// Layer 1: Time Gate
+// Layer 2: Time Gate (only gates downloads, not cache reads)
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if the current IST time is within the build window
@@ -50,7 +50,7 @@ pub fn is_within_build_window(window_start: &str, window_end: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 2: Freshness Marker
+// Layer 1: Freshness Marker (always checked first — enables crash recovery)
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if today's IST date matches the freshness marker file.
@@ -95,30 +95,17 @@ pub fn write_freshness_marker(cache_dir: &str) {
 /// Main entry: three-layer defense instrument loading.
 ///
 /// Returns `Ok(Some((universe, was_fresh_build)))` if instruments were built.
-/// Returns `Ok(None)` if time-gated skip (outside build window).
+/// Returns `Ok(None)` if no instruments available (outside window + no cache).
 ///
 /// `was_fresh_build` is `true` when a full download + persist happened (first
-/// build of the day). `false` when loaded from cache (marker was fresh).
+/// build of the day). `false` when loaded from cache (fresh or stale).
 pub async fn load_or_build_instruments(
     dhan_csv_url: &str,
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
 ) -> Result<Option<(FnoUniverse, bool)>> {
-    // Layer 1: Time gate
-    if !is_within_build_window(
-        &instrument_config.build_window_start,
-        &instrument_config.build_window_end,
-    ) {
-        info!(
-            window_start = %instrument_config.build_window_start,
-            window_end = %instrument_config.build_window_end,
-            "instruments: TIME-GATED SKIP (outside build window)"
-        );
-        return Ok(None);
-    }
-
-    // Layer 2: Freshness marker
+    // Layer 1: Freshness marker — always checked first (enables crash recovery)
     if is_instrument_fresh(&instrument_config.csv_cache_directory) {
         info!("instruments: loading from cache (freshness marker = today)");
         let download_result = load_cached_csv(
@@ -135,7 +122,42 @@ pub async fn load_or_build_instruments(
         return Ok(Some((universe, false)));
     }
 
-    // Full build: download → parse → build → persist → marker
+    // Layer 2: Time gate — only gates downloads, not cache reads
+    if !is_within_build_window(
+        &instrument_config.build_window_start,
+        &instrument_config.build_window_end,
+    ) {
+        // Outside window + no fresh marker → try stale cache as fallback
+        match load_cached_csv(
+            &instrument_config.csv_cache_directory,
+            &instrument_config.csv_cache_filename,
+        )
+        .await
+        {
+            Ok(download_result) => {
+                warn!(
+                    window_start = %instrument_config.build_window_start,
+                    window_end = %instrument_config.build_window_end,
+                    "instruments: outside build window, using STALE cached CSV as fallback"
+                );
+                let universe =
+                    build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+                        .context("failed to build universe from stale cached CSV")?;
+
+                return Ok(Some((universe, false)));
+            }
+            Err(_) => {
+                info!(
+                    window_start = %instrument_config.build_window_start,
+                    window_end = %instrument_config.build_window_end,
+                    "instruments: TIME-GATED SKIP (outside build window, no cache available)"
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    // Layer 3: Full build — within window + not fresh → download → parse → persist → marker
     info!("instruments: full build (no freshness marker for today)");
     let download_result = download_instrument_csv(
         dhan_csv_url,

@@ -227,7 +227,7 @@ pub async fn load_cached_csv(cache_dir: &str, cache_filename: &str) -> Result<Cs
     info!(
         path = %cache_path.display(),
         bytes = csv_text.len(),
-        "instrument CSV loaded from cache (freshness marker = today)"
+        "instrument CSV loaded from cache"
     );
     Ok(CsvDownloadResult {
         csv_text,
