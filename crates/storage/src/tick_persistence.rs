@@ -163,6 +163,17 @@ impl TickPersistenceWriter {
 ///
 /// Converts the IST-naive exchange timestamp to proper UTC by subtracting
 /// the IST offset (5h30m = 19800s), then writes all tick fields into the buffer.
+/// Rounds an f32 price to 2 decimal places when widening to f64.
+///
+/// Dhan sends prices as f32 (IEEE 754 binary32). Values like 694.05 cannot be
+/// represented exactly in f32 → the nearest f32 is 694.04998779296875. When widened
+/// to f64 via `f64::from(f32)`, QuestDB displays all 16 digits of the artifact.
+/// Rounding to 2 decimals restores the intended paise-precision price.
+#[inline(always)]
+fn f32_price_to_f64(value: f32) -> f64 {
+    (f64::from(value) * 100.0).round() / 100.0
+}
+
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     // Dhan V2 sends exchange_timestamp as IST-naive epoch: the IST clock time
     // (e.g., 09:25:32 IST) encoded as if it were UTC epoch seconds. To store as
@@ -178,21 +189,21 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("segment")?
         .column_i64("security_id", i64::from(tick.security_id))
         .context("security_id")?
-        .column_f64("ltp", f64::from(tick.last_traded_price))
+        .column_f64("ltp", f32_price_to_f64(tick.last_traded_price))
         .context("ltp")?
-        .column_f64("open", f64::from(tick.day_open))
+        .column_f64("open", f32_price_to_f64(tick.day_open))
         .context("open")?
-        .column_f64("high", f64::from(tick.day_high))
+        .column_f64("high", f32_price_to_f64(tick.day_high))
         .context("high")?
-        .column_f64("low", f64::from(tick.day_low))
+        .column_f64("low", f32_price_to_f64(tick.day_low))
         .context("low")?
-        .column_f64("close", f64::from(tick.day_close))
+        .column_f64("close", f32_price_to_f64(tick.day_close))
         .context("close")?
         .column_i64("volume", i64::from(tick.volume))
         .context("volume")?
         .column_i64("oi", i64::from(tick.open_interest))
         .context("oi")?
-        .column_f64("avg_price", f64::from(tick.average_traded_price))
+        .column_f64("avg_price", f32_price_to_f64(tick.average_traded_price))
         .context("avg_price")?
         .column_i64("last_trade_qty", i64::from(tick.last_trade_quantity))
         .context("last_trade_qty")?
