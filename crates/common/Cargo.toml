@@ -12,6 +12,7 @@ toml = { workspace = true }
 figment = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+rkyv = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

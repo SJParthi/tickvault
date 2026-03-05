@@ -7,6 +7,7 @@
 //! # Boot Sequence Position
 //! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
+pub mod binary_cache;
 pub mod csv_downloader;
 pub mod csv_parser;
 pub mod diagnostic;

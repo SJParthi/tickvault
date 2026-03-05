@@ -351,6 +351,10 @@ pub const INSTRUMENT_CSV_RETRY_MAX_DELAY_MS: u64 = 8000;
 /// Written on successful build; contains today's IST date as `YYYY-MM-DD`.
 pub const INSTRUMENT_FRESHNESS_MARKER_FILENAME: &str = "instrument-build-date.txt";
 
+/// Filename for the rkyv binary cache of `FnoUniverse`.
+/// Written alongside CSV cache; loaded first on market-hours restart for sub-ms recovery.
+pub const BINARY_CACHE_FILENAME: &str = "fno-universe.rkyv";
+
 // ---------------------------------------------------------------------------
 // Instrument CSV — Column Names (for auto-detection from header)
 // ---------------------------------------------------------------------------

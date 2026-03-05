@@ -174,6 +174,7 @@
 | 74 | rustfmt | Built-in | Code formatting: cargo fmt --check in CI |
 | 75 | totp-rs | 5.7.0 | TOTP 2FA: Dhan mandatory login |
 | 76 | bitcode | 0.6.9 | Binary serialization: compact state snapshots |
+| 77 | rkyv | 0.8.15 | Zero-copy deserialization: sub-ms instrument universe loading |
 
 > **API note:** secrecy 0.10.3 uses `SecretString` (= `SecretBox<str>`), NOT `Secret<T>`.
 > Create via `SecretString::from(string)`. `expose_secret()` returns `&str`.
