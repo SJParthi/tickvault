@@ -270,4 +270,3 @@ services:
       start_period: 10s
     networks:
       - dlt-network
-
