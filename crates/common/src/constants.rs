@@ -728,6 +728,12 @@ pub const DISCONNECT_OFFSET_CODE: usize = 8;
 /// QuestDB table: raw tick data from WebSocket feed.
 pub const QUESTDB_TABLE_TICKS: &str = "ticks";
 
+/// QuestDB table: 5-level market depth snapshots from Full (code 8) and Market Depth (code 3) packets.
+pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
+
+/// QuestDB table: previous close reference data from code 6 packets.
+pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
+
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants
 // ---------------------------------------------------------------------------
@@ -737,6 +743,10 @@ pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
 
 /// Default tick flush interval in milliseconds.
 pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
+
+/// Default depth batch flush size for QuestDB ILP writes.
+/// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
+pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Validation Constants

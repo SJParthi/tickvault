@@ -19,7 +19,9 @@ use dhan_live_trader_common::constants::MINIMUM_VALID_EXCHANGE_TIMESTAMP;
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 
-use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
+use dhan_live_trader_storage::tick_persistence::{
+    DepthPersistenceWriter, TickPersistenceWriter, build_previous_close_row,
+};
 
 /// Runs the tick processing pipeline until the frame receiver closes.
 ///
@@ -27,10 +29,12 @@ use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
 ///
 /// # Arguments
 /// * `frame_receiver` — raw binary frames from WebSocket pool
-/// * `tick_writer` — batched QuestDB ILP writer (None if QuestDB unavailable)
+/// * `tick_writer` — batched QuestDB ILP writer for ticks (None if QuestDB unavailable)
+/// * `depth_writer` — batched QuestDB ILP writer for market depth (None if QuestDB unavailable)
 pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<Vec<u8>>,
     mut tick_writer: Option<TickPersistenceWriter>,
+    mut depth_writer: Option<DepthPersistenceWriter>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -39,6 +43,11 @@ pub async fn run_tick_processor(
     let m_parse_errors = counter!("dlt_parse_errors_total");
     let m_storage_errors = counter!("dlt_storage_errors_total");
     let m_junk_filtered = counter!("dlt_junk_ticks_filtered_total");
+    let m_depth_snapshots = counter!("dlt_depth_snapshots_total");
+    let m_oi_updates = counter!("dlt_oi_updates_total");
+    let m_prev_close_updates = counter!("dlt_prev_close_updates_total");
+    let m_market_status_updates = counter!("dlt_market_status_updates_total");
+    let m_disconnects = counter!("dlt_disconnect_frames_total");
     let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
     let m_pipeline_active = gauge!("dlt_pipeline_active");
 
@@ -78,7 +87,7 @@ pub async fn run_tick_processor(
 
         // Process based on frame type
         match parsed {
-            ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _) => {
+            ParsedFrame::Tick(tick) => {
                 ticks_processed += 1;
                 m_ticks.increment(1);
 
@@ -124,28 +133,130 @@ pub async fn run_tick_processor(
                     "tick processed"
                 );
             }
+            ParsedFrame::TickWithDepth(tick, depth) => {
+                ticks_processed += 1;
+                m_ticks.increment(1);
+
+                // Filter junk ticks (same criteria as Tick)
+                if tick.last_traded_price <= 0.0
+                    || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
+                {
+                    junk_ticks_filtered += 1;
+                    m_junk_filtered.increment(1);
+                    if junk_ticks_filtered <= 10 {
+                        debug!(
+                            security_id = tick.security_id,
+                            ltp = tick.last_traded_price,
+                            exchange_timestamp = tick.exchange_timestamp,
+                            total_filtered = junk_ticks_filtered,
+                            "junk tick with depth filtered — LTP or timestamp invalid"
+                        );
+                    }
+                    continue;
+                }
+
+                // Persist tick to QuestDB
+                if let Some(ref mut writer) = tick_writer
+                    && let Err(err) = writer.append_tick(&tick)
+                {
+                    storage_errors += 1;
+                    m_storage_errors.increment(1);
+                    if storage_errors <= 100 {
+                        warn!(
+                            ?err,
+                            security_id = tick.security_id,
+                            total_errors = storage_errors,
+                            "failed to append tick to QuestDB"
+                        );
+                    }
+                }
+
+                // Persist 5-level depth to QuestDB (separate table)
+                m_depth_snapshots.increment(1);
+                if let Some(ref mut dw) = depth_writer
+                    && let Err(err) = dw.append_depth(
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.received_at_nanos,
+                        &depth,
+                    )
+                {
+                    storage_errors += 1;
+                    m_storage_errors.increment(1);
+                    if storage_errors <= 100 {
+                        warn!(
+                            ?err,
+                            security_id = tick.security_id,
+                            total_errors = storage_errors,
+                            "failed to append depth to QuestDB"
+                        );
+                    }
+                }
+
+                trace!(
+                    security_id = tick.security_id,
+                    ltp = tick.last_traded_price,
+                    "tick with depth processed"
+                );
+            }
             ParsedFrame::OiUpdate {
                 security_id,
+                exchange_segment_code,
                 open_interest,
-                ..
             } => {
-                debug!(security_id, open_interest, "OI update received");
+                m_oi_updates.increment(1);
+                debug!(
+                    security_id,
+                    exchange_segment_code, open_interest, "OI update received"
+                );
             }
             ParsedFrame::PreviousClose {
                 security_id,
+                exchange_segment_code,
                 previous_close,
-                ..
+                previous_oi,
             } => {
-                debug!(security_id, previous_close, "previous close received");
+                m_prev_close_updates.increment(1);
+
+                // Persist previous close to QuestDB
+                if let Some(ref mut writer) = tick_writer
+                    && let Err(err) = build_previous_close_row(
+                        writer.buffer_mut(),
+                        security_id,
+                        exchange_segment_code,
+                        previous_close,
+                        previous_oi,
+                        received_at_nanos,
+                    )
+                {
+                    storage_errors += 1;
+                    m_storage_errors.increment(1);
+                    if storage_errors <= 100 {
+                        warn!(
+                            ?err,
+                            security_id, "failed to write previous close to QuestDB"
+                        );
+                    }
+                }
+
+                debug!(
+                    security_id,
+                    exchange_segment_code, previous_close, previous_oi, "previous close persisted"
+                );
             }
             ParsedFrame::MarketStatus {
                 exchange_segment_code,
                 security_id,
             } => {
+                m_market_status_updates.increment(1);
                 info!(exchange_segment_code, security_id, "market status update");
             }
             ParsedFrame::Disconnect(code) => {
-                warn!(?code, "disconnect frame received from Dhan");
+                m_disconnects.increment(1);
+                error!(
+                    ?code,
+                    "disconnect frame received from Dhan — connection will be closed by WebSocket layer"
+                );
             }
         }
 
@@ -158,15 +269,25 @@ pub async fn run_tick_processor(
             {
                 warn!(?err, "periodic tick flush failed");
             }
+            if let Some(ref mut dw) = depth_writer
+                && let Err(err) = dw.flush_if_needed()
+            {
+                warn!(?err, "periodic depth flush failed");
+            }
             last_flush_check = Instant::now();
         }
     }
 
-    // Final tick flush to QuestDB
+    // Final flush to QuestDB
     if let Some(ref mut writer) = tick_writer
         && let Err(err) = writer.force_flush()
     {
         error!(?err, "final tick flush failed");
+    }
+    if let Some(ref mut dw) = depth_writer
+        && let Err(err) = dw.force_flush()
+    {
+        error!(?err, "final depth flush failed");
     }
 
     m_pipeline_active.set(0.0);
@@ -215,7 +336,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send a valid ticker frame
@@ -235,7 +356,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send a too-short frame
@@ -257,7 +378,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send a ticker frame with LTP=0.0 — should be filtered (not crash)
@@ -275,7 +396,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send a ticker frame with LTT=0 (epoch 1970) — should be filtered
@@ -293,7 +414,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send junk tick first (LTP=0)
@@ -315,7 +436,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Close immediately
@@ -339,7 +460,7 @@ mod tests {
     async fn test_tick_processor_handles_oi_update() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
         frame_tx.send(frame).await.unwrap();
@@ -352,7 +473,7 @@ mod tests {
     async fn test_tick_processor_handles_previous_close() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
         frame_tx.send(frame).await.unwrap();
@@ -365,7 +486,7 @@ mod tests {
     async fn test_tick_processor_handles_market_status() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
         frame_tx.send(frame).await.unwrap();
@@ -378,7 +499,7 @@ mod tests {
     async fn test_tick_processor_handles_disconnect() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
         // Set disconnect code to 807 (AccessTokenExpired)
@@ -393,7 +514,7 @@ mod tests {
     async fn test_tick_processor_handles_full_quote() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
         // Full quote packet with valid LTP and timestamp
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -414,7 +535,7 @@ mod tests {
         // After 100, the warn! is suppressed; the processor still continues.
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         for _ in 0..105 {
@@ -438,7 +559,7 @@ mod tests {
         // checks `if let Some(ref mut writer)` and falls through.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send a valid tick so frames_processed > 0
@@ -457,7 +578,7 @@ mod tests {
         // Exercise the periodic flush check by sending frames with a gap > 100ms.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send first valid tick
@@ -481,7 +602,7 @@ mod tests {
         // Send > 10 junk ticks to exercise the `if junk_ticks_filtered <= 10` boundary.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         for _ in 0..15 {
@@ -498,7 +619,7 @@ mod tests {
     async fn test_tick_processor_negative_ltp_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // LTP = -1.0 should be filtered as junk
@@ -516,7 +637,7 @@ mod tests {
         // multiple code paths in a single run.
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Parse error (too short)
@@ -565,7 +686,7 @@ mod tests {
         // Send previous_close then market_status in sequence.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         let prev_close = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
@@ -584,7 +705,7 @@ mod tests {
         // Full quote with LTP=0 should be filtered as junk.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -604,7 +725,7 @@ mod tests {
         // Full quote with valid LTP and timestamp should be processed.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -623,7 +744,7 @@ mod tests {
         // Send many valid frames rapidly to verify periodic flush check runs.
         let (frame_tx, frame_rx) = mpsc::channel(500);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         // Send 50 valid frames
@@ -651,7 +772,7 @@ mod tests {
         // Unknown response code (99) should be counted as a parse error.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, None).await;
+            run_tick_processor(frame_rx, None, None).await;
         });
 
         let mut buf = vec![0u8; 8];
@@ -751,7 +872,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, Some(writer)).await;
+            run_tick_processor(frame_rx, Some(writer), None).await;
         });
 
         // Send a valid tick
@@ -789,7 +910,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(200);
 
         let handle = tokio::spawn(async move {
-            run_tick_processor(frame_rx, Some(writer)).await;
+            run_tick_processor(frame_rx, Some(writer), None).await;
         });
 
         // Send valid ticks — they buffer successfully but flush will fail

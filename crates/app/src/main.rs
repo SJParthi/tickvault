@@ -42,7 +42,8 @@ use dhan_live_trader_core::websocket::types::InstrumentSubscription;
 
 use dhan_live_trader_storage::instrument_persistence::ensure_instrument_tables;
 use dhan_live_trader_storage::tick_persistence::{
-    TickPersistenceWriter, ensure_tick_table_dedup_keys,
+    DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
+    ensure_tick_table_dedup_keys,
 };
 
 use dhan_live_trader_api::build_router;
@@ -163,9 +164,10 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 6: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!("setting up QuestDB tables (ticks + instruments)");
+    info!("setting up QuestDB tables (ticks + instruments + depth + previous_close)");
 
     ensure_tick_table_dedup_keys(&config.questdb).await;
+    ensure_depth_and_prev_close_tables(&config.questdb).await;
     ensure_instrument_tables(&config.questdb).await;
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
@@ -177,6 +179,20 @@ async fn main() -> Result<()> {
             warn!(
                 ?err,
                 "QuestDB tick writer unavailable — ticks will not be persisted"
+            );
+            None
+        }
+    };
+
+    let depth_writer = match DepthPersistenceWriter::new(&config.questdb) {
+        Ok(writer) => {
+            info!("QuestDB depth writer connected");
+            Some(writer)
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "QuestDB depth writer unavailable — market depth will not be persisted"
             );
             None
         }
@@ -300,7 +316,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let processor_handle = if let Some(receiver) = frame_receiver {
         let handle = tokio::spawn(async move {
-            run_tick_processor(receiver, tick_writer).await;
+            run_tick_processor(receiver, tick_writer, depth_writer).await;
         });
         info!("tick processor started");
         Some(handle)
