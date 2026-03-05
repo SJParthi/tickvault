@@ -9,9 +9,10 @@
            QuestDB's PG wire protocol doesn't implement pg_catalog system tables,
            so JDBC driver probes for pg_timezone_names, pg_extension, pg_auth_members fail.
            This is expected — QuestDB tables are accessible, these errors are cosmetic. -->
-      <jdbc-url>jdbc:postgresql://localhost:8812/qdb?sslmode=disable&amp;preferQueryMode=simple&amp;currentSchema=public&amp;assumeMinServerVersion=16</jdbc-url>
+      <jdbc-url>jdbc:postgresql://localhost:8812/qdb?sslmode=disable&amp;gssEncMode=disable&amp;preferQueryMode=simple&amp;currentSchema=public&amp;assumeMinServerVersion=16</jdbc-url>
       <jdbc-additional-properties>
         <property name="com.intellij.clouds.kubernetes.db.enabled" value="false" />
+        <property name="com.intellij.sql.introspection.auto" value="false" />
       </jdbc-additional-properties>
       <auth-provider>pgpass</auth-provider>
       <user-name>admin</user-name>

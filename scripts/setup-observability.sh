@@ -252,7 +252,13 @@ else
     if [ "$RESTART" = true ]; then
         step "Tearing down existing stack"
         docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>&1 || true
-        ok "Stack torn down"
+        # Remove Grafana data volume to purge stale provisioning state.
+        # Old Telegram contact point (with empty bot token) persists in Grafana's
+        # SQLite DB even after removing it from alerts.yml — causes crash-loop.
+        # All dashboards/datasources/alerts are defined in provisioning files, so
+        # nothing is lost by clearing the volume.
+        docker volume rm dlt-grafana-data 2>/dev/null || true
+        ok "Stack torn down (Grafana volume reset)"
     else
         step "Checking existing stack state"
         RUNNING=$(docker ps --filter "name=dlt-" --format "{{.Names}}" 2>/dev/null | wc -l | tr -d ' ')
