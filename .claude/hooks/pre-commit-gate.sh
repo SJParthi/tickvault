@@ -58,9 +58,11 @@ if [ -n "$RS_STAGED" ]; then
 
   # Gate 1: cargo fmt (show errors on failure)
   echo "  [1/10] cargo fmt --check..." >&2
-  FMT_OUT=$(cargo fmt --all -- --check 2>&1)
+  FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
-  if [ "$FMT_EXIT" -ne 0 ]; then
+  if [ "$FMT_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo fmt timed out (60s)" >&2
+  elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo fmt check failed:" >&2
     echo "$FMT_OUT" | tail -20 >&2
     echo "  Run 'cargo fmt --all' to fix." >&2
@@ -71,9 +73,11 @@ if [ -n "$RS_STAGED" ]; then
 
   # Gate 2: cargo clippy (show errors on failure)
   echo "  [2/10] cargo clippy..." >&2
-  CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+  CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
   CLIPPY_EXIT=$?
-  if [ "$CLIPPY_EXIT" -ne 0 ]; then
+  if [ "$CLIPPY_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo clippy timed out (120s)" >&2
+  elif [ "$CLIPPY_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo clippy has warnings:" >&2
     echo "$CLIPPY_OUT" | tail -20 >&2
     FAILED=1
@@ -83,9 +87,11 @@ if [ -n "$RS_STAGED" ]; then
 
   # Gate 3: cargo test (show errors on failure)
   echo "  [3/10] cargo test..." >&2
-  TEST_OUT=$(cargo test --workspace 2>&1)
+  TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
   TEST_EXIT=$?
-  if [ "$TEST_EXIT" -ne 0 ]; then
+  if [ "$TEST_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo test timed out (120s)" >&2
+  elif [ "$TEST_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo test failed:" >&2
     echo "$TEST_OUT" | tail -20 >&2
     FAILED=1

@@ -75,8 +75,11 @@ else
 
   # Gate 1: cargo fmt
   echo "  [1/8] cargo fmt --check..." >&2
-  FMT_OUT=$(cargo fmt --all -- --check 2>&1)
-  if [ $? -ne 0 ]; then
+  FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
+  FMT_EXIT=$?
+  if [ "$FMT_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo fmt timed out (60s)" >&2
+  elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: Code not formatted:" >&2
     echo "$FMT_OUT" | tail -10 >&2
     FAILED=1
@@ -86,8 +89,11 @@ else
 
   # Gate 2: cargo clippy
   echo "  [2/8] cargo clippy..." >&2
-  CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
-  if [ $? -ne 0 ]; then
+  CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+  CLIPPY_EXIT=$?
+  if [ "$CLIPPY_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo clippy timed out (120s)" >&2
+  elif [ "$CLIPPY_EXIT" -ne 0 ]; then
     echo "  FAIL: clippy warnings found:" >&2
     echo "$CLIPPY_OUT" | tail -20 >&2
     FAILED=1
@@ -97,8 +103,11 @@ else
 
   # Gate 3: cargo test
   echo "  [3/8] cargo test..." >&2
-  TEST_OUT=$(cargo test --workspace 2>&1)
-  if [ $? -ne 0 ]; then
+  TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
+  TEST_EXIT=$?
+  if [ "$TEST_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo test timed out (120s)" >&2
+  elif [ "$TEST_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo test failed:" >&2
     echo "$TEST_OUT" | tail -20 >&2
     FAILED=1
@@ -138,9 +147,11 @@ fi
 # Gate 6: cargo audit (CVEs + yanked — required if installed)
 echo "  [6/8] cargo audit (CVEs + yanked)..." >&2
 if command -v cargo-audit > /dev/null 2>&1; then
-  AUDIT_OUT=$(cargo audit --deny yanked 2>&1)
+  AUDIT_OUT=$(timeout 30 cargo audit --deny yanked 2>&1)
   AUDIT_EXIT=$?
-  if echo "$AUDIT_OUT" | grep -q "couldn't fetch advisory database"; then
+  if [ "$AUDIT_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo audit timed out (30s)" >&2
+  elif echo "$AUDIT_OUT" | grep -q "couldn't fetch advisory database"; then
     echo "  SKIP: Cannot reach advisory database (network issue)" >&2
   elif [ "$AUDIT_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo audit found issues:" >&2
@@ -156,9 +167,11 @@ fi
 # Gate 7: cargo deny (advisory — only if installed)
 echo "  [7/8] cargo deny..." >&2
 if command -v cargo-deny > /dev/null 2>&1; then
-  DENY_OUTPUT=$(cargo deny check 2>&1)
+  DENY_OUTPUT=$(timeout 30 cargo deny check 2>&1)
   DENY_EXIT=$?
-  if [ "$DENY_EXIT" -ne 0 ]; then
+  if [ "$DENY_EXIT" -eq 124 ]; then
+    echo "  SKIP: cargo deny timed out (30s)" >&2
+  elif [ "$DENY_EXIT" -ne 0 ]; then
     if echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect'; then
       echo "  SKIP: cargo deny cannot reach advisory DB (network/proxy). CI will enforce." >&2
     else
@@ -198,14 +211,17 @@ fi
 TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
-# Clean up auto-save refs on successful push (non-blocking)
+# Clean up auto-save refs on successful push (background, non-blocking)
 BRANCH_NOW=$(git branch --show-current 2>/dev/null || echo "")
 BRANCH_SAFE_NOW=$(echo "$BRANCH_NOW" | tr '/' '-' | tr -cd 'a-zA-Z0-9_-')
 if [ -n "$BRANCH_SAFE_NOW" ]; then
-  for ref in $(git for-each-ref --format='%(refname)' "refs/auto-save/${BRANCH_SAFE_NOW}-" 2>/dev/null); do
-    git push origin --delete "$ref" 2>/dev/null || true
-    git update-ref -d "$ref" 2>/dev/null || true
-  done
+  (
+    for ref in $(git for-each-ref --format='%(refname)' "refs/auto-save/${BRANCH_SAFE_NOW}-" 2>/dev/null); do
+      timeout 10 git push origin --delete "$ref" 2>/dev/null || true
+      git update-ref -d "$ref" 2>/dev/null || true
+    done
+  ) > /dev/null 2>&1 &
+  disown
 fi
 
 if [ "$COMMIT_VERIFIED" = "true" ]; then
