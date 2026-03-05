@@ -2623,4 +2623,46 @@ mod tests {
         // persist_instrument_snapshot swallows errors and always returns Ok
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // ensure_instrument_tables — DDL + DEDUP success and failure paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises both DDL CREATE TABLE and DEDUP UPSERT KEY success paths.
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_non_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises both DDL and DEDUP non-success response paths.
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_unreachable_host() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Exercises the connection error path for DDL and DEDUP requests.
+        ensure_instrument_tables(&config).await;
+    }
 }
