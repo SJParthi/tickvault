@@ -356,7 +356,7 @@ DS_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/datasources" \
 if [ -n "$DS_JSON" ] && [ "$DS_JSON" != "[]" ]; then
     DS_COUNT=$(echo "$DS_JSON" | grep -o '"name"' | wc -l | tr -d ' ')
     # Check each expected datasource
-    for ds in Prometheus Loki Jaeger; do
+    for ds in Prometheus Loki Jaeger QuestDB; do
         if echo "$DS_JSON" | grep -q "\"name\":\"${ds}\""; then
             info "  ${ds}: provisioned"
         else
