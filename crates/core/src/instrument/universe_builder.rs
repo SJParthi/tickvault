@@ -3587,7 +3587,11 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/instruments.csv");
 
-        let temp_dir = std::env::temp_dir().join("dlt-test-build-fno-universe-e2e");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-build-fno-universe-e2e-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let config = InstrumentConfig {
             daily_download_time: "08:00:00".to_owned(),
             csv_cache_directory: temp_dir.to_str().unwrap().to_owned(),

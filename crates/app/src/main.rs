@@ -34,7 +34,9 @@ use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
-use dhan_live_trader_core::instrument::{build_subscription_plan, load_or_build_instruments};
+use dhan_live_trader_core::instrument::{
+    build_subscription_plan, load_or_build_instruments, run_instrument_diagnostic,
+};
 use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
@@ -137,6 +139,42 @@ async fn main() -> Result<()> {
         tracing_enabled = config.observability.tracing_enabled,
         "dhan-live-trader starting"
     );
+
+    // -----------------------------------------------------------------------
+    // CLI: --instrument-diagnostic (run diagnostic and exit)
+    // -----------------------------------------------------------------------
+    if std::env::args().any(|arg| arg == "--instrument-diagnostic") {
+        info!("running instrument diagnostic (--instrument-diagnostic flag detected)");
+        let report = run_instrument_diagnostic(
+            &config.dhan.instrument_csv_url,
+            &config.dhan.instrument_csv_fallback_url,
+            &config.instrument,
+        )
+        .await;
+
+        let json = serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|err| format!("{{\"error\": \"serialization failed: {err}\"}}"));
+        #[allow(clippy::print_stdout)] // APPROVED: CLI diagnostic output to stdout, not logging
+        {
+            println!("{json}"); // APPROVED: CLI diagnostic requires stdout output
+        }
+
+        if report.healthy {
+            info!("instrument diagnostic: ALL CHECKS PASSED");
+        } else {
+            let failed: Vec<_> = report
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| c.name.as_str())
+                .collect();
+            error!(
+                failed_checks = ?failed,
+                "instrument diagnostic: SOME CHECKS FAILED"
+            );
+        }
+        return Ok(());
+    }
 
     // -----------------------------------------------------------------------
     // Step 4: Initialize notification service (best-effort — no-op if SSM unavailable)

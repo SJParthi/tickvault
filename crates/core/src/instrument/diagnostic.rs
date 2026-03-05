@@ -1,0 +1,523 @@
+//! Instrument system diagnostic — end-to-end health check.
+//!
+//! Downloads the CSV, validates headers, parses rows, builds the universe,
+//! runs validation, and reports detailed status for each step.
+//! Reuses existing functions — no new HTTP or parsing logic.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use reqwest::Client;
+use serde::Serialize;
+use tracing::info;
+
+use dhan_live_trader_common::config::InstrumentConfig;
+use dhan_live_trader_common::constants::*;
+
+use super::csv_downloader::download_instrument_csv;
+use super::csv_parser::parse_instrument_csv;
+use super::instrument_loader::{is_instrument_fresh, is_within_build_window};
+use super::universe_builder::build_fno_universe_from_csv;
+use super::validation::validate_fno_universe;
+
+// ---------------------------------------------------------------------------
+// Report Types
+// ---------------------------------------------------------------------------
+
+/// Complete diagnostic report for the instrument system.
+#[derive(Debug, Serialize)]
+pub struct DiagnosticReport {
+    /// Overall pass/fail.
+    pub healthy: bool,
+    /// Individual check results.
+    pub checks: Vec<CheckResult>,
+}
+
+/// Result of a single diagnostic check.
+#[derive(Debug, Serialize)]
+pub struct CheckResult {
+    /// Check name (e.g., "url_reachability", "csv_headers").
+    pub name: String,
+    /// Whether this check passed.
+    pub passed: bool,
+    /// Human-readable detail.
+    pub detail: String,
+    /// Duration of this check in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// All expected CSV column names for header validation.
+const EXPECTED_COLUMNS: &[&str] = &[
+    CSV_COLUMN_EXCH_ID,
+    CSV_COLUMN_SEGMENT,
+    CSV_COLUMN_SECURITY_ID,
+    CSV_COLUMN_INSTRUMENT,
+    CSV_COLUMN_UNDERLYING_SECURITY_ID,
+    CSV_COLUMN_UNDERLYING_SYMBOL,
+    CSV_COLUMN_SYMBOL_NAME,
+    CSV_COLUMN_DISPLAY_NAME,
+    CSV_COLUMN_SERIES,
+    CSV_COLUMN_LOT_SIZE,
+    CSV_COLUMN_EXPIRY_DATE,
+    CSV_COLUMN_STRIKE_PRICE,
+    CSV_COLUMN_OPTION_TYPE,
+    CSV_COLUMN_TICK_SIZE,
+    CSV_COLUMN_EXPIRY_FLAG,
+];
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Run all diagnostic checks and return a structured report.
+pub async fn run_instrument_diagnostic(
+    primary_url: &str,
+    fallback_url: &str,
+    instrument_config: &InstrumentConfig,
+) -> DiagnosticReport {
+    let mut checks = Vec::with_capacity(8);
+
+    // Check 1: URL reachability (primary)
+    checks.push(check_url_reachability(primary_url, "primary").await);
+
+    // Check 2: URL reachability (fallback)
+    checks.push(check_url_reachability(fallback_url, "fallback").await);
+
+    // Check 3: Time gate status
+    checks.push(check_time_gate(
+        &instrument_config.build_window_start,
+        &instrument_config.build_window_end,
+    ));
+
+    // Check 4: Cache status
+    checks.push(check_cache_status(
+        &instrument_config.csv_cache_directory,
+        &instrument_config.csv_cache_filename,
+    ));
+
+    // Check 5: CSV download
+    let start = Instant::now();
+    let download_result = download_instrument_csv(
+        primary_url,
+        fallback_url,
+        &instrument_config.csv_cache_directory,
+        &instrument_config.csv_cache_filename,
+        instrument_config.csv_download_timeout_secs,
+    )
+    .await;
+    let download_ms = start.elapsed().as_millis() as u64;
+
+    let csv_text = match download_result {
+        Ok(result) => {
+            checks.push(CheckResult {
+                name: "csv_download".to_owned(),
+                passed: true,
+                detail: format!(
+                    "downloaded {} bytes from {} source",
+                    result.csv_text.len(),
+                    result.source
+                ),
+                duration_ms: download_ms,
+            });
+            Some(result.csv_text)
+        }
+        Err(err) => {
+            checks.push(CheckResult {
+                name: "csv_download".to_owned(),
+                passed: false,
+                detail: format!("download failed: {err}"),
+                duration_ms: download_ms,
+            });
+            None
+        }
+    };
+
+    // Checks 6-8 depend on successful download
+    if let Some(csv_text) = csv_text {
+        // Check 6: CSV header validation
+        checks.push(check_csv_headers(&csv_text));
+
+        // Check 7: CSV parse
+        let start = Instant::now();
+        let parse_result = parse_instrument_csv(&csv_text);
+        let parse_ms = start.elapsed().as_millis() as u64;
+
+        match parse_result {
+            Ok((total_rows, parsed_rows)) => {
+                let nse_i = parsed_rows
+                    .iter()
+                    .filter(|r| {
+                        r.segment == 'I'
+                            && matches!(
+                                r.exchange,
+                                dhan_live_trader_common::types::Exchange::NationalStockExchange
+                            )
+                    })
+                    .count();
+                let nse_e = parsed_rows
+                    .iter()
+                    .filter(|r| {
+                        r.segment == 'E'
+                            && matches!(
+                                r.exchange,
+                                dhan_live_trader_common::types::Exchange::NationalStockExchange
+                            )
+                    })
+                    .count();
+                let nse_d = parsed_rows
+                    .iter()
+                    .filter(|r| {
+                        r.segment == 'D'
+                            && matches!(
+                                r.exchange,
+                                dhan_live_trader_common::types::Exchange::NationalStockExchange
+                            )
+                    })
+                    .count();
+                let bse_i = parsed_rows
+                    .iter()
+                    .filter(|r| {
+                        r.segment == 'I'
+                            && matches!(
+                                r.exchange,
+                                dhan_live_trader_common::types::Exchange::BombayStockExchange
+                            )
+                    })
+                    .count();
+                let bse_d = parsed_rows
+                    .iter()
+                    .filter(|r| {
+                        r.segment == 'D'
+                            && matches!(
+                                r.exchange,
+                                dhan_live_trader_common::types::Exchange::BombayStockExchange
+                            )
+                    })
+                    .count();
+
+                checks.push(CheckResult {
+                    name: "csv_parse".to_owned(),
+                    passed: true,
+                    detail: format!(
+                        "total={total_rows}, parsed={}, NSE_I={nse_i}, NSE_E={nse_e}, NSE_D={nse_d}, BSE_I={bse_i}, BSE_D={bse_d}",
+                        parsed_rows.len()
+                    ),
+                    duration_ms: parse_ms,
+                });
+
+                // Check 8: Universe build + validation
+                let start = Instant::now();
+                match build_fno_universe_from_csv(&csv_text, "diagnostic") {
+                    Ok(universe) => {
+                        let build_ms = start.elapsed().as_millis() as u64;
+                        let uc = universe.underlyings.len();
+                        let dc = universe.derivative_contracts.len();
+
+                        // Run validation
+                        match validate_fno_universe(&universe) {
+                            Ok(()) => {
+                                checks.push(CheckResult {
+                                    name: "universe_build_and_validate".to_owned(),
+                                    passed: true,
+                                    detail: format!(
+                                        "{uc} underlyings, {dc} derivatives — validation passed"
+                                    ),
+                                    duration_ms: build_ms,
+                                });
+                            }
+                            Err(err) => {
+                                checks.push(CheckResult {
+                                    name: "universe_build_and_validate".to_owned(),
+                                    passed: false,
+                                    detail: format!(
+                                        "{uc} underlyings, {dc} derivatives — validation FAILED: {err}"
+                                    ),
+                                    duration_ms: build_ms,
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let build_ms = start.elapsed().as_millis() as u64;
+                        checks.push(CheckResult {
+                            name: "universe_build_and_validate".to_owned(),
+                            passed: false,
+                            detail: format!("universe build failed: {err}"),
+                            duration_ms: build_ms,
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                checks.push(CheckResult {
+                    name: "csv_parse".to_owned(),
+                    passed: false,
+                    detail: format!("parse failed: {err}"),
+                    duration_ms: parse_ms,
+                });
+            }
+        }
+    }
+
+    let healthy = checks.iter().all(|c| c.passed);
+    info!(
+        healthy,
+        checks = checks.len(),
+        "instrument diagnostic complete"
+    );
+
+    DiagnosticReport { healthy, checks }
+}
+
+// ---------------------------------------------------------------------------
+// Individual Checks
+// ---------------------------------------------------------------------------
+
+/// Check if a URL is reachable via HEAD request.
+async fn check_url_reachability(url: &str, label: &str) -> CheckResult {
+    let start = Instant::now();
+
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(INSTRUMENT_CSV_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            return CheckResult {
+                name: format!("url_reachability_{label}"),
+                passed: false,
+                detail: format!("failed to build HTTP client: {err}"),
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    match client.head(url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let content_length = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+
+            CheckResult {
+                name: format!("url_reachability_{label}"),
+                passed: status.is_success(),
+                detail: format!("HTTP {status}, content-length={content_length}, url={url}"),
+                duration_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+        Err(err) => CheckResult {
+            name: format!("url_reachability_{label}"),
+            passed: false,
+            detail: format!("request failed: {err}, url={url}"),
+            duration_ms: start.elapsed().as_millis() as u64,
+        },
+    }
+}
+
+/// Check time gate status.
+fn check_time_gate(window_start: &str, window_end: &str) -> CheckResult {
+    let start = Instant::now();
+    let is_open = is_within_build_window(window_start, window_end);
+
+    // IST_UTC_OFFSET_SECONDS (19800) is always valid for FixedOffset::east_opt.
+    // Fall back to UTC if somehow invalid (impossible with our constant).
+    let ist_offset = chrono::FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
+        .or_else(|| chrono::FixedOffset::east_opt(0));
+    let now_ist_str = match ist_offset {
+        Some(offset) => chrono::Utc::now()
+            .with_timezone(&offset)
+            .format("%H:%M:%S")
+            .to_string(),
+        None => "unknown".to_owned(),
+    };
+
+    CheckResult {
+        name: "time_gate".to_owned(),
+        passed: true, // Time gate is informational, not a pass/fail
+        detail: format!(
+            "ist_time={now_ist_str}, window=[{window_start}, {window_end}), gate_open={is_open}"
+        ),
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Check cache directory and freshness marker status.
+fn check_cache_status(cache_dir: &str, cache_filename: &str) -> CheckResult {
+    let start = Instant::now();
+    let cache_path = Path::new(cache_dir).join(cache_filename);
+    let marker_path = Path::new(cache_dir).join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+
+    let dir_exists = Path::new(cache_dir).is_dir();
+    let file_exists = cache_path.is_file();
+    let file_size = if file_exists {
+        std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let is_fresh = is_instrument_fresh(cache_dir);
+    let marker_content = std::fs::read_to_string(&marker_path).unwrap_or_default();
+
+    CheckResult {
+        name: "cache_status".to_owned(),
+        passed: true, // Cache is informational
+        detail: format!(
+            "dir_exists={dir_exists}, csv_exists={file_exists}, csv_bytes={file_size}, \
+             fresh={is_fresh}, marker={}, cache_dir={cache_dir}",
+            marker_content.trim()
+        ),
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Check CSV headers against expected column names.
+fn check_csv_headers(csv_text: &str) -> CheckResult {
+    let start = Instant::now();
+
+    // Strip BOM if present (same as csv_parser.rs)
+    let csv_text = csv_text.strip_prefix('\u{FEFF}').unwrap_or(csv_text);
+
+    // Read just the first line as headers
+    let first_line = csv_text.lines().next().unwrap_or("");
+    let actual_columns: Vec<&str> = first_line.split(',').map(|s| s.trim()).collect();
+
+    let mut missing: Vec<&str> = Vec::new();
+    for expected in EXPECTED_COLUMNS {
+        if !actual_columns.contains(expected) {
+            missing.push(expected);
+        }
+    }
+
+    let extra: Vec<&&str> = actual_columns
+        .iter()
+        .filter(|col| !col.is_empty() && !EXPECTED_COLUMNS.contains(col))
+        .collect();
+
+    if missing.is_empty() {
+        CheckResult {
+            name: "csv_headers".to_owned(),
+            passed: true,
+            detail: format!(
+                "all {} expected columns present, {} extra columns: [{}]",
+                EXPECTED_COLUMNS.len(),
+                extra.len(),
+                extra.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+            ),
+            duration_ms: start.elapsed().as_millis() as u64,
+        }
+    } else {
+        CheckResult {
+            name: "csv_headers".to_owned(),
+            passed: false,
+            detail: format!(
+                "MISSING columns: [{}], extra columns: [{}], actual header: {first_line}",
+                missing.join(", "),
+                extra.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+            ),
+            duration_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_csv_headers_all_present() {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,";
+        let csv = format!(
+            "{header}\nNSE,I,13,ISIN,IDX_I,13,NIFTY,NIFTY 50,Nifty 50,INDEX,EQ,1,0001-01-01,0,XX,0.05,0,"
+        );
+        let result = check_csv_headers(&csv);
+        assert!(result.passed, "all columns present: {}", result.detail);
+    }
+
+    #[test]
+    fn test_check_csv_headers_missing_column() {
+        // Missing EXPIRY_FLAG
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,";
+        let result = check_csv_headers(header);
+        assert!(!result.passed, "missing column should fail");
+        assert!(
+            result.detail.contains("EXPIRY_FLAG"),
+            "should report missing EXPIRY_FLAG: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_check_csv_headers_with_bom() {
+        let header = "\u{FEFF}EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,";
+        let result = check_csv_headers(header);
+        assert!(result.passed, "BOM should be stripped: {}", result.detail);
+    }
+
+    #[test]
+    fn test_check_time_gate_always_passes() {
+        let result = check_time_gate("08:25:00", "08:55:00");
+        assert!(result.passed, "time gate is informational");
+        assert!(result.detail.contains("gate_open="));
+    }
+
+    #[test]
+    fn test_check_cache_status_nonexistent_dir() {
+        let result = check_cache_status("/tmp/dlt-nonexistent-diag-99999", "test.csv");
+        assert!(result.passed, "cache status is informational");
+        assert!(
+            result.detail.contains("dir_exists=false"),
+            "should report dir missing: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_diagnostic_report_serialization() {
+        let report = DiagnosticReport {
+            healthy: true,
+            checks: vec![CheckResult {
+                name: "test".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 42,
+            }],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"healthy\":true"));
+        assert!(json.contains("\"name\":\"test\""));
+    }
+
+    #[test]
+    fn test_expected_columns_count() {
+        assert_eq!(
+            EXPECTED_COLUMNS.len(),
+            15,
+            "should have 15 expected columns"
+        );
+    }
+
+    #[test]
+    fn test_check_csv_headers_empty_input() {
+        let result = check_csv_headers("");
+        assert!(!result.passed, "empty input should have missing columns");
+    }
+
+    #[tokio::test]
+    async fn test_check_url_reachability_unreachable() {
+        let result = check_url_reachability("http://127.0.0.1:1/nonexistent", "test").await;
+        assert!(!result.passed, "unreachable URL should fail");
+        assert!(result.detail.contains("request failed"));
+    }
+}

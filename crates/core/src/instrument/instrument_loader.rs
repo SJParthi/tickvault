@@ -281,7 +281,11 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_stale_marker() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-stale-marker");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-stale-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         std::fs::write(&marker_path, "2020-01-01").unwrap();
@@ -293,7 +297,11 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_today_marker() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-today-marker");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-today-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let today = now_ist_date_string();
@@ -306,7 +314,11 @@ mod tests {
 
     #[test]
     fn test_write_freshness_marker_roundtrip() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-roundtrip");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-roundtrip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
 
         // Ensure clean state
@@ -375,7 +387,11 @@ mod tests {
     #[test]
     fn test_is_instrument_fresh_marker_with_trailing_newline() {
         // is_instrument_fresh uses .trim() so trailing newline should match
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-trailing-newline");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-trailing-newline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let today = now_ist_date_string();
@@ -391,7 +407,11 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_marker_with_surrounding_whitespace() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-whitespace");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-whitespace-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let today = now_ist_date_string();
@@ -407,7 +427,11 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_empty_file_returns_false() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-empty");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-empty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         std::fs::write(&marker_path, "").unwrap();
@@ -422,7 +446,11 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_garbage_content_returns_false() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-garbage");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-garbage-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         std::fs::write(&marker_path, "not-a-date").unwrap();
@@ -437,7 +465,11 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_tomorrow_date_returns_false() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-tomorrow");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-tomorrow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         // Write a date far in the future — should not match today
@@ -457,11 +489,16 @@ mod tests {
 
     #[test]
     fn test_write_freshness_marker_creates_nested_directories() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-nested/a/b/c");
+        let base_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-nested-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let temp_dir = base_dir.join("a/b/c");
         let cache_dir = temp_dir.to_str().unwrap();
 
         // Ensure clean state
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt-test-marker-nested"));
+        let _ = std::fs::remove_dir_all(&base_dir);
 
         write_freshness_marker(cache_dir);
 
@@ -471,12 +508,16 @@ mod tests {
             "marker should be fresh after writing to nested dir"
         );
 
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt-test-marker-nested"));
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]
     fn test_write_freshness_marker_overwrites_stale_marker() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-overwrite");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-marker-overwrite-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -577,7 +618,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_rebuild_instruments_with_fresh_marker_returns_none() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-rebuild-fresh");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-rebuild-fresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap().to_owned();
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -619,7 +664,11 @@ mod tests {
     #[tokio::test]
     async fn test_try_rebuild_instruments_without_marker_attempts_download() {
         // No marker, no server → download fails → returns error
-        let temp_dir = std::env::temp_dir().join("dlt-test-rebuild-no-marker");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-rebuild-no-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap().to_owned();
         let _ = std::fs::remove_dir_all(&temp_dir);
 

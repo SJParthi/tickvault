@@ -10,6 +10,7 @@ use axum::extract::State;
 use serde::Serialize;
 use tracing::{info, warn};
 
+use dhan_live_trader_core::instrument::run_instrument_diagnostic;
 use dhan_live_trader_core::instrument::try_rebuild_instruments;
 
 use crate::state::SharedAppState;
@@ -115,6 +116,28 @@ async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
             })
         }
     }
+}
+
+/// `GET /api/instruments/diagnostic` — full instrument system health check.
+///
+/// Downloads CSV, validates headers, parses rows, builds universe, and
+/// reports detailed status for each step.
+pub async fn instrument_diagnostic(State(state): State<SharedAppState>) -> Json<serde_json::Value> {
+    let dhan = state.dhan_config();
+    let inst = state.instrument_config();
+
+    let report = run_instrument_diagnostic(
+        &dhan.instrument_csv_url,
+        &dhan.instrument_csv_fallback_url,
+        inst,
+    )
+    .await;
+
+    Json(
+        serde_json::to_value(report).unwrap_or_else(
+            |err| serde_json::json!({"error": format!("serialization failed: {err}")}),
+        ),
+    )
 }
 
 #[cfg(test)]

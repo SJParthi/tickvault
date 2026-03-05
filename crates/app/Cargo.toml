@@ -29,6 +29,7 @@ metrics-exporter-prometheus = { workspace = true }
 figment = { workspace = true }
 clap = { workspace = true }
 secrecy = { workspace = true }
+serde_json = { workspace = true }
 signal-hook = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
