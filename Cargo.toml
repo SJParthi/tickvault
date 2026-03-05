@@ -75,7 +75,7 @@ tower = { version = "0.5.2", features = ["full"] }
 tower-http = { version = "0.6.5", features = ["cors", "trace", "compression-gzip"] }
 
 # ---- Section 9: Configuration ----
-toml = "1.0.2"
+toml = "1.0.4"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
@@ -114,9 +114,9 @@ rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs
 rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
-aws-config = "1.6.3"
-aws-sdk-sns = "1.68.0"
-aws-sdk-ssm = "1.68.0"
+aws-config = "1.8.15"
+aws-sdk-sns = "1.97.0"
+aws-sdk-ssm = "1.107.0"
 
 # ---- Section 16: CLI ----
 clap = { version = "4.5.32", features = ["derive"] }
