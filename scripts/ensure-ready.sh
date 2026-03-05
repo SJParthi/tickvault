@@ -36,6 +36,7 @@ open_url() {
 # ---- Auto-open all monitoring dashboards ----
 open_dashboards() {
     echo -e "${CYAN}Opening monitoring dashboards...${NC}"
+    # Grafana: anonymous access enabled — no login required
     open_url "http://localhost:3000/d/dlt-system-overview/dlt-system-overview?orgId=1&refresh=5s"
     sleep 0.3
     open_url "http://localhost:9090/targets"
@@ -44,8 +45,13 @@ open_dashboards() {
     sleep 0.3
     open_url "http://localhost:8080"
     sleep 0.3
+    # QuestDB web console — use this for SQL queries (NOT IntelliJ Database tool)
     open_url "http://localhost:9000"
     echo -e "${GREEN}Opened: Grafana, Prometheus, Jaeger, Traefik, QuestDB${NC}"
+    echo ""
+    echo -e "${YELLOW}NOTE:${NC} QuestDB SQL queries → use Web Console (localhost:9000) or Grafana Explore."
+    echo -e "${YELLOW}      ${NC} IntelliJ Database tool shows pg_catalog errors — this is a known QuestDB"
+    echo -e "${YELLOW}      ${NC} limitation (QuestDB's PG wire protocol doesn't support system catalogs)."
 }
 
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----

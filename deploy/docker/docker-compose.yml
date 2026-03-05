@@ -218,10 +218,15 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${DLT_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_SECURITY_ADMIN_PASSWORD: ${DLT_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_UNIFIED_ALERTING_ENABLED: "true"
+      # QuestDB credentials for Grafana PostgreSQL datasource provisioning
+      DLT_QUESTDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+      DLT_QUESTDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     depends_on:
       dlt-prometheus:
         condition: service_healthy

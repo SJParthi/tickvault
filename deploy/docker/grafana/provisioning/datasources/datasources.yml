@@ -42,3 +42,26 @@ datasources:
       tracesToLogsV2:
         datasourceUid: loki
         filterByTraceID: true
+
+  # QuestDB via PostgreSQL wire protocol (port 8812).
+  # Credentials injected from docker-compose environment (sourced from AWS SSM).
+  # Use this for tick data, instrument metadata, and order audit queries.
+  # NOTE: QuestDB's PG wire protocol has limited pg_catalog support.
+  # Grafana's PostgreSQL datasource works for SELECT queries and time-series panels.
+  - name: QuestDB
+    uid: questdb
+    type: postgres
+    access: proxy
+    url: dlt-questdb:8812
+    database: qdb
+    user: $DLT_QUESTDB_PG_USER
+    secureJsonData:
+      password: $DLT_QUESTDB_PG_PASSWORD
+    editable: false
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      postgresVersion: 1200
+      timescaledb: false
