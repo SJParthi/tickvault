@@ -2,9 +2,9 @@
 //!
 //! # Semantics
 //! - **Market hours** `[08:45, 16:00)` IST — NEVER download. Load from:
-//!   1. rkyv binary cache (~5-15ms)
+//!   1. rkyv zero-copy binary cache (sub-0.5ms via `MappedUniverse`)
 //!   2. CSV file cache fallback (~400ms, then writes rkyv for next restart)
-//!   3. `None` — no instruments available
+//!   3. `Unavailable` — no instruments available
 //! - **Outside market hours** — ALWAYS download fresh CSV (ignores freshness
 //!   marker). On download failure, falls back to rkyv → CSV → error.
 //! - **Manual API** — `POST /api/instruments/rebuild`. Bypasses market hours
@@ -19,17 +19,37 @@ use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveTime, Utc};
 use tracing::{info, warn};
 
-use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig};
+use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig, SubscriptionConfig};
 use dhan_live_trader_common::constants::{
     INSTRUMENT_FRESHNESS_MARKER_FILENAME, IST_UTC_OFFSET_SECONDS,
 };
 use dhan_live_trader_common::instrument_types::FnoUniverse;
 
-use super::binary_cache::{read_binary_cache, write_binary_cache};
+use super::binary_cache::{MappedUniverse, read_binary_cache, write_binary_cache};
 use super::csv_downloader::{download_instrument_csv, load_cached_csv};
+use super::subscription_planner::{SubscriptionPlan, build_subscription_plan_from_archived};
 use super::universe_builder::build_fno_universe_from_csv;
 
 use dhan_live_trader_storage::instrument_persistence::persist_instrument_snapshot;
+
+// ---------------------------------------------------------------------------
+// Load Result
+// ---------------------------------------------------------------------------
+
+/// Result of the instrument loading process.
+///
+/// Separates the two performance-critical paths:
+/// - **Market hours restart**: zero-copy rkyv → `CachedPlan` (sub-0.5ms)
+/// - **Outside market hours**: full download+build → `FreshBuild` (seconds)
+pub enum InstrumentLoadResult {
+    /// Fresh build with owned universe (outside market hours / manual rebuild).
+    /// Caller should build a `SubscriptionPlan` and send notifications.
+    FreshBuild(FnoUniverse),
+    /// Zero-copy cached plan (market hours restart). Ready to use immediately.
+    CachedPlan(SubscriptionPlan),
+    /// No instruments available (market hours + no cache).
+    Unavailable,
+}
 
 // ---------------------------------------------------------------------------
 // Market Hours Check (replaces old "build window" concept)
@@ -97,17 +117,17 @@ pub fn write_freshness_marker(cache_dir: &str) {
 
 /// Main entry: market-hours-aware instrument loading.
 ///
-/// Returns `Ok(Some((universe, was_fresh_build)))` if instruments were loaded.
-/// Returns `Ok(None)` if no instruments available (market hours + no cache).
-///
-/// `was_fresh_build` is `true` when a full download + persist happened.
-/// `false` when loaded from cache (rkyv or CSV).
+/// Returns:
+/// - `InstrumentLoadResult::FreshBuild(universe)` — outside market hours, full download+build
+/// - `InstrumentLoadResult::CachedPlan(plan)` — market hours, zero-copy rkyv or CSV fallback
+/// - `InstrumentLoadResult::Unavailable` — market hours, no cache available
 pub async fn load_or_build_instruments(
     dhan_csv_url: &str,
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
-) -> Result<Option<(FnoUniverse, bool)>> {
+    subscription_config: &SubscriptionConfig,
+) -> Result<InstrumentLoadResult> {
     let cache_dir = &instrument_config.csv_cache_directory;
 
     if is_within_build_window(
@@ -115,7 +135,12 @@ pub async fn load_or_build_instruments(
         &instrument_config.build_window_end,
     ) {
         // ----- MARKET HOURS: cache only, NEVER download -----
-        return load_from_cache_only(cache_dir, &instrument_config.csv_cache_filename).await;
+        return load_from_cache_only(
+            cache_dir,
+            &instrument_config.csv_cache_filename,
+            subscription_config,
+        )
+        .await;
     }
 
     // ----- OUTSIDE MARKET HOURS: always download fresh -----
@@ -180,20 +205,31 @@ pub async fn try_rebuild_instruments(
 // Internal: Market Hours Cache Loading
 // ---------------------------------------------------------------------------
 
-/// Market hours path: rkyv → CSV → None. NEVER downloads.
+/// Market hours path: zero-copy rkyv → CSV fallback → Unavailable. NEVER downloads.
 async fn load_from_cache_only(
     cache_dir: &str,
     csv_filename: &str,
-) -> Result<Option<(FnoUniverse, bool)>> {
-    // Try 1: rkyv binary cache (fastest, ~5-15ms)
-    match read_binary_cache(cache_dir) {
-        Ok(Some(universe)) => {
-            info!(
-                derivatives = universe.derivative_contracts.len(),
-                underlyings = universe.underlyings.len(),
-                "market hours: loaded instruments from rkyv binary cache"
+    subscription_config: &SubscriptionConfig,
+) -> Result<InstrumentLoadResult> {
+    let ist =
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset constant")?;
+    let today = Utc::now().with_timezone(&ist).date_naive();
+
+    // Try 1: Zero-copy rkyv binary cache (sub-0.5ms)
+    match MappedUniverse::load(cache_dir) {
+        Ok(Some(mapped)) => {
+            let plan = build_subscription_plan_from_archived(
+                mapped.archived(),
+                subscription_config,
+                today,
             );
-            return Ok(Some((universe, false)));
+            info!(
+                derivatives = mapped.derivative_count(),
+                underlyings = mapped.underlying_count(),
+                total_subscriptions = plan.summary.total,
+                "market hours: zero-copy rkyv loaded (sub-0.5ms)"
+            );
+            return Ok(InstrumentLoadResult::CachedPlan(plan));
         }
         Ok(None) => {
             info!("market hours: no rkyv binary cache found, trying CSV fallback");
@@ -203,7 +239,7 @@ async fn load_from_cache_only(
         }
     }
 
-    // Try 2: CSV file cache (~400ms)
+    // Try 2: CSV file cache (~400ms) — build plan from owned universe
     match load_cached_csv(cache_dir, csv_filename).await {
         Ok(download_result) => {
             let universe =
@@ -219,16 +255,16 @@ async fn load_from_cache_only(
                 derivatives = universe.derivative_contracts.len(),
                 "market hours: loaded instruments from CSV cache (rkyv cache written for next restart)"
             );
-            return Ok(Some((universe, false)));
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
         }
         Err(err) => {
             warn!(%err, "market hours: no CSV cache available either");
         }
     }
 
-    // No cache available — return None
+    // No cache available
     info!("market hours: no instrument cache available (rkyv + CSV both missing)");
-    Ok(None)
+    Ok(InstrumentLoadResult::Unavailable)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +277,7 @@ async fn load_with_download(
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
-) -> Result<Option<(FnoUniverse, bool)>> {
+) -> Result<InstrumentLoadResult> {
     let cache_dir = &instrument_config.csv_cache_directory;
 
     // Always attempt download (ignore freshness marker outside market hours)
@@ -272,7 +308,7 @@ async fn load_with_download(
 
             write_freshness_marker(cache_dir);
 
-            return Ok(Some((universe, true)));
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
         }
         Err(err) => {
             warn!(%err, "outside market hours: CSV download failed, trying caches");
@@ -287,7 +323,7 @@ async fn load_with_download(
                 derivatives = universe.derivative_contracts.len(),
                 "outside market hours: download failed, using rkyv binary cache fallback"
             );
-            return Ok(Some((universe, false)));
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
         }
         Ok(None) => {}
         Err(err) => {
@@ -306,7 +342,7 @@ async fn load_with_download(
             derivatives = universe.derivative_contracts.len(),
             "outside market hours: download failed, using stale CSV cache fallback"
         );
-        return Ok(Some((universe, false)));
+        return Ok(InstrumentLoadResult::FreshBuild(universe));
     }
 
     // All sources failed
@@ -339,6 +375,7 @@ fn now_ist_date_string() -> String {
 mod tests {
     use super::*;
     use chrono::Timelike;
+    use dhan_live_trader_common::config::SubscriptionConfig;
     use dhan_live_trader_common::constants::BINARY_CACHE_FILENAME;
     use dhan_live_trader_common::instrument_types::UniverseBuildMetadata;
     use std::collections::HashMap;
@@ -398,6 +435,10 @@ mod tests {
             http_port: 19998,
             pg_port: 18812,
         }
+    }
+
+    fn test_subscription_config() -> SubscriptionConfig {
+        SubscriptionConfig::default()
     }
 
     // -----------------------------------------------------------------------
@@ -566,12 +607,19 @@ mod tests {
             "http://127.0.0.1:1/fake",
             &config,
             &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
-        let (loaded, was_fresh) = result.unwrap().unwrap();
-        assert!(!was_fresh, "should be from cache, not fresh build");
-        assert_eq!(loaded.build_metadata.csv_source, "test");
+        match result.unwrap() {
+            InstrumentLoadResult::CachedPlan(_plan) => {
+                // Zero-copy path: returns plan directly
+            }
+            other => panic!(
+                "expected CachedPlan, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -581,7 +629,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_market_hours_no_cache_returns_none() {
+    async fn test_market_hours_no_cache_returns_unavailable() {
         let dir = unique_temp_dir("mh-no-cache");
         let _ = std::fs::remove_dir_all(&dir);
         let cache_dir = dir.to_str().unwrap();
@@ -592,13 +640,13 @@ mod tests {
             "http://127.0.0.1:1/fake",
             &config,
             &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
-        assert!(result.is_ok());
         assert!(
-            result.unwrap().is_none(),
-            "no cache should return None during market hours"
+            matches!(result.unwrap(), InstrumentLoadResult::Unavailable),
+            "no cache should return Unavailable during market hours"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -609,7 +657,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_market_hours_corrupt_rkyv_no_csv_returns_none() {
+    async fn test_market_hours_corrupt_rkyv_no_csv_returns_unavailable() {
         let dir = unique_temp_dir("mh-corrupt-rkyv");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -625,11 +673,14 @@ mod tests {
             "http://127.0.0.1:1/fake",
             &config,
             &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "corrupt rkyv + no CSV → None");
+        assert!(
+            matches!(result.unwrap(), InstrumentLoadResult::Unavailable),
+            "corrupt rkyv + no CSV → Unavailable"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -645,7 +696,7 @@ mod tests {
         let cache_dir = dir.to_str().unwrap();
 
         // Window = always inside, fake URLs, no cache
-        // If download was attempted, it would timeout. Instead, returns None instantly.
+        // If download was attempted, it would timeout. Instead, returns Unavailable instantly.
         let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
         let start = std::time::Instant::now();
         let result = load_or_build_instruments(
@@ -653,12 +704,12 @@ mod tests {
             "http://127.0.0.1:1/fake",
             &config,
             &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
         let elapsed = start.elapsed();
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(matches!(result.unwrap(), InstrumentLoadResult::Unavailable));
         // If download was attempted with 2s timeout, this would take >2s
         assert!(
             elapsed.as_millis() < 500,
@@ -690,12 +741,19 @@ mod tests {
             "http://127.0.0.1:1/fake",
             &config,
             &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
-        let (loaded, was_fresh) = result.unwrap().unwrap();
-        assert!(!was_fresh, "fallback from rkyv should not be fresh build");
-        assert_eq!(loaded.build_metadata.csv_source, "test");
+        match result.unwrap() {
+            InstrumentLoadResult::FreshBuild(loaded) => {
+                assert_eq!(loaded.build_metadata.csv_source, "test");
+            }
+            other => panic!(
+                "expected FreshBuild, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -717,6 +775,7 @@ mod tests {
             "http://127.0.0.1:1/fake",
             &config,
             &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 

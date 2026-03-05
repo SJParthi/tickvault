@@ -218,6 +218,41 @@ impl fmt::Display for OptionType {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Archived → Owned Conversions (for zero-copy rkyv access)
+// ---------------------------------------------------------------------------
+
+impl From<&ArchivedExchange> for Exchange {
+    fn from(archived: &ArchivedExchange) -> Self {
+        match archived {
+            ArchivedExchange::NationalStockExchange => Self::NationalStockExchange,
+            ArchivedExchange::BombayStockExchange => Self::BombayStockExchange,
+        }
+    }
+}
+
+impl From<&ArchivedExchangeSegment> for ExchangeSegment {
+    fn from(archived: &ArchivedExchangeSegment) -> Self {
+        match archived {
+            ArchivedExchangeSegment::IdxI => Self::IdxI,
+            ArchivedExchangeSegment::NseEquity => Self::NseEquity,
+            ArchivedExchangeSegment::NseFno => Self::NseFno,
+            ArchivedExchangeSegment::BseEquity => Self::BseEquity,
+            ArchivedExchangeSegment::BseFno => Self::BseFno,
+            ArchivedExchangeSegment::McxComm => Self::McxComm,
+        }
+    }
+}
+
+impl From<&ArchivedOptionType> for OptionType {
+    fn from(archived: &ArchivedOptionType) -> Self {
+        match archived {
+            ArchivedOptionType::Call => Self::Call,
+            ArchivedOptionType::Put => Self::Put,
+        }
+    }
+}
+
 /// Unique identifier for a security in the Dhan system.
 pub type SecurityId = u32;
 

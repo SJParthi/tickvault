@@ -35,7 +35,8 @@ use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
 use dhan_live_trader_core::instrument::{
-    build_subscription_plan, load_or_build_instruments, run_instrument_diagnostic,
+    InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
+    run_instrument_diagnostic,
 };
 use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
@@ -246,10 +247,11 @@ async fn main() -> Result<()> {
         &config.dhan.instrument_csv_fallback_url,
         &config.instrument,
         &config.questdb,
+        &config.subscription,
     )
     .await
     {
-        Ok(Some((universe, was_fresh_build))) => {
+        Ok(InstrumentLoadResult::FreshBuild(universe)) => {
             let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
                 .context("invalid IST offset constant")?;
             let today = Utc::now().with_timezone(&ist).date_naive();
@@ -263,22 +265,31 @@ async fn main() -> Result<()> {
                 stock_derivatives = plan.summary.stock_derivatives,
                 total = plan.summary.total,
                 feed_mode = %plan.summary.feed_mode,
-                fresh_build = was_fresh_build,
-                "subscription plan ready"
+                "subscription plan ready (fresh build)"
             );
 
-            if was_fresh_build {
-                notifier.notify(NotificationEvent::InstrumentBuildSuccess {
-                    source: universe.build_metadata.csv_source,
-                    derivative_count: universe.derivative_contracts.len(),
-                    underlying_count: universe.underlyings.len(),
-                });
-            }
+            notifier.notify(NotificationEvent::InstrumentBuildSuccess {
+                source: universe.build_metadata.csv_source,
+                derivative_count: universe.derivative_contracts.len(),
+                underlying_count: universe.underlyings.len(),
+            });
             Some(plan)
         }
-        Ok(None) => {
-            // Time-gated skip — outside build window
-            info!("instruments: skipped (outside build window)");
+        Ok(InstrumentLoadResult::CachedPlan(plan)) => {
+            info!(
+                major_indices = plan.summary.major_index_values,
+                display_indices = plan.summary.display_indices,
+                index_derivatives = plan.summary.index_derivatives,
+                stock_equities = plan.summary.stock_equities,
+                stock_derivatives = plan.summary.stock_derivatives,
+                total = plan.summary.total,
+                feed_mode = %plan.summary.feed_mode,
+                "subscription plan ready (zero-copy rkyv cache)"
+            );
+            Some(plan)
+        }
+        Ok(InstrumentLoadResult::Unavailable) => {
+            info!("instruments: no cache available during market hours");
             None
         }
         Err(err) => {

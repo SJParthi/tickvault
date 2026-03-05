@@ -197,6 +197,51 @@ impl fmt::Display for IndexSubcategory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Archived → Owned Conversions (for zero-copy rkyv access)
+// ---------------------------------------------------------------------------
+
+impl From<&ArchivedUnderlyingKind> for UnderlyingKind {
+    fn from(archived: &ArchivedUnderlyingKind) -> Self {
+        match archived {
+            ArchivedUnderlyingKind::NseIndex => Self::NseIndex,
+            ArchivedUnderlyingKind::BseIndex => Self::BseIndex,
+            ArchivedUnderlyingKind::Stock => Self::Stock,
+        }
+    }
+}
+
+impl From<&ArchivedDhanInstrumentKind> for DhanInstrumentKind {
+    fn from(archived: &ArchivedDhanInstrumentKind) -> Self {
+        match archived {
+            ArchivedDhanInstrumentKind::FutureIndex => Self::FutureIndex,
+            ArchivedDhanInstrumentKind::FutureStock => Self::FutureStock,
+            ArchivedDhanInstrumentKind::OptionIndex => Self::OptionIndex,
+            ArchivedDhanInstrumentKind::OptionStock => Self::OptionStock,
+        }
+    }
+}
+
+impl From<&ArchivedIndexCategory> for IndexCategory {
+    fn from(archived: &ArchivedIndexCategory) -> Self {
+        match archived {
+            ArchivedIndexCategory::FnoUnderlying => Self::FnoUnderlying,
+            ArchivedIndexCategory::DisplayIndex => Self::DisplayIndex,
+        }
+    }
+}
+
+/// Reconstruct a `NaiveDate` from an archived rkyv `i32_le` (days from CE).
+///
+/// # Safety contract
+/// The caller must ensure the `i32_le` value was produced by [`NaiveDateAsI32`]
+/// serialization of a valid `NaiveDate`.
+#[allow(clippy::expect_used)] // APPROVED: archived value validated at cache write time
+pub fn naive_date_from_archived_i32(days: &rkyv::rend::i32_le) -> NaiveDate {
+    NaiveDate::from_num_days_from_ce_opt((*days).into())
+        .expect("valid days-from-CE in validated rkyv archive") // APPROVED: archived value validated at cache write time
+}
+
 /// A subscribed index — one of the 31 documented indices.
 ///
 /// 8 F&O indices (NIFTY, BANKNIFTY, etc.) + 23 display indices (VIX, sectoral, etc.).

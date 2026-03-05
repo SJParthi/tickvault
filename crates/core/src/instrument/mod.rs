@@ -16,7 +16,10 @@ pub mod subscription_planner;
 pub mod universe_builder;
 pub mod validation;
 
+pub use binary_cache::MappedUniverse;
 pub use diagnostic::run_instrument_diagnostic;
-pub use instrument_loader::{load_or_build_instruments, try_rebuild_instruments};
-pub use subscription_planner::build_subscription_plan;
+pub use instrument_loader::{
+    InstrumentLoadResult, load_or_build_instruments, try_rebuild_instruments,
+};
+pub use subscription_planner::{build_subscription_plan, build_subscription_plan_from_archived};
 pub use universe_builder::{build_fno_universe, build_fno_universe_from_csv};
