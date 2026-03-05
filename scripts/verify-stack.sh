@@ -135,19 +135,23 @@ echo ""
 # --- Grafana Provisioning -----------------------------------------------------
 echo -e "${CYAN}[5/5]${NC} Grafana Provisioning"
 
-# Check datasources
-DS_JSON=$(curl -sf --max-time 3 "http://localhost:3000/api/datasources" \
-    -H "Authorization: Basic $(echo -n "${DLT_GRAFANA_ADMIN_USER:-admin}:${DLT_GRAFANA_ADMIN_PASSWORD:-admin}" | base64)" 2>/dev/null || echo "")
+# Check datasources (anonymous access enabled — no auth header needed)
+DS_JSON=$(curl -sf --max-time 3 "http://localhost:3000/api/datasources" 2>/dev/null || echo "")
 if [ -n "$DS_JSON" ] && [ "$DS_JSON" != "[]" ]; then
     DS_COUNT=$(echo "$DS_JSON" | grep -o '"name"' | wc -l)
     echo -e "  Datasources:     ${GREEN}${DS_COUNT} configured${NC}"
+    # Check QuestDB datasource specifically
+    if echo "$DS_JSON" | grep -q '"name":"QuestDB"'; then
+        echo -e "  QuestDB DS:      ${GREEN}provisioned (query via Grafana Explore)${NC}"
+    else
+        echo -e "  QuestDB DS:      ${YELLOW}not found — restart Grafana to provision${NC}"
+    fi
 else
-    echo -e "  Datasources:     ${YELLOW}could not verify (check credentials)${NC}"
+    echo -e "  Datasources:     ${YELLOW}could not verify (Grafana may still be starting)${NC}"
 fi
 
-# Check dashboards
-DASH_SEARCH=$(curl -sf --max-time 3 "http://localhost:3000/api/search?type=dash-db" \
-    -H "Authorization: Basic $(echo -n "${DLT_GRAFANA_ADMIN_USER:-admin}:${DLT_GRAFANA_ADMIN_PASSWORD:-admin}" | base64)" 2>/dev/null || echo "")
+# Check dashboards (anonymous access enabled — no auth header needed)
+DASH_SEARCH=$(curl -sf --max-time 3 "http://localhost:3000/api/search?type=dash-db" 2>/dev/null || echo "")
 if [ -n "$DASH_SEARCH" ] && [ "$DASH_SEARCH" != "[]" ]; then
     DASH_COUNT=$(echo "$DASH_SEARCH" | grep -o '"uid"' | wc -l)
     echo -e "  Dashboards:      ${GREEN}${DASH_COUNT} provisioned${NC}"
