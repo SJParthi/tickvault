@@ -49,7 +49,9 @@ FAILED=0
 # DEDUP CHECK: Did pre-commit gate already pass for this HEAD?
 # ─────────────────────────────────────────────
 STATE_FILE="$HOOKS_DIR/.last-quality-pass"
-HEAD_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+# NOTE: pre-commit-gate writes HEAD *before* the commit runs (PreToolUse hook),
+# so the saved hash = parent of the new commit. We compare HEAD~1 to match.
+HEAD_PARENT=$(git rev-parse HEAD~1 2>/dev/null || echo "unknown")
 COMMIT_VERIFIED=false
 
 if [ -f "$STATE_FILE" ]; then
@@ -58,7 +60,7 @@ if [ -f "$STATE_FILE" ]; then
   NOW=$(date +%s)
   AGE=$(( NOW - SAVED_TIME ))
 
-  if [ "$SAVED_HASH" = "$HEAD_HASH" ] && [ "$AGE" -lt 300 ]; then
+  if [ "$SAVED_HASH" = "$HEAD_PARENT" ] && [ "$AGE" -lt 300 ]; then
     COMMIT_VERIFIED=true
   fi
 fi
@@ -67,7 +69,7 @@ if [ "$COMMIT_VERIFIED" = "true" ]; then
   echo "╔══════════════════════════════════════════════╗" >&2
   echo "║  PRE-PUSH (FAST — commit-verified ${AGE}s ago) ║" >&2
   echo "╚══════════════════════════════════════════════╝" >&2
-  echo "  [1-5/8] SKIP: Already verified by pre-commit gate (HEAD ${HEAD_HASH:0:7})" >&2
+  echo "  [1-5/8] SKIP: Already verified by pre-commit gate (parent ${HEAD_PARENT:0:7})" >&2
 else
   echo "╔══════════════════════════════════════════════╗" >&2
   echo "║        PRE-PUSH SAFETY NET (8 Gates)          ║" >&2
@@ -209,7 +211,7 @@ fi
 
 # Write state file for pre-PR gate optimization
 TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
-echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
+echo "$HEAD_PARENT $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
 # Clean up auto-save refs on successful push (background, non-blocking)
 BRANCH_NOW=$(git branch --show-current 2>/dev/null || echo "")
