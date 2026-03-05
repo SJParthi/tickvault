@@ -32,24 +32,24 @@ fi
 
 # Check 4: Network ops in background (non-blocking)
 # Push branch to remote + collision detection — runs async, does NOT block session
+# CRITICAL: redirect stdout+stderr to log file and disown, otherwise the hook
+# framework waits for stderr to close and the entire SessionStart hangs.
+NETWORK_LOG="$CWD/.claude/hooks/.session-network.log"
 (
   if [ "$BRANCH" != "detached" ]; then
     REMOTE_REF=$(git -C "$CWD" ls-remote --heads origin "$BRANCH" 2>/dev/null | head -1)
     if [ -z "$REMOTE_REF" ]; then
-      git -C "$CWD" push -u origin "$BRANCH" 2>/dev/null || true
+      timeout 15 git -C "$CWD" push -u origin "$BRANCH" 2>/dev/null || true
     fi
   fi
 
   # Lightweight collision warning (ls-remote only, no fetch)
-  BRANCH_SAFE=$(echo "$BRANCH" | tr '/' '-' | tr -cd 'a-zA-Z0-9_-')
-  MY_SESSION="${CLAUDE_SESSION_ID:-notset}"
-  REMOTE_REFS=$(git -C "$CWD" ls-remote origin 'refs/auto-save/*' 2>/dev/null)
+  REMOTE_REFS=$(timeout 10 git -C "$CWD" ls-remote origin 'refs/auto-save/*' 2>/dev/null)
   if [ -n "$REMOTE_REFS" ]; then
-    echo "" >&2
-    echo "INFO: Found auto-save snapshots from previous sessions." >&2
-    echo "Run: .claude/hooks/recover-wip.sh to list/restore" >&2
+    echo "[$(date '+%H:%M:%S')] Found auto-save snapshots from previous sessions."
   fi
-) &
+) >> "$NETWORK_LOG" 2>&1 &
+disown
 
 # Remind about principles and phase
 echo "" >&2
