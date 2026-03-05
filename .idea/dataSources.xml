@@ -5,7 +5,7 @@
       <driver-ref>postgresql</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.postgresql.Driver</jdbc-driver>
-      <jdbc-url>jdbc:postgresql://localhost:8812/qdb?sslmode=disable&amp;preferQueryMode=simple</jdbc-url>
+      <jdbc-url>jdbc:postgresql://localhost:8812/qdb?sslmode=disable&amp;preferQueryMode=simple&amp;currentSchema=public</jdbc-url>
       <jdbc-additional-properties>
         <property name="com.intellij.clouds.kubernetes.db.enabled" value="false" />
       </jdbc-additional-properties>
@@ -15,6 +15,13 @@
 Port 8812 (PG wire). Docker service: dlt-questdb.
 Credentials: auto-configured from AWS SSM via ~/.pgpass (ensure-ready.sh handles this).
 Just click Run App once — everything is automatic.</remarks>
+      <introspection-scope>
+        <node negative="1">
+          <node qname="@" />
+          <node qname="@.pg_catalog" />
+          <node qname="@.information_schema" />
+        </node>
+      </introspection-scope>
     </data-source>
   </component>
 </project>
