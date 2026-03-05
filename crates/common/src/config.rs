@@ -775,4 +775,71 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("build_window_start"));
     }
+
+    // --- SubscriptionConfig ---
+
+    #[test]
+    fn test_subscription_config_default_values() {
+        let cfg = SubscriptionConfig::default();
+        assert_eq!(cfg.feed_mode, "Ticker");
+        assert!(cfg.subscribe_index_derivatives);
+        assert!(cfg.subscribe_stock_derivatives);
+        assert!(cfg.subscribe_display_indices);
+        assert!(cfg.subscribe_stock_equities);
+        assert_eq!(cfg.stock_atm_strikes_above, 10);
+        assert_eq!(cfg.stock_atm_strikes_below, 10);
+        assert!(cfg.stock_default_atm_fallback_enabled);
+    }
+
+    #[test]
+    fn test_parsed_feed_mode_ticker() {
+        let cfg = SubscriptionConfig::default();
+        let mode = cfg.parsed_feed_mode().unwrap();
+        assert_eq!(mode, crate::types::FeedMode::Ticker);
+    }
+
+    #[test]
+    fn test_parsed_feed_mode_quote() {
+        let mut cfg = SubscriptionConfig::default();
+        cfg.feed_mode = "Quote".to_string();
+        let mode = cfg.parsed_feed_mode().unwrap();
+        assert_eq!(mode, crate::types::FeedMode::Quote);
+    }
+
+    #[test]
+    fn test_parsed_feed_mode_full() {
+        let mut cfg = SubscriptionConfig::default();
+        cfg.feed_mode = "Full".to_string();
+        let mode = cfg.parsed_feed_mode().unwrap();
+        assert_eq!(mode, crate::types::FeedMode::Full);
+    }
+
+    #[test]
+    fn test_parsed_feed_mode_invalid_returns_error() {
+        let mut cfg = SubscriptionConfig::default();
+        cfg.feed_mode = "Invalid".to_string();
+        let err = cfg.parsed_feed_mode().unwrap_err();
+        assert!(err.to_string().contains("Invalid"));
+    }
+
+    // --- NotificationConfig ---
+
+    #[test]
+    fn test_notification_config_default_values() {
+        let cfg = NotificationConfig::default();
+        assert_eq!(cfg.telegram_api_base_url, "https://api.telegram.org");
+        assert_eq!(cfg.send_timeout_ms, 10_000);
+        assert!(!cfg.sns_enabled);
+    }
+
+    // --- ObservabilityConfig ---
+
+    #[test]
+    fn test_observability_config_default_values() {
+        let cfg = ObservabilityConfig::default();
+        assert_eq!(cfg.metrics_port, 9091);
+        assert!(cfg.otlp_endpoint.contains("4317"));
+        assert!(cfg.metrics_enabled);
+        assert!(cfg.tracing_enabled);
+    }
 }

@@ -288,6 +288,32 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_http_and_https_urls_both_redacted() {
+        // Covers the (Some(h), Some(hs)) => h.min(hs) branch in redact_urls
+        let input = "tried http://a.com/x?secret=123 then https://b.com/y?key=456";
+        let output = redact_url_params(input);
+        assert!(!output.contains("123"), "http param leaked: {output}");
+        assert!(!output.contains("456"), "https param leaked: {output}");
+        assert!(
+            output.contains("http://a.com/x?[REDACTED]"),
+            "http URL not redacted: {output}"
+        );
+        assert!(
+            output.contains("https://b.com/y?[REDACTED]"),
+            "https URL not redacted: {output}"
+        );
+    }
+
+    #[test]
+    fn test_https_before_http_both_redacted() {
+        // Ensures both orders work: https first, http second
+        let input = "first https://secure.com?a=1 second http://plain.com?b=2";
+        let output = redact_url_params(input);
+        assert!(!output.contains("a=1"), "https param leaked: {output}");
+        assert!(!output.contains("b=2"), "http param leaked: {output}");
+    }
+
+    #[test]
     fn test_dhan_auth_full_error_with_body() {
         let input = "Dhan authentication failed: generateAccessToken request failed: error sending request for url (https://auth.dhan.co/app/generateAccessToken?dhanClientId=1106656882&pin=785478&totp=772509)";
         let output = redact_url_params(input);
