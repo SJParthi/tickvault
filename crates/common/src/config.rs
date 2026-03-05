@@ -800,24 +800,30 @@ mod tests {
 
     #[test]
     fn test_parsed_feed_mode_quote() {
-        let mut cfg = SubscriptionConfig::default();
-        cfg.feed_mode = "Quote".to_string();
+        let cfg = SubscriptionConfig {
+            feed_mode: "Quote".to_string(),
+            ..Default::default()
+        };
         let mode = cfg.parsed_feed_mode().unwrap();
         assert_eq!(mode, crate::types::FeedMode::Quote);
     }
 
     #[test]
     fn test_parsed_feed_mode_full() {
-        let mut cfg = SubscriptionConfig::default();
-        cfg.feed_mode = "Full".to_string();
+        let cfg = SubscriptionConfig {
+            feed_mode: "Full".to_string(),
+            ..Default::default()
+        };
         let mode = cfg.parsed_feed_mode().unwrap();
         assert_eq!(mode, crate::types::FeedMode::Full);
     }
 
     #[test]
     fn test_parsed_feed_mode_invalid_returns_error() {
-        let mut cfg = SubscriptionConfig::default();
-        cfg.feed_mode = "Invalid".to_string();
+        let cfg = SubscriptionConfig {
+            feed_mode: "Invalid".to_string(),
+            ..Default::default()
+        };
         let err = cfg.parsed_feed_mode().unwrap_err();
         assert!(err.to_string().contains("Invalid"));
     }
