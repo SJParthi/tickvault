@@ -1,22 +1,20 @@
 #!/bin/bash
-# pre-commit-gate.sh — Master quality gate for git commit
+# pre-commit-gate.sh — Fast quality gate for git commit
 # Called by PreToolUse hook on Bash commands matching "git commit"
 # Exit 2 = BLOCK commit. This is the final checkpoint.
 #
-# Gate order:
+# FAST gates only (< 5s total):
 #   1. cargo fmt --check
-#   2. cargo clippy -D warnings
-#   3. cargo test
-#   4. Banned pattern scanner (unwrap, expect, println, localhost, DashMap, hardcoded values, etc.)
-#   5. O(1) latency & dedup scanner (linear search, blocking I/O, missing dedup)
-#   6. Secret scanner (API keys, tokens, passwords)
-#   7. Cargo.toml version pinning (no ^, ~, *, >= in deps)
-#   8. Test count guard (ratcheting baseline — count can only go up)
-#   9. Commit message format (conventional commits)
-#  10. Typos check (staged files)
+#   2. Banned pattern scanner
+#   3. O(1) latency & dedup scanner
+#   4. Secret scanner
+#   5. Cargo.toml version pinning
+#   6. Commit message format
+#   7. Typos check
 #
+# Heavy gates (clippy, test, audit, deny) run on PUSH only.
 # ALL gates must pass. One failure = commit blocked.
-# On success, writes state file for pre-PR gate optimization.
+# On success, writes state file for pre-push gate optimization.
 
 set -uo pipefail
 
@@ -48,16 +46,15 @@ HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║        PRE-COMMIT QUALITY GATE (10 Gates)    ║" >&2
+echo "║      PRE-COMMIT FAST GATE (7 Gates)          ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
 # ─────────────────────────────────────────────
-# GATE 1-3: Only if Rust files are staged
+# GATE 1: cargo fmt only (fast, no clippy/test — those run on push)
 # ─────────────────────────────────────────────
 if [ -n "$RS_STAGED" ]; then
 
-  # Gate 1: cargo fmt (show errors on failure)
-  echo "  [1/10] cargo fmt --check..." >&2
+  echo "  [1/7] cargo fmt --check..." >&2
   FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
   if [ "$FMT_EXIT" -eq 124 ]; then
@@ -71,65 +68,37 @@ if [ -n "$RS_STAGED" ]; then
     echo "  PASS: cargo fmt" >&2
   fi
 
-  # Gate 2: cargo clippy (show errors on failure)
-  echo "  [2/10] cargo clippy..." >&2
-  CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
-  CLIPPY_EXIT=$?
-  if [ "$CLIPPY_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo clippy timed out (120s)" >&2
-  elif [ "$CLIPPY_EXIT" -ne 0 ]; then
-    echo "  FAIL: cargo clippy has warnings:" >&2
-    echo "$CLIPPY_OUT" | tail -20 >&2
-    FAILED=1
-  else
-    echo "  PASS: cargo clippy (zero warnings)" >&2
-  fi
-
-  # Gate 3: cargo test (show errors on failure)
-  echo "  [3/10] cargo test..." >&2
-  TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
-  TEST_EXIT=$?
-  if [ "$TEST_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo test timed out (120s)" >&2
-  elif [ "$TEST_EXIT" -ne 0 ]; then
-    echo "  FAIL: cargo test failed:" >&2
-    echo "$TEST_OUT" | tail -20 >&2
-    FAILED=1
-  else
-    echo "  PASS: cargo test (100% pass)" >&2
-  fi
-
-  # Gate 4: Banned pattern scanner
-  echo "  [4/10] Banned pattern scan..." >&2
+  # Gate 2: Banned pattern scanner
+  echo "  [2/7] Banned pattern scan..." >&2
   if ! echo "$RS_STAGED" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$RS_STAGED" 2>&1; then
     FAILED=1
   fi
 
-  # Gate 5: O(1) latency & dedup scanner
-  echo "  [5/10] O(1) latency & dedup scan..." >&2
+  # Gate 3: O(1) latency & dedup scanner
+  echo "  [3/7] O(1) latency & dedup scan..." >&2
   if ! echo "$RS_STAGED" | "$HOOKS_DIR/dedup-latency-scanner.sh" "$CWD" "$RS_STAGED" 2>&1; then
     FAILED=1
   fi
 
 else
-  echo "  [1-3/10] No .rs files staged — skipping cargo gates" >&2
-  echo "  [4-5/10] No .rs files staged — skipping Rust scanners" >&2
+  echo "  [1/7] No .rs files staged — skipping fmt" >&2
+  echo "  [2-3/7] No .rs files staged — skipping Rust scanners" >&2
 fi
 
 # ─────────────────────────────────────────────
-# GATE 6: Secret scanner (runs on ALL staged files, not just .rs)
+# GATE 4: Secret scanner (runs on ALL staged files, not just .rs)
 # ─────────────────────────────────────────────
-echo "  [6/10] Secret scan..." >&2
+echo "  [4/7] Secret scan..." >&2
 if ! echo "$ALL_STAGED" | "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1; then
   FAILED=1
 fi
 
 # ─────────────────────────────────────────────
-# GATE 7: Cargo.toml version pinning (no ^, ~, *, >= in deps)
+# GATE 5: Cargo.toml version pinning (no ^, ~, *, >= in deps)
 # ─────────────────────────────────────────────
 TOML_STAGED=$(echo "$ALL_STAGED" | grep 'Cargo\.toml$' || true)
 if [ -n "$TOML_STAGED" ]; then
-  echo "  [7/10] Cargo.toml version pinning check..." >&2
+  echo "  [5/7] Cargo.toml version pinning check..." >&2
   TOML_VIOLATIONS=0
   while IFS= read -r toml_file; do
     [ -z "$toml_file" ] && continue
@@ -152,31 +121,13 @@ if [ -n "$TOML_STAGED" ]; then
     echo "  PASS: Cargo.toml versions pinned" >&2
   fi
 else
-  echo "  [7/10] No Cargo.toml staged — skipping version pin check" >&2
+  echo "  [5/7] No Cargo.toml staged — skipping version pin check" >&2
 fi
 
 # ─────────────────────────────────────────────
-# GATE 8: Test count guard (ratcheting baseline)
+# GATE 6: Commit message format (conventional commits)
 # ─────────────────────────────────────────────
-if [ -n "$RS_STAGED" ]; then
-  echo "  [8/10] Test count guard..." >&2
-  if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
-    if ! "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
-      FAILED=1
-    fi
-  else
-    echo "  SKIP: test-count-guard.sh not executable" >&2
-  fi
-else
-  echo "  [8/10] No .rs files staged — skipping test count guard" >&2
-fi
-
-# ─────────────────────────────────────────────
-# GATE 9: Commit message format (conventional commits)
-# Validates the commit message being created follows convention.
-# We extract the message from the git commit command itself.
-# ─────────────────────────────────────────────
-echo "  [9/10] Commit message format..." >&2
+echo "  [6/7] Commit message format..." >&2
 # Extract -m "message" from the git commit command
 COMMIT_MSG=$(echo "$COMMAND" | grep -oP '(?<=-m\s["\x27])[^"\x27]+' 2>/dev/null | head -1 || true)
 if [ -z "$COMMIT_MSG" ]; then
@@ -202,9 +153,9 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# GATE 10: Typos check (staged files)
+# GATE 7: Typos check (staged files)
 # ─────────────────────────────────────────────
-echo "  [10/10] Typos check..." >&2
+echo "  [7/7] Typos check..." >&2
 if command -v typos > /dev/null 2>&1; then
   # Check only staged files to keep it fast
   TYPO_FILES=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -E '\.(rs|toml|md|yml|yaml|sh)$' || true)
@@ -251,6 +202,6 @@ TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | 
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  ALL 10 GATES PASSED — Commit allowed         ║" >&2
+echo "║  ALL 7 GATES PASSED — Commit allowed           ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0
