@@ -113,7 +113,7 @@ rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs
 rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
-aws-config = "1.6.3"
+aws-config = "1.8.15"
 aws-sdk-sns = "1.97.0"
 aws-sdk-ssm = "1.68.0"
 
