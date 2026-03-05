@@ -536,7 +536,9 @@ if [ "$OPEN_BROWSER" = true ] && [ "$FAIL" -eq 0 ]; then
     open_url "http://localhost:16686"
     sleep 0.5
     open_url "http://localhost:8080"
-    echo -e "  ${GREEN}Opened: Grafana, Prometheus, Jaeger, Traefik${NC}"
+    sleep 0.5
+    open_url "http://localhost:9000"
+    echo -e "  ${GREEN}Opened: Grafana, Prometheus, Jaeger, Traefik, QuestDB${NC}"
 fi
 
 echo ""
