@@ -5,13 +5,14 @@
 
 use dhan_live_trader_common::constants::{
     RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER,
-    RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI, RESPONSE_CODE_PREVIOUS_CLOSE,
-    RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
+    RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
+    RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
 };
 
 use super::disconnect::parse_disconnect_packet;
 use super::full_packet::parse_full_packet;
 use super::header::parse_header;
+use super::market_depth::parse_market_depth_packet;
 use super::market_status::validate_market_status_packet;
 use super::oi::parse_oi_packet;
 use super::previous_close::parse_previous_close_packet;
@@ -42,6 +43,10 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
         RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => {
             let tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
             Ok(ParsedFrame::Tick(tick))
+        }
+        RESPONSE_CODE_MARKET_DEPTH => {
+            let (tick, depth) = parse_market_depth_packet(raw, &header, received_at_nanos)?;
+            Ok(ParsedFrame::TickWithDepth(tick, depth))
         }
         RESPONSE_CODE_QUOTE => {
             let tick = parse_quote_packet(raw, &header, received_at_nanos)?;
@@ -88,8 +93,9 @@ mod tests {
     use super::*;
     use crate::websocket::types::DisconnectCode;
     use dhan_live_trader_common::constants::{
-        DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
-        PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
+        DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_DEPTH_PACKET_SIZE,
+        MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE,
+        TICKER_PACKET_SIZE,
     };
     use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 
@@ -191,6 +197,34 @@ mod tests {
         let (tick, depth) = unwrap_tick_with_depth(dispatch_frame(&buf, 0).unwrap());
         assert_eq!(tick.security_id, 42);
         assert_eq!(depth.len(), 5);
+    }
+
+    #[test]
+    fn test_dispatch_market_depth() {
+        let buf = make_minimal_packet(RESPONSE_CODE_MARKET_DEPTH, MARKET_DEPTH_PACKET_SIZE);
+        let (tick, depth) = unwrap_tick_with_depth(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.security_id, 42);
+        assert_eq!(depth.len(), 5);
+    }
+
+    #[test]
+    fn test_dispatch_market_depth_insufficient_body() {
+        let mut buf = [0u8; 8];
+        buf[0] = RESPONSE_CODE_MARKET_DEPTH;
+        buf[1..3].copy_from_slice(&8u16.to_le_bytes());
+        buf[3] = 2;
+        buf[4..8].copy_from_slice(&42u32.to_le_bytes());
+        let (expected, actual) = unwrap_insufficient_bytes(dispatch_frame(&buf, 0).unwrap_err());
+        assert_eq!(expected, MARKET_DEPTH_PACKET_SIZE);
+        assert_eq!(actual, 8);
+    }
+
+    #[test]
+    fn test_dispatch_received_at_nanos_propagated_market_depth() {
+        let buf = make_minimal_packet(RESPONSE_CODE_MARKET_DEPTH, MARKET_DEPTH_PACKET_SIZE);
+        let nanos = 7_777_777_777_i64;
+        let (tick, _) = unwrap_tick_with_depth(dispatch_frame(&buf, nanos).unwrap());
+        assert_eq!(tick.received_at_nanos, nanos);
     }
 
     #[test]

@@ -36,21 +36,10 @@ fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// Helper: reads a little-endian i32 from a byte slice at the given offset.
+/// Helper: reads a little-endian u16 from a byte slice at the given offset.
 #[inline(always)]
-fn read_i32_le(raw: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-    ])
-}
-
-/// Helper: reads a little-endian i16 from a byte slice at the given offset.
-#[inline(always)]
-fn read_i16_le(raw: &[u8], offset: usize) -> i16 {
-    i16::from_le_bytes([raw[offset], raw[offset + 1]])
+fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([raw[offset], raw[offset + 1]])
 }
 
 /// Parses a Full packet into a `ParsedTick` and 5 market depth levels.
@@ -96,10 +85,10 @@ pub fn parse_full_packet(
     for (i, level) in depth.iter_mut().enumerate() {
         let base = FULL_OFFSET_DEPTH_START + i * MARKET_DEPTH_LEVEL_SIZE;
         *level = MarketDepthLevel {
-            bid_quantity: read_i32_le(raw, base),
-            ask_quantity: read_i32_le(raw, base + 4),
-            bid_orders: read_i16_le(raw, base + 8),
-            ask_orders: read_i16_le(raw, base + 10),
+            bid_quantity: read_u32_le(raw, base),
+            ask_quantity: read_u32_le(raw, base + 4),
+            bid_orders: read_u16_le(raw, base + 8),
+            ask_orders: read_u16_le(raw, base + 10),
             bid_price: read_f32_le(raw, base + 12),
             ask_price: read_f32_le(raw, base + 16),
         };
@@ -152,7 +141,7 @@ mod tests {
         close: f32,
         high: f32,
         low: f32,
-        depth_data: Option<[(i32, i32, i16, i16, f32, f32); 5]>,
+        depth_data: Option<[(u32, u32, u16, u16, f32, f32); 5]>,
     ) -> (Vec<u8>, PacketHeader) {
         let mut buf = vec![0u8; FULL_QUOTE_PACKET_SIZE];
         // header
@@ -353,10 +342,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_full_negative_depth_values() {
-        // depth quantities can be negative in edge cases
+    fn test_parse_full_max_depth_values() {
+        // Dhan SDK uses unsigned types (I=u32, H=u16) for depth fields.
         let depth_data = [
-            (-100, -200, -1, -2, 99.0f32, 101.0f32),
+            (u32::MAX, u32::MAX, u16::MAX, u16::MAX, 99.0f32, 101.0f32),
             (0, 0, 0, 0, 0.0, 0.0),
             (0, 0, 0, 0, 0.0, 0.0),
             (0, 0, 0, 0, 0.0, 0.0),
@@ -382,10 +371,10 @@ mod tests {
             Some(depth_data),
         );
         let (_, depth) = parse_full_packet(&buf, &hdr, 0).unwrap();
-        assert_eq!(depth[0].bid_quantity, -100);
-        assert_eq!(depth[0].ask_quantity, -200);
-        assert_eq!(depth[0].bid_orders, -1);
-        assert_eq!(depth[0].ask_orders, -2);
+        assert_eq!(depth[0].bid_quantity, u32::MAX);
+        assert_eq!(depth[0].ask_quantity, u32::MAX);
+        assert_eq!(depth[0].bid_orders, u16::MAX);
+        assert_eq!(depth[0].ask_orders, u16::MAX);
     }
 
     #[test]
