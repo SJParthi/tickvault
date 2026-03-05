@@ -74,10 +74,12 @@ http:
         servers:
           - url: "http://dlt-jaeger:16686"
 
+    # App runs on the host (IntelliJ / cargo run), not inside Docker.
+    # host.docker.internal resolves to the Docker host on both macOS and Linux.
     app:
       loadBalancer:
         servers:
-          - url: "http://dlt-app:3001"
+          - url: "http://host.docker.internal:3001"
 
     alloy:
       loadBalancer:
