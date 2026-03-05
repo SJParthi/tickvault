@@ -3,6 +3,10 @@
 //! Serialize/deserialize the instrument universe to a memory-mapped binary file
 //! for fast restart during market hours. Uses rkyv `from_bytes` for validated
 //! deserialization (~5-15ms, 25x faster than CSV re-parse).
+//!
+//! # Cache Format
+//! `[MAGIC (4 bytes)] [VERSION (1 byte)] [rkyv payload ...]`
+//! Magic = `b"RKYV"`, Version = `1`. Validated on load to reject stale caches.
 
 use std::path::Path;
 
@@ -13,32 +17,56 @@ use tracing::info;
 use dhan_live_trader_common::constants::BINARY_CACHE_FILENAME;
 use dhan_live_trader_common::instrument_types::{ArchivedFnoUniverse, FnoUniverse};
 
+/// Magic bytes at the start of every rkyv cache file.
+const CACHE_MAGIC: &[u8; 4] = b"RKYV";
+
+/// Cache format version. Bump when rkyv version or type layout changes.
+const CACHE_VERSION: u8 = 1;
+
+/// Total header size: 4 (magic) + 1 (version).
+const HEADER_LEN: usize = CACHE_MAGIC.len() + 1;
+
 /// Serialize `FnoUniverse` to rkyv binary file.
 ///
+/// Uses temp file + atomic rename to prevent readers from seeing partial writes.
 /// Called after successful CSV build. Best-effort — caller should log and
 /// continue if this fails.
 pub fn write_binary_cache(universe: &FnoUniverse, cache_dir: &str) -> Result<()> {
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(universe)
+    let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(universe)
         .map_err(|err| anyhow::anyhow!("rkyv serialize failed: {err}"))?;
+
     let path = Path::new(cache_dir).join(BINARY_CACHE_FILENAME);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create cache dir: {}", parent.display()))?;
     }
-    std::fs::write(&path, &bytes)
-        .with_context(|| format!("failed to write rkyv cache: {}", path.display()))?;
+
+    // Build payload: header + rkyv bytes
+    let mut payload = Vec::with_capacity(HEADER_LEN + rkyv_bytes.len());
+    payload.extend_from_slice(CACHE_MAGIC);
+    payload.push(CACHE_VERSION);
+    payload.extend_from_slice(&rkyv_bytes);
+
+    // Atomic write: temp file → rename (prevents readers from seeing partial data)
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, &payload)
+        .with_context(|| format!("failed to write temp rkyv cache: {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &path)
+        .with_context(|| format!("failed to rename rkyv cache: {}", path.display()))?;
+
     info!(
-        bytes = bytes.len(),
+        bytes = payload.len(),
         path = %path.display(),
-        "rkyv binary cache written"
+        "rkyv binary cache written (atomic)"
     );
     Ok(())
 }
 
 /// Load `FnoUniverse` from rkyv binary cache via mmap.
 ///
+/// Validates magic bytes + version header before deserializing.
 /// Returns `Ok(None)` if the file does not exist.
-/// Returns `Err` if the file exists but is corrupt or unreadable.
+/// Returns `Err` if the file exists but has wrong header, version, or corrupt data.
 pub fn read_binary_cache(cache_dir: &str) -> Result<Option<FnoUniverse>> {
     let path = Path::new(cache_dir).join(BINARY_CACHE_FILENAME);
     if !path.exists() {
@@ -50,7 +78,9 @@ pub fn read_binary_cache(cache_dir: &str) -> Result<Option<FnoUniverse>> {
     let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, single-process, no concurrent writers
         .with_context(|| format!("failed to mmap rkyv cache: {}", path.display()))?;
 
-    let universe = rkyv::from_bytes::<FnoUniverse, rkyv::rancor::Error>(&mmap)
+    let rkyv_payload = validate_header(&mmap, &path)?;
+
+    let universe = rkyv::from_bytes::<FnoUniverse, rkyv::rancor::Error>(rkyv_payload)
         .map_err(|err| anyhow::anyhow!("rkyv deserialize failed (corrupt cache?): {err}"))?;
 
     info!(
@@ -60,6 +90,34 @@ pub fn read_binary_cache(cache_dir: &str) -> Result<Option<FnoUniverse>> {
         "rkyv binary cache loaded"
     );
     Ok(Some(universe))
+}
+
+/// Validate cache header (magic + version) and return the rkyv payload slice.
+fn validate_header<'a>(data: &'a [u8], path: &Path) -> Result<&'a [u8]> {
+    if data.len() < HEADER_LEN {
+        anyhow::bail!(
+            "rkyv cache too small ({} bytes < {} header): {}",
+            data.len(),
+            HEADER_LEN,
+            path.display()
+        );
+    }
+    if &data[..4] != CACHE_MAGIC {
+        anyhow::bail!(
+            "rkyv cache bad magic (expected RKYV, got {:?}): {}",
+            &data[..4],
+            path.display()
+        );
+    }
+    if data[4] != CACHE_VERSION {
+        anyhow::bail!(
+            "rkyv cache version mismatch (expected {}, got {}): {}",
+            CACHE_VERSION,
+            data[4],
+            path.display()
+        );
+    }
+    Ok(&data[HEADER_LEN..])
 }
 
 // ---------------------------------------------------------------------------
@@ -75,22 +133,25 @@ pub fn read_binary_cache(cache_dir: &str) -> Result<Option<FnoUniverse>> {
 ///
 /// # Safety
 /// Uses `rkyv::access_unchecked` internally. This is safe because:
-/// 1. The binary cache is written by our own `write_binary_cache` (same rkyv version)
+/// 1. The binary cache is written by our own `write_binary_cache` (same rkyv version,
+///    validated via magic bytes + version header)
 /// 2. The mmap is read-only — no concurrent mutation possible
-/// 3. Single-process access — no concurrent writers
-/// 4. File size is validated before access
+/// 3. Single-process access — atomic rename prevents partial reads
+/// 4. Magic bytes + version + file size validated before access
 pub struct MappedUniverse {
     mmap: Mmap,
 }
 
-/// Minimum valid rkyv cache file size (empty FnoUniverse is still > 100 bytes).
-const MIN_RKYV_CACHE_BYTES: u64 = 64;
+/// Minimum valid rkyv cache file size (header + smallest valid rkyv payload).
+const MIN_RKYV_CACHE_BYTES: u64 = 256;
 
 impl MappedUniverse {
     /// Load and validate the rkyv binary cache. Sub-0.5ms.
     ///
+    /// Validates magic bytes, version, minimum size, then does a quick field
+    /// access to catch obvious corruption before returning.
     /// Returns `Ok(None)` if the file does not exist.
-    /// Returns `Err` if the file exists but is too small (likely corrupt).
+    /// Returns `Err` if the file exists but fails any validation.
     pub fn load(cache_dir: &str) -> Result<Option<Self>> {
         let path = Path::new(cache_dir).join(BINARY_CACHE_FILENAME);
         if !path.exists() {
@@ -112,15 +173,15 @@ impl MappedUniverse {
         let file = std::fs::File::open(&path)
             .with_context(|| format!("failed to open rkyv cache: {}", path.display()))?;
 
-        let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, single-process, no concurrent writers
+        let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, single-process, atomic writes
             .with_context(|| format!("failed to mmap rkyv cache: {}", path.display()))?;
+
+        // Validate header (magic + version) before interpreting payload
+        let _ = validate_header(&mmap, &path)?;
 
         let mapped = Self { mmap };
 
-        // Validate the archived data is accessible (fast sanity check).
-        // access_unchecked will interpret the bytes — if the file is garbage,
-        // reading fields later could panic. We do a quick field access to catch
-        // obvious corruption early.
+        // Quick field access to catch obvious corruption early
         let archived = mapped.archived();
         let _derivative_count = archived.derivative_contracts.len();
         let _underlying_count = archived.underlyings.len();
@@ -138,15 +199,16 @@ impl MappedUniverse {
     /// Zero-copy access to the archived universe. Sub-microsecond.
     ///
     /// # Safety
-    /// Data was validated in `load()`. Mmap is read-only, single-process.
+    /// Header validated in `load()`. Mmap is read-only, single-process.
     #[inline]
     pub fn archived(&self) -> &ArchivedFnoUniverse {
-        unsafe { rkyv::access_unchecked::<ArchivedFnoUniverse>(&self.mmap) } // SAFETY: see struct-level safety comment
+        // Skip the 5-byte header (magic + version) to reach the rkyv payload
+        unsafe { rkyv::access_unchecked::<ArchivedFnoUniverse>(&self.mmap[HEADER_LEN..]) } // SAFETY: see struct-level safety comment
     }
 
     /// Full deserialization to owned types (for non-hot-path code like persistence).
     pub fn to_owned(&self) -> Result<FnoUniverse> {
-        rkyv::from_bytes::<FnoUniverse, rkyv::rancor::Error>(&self.mmap)
+        rkyv::from_bytes::<FnoUniverse, rkyv::rancor::Error>(&self.mmap[HEADER_LEN..])
             .map_err(|err| anyhow::anyhow!("rkyv deserialize failed: {err}"))
     }
 
@@ -247,7 +309,10 @@ mod tests {
         std::fs::write(&path, b"this is garbage data not rkyv").unwrap();
 
         let result = read_binary_cache(dir.to_str().unwrap());
-        assert!(result.is_err(), "corrupt rkyv file should return Err");
+        assert!(
+            result.is_err(),
+            "corrupt rkyv file should return Err (bad magic)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -263,6 +328,53 @@ mod tests {
 
         let result = read_binary_cache(dir.to_str().unwrap());
         assert!(result.is_err(), "empty rkyv file should return Err");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_binary_cache_bad_magic_returns_error() {
+        let dir = unique_temp_dir("rkyv-bad-magic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join(BINARY_CACHE_FILENAME);
+        // Valid size but wrong magic bytes
+        let mut data = vec![0u8; 300];
+        data[..4].copy_from_slice(b"FAKE");
+        data[4] = CACHE_VERSION;
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_binary_cache(dir.to_str().unwrap());
+        assert!(result.is_err(), "bad magic should return Err");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bad magic"),
+            "error should mention magic: {err_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_binary_cache_wrong_version_returns_error() {
+        let dir = unique_temp_dir("rkyv-wrong-ver");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join(BINARY_CACHE_FILENAME);
+        let mut data = vec![0u8; 300];
+        data[..4].copy_from_slice(CACHE_MAGIC);
+        data[4] = CACHE_VERSION + 1; // wrong version
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_binary_cache(dir.to_str().unwrap());
+        assert!(result.is_err(), "wrong version should return Err");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("version mismatch"),
+            "error should mention version: {err_msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -321,7 +433,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = dir.join(BINARY_CACHE_FILENAME);
-        std::fs::write(&path, b"tiny").unwrap();
+        // 100 bytes is below MIN_RKYV_CACHE_BYTES (256)
+        std::fs::write(&path, &vec![0u8; 100]).unwrap();
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
         assert!(result.is_err(), "too-small rkyv file should return Err");

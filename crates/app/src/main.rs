@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
                 failed_checks = ?failed,
                 "instrument diagnostic: SOME CHECKS FAILED"
             );
+            std::process::exit(1);
         }
         return Ok(());
     }
