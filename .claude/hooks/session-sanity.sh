@@ -37,9 +37,15 @@ fi
 NETWORK_LOG="$CWD/.claude/hooks/.session-network.log"
 (
   if [ "$BRANCH" != "detached" ]; then
-    REMOTE_REF=$(git -C "$CWD" ls-remote --heads origin "$BRANCH" 2>/dev/null | head -1)
-    if [ -z "$REMOTE_REF" ]; then
-      timeout 15 git -C "$CWD" push -u origin "$BRANCH" 2>/dev/null || true
+    # Wait if user push is in progress
+    PUSH_LOCK="$CWD/.claude/hooks/.push-in-progress"
+    if [ -f "$PUSH_LOCK" ]; then
+      echo "[$(date '+%H:%M:%S')] Push lock found, skipping session push"
+    else
+      REMOTE_REF=$(git -C "$CWD" ls-remote --heads origin "$BRANCH" 2>/dev/null | head -1)
+      if [ -z "$REMOTE_REF" ]; then
+        timeout 15 git -C "$CWD" push -u origin "$BRANCH" 2>/dev/null || true
+      fi
     fi
   fi
 

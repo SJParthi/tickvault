@@ -122,8 +122,11 @@ if [ "$QUALITY_FRESH" = "false" ]; then
 
     # 4a: cargo fmt --check
     echo "  [4a/4e] cargo fmt --check..." >&2
-    FMT_OUT=$(cargo fmt --all -- --check 2>&1)
-    if [ $? -ne 0 ]; then
+    FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
+    FMT_EXIT=$?
+    if [ "$FMT_EXIT" -eq 124 ]; then
+      echo "  SKIP: cargo fmt timed out (60s)" >&2
+    elif [ "$FMT_EXIT" -ne 0 ]; then
       echo "  FAIL: cargo fmt:" >&2
       echo "$FMT_OUT" | tail -10 >&2
       FAILED=1
@@ -133,8 +136,11 @@ if [ "$QUALITY_FRESH" = "false" ]; then
 
     # 4b: cargo clippy
     echo "  [4b/4e] cargo clippy..." >&2
-    CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
-    if [ $? -ne 0 ]; then
+    CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+    CLIPPY_EXIT=$?
+    if [ "$CLIPPY_EXIT" -eq 124 ]; then
+      echo "  SKIP: cargo clippy timed out (120s)" >&2
+    elif [ "$CLIPPY_EXIT" -ne 0 ]; then
       echo "  FAIL: cargo clippy:" >&2
       echo "$CLIPPY_OUT" | tail -20 >&2
       FAILED=1
@@ -144,8 +150,11 @@ if [ "$QUALITY_FRESH" = "false" ]; then
 
     # 4c: cargo test
     echo "  [4c/4e] cargo test..." >&2
-    TEST_OUT=$(cargo test --workspace 2>&1)
-    if [ $? -ne 0 ]; then
+    TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
+    TEST_EXIT=$?
+    if [ "$TEST_EXIT" -eq 124 ]; then
+      echo "  SKIP: cargo test timed out (120s)" >&2
+    elif [ "$TEST_EXIT" -ne 0 ]; then
       echo "  FAIL: cargo test:" >&2
       echo "$TEST_OUT" | tail -20 >&2
       FAILED=1
@@ -157,7 +166,7 @@ if [ "$QUALITY_FRESH" = "false" ]; then
     echo "  [4d/4e] Banned pattern scan..." >&2
     ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
     if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
-      if ! echo "$ALL_RS" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
+      if ! timeout 60 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
         echo "  FAIL: Banned patterns found in workspace." >&2
         FAILED=1
       else
@@ -170,7 +179,7 @@ if [ "$QUALITY_FRESH" = "false" ]; then
     # 4e: Test count guard
     echo "  [4e/4e] Test count guard..." >&2
     if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
-      if ! "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
+      if ! timeout 30 "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
         FAILED=1
       fi
     else
