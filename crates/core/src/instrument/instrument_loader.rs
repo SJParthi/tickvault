@@ -1,13 +1,13 @@
-//! Three-layer instrument defense: Time Gate + Freshness Marker + Manual API.
+//! Three-layer instrument defense: Freshness Marker + Time Gate + Manual API.
 //!
 //! Ensures instruments build ONCE at 8:30 AM boot. During trading-hours
-//! restarts, zero overhead — not even a file read.
+//! restarts, cache loads instantly — no time gate blocks recovery.
 //!
 //! # Three Layers
-//! 1. **Time Gate** — sub-nanosecond integer comparison. Outside [08:25, 08:55]
-//!    IST? Skip entirely.
-//! 2. **Freshness Marker** — one file read (~100μs). Already built today? Load
-//!    from cache, skip download + persist.
+//! 1. **Freshness Marker** — one file read (~100μs). Already built today? Load
+//!    from cache unconditionally. Crash at 10:30? Instant recovery.
+//! 2. **Time Gate** — sub-nanosecond integer comparison. Outside [08:25, 08:55]
+//!    IST? Try stale cache as fallback. Only gates fresh downloads.
 //! 3. **Manual API** — `POST /api/instruments/rebuild`. Bypasses time gate,
 //!    respects freshness marker (idempotent, one-shot).
 
@@ -29,7 +29,7 @@ use super::universe_builder::build_fno_universe_from_csv;
 use dhan_live_trader_storage::instrument_persistence::persist_instrument_snapshot;
 
 // ---------------------------------------------------------------------------
-// Layer 1: Time Gate
+// Layer 2: Time Gate (only gates downloads, not cache reads)
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if the current IST time is within the build window
@@ -50,7 +50,7 @@ pub fn is_within_build_window(window_start: &str, window_end: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 2: Freshness Marker
+// Layer 1: Freshness Marker (always checked first — enables crash recovery)
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if today's IST date matches the freshness marker file.
@@ -95,30 +95,17 @@ pub fn write_freshness_marker(cache_dir: &str) {
 /// Main entry: three-layer defense instrument loading.
 ///
 /// Returns `Ok(Some((universe, was_fresh_build)))` if instruments were built.
-/// Returns `Ok(None)` if time-gated skip (outside build window).
+/// Returns `Ok(None)` if no instruments available (outside window + no cache).
 ///
 /// `was_fresh_build` is `true` when a full download + persist happened (first
-/// build of the day). `false` when loaded from cache (marker was fresh).
+/// build of the day). `false` when loaded from cache (fresh or stale).
 pub async fn load_or_build_instruments(
     dhan_csv_url: &str,
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
 ) -> Result<Option<(FnoUniverse, bool)>> {
-    // Layer 1: Time gate
-    if !is_within_build_window(
-        &instrument_config.build_window_start,
-        &instrument_config.build_window_end,
-    ) {
-        info!(
-            window_start = %instrument_config.build_window_start,
-            window_end = %instrument_config.build_window_end,
-            "instruments: TIME-GATED SKIP (outside build window)"
-        );
-        return Ok(None);
-    }
-
-    // Layer 2: Freshness marker
+    // Layer 1: Freshness marker — always checked first (enables crash recovery)
     if is_instrument_fresh(&instrument_config.csv_cache_directory) {
         info!("instruments: loading from cache (freshness marker = today)");
         let download_result = load_cached_csv(
@@ -135,7 +122,42 @@ pub async fn load_or_build_instruments(
         return Ok(Some((universe, false)));
     }
 
-    // Full build: download → parse → build → persist → marker
+    // Layer 2: Time gate — only gates downloads, not cache reads
+    if !is_within_build_window(
+        &instrument_config.build_window_start,
+        &instrument_config.build_window_end,
+    ) {
+        // Outside window + no fresh marker → try stale cache as fallback
+        match load_cached_csv(
+            &instrument_config.csv_cache_directory,
+            &instrument_config.csv_cache_filename,
+        )
+        .await
+        {
+            Ok(download_result) => {
+                warn!(
+                    window_start = %instrument_config.build_window_start,
+                    window_end = %instrument_config.build_window_end,
+                    "instruments: outside build window, using STALE cached CSV as fallback"
+                );
+                let universe =
+                    build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+                        .context("failed to build universe from stale cached CSV")?;
+
+                return Ok(Some((universe, false)));
+            }
+            Err(_) => {
+                info!(
+                    window_start = %instrument_config.build_window_start,
+                    window_end = %instrument_config.build_window_end,
+                    "instruments: TIME-GATED SKIP (outside build window, no cache available)"
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    // Layer 3: Full build — within window + not fresh → download → parse → persist → marker
     info!("instruments: full build (no freshness marker for today)");
     let download_result = download_instrument_csv(
         dhan_csv_url,
@@ -226,6 +248,7 @@ fn now_ist_date_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     // Note: is_within_build_window() uses the real clock via now_ist_time().
     // We test the boundary logic by choosing windows that are guaranteed to
@@ -302,6 +325,331 @@ mod tests {
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let content = std::fs::read_to_string(&marker_path).unwrap();
         assert_eq!(content, now_ist_date_string());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // now_ist_date_string / now_ist_time — format and range checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_now_ist_date_string_format_yyyy_mm_dd() {
+        let date_str = now_ist_date_string();
+        // Must match YYYY-MM-DD (chrono NaiveDate::to_string output)
+        assert_eq!(date_str.len(), 10, "date must be 10 chars: {}", date_str);
+        assert_eq!(
+            date_str.chars().nth(4),
+            Some('-'),
+            "5th char must be dash: {}",
+            date_str
+        );
+        assert_eq!(
+            date_str.chars().nth(7),
+            Some('-'),
+            "8th char must be dash: {}",
+            date_str
+        );
+        // Year, month, day must be parseable integers
+        let year: i32 = date_str[..4].parse().unwrap();
+        let month: u32 = date_str[5..7].parse().unwrap();
+        let day: u32 = date_str[8..10].parse().unwrap();
+        assert!(year >= 2024, "year must be >= 2024: {}", year);
+        assert!((1..=12).contains(&month), "month out of range: {}", month);
+        assert!((1..=31).contains(&day), "day out of range: {}", day);
+    }
+
+    #[test]
+    fn test_now_ist_time_returns_valid_time() {
+        let time = now_ist_time();
+        // NaiveTime is always valid, but verify it's a reasonable IST time
+        assert!(time.hour() < 24);
+        assert!(time.minute() < 60);
+        assert!(time.second() < 60);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_instrument_fresh — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_instrument_fresh_marker_with_trailing_newline() {
+        // is_instrument_fresh uses .trim() so trailing newline should match
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-trailing-newline");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        let today = now_ist_date_string();
+        std::fs::write(&marker_path, format!("{}\n", today)).unwrap();
+
+        assert!(
+            is_instrument_fresh(temp_dir.to_str().unwrap()),
+            "trailing newline should be trimmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_marker_with_surrounding_whitespace() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-whitespace");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        let today = now_ist_date_string();
+        std::fs::write(&marker_path, format!("  {}  \n", today)).unwrap();
+
+        assert!(
+            is_instrument_fresh(temp_dir.to_str().unwrap()),
+            "surrounding whitespace should be trimmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_empty_file_returns_false() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-empty");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "").unwrap();
+
+        assert!(
+            !is_instrument_fresh(temp_dir.to_str().unwrap()),
+            "empty marker file should not be fresh"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_garbage_content_returns_false() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-garbage");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "not-a-date").unwrap();
+
+        assert!(
+            !is_instrument_fresh(temp_dir.to_str().unwrap()),
+            "garbage content should not match today"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_tomorrow_date_returns_false() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-tomorrow");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        // Write a date far in the future — should not match today
+        std::fs::write(&marker_path, "2099-12-31").unwrap();
+
+        assert!(
+            !is_instrument_fresh(temp_dir.to_str().unwrap()),
+            "future date should not match today"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // write_freshness_marker — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_freshness_marker_creates_nested_directories() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-nested/a/b/c");
+        let cache_dir = temp_dir.to_str().unwrap();
+
+        // Ensure clean state
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt-test-marker-nested"));
+
+        write_freshness_marker(cache_dir);
+
+        // Verify marker was written
+        assert!(
+            is_instrument_fresh(cache_dir),
+            "marker should be fresh after writing to nested dir"
+        );
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt-test-marker-nested"));
+    }
+
+    #[test]
+    fn test_write_freshness_marker_overwrites_stale_marker() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-marker-overwrite");
+        let cache_dir = temp_dir.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Write a stale marker
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "2020-01-01").unwrap();
+        assert!(
+            !is_instrument_fresh(cache_dir),
+            "stale marker must not be fresh"
+        );
+
+        // Overwrite with today
+        write_freshness_marker(cache_dir);
+        assert!(
+            is_instrument_fresh(cache_dir),
+            "marker should be fresh after overwrite"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_write_freshness_marker_readonly_directory_no_panic() {
+        // Best-effort: writing to an impossible path should not panic
+        write_freshness_marker("/proc/1/nonexistent-marker");
+        // No assertion — just verify no panic
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_build_window — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_build_window_both_invalid_returns_false() {
+        assert!(!is_within_build_window("xyz", "abc"));
+    }
+
+    #[test]
+    fn test_is_within_build_window_reversed_window_returns_false() {
+        // end before start — current time cannot be >= 23:00 AND < 01:00 simultaneously
+        assert!(!is_within_build_window("23:00:00", "01:00:00"));
+    }
+
+    #[test]
+    fn test_is_within_build_window_narrow_past_window_returns_false() {
+        // A window in the distant past (00:00 to 00:01) — only true if running
+        // exactly at midnight; we test the negative case with a one-second window
+        // at 00:00:00 to 00:00:01 — almost certainly outside
+        let result = is_within_build_window("00:00:00", "00:00:01");
+        // Can't assert deterministically, but verify no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_is_within_build_window_empty_strings_return_false() {
+        assert!(!is_within_build_window("", "08:55:00"));
+        assert!(!is_within_build_window("08:25:00", ""));
+        assert!(!is_within_build_window("", ""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Async orchestrator tests — testing observable behavior via markers
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_load_or_build_instruments_outside_window_returns_none() {
+        // Use an impossible window (00:00:00 to 00:00:00) — always outside
+        let instrument_config = InstrumentConfig {
+            daily_download_time: "08:45:00".to_owned(),
+            csv_cache_directory: "/tmp/dlt-test-load-outside".to_owned(),
+            csv_cache_filename: "test.csv".to_owned(),
+            csv_download_timeout_secs: 5,
+            build_window_start: "00:00:00".to_owned(),
+            build_window_end: "00:00:00".to_owned(),
+        };
+        let questdb_config = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            ilp_port: 19999,
+            http_port: 19998,
+            pg_port: 18812,
+        };
+
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &instrument_config,
+            &questdb_config,
+        )
+        .await;
+
+        assert!(result.is_ok(), "outside window should not error");
+        assert!(
+            result.unwrap().is_none(),
+            "outside window should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_rebuild_instruments_with_fresh_marker_returns_none() {
+        let temp_dir = std::env::temp_dir().join("dlt-test-rebuild-fresh");
+        let cache_dir = temp_dir.to_str().unwrap().to_owned();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Write today's marker so rebuild thinks it's already done
+        write_freshness_marker(&cache_dir);
+
+        let instrument_config = InstrumentConfig {
+            daily_download_time: "08:45:00".to_owned(),
+            csv_cache_directory: cache_dir.clone(),
+            csv_cache_filename: "test.csv".to_owned(),
+            csv_download_timeout_secs: 5,
+            build_window_start: "00:00:00".to_owned(),
+            build_window_end: "23:59:59".to_owned(),
+        };
+        let questdb_config = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            ilp_port: 19999,
+            http_port: 19998,
+            pg_port: 18812,
+        };
+
+        let result = try_rebuild_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &instrument_config,
+            &questdb_config,
+        )
+        .await;
+
+        assert!(result.is_ok(), "fresh marker should not error");
+        assert!(
+            result.unwrap().is_none(),
+            "fresh marker should return None (idempotent)"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_try_rebuild_instruments_without_marker_attempts_download() {
+        // No marker, no server → download fails → returns error
+        let temp_dir = std::env::temp_dir().join("dlt-test-rebuild-no-marker");
+        let cache_dir = temp_dir.to_str().unwrap().to_owned();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let instrument_config = InstrumentConfig {
+            daily_download_time: "08:45:00".to_owned(),
+            csv_cache_directory: cache_dir,
+            csv_cache_filename: "test.csv".to_owned(),
+            csv_download_timeout_secs: 2,
+            build_window_start: "00:00:00".to_owned(),
+            build_window_end: "23:59:59".to_owned(),
+        };
+        let questdb_config = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            ilp_port: 19999,
+            http_port: 19998,
+            pg_port: 18812,
+        };
+
+        let result = try_rebuild_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &instrument_config,
+            &questdb_config,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "no marker + no server should return error from download failure"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

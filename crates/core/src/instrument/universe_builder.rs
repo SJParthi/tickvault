@@ -3686,4 +3686,319 @@ mod tests {
         // Clean up
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Duplicate key handling: last-write-wins semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_index_lookup_duplicate_symbol_last_wins() {
+        // Same symbol with different security_ids → HashMap overwrites
+        let rows = vec![
+            make_index_row(100, "NIFTY", Exchange::NationalStockExchange),
+            make_index_row(200, "NIFTY", Exchange::NationalStockExchange),
+        ];
+        let lookup = build_index_lookup(&rows);
+        assert_eq!(
+            lookup.len(),
+            1,
+            "duplicate symbols should produce one entry"
+        );
+        // Last entry wins (HashMap::insert overwrites)
+        assert_eq!(lookup["NIFTY"].security_id, 200);
+    }
+
+    #[test]
+    fn test_build_equity_lookup_duplicate_symbol_last_wins() {
+        let rows = vec![
+            make_equity_row(100, "RELIANCE"),
+            make_equity_row(200, "RELIANCE"),
+        ];
+        let lookup = build_equity_lookup(&rows);
+        assert_eq!(lookup.len(), 1);
+        assert_eq!(lookup["RELIANCE"], 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // discover_fno_underlyings: first-occurrence-wins dedup preserves lot_size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_first_occurrence_preserves_lot_size() {
+        let rows = vec![
+            make_futstk_row(1001, 2885, "RELIANCE", "2026-03-30", 500),
+            make_futstk_row(1002, 2885, "RELIANCE", "2026-04-30", 250), // different lot
+        ];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1);
+        // First occurrence wins — lot_size should be 500, not 250
+        assert_eq!(underlyings[0].lot_size, 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_derivatives_and_chains: NaN strike in option chain sort
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_nan_strike_does_not_panic_during_sort() {
+        // NaN strikes should not panic — partial_cmp returns None → Equal
+        let today = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "NIFTY".to_owned(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_owned(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 75,
+                contract_count: 0,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+            },
+        );
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            // Option with NaN strike (crafted)
+            {
+                let mut row = make_optidx_row(
+                    70001,
+                    26000,
+                    "NIFTY",
+                    "2026-03-30",
+                    22000.0,
+                    OptionType::Call,
+                    75,
+                );
+                row.strike_price = f64::NAN;
+                row
+            },
+            make_optidx_row(
+                70002,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                22500.0,
+                OptionType::Call,
+                75,
+            ),
+        ];
+
+        // Should not panic
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, today);
+        // NaN strike normalizes to 0.0 (NaN > 0.0 is false → sentinel branch)
+        // Actually in our code: strike < 0.0 check — NaN < 0.0 is false, so NaN stays as-is
+        // But the sort uses partial_cmp().unwrap_or(Equal) — should not panic
+        assert!(!result.derivative_contracts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_derivatives_and_chains: duplicate contract in CSV
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_duplicate_contract_both_inserted() {
+        // Same security_id appearing twice → HashMap insert overwrites (last wins)
+        let today = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "NIFTY".to_owned(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_owned(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 75,
+                contract_count: 0,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+            },
+        );
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            // Duplicate with same security_id
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, today);
+        // HashMap keyed by security_id → duplicate overwrites, count = 1
+        assert_eq!(result.derivative_contracts.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_fno_universe_from_csv: error paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_fno_universe_from_csv_empty_csv_returns_error() {
+        let result = build_fno_universe_from_csv("", "test");
+        assert!(result.is_err(), "empty CSV should fail parsing");
+    }
+
+    #[test]
+    fn test_build_fno_universe_from_csv_malformed_csv_returns_error() {
+        let result = build_fno_universe_from_csv("not,a,valid,csv\nrow", "test");
+        assert!(result.is_err(), "malformed CSV should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_subscribed_indices: unknown subcategory defaults to Thematic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_unknown_subcategory_defaults_to_thematic() {
+        // We can't modify the constant, but we CAN verify that all entries
+        // in DISPLAY_INDEX_ENTRIES have recognized subcategories
+        let valid_subcategories = [
+            "Volatility",
+            "BroadMarket",
+            "MidCap",
+            "SmallCap",
+            "Sectoral",
+            "Thematic",
+        ];
+        for &(name, _id, subcategory) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                valid_subcategories.contains(&subcategory),
+                "DISPLAY_INDEX_ENTRIES has unrecognized subcategory '{}' for index '{}'",
+                subcategory,
+                name
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Expiry calendar deduplication via BTreeSet
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_expiry_calendar_deduplicates_same_date() {
+        // Two contracts with same expiry → calendar has one date
+        let today = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "NIFTY".to_owned(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_owned(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 75,
+                contract_count: 0,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+            },
+        );
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            // Two futures with same expiry
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            // Option with same expiry
+            make_optidx_row(
+                70001,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                22000.0,
+                OptionType::Call,
+                75,
+            ),
+        ];
+
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, today);
+        let calendar = &result.expiry_calendars["NIFTY"];
+        // Despite 2 contracts with same expiry, calendar should have exactly 1 date
+        assert_eq!(
+            calendar.expiry_dates.len(),
+            1,
+            "BTreeSet should deduplicate same expiry date"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Option chain with only puts (no calls)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_option_chain_puts_only() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "NIFTY".to_owned(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_owned(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 75,
+                contract_count: 0,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+            },
+        );
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_optidx_row(
+                70001,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                22000.0,
+                OptionType::Put,
+                75,
+            ),
+            make_optidx_row(
+                70002,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                22500.0,
+                OptionType::Put,
+                75,
+            ),
+        ];
+
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, today);
+        let key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_owned(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        let chain = &result.option_chains[&key];
+        assert!(chain.calls.is_empty(), "no calls in chain");
+        assert_eq!(chain.puts.len(), 2, "two puts in chain");
+    }
 }

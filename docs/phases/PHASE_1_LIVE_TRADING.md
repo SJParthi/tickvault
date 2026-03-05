@@ -1206,7 +1206,7 @@ Response: Array of OHLCV candles with timestamps.
 ### Block 01: Master Instrument Download — COMPLETE
 
 - [x] CSV download with retry + fallback
-- [x] 6-pass mapping algorithm
+- [x] 5-pass mapping algorithm
 - [x] FnoUniverse object with all lookup maps
 - [x] WebSocket subscription plan generation
 - [x] Validation (must-exist checks, count bounds)
