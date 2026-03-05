@@ -15,9 +15,12 @@ rule_files:
 
 scrape_configs:
   # Application metrics (exposed by dhan-live-trader via metrics-exporter-prometheus)
+  # App runs on the host (IntelliJ / cargo run), not inside Docker.
+  # host.docker.internal resolves to the Docker host on both macOS and Linux
+  # (Linux requires extra_hosts in docker-compose.yml).
   - job_name: "dlt-application"
     static_configs:
-      - targets: ["dlt-app:9091"]
+      - targets: ["host.docker.internal:9091"]
         labels:
           service: "dhan-live-trader"
 

@@ -393,17 +393,46 @@ else
     warn "Alert rules not yet loaded (Grafana unified alerting may need time)"
 fi
 
-# Verify Telegram contact point is provisioned
+# Configure Telegram contact point via API (not file provisioning — empty tokens crash Grafana)
 CP_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/contact-points" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
-if echo "$CP_JSON" | grep -q "telegram"; then
-    ok "Telegram contact point provisioned — Grafana alerts → your phone"
-else
-    if [ -n "$DLT_TELEGRAM_BOT_TOKEN" ]; then
-        warn "Telegram contact point not yet visible (Grafana may need restart)"
+if echo "$CP_JSON" | grep -q "dlt-telegram"; then
+    ok "Telegram contact point already configured"
+elif [ -n "$DLT_TELEGRAM_BOT_TOKEN" ] && [ -n "$DLT_TELEGRAM_CHAT_ID" ]; then
+    # Create Telegram contact point via Grafana API
+    TELEGRAM_PAYLOAD=$(cat <<EOFPAYLOAD
+{
+  "name": "dlt-telegram",
+  "type": "telegram",
+  "settings": {
+    "bottoken": "${DLT_TELEGRAM_BOT_TOKEN}",
+    "chatid": "${DLT_TELEGRAM_CHAT_ID}",
+    "parse_mode": "HTML",
+    "message": "{{ if gt (len .Alerts.Firing) 0 }}🔴 FIRING{{ end }}{{ if gt (len .Alerts.Resolved) 0 }}🟢 RESOLVED{{ end }}\n{{ range .Alerts }}\n<b>{{ .Labels.alertname }}</b>\n{{ .Annotations.summary }}\n{{ .Annotations.description }}\nSeverity: {{ .Labels.severity }}\n{{ end }}"
+  },
+  "disableResolveMessage": false
+}
+EOFPAYLOAD
+    )
+    CP_RESULT=$(curl -sf --max-time 5 -X POST "http://localhost:3000/api/v1/provisioning/contact-points" \
+        -H "Authorization: Basic ${GRAFANA_AUTH}" \
+        -H "Content-Type: application/json" \
+        -H "X-Disable-Provenance: true" \
+        -d "${TELEGRAM_PAYLOAD}" 2>/dev/null || echo "")
+    if echo "$CP_RESULT" | grep -q "uid"; then
+        # Update notification policy to use Telegram
+        POLICY_PAYLOAD='{"receiver":"dlt-telegram","group_by":["grafana_folder","alertname"],"group_wait":"30s","group_interval":"5m","repeat_interval":"4h"}'
+        curl -sf --max-time 5 -X PUT "http://localhost:3000/api/v1/provisioning/policies" \
+            -H "Authorization: Basic ${GRAFANA_AUTH}" \
+            -H "Content-Type: application/json" \
+            -H "X-Disable-Provenance: true" \
+            -d "${POLICY_PAYLOAD}" > /dev/null 2>&1 || true
+        ok "Telegram contact point created — Grafana alerts → your phone"
     else
-        info "Telegram contact point skipped (no bot token in SSM)"
+        warn "Could not create Telegram contact point (Grafana API error)"
     fi
+else
+    info "Telegram contact point skipped (no bot token in SSM — alerts go to default receiver)"
 fi
 
 # ---- Step 14: Prometheus rules ----
