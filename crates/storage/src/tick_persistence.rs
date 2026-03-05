@@ -15,6 +15,7 @@
 //! the system logs WARN and continues — no data is buffered in memory beyond
 //! the current batch to prevent OOM.
 
+use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -156,6 +157,43 @@ impl TickPersistenceWriter {
 }
 
 // ---------------------------------------------------------------------------
+// f32 → f64 Precision-Preserving Conversion
+// ---------------------------------------------------------------------------
+
+/// Stack buffer size for f32 shortest decimal representation.
+/// Maximum f32 decimal string: "-3.4028235e+38" = 15 chars. 24 is generous.
+const F32_DECIMAL_BUF_SIZE: usize = 24;
+
+/// Converts f32 to f64 preserving the shortest decimal representation.
+///
+/// Dhan sends prices as IEEE 754 f32 on the wire. Direct `f64::from(f32)`
+/// widens the bit pattern, revealing hidden f32 imprecision:
+///   21004.95_f32 → `f64::from()` → 21004.94921875_f64  ← WRONG
+///   21004.95_f32 → this function → 21004.95_f64         ← CORRECT
+///
+/// Matches the Dhan Python SDK behavior: `"{:.2f}".format(value)`.
+///
+/// # Performance
+/// Zero heap allocation — uses a stack buffer for the decimal string.
+#[inline]
+fn f32_to_f64_clean(v: f32) -> f64 {
+    if v == 0.0 || !v.is_finite() {
+        return f64::from(v);
+    }
+    let mut buf = [0u8; F32_DECIMAL_BUF_SIZE];
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    // f32 Display uses ryu internally — produces the shortest decimal
+    // representation that round-trips through f32. Zero allocation.
+    let _ = write!(cursor, "{v}");
+    let n = cursor.position() as usize;
+    // f32 Display only produces ASCII digits, '.', '-', 'e', '+'.
+    std::str::from_utf8(&buf[..n])
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(f64::from(v))
+}
+
+// ---------------------------------------------------------------------------
 // Buffer Building (extracted for testability)
 // ---------------------------------------------------------------------------
 
@@ -163,6 +201,9 @@ impl TickPersistenceWriter {
 ///
 /// Converts the IST-naive exchange timestamp to proper UTC by subtracting
 /// the IST offset (5h30m = 19800s), then writes all tick fields into the buffer.
+///
+/// Price fields use `f32_to_f64_clean` to preserve the original Dhan f32
+/// precision without f32→f64 widening artifacts.
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     // Dhan V2 sends exchange_timestamp as IST-naive epoch: the IST clock time
     // (e.g., 09:25:32 IST) encoded as if it were UTC epoch seconds. To store as
@@ -178,21 +219,21 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("segment")?
         .column_i64("security_id", i64::from(tick.security_id))
         .context("security_id")?
-        .column_f64("ltp", f64::from(tick.last_traded_price))
+        .column_f64("ltp", f32_to_f64_clean(tick.last_traded_price))
         .context("ltp")?
-        .column_f64("open", f64::from(tick.day_open))
+        .column_f64("open", f32_to_f64_clean(tick.day_open))
         .context("open")?
-        .column_f64("high", f64::from(tick.day_high))
+        .column_f64("high", f32_to_f64_clean(tick.day_high))
         .context("high")?
-        .column_f64("low", f64::from(tick.day_low))
+        .column_f64("low", f32_to_f64_clean(tick.day_low))
         .context("low")?
-        .column_f64("close", f64::from(tick.day_close))
+        .column_f64("close", f32_to_f64_clean(tick.day_close))
         .context("close")?
         .column_i64("volume", i64::from(tick.volume))
         .context("volume")?
         .column_i64("oi", i64::from(tick.open_interest))
         .context("oi")?
-        .column_f64("avg_price", f64::from(tick.average_traded_price))
+        .column_f64("avg_price", f32_to_f64_clean(tick.average_traded_price))
         .context("avg_price")?
         .column_i64("last_trade_qty", i64::from(tick.last_trade_quantity))
         .context("last_trade_qty")?
@@ -1543,5 +1584,104 @@ mod tests {
 
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count(), 0);
+    }
+
+    // --- f32_to_f64_clean tests ---
+
+    #[test]
+    fn test_f32_to_f64_clean_preserves_simple_prices() {
+        // Dhan sends these as f32. Direct f64::from() would corrupt them.
+        assert_eq!(f32_to_f64_clean(24500.5), 24500.5);
+        assert_eq!(f32_to_f64_clean(100.0), 100.0);
+        assert_eq!(f32_to_f64_clean(24.45), 24.45);
+        assert_eq!(f32_to_f64_clean(58755.25), 58755.25);
+        assert_eq!(f32_to_f64_clean(16281.5), 16281.5);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_index_values() {
+        // Index values from the screenshot that were corrupted
+        let nifty_f32: f32 = 21004.95;
+        let result = f32_to_f64_clean(nifty_f32);
+        assert_eq!(result, 21004.95_f64);
+
+        let bank_nifty_f32: f32 = 27929.1;
+        let result = f32_to_f64_clean(bank_nifty_f32);
+        assert_eq!(result, 27929.1_f64);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_vs_naive_conversion() {
+        // Demonstrate the problem: f64::from(f32) reveals artifacts
+        let price: f32 = 744.15;
+        let naive = f64::from(price);
+        let clean = f32_to_f64_clean(price);
+
+        // Naive conversion shows artifacts
+        assert_ne!(naive, 744.15_f64, "naive should differ from clean f64");
+        // Clean conversion preserves the intended value
+        assert_eq!(clean, 744.15_f64, "clean should match intended f64");
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_zero() {
+        assert_eq!(f32_to_f64_clean(0.0), 0.0);
+        assert_eq!(
+            f32_to_f64_clean(-0.0).to_bits(),
+            f64::from(-0.0_f32).to_bits()
+        );
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_infinity_and_nan() {
+        assert_eq!(f32_to_f64_clean(f32::INFINITY), f64::INFINITY);
+        assert_eq!(f32_to_f64_clean(f32::NEG_INFINITY), f64::NEG_INFINITY);
+        assert!(f32_to_f64_clean(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_small_values() {
+        assert_eq!(f32_to_f64_clean(0.05), 0.05);
+        assert_eq!(f32_to_f64_clean(0.1), 0.1);
+        assert_eq!(f32_to_f64_clean(1.5), 1.5);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_large_values() {
+        assert_eq!(f32_to_f64_clean(100000.0), 100000.0);
+        assert_eq!(f32_to_f64_clean(999999.5), 999999.5);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_negative_prices() {
+        assert_eq!(f32_to_f64_clean(-24500.5), -24500.5);
+        assert_eq!(f32_to_f64_clean(-0.05), -0.05);
+    }
+
+    #[test]
+    fn test_build_tick_row_ltp_precision_preserved() {
+        // Verify the actual ILP buffer contains clean values, not f32→f64 artifacts.
+        let tick = ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 21004.95,
+            exchange_timestamp: 1772073900,
+            received_at_nanos: 0,
+            ..Default::default()
+        };
+
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        build_tick_row(&mut buf, &tick).unwrap();
+        let ilp_str = String::from_utf8_lossy(buf.as_bytes());
+
+        // The ILP line should contain "ltp=21004.95" not "ltp=21004.94921875"
+        assert!(
+            ilp_str.contains("ltp=21004.95"),
+            "ILP buffer should contain clean LTP. Got: {ilp_str}"
+        );
+        assert!(
+            !ilp_str.contains("21004.949"),
+            "ILP buffer must NOT contain f32→f64 artifact. Got: {ilp_str}"
+        );
     }
 }

@@ -17,6 +17,10 @@ pub const TICKER_PACKET_SIZE: usize = 16;
 /// SDK format: `<BHBIfHIfIIIffff`
 pub const QUOTE_PACKET_SIZE: usize = 50;
 
+/// Market depth standalone packet: 112 bytes (header 8 + LTP float32 + depth 100 bytes).
+/// SDK format: `<BHBIf100s`
+pub const MARKET_DEPTH_PACKET_SIZE: usize = 112;
+
 /// Full packet (quote + OI + 5-level market depth): 162 bytes.
 /// SDK format: `<BHBIfHIfIIIIIIffff100s`
 pub const FULL_QUOTE_PACKET_SIZE: usize = 162;
@@ -132,6 +136,11 @@ pub const RESPONSE_CODE_INDEX_TICKER: u8 = 1;
 
 /// Response code for ticker packet (16 bytes).
 pub const RESPONSE_CODE_TICKER: u8 = 2;
+
+/// Response code for market depth standalone packet (112 bytes).
+/// Format: `<BHBIf100s>` — Header(8) + LTP(f32) + Depth(5×20 bytes).
+/// Dhan Python SDK: `process_market_depth(data)`.
+pub const RESPONSE_CODE_MARKET_DEPTH: u8 = 3;
 
 /// Response code for quote packet (50 bytes).
 pub const RESPONSE_CODE_QUOTE: u8 = 4;
@@ -611,6 +620,15 @@ pub const HEADER_OFFSET_EXCHANGE_SEGMENT: usize = 3;
 
 /// Security ID (u32 LE) position in binary header.
 pub const HEADER_OFFSET_SECURITY_ID: usize = 4;
+
+// --- Market Depth standalone packet body offsets (112 bytes total) ---
+// Format: <BHBIf100s> — same LTP offset as Ticker, depth at offset 12.
+
+/// LTP (f32 LE) offset in Market Depth standalone packet.
+pub const MARKET_DEPTH_OFFSET_LTP: usize = 8;
+
+/// Start of 5-level market depth (100 bytes) in Market Depth standalone packet.
+pub const MARKET_DEPTH_OFFSET_DEPTH_START: usize = 12;
 
 // --- Ticker packet body offsets (16 bytes total) ---
 
