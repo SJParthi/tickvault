@@ -19,7 +19,10 @@ use std::fmt;
 
 use chrono::NaiveDate;
 
-use crate::instrument_types::{DerivativeContract, DhanInstrumentKind, FnoUnderlying};
+use crate::instrument_types::{
+    ArchivedDerivativeContract, ArchivedFnoUnderlying, DerivativeContract, DhanInstrumentKind,
+    FnoUnderlying, naive_date_from_archived_i32,
+};
 use crate::types::{ExchangeSegment, FeedMode, OptionType, SecurityId};
 
 // ---------------------------------------------------------------------------
@@ -295,6 +298,50 @@ pub fn make_derivative_instrument(
             None
         },
         option_type: contract.option_type,
+        feed_mode,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder helpers — zero-copy archived types → SubscribedInstrument
+// ---------------------------------------------------------------------------
+
+/// Creates a `SubscribedInstrument` for a stock equity price feed from an archived underlying.
+pub fn make_stock_equity_instrument_from_archived(
+    underlying: &ArchivedFnoUnderlying,
+    feed_mode: FeedMode,
+) -> SubscribedInstrument {
+    SubscribedInstrument {
+        security_id: underlying.price_feed_security_id.to_native(),
+        exchange_segment: ExchangeSegment::from(&underlying.price_feed_segment),
+        category: SubscriptionCategory::StockEquity,
+        display_label: underlying.underlying_symbol.as_str().to_owned(),
+        underlying_symbol: underlying.underlying_symbol.as_str().to_owned(),
+        instrument_kind: None,
+        expiry_date: None,
+        strike_price: None,
+        option_type: None,
+        feed_mode,
+    }
+}
+
+/// Creates a `SubscribedInstrument` from an archived derivative contract.
+pub fn make_derivative_instrument_from_archived(
+    contract: &ArchivedDerivativeContract,
+    category: SubscriptionCategory,
+    feed_mode: FeedMode,
+) -> SubscribedInstrument {
+    let strike = contract.strike_price.to_native();
+    SubscribedInstrument {
+        security_id: contract.security_id.to_native(),
+        exchange_segment: ExchangeSegment::from(&contract.exchange_segment),
+        category,
+        display_label: contract.display_name.as_str().to_owned(),
+        underlying_symbol: contract.underlying_symbol.as_str().to_owned(),
+        instrument_kind: Some(DhanInstrumentKind::from(&contract.instrument_kind)),
+        expiry_date: Some(naive_date_from_archived_i32(&contract.expiry_date)),
+        strike_price: if strike > 0.0 { Some(strike) } else { None },
+        option_type: contract.option_type.as_ref().map(OptionType::from),
         feed_mode,
     }
 }

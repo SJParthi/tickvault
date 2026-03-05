@@ -265,7 +265,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_and_read_cache() {
-        let temp_dir = env::temp_dir().join("dlt-test-csv-cache");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-csv-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "test-instruments.csv";
 
@@ -291,7 +295,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_cache_too_small_returns_error() {
-        let temp_dir = env::temp_dir().join("dlt-test-csv-small");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-csv-small-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::create_dir_all(&temp_dir).await;
         let cache_path = temp_dir.join("small.csv");
         fs::write(&cache_path, "tiny").await.unwrap();
@@ -330,7 +338,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_cached_csv_success() {
-        let temp_dir = env::temp_dir().join("dlt-test-load-cached");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-load-cached-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "cached-load.csv";
 
@@ -431,7 +443,11 @@ mod tests {
         let fake_csv = "X".repeat(INSTRUMENT_CSV_MIN_BYTES + 100);
         let url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-primary-ok");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-primary-ok-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
 
         let result = download_instrument_csv(
@@ -460,7 +476,11 @@ mod tests {
         let fake_csv = "Y".repeat(INSTRUMENT_CSV_MIN_BYTES + 100);
         let fallback_url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-fallback-ok");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-fallback-ok-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
 
         let result = download_instrument_csv(
@@ -530,7 +550,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_cache_creates_directory_if_missing() {
-        let temp_dir = env::temp_dir().join("dlt-test-write-cache-mkdir");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-write-cache-mkdir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let nested_dir = temp_dir.join("a").join("b").join("c");
         let cache_dir = nested_dir.to_str().unwrap();
         let fake_csv = "Z".repeat(100);
@@ -549,7 +573,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_cache_overwrite_existing() {
-        let temp_dir = env::temp_dir().join("dlt-test-write-cache-overwrite");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-write-cache-overwrite-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
 
         write_cache(cache_dir, "test.csv", "first content").await;
@@ -569,7 +597,11 @@ mod tests {
         let fake_csv = "C".repeat(INSTRUMENT_CSV_MIN_BYTES + 50);
         let url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-cache-write");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-cache-write-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "cached-after-dl.csv";
 
@@ -650,7 +682,11 @@ mod tests {
         let fake_csv = "E".repeat(INSTRUMENT_CSV_MIN_BYTES + 50);
         let url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-primary-cache-verify");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-primary-cache-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "verify-cache.csv";
 
@@ -682,7 +718,11 @@ mod tests {
         let fake_csv = "F".repeat(INSTRUMENT_CSV_MIN_BYTES + 50);
         let fallback_url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-fallback-cache-verify");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-fallback-cache-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "verify-fallback-cache.csv";
 
@@ -721,7 +761,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_cache_exactly_min_bytes_succeeds() {
-        let temp_dir = env::temp_dir().join("dlt-test-csv-exact-min");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-csv-exact-min-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::create_dir_all(&temp_dir).await;
         let cache_path = temp_dir.join("exact-min.csv");
 
@@ -740,7 +784,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_cache_one_below_min_bytes_fails() {
-        let temp_dir = env::temp_dir().join("dlt-test-csv-below-min");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-csv-below-min-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::create_dir_all(&temp_dir).await;
         let cache_path = temp_dir.join("below-min.csv");
 
@@ -783,7 +831,11 @@ mod tests {
     async fn test_write_cache_file_write_failure() {
         // Create a directory where the "file" name is actually a directory,
         // causing fs::write to fail (covers lines 201-202).
-        let temp_dir = env::temp_dir().join("dlt-test-write-cache-file-fail");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-write-cache-file-fail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let _ = fs::create_dir_all(&temp_dir).await;
 
@@ -820,7 +872,11 @@ mod tests {
         let fake_csv = "P".repeat(INSTRUMENT_CSV_MIN_BYTES + 10);
         let url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-primary-bytes-log");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-primary-bytes-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
 
         let result = download_instrument_csv(
@@ -846,7 +902,11 @@ mod tests {
         let fake_csv = "Q".repeat(INSTRUMENT_CSV_MIN_BYTES + 10);
         let fallback_url = spawn_test_http_server(200, &fake_csv).await;
 
-        let temp_dir = env::temp_dir().join("dlt-test-dl-fallback-bytes-log");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-fallback-bytes-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
 
         let result = download_instrument_csv(
@@ -868,7 +928,11 @@ mod tests {
     #[tokio::test]
     async fn test_download_cache_success_logs_byte_count() {
         // Exercises lines 109-110: cache success with byte count in warn log
-        let temp_dir = env::temp_dir().join("dlt-test-dl-cache-bytes-log");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-dl-cache-bytes-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "cached-bytes-log.csv";
 
@@ -996,7 +1060,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_cache_invalid_utf8_returns_error() {
-        let temp_dir = env::temp_dir().join("dlt-test-csv-invalid-utf8");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-csv-invalid-utf8-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::create_dir_all(&temp_dir).await;
         let cache_path = temp_dir.join("bad-utf8.csv");
 
@@ -1064,7 +1132,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_cached_csv_source_field_is_cache() {
-        let temp_dir = env::temp_dir().join("dlt-test-load-cached-source");
+        let temp_dir = env::temp_dir().join(format!(
+            "dlt-test-load-cached-source-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let cache_dir = temp_dir.to_str().unwrap();
         let cache_filename = "source-check.csv";
 

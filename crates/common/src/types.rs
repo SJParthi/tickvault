@@ -8,7 +8,20 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Exchange identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum Exchange {
     /// National Stock Exchange of India.
     NationalStockExchange,
@@ -33,7 +46,20 @@ impl fmt::Display for Exchange {
 }
 
 /// Exchange segment for subscription and routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum ExchangeSegment {
     /// Index segment (both NSE and BSE indices).
     IdxI,
@@ -70,7 +96,20 @@ impl fmt::Display for ExchangeSegment {
 }
 
 /// WebSocket feed mode determining the data granularity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum FeedMode {
     /// Compact price data (16 bytes: header + LTP + LTT).
     Ticker,
@@ -98,7 +137,20 @@ impl fmt::Display for FeedMode {
 }
 
 /// Instrument type classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum InstrumentType {
     /// Index (e.g., NIFTY, BANKNIFTY).
     Index,
@@ -129,7 +181,20 @@ impl fmt::Display for InstrumentType {
 }
 
 /// Option type for derivatives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum OptionType {
     /// Call option.
     Call,
@@ -150,6 +215,41 @@ impl OptionType {
 impl fmt::Display for OptionType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archived → Owned Conversions (for zero-copy rkyv access)
+// ---------------------------------------------------------------------------
+
+impl From<&ArchivedExchange> for Exchange {
+    fn from(archived: &ArchivedExchange) -> Self {
+        match archived {
+            ArchivedExchange::NationalStockExchange => Self::NationalStockExchange,
+            ArchivedExchange::BombayStockExchange => Self::BombayStockExchange,
+        }
+    }
+}
+
+impl From<&ArchivedExchangeSegment> for ExchangeSegment {
+    fn from(archived: &ArchivedExchangeSegment) -> Self {
+        match archived {
+            ArchivedExchangeSegment::IdxI => Self::IdxI,
+            ArchivedExchangeSegment::NseEquity => Self::NseEquity,
+            ArchivedExchangeSegment::NseFno => Self::NseFno,
+            ArchivedExchangeSegment::BseEquity => Self::BseEquity,
+            ArchivedExchangeSegment::BseFno => Self::BseFno,
+            ArchivedExchangeSegment::McxComm => Self::McxComm,
+        }
+    }
+}
+
+impl From<&ArchivedOptionType> for OptionType {
+    fn from(archived: &ArchivedOptionType) -> Self {
+        match archived {
+            ArchivedOptionType::Call => Self::Call,
+            ArchivedOptionType::Put => Self::Put,
+        }
     }
 }
 

@@ -18,7 +18,7 @@
 //! Total must fit within 25,000 (5 connections x 5,000 each).
 //! The planner logs a warning if capacity is exceeded.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
@@ -27,10 +27,13 @@ use dhan_live_trader_common::config::SubscriptionConfig;
 use dhan_live_trader_common::constants::{FULL_CHAIN_INDEX_SYMBOLS, MAX_TOTAL_SUBSCRIPTIONS};
 use dhan_live_trader_common::instrument_registry::{
     InstrumentRegistry, SubscribedInstrument, SubscriptionCategory, make_derivative_instrument,
-    make_display_index_instrument, make_major_index_instrument, make_stock_equity_instrument,
+    make_derivative_instrument_from_archived, make_display_index_instrument,
+    make_major_index_instrument, make_stock_equity_instrument,
+    make_stock_equity_instrument_from_archived,
 };
 use dhan_live_trader_common::instrument_types::{
-    FnoUniverse, IndexCategory, OptionChainKey, UnderlyingKind,
+    ArchivedFnoUniverse, DhanInstrumentKind, FnoUniverse, IndexCategory, OptionChainKey,
+    UnderlyingKind, naive_date_from_archived_i32,
 };
 use dhan_live_trader_common::types::FeedMode;
 
@@ -383,6 +386,324 @@ pub fn build_subscription_plan(
         stocks_skipped = summary.stocks_skipped_no_chain,
         capacity_pct = format!("{:.1}%", summary.capacity_utilization_pct),
         "Subscription plan built"
+    );
+
+    SubscriptionPlan { registry, summary }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-Copy Archived Planner (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Builds a subscription plan from zero-copy archived data. No heap
+/// allocation for the universe — only the output `SubscribedInstrument`
+/// structs are allocated.
+///
+/// Same logic as [`build_subscription_plan`] but operates on
+/// `&ArchivedFnoUniverse` from a memory-mapped rkyv cache.
+pub fn build_subscription_plan_from_archived(
+    universe: &ArchivedFnoUniverse,
+    config: &SubscriptionConfig,
+    today: NaiveDate,
+) -> SubscriptionPlan {
+    let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
+
+    let mut instruments: Vec<SubscribedInstrument> = Vec::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
+    let mut seen_ids: HashSet<u32> = HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
+    let mut stocks_skipped_no_chain: usize = 0;
+
+    let full_chain_set: HashSet<&str> = FULL_CHAIN_INDEX_SYMBOLS.iter().copied().collect();
+
+    // Pre-build option chain lookup: (symbol, expiry) → &ArchivedOptionChain.
+    // ArchivedOptionChainKey can't be constructed for HashMap::get, so we build
+    // a local lookup from the archived data (one-time O(n) for ~2K entries).
+    let mut option_chain_lookup: HashMap<(&str, NaiveDate), usize> =
+        HashMap::with_capacity(universe.option_chains.len());
+    let option_chain_entries: Vec<_> = universe.option_chains.iter().collect();
+    for (idx, (key, _)) in option_chain_entries.iter().enumerate() {
+        let symbol = key.underlying_symbol.as_str();
+        let expiry = naive_date_from_archived_i32(&key.expiry_date);
+        option_chain_lookup.insert((symbol, expiry), idx);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Major index value feeds (IDX_I)
+    // -----------------------------------------------------------------------
+    for underlying in universe.underlyings.values() {
+        let symbol = underlying.underlying_symbol.as_str();
+        if !full_chain_set.contains(symbol) {
+            continue;
+        }
+        let price_id = underlying.price_feed_security_id.to_native();
+        if seen_ids.insert(price_id) {
+            instruments.push(make_major_index_instrument(price_id, symbol, feed_mode));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Display indices (IDX_I)
+    // -----------------------------------------------------------------------
+    if config.subscribe_display_indices {
+        for index in universe.subscribed_indices.iter() {
+            let cat = IndexCategory::from(&index.category);
+            let sec_id = index.security_id.to_native();
+            if cat == IndexCategory::DisplayIndex && seen_ids.insert(sec_id) {
+                instruments.push(make_display_index_instrument(
+                    sec_id,
+                    index.symbol.as_str(),
+                    feed_mode,
+                ));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Index derivatives — ALL contracts for major indices
+    // -----------------------------------------------------------------------
+    if config.subscribe_index_derivatives {
+        for contract in universe.derivative_contracts.values() {
+            let kind = DhanInstrumentKind::from(&contract.instrument_kind);
+            let is_index = matches!(
+                kind,
+                DhanInstrumentKind::FutureIndex | DhanInstrumentKind::OptionIndex
+            );
+            let sec_id = contract.security_id.to_native();
+            if is_index
+                && full_chain_set.contains(contract.underlying_symbol.as_str())
+                && seen_ids.insert(sec_id)
+            {
+                instruments.push(make_derivative_instrument_from_archived(
+                    contract,
+                    SubscriptionCategory::IndexDerivative,
+                    feed_mode,
+                ));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Stock equities + Stock derivatives (current expiry)
+    // -----------------------------------------------------------------------
+    for underlying in universe.underlyings.values() {
+        let kind = UnderlyingKind::from(&underlying.kind);
+        if kind != UnderlyingKind::Stock {
+            continue;
+        }
+
+        let symbol = underlying.underlying_symbol.as_str();
+
+        // 4a. Stock equity price feed
+        let price_id = underlying.price_feed_security_id.to_native();
+        if config.subscribe_stock_equities && seen_ids.insert(price_id) {
+            instruments.push(make_stock_equity_instrument_from_archived(
+                underlying, feed_mode,
+            ));
+        }
+
+        // 4b. Stock derivatives — current expiry only, ATM ± N strikes
+        if !config.subscribe_stock_derivatives {
+            continue;
+        }
+
+        // Find current expiry (first expiry >= today)
+        let current_expiry = universe.expiry_calendars.get(symbol).and_then(|cal| {
+            cal.expiry_dates.iter().find_map(|d| {
+                let date = naive_date_from_archived_i32(d);
+                if date >= today { Some(date) } else { None }
+            })
+        });
+
+        let Some(expiry) = current_expiry else {
+            debug!(
+                underlying = %symbol,
+                "No current expiry found — skipping stock derivatives"
+            );
+            stocks_skipped_no_chain += 1;
+            continue;
+        };
+
+        // Look up option chain via our pre-built index
+        if let Some(&chain_idx) = option_chain_lookup.get(&(symbol, expiry)) {
+            let (_, chain) = &option_chain_entries[chain_idx];
+
+            // Future for this expiry
+            if let Some(archived_future_id) = chain.future_security_id.as_ref() {
+                let future_id: u32 = archived_future_id.to_native();
+                if seen_ids.insert(future_id) {
+                    // Look up the future contract in derivative_contracts
+                    let archived_key = rkyv::rend::u32_le::from_native(future_id);
+                    if let Some(future_contract) = universe.derivative_contracts.get(&archived_key)
+                    {
+                        instruments.push(make_derivative_instrument_from_archived(
+                            future_contract,
+                            SubscriptionCategory::StockDerivative,
+                            feed_mode,
+                        ));
+                    }
+                }
+            }
+
+            // ATM ± N strike filtering
+            let atm_above = config.stock_atm_strikes_above;
+            let atm_below = config.stock_atm_strikes_below;
+
+            // Calls
+            let call_count = chain.calls.len();
+            if call_count > 0 {
+                let mid_idx = call_count / 2;
+                let start = mid_idx.saturating_sub(atm_below);
+                let end = (mid_idx + atm_above + 1).min(call_count);
+                for entry in &chain.calls[start..end] {
+                    let sec_id = entry.security_id.to_native();
+                    let archived_key = rkyv::rend::u32_le::from_native(sec_id);
+                    if let Some(contract) = universe.derivative_contracts.get(&archived_key)
+                        && seen_ids.insert(sec_id)
+                    {
+                        instruments.push(make_derivative_instrument_from_archived(
+                            contract,
+                            SubscriptionCategory::StockDerivative,
+                            feed_mode,
+                        ));
+                    }
+                }
+            }
+
+            // Puts
+            let put_count = chain.puts.len();
+            if put_count > 0 {
+                let mid_idx = put_count / 2;
+                let start = mid_idx.saturating_sub(atm_below);
+                let end = (mid_idx + atm_above + 1).min(put_count);
+                for entry in &chain.puts[start..end] {
+                    let sec_id = entry.security_id.to_native();
+                    let archived_key = rkyv::rend::u32_le::from_native(sec_id);
+                    if let Some(contract) = universe.derivative_contracts.get(&archived_key)
+                        && seen_ids.insert(sec_id)
+                    {
+                        instruments.push(make_derivative_instrument_from_archived(
+                            contract,
+                            SubscriptionCategory::StockDerivative,
+                            feed_mode,
+                        ));
+                    }
+                }
+            }
+        } else {
+            debug!(
+                underlying = %symbol,
+                expiry = %expiry,
+                "No option chain found for current expiry — skipping"
+            );
+            stocks_skipped_no_chain += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Progressive fill — remaining stock derivatives to 25K capacity
+    // -----------------------------------------------------------------------
+    let mut stock_derivatives_available: usize = 0;
+    let mut stock_derivatives_skipped: usize = 0;
+
+    if config.subscribe_stock_derivatives {
+        // O(1) EXEMPT: begin — planner runs once at startup, not per tick
+        let count_before_stage2 = instruments.len();
+
+        let mut remaining_stock_derivatives: Vec<(u32, NaiveDate, &str, &_)> = universe
+            .derivative_contracts
+            .values()
+            .filter_map(|c| {
+                let kind = DhanInstrumentKind::from(&c.instrument_kind);
+                let is_stock_deriv = matches!(
+                    kind,
+                    DhanInstrumentKind::FutureStock | DhanInstrumentKind::OptionStock
+                );
+                let expiry = naive_date_from_archived_i32(&c.expiry_date);
+                let sec_id = c.security_id.to_native();
+                if is_stock_deriv && expiry >= today && !seen_ids.contains(&sec_id) {
+                    Some((sec_id, expiry, c.underlying_symbol.as_str(), c))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Deterministic sort: nearest expiry -> underlying -> security_id
+        remaining_stock_derivatives
+            .sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(b.2)).then(a.0.cmp(&b.0)));
+
+        stock_derivatives_available = remaining_stock_derivatives.len();
+        for (sec_id, _, _, contract) in &remaining_stock_derivatives {
+            if instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS {
+                break;
+            }
+            if seen_ids.insert(*sec_id) {
+                instruments.push(make_derivative_instrument_from_archived(
+                    contract,
+                    SubscriptionCategory::StockDerivative,
+                    feed_mode,
+                ));
+            }
+        }
+
+        let stage2_added = instruments.len() - count_before_stage2;
+        stock_derivatives_skipped = stock_derivatives_available.saturating_sub(stage2_added);
+
+        info!(
+            stage2_available = stock_derivatives_available,
+            stage2_added = stage2_added,
+            stage2_skipped = stock_derivatives_skipped,
+            "Progressive fill: Stage 2 stock derivatives (archived)"
+        );
+        // O(1) EXEMPT: end
+    }
+
+    // -----------------------------------------------------------------------
+    // Build the registry and summary
+    // -----------------------------------------------------------------------
+    let registry = InstrumentRegistry::from_instruments(instruments);
+
+    let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
+    if exceeds_capacity {
+        warn!(
+            total = registry.len(),
+            capacity = MAX_TOTAL_SUBSCRIPTIONS,
+            "Subscription plan exceeds WebSocket capacity"
+        );
+    }
+
+    let total = registry.len();
+    let capacity_utilization_pct = if MAX_TOTAL_SUBSCRIPTIONS > 0 {
+        (total as f64 / MAX_TOTAL_SUBSCRIPTIONS as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let summary = SubscriptionPlanSummary {
+        major_index_values: registry.category_count(SubscriptionCategory::MajorIndexValue),
+        display_indices: registry.category_count(SubscriptionCategory::DisplayIndex),
+        index_derivatives: registry.category_count(SubscriptionCategory::IndexDerivative),
+        stock_equities: registry.category_count(SubscriptionCategory::StockEquity),
+        stock_derivatives: registry.category_count(SubscriptionCategory::StockDerivative),
+        total,
+        feed_mode,
+        exceeds_capacity,
+        stocks_skipped_no_chain,
+        stock_derivatives_available,
+        stock_derivatives_skipped,
+        capacity_utilization_pct,
+    };
+
+    info!(
+        major_index_values = summary.major_index_values,
+        display_indices = summary.display_indices,
+        index_derivatives = summary.index_derivatives,
+        stock_equities = summary.stock_equities,
+        stock_derivatives = summary.stock_derivatives,
+        total = summary.total,
+        feed_mode = %feed_mode,
+        stocks_skipped = summary.stocks_skipped_no_chain,
+        capacity_pct = format!("{:.1}%", summary.capacity_utilization_pct),
+        "Subscription plan built (from archived zero-copy data)"
     );
 
     SubscriptionPlan { registry, summary }
@@ -1880,5 +2201,81 @@ mod tests {
                 "DISPLAY_INDEX_ENTRIES has empty name"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Archived vs non-archived planner parity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_archived_planner_produces_identical_summary() {
+        use crate::instrument::binary_cache::{MappedUniverse, write_binary_cache};
+
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // APPROVED: test constant
+
+        // Build plan from owned types
+        let plan_owned = build_subscription_plan(&universe, &config, today);
+
+        // Serialize → load as archived → build plan from archived types
+        let dir = std::env::temp_dir().join(format!(
+            "dlt-test-planner-parity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.to_str().unwrap(); // APPROVED: test-only path
+        write_binary_cache(&universe, cache_dir).unwrap(); // APPROVED: test assertion
+
+        let mapped = MappedUniverse::load(cache_dir).unwrap().unwrap(); // APPROVED: test assertion
+        let archived = mapped.archived();
+        let plan_archived = build_subscription_plan_from_archived(archived, &config, today);
+
+        // Summaries must be identical
+        assert_eq!(
+            plan_owned.summary.major_index_values, plan_archived.summary.major_index_values,
+            "major_index_values mismatch"
+        );
+        assert_eq!(
+            plan_owned.summary.display_indices, plan_archived.summary.display_indices,
+            "display_indices mismatch"
+        );
+        assert_eq!(
+            plan_owned.summary.index_derivatives, plan_archived.summary.index_derivatives,
+            "index_derivatives mismatch"
+        );
+        assert_eq!(
+            plan_owned.summary.stock_equities, plan_archived.summary.stock_equities,
+            "stock_equities mismatch"
+        );
+        assert_eq!(
+            plan_owned.summary.stock_derivatives, plan_archived.summary.stock_derivatives,
+            "stock_derivatives mismatch"
+        );
+        assert_eq!(
+            plan_owned.summary.total, plan_archived.summary.total,
+            "total mismatch"
+        );
+        assert_eq!(
+            plan_owned.summary.feed_mode, plan_archived.summary.feed_mode,
+            "feed_mode mismatch"
+        );
+
+        // Registry security IDs must be identical sets
+        let mut ids_owned: Vec<u32> = plan_owned.registry.iter().map(|i| i.security_id).collect();
+        let mut ids_archived: Vec<u32> = plan_archived
+            .registry
+            .iter()
+            .map(|i| i.security_id)
+            .collect();
+        ids_owned.sort();
+        ids_archived.sort();
+        assert_eq!(
+            ids_owned, ids_archived,
+            "archived planner produced different security_id set"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

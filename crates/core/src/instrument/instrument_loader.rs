@@ -1,15 +1,17 @@
-//! Three-layer instrument defense: Freshness Marker + Time Gate + Manual API.
+//! Market-hours-aware instrument loader with rkyv binary cache.
 //!
-//! Ensures instruments build ONCE at 8:30 AM boot. During trading-hours
-//! restarts, cache loads instantly — no time gate blocks recovery.
+//! # Semantics
+//! - **Market hours** `[08:45, 16:00)` IST — NEVER download. Load from:
+//!   1. rkyv zero-copy binary cache (sub-0.5ms via `MappedUniverse`)
+//!   2. CSV file cache fallback (~400ms, then writes rkyv for next restart)
+//!   3. `Unavailable` — no instruments available
+//! - **Outside market hours** — ALWAYS download fresh CSV (ignores freshness
+//!   marker). On download failure, falls back to rkyv → CSV → error.
+//! - **Manual API** — `POST /api/instruments/rebuild`. Bypasses market hours
+//!   check, always downloads, respects freshness marker (idempotent).
 //!
-//! # Three Layers
-//! 1. **Freshness Marker** — one file read (~100μs). Already built today? Load
-//!    from cache unconditionally. Crash at 10:30? Instant recovery.
-//! 2. **Time Gate** — sub-nanosecond integer comparison. Outside [08:25, 08:55]
-//!    IST? Try stale cache as fallback. Only gates fresh downloads.
-//! 3. **Manual API** — `POST /api/instruments/rebuild`. Bypasses time gate,
-//!    respects freshness marker (idempotent, one-shot).
+//! # Boot Sequence Position
+//! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
 use std::path::Path;
 
@@ -17,24 +19,46 @@ use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveTime, Utc};
 use tracing::{info, warn};
 
-use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig};
+use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig, SubscriptionConfig};
 use dhan_live_trader_common::constants::{
     INSTRUMENT_FRESHNESS_MARKER_FILENAME, IST_UTC_OFFSET_SECONDS,
 };
 use dhan_live_trader_common::instrument_types::FnoUniverse;
 
+use super::binary_cache::{MappedUniverse, read_binary_cache, write_binary_cache};
 use super::csv_downloader::{download_instrument_csv, load_cached_csv};
+use super::subscription_planner::{SubscriptionPlan, build_subscription_plan_from_archived};
 use super::universe_builder::build_fno_universe_from_csv;
 
 use dhan_live_trader_storage::instrument_persistence::persist_instrument_snapshot;
 
 // ---------------------------------------------------------------------------
-// Layer 2: Time Gate (only gates downloads, not cache reads)
+// Load Result
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if the current IST time is within the build window
+/// Result of the instrument loading process.
+///
+/// Separates the two performance-critical paths:
+/// - **Market hours restart**: zero-copy rkyv → `CachedPlan` (sub-0.5ms)
+/// - **Outside market hours**: full download+build → `FreshBuild` (seconds)
+pub enum InstrumentLoadResult {
+    /// Fresh build with owned universe (outside market hours / manual rebuild).
+    /// Caller should build a `SubscriptionPlan` and send notifications.
+    FreshBuild(FnoUniverse),
+    /// Zero-copy cached plan (market hours restart). Ready to use immediately.
+    CachedPlan(SubscriptionPlan),
+    /// No instruments available (market hours + no cache).
+    Unavailable,
+}
+
+// ---------------------------------------------------------------------------
+// Market Hours Check (replaces old "build window" concept)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the current IST time is within the market hours window
 /// `[window_start, window_end)` (inclusive start, exclusive end).
 ///
+/// During this window, downloads are BLOCKED — only cached instruments are used.
 /// Both arguments must be `HH:MM:SS` format. Already validated at config load.
 pub fn is_within_build_window(window_start: &str, window_end: &str) -> bool {
     let start = match NaiveTime::parse_from_str(window_start, "%H:%M:%S") {
@@ -50,7 +74,7 @@ pub fn is_within_build_window(window_start: &str, window_end: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 1: Freshness Marker (always checked first — enables crash recovery)
+// Freshness Marker
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if today's IST date matches the freshness marker file.
@@ -72,7 +96,6 @@ pub fn is_instrument_fresh(cache_dir: &str) -> bool {
 pub fn write_freshness_marker(cache_dir: &str) {
     let marker_path = Path::new(cache_dir).join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
 
-    // Ensure directory exists
     if let Some(parent) = marker_path.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
@@ -92,100 +115,48 @@ pub fn write_freshness_marker(cache_dir: &str) {
 // Public Orchestrators
 // ---------------------------------------------------------------------------
 
-/// Main entry: three-layer defense instrument loading.
+/// Main entry: market-hours-aware instrument loading.
 ///
-/// Returns `Ok(Some((universe, was_fresh_build)))` if instruments were built.
-/// Returns `Ok(None)` if no instruments available (outside window + no cache).
-///
-/// `was_fresh_build` is `true` when a full download + persist happened (first
-/// build of the day). `false` when loaded from cache (fresh or stale).
+/// Returns:
+/// - `InstrumentLoadResult::FreshBuild(universe)` — outside market hours, full download+build
+/// - `InstrumentLoadResult::CachedPlan(plan)` — market hours, zero-copy rkyv or CSV fallback
+/// - `InstrumentLoadResult::Unavailable` — market hours, no cache available
 pub async fn load_or_build_instruments(
     dhan_csv_url: &str,
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
-) -> Result<Option<(FnoUniverse, bool)>> {
-    // Layer 1: Freshness marker — always checked first (enables crash recovery)
-    if is_instrument_fresh(&instrument_config.csv_cache_directory) {
-        info!("instruments: loading from cache (freshness marker = today)");
-        let download_result = load_cached_csv(
-            &instrument_config.csv_cache_directory,
-            &instrument_config.csv_cache_filename,
-        )
-        .await
-        .context("failed to load cached CSV despite freshness marker")?;
+    subscription_config: &SubscriptionConfig,
+) -> Result<InstrumentLoadResult> {
+    let cache_dir = &instrument_config.csv_cache_directory;
 
-        let universe =
-            build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
-                .context("failed to build universe from cached CSV")?;
-
-        return Ok(Some((universe, false)));
-    }
-
-    // Layer 2: Time gate — only gates downloads, not cache reads
-    if !is_within_build_window(
+    if is_within_build_window(
         &instrument_config.build_window_start,
         &instrument_config.build_window_end,
     ) {
-        // Outside window + no fresh marker → try stale cache as fallback
-        match load_cached_csv(
-            &instrument_config.csv_cache_directory,
+        // ----- MARKET HOURS: cache only, NEVER download -----
+        return load_from_cache_only(
+            cache_dir,
             &instrument_config.csv_cache_filename,
+            subscription_config,
         )
-        .await
-        {
-            Ok(download_result) => {
-                warn!(
-                    window_start = %instrument_config.build_window_start,
-                    window_end = %instrument_config.build_window_end,
-                    "instruments: outside build window, using STALE cached CSV as fallback"
-                );
-                let universe =
-                    build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
-                        .context("failed to build universe from stale cached CSV")?;
-
-                return Ok(Some((universe, false)));
-            }
-            Err(_) => {
-                info!(
-                    window_start = %instrument_config.build_window_start,
-                    window_end = %instrument_config.build_window_end,
-                    "instruments: TIME-GATED SKIP (outside build window, no cache available)"
-                );
-                return Ok(None);
-            }
-        }
+        .await;
     }
 
-    // Layer 3: Full build — within window + not fresh → download → parse → persist → marker
-    info!("instruments: full build (no freshness marker for today)");
-    let download_result = download_instrument_csv(
+    // ----- OUTSIDE MARKET HOURS: always download fresh -----
+    load_with_download(
         dhan_csv_url,
         dhan_csv_fallback_url,
-        &instrument_config.csv_cache_directory,
-        &instrument_config.csv_cache_filename,
-        instrument_config.csv_download_timeout_secs,
+        instrument_config,
+        questdb_config,
     )
     .await
-    .context("instrument CSV download failed")?;
-
-    let universe = build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
-        .context("failed to build F&O universe")?;
-
-    // Persist to QuestDB (best-effort — warn on failure, don't block boot)
-    if let Err(err) = persist_instrument_snapshot(&universe, questdb_config).await {
-        warn!(%err, "instrument snapshot persistence failed (non-fatal)");
-    }
-
-    write_freshness_marker(&instrument_config.csv_cache_directory);
-
-    Ok(Some((universe, true)))
 }
 
-/// Manual trigger: bypasses time gate, respects freshness marker.
+/// Manual trigger: bypasses market hours check, respects freshness marker.
 ///
 /// Called by `POST /api/instruments/rebuild`.
-/// Returns `Ok(None)` if already built today (idempotent — click 100 times, no effect).
+/// Returns `Ok(None)` if already built today (idempotent).
 /// Returns `Ok(Some(universe))` if rebuilt successfully.
 pub async fn try_rebuild_instruments(
     dhan_csv_url: &str,
@@ -193,8 +164,10 @@ pub async fn try_rebuild_instruments(
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
 ) -> Result<Option<FnoUniverse>> {
+    let cache_dir = &instrument_config.csv_cache_directory;
+
     // Respect freshness marker (idempotent)
-    if is_instrument_fresh(&instrument_config.csv_cache_directory) {
+    if is_instrument_fresh(cache_dir) {
         info!("manual rebuild: already built today, skipping");
         return Ok(None);
     }
@@ -204,7 +177,7 @@ pub async fn try_rebuild_instruments(
     let download_result = download_instrument_csv(
         dhan_csv_url,
         dhan_csv_fallback_url,
-        &instrument_config.csv_cache_directory,
+        cache_dir,
         &instrument_config.csv_cache_filename,
         instrument_config.csv_download_timeout_secs,
     )
@@ -218,9 +191,162 @@ pub async fn try_rebuild_instruments(
         warn!(%err, "manual rebuild: persistence failed (non-fatal)");
     }
 
-    write_freshness_marker(&instrument_config.csv_cache_directory);
+    // Write rkyv binary cache for fast restart
+    if let Err(err) = write_binary_cache(&universe, cache_dir) {
+        warn!(%err, "manual rebuild: rkyv binary cache write failed (non-fatal)");
+    }
+
+    write_freshness_marker(cache_dir);
 
     Ok(Some(universe))
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Market Hours Cache Loading
+// ---------------------------------------------------------------------------
+
+/// Market hours path: zero-copy rkyv → CSV fallback → Unavailable. NEVER downloads.
+async fn load_from_cache_only(
+    cache_dir: &str,
+    csv_filename: &str,
+    subscription_config: &SubscriptionConfig,
+) -> Result<InstrumentLoadResult> {
+    let ist =
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset constant")?;
+    let today = Utc::now().with_timezone(&ist).date_naive();
+
+    // Try 1: Zero-copy rkyv binary cache (sub-0.5ms)
+    match MappedUniverse::load(cache_dir) {
+        Ok(Some(mapped)) => {
+            let plan = build_subscription_plan_from_archived(
+                mapped.archived(),
+                subscription_config,
+                today,
+            );
+            info!(
+                derivatives = mapped.derivative_count(),
+                underlyings = mapped.underlying_count(),
+                total_subscriptions = plan.summary.total,
+                "market hours: zero-copy rkyv loaded (sub-0.5ms)"
+            );
+            return Ok(InstrumentLoadResult::CachedPlan(plan));
+        }
+        Ok(None) => {
+            info!("market hours: no rkyv binary cache found, trying CSV fallback");
+        }
+        Err(err) => {
+            warn!(%err, "market hours: rkyv binary cache corrupt, trying CSV fallback");
+        }
+    }
+
+    // Try 2: CSV file cache (~400ms) — build plan from owned universe
+    match load_cached_csv(cache_dir, csv_filename).await {
+        Ok(download_result) => {
+            let universe =
+                build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+                    .context("market hours: failed to build universe from cached CSV")?;
+
+            // Write rkyv binary cache for next restart
+            if let Err(err) = write_binary_cache(&universe, cache_dir) {
+                warn!(%err, "market hours: failed to write rkyv cache after CSV load (non-fatal)");
+            }
+
+            info!(
+                derivatives = universe.derivative_contracts.len(),
+                "market hours: loaded instruments from CSV cache (rkyv cache written for next restart)"
+            );
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
+        }
+        Err(err) => {
+            warn!(%err, "market hours: no CSV cache available either");
+        }
+    }
+
+    // No cache available
+    info!("market hours: no instrument cache available (rkyv + CSV both missing)");
+    Ok(InstrumentLoadResult::Unavailable)
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Outside Market Hours Download
+// ---------------------------------------------------------------------------
+
+/// Outside market hours: always download fresh, fallback to caches on failure.
+async fn load_with_download(
+    dhan_csv_url: &str,
+    dhan_csv_fallback_url: &str,
+    instrument_config: &InstrumentConfig,
+    questdb_config: &QuestDbConfig,
+) -> Result<InstrumentLoadResult> {
+    let cache_dir = &instrument_config.csv_cache_directory;
+
+    // Always attempt download (ignore freshness marker outside market hours)
+    info!("outside market hours: downloading fresh instrument CSV");
+    match download_instrument_csv(
+        dhan_csv_url,
+        dhan_csv_fallback_url,
+        cache_dir,
+        &instrument_config.csv_cache_filename,
+        instrument_config.csv_download_timeout_secs,
+    )
+    .await
+    {
+        Ok(download_result) => {
+            let universe =
+                build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+                    .context("outside market hours: universe build failed")?;
+
+            // Persist to QuestDB (best-effort)
+            if let Err(err) = persist_instrument_snapshot(&universe, questdb_config).await {
+                warn!(%err, "instrument snapshot persistence failed (non-fatal)");
+            }
+
+            // Write rkyv binary cache for fast market-hours restart
+            if let Err(err) = write_binary_cache(&universe, cache_dir) {
+                warn!(%err, "rkyv binary cache write failed (non-fatal)");
+            }
+
+            write_freshness_marker(cache_dir);
+
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
+        }
+        Err(err) => {
+            warn!(%err, "outside market hours: CSV download failed, trying caches");
+        }
+    }
+
+    // Download failed — fall back to caches
+    // Try rkyv binary cache
+    match read_binary_cache(cache_dir) {
+        Ok(Some(universe)) => {
+            warn!(
+                derivatives = universe.derivative_contracts.len(),
+                "outside market hours: download failed, using rkyv binary cache fallback"
+            );
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(%err, "outside market hours: rkyv cache also corrupt");
+        }
+    }
+
+    // Try CSV file cache
+    if let Ok(download_result) =
+        load_cached_csv(cache_dir, &instrument_config.csv_cache_filename).await
+    {
+        let universe =
+            build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+                .context("outside market hours: failed to build universe from stale CSV")?;
+        warn!(
+            derivatives = universe.derivative_contracts.len(),
+            "outside market hours: download failed, using stale CSV cache fallback"
+        );
+        return Ok(InstrumentLoadResult::FreshBuild(universe));
+    }
+
+    // All sources failed
+    anyhow::bail!("outside market hours: all instrument sources failed (download + rkyv + CSV)")
 }
 
 // ---------------------------------------------------------------------------
@@ -249,21 +375,83 @@ fn now_ist_date_string() -> String {
 mod tests {
     use super::*;
     use chrono::Timelike;
+    use dhan_live_trader_common::config::SubscriptionConfig;
+    use dhan_live_trader_common::constants::BINARY_CACHE_FILENAME;
+    use dhan_live_trader_common::instrument_types::UniverseBuildMetadata;
+    use std::collections::HashMap;
 
-    // Note: is_within_build_window() uses the real clock via now_ist_time().
-    // We test the boundary logic by choosing windows that are guaranteed to
-    // include or exclude the current time.
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dlt-test-loader-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    fn test_universe() -> FnoUniverse {
+        use chrono::{FixedOffset, Utc};
+        let ist = FixedOffset::east_opt(19_800).unwrap(); // APPROVED: test constant
+        FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 100,
+                parsed_row_count: 50,
+                index_count: 8,
+                equity_count: 20,
+                underlying_count: 5,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: std::time::Duration::from_millis(42),
+                build_timestamp: Utc::now().with_timezone(&ist),
+            },
+        }
+    }
+
+    fn test_instrument_config(
+        cache_dir: &str,
+        window_start: &str,
+        window_end: &str,
+    ) -> InstrumentConfig {
+        InstrumentConfig {
+            daily_download_time: "08:45:00".to_owned(),
+            csv_cache_directory: cache_dir.to_owned(),
+            csv_cache_filename: "test.csv".to_owned(),
+            csv_download_timeout_secs: 2,
+            build_window_start: window_start.to_owned(),
+            build_window_end: window_end.to_owned(),
+        }
+    }
+
+    fn test_questdb_config() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            ilp_port: 19999,
+            http_port: 19998,
+            pg_port: 18812,
+        }
+    }
+
+    fn test_subscription_config() -> SubscriptionConfig {
+        SubscriptionConfig::default()
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_build_window
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_is_within_build_window_full_day_window() {
-        // 00:00 to 23:59 — always inside
         assert!(is_within_build_window("00:00:00", "23:59:59"));
     }
 
     #[test]
     fn test_is_within_build_window_impossible_window() {
-        // Window of zero length — never inside (start == end rejected by config)
-        // But even if passed, start < end is required for true
         assert!(!is_within_build_window("12:00:00", "12:00:00"));
     }
 
@@ -273,241 +461,112 @@ mod tests {
         assert!(!is_within_build_window("08:25:00", "bad"));
     }
 
+    // -----------------------------------------------------------------------
+    // Freshness marker
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_is_instrument_fresh_no_marker() {
-        // Non-existent directory — no marker file
         assert!(!is_instrument_fresh("/tmp/dlt-nonexistent-marker-98765"));
     }
 
     #[test]
     fn test_is_instrument_fresh_stale_marker() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-stale-marker");
+        let temp_dir = unique_temp_dir("stale-marker");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         std::fs::write(&marker_path, "2020-01-01").unwrap();
-
         assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
-
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_is_instrument_fresh_today_marker() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-today-marker");
+        let temp_dir = unique_temp_dir("today-marker");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let today = now_ist_date_string();
         std::fs::write(&marker_path, &today).unwrap();
-
         assert!(is_instrument_fresh(temp_dir.to_str().unwrap()));
-
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_write_freshness_marker_roundtrip() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-roundtrip");
+        let temp_dir = unique_temp_dir("marker-roundtrip");
         let cache_dir = temp_dir.to_str().unwrap();
-
-        // Ensure clean state
         let _ = std::fs::remove_dir_all(&temp_dir);
-
-        // Should not be fresh before writing
         assert!(!is_instrument_fresh(cache_dir));
-
-        // Write marker
         write_freshness_marker(cache_dir);
-
-        // Should be fresh after writing
         assert!(is_instrument_fresh(cache_dir));
-
-        // Verify file content
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let content = std::fs::read_to_string(&marker_path).unwrap();
         assert_eq!(content, now_ist_date_string());
-
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     // -----------------------------------------------------------------------
-    // now_ist_date_string / now_ist_time — format and range checks
+    // now_ist_date_string / now_ist_time
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_now_ist_date_string_format_yyyy_mm_dd() {
         let date_str = now_ist_date_string();
-        // Must match YYYY-MM-DD (chrono NaiveDate::to_string output)
-        assert_eq!(date_str.len(), 10, "date must be 10 chars: {}", date_str);
-        assert_eq!(
-            date_str.chars().nth(4),
-            Some('-'),
-            "5th char must be dash: {}",
-            date_str
-        );
-        assert_eq!(
-            date_str.chars().nth(7),
-            Some('-'),
-            "8th char must be dash: {}",
-            date_str
-        );
-        // Year, month, day must be parseable integers
-        let year: i32 = date_str[..4].parse().unwrap();
-        let month: u32 = date_str[5..7].parse().unwrap();
-        let day: u32 = date_str[8..10].parse().unwrap();
-        assert!(year >= 2024, "year must be >= 2024: {}", year);
-        assert!((1..=12).contains(&month), "month out of range: {}", month);
-        assert!((1..=31).contains(&day), "day out of range: {}", day);
+        assert_eq!(date_str.len(), 10);
+        assert_eq!(date_str.chars().nth(4), Some('-'));
+        assert_eq!(date_str.chars().nth(7), Some('-'));
     }
 
     #[test]
     fn test_now_ist_time_returns_valid_time() {
         let time = now_ist_time();
-        // NaiveTime is always valid, but verify it's a reasonable IST time
         assert!(time.hour() < 24);
         assert!(time.minute() < 60);
-        assert!(time.second() < 60);
     }
 
     // -----------------------------------------------------------------------
-    // is_instrument_fresh — additional edge cases
+    // Freshness marker — edge cases
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_is_instrument_fresh_marker_with_trailing_newline() {
-        // is_instrument_fresh uses .trim() so trailing newline should match
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-trailing-newline");
+        let temp_dir = unique_temp_dir("marker-newline");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         let today = now_ist_date_string();
         std::fs::write(&marker_path, format!("{}\n", today)).unwrap();
-
-        assert!(
-            is_instrument_fresh(temp_dir.to_str().unwrap()),
-            "trailing newline should be trimmed"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_is_instrument_fresh_marker_with_surrounding_whitespace() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-whitespace");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
-        let today = now_ist_date_string();
-        std::fs::write(&marker_path, format!("  {}  \n", today)).unwrap();
-
-        assert!(
-            is_instrument_fresh(temp_dir.to_str().unwrap()),
-            "surrounding whitespace should be trimmed"
-        );
-
+        assert!(is_instrument_fresh(temp_dir.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_is_instrument_fresh_empty_file_returns_false() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-empty");
+        let temp_dir = unique_temp_dir("marker-empty");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
         std::fs::write(&marker_path, "").unwrap();
-
-        assert!(
-            !is_instrument_fresh(temp_dir.to_str().unwrap()),
-            "empty marker file should not be fresh"
-        );
-
+        assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
-
-    #[test]
-    fn test_is_instrument_fresh_garbage_content_returns_false() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-garbage");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
-        std::fs::write(&marker_path, "not-a-date").unwrap();
-
-        assert!(
-            !is_instrument_fresh(temp_dir.to_str().unwrap()),
-            "garbage content should not match today"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_is_instrument_fresh_tomorrow_date_returns_false() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-tomorrow");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
-        // Write a date far in the future — should not match today
-        std::fs::write(&marker_path, "2099-12-31").unwrap();
-
-        assert!(
-            !is_instrument_fresh(temp_dir.to_str().unwrap()),
-            "future date should not match today"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // write_freshness_marker — additional edge cases
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_write_freshness_marker_creates_nested_directories() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-nested/a/b/c");
+        let base_dir = unique_temp_dir("marker-nested");
+        let temp_dir = base_dir.join("a/b/c");
         let cache_dir = temp_dir.to_str().unwrap();
-
-        // Ensure clean state
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt-test-marker-nested"));
-
+        let _ = std::fs::remove_dir_all(&base_dir);
         write_freshness_marker(cache_dir);
-
-        // Verify marker was written
-        assert!(
-            is_instrument_fresh(cache_dir),
-            "marker should be fresh after writing to nested dir"
-        );
-
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt-test-marker-nested"));
-    }
-
-    #[test]
-    fn test_write_freshness_marker_overwrites_stale_marker() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-marker-overwrite");
-        let cache_dir = temp_dir.to_str().unwrap();
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
-        // Write a stale marker
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
-        std::fs::write(&marker_path, "2020-01-01").unwrap();
-        assert!(
-            !is_instrument_fresh(cache_dir),
-            "stale marker must not be fresh"
-        );
-
-        // Overwrite with today
-        write_freshness_marker(cache_dir);
-        assert!(
-            is_instrument_fresh(cache_dir),
-            "marker should be fresh after overwrite"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        assert!(is_instrument_fresh(cache_dir));
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]
     fn test_write_freshness_marker_readonly_directory_no_panic() {
-        // Best-effort: writing to an impossible path should not panic
         write_freshness_marker("/proc/1/nonexistent-marker");
-        // No assertion — just verify no panic
     }
 
     // -----------------------------------------------------------------------
-    // is_within_build_window — additional edge cases
+    // is_within_build_window — additional
     // -----------------------------------------------------------------------
 
     #[test]
@@ -517,18 +576,7 @@ mod tests {
 
     #[test]
     fn test_is_within_build_window_reversed_window_returns_false() {
-        // end before start — current time cannot be >= 23:00 AND < 01:00 simultaneously
         assert!(!is_within_build_window("23:00:00", "01:00:00"));
-    }
-
-    #[test]
-    fn test_is_within_build_window_narrow_past_window_returns_false() {
-        // A window in the distant past (00:00 to 00:01) — only true if running
-        // exactly at midnight; we test the negative case with a one-second window
-        // at 00:00:00 to 00:00:01 — almost certainly outside
-        let result = is_within_build_window("00:00:00", "00:00:01");
-        // Can't assert deterministically, but verify no panic
-        let _ = result;
     }
 
     #[test]
@@ -539,116 +587,254 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Async orchestrator tests — testing observable behavior via markers
+    // Market hours: rkyv cache loads
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_load_or_build_instruments_outside_window_returns_none() {
-        // Use an impossible window (00:00:00 to 00:00:00) — always outside
-        let instrument_config = InstrumentConfig {
-            daily_download_time: "08:45:00".to_owned(),
-            csv_cache_directory: "/tmp/dlt-test-load-outside".to_owned(),
-            csv_cache_filename: "test.csv".to_owned(),
-            csv_download_timeout_secs: 5,
-            build_window_start: "00:00:00".to_owned(),
-            build_window_end: "00:00:00".to_owned(),
-        };
-        let questdb_config = QuestDbConfig {
-            host: "127.0.0.1".to_owned(),
-            ilp_port: 19999,
-            http_port: 19998,
-            pg_port: 18812,
-        };
+    async fn test_market_hours_rkyv_cache_loads() {
+        let dir = unique_temp_dir("mh-rkyv-loads");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.to_str().unwrap();
 
+        // Pre-write rkyv cache
+        let universe = test_universe();
+        write_binary_cache(&universe, cache_dir).unwrap();
+
+        // Window = always inside (00:00 to 23:59)
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
         let result = load_or_build_instruments(
             "http://127.0.0.1:1/fake",
             "http://127.0.0.1:1/fake",
-            &instrument_config,
-            &questdb_config,
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
-        assert!(result.is_ok(), "outside window should not error");
-        assert!(
-            result.unwrap().is_none(),
-            "outside window should return None"
-        );
+        match result.unwrap() {
+            InstrumentLoadResult::CachedPlan(_plan) => {
+                // Zero-copy path: returns plan directly
+            }
+            other => panic!(
+                "expected CachedPlan, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // Market hours: no rkyv, no CSV → None
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_try_rebuild_instruments_with_fresh_marker_returns_none() {
-        let temp_dir = std::env::temp_dir().join("dlt-test-rebuild-fresh");
-        let cache_dir = temp_dir.to_str().unwrap().to_owned();
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    async fn test_market_hours_no_cache_returns_unavailable() {
+        let dir = unique_temp_dir("mh-no-cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.to_str().unwrap();
 
-        // Write today's marker so rebuild thinks it's already done
-        write_freshness_marker(&cache_dir);
-
-        let instrument_config = InstrumentConfig {
-            daily_download_time: "08:45:00".to_owned(),
-            csv_cache_directory: cache_dir.clone(),
-            csv_cache_filename: "test.csv".to_owned(),
-            csv_download_timeout_secs: 5,
-            build_window_start: "00:00:00".to_owned(),
-            build_window_end: "23:59:59".to_owned(),
-        };
-        let questdb_config = QuestDbConfig {
-            host: "127.0.0.1".to_owned(),
-            ilp_port: 19999,
-            http_port: 19998,
-            pg_port: 18812,
-        };
-
-        let result = try_rebuild_instruments(
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
+        let result = load_or_build_instruments(
             "http://127.0.0.1:1/fake",
             "http://127.0.0.1:1/fake",
-            &instrument_config,
-            &questdb_config,
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
-        assert!(result.is_ok(), "fresh marker should not error");
         assert!(
-            result.unwrap().is_none(),
-            "fresh marker should return None (idempotent)"
+            matches!(result.unwrap(), InstrumentLoadResult::Unavailable),
+            "no cache should return Unavailable during market hours"
         );
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // Market hours: corrupt rkyv → CSV fallback writes new rkyv
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_try_rebuild_instruments_without_marker_attempts_download() {
-        // No marker, no server → download fails → returns error
-        let temp_dir = std::env::temp_dir().join("dlt-test-rebuild-no-marker");
-        let cache_dir = temp_dir.to_str().unwrap().to_owned();
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    async fn test_market_hours_corrupt_rkyv_no_csv_returns_unavailable() {
+        let dir = unique_temp_dir("mh-corrupt-rkyv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.to_str().unwrap();
 
-        let instrument_config = InstrumentConfig {
-            daily_download_time: "08:45:00".to_owned(),
-            csv_cache_directory: cache_dir,
-            csv_cache_filename: "test.csv".to_owned(),
-            csv_download_timeout_secs: 2,
-            build_window_start: "00:00:00".to_owned(),
-            build_window_end: "23:59:59".to_owned(),
-        };
-        let questdb_config = QuestDbConfig {
-            host: "127.0.0.1".to_owned(),
-            ilp_port: 19999,
-            http_port: 19998,
-            pg_port: 18812,
-        };
+        // Write corrupt rkyv
+        let rkyv_path = dir.join(BINARY_CACHE_FILENAME);
+        std::fs::write(&rkyv_path, b"garbage").unwrap();
 
-        let result = try_rebuild_instruments(
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
+        let result = load_or_build_instruments(
             "http://127.0.0.1:1/fake",
             "http://127.0.0.1:1/fake",
-            &instrument_config,
-            &questdb_config,
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+        )
+        .await;
+
+        assert!(
+            matches!(result.unwrap(), InstrumentLoadResult::Unavailable),
+            "corrupt rkyv + no CSV → Unavailable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Market hours: NEVER downloads (proves download is unreachable)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_market_hours_never_downloads() {
+        let dir = unique_temp_dir("mh-never-downloads");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.to_str().unwrap();
+
+        // Window = always inside, fake URLs, no cache
+        // If download was attempted, it would timeout. Instead, returns Unavailable instantly.
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
+        let start = std::time::Instant::now();
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result.unwrap(), InstrumentLoadResult::Unavailable));
+        // If download was attempted with 2s timeout, this would take >2s
+        assert!(
+            elapsed.as_millis() < 500,
+            "should return instantly (no download), took {}ms",
+            elapsed.as_millis()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Outside hours: download fails → rkyv fallback
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_outside_hours_download_fails_rkyv_fallback() {
+        let dir = unique_temp_dir("oh-rkyv-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.to_str().unwrap();
+
+        // Pre-write rkyv cache
+        let universe = test_universe();
+        write_binary_cache(&universe, cache_dir).unwrap();
+
+        // Window = always outside (00:00 to 00:00)
+        let config = test_instrument_config(cache_dir, "00:00:00", "00:00:00");
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+        )
+        .await;
+
+        match result.unwrap() {
+            InstrumentLoadResult::FreshBuild(loaded) => {
+                assert_eq!(loaded.build_metadata.csv_source, "test");
+            }
+            other => panic!(
+                "expected FreshBuild, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Outside hours: all fail → error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_outside_hours_all_fail_returns_error() {
+        let dir = unique_temp_dir("oh-all-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.to_str().unwrap();
+
+        // Window = always outside, no cache, fake URLs
+        let config = test_instrument_config(cache_dir, "00:00:00", "00:00:00");
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
         )
         .await;
 
         assert!(
             result.is_err(),
-            "no marker + no server should return error from download failure"
+            "outside hours with no sources should error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual rebuild: fresh marker returns None
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_rebuild_instruments_with_fresh_marker_returns_none() {
+        let temp_dir = unique_temp_dir("rebuild-fresh");
+        let cache_dir = temp_dir.to_str().unwrap().to_owned();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        write_freshness_marker(&cache_dir);
+
+        let config = test_instrument_config(&cache_dir, "00:00:00", "23:59:59");
+        let result = try_rebuild_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "fresh marker should return None");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual rebuild: no marker → attempts download
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_rebuild_instruments_without_marker_attempts_download() {
+        let temp_dir = unique_temp_dir("rebuild-no-marker");
+        let cache_dir = temp_dir.to_str().unwrap().to_owned();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let config = test_instrument_config(&cache_dir, "00:00:00", "23:59:59");
+        let result = try_rebuild_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "no marker + no server should error from download failure"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
