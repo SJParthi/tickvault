@@ -77,22 +77,25 @@ impl Default for ParsedTick {
 // Market Depth Level — from Full packet (5 levels × 20 bytes)
 // ---------------------------------------------------------------------------
 
-/// A single level of market depth from the Full packet.
+/// A single level of market depth from the Full/MarketDepth packet.
 ///
-/// Dhan sends 5 levels. This struct is `Copy` + `Default` for stack allocation.
+/// Dhan sends 5 levels per packet. This struct is `Copy` + `Default` for stack allocation.
+///
+/// Dhan SDK format per level: `<IIHHff>` (u32, u32, u16, u16, f32, f32).
+/// All quantity/order fields are unsigned per the Dhan binary protocol.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MarketDepthLevel {
-    /// Bid quantity at this level.
-    pub bid_quantity: i32,
-    /// Ask quantity at this level.
-    pub ask_quantity: i32,
-    /// Number of bid orders at this level.
-    pub bid_orders: i16,
-    /// Number of ask orders at this level.
-    pub ask_orders: i16,
-    /// Bid price at this level (rupees).
+    /// Bid quantity at this level (Dhan wire: u32).
+    pub bid_quantity: u32,
+    /// Ask quantity at this level (Dhan wire: u32).
+    pub ask_quantity: u32,
+    /// Number of bid orders at this level (Dhan wire: u16).
+    pub bid_orders: u16,
+    /// Number of ask orders at this level (Dhan wire: u16).
+    pub ask_orders: u16,
+    /// Bid price at this level (rupees, Dhan wire: f32).
     pub bid_price: f32,
-    /// Ask price at this level (rupees).
+    /// Ask price at this level (rupees, Dhan wire: f32).
     pub ask_price: f32,
 }
 
