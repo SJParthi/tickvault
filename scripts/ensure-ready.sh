@@ -21,6 +21,33 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# ---- Cross-platform browser opener ----
+open_url() {
+    local url="$1"
+    if command -v xdg-open > /dev/null 2>&1; then
+        xdg-open "$url" 2>/dev/null &
+    elif command -v open > /dev/null 2>&1; then
+        open "$url" 2>/dev/null &
+    else
+        echo -e "  ${YELLOW}Open manually:${NC} $url"
+    fi
+}
+
+# ---- Auto-open all monitoring dashboards ----
+open_dashboards() {
+    echo -e "${CYAN}Opening monitoring dashboards...${NC}"
+    open_url "http://localhost:3000/d/dlt-system-overview/dlt-system-overview?orgId=1&refresh=5s"
+    sleep 0.3
+    open_url "http://localhost:9090/targets"
+    sleep 0.3
+    open_url "http://localhost:16686"
+    sleep 0.3
+    open_url "http://localhost:8080"
+    sleep 0.3
+    open_url "http://localhost:9000"
+    echo -e "${GREEN}Opened: Grafana, Prometheus, Jaeger, Traefik, QuestDB${NC}"
+}
+
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
 # Reads credentials from the running dlt-questdb container (set via AWS SSM).
 # pgpass format: hostname:port:database:username:password
@@ -68,6 +95,7 @@ all_running() {
 if all_running; then
     ensure_pgpass
     echo -e "${GREEN}All 8 infrastructure containers running. Ready.${NC}"
+    open_dashboards
     exit 0
 fi
 
@@ -187,6 +215,7 @@ if all_running; then
     echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║   Infrastructure ready. All 8 services UP.     ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}"
+    open_dashboards
     exit 0
 else
     echo -e "${RED}Some containers failed to start. Check Docker Desktop.${NC}"

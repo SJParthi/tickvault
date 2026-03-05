@@ -46,6 +46,7 @@ help: ## Show this help
 
 run: ## Run app in dev mode (pretty logs, localhost config)
 	@echo "🚀 Starting $(APP_NAME)..."
+	@./scripts/ensure-ready.sh
 	@cargo run
 
 stop: ## Stop running app
@@ -241,6 +242,7 @@ obs-open: ## Open all monitoring dashboards in browser
 	@open http://localhost:9090/targets 2>/dev/null || xdg-open http://localhost:9090/targets 2>/dev/null || true
 	@open http://localhost:16686 2>/dev/null || xdg-open http://localhost:16686 2>/dev/null || true
 	@open http://localhost:8080 2>/dev/null || xdg-open http://localhost:8080 2>/dev/null || true
+	@open http://localhost:9000 2>/dev/null || xdg-open http://localhost:9000 2>/dev/null || true
 
 # =============================================================================
 # MONITORING — Open individual dashboards in browser

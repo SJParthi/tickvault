@@ -120,8 +120,11 @@
   "schemaVersion": 39,
   "tags": ["dhan-live-trader", "logs"],
   "templating": { "list": [] },
+  "refresh": "5s",
   "time": { "from": "now-1h", "to": "now" },
-  "timepicker": {},
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+  },
   "timezone": "Asia/Kolkata",
   "title": "DLT — Logs",
   "uid": "dlt-logs",

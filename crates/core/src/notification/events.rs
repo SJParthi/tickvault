@@ -102,7 +102,13 @@ impl NotificationEvent {
     pub fn to_message(&self) -> String {
         match self {
             Self::StartupComplete { mode } => {
-                format!("<b>dhan-live-trader started</b>\nMode: {mode}")
+                format!(
+                    "<b>dhan-live-trader started</b>\nMode: {mode}\n\n\
+                     Grafana: http://localhost:3000\n\
+                     Prometheus: http://localhost:9090\n\
+                     Jaeger: http://localhost:16686\n\
+                     QuestDB: http://localhost:9000"
+                )
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
             Self::AuthenticationFailed { reason } => {
@@ -189,6 +195,10 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
+        assert!(msg.contains("Grafana: http://localhost:3000"));
+        assert!(msg.contains("Prometheus: http://localhost:9090"));
+        assert!(msg.contains("Jaeger: http://localhost:16686"));
+        assert!(msg.contains("QuestDB: http://localhost:9000"));
     }
 
     #[test]
@@ -196,6 +206,7 @@ mod tests {
         let event = NotificationEvent::StartupComplete { mode: "OFFLINE" };
         let msg = event.to_message();
         assert!(msg.contains("OFFLINE"));
+        assert!(msg.contains("Grafana"));
     }
 
     #[test]
