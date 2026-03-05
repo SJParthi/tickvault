@@ -116,4 +116,46 @@ mod tests {
         let state2 = state1.clone();
         assert_eq!(state2.questdb_config().host, "clone-test");
     }
+
+    #[test]
+    fn test_dhan_config_getter() {
+        let qdb = QuestDbConfig {
+            host: "test".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state = SharedAppState::new(qdb, test_dhan_config(), test_instrument_config());
+        assert_eq!(state.dhan_config().max_instruments_per_connection, 5000);
+        assert_eq!(state.dhan_config().max_websocket_connections, 5);
+    }
+
+    #[test]
+    fn test_instrument_config_getter() {
+        let qdb = QuestDbConfig {
+            host: "test".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state = SharedAppState::new(qdb, test_dhan_config(), test_instrument_config());
+        assert_eq!(state.instrument_config().csv_download_timeout_secs, 120);
+        assert_eq!(state.instrument_config().build_window_start, "08:25:00");
+    }
+
+    #[test]
+    fn test_rebuild_in_progress_getter() {
+        use std::sync::atomic::Ordering;
+
+        let qdb = QuestDbConfig {
+            host: "test".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let state = SharedAppState::new(qdb, test_dhan_config(), test_instrument_config());
+        assert!(!state.rebuild_in_progress().load(Ordering::SeqCst));
+        state.rebuild_in_progress().store(true, Ordering::SeqCst);
+        assert!(state.rebuild_in_progress().load(Ordering::SeqCst));
+    }
 }

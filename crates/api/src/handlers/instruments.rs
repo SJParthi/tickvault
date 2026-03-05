@@ -146,4 +146,24 @@ mod tests {
         assert!(!json.contains("derivative_count"));
         assert!(!json.contains("underlying_count"));
     }
+
+    #[test]
+    fn test_rebuild_guard_clears_flag_on_drop() {
+        let flag = AtomicBool::new(true);
+        {
+            let _guard = RebuildGuard { flag: &flag };
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        // After guard is dropped, flag must be false
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_rebuild_guard_clears_flag_when_already_false() {
+        let flag = AtomicBool::new(false);
+        {
+            let _guard = RebuildGuard { flag: &flag };
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+    }
 }
