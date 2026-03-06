@@ -77,6 +77,19 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-env-files.sh"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-pr-gate.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-merge-gate.sh"
+          }
+        ]
       }
     ],
     "PostToolUse": [

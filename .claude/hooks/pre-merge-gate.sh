@@ -13,9 +13,20 @@ set -uo pipefail
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-# Only gate commands that START with gh pr merge (not mentioned in commit messages)
-if ! echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then
+# Gate: gh pr merge OR gh api calls that hit /pulls/*/merge endpoint
+IS_GH_PR_MERGE=$(echo "$COMMAND" | grep -cE '^\s*gh\s+pr\s+merge' || true)
+IS_GH_API_MERGE=$(echo "$COMMAND" | grep -cE 'gh\s+api.*pulls/[0-9]+/merge' || true)
+
+if [ "$IS_GH_PR_MERGE" -eq 0 ] && [ "$IS_GH_API_MERGE" -eq 0 ]; then
   exit 0
+fi
+
+if [ "$IS_GH_API_MERGE" -gt 0 ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  BLOCKED: gh api merge bypass detected        ║" >&2
+  echo "║  Use 'gh pr merge' so CI gates are enforced   ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+  exit 2
 fi
 
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')

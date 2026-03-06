@@ -15,10 +15,20 @@ set -uo pipefail
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-# Only gate commands that START with gh pr create (not mentioned in commit messages)
-# Use ^gh or leading whitespace to avoid matching commit message text containing "gh pr create"
-if ! echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+create'; then
+# Gate: gh pr create OR gh api calls that create PRs
+IS_GH_PR_CREATE=$(echo "$COMMAND" | grep -cE '^\s*gh\s+pr\s+create' || true)
+IS_GH_API_PR=$(echo "$COMMAND" | grep -cE 'gh\s+api.*repos/.*/pulls\s' || true)
+
+if [ "$IS_GH_PR_CREATE" -eq 0 ] && [ "$IS_GH_API_PR" -eq 0 ]; then
   exit 0
+fi
+
+if [ "$IS_GH_API_PR" -gt 0 ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  BLOCKED: gh api PR bypass detected           ║" >&2
+  echo "║  Use 'gh pr create' so quality gates run      ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+  exit 2
 fi
 
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
