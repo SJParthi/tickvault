@@ -85,7 +85,7 @@ impl WebSocketConnectionPool {
 
         // Dynamic capacity: effective limit depends on config, not hardcoded 25K.
         // If max_per_conn=2000, num_connections=5 → effective capacity = 10,000.
-        let effective_capacity = max_per_conn * num_connections;
+        let effective_capacity = max_per_conn.saturating_mul(num_connections);
         if total > effective_capacity {
             return Err(WebSocketError::CapacityExceeded {
                 requested: total,
@@ -103,7 +103,9 @@ impl WebSocketConnectionPool {
             (0..num_connections).map(|_| Vec::new()).collect();
 
         for (idx, instrument) in instruments.into_iter().enumerate() {
-            connection_instruments[idx % num_connections].push(instrument);
+            // SAFETY: num_connections guaranteed > 0 by config validation + .min(MAX_WEBSOCKET_CONNECTIONS=5)
+            let slot = idx.checked_rem(num_connections).unwrap_or(0);
+            connection_instruments[slot].push(instrument);
         }
 
         let connections: Vec<Arc<WebSocketConnection>> = connection_instruments
@@ -206,6 +208,7 @@ impl WebSocketConnectionPool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
     use crate::websocket::types::ConnectionState;

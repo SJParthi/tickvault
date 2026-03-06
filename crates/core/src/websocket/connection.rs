@@ -302,7 +302,9 @@ impl WebSocketConnection {
 
         // Connect with timeout.
         let connect_timeout = Duration::from_millis(
-            self.dhan_config.max_instruments_per_connection as u64 * 10 + 10000,
+            (self.dhan_config.max_instruments_per_connection as u64)
+                .saturating_mul(10)
+                .saturating_add(10000),
         );
         let connect_result = time::timeout(
             connect_timeout,
@@ -348,7 +350,7 @@ impl WebSocketConnection {
                 })?;
             // Yield between batches to avoid starving other tasks.
             // Skip yield after the last batch (nothing to wait for).
-            if batch_index < self.cached_subscription_messages.len() - 1 {
+            if batch_index < self.cached_subscription_messages.len().saturating_sub(1) {
                 tokio::task::yield_now().await;
             }
         }
@@ -544,7 +546,7 @@ impl WebSocketConnection {
                 return;
             }
             time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
-            waited += POLL_INTERVAL_SECS;
+            waited = waited.saturating_add(POLL_INTERVAL_SECS);
         }
         warn!(
             connection_id = self.connection_id,

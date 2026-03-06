@@ -201,7 +201,7 @@ pub fn build_subscription_plan(
                 underlying = %underlying.underlying_symbol,
                 "No current expiry found — skipping stock derivatives"
             );
-            stocks_skipped_no_chain += 1;
+            stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
             continue;
         };
 
@@ -235,7 +235,10 @@ pub fn build_subscription_plan(
             if call_count > 0 {
                 let mid_idx = call_count / 2;
                 let start = mid_idx.saturating_sub(atm_below);
-                let end = (mid_idx + atm_above + 1).min(call_count);
+                let end = mid_idx
+                    .saturating_add(atm_above)
+                    .saturating_add(1)
+                    .min(call_count);
                 for entry in &chain.calls[start..end] {
                     if let Some(contract) = universe.derivative_contracts.get(&entry.security_id)
                         && seen_ids.insert(entry.security_id)
@@ -254,7 +257,10 @@ pub fn build_subscription_plan(
             if put_count > 0 {
                 let mid_idx = put_count / 2;
                 let start = mid_idx.saturating_sub(atm_below);
-                let end = (mid_idx + atm_above + 1).min(put_count);
+                let end = mid_idx
+                    .saturating_add(atm_above)
+                    .saturating_add(1)
+                    .min(put_count);
                 for entry in &chain.puts[start..end] {
                     if let Some(contract) = universe.derivative_contracts.get(&entry.security_id)
                         && seen_ids.insert(entry.security_id)
@@ -273,7 +279,7 @@ pub fn build_subscription_plan(
                 expiry = %expiry,
                 "No option chain found for current expiry — skipping"
             );
-            stocks_skipped_no_chain += 1;
+            stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
         }
     }
 
@@ -327,7 +333,7 @@ pub fn build_subscription_plan(
             }
         }
 
-        let stage2_added = instruments.len() - count_before_stage2;
+        let stage2_added = instruments.len().saturating_sub(count_before_stage2);
         stock_derivatives_skipped = stock_derivatives_available.saturating_sub(stage2_added);
 
         info!(
@@ -518,7 +524,7 @@ pub fn build_subscription_plan_from_archived(
                 underlying = %symbol,
                 "No current expiry found — skipping stock derivatives"
             );
-            stocks_skipped_no_chain += 1;
+            stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
             continue;
         };
 
@@ -552,7 +558,10 @@ pub fn build_subscription_plan_from_archived(
             if call_count > 0 {
                 let mid_idx = call_count / 2;
                 let start = mid_idx.saturating_sub(atm_below);
-                let end = (mid_idx + atm_above + 1).min(call_count);
+                let end = mid_idx
+                    .saturating_add(atm_above)
+                    .saturating_add(1)
+                    .min(call_count);
                 for entry in &chain.calls[start..end] {
                     let sec_id = entry.security_id.to_native();
                     let archived_key = rkyv::rend::u32_le::from_native(sec_id);
@@ -573,7 +582,10 @@ pub fn build_subscription_plan_from_archived(
             if put_count > 0 {
                 let mid_idx = put_count / 2;
                 let start = mid_idx.saturating_sub(atm_below);
-                let end = (mid_idx + atm_above + 1).min(put_count);
+                let end = mid_idx
+                    .saturating_add(atm_above)
+                    .saturating_add(1)
+                    .min(put_count);
                 for entry in &chain.puts[start..end] {
                     let sec_id = entry.security_id.to_native();
                     let archived_key = rkyv::rend::u32_le::from_native(sec_id);
@@ -594,7 +606,7 @@ pub fn build_subscription_plan_from_archived(
                 expiry = %expiry,
                 "No option chain found for current expiry — skipping"
             );
-            stocks_skipped_no_chain += 1;
+            stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
         }
     }
 
@@ -645,7 +657,7 @@ pub fn build_subscription_plan_from_archived(
             }
         }
 
-        let stage2_added = instruments.len() - count_before_stage2;
+        let stage2_added = instruments.len().saturating_sub(count_before_stage2);
         stock_derivatives_skipped = stock_derivatives_available.saturating_sub(stage2_added);
 
         info!(
@@ -714,6 +726,7 @@ pub fn build_subscription_plan_from_archived(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
     use std::collections::HashMap;
