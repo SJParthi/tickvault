@@ -41,7 +41,7 @@ Types:    feat, fix, refactor, test, docs, chore, perf, security
 ```
 
 Every commit compiles + passes tests. One logical change per commit.
-No branch protection or required checks until production deployment.
+Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan must pass before merge. Enforced for admins. No direct pushes to main.
 
 ## CARGO
 
