@@ -199,6 +199,18 @@ impl WebSocketConnection {
                             m_conn_active.set(0.0);
                             return Err(WebSocketError::NonReconnectableDisconnect { code });
                         }
+                        Err(WebSocketError::DhanDisconnect { code })
+                            if code.requires_token_refresh() =>
+                        {
+                            m_conn_active.set(0.0);
+                            warn!(
+                                connection_id = self.connection_id,
+                                disconnect_code = %code,
+                                "Token expired — waiting for renewal before reconnect"
+                            );
+                            // Wait for renewal to swap in a valid token before reconnecting.
+                            self.wait_for_valid_token().await;
+                        }
                         Err(err) => {
                             m_conn_active.set(0.0);
                             warn!(
@@ -245,6 +257,14 @@ impl WebSocketConnection {
             .as_ref()
             .as_ref()
             .ok_or(WebSocketError::NoTokenAvailable)?;
+
+        if !token_state.is_valid() {
+            warn!(
+                connection_id = self.connection_id,
+                "Token is expired — skipping connection attempt"
+            );
+            return Err(WebSocketError::NoTokenAvailable);
+        }
 
         let access_token = token_state.access_token().expose_secret().to_string();
 
@@ -384,13 +404,31 @@ impl WebSocketConnection {
                 }
                 Ok(frame_result) => match frame_result {
                     Some(Ok(Message::Binary(data))) => {
-                        // Forward raw binary frame to downstream.
-                        if self.frame_sender.send(data.to_vec()).await.is_err() {
-                            warn!(
-                                connection_id = self.connection_id,
-                                "Frame receiver dropped — stopping read loop"
-                            );
-                            return Ok(());
+                        // Forward raw binary frame to downstream with timeout.
+                        // If the tick processor is blocked, we drop the frame
+                        // rather than blocking the entire WS read loop.
+                        let send_timeout = Duration::from_secs(
+                            dhan_live_trader_common::constants::FRAME_SEND_TIMEOUT_SECS,
+                        );
+                        match time::timeout(send_timeout, self.frame_sender.send(data.to_vec()))
+                            .await
+                        {
+                            Ok(Ok(())) => {} // sent successfully
+                            Ok(Err(_)) => {
+                                warn!(
+                                    connection_id = self.connection_id,
+                                    "Frame receiver dropped — stopping read loop"
+                                );
+                                return Ok(());
+                            }
+                            Err(_elapsed) => {
+                                warn!(
+                                    connection_id = self.connection_id,
+                                    timeout_secs =
+                                        dhan_live_trader_common::constants::FRAME_SEND_TIMEOUT_SECS,
+                                    "Frame send timed out — tick processor may be blocked, dropping frame"
+                                );
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -481,6 +519,37 @@ impl WebSocketConnection {
 
         time::sleep(Duration::from_millis(delay_ms)).await;
         true
+    }
+
+    /// Waits until the token handle contains a valid (non-expired) token.
+    ///
+    /// Polls every 5 seconds up to 60 seconds. If no valid token appears
+    /// (renewal task hasn't swapped one in), gives up and lets the reconnect
+    /// loop attempt with whatever token is available.
+    async fn wait_for_valid_token(&self) {
+        const POLL_INTERVAL_SECS: u64 = 5;
+        const MAX_WAIT_SECS: u64 = 60;
+
+        let mut waited: u64 = 0;
+        while waited < MAX_WAIT_SECS {
+            let guard = self.token_handle.load();
+            if let Some(state) = guard.as_ref().as_ref() {
+                if state.is_valid() {
+                    info!(
+                        connection_id = self.connection_id,
+                        waited_secs = waited,
+                        "Valid token available — resuming reconnection"
+                    );
+                    return;
+                }
+            }
+            time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            waited += POLL_INTERVAL_SECS;
+        }
+        warn!(
+            connection_id = self.connection_id,
+            "Timed out waiting for valid token — attempting reconnect anyway"
+        );
     }
 
     #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable

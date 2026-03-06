@@ -789,7 +789,20 @@ pub const STOCK_CONTRACTS_PER_EXPIRY: usize =
 
 /// Maximum time to wait for the tick processor to complete its final QuestDB
 /// flush during graceful shutdown. After this, the processor is force-aborted.
-pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum time to wait for initial token acquisition at startup (seconds).
+/// Prevents indefinite hang if Dhan API is unreachable on boot.
+pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum consecutive renewal circuit-breaker cycles before the renewal loop
+/// halts and raises a critical alert. Prevents infinite retry with expired token.
+pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
+
+/// Timeout for sending a frame into the tick processor channel (seconds).
+/// If the tick processor is blocked, the WebSocket read loop drops the frame
+/// after this timeout instead of blocking forever.
+pub const FRAME_SEND_TIMEOUT_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions

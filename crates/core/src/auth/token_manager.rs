@@ -422,8 +422,14 @@ impl TokenManager {
     // Private — Renewal Loop
     // -----------------------------------------------------------------------
 
-    /// Background renewal loop with retry and backoff.
+    /// Background renewal loop with retry, backoff, and circuit-breaker halt.
+    ///
+    /// If renewal fails repeatedly, the circuit breaker sleeps 60s and retries.
+    /// After `TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES` consecutive failures,
+    /// the loop halts with a critical alert — operator must intervene.
     async fn renewal_loop(self: Arc<Self>) {
+        let mut consecutive_circuit_breaker_cycles: u32 = 0;
+
         loop {
             let sleep_duration = self.time_until_next_refresh();
 
@@ -474,15 +480,41 @@ impl TokenManager {
                 }
             }
 
-            if !succeeded {
+            if succeeded {
+                consecutive_circuit_breaker_cycles = 0;
+            } else {
+                consecutive_circuit_breaker_cycles += 1;
                 error!(
                     attempts,
+                    circuit_breaker_cycle = consecutive_circuit_breaker_cycles,
+                    max_cycles = dhan_live_trader_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
                     "ALL token renewal attempts exhausted — token may expire"
                 );
                 self.notifier.notify(NotificationEvent::TokenRenewalFailed {
                     attempts,
-                    reason: "all renewal attempts exhausted — token may expire".to_string(),
+                    reason: format!(
+                        "all renewal attempts exhausted (cycle {}/{}) — token may expire",
+                        consecutive_circuit_breaker_cycles,
+                        dhan_live_trader_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
+                    ),
                 });
+
+                if consecutive_circuit_breaker_cycles
+                    >= dhan_live_trader_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
+                {
+                    error!(
+                        "token renewal halted after {} consecutive failures — operator must intervene",
+                        consecutive_circuit_breaker_cycles
+                    );
+                    self.notifier.notify(NotificationEvent::TokenRenewalFailed {
+                        attempts: consecutive_circuit_breaker_cycles,
+                        reason:
+                            "HALTED: token renewal permanently failed — manual restart required"
+                                .to_string(),
+                    });
+                    return;
+                }
+
                 tokio::time::sleep(Duration::from_secs(
                     dhan_live_trader_common::constants::TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS,
                 ))
