@@ -9,7 +9,17 @@ use libfuzzer_sys::fuzz_target;
 
 use dhan_live_trader_common::config::ApplicationConfig;
 
+/// Maximum config input size (64 KiB). Real config files are ~2 KiB.
+/// Limits stack depth the TOML parser can reach, preventing stack overflow
+/// under AddressSanitizer (which reduces default stack size).
+const MAX_CONFIG_INPUT_SIZE: usize = 65_536;
+
 fuzz_target!(|data: &[u8]| {
+    // Reject oversized input — prevents pathological nesting depth
+    if data.len() > MAX_CONFIG_INPUT_SIZE {
+        return;
+    }
+
     // Treat fuzz input as TOML string
     let Ok(toml_str) = std::str::from_utf8(data) else {
         return; // Not valid UTF-8 — skip

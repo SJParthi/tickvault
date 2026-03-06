@@ -4,6 +4,10 @@
 # Runs on every push to main/develop and every PR — but ONLY for code changes.
 # All checks must pass. Failure = build is RED. No merging.
 #
+# Cost optimization: Heavy jobs (Build, Security, Coverage) SKIP on draft PRs.
+# Mark PR as "Ready for Review" to trigger full CI before merge.
+# Commit Lint always runs on PRs (lightweight).
+#
 # Jobs:
 #   1. Build & Verify — compile + fmt + clippy + docs + typos + machete + test
 #   2. Security & Audit — cargo deny + cargo audit (parallel after Job 1)
@@ -33,6 +37,7 @@ on:
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/**'
       - 'Cargo.toml'
@@ -88,8 +93,10 @@ jobs:
           echo "All commit messages follow conventional format."
 
   # ---- Job 1: Build & Verify (compile + lint + test — one runner) ----
+  # Skip on draft PRs to save CI minutes — runs when PR is marked ready
   build-and-verify:
     name: "Build & Verify"
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
