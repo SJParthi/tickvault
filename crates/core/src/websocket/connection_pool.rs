@@ -37,7 +37,7 @@ pub struct WebSocketConnectionPool {
     connections: Vec<Arc<WebSocketConnection>>,
 
     /// Receiver for raw binary frames from all connections.
-    frame_receiver: mpsc::Receiver<Vec<u8>>,
+    frame_receiver: mpsc::Receiver<bytes::Bytes>,
 
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
@@ -178,7 +178,7 @@ impl WebSocketConnectionPool {
     ///
     /// The caller owns this receiver and reads raw binary frames from
     /// all active connections. Each frame is a complete Dhan binary packet.
-    pub fn take_frame_receiver(&mut self) -> mpsc::Receiver<Vec<u8>> {
+    pub fn take_frame_receiver(&mut self) -> mpsc::Receiver<bytes::Bytes> {
         // Replace with a dummy channel — receiver can only be taken once.
         let (_, dummy) = mpsc::channel(1);
         std::mem::replace(&mut self.frame_receiver, dummy)

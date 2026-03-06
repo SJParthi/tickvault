@@ -67,7 +67,7 @@ pub struct WebSocketConnection {
     instruments: Vec<InstrumentSubscription>,
 
     /// Channel sender for forwarding raw binary frames to downstream.
-    frame_sender: mpsc::Sender<Vec<u8>>,
+    frame_sender: mpsc::Sender<bytes::Bytes>,
 
     /// Current connection state (tracked for health reporting).
     state: std::sync::Mutex<ConnectionState>,
@@ -93,7 +93,7 @@ impl WebSocketConnection {
         ws_config: WebSocketConfig,
         instruments: Vec<InstrumentSubscription>,
         feed_mode: FeedMode,
-        frame_sender: mpsc::Sender<Vec<u8>>,
+        frame_sender: mpsc::Sender<bytes::Bytes>,
     ) -> Self {
         let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
 
@@ -412,9 +412,7 @@ impl WebSocketConnection {
                         let send_timeout = Duration::from_secs(
                             dhan_live_trader_common::constants::FRAME_SEND_TIMEOUT_SECS,
                         );
-                        match time::timeout(send_timeout, self.frame_sender.send(data.to_vec()))
-                            .await
-                        {
+                        match time::timeout(send_timeout, self.frame_sender.send(data)).await {
                             Ok(Ok(())) => {} // sent successfully
                             Ok(Err(_)) => {
                                 warn!(
@@ -1980,7 +1978,9 @@ mod tests {
     }
 
     /// Helper: creates a `WebSocketConnection` with tiny timeouts for fast tests.
-    fn make_test_conn_for_read_loop(frame_sender: mpsc::Sender<Vec<u8>>) -> WebSocketConnection {
+    fn make_test_conn_for_read_loop(
+        frame_sender: mpsc::Sender<bytes::Bytes>,
+    ) -> WebSocketConnection {
         WebSocketConnection::new(
             0,
             make_test_token_handle(),
