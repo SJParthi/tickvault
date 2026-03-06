@@ -144,4 +144,41 @@ mod tests {
         let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
         assert_eq!(tick.last_traded_price, price);
     }
+
+    #[test]
+    fn test_parse_ticker_nan_ltp_parses_without_panic() {
+        let (buf, hdr) = make_ticker_packet(2, 13, f32::NAN, 1772073900);
+        let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_ticker_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_ticker_packet(2, 13, f32::INFINITY, 1772073900);
+        let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+    }
+
+    #[test]
+    fn test_parse_ticker_neg_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_ticker_packet(2, 13, f32::NEG_INFINITY, 1772073900);
+        let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+        assert!(tick.last_traded_price.is_sign_negative());
+    }
+
+    #[test]
+    fn test_parse_ticker_negative_zero_ltp() {
+        let (buf, hdr) = make_ticker_packet(2, 13, -0.0, 100);
+        let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.last_traded_price, 0.0); // -0.0 == 0.0 in IEEE 754
+    }
+
+    #[test]
+    fn test_parse_ticker_extra_bytes_ignored() {
+        let (mut buf, hdr) = make_ticker_packet(2, 13, 24500.0, 1772073900);
+        buf.extend_from_slice(&[0xFF; 20]); // extra garbage
+        let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
+        assert!((tick.last_traded_price - 24500.0).abs() < 0.01);
+    }
 }

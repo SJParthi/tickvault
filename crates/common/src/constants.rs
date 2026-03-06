@@ -804,6 +804,16 @@ pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
 /// after this timeout instead of blocking forever.
 pub const FRAME_SEND_TIMEOUT_SECS: u64 = 5;
 
+/// Power-of-two exponent for the tick deduplication ring buffer.
+///
+/// Size = 2^16 = 65,536 slots x 8 bytes = 512 KiB.
+/// Catches exact duplicate ticks (same security_id + timestamp + LTP)
+/// resent by Dhan on WebSocket reconnection.
+///
+/// False negatives (missed duplicates due to hash collision/eviction) are safe:
+/// QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the authoritative dedup layer.
+pub const DEDUP_RING_BUFFER_POWER: u32 = 16;
+
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
@@ -835,4 +845,11 @@ const _: () = assert!(
 const _: () = assert!(
     ORDER_EVENT_RING_BUFFER_CAPACITY.is_power_of_two(),
     "ORDER_EVENT_RING_BUFFER_CAPACITY must be power of 2"
+);
+
+// Sanity: dedup ring buffer power must be in range [8, 24].
+// 2^8 = 256 (minimum useful), 2^24 = 16M (8 bytes × 16M = 128 MiB max).
+const _: () = assert!(
+    DEDUP_RING_BUFFER_POWER >= 8 && DEDUP_RING_BUFFER_POWER <= 24,
+    "DEDUP_RING_BUFFER_POWER must be in [8, 24]"
 );

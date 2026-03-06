@@ -408,4 +408,227 @@ mod tests {
         assert_eq!(tick.oi_day_high, u32::MAX);
         assert_eq!(tick.oi_day_low, u32::MAX);
     }
+
+    #[test]
+    fn test_parse_full_nan_ltp_parses_without_panic() {
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            f32::NAN,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            None,
+        );
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_full_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            f32::INFINITY,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            None,
+        );
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+    }
+
+    #[test]
+    fn test_parse_full_neg_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            f32::NEG_INFINITY,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            None,
+        );
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+        assert!(tick.last_traded_price.is_sign_negative());
+    }
+
+    #[test]
+    fn test_parse_full_nan_ohlc_parses_without_panic() {
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            None,
+        );
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.day_open.is_nan());
+        assert!(tick.day_close.is_nan());
+        assert!(tick.day_high.is_nan());
+        assert!(tick.day_low.is_nan());
+    }
+
+    #[test]
+    fn test_parse_full_nan_atp_parses_without_panic() {
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            f32::NAN,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            None,
+        );
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.average_traded_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_full_nan_depth_prices_parse_without_panic() {
+        let depth_data = [
+            (1000u32, 500u32, 10u16, 5u16, f32::NAN, f32::NAN),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+        ];
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            Some(depth_data),
+        );
+        let (_, depth) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(depth[0].bid_price.is_nan());
+        assert!(depth[0].ask_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_full_infinity_depth_prices_parse_without_panic() {
+        let depth_data = [
+            (
+                1000u32,
+                500u32,
+                10u16,
+                5u16,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+        ];
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            Some(depth_data),
+        );
+        let (_, depth) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!(depth[0].bid_price.is_infinite());
+        assert!(depth[0].ask_price.is_infinite());
+        assert!(depth[0].ask_price.is_sign_negative());
+    }
+
+    #[test]
+    fn test_parse_full_negative_zero_ltp() {
+        let (buf, hdr) = make_full_packet(
+            2, 13, -0.0, 1, 100, 100.0, 1000, 500, 500, 0, 0, 0, 99.0, 98.0, 101.0, 97.0, None,
+        );
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.last_traded_price, 0.0); // -0.0 == 0.0 in IEEE 754
+    }
+
+    #[test]
+    fn test_parse_full_extra_bytes_ignored() {
+        let (mut buf, hdr) = make_full_packet(
+            2, 13, 24500.0, 1, 1772073900, 100.0, 1000, 500, 500, 0, 0, 0, 99.0, 98.0, 101.0, 97.0,
+            None,
+        );
+        buf.extend_from_slice(&[0xFF; 20]); // extra garbage
+        let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        assert!((tick.last_traded_price - 24500.0).abs() < 0.01);
+    }
 }

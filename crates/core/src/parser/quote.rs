@@ -279,4 +279,132 @@ mod tests {
             panic!("wrong error: {err:?}")
         };
     }
+
+    #[test]
+    fn test_parse_quote_nan_ltp_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            f32::NAN,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_quote_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            f32::INFINITY,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+    }
+
+    #[test]
+    fn test_parse_quote_neg_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            f32::NEG_INFINITY,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+        assert!(tick.last_traded_price.is_sign_negative());
+    }
+
+    #[test]
+    fn test_parse_quote_nan_atp_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            f32::NAN,
+            1000,
+            500,
+            500,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.average_traded_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_quote_nan_ohlc_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.day_open.is_nan());
+        assert!(tick.day_close.is_nan());
+        assert!(tick.day_high.is_nan());
+        assert!(tick.day_low.is_nan());
+    }
+
+    #[test]
+    fn test_parse_quote_negative_zero_ltp() {
+        let (buf, hdr) = make_quote_packet(
+            2, 13, -0.0, 1, 100, 100.0, 1000, 500, 500, 99.0, 98.0, 101.0, 97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.last_traded_price, 0.0); // -0.0 == 0.0 in IEEE 754
+    }
+
+    #[test]
+    fn test_parse_quote_f32_precision() {
+        let price: f32 = 24567.85;
+        let (buf, hdr) = make_quote_packet(
+            2, 13, price, 1, 100, 100.0, 1000, 500, 500, 99.0, 98.0, 101.0, 97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.last_traded_price, price);
+    }
 }
