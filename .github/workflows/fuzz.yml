@@ -53,18 +53,18 @@ jobs:
             echo "No fuzz targets configured yet — skipping."
           fi
 
+      - name: Build fuzz target (${{ matrix.target }})
+        if: steps.check.outputs.exists == 'true'
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
       - name: Run fuzz target (${{ matrix.target }})
         if: steps.check.outputs.exists == 'true'
         run: |
-          # Run for 5 minutes per target
-          timeout 300 cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 || {
+          # Run for 5 minutes per target; libfuzzer exits 0 when time is up
+          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 || {
             EXIT_CODE=$?
-            if [ "$EXIT_CODE" -eq 124 ]; then
-              echo "Fuzz run completed (timeout reached — no crashes found)"
-            else
-              echo "Fuzz run found a crash!"
-              exit 1
-            fi
+            echo "Fuzz run found a crash (exit code $EXIT_CODE)!"
+            exit 1
           }
 
       - name: Upload crash artifacts

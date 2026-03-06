@@ -8,8 +8,8 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4.9"
-toml = "1.0.2"
+libfuzzer-sys = "=0.4.12"
+toml = { version = "=1.0.4", default-features = false, features = ["parse"] }
 dhan-live-trader-core = { path = "../crates/core" }
 dhan-live-trader-common = { path = "../crates/common" }
 
