@@ -25,6 +25,19 @@ use dhan_live_trader_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, build_previous_close_row,
 };
 
+use dhan_live_trader_common::tick_types::MarketDepthLevel;
+
+/// Returns `true` if all 5 depth levels have finite bid/ask prices.
+///
+/// # Performance
+/// O(1) — exactly 10 `is_finite()` checks (single CPU instruction each).
+#[inline(always)]
+fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
+    depth
+        .iter()
+        .all(|level| level.bid_price.is_finite() && level.ask_price.is_finite())
+}
+
 // ---------------------------------------------------------------------------
 // O(1) Tick Deduplication Ring Buffer
 // ---------------------------------------------------------------------------
@@ -110,7 +123,7 @@ impl TickDedupRing {
 /// * `tick_writer` — batched QuestDB ILP writer for ticks (None if QuestDB unavailable)
 /// * `depth_writer` — batched QuestDB ILP writer for market depth (None if QuestDB unavailable)
 pub async fn run_tick_processor(
-    mut frame_receiver: mpsc::Receiver<Vec<u8>>,
+    mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
     mut tick_writer: Option<TickPersistenceWriter>,
     mut depth_writer: Option<DepthPersistenceWriter>,
 ) {
@@ -287,6 +300,13 @@ pub async fn run_tick_processor(
                 // else: LTP valid but no exchange_timestamp (Market Depth code 3)
                 // — skip tick persistence, still persist depth below
 
+                // Guard: skip depth with NaN/Infinity bid/ask prices
+                if !depth_prices_are_finite(&depth) {
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
+                    m_junk_filtered.increment(1);
+                    continue;
+                }
+
                 // Persist 5-level depth to QuestDB (separate table)
                 m_depth_snapshots.increment(1);
                 if let Some(ref mut dw) = depth_writer
@@ -333,6 +353,13 @@ pub async fn run_tick_processor(
                 previous_oi,
             } => {
                 m_prev_close_updates.increment(1);
+
+                // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame)
+                if !previous_close.is_finite() {
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
+                    m_junk_filtered.increment(1);
+                    continue;
+                }
 
                 // Persist previous close to QuestDB
                 if let Some(ref mut writer) = tick_writer
@@ -459,7 +486,7 @@ mod tests {
 
         // Send a valid ticker frame
         let frame = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Give processor time to process
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -478,11 +505,17 @@ mod tests {
         });
 
         // Send a too-short frame
-        frame_tx.send(vec![0u8; 4]).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(vec![0u8; 4]))
+            .await
+            .unwrap();
 
         // Send a valid frame after — should still work
         let valid_frame = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(valid_frame).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(valid_frame))
+            .await
+            .unwrap();
 
         // Give processor time to process
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -501,7 +534,7 @@ mod tests {
 
         // Send a ticker frame with LTP=0.0 — should be filtered (not crash)
         let frame = make_ticker_frame(13, 0.0, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -519,7 +552,7 @@ mod tests {
 
         // Send a ticker frame with LTT=0 (epoch 1970) — should be filtered
         let frame = make_ticker_frame(13, 24500.0, 0);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -537,11 +570,11 @@ mod tests {
 
         // Send junk tick first (LTP=0)
         let junk = make_ticker_frame(13, 0.0, 1772073900);
-        frame_tx.send(junk).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(junk)).await.unwrap();
 
         // Then send valid tick — processor should not crash
         let valid = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(valid).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(valid)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -581,7 +614,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -594,7 +627,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -607,7 +640,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -622,7 +655,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
         // Set disconnect code to 807 (AccessTokenExpired)
         frame[8..10].copy_from_slice(&807u16.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -641,7 +674,7 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -657,12 +690,15 @@ mod tests {
         });
 
         for _ in 0..105 {
-            frame_tx.send(vec![0u8; 4]).await.unwrap();
+            frame_tx
+                .send(bytes::Bytes::from(vec![0u8; 4]))
+                .await
+                .unwrap();
         }
 
         // Send a valid frame after — processor should still work.
         let valid = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(valid).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(valid)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(frame_tx);
@@ -682,7 +718,7 @@ mod tests {
 
         // Send a valid tick so frames_processed > 0
         let frame = make_ticker_frame(42, 25000.0, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -701,14 +737,14 @@ mod tests {
 
         // Send first valid tick
         let frame1 = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(frame1).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame1)).await.unwrap();
 
         // Wait > 100ms so periodic flush elapsed check triggers
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Send second tick — this will trigger the elapsed > 100ms branch
         let frame2 = make_ticker_frame(14, 24600.0, 1772073901);
-        frame_tx.send(frame2).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame2)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -725,7 +761,7 @@ mod tests {
 
         for _ in 0..15 {
             let junk = make_ticker_frame(13, 0.0, 1772073900);
-            frame_tx.send(junk).await.unwrap();
+            frame_tx.send(bytes::Bytes::from(junk)).await.unwrap();
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -742,7 +778,7 @@ mod tests {
 
         // LTP = -1.0 should be filtered as junk
         let frame = make_ticker_frame(13, -1.0, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -759,36 +795,46 @@ mod tests {
         });
 
         // Parse error (too short)
-        frame_tx.send(vec![0u8; 3]).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(vec![0u8; 3]))
+            .await
+            .unwrap();
         // Valid tick
         frame_tx
-            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24500.0, 1772073900,
+            )))
             .await
             .unwrap();
         // Junk tick (LTP=0)
         frame_tx
-            .send(make_ticker_frame(14, 0.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(14, 0.0, 1772073900)))
             .await
             .unwrap();
         // Junk tick (timestamp=0)
         frame_tx
-            .send(make_ticker_frame(15, 24500.0, 0))
+            .send(bytes::Bytes::from(make_ticker_frame(15, 24500.0, 0)))
             .await
             .unwrap();
         // Valid tick
         frame_tx
-            .send(make_ticker_frame(16, 24600.0, 1772073901))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                16, 24600.0, 1772073901,
+            )))
             .await
             .unwrap();
         // OI update
         frame_tx
-            .send(make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE))
+            .send(bytes::Bytes::from(make_packet(
+                RESPONSE_CODE_OI,
+                OI_PACKET_SIZE,
+            )))
             .await
             .unwrap();
         // Disconnect
         let mut disc = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
         disc[8..10].copy_from_slice(&807u16.to_le_bytes());
-        frame_tx.send(disc).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(disc)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(frame_tx);
@@ -808,10 +854,13 @@ mod tests {
         });
 
         let prev_close = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
-        frame_tx.send(prev_close).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(prev_close)).await.unwrap();
 
         let market_status = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
-        frame_tx.send(market_status).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(market_status))
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -831,7 +880,7 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&0.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -850,7 +899,7 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&25000.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -868,7 +917,7 @@ mod tests {
         // Send 50 valid frames
         for i in 0..50 {
             let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900);
-            frame_tx.send(frame).await.unwrap();
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
         // Wait for periodic flush check to trigger
@@ -877,7 +926,7 @@ mod tests {
         // Send another batch
         for i in 0..50 {
             let frame = make_ticker_frame(100 + i, 25000.0, 1772073901);
-            frame_tx.send(frame).await.unwrap();
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -898,7 +947,7 @@ mod tests {
         buf[1..3].copy_from_slice(&8u16.to_le_bytes());
         buf[3] = 2;
         buf[4..8].copy_from_slice(&42u32.to_le_bytes());
-        frame_tx.send(buf).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(buf)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -995,14 +1044,14 @@ mod tests {
 
         // Send a valid tick
         let frame = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Wait > 100ms to trigger periodic flush check
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Send another valid tick after the delay to trigger the elapsed check
         let frame2 = make_ticker_frame(14, 24600.0, 1772073901);
-        frame_tx.send(frame2).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame2)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1034,7 +1083,7 @@ mod tests {
         // Send valid ticks — they buffer successfully but flush will fail
         for i in 0..5 {
             let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900);
-            frame_tx.send(frame).await.unwrap();
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
         // Wait > 1s so writer.flush_if_needed() actually tries to flush
@@ -1045,7 +1094,7 @@ mod tests {
         // Send more ticks to trigger the periodic flush check on next iteration
         for i in 0..5 {
             let frame = make_ticker_frame(20 + i, 25000.0, 1772073901);
-            frame_tx.send(frame).await.unwrap();
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1086,7 +1135,7 @@ mod tests {
 
         // Send a Market Depth frame with valid LTP but no timestamp
         let frame = make_market_depth_frame(13, 24500.0);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -1105,7 +1154,7 @@ mod tests {
         });
 
         let frame = make_market_depth_frame(13, 0.0);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -1154,11 +1203,14 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Send a Market Depth packet (code 3) with valid LTP but no timestamp
         let depth_frame = make_market_depth_frame(42, 25000.0);
-        frame_tx.send(depth_frame).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(depth_frame))
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -1300,7 +1352,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_ticker_frame(13, f32::NAN, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1313,7 +1365,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_ticker_frame(13, f32::INFINITY, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1326,7 +1378,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_ticker_frame(13, f32::NEG_INFINITY, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1342,7 +1394,7 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1359,7 +1411,7 @@ mod tests {
             .copy_from_slice(&f32::INFINITY.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1372,7 +1424,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_market_depth_frame(13, f32::NAN);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1385,7 +1437,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_market_depth_frame(13, f32::INFINITY);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1403,8 +1455,11 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(frame.clone()).await.unwrap();
-        frame_tx.send(frame).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(frame.clone()))
+            .await
+            .unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1418,11 +1473,15 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         frame_tx
-            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24500.0, 1772073900,
+            )))
             .await
             .unwrap();
         frame_tx
-            .send(make_ticker_frame(13, 24500.0, 1772073901))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24500.0, 1772073901,
+            )))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1438,11 +1497,15 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         frame_tx
-            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24500.0, 1772073900,
+            )))
             .await
             .unwrap();
         frame_tx
-            .send(make_ticker_frame(13, 24501.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24501.0, 1772073900,
+            )))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1458,11 +1521,15 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         frame_tx
-            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24500.0, 1772073900,
+            )))
             .await
             .unwrap();
         frame_tx
-            .send(make_ticker_frame(14, 24500.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                14, 24500.0, 1772073900,
+            )))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1479,7 +1546,10 @@ mod tests {
         });
         let frame = make_ticker_frame(13, 24500.0, 1772073900);
         for _ in 0..100 {
-            frame_tx.send(frame.clone()).await.unwrap();
+            frame_tx
+                .send(bytes::Bytes::from(frame.clone()))
+                .await
+                .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(frame_tx);
@@ -1495,12 +1565,14 @@ mod tests {
         });
         // Send junk tick
         frame_tx
-            .send(make_ticker_frame(13, 0.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(13, 0.0, 1772073900)))
             .await
             .unwrap();
         // Send valid tick for same security — should NOT be treated as duplicate
         frame_tx
-            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13, 24500.0, 1772073900,
+            )))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1519,8 +1591,11 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(frame.clone()).await.unwrap();
-        frame_tx.send(frame).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(frame.clone()))
+            .await
+            .unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1535,8 +1610,11 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_market_depth_frame(13, 24500.0);
-        frame_tx.send(frame.clone()).await.unwrap();
-        frame_tx.send(frame).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(frame.clone()))
+            .await
+            .unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1558,7 +1636,7 @@ mod tests {
         });
         let subnormal: f32 = f32::MIN_POSITIVE / 2.0;
         let frame = make_ticker_frame(13, subnormal, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1572,7 +1650,7 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame = make_ticker_frame(13, -0.0, 1772073900);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1587,7 +1665,7 @@ mod tests {
         // u32::MAX security_id with valid LTP and timestamp
         let mut frame = make_ticker_frame(0, 24500.0, 1772073900);
         frame[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1601,7 +1679,7 @@ mod tests {
         });
         // Exact minimum valid timestamp — should pass
         let frame = make_ticker_frame(13, 24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP);
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1618,7 +1696,7 @@ mod tests {
             24500.0,
             MINIMUM_VALID_EXCHANGE_TIMESTAMP.saturating_sub(1),
         );
-        frame_tx.send(frame).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1635,17 +1713,19 @@ mod tests {
         // 1. Index Ticker (code 1)
         let mut idx_tick = make_ticker_frame(13, 24500.0, 1772073900);
         idx_tick[0] = 1; // RESPONSE_CODE_INDEX_TICKER
-        frame_tx.send(idx_tick).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(idx_tick)).await.unwrap();
 
         // 2. Ticker (code 2) — already default from make_ticker_frame
         frame_tx
-            .send(make_ticker_frame(14, 24600.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                14, 24600.0, 1772073900,
+            )))
             .await
             .unwrap();
 
         // 3. Market Depth (code 3)
         frame_tx
-            .send(make_market_depth_frame(15, 24700.0))
+            .send(bytes::Bytes::from(make_market_depth_frame(15, 24700.0)))
             .await
             .unwrap();
 
@@ -1654,29 +1734,32 @@ mod tests {
             dhan_live_trader_common::constants::RESPONSE_CODE_QUOTE,
             dhan_live_trader_common::constants::QUOTE_PACKET_SIZE,
         );
-        frame_tx.send(quote).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(quote)).await.unwrap();
 
         // 5. OI (code 5)
         frame_tx
-            .send(make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE))
+            .send(bytes::Bytes::from(make_packet(
+                RESPONSE_CODE_OI,
+                OI_PACKET_SIZE,
+            )))
             .await
             .unwrap();
 
         // 6. Previous Close (code 6)
         frame_tx
-            .send(make_packet(
+            .send(bytes::Bytes::from(make_packet(
                 RESPONSE_CODE_PREVIOUS_CLOSE,
                 PREVIOUS_CLOSE_PACKET_SIZE,
-            ))
+            )))
             .await
             .unwrap();
 
         // 7. Market Status (code 7)
         frame_tx
-            .send(make_packet(
+            .send(bytes::Bytes::from(make_packet(
                 RESPONSE_CODE_MARKET_STATUS,
                 MARKET_STATUS_PACKET_SIZE,
-            ))
+            )))
             .await
             .unwrap();
 
@@ -1685,12 +1768,12 @@ mod tests {
         full[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24800.0_f32.to_le_bytes());
         full[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
             .copy_from_slice(&1772073900_u32.to_le_bytes());
-        frame_tx.send(full).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(full)).await.unwrap();
 
         // 9. Disconnect (code 50)
         let mut disc = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
         disc[8..10].copy_from_slice(&807u16.to_le_bytes());
-        frame_tx.send(disc).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(disc)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(frame_tx);
@@ -1706,10 +1789,13 @@ mod tests {
             run_tick_processor(frame_rx, None, None).await;
         });
         let frame_a = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(frame_a.clone()).await.unwrap();
-        frame_tx.send(frame_a).await.unwrap(); // duplicate
+        frame_tx
+            .send(bytes::Bytes::from(frame_a.clone()))
+            .await
+            .unwrap();
+        frame_tx.send(bytes::Bytes::from(frame_a)).await.unwrap(); // duplicate
         let frame_b = make_ticker_frame(13, 24501.0, 1772073900);
-        frame_tx.send(frame_b).await.unwrap(); // NOT duplicate (different LTP)
+        frame_tx.send(bytes::Bytes::from(frame_b)).await.unwrap(); // NOT duplicate (different LTP)
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
@@ -1725,38 +1811,134 @@ mod tests {
 
         // Valid tick
         let valid1 = make_ticker_frame(13, 24500.0, 1772073900);
-        frame_tx.send(valid1.clone()).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(valid1.clone()))
+            .await
+            .unwrap();
         // Exact duplicate
-        frame_tx.send(valid1).await.unwrap();
+        frame_tx.send(bytes::Bytes::from(valid1)).await.unwrap();
         // Junk (LTP=0)
         frame_tx
-            .send(make_ticker_frame(14, 0.0, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(14, 0.0, 1772073900)))
             .await
             .unwrap();
         // NaN LTP
         frame_tx
-            .send(make_ticker_frame(15, f32::NAN, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                15,
+                f32::NAN,
+                1772073900,
+            )))
             .await
             .unwrap();
         // Infinity LTP
         frame_tx
-            .send(make_ticker_frame(16, f32::INFINITY, 1772073900))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                16,
+                f32::INFINITY,
+                1772073900,
+            )))
             .await
             .unwrap();
         // Parse error (too short)
-        frame_tx.send(vec![0u8; 3]).await.unwrap();
+        frame_tx
+            .send(bytes::Bytes::from(vec![0u8; 3]))
+            .await
+            .unwrap();
         // Valid tick (different security+timestamp — should pass)
         frame_tx
-            .send(make_ticker_frame(17, 24600.0, 1772073901))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                17, 24600.0, 1772073901,
+            )))
             .await
             .unwrap();
         // Market Depth (no timestamp, valid LTP — should NOT be dedup-filtered)
         frame_tx
-            .send(make_market_depth_frame(18, 24700.0))
+            .send(bytes::Bytes::from(make_market_depth_frame(18, 24700.0)))
             .await
             .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth NaN/Infinity guard tests
+    // -----------------------------------------------------------------------
+
+    /// Build a Market Depth frame with a NaN bid_price in level 0.
+    fn make_market_depth_frame_with_nan_bid(security_id: u32, ltp: f32) -> Vec<u8> {
+        let mut buf = make_market_depth_frame(security_id, ltp);
+        // Level 0 bid_price at MARKET_DEPTH_OFFSET_DEPTH_START + 12 = 24
+        buf[24..28].copy_from_slice(&f32::NAN.to_le_bytes());
+        buf
+    }
+
+    /// Build a Market Depth frame with an Infinity ask_price in level 0.
+    fn make_market_depth_frame_with_inf_ask(security_id: u32, ltp: f32) -> Vec<u8> {
+        let mut buf = make_market_depth_frame(security_id, ltp);
+        // Level 0 ask_price at MARKET_DEPTH_OFFSET_DEPTH_START + 16 = 28
+        buf[28..32].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_depth_nan_bid_price_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame_with_nan_bid(13, 24500.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_depth_inf_ask_price_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame_with_inf_ask(13, 24500.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // PreviousClose NaN/Infinity guard tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_nan_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut buf = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        buf[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(buf)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_infinity_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut buf = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        buf[8..12].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(buf)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
     }

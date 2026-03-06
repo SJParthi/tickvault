@@ -2,7 +2,7 @@
 //! parses them, filters junk ticks, and persists to QuestDB via ILP.
 //!
 //! # Flow
-//! `WebSocket Pool → mpsc::Receiver<Vec<u8>> → dispatch_frame → ParsedTick`
+//! `WebSocket Pool → mpsc::Receiver<Bytes> → dispatch_frame → ParsedTick`
 //! → junk filter (LTP > 0, valid timestamp) → `TickPersistenceWriter` → QuestDB
 
 pub mod tick_processor;
