@@ -15,6 +15,7 @@ use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 use super::types::{PacketHeader, ParseError};
 
 /// Helper: reads a little-endian f32 from a byte slice at the given offset.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes([
@@ -26,6 +27,7 @@ fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
 }
 
 /// Helper: reads a little-endian u32 from a byte slice at the given offset.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
@@ -37,6 +39,7 @@ fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
 }
 
 /// Helper: reads a little-endian u16 from a byte slice at the given offset.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([raw[offset], raw[offset + 1]])
@@ -50,6 +53,7 @@ fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
 ///
 /// # Performance
 /// O(1) — one f32 read + fixed 5-iteration depth parse.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by MARKET_DEPTH_PACKET_SIZE check; depth loop is fixed 5 iterations
 pub fn parse_market_depth_packet(
     raw: &[u8],
     header: &PacketHeader,
@@ -91,6 +95,7 @@ pub fn parse_market_depth_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;

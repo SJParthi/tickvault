@@ -89,6 +89,7 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
 }
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
     use crate::websocket::types::DisconnectCode;

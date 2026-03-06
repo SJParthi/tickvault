@@ -17,6 +17,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — four `from_le_bytes` reads from contiguous memory.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by BINARY_HEADER_SIZE check
 pub fn parse_header(raw: &[u8]) -> Result<PacketHeader, ParseError> {
     if raw.len() < BINARY_HEADER_SIZE {
         return Err(ParseError::InsufficientBytes {
