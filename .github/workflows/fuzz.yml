@@ -1,7 +1,7 @@
 # =============================================================================
 # dhan-live-trader — Fuzz Testing (Nightly Scheduled)
 # =============================================================================
-# Runs cargo-fuzz targets nightly. Creates GitHub issue on crash.
+# Runs cargo-fuzz targets weekly. Creates GitHub issue on crash.
 # Catches panic/crash bugs from malformed input (WebSocket frames, configs).
 # =============================================================================
 
@@ -9,8 +9,8 @@ name: Fuzz
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Daily 2 AM UTC
-  workflow_dispatch:       # Allow manual trigger
+    - cron: '0 2 * * 1'  # Weekly Monday 2 AM UTC — saves ~85% scheduled minutes vs daily
+  workflow_dispatch:       # Allow manual trigger for on-demand testing
 
 permissions:
   contents: read
