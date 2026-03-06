@@ -397,10 +397,15 @@ impl ApplicationConfig {
             bail!("network.retry_max_attempts must be > 0");
         }
 
-        // Risk: daily loss must be positive and reasonable.
-        if self.risk.max_daily_loss_percent <= 0.0 || self.risk.max_daily_loss_percent > 100.0 {
+        // Risk: daily loss must be a finite positive number in (0, 100].
+        // NaN/Inf must be rejected — NaN defeats comparisons (all return false)
+        // and would corrupt financial calculations.
+        if !self.risk.max_daily_loss_percent.is_finite()
+            || self.risk.max_daily_loss_percent <= 0.0
+            || self.risk.max_daily_loss_percent > 100.0
+        {
             bail!(
-                "risk.max_daily_loss_percent must be in (0, 100], got {}",
+                "risk.max_daily_loss_percent must be a finite value in (0, 100], got {}",
                 self.risk.max_daily_loss_percent
             );
         }
@@ -665,6 +670,30 @@ mod tests {
         let mut config = make_valid_config();
         config.risk.max_daily_loss_percent = 100.0;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_daily_loss_percent_nan_fails() {
+        let mut config = make_valid_config();
+        config.risk.max_daily_loss_percent = f64::NAN;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_daily_loss_percent"));
+    }
+
+    #[test]
+    fn test_daily_loss_percent_inf_fails() {
+        let mut config = make_valid_config();
+        config.risk.max_daily_loss_percent = f64::INFINITY;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_daily_loss_percent"));
+    }
+
+    #[test]
+    fn test_daily_loss_percent_neg_inf_fails() {
+        let mut config = make_valid_config();
+        config.risk.max_daily_loss_percent = f64::NEG_INFINITY;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_daily_loss_percent"));
     }
 
     #[test]
