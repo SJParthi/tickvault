@@ -321,7 +321,7 @@ fn build_derivatives_and_chains(
                         segment = "I",
                         "duplicate security_id in CSV — keeping first occurrence"
                     );
-                    duplicate_count += 1;
+                    duplicate_count = duplicate_count.saturating_add(1);
                     continue;
                 }
                 instrument_info.insert(
@@ -343,7 +343,7 @@ fn build_derivatives_and_chains(
                         segment = "E",
                         "duplicate security_id in CSV — keeping first occurrence"
                     );
-                    duplicate_count += 1;
+                    duplicate_count = duplicate_count.saturating_add(1);
                     continue;
                 }
                 instrument_info.insert(
@@ -377,14 +377,14 @@ fn build_derivatives_and_chains(
             CSV_INSTRUMENT_OPTIDX => DhanInstrumentKind::OptionIndex,
             CSV_INSTRUMENT_OPTSTK => DhanInstrumentKind::OptionStock,
             _ => {
-                skipped_unknown_instrument += 1;
+                skipped_unknown_instrument = skipped_unknown_instrument.saturating_add(1);
                 continue;
             }
         };
 
         // Skip TEST instruments
         if row.underlying_symbol.contains(CSV_TEST_SYMBOL_MARKER) {
-            skipped_test += 1;
+            skipped_test = skipped_test.saturating_add(1);
             continue;
         }
 
@@ -396,13 +396,13 @@ fn build_derivatives_and_chains(
                 CSV_INSTRUMENT_FUTSTK | CSV_INSTRUMENT_OPTSTK
             )
         {
-            skipped_bse_stock_derivative += 1;
+            skipped_bse_stock_derivative = skipped_bse_stock_derivative.saturating_add(1);
             continue;
         }
 
         // Skip if underlying not in our universe
         if !underlyings.contains_key(&row.underlying_symbol) {
-            skipped_unknown_underlying += 1;
+            skipped_unknown_underlying = skipped_unknown_underlying.saturating_add(1);
             continue;
         }
 
@@ -421,7 +421,7 @@ fn build_derivatives_and_chains(
 
         // Skip expired contracts (expiry < today)
         if expiry_date < today {
-            skipped_expired += 1;
+            skipped_expired = skipped_expired.saturating_add(1);
             continue;
         }
 
@@ -446,7 +446,7 @@ fn build_derivatives_and_chains(
                 segment = "D",
                 "duplicate security_id in CSV — keeping first occurrence"
             );
-            duplicate_count += 1;
+            duplicate_count = duplicate_count.saturating_add(1);
             continue;
         }
 
@@ -488,9 +488,10 @@ fn build_derivatives_and_chains(
             .insert(expiry_date);
 
         // Increment per-underlying contract count
-        *contract_counts
+        let count = contract_counts
             .entry(row.underlying_symbol.clone())
-            .or_default() += 1;
+            .or_default();
+        *count = count.saturating_add(1);
 
         // Build chain key
         let chain_key = OptionChainKey {
@@ -821,6 +822,7 @@ pub fn build_fno_universe_from_csv(csv_text: &str, source: &str) -> Result<FnoUn
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
 

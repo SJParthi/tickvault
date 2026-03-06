@@ -123,6 +123,7 @@ pub fn build_disconnect_message() -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
     use dhan_live_trader_common::types::ExchangeSegment;
