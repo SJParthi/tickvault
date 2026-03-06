@@ -26,7 +26,7 @@ assignees: SJParthi
 
 ## Environment
 
-- **Branch:** <!-- e.g., main, develop, feature/... -->
+- **Branch:** <!-- e.g., main, feature/... -->
 - **Rust version:** <!-- rustc --version -->
 - **OS:** <!-- macOS, Linux, Docker -->
 - **Docker services running:** <!-- Yes/No -->

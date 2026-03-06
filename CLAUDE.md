@@ -35,12 +35,13 @@ NEVER execute without approval. NEVER guess versions. Silence != approval.
 ## GIT
 
 ```
-Branches: main | develop | feature/<phase>/<name> | fix/<desc> | hotfix/<desc>
+Branch:   main (single branch until AWS deployment)
 Commit:   <type>(<scope>): <description>
 Types:    feat, fix, refactor, test, docs, chore, perf, security
 ```
 
 Every commit compiles + passes tests. One logical change per commit.
+No branch protection or required checks until production deployment.
 
 ## CARGO
 

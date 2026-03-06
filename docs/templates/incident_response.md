@@ -19,7 +19,7 @@
    - Root cause clear + fix <10 lines → hotfix
 
 **Rollback:** Traefik blue-green switch → verify health → notify Parthiban
-**Hotfix:** Branch hotfix/<desc> → fix + test (all gates apply) → deploy → merge to main AND develop
+**Hotfix:** Branch hotfix/<desc> → fix + test → deploy → merge to main
 
 ## Post-Mortem Template
 

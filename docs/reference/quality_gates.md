@@ -39,7 +39,7 @@ Stage 6 — Coverage:  cargo-llvm-cov (<99% = FAIL, per-crate thresholds in qual
 ```
 Any stage fails = build is RED. No exceptions.
 
-**Branch Protection:** main requires all checks + PR review. develop requires compile+lint+test.
+**Branch Protection:** None until AWS deployment. CI runs on PRs to main.
 **CI Caching:** Cache cargo registry/git/target, key on Cargo.lock hash.
 **Auto-Cancel:** Stale workflows via concurrency group.
 

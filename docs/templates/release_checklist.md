@@ -3,7 +3,7 @@
 > Extracted from CLAUDE.md Gate 5b. Claude Code fills this out, Parthiban reviews.
 
 ## Pre-Release
-- [ ] All CI gates pass on `develop` (6 stages green)
+- [ ] All CI gates pass on `main` (6 stages green)
 - [ ] All benchmarks within budget (zero regressions >5%)
 - [ ] Coverage meets per-crate thresholds
 - [ ] cargo audit: zero known CVEs
@@ -12,7 +12,7 @@
 - [ ] Version bumped in workspace Cargo.toml
 
 ## Build & Tag
-- [ ] Merge develop → main via PR (with CI passing)
+- [ ] Tag release on main (CI passing)
 - [ ] Tag: `git tag -a v<X.Y.Z> -m "Release v<X.Y.Z>: <summary>"`
 - [ ] Docker image built: `docker build -t dlt:v<X.Y.Z> .`
 - [ ] Docker image tagged: `dlt:v<X.Y.Z>` (NEVER :latest)
