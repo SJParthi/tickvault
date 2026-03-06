@@ -13,7 +13,7 @@
 //! | 4 | Pass 3 + Pass 1/2 lookups | FnoUnderlying with price IDs linked |
 //! | 5 | All segment="D" rows | contracts, option chains, expiry calendars |
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -306,10 +306,24 @@ fn build_derivatives_and_chains(
     // Track contract count per underlying
     let mut contract_counts: HashMap<String, usize> = HashMap::with_capacity(256);
 
+    // Dedup tracker: detect duplicate security_ids across all rows
+    let mut seen_security_ids: HashSet<SecurityId> = HashSet::with_capacity(170_000);
+    let mut duplicate_count: usize = 0;
+
     // --- Step 1: Instrument info for indices and equities ---
     for row in rows {
         match row.segment {
             'I' => {
+                if !seen_security_ids.insert(row.security_id) {
+                    warn!(
+                        security_id = row.security_id,
+                        symbol = %row.underlying_symbol,
+                        segment = "I",
+                        "duplicate security_id in CSV — keeping first occurrence"
+                    );
+                    duplicate_count += 1;
+                    continue;
+                }
                 instrument_info.insert(
                     row.security_id,
                     InstrumentInfo::Index {
@@ -322,6 +336,16 @@ fn build_derivatives_and_chains(
             'E' if row.exchange == Exchange::NationalStockExchange
                 && row.series == CSV_SERIES_EQUITY =>
             {
+                if !seen_security_ids.insert(row.security_id) {
+                    warn!(
+                        security_id = row.security_id,
+                        symbol = %row.underlying_symbol,
+                        segment = "E",
+                        "duplicate security_id in CSV — keeping first occurrence"
+                    );
+                    duplicate_count += 1;
+                    continue;
+                }
                 instrument_info.insert(
                     row.security_id,
                     InstrumentInfo::Equity {
@@ -414,6 +438,18 @@ fn build_derivatives_and_chains(
             row.strike_price
         };
 
+        // Dedup: skip if security_id already seen (keep first occurrence)
+        if !seen_security_ids.insert(row.security_id) {
+            warn!(
+                security_id = row.security_id,
+                symbol = %row.underlying_symbol,
+                segment = "D",
+                "duplicate security_id in CSV — keeping first occurrence"
+            );
+            duplicate_count += 1;
+            continue;
+        }
+
         // Create DerivativeContract
         let contract = DerivativeContract {
             security_id: row.security_id,
@@ -489,6 +525,13 @@ fn build_derivatives_and_chains(
         }
     }
 
+    if duplicate_count > 0 {
+        warn!(
+            duplicate_count,
+            "Pass 5: duplicate security_ids detected in CSV — first occurrences kept"
+        );
+    }
+
     info!(
         derivative_count = derivative_contracts.len(),
         skipped_expired,
@@ -496,6 +539,7 @@ fn build_derivatives_and_chains(
         skipped_test,
         skipped_unknown_instrument,
         skipped_bse_stock_derivative,
+        duplicate_count,
         "Pass 5: derivative scanning complete"
     );
 
@@ -3587,7 +3631,11 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/instruments.csv");
 
-        let temp_dir = std::env::temp_dir().join("dlt-test-build-fno-universe-e2e");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-test-build-fno-universe-e2e-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let config = InstrumentConfig {
             daily_download_time: "08:00:00".to_owned(),
             csv_cache_directory: temp_dir.to_str().unwrap().to_owned(),

@@ -4,7 +4,7 @@
 //! Any validation failure prevents system startup.
 
 use anyhow::{Result, bail};
-use tracing::info;
+use tracing::{info, warn};
 
 use dhan_live_trader_common::constants::*;
 use dhan_live_trader_common::error::ApplicationError;
@@ -122,6 +122,109 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
         bail!(ApplicationError::UniverseValidationFailed {
             check: "derivative_contracts map is empty".to_owned(),
         });
+    }
+
+    // Check 6: Every derivative_contract.underlying_symbol exists in underlyings
+    let mut orphan_derivatives: usize = 0;
+    for contract in universe.derivative_contracts.values() {
+        if !universe
+            .underlyings
+            .contains_key(&contract.underlying_symbol)
+        {
+            orphan_derivatives += 1;
+            if orphan_derivatives <= 5 {
+                warn!(
+                    security_id = contract.security_id,
+                    underlying = %contract.underlying_symbol,
+                    "derivative references non-existent underlying"
+                );
+            }
+        }
+    }
+    if orphan_derivatives > 0 {
+        bail!(ApplicationError::UniverseValidationFailed {
+            check: format!(
+                "{} derivative contracts reference non-existent underlyings",
+                orphan_derivatives
+            ),
+        });
+    }
+
+    info!("validation: derivative → underlying cross-reference passed");
+
+    // Check 7: Every option_chain.future_security_id exists in derivative_contracts
+    let mut orphan_futures: usize = 0;
+    for chain in universe.option_chains.values() {
+        if let Some(future_id) = chain.future_security_id
+            && !universe.derivative_contracts.contains_key(&future_id)
+        {
+            orphan_futures += 1;
+            if orphan_futures <= 5 {
+                warn!(
+                    future_id,
+                    underlying = %chain.underlying_symbol,
+                    "option chain references non-existent future contract"
+                );
+            }
+        }
+    }
+    if orphan_futures > 0 {
+        bail!(ApplicationError::UniverseValidationFailed {
+            check: format!(
+                "{} option chains reference non-existent future contracts",
+                orphan_futures
+            ),
+        });
+    }
+
+    info!("validation: option chain → future cross-reference passed");
+
+    // Check 8: Every expiry_calendar symbol exists in underlyings
+    let mut orphan_calendars: usize = 0;
+    for symbol in universe.expiry_calendars.keys() {
+        if !universe.underlyings.contains_key(symbol) {
+            orphan_calendars += 1;
+            if orphan_calendars <= 5 {
+                warn!(
+                    symbol = %symbol,
+                    "expiry calendar references non-existent underlying"
+                );
+            }
+        }
+    }
+    if orphan_calendars > 0 {
+        bail!(ApplicationError::UniverseValidationFailed {
+            check: format!(
+                "{} expiry calendars reference non-existent underlyings",
+                orphan_calendars
+            ),
+        });
+    }
+
+    info!("validation: expiry calendar → underlying cross-reference passed");
+
+    // Check 9: Every underlying's price_feed_security_id exists in instrument_info (warn only)
+    let mut missing_price_feeds: usize = 0;
+    for underlying in universe.underlyings.values() {
+        if !universe
+            .instrument_info
+            .contains_key(&underlying.price_feed_security_id)
+        {
+            missing_price_feeds += 1;
+            if missing_price_feeds <= 5 {
+                warn!(
+                    symbol = %underlying.underlying_symbol,
+                    price_feed_id = underlying.price_feed_security_id,
+                    "underlying price_feed_security_id not in instrument_info"
+                );
+            }
+        }
+    }
+    if missing_price_feeds > 0 {
+        warn!(
+            missing_price_feeds,
+            "some underlying price_feed_security_ids not in instrument_info (non-fatal)"
+        );
     }
 
     info!(

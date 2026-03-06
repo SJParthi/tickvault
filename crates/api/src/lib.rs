@@ -5,6 +5,7 @@
 //! - `GET /api/stats` — QuestDB table counts
 //! - `GET /portal` — DLT Control Panel (links to all monitoring services)
 //! - `POST /api/instruments/rebuild` — one-shot instrument rebuild
+//! - `GET /api/instruments/diagnostic` — full instrument system health check
 //!
 //! # Boot Sequence Position
 //! Pipeline → **API Server**
@@ -33,6 +34,10 @@ pub fn build_router(state: SharedAppState) -> Router {
         .route(
             "/api/instruments/rebuild",
             axum::routing::post(handlers::instruments::rebuild_instruments),
+        )
+        .route(
+            "/api/instruments/diagnostic",
+            axum::routing::get(handlers::instruments::instrument_diagnostic),
         )
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .layer(cors)

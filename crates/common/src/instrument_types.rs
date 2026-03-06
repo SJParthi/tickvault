@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
@@ -18,7 +18,20 @@ use crate::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 // ---------------------------------------------------------------------------
 
 /// Classification of an F&O underlying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum UnderlyingKind {
     /// NSE index with F&O derivatives (e.g., NIFTY, BANKNIFTY).
     NseIndex,
@@ -46,7 +59,20 @@ impl fmt::Display for UnderlyingKind {
 }
 
 /// Classification of a derivative instrument as it appears in the Dhan CSV.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum DhanInstrumentKind {
     /// Index future (FUTIDX).
     FutureIndex,
@@ -81,7 +107,20 @@ impl fmt::Display for DhanInstrumentKind {
 // ---------------------------------------------------------------------------
 
 /// Category of a subscribed index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum IndexCategory {
     /// F&O underlying index (has derivatives, e.g., NIFTY, BANKNIFTY, SENSEX).
     FnoUnderlying,
@@ -106,7 +145,20 @@ impl fmt::Display for IndexCategory {
 }
 
 /// Subcategory of a display index for dashboard grouping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq))]
 pub enum IndexSubcategory {
     /// Volatility indices (e.g., INDIA VIX).
     Volatility,
@@ -145,11 +197,58 @@ impl fmt::Display for IndexSubcategory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Archived → Owned Conversions (for zero-copy rkyv access)
+// ---------------------------------------------------------------------------
+
+impl From<&ArchivedUnderlyingKind> for UnderlyingKind {
+    fn from(archived: &ArchivedUnderlyingKind) -> Self {
+        match archived {
+            ArchivedUnderlyingKind::NseIndex => Self::NseIndex,
+            ArchivedUnderlyingKind::BseIndex => Self::BseIndex,
+            ArchivedUnderlyingKind::Stock => Self::Stock,
+        }
+    }
+}
+
+impl From<&ArchivedDhanInstrumentKind> for DhanInstrumentKind {
+    fn from(archived: &ArchivedDhanInstrumentKind) -> Self {
+        match archived {
+            ArchivedDhanInstrumentKind::FutureIndex => Self::FutureIndex,
+            ArchivedDhanInstrumentKind::FutureStock => Self::FutureStock,
+            ArchivedDhanInstrumentKind::OptionIndex => Self::OptionIndex,
+            ArchivedDhanInstrumentKind::OptionStock => Self::OptionStock,
+        }
+    }
+}
+
+impl From<&ArchivedIndexCategory> for IndexCategory {
+    fn from(archived: &ArchivedIndexCategory) -> Self {
+        match archived {
+            ArchivedIndexCategory::FnoUnderlying => Self::FnoUnderlying,
+            ArchivedIndexCategory::DisplayIndex => Self::DisplayIndex,
+        }
+    }
+}
+
+/// Reconstruct a `NaiveDate` from an archived rkyv `i32_le` (days from CE).
+///
+/// # Safety contract
+/// The caller must ensure the `i32_le` value was produced by [`NaiveDateAsI32`]
+/// serialization of a valid `NaiveDate`.
+#[allow(clippy::expect_used)] // APPROVED: archived value validated at cache write time
+pub fn naive_date_from_archived_i32(days: &rkyv::rend::i32_le) -> NaiveDate {
+    NaiveDate::from_num_days_from_ce_opt((*days).into())
+        .expect("valid days-from-CE in validated rkyv archive") // APPROVED: archived value validated at cache write time
+}
+
 /// A subscribed index — one of the 31 documented indices.
 ///
 /// 8 F&O indices (NIFTY, BANKNIFTY, etc.) + 23 display indices (VIX, sectoral, etc.).
 /// All subscribed on IDX_I exchange segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct SubscribedIndex {
     /// Index symbol (e.g., "NIFTY", "INDIA VIX", "NIFTY AUTO").
     pub symbol: String,
@@ -176,7 +275,9 @@ pub struct SubscribedIndex {
 /// One entry per unique `UNDERLYING_SYMBOL` that has derivatives.
 /// Contains everything needed to subscribe to the underlying's live price
 /// feed and to look up its derivative contracts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FnoUnderlying {
     /// Underlying symbol (e.g., "NIFTY", "RELIANCE").
     pub underlying_symbol: String,
@@ -214,7 +315,9 @@ pub struct FnoUnderlying {
 // ---------------------------------------------------------------------------
 
 /// A single derivative contract (future or option).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct DerivativeContract {
     /// This contract's own security ID (unique across all contracts).
     pub security_id: SecurityId,
@@ -229,6 +332,7 @@ pub struct DerivativeContract {
     pub exchange_segment: ExchangeSegment,
 
     /// Expiry date of this contract.
+    #[rkyv(with = NaiveDateAsI32)]
     pub expiry_date: NaiveDate,
 
     /// Strike price. 0.0 for futures.
@@ -255,12 +359,15 @@ pub struct DerivativeContract {
 // ---------------------------------------------------------------------------
 
 /// A single option chain: all contracts for one (underlying, expiry).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct OptionChain {
     /// Underlying symbol.
     pub underlying_symbol: String,
 
     /// Expiry date for this chain.
+    #[rkyv(with = NaiveDateAsI32)]
     pub expiry_date: NaiveDate,
 
     /// Call options sorted by strike price ascending.
@@ -274,7 +381,9 @@ pub struct OptionChain {
 }
 
 /// One strike in an option chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct OptionChainEntry {
     /// Security ID of this option contract.
     pub security_id: SecurityId,
@@ -291,12 +400,25 @@ pub struct OptionChainEntry {
 // ---------------------------------------------------------------------------
 
 /// Composite key for option chain lookups.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(derive(Hash, PartialEq, Eq))]
 pub struct OptionChainKey {
     /// Underlying symbol.
     pub underlying_symbol: String,
 
     /// Expiry date.
+    #[rkyv(with = NaiveDateAsI32)]
     pub expiry_date: NaiveDate,
 }
 
@@ -305,12 +427,15 @@ pub struct OptionChainKey {
 // ---------------------------------------------------------------------------
 
 /// Expiry calendar for a single underlying.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct ExpiryCalendar {
     /// Underlying symbol.
     pub underlying_symbol: String,
 
     /// Sorted expiry dates (ascending), all >= today at build time.
+    #[rkyv(with = rkyv::with::Map<NaiveDateAsI32>)]
     pub expiry_dates: Vec<NaiveDate>,
 }
 
@@ -322,7 +447,9 @@ pub struct ExpiryCalendar {
 ///
 /// Used by the WebSocket binary parser to decode what a security ID
 /// represents when receiving tick data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum InstrumentInfo {
     /// An index (IDX_I segment).
     Index {
@@ -341,6 +468,7 @@ pub enum InstrumentInfo {
         underlying_symbol: String,
         instrument_kind: DhanInstrumentKind,
         exchange_segment: ExchangeSegment,
+        #[rkyv(with = NaiveDateAsI32)]
         expiry_date: NaiveDate,
         strike_price: f64,
         option_type: Option<OptionType>,
@@ -352,7 +480,9 @@ pub enum InstrumentInfo {
 // ---------------------------------------------------------------------------
 
 /// Metadata about the universe build for logging and monitoring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct UniverseBuildMetadata {
     /// Which CSV URL was used (primary or fallback).
     pub csv_source: String,
@@ -380,9 +510,11 @@ pub struct UniverseBuildMetadata {
 
     /// Total universe build duration.
     #[serde(with = "duration_serde")]
+    #[rkyv(with = DurationAsMillis)]
     pub build_duration: Duration,
 
     /// Timestamp when the build completed (IST).
+    #[rkyv(with = DateTimeFixedOffsetAsI64)]
     pub build_timestamp: DateTime<FixedOffset>,
 }
 
@@ -402,6 +534,181 @@ mod duration_serde {
     }
 }
 
+/// rkyv wrapper for `NaiveDate` — stored as `i32` (days from CE epoch).
+///
+/// chrono's rkyv-64 feature uses rkyv 0.7; we use rkyv 0.8. This bridges the gap.
+/// Used via `#[rkyv(with = NaiveDateAsI32)]`.
+pub struct NaiveDateAsI32;
+
+impl rkyv::with::ArchiveWith<NaiveDate> for NaiveDateAsI32 {
+    type Archived = rkyv::rend::i32_le;
+    type Resolver = ();
+
+    fn resolve_with(
+        field: &NaiveDate,
+        _resolver: Self::Resolver,
+        out: rkyv::Place<Self::Archived>,
+    ) {
+        let value = rkyv::rend::i32_le::from_native(field.num_days_from_ce());
+        rkyv::Archive::resolve(&value, (), out);
+    }
+}
+
+impl<S: rkyv::rancor::Fallible + ?Sized> rkyv::with::SerializeWith<NaiveDate, S>
+    for NaiveDateAsI32
+{
+    fn serialize_with(
+        _field: &NaiveDate,
+        _serializer: &mut S,
+    ) -> Result<Self::Resolver, <S as rkyv::rancor::Fallible>::Error> {
+        Ok(())
+    }
+}
+
+impl<D: rkyv::rancor::Fallible + ?Sized>
+    rkyv::with::DeserializeWith<rkyv::rend::i32_le, NaiveDate, D> for NaiveDateAsI32
+where
+    <D as rkyv::rancor::Fallible>::Error: rkyv::rancor::Source,
+{
+    fn deserialize_with(
+        archived: &rkyv::rend::i32_le,
+        _deserializer: &mut D,
+    ) -> Result<NaiveDate, <D as rkyv::rancor::Fallible>::Error> {
+        NaiveDate::from_num_days_from_ce_opt((*archived).into())
+            .ok_or_else(|| rkyv::rancor::Source::new(NaiveDateRkyvError))
+    }
+}
+
+/// Error type for invalid NaiveDate deserialization from rkyv.
+#[derive(Debug)]
+struct NaiveDateRkyvError;
+
+impl fmt::Display for NaiveDateRkyvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid NaiveDate days-from-CE value in rkyv archive")
+    }
+}
+
+impl std::error::Error for NaiveDateRkyvError {}
+
+/// rkyv wrapper for `DateTime<FixedOffset>` — stored as `(i64, i32)` (timestamp secs + UTC offset secs).
+///
+/// Used via `#[rkyv(with = DateTimeFixedOffsetAsI64)]`.
+pub struct DateTimeFixedOffsetAsI64;
+
+/// Archived form of `DateTime<FixedOffset>`: timestamp seconds + UTC offset seconds.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(compare(PartialEq))]
+pub struct ArchivedDateTimeFixedOffset {
+    pub timestamp_secs: i64,
+    pub offset_secs: i32,
+}
+
+impl rkyv::with::ArchiveWith<DateTime<FixedOffset>> for DateTimeFixedOffsetAsI64 {
+    type Archived = <ArchivedDateTimeFixedOffset as rkyv::Archive>::Archived;
+    type Resolver = <ArchivedDateTimeFixedOffset as rkyv::Archive>::Resolver;
+
+    fn resolve_with(
+        field: &DateTime<FixedOffset>,
+        resolver: Self::Resolver,
+        out: rkyv::Place<Self::Archived>,
+    ) {
+        let proxy = ArchivedDateTimeFixedOffset {
+            timestamp_secs: field.timestamp(),
+            offset_secs: field.offset().local_minus_utc(),
+        };
+        rkyv::Archive::resolve(&proxy, resolver, out);
+    }
+}
+
+impl<S: rkyv::rancor::Fallible + rkyv::ser::Writer + ?Sized>
+    rkyv::with::SerializeWith<DateTime<FixedOffset>, S> for DateTimeFixedOffsetAsI64
+{
+    fn serialize_with(
+        field: &DateTime<FixedOffset>,
+        serializer: &mut S,
+    ) -> Result<Self::Resolver, <S as rkyv::rancor::Fallible>::Error> {
+        let proxy = ArchivedDateTimeFixedOffset {
+            timestamp_secs: field.timestamp(),
+            offset_secs: field.offset().local_minus_utc(),
+        };
+        rkyv::Serialize::serialize(&proxy, serializer)
+    }
+}
+
+impl<D: rkyv::rancor::Fallible + ?Sized>
+    rkyv::with::DeserializeWith<
+        <ArchivedDateTimeFixedOffset as rkyv::Archive>::Archived,
+        DateTime<FixedOffset>,
+        D,
+    > for DateTimeFixedOffsetAsI64
+where
+    <D as rkyv::rancor::Fallible>::Error: rkyv::rancor::Source,
+{
+    fn deserialize_with(
+        archived: &<ArchivedDateTimeFixedOffset as rkyv::Archive>::Archived,
+        deserializer: &mut D,
+    ) -> Result<DateTime<FixedOffset>, <D as rkyv::rancor::Fallible>::Error> {
+        let proxy: ArchivedDateTimeFixedOffset =
+            rkyv::Deserialize::deserialize(archived, deserializer)?;
+        let offset = FixedOffset::east_opt(proxy.offset_secs)
+            .ok_or_else(|| rkyv::rancor::Source::new(DateTimeRkyvError))?;
+        DateTime::from_timestamp(proxy.timestamp_secs, 0)
+            .map(|dt| dt.with_timezone(&offset))
+            .ok_or_else(|| rkyv::rancor::Source::new(DateTimeRkyvError))
+    }
+}
+
+/// Error type for invalid DateTime deserialization from rkyv.
+#[derive(Debug)]
+struct DateTimeRkyvError;
+
+impl fmt::Display for DateTimeRkyvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid DateTime<FixedOffset> value in rkyv archive")
+    }
+}
+
+impl std::error::Error for DateTimeRkyvError {}
+
+/// rkyv wrapper for `Duration` — stored as `u64` milliseconds.
+///
+/// Mirrors `duration_serde` above. Used via `#[rkyv(with = DurationAsMillis)]`.
+pub struct DurationAsMillis;
+
+impl rkyv::with::ArchiveWith<Duration> for DurationAsMillis {
+    type Archived = rkyv::rend::u64_le;
+    type Resolver = ();
+
+    fn resolve_with(field: &Duration, _resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        let millis = field.as_millis() as u64;
+        let value = rkyv::rend::u64_le::from_native(millis);
+        rkyv::Archive::resolve(&value, (), out);
+    }
+}
+
+impl<S: rkyv::rancor::Fallible + ?Sized> rkyv::with::SerializeWith<Duration, S>
+    for DurationAsMillis
+{
+    fn serialize_with(
+        _field: &Duration,
+        _serializer: &mut S,
+    ) -> Result<Self::Resolver, <S as rkyv::rancor::Fallible>::Error> {
+        Ok(())
+    }
+}
+
+impl<D: rkyv::rancor::Fallible + ?Sized>
+    rkyv::with::DeserializeWith<rkyv::rend::u64_le, Duration, D> for DurationAsMillis
+{
+    fn deserialize_with(
+        archived: &rkyv::rend::u64_le,
+        _deserializer: &mut D,
+    ) -> Result<Duration, <D as rkyv::rancor::Fallible>::Error> {
+        Ok(Duration::from_millis((*archived).into()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // F&O Universe (the single output artifact)
 // ---------------------------------------------------------------------------
@@ -411,7 +718,9 @@ mod duration_serde {
 /// This is the single artifact consumed by all downstream blocks:
 /// WebSocket subscription, binary parser decoding, OMS order validation,
 /// storage persistence, and API endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FnoUniverse {
     /// All F&O underlyings, keyed by underlying symbol.
     pub underlyings: HashMap<String, FnoUnderlying>,

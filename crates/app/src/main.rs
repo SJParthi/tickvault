@@ -34,7 +34,10 @@ use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
-use dhan_live_trader_core::instrument::{build_subscription_plan, load_or_build_instruments};
+use dhan_live_trader_core::instrument::{
+    InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
+    run_instrument_diagnostic,
+};
 use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
@@ -139,6 +142,43 @@ async fn main() -> Result<()> {
     );
 
     // -----------------------------------------------------------------------
+    // CLI: --instrument-diagnostic (run diagnostic and exit)
+    // -----------------------------------------------------------------------
+    if std::env::args().any(|arg| arg == "--instrument-diagnostic") {
+        info!("running instrument diagnostic (--instrument-diagnostic flag detected)");
+        let report = run_instrument_diagnostic(
+            &config.dhan.instrument_csv_url,
+            &config.dhan.instrument_csv_fallback_url,
+            &config.instrument,
+        )
+        .await;
+
+        let json = serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|err| format!("{{\"error\": \"serialization failed: {err}\"}}"));
+        #[allow(clippy::print_stdout)] // APPROVED: CLI diagnostic output to stdout, not logging
+        {
+            println!("{json}"); // APPROVED: CLI diagnostic requires stdout output
+        }
+
+        if report.healthy {
+            info!("instrument diagnostic: ALL CHECKS PASSED");
+        } else {
+            let failed: Vec<_> = report
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| c.name.as_str())
+                .collect();
+            error!(
+                failed_checks = ?failed,
+                "instrument diagnostic: SOME CHECKS FAILED"
+            );
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Step 4: Initialize notification service (best-effort — no-op if SSM unavailable)
     // -----------------------------------------------------------------------
     info!("initializing Telegram notification service");
@@ -208,10 +248,11 @@ async fn main() -> Result<()> {
         &config.dhan.instrument_csv_fallback_url,
         &config.instrument,
         &config.questdb,
+        &config.subscription,
     )
     .await
     {
-        Ok(Some((universe, was_fresh_build))) => {
+        Ok(InstrumentLoadResult::FreshBuild(universe)) => {
             let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
                 .context("invalid IST offset constant")?;
             let today = Utc::now().with_timezone(&ist).date_naive();
@@ -225,22 +266,31 @@ async fn main() -> Result<()> {
                 stock_derivatives = plan.summary.stock_derivatives,
                 total = plan.summary.total,
                 feed_mode = %plan.summary.feed_mode,
-                fresh_build = was_fresh_build,
-                "subscription plan ready"
+                "subscription plan ready (fresh build)"
             );
 
-            if was_fresh_build {
-                notifier.notify(NotificationEvent::InstrumentBuildSuccess {
-                    source: universe.build_metadata.csv_source,
-                    derivative_count: universe.derivative_contracts.len(),
-                    underlying_count: universe.underlyings.len(),
-                });
-            }
+            notifier.notify(NotificationEvent::InstrumentBuildSuccess {
+                source: universe.build_metadata.csv_source,
+                derivative_count: universe.derivative_contracts.len(),
+                underlying_count: universe.underlyings.len(),
+            });
             Some(plan)
         }
-        Ok(None) => {
-            // Time-gated skip — outside build window
-            info!("instruments: skipped (outside build window)");
+        Ok(InstrumentLoadResult::CachedPlan(plan)) => {
+            info!(
+                major_indices = plan.summary.major_index_values,
+                display_indices = plan.summary.display_indices,
+                index_derivatives = plan.summary.index_derivatives,
+                stock_equities = plan.summary.stock_equities,
+                stock_derivatives = plan.summary.stock_derivatives,
+                total = plan.summary.total,
+                feed_mode = %plan.summary.feed_mode,
+                "subscription plan ready (zero-copy rkyv cache)"
+            );
+            Some(plan)
+        }
+        Ok(InstrumentLoadResult::Unavailable) => {
+            info!("instruments: no cache available during market hours");
             None
         }
         Err(err) => {
@@ -296,7 +346,7 @@ async fn main() -> Result<()> {
         .context("failed to create WebSocket connection pool")?;
 
         let receiver = pool.take_frame_receiver();
-        let handles = pool.spawn_all();
+        let handles = pool.spawn_all().await;
 
         info!(
             connections = handles.len(),

@@ -38,6 +38,9 @@ pub struct WebSocketConnectionPool {
 
     /// Receiver for raw binary frames from all connections.
     frame_receiver: mpsc::Receiver<Vec<u8>>,
+
+    /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
+    connection_stagger_ms: u64,
 }
 
 impl std::fmt::Debug for WebSocketConnectionPool {
@@ -130,24 +133,44 @@ impl WebSocketConnectionPool {
         Ok(Self {
             connections,
             frame_receiver,
+            connection_stagger_ms: ws_config.connection_stagger_ms,
         })
     }
 
-    /// Spawns all connections as independent tokio tasks.
+    /// Spawns all connections as independent tokio tasks with staggered startup.
     ///
     /// Each connection manages its own lifecycle (connect, subscribe, ping,
-    /// read, reconnect). Returns task handles for monitoring/cancellation.
+    /// read, reconnect). Connections are spawned with a configurable delay
+    /// between each to avoid hitting Dhan's server simultaneously.
+    /// Returns task handles for monitoring/cancellation.
     // O(1) EXEMPT: begin — spawn runs once per session
-    pub fn spawn_all(&self) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
-        self.connections
-            .iter()
-            .map(|conn| {
-                let conn = Arc::clone(conn);
-                tokio::spawn(async move { conn.run().await })
-            })
-            .collect()
-        // O(1) EXEMPT: end
+    pub async fn spawn_all(&self) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
+        let stagger = std::time::Duration::from_millis(self.connection_stagger_ms);
+        let mut handles = Vec::with_capacity(self.connections.len());
+
+        for (idx, conn) in self.connections.iter().enumerate() {
+            if idx > 0 && !stagger.is_zero() {
+                info!(
+                    connection_id = idx,
+                    stagger_ms = self.connection_stagger_ms,
+                    "Waiting before spawning next WebSocket connection"
+                );
+                tokio::time::sleep(stagger).await;
+            }
+
+            let conn = Arc::clone(conn);
+            handles.push(tokio::spawn(async move { conn.run().await }));
+
+            info!(
+                connection_id = idx,
+                total = self.connections.len(),
+                "Spawned WebSocket connection"
+            );
+        }
+
+        handles
     }
+    // O(1) EXEMPT: end
 
     /// Returns the frame receiver for downstream binary frame processing.
     ///
@@ -209,6 +232,7 @@ mod tests {
             reconnect_max_delay_ms: 30000,
             reconnect_max_attempts: 10,
             subscription_batch_size: 100,
+            connection_stagger_ms: 0, // No stagger in tests for speed
         }
     }
 
@@ -629,7 +653,7 @@ mod tests {
         )
         .unwrap();
 
-        let handles = pool.spawn_all();
+        let handles = pool.spawn_all().await;
         assert_eq!(
             handles.len(),
             pool.connection_count(),
@@ -662,7 +686,7 @@ mod tests {
         )
         .unwrap();
 
-        let handles = pool.spawn_all();
+        let handles = pool.spawn_all().await;
         assert_eq!(handles.len(), 5, "empty pool still has 5 connections");
 
         for handle in handles {
@@ -688,7 +712,7 @@ mod tests {
         )
         .unwrap();
 
-        let handles = pool.spawn_all();
+        let handles = pool.spawn_all().await;
 
         for handle in handles {
             let join_result = handle.await.unwrap();
@@ -950,12 +974,80 @@ mod tests {
         )
         .unwrap();
 
-        let handles = pool.spawn_all();
+        let handles = pool.spawn_all().await;
         assert_eq!(handles.len(), 1);
 
         for handle in handles {
             let result = handle.await;
             assert!(result.is_ok(), "JoinHandle must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_with_stagger_returns_correct_handles() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 0,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                connection_stagger_ms: 50, // 50ms stagger for fast test
+                ..make_test_ws_config()
+            },
+            make_instruments(10),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let start = tokio::time::Instant::now();
+        let handles = pool.spawn_all().await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(handles.len(), 5);
+        // 4 gaps of 50ms = 200ms minimum
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "Stagger should cause at least 200ms delay for 5 connections, got {elapsed:?}",
+        );
+
+        for handle in handles {
+            let result = handle.await;
+            assert!(result.is_ok(), "JoinHandle must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_zero_stagger_is_instant() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 0,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                connection_stagger_ms: 0,
+                ..make_test_ws_config()
+            },
+            make_instruments(10),
+            FeedMode::Ticker,
+        )
+        .unwrap();
+
+        let start = tokio::time::Instant::now();
+        let handles = pool.spawn_all().await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(handles.len(), 5);
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "Zero stagger should be near-instant, got {elapsed:?}",
+        );
+
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 }
