@@ -260,12 +260,17 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-llvm-cov
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.6.16
 
       - name: Run coverage (workspace — collect JSON + LCOV)
         run: |
           mkdir -p target/llvm-cov
-          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json
+          cargo llvm-cov --workspace --json --output-path target/llvm-cov/coverage.json 2>&1 || {
+            echo "::error::cargo llvm-cov failed — dumping environment info"
+            cargo llvm-cov --version
+            rustc --version
+            exit 1
+          }
           cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
 
       - name: Enforce workspace coverage threshold (HARD FAIL)
