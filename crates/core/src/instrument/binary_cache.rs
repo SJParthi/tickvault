@@ -445,7 +445,7 @@ mod tests {
 
         let path = dir.join(BINARY_CACHE_FILENAME);
         // 32 bytes is below MIN_RKYV_CACHE_BYTES (64)
-        std::fs::write(&path, &vec![0u8; 32]).unwrap();
+        std::fs::write(&path, vec![0u8; 32]).unwrap();
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
         assert!(result.is_err(), "too-small rkyv file should return Err");
