@@ -68,6 +68,7 @@ criterion/
 # ---- Fuzz artifacts ----
 fuzz/artifacts/
 fuzz/corpus/
+fuzz/target/
 
 # ---- Quality gate state files (local machine state) ----
 .claude/hooks/.last-quality-pass
