@@ -408,8 +408,8 @@ fn mask_phone(phone: &str) -> String {
     if phone.len() <= 8 {
         return "***".to_string();
     }
-    let keep_prefix = 3;
-    let keep_suffix = 5;
+    let keep_prefix: usize = 3;
+    let keep_suffix: usize = 5;
     let mask_len = phone
         .len()
         .saturating_sub(keep_prefix.saturating_add(keep_suffix));
