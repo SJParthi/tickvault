@@ -533,15 +533,15 @@ impl WebSocketConnection {
         let mut waited: u64 = 0;
         while waited < MAX_WAIT_SECS {
             let guard = self.token_handle.load();
-            if let Some(state) = guard.as_ref().as_ref() {
-                if state.is_valid() {
-                    info!(
-                        connection_id = self.connection_id,
-                        waited_secs = waited,
-                        "Valid token available — resuming reconnection"
-                    );
-                    return;
-                }
+            if let Some(state) = guard.as_ref().as_ref()
+                && state.is_valid()
+            {
+                info!(
+                    connection_id = self.connection_id,
+                    waited_secs = waited,
+                    "Valid token available — resuming reconnection"
+                );
+                return;
             }
             time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
             waited += POLL_INTERVAL_SECS;
