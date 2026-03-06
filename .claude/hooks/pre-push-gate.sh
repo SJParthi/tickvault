@@ -55,8 +55,9 @@ FAILED=0
 # DEDUP CHECK: Did pre-commit gate already pass for this HEAD?
 # ─────────────────────────────────────────────
 STATE_FILE="$HOOKS_DIR/.last-quality-pass"
-# NOTE: pre-commit-gate writes HEAD *before* the commit runs (PreToolUse hook),
-# so the saved hash = parent of the new commit. We compare HEAD~1 to match.
+# NOTE: post-commit-state.sh updates saved hash to NEW HEAD after commit.
+# pre-commit-gate.sh writes OLD HEAD (parent) before commit.
+# We check both HEAD and HEAD~1 to handle either case.
 HEAD_CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 HEAD_PARENT=$(git rev-parse HEAD~1 2>/dev/null || echo "unknown")
 COMMIT_VERIFIED=false
@@ -67,7 +68,7 @@ if [ -f "$STATE_FILE" ]; then
   NOW=$(date +%s)
   AGE=$(( NOW - SAVED_TIME ))
 
-  if [ "$SAVED_HASH" = "$HEAD_PARENT" ] && [ "$AGE" -lt 300 ]; then
+  if { [ "$SAVED_HASH" = "$HEAD_CURRENT" ] || [ "$SAVED_HASH" = "$HEAD_PARENT" ]; } && [ "$AGE" -lt 300 ]; then
     COMMIT_VERIFIED=true
   fi
 fi
