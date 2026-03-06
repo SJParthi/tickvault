@@ -5,6 +5,7 @@
 # Mutation testing verifies that tests actually catch bugs — if a mutant survives,
 # it means there's a code path where tests don't detect a behavior change.
 #
+# Cost optimization: Skips on draft PRs. Schedule changed from nightly to weekly.
 # This is a required status check — PR cannot merge if mutation score drops.
 # =============================================================================
 
@@ -12,10 +13,11 @@ name: Mutation Testing
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # Nightly at 3 AM UTC — catches untested code without blocking PRs
+    - cron: '0 3 * * 1'  # Weekly Monday 3 AM UTC — catches untested code without burning daily minutes
   workflow_dispatch: # Manual trigger for on-demand mutation testing
   pull_request:
     branches: [main]    # Only gate main merges, not develop (saves ~50% runs)
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/core/**/*.rs'
       - 'crates/trading/**/*.rs'
@@ -35,6 +37,7 @@ env:
 jobs:
   mutants:
     name: "Mutation Testing (critical crates)"
+    if: github.event.pull_request.draft != true || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
