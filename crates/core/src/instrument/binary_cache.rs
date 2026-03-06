@@ -5,8 +5,9 @@
 //! deserialization (~5-15ms, 25x faster than CSV re-parse).
 //!
 //! # Cache Format
-//! `[MAGIC (4 bytes)] [VERSION (1 byte)] [rkyv payload ...]`
-//! Magic = `b"RKYV"`, Version = `1`. Validated on load to reject stale caches.
+//! `[MAGIC (4 bytes)] [VERSION (1 byte)] [PAD (3 bytes)] [rkyv payload ...]`
+//! Magic = `b"RKYV"`, Version = `2`. 8-byte header for rkyv alignment.
+//! Validated on load to reject stale caches.
 
 use std::path::Path;
 
@@ -25,11 +26,8 @@ const CACHE_MAGIC: &[u8; 4] = b"RKYV";
 const CACHE_VERSION: u8 = 2;
 
 /// Total header size: 8 bytes (4 magic + 1 version + 3 padding).
-///
-/// Padded to 8 bytes so the rkyv payload starts at an 8-byte aligned offset.
-/// rkyv 0.8 with `bytecheck` requires proper alignment for types containing
-/// `u64`/`f64` fields. Without this padding, `from_bytes` rejects the buffer
-/// with an "unaligned pointer" error.
+/// Padded to 8-byte alignment so the rkyv payload starts at an aligned offset,
+/// which rkyv requires for zero-copy deserialization from mmap.
 const HEADER_LEN: usize = 8;
 
 /// Serialize `FnoUniverse` to rkyv binary file.
@@ -47,11 +45,11 @@ pub fn write_binary_cache(universe: &FnoUniverse, cache_dir: &str) -> Result<()>
             .with_context(|| format!("failed to create cache dir: {}", parent.display()))?;
     }
 
-    // Build payload: header (8 bytes, aligned) + rkyv bytes
+    // Build payload: 8-byte aligned header + rkyv bytes
     let mut payload = Vec::with_capacity(HEADER_LEN + rkyv_bytes.len());
     payload.extend_from_slice(CACHE_MAGIC);
     payload.push(CACHE_VERSION);
-    payload.extend_from_slice(&[0u8; 3]); // 3 padding bytes → 8-byte aligned rkyv payload
+    payload.extend_from_slice(&[0u8; HEADER_LEN - CACHE_MAGIC.len() - 1]); // padding
     payload.extend_from_slice(&rkyv_bytes);
 
     // Atomic write: temp file → rename (prevents readers from seeing partial data)
@@ -149,12 +147,9 @@ pub struct MappedUniverse {
     mmap: Mmap,
 }
 
-/// Minimum valid rkyv cache file size (header + smallest valid rkyv payload).
-///
-/// An empty `FnoUniverse` serializes to ~136 rkyv bytes + 8-byte header = ~144.
-/// Set to 64 to catch obviously truncated/corrupt files while allowing small
-/// valid universes (e.g., test fixtures).
-const MIN_RKYV_CACHE_BYTES: u64 = 64;
+/// Minimum valid rkyv cache file size (header + smallest possible rkyv payload).
+/// An empty FnoUniverse serializes to ~136 bytes + 8 header = 144 bytes.
+const MIN_RKYV_CACHE_BYTES: u64 = HEADER_LEN as u64 + 16;
 
 impl MappedUniverse {
     /// Load and validate the rkyv binary cache. Sub-0.5ms.
@@ -213,7 +208,7 @@ impl MappedUniverse {
     /// Header validated in `load()`. Mmap is read-only, single-process.
     #[inline]
     pub fn archived(&self) -> &ArchivedFnoUniverse {
-        // Skip the 5-byte header (magic + version) to reach the rkyv payload
+        // Skip the 8-byte header (magic + version + padding) to reach the rkyv payload
         unsafe { rkyv::access_unchecked::<ArchivedFnoUniverse>(&self.mmap[HEADER_LEN..]) } // SAFETY: see struct-level safety comment
     }
 
@@ -444,8 +439,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = dir.join(BINARY_CACHE_FILENAME);
-        // 32 bytes is below MIN_RKYV_CACHE_BYTES (64)
-        std::fs::write(&path, vec![0u8; 32]).unwrap();
+        // 16 bytes is below MIN_RKYV_CACHE_BYTES (HEADER_LEN + 16 = 24)
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
         assert!(result.is_err(), "too-small rkyv file should return Err");

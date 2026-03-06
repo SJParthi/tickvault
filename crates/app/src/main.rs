@@ -346,7 +346,7 @@ async fn main() -> Result<()> {
         .context("failed to create WebSocket connection pool")?;
 
         let receiver = pool.take_frame_receiver();
-        let handles = pool.spawn_all();
+        let handles = pool.spawn_all().await;
 
         info!(
             connections = handles.len(),

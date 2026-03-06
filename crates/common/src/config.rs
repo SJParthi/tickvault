@@ -88,6 +88,10 @@ pub struct WebSocketConfig {
     pub reconnect_max_attempts: u32,
     /// Maximum instruments per subscription message (Dhan limit: 100).
     pub subscription_batch_size: usize,
+    /// Delay in milliseconds between spawning successive WebSocket connections.
+    /// Prevents all connections from hitting Dhan's server simultaneously at startup.
+    /// 0 = no stagger (all spawn immediately). Only affects initial startup, not reconnects.
+    pub connection_stagger_ms: u64,
 }
 
 /// QuestDB connection configuration.
@@ -507,6 +511,7 @@ mod tests {
                 reconnect_max_delay_ms: 30000,
                 reconnect_max_attempts: 10,
                 subscription_batch_size: 100,
+                connection_stagger_ms: 10000,
             },
             questdb: QuestDbConfig {
                 host: "dlt-questdb".to_string(),
