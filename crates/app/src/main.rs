@@ -189,17 +189,41 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 
-    let token_manager =
-        match TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier)
-            .await
-        {
-            Ok(manager) => manager,
-            Err(err) => {
-                // Only reaches here on permanent auth error or Ctrl+C.
-                error!(error = %err, "authentication failed permanently — exiting");
-                return Ok(());
-            }
-        };
+    let token_init_timeout =
+        std::time::Duration::from_secs(dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS);
+    let token_manager = match tokio::time::timeout(
+        token_init_timeout,
+        TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier),
+    )
+    .await
+    {
+        Ok(Ok(manager)) => manager,
+        Ok(Err(err)) => {
+            // Permanent auth error or Ctrl+C.
+            error!(error = %err, "authentication failed permanently — exiting");
+            notifier.notify(
+                dhan_live_trader_core::notification::events::NotificationEvent::AuthenticationFailed {
+                    reason: format!("PERMANENT: {err}"),
+                },
+            );
+            return Ok(());
+        }
+        Err(_elapsed) => {
+            error!(
+                timeout_secs = dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                "authentication timed out — Dhan API may be unreachable"
+            );
+            notifier.notify(
+                dhan_live_trader_core::notification::events::NotificationEvent::AuthenticationFailed {
+                    reason: format!(
+                        "TIMEOUT: initial auth did not complete within {}s — check Dhan API and network",
+                        dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                    ),
+                },
+            );
+            return Ok(());
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Step 6: Set up QuestDB tick persistence (best-effort)
@@ -216,9 +240,16 @@ async fn main() -> Result<()> {
             Some(writer)
         }
         Err(err) => {
-            warn!(
+            error!(
                 ?err,
-                "QuestDB tick writer unavailable — ticks will not be persisted"
+                "QuestDB tick writer unavailable — ticks will NOT be persisted"
+            );
+            notifier.notify(
+                dhan_live_trader_core::notification::events::NotificationEvent::Custom {
+                    message: format!(
+                        "<b>QuestDB UNAVAILABLE</b>\nTick writer failed: {err}\nTicks will NOT be persisted until restart."
+                    ),
+                },
             );
             None
         }
@@ -230,9 +261,9 @@ async fn main() -> Result<()> {
             Some(writer)
         }
         Err(err) => {
-            warn!(
+            error!(
                 ?err,
-                "QuestDB depth writer unavailable — market depth will not be persisted"
+                "QuestDB depth writer unavailable — market depth will NOT be persisted"
             );
             None
         }
@@ -440,19 +471,39 @@ async fn main() -> Result<()> {
     info!("shutdown signal received — stopping gracefully");
     notifier.notify(NotificationEvent::ShutdownInitiated);
 
-    // Cancel background tasks
-    renewal_handle.abort();
-    if let Some(handle) = processor_handle {
-        handle.abort();
-    }
-    api_handle.abort();
+    // Spawn a second signal listener: if the operator sends another Ctrl+C
+    // during shutdown, exit immediately instead of hanging.
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        warn!("second shutdown signal received — forcing immediate exit");
+        std::process::exit(1);
+    });
 
-    // Wait briefly for clean shutdown
+    // 1. Stop token renewal (no dependencies).
+    renewal_handle.abort();
+
+    // 2. Abort WebSocket connections. This drops all frame_sender handles,
+    //    which causes the tick processor's recv() to return None and exit
+    //    its loop — triggering the final QuestDB flush.
     for handle in ws_handles {
         handle.abort();
     }
 
-    // Flush pending OpenTelemetry spans before exit (Drop triggers batch flush)
+    // 3. Wait for the tick processor to finish its final flush (bounded).
+    if let Some(handle) = processor_handle {
+        let shutdown_timeout = std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+        );
+        match tokio::time::timeout(shutdown_timeout, handle).await {
+            Ok(_) => info!("tick processor shut down gracefully"),
+            Err(_) => warn!("tick processor shutdown timed out — aborting"),
+        }
+    }
+
+    // 4. Stop API server.
+    api_handle.abort();
+
+    // 5. Flush pending OpenTelemetry spans before exit (Drop triggers batch flush).
     drop(otel_provider);
 
     info!("dhan-live-trader stopped");

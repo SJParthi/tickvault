@@ -467,6 +467,25 @@ impl ApplicationConfig {
             bail!("websocket.pong_timeout_secs must be > 0");
         }
 
+        // WebSocket: computed read timeout must be reasonable relative to Dhan's
+        // 40s server timeout. We allow up to 2× the server timeout as an upper
+        // bound — beyond that, the config is likely misconfigured.
+        let computed_read_timeout = self
+            .websocket
+            .ping_interval_secs
+            .saturating_mul(u64::from(self.websocket.max_consecutive_pong_failures) + 1)
+            .saturating_add(self.websocket.pong_timeout_secs);
+        let max_reasonable_timeout = crate::constants::SERVER_PING_TIMEOUT_SECS * 2;
+        if computed_read_timeout > max_reasonable_timeout {
+            bail!(
+                "websocket read timeout ({}s = ping_interval × (max_failures+1) + pong_timeout) \
+                 exceeds {}s — Dhan server disconnects at {}s",
+                computed_read_timeout,
+                max_reasonable_timeout,
+                crate::constants::SERVER_PING_TIMEOUT_SECS
+            );
+        }
+
         // Notification: send timeout must be positive.
         if self.notification.send_timeout_ms == 0 {
             bail!("notification.send_timeout_ms must be > 0");
