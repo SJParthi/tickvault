@@ -581,7 +581,7 @@ fn write_derivative_contracts(
         write_single_contract(buffer, contract, snapshot_nanos)?;
 
         // Flush in batches to prevent unbounded memory growth.
-        if (index + 1) % ILP_FLUSH_BATCH_SIZE == 0 {
+        if index.saturating_add(1) % ILP_FLUSH_BATCH_SIZE == 0 {
             sender
                 .flush(buffer)
                 .context("flush derivative_contracts batch")?;
