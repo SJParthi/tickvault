@@ -6,15 +6,14 @@ paths:
 
 # Enforcement Architecture
 
-## Hook Pyramid (layered, not duplicated)
-- **Pre-commit (8 gates):** FULL quality — fmt, clippy, test, banned, O(1), secrets, version pin, test count
-- **Pre-push (7 gates):** VERIFY + security — fmt, clippy, test, banned, test count, audit, deny
-- **Pre-PR (5 gates):** VERIFY state + conventions — uses state file to skip redundant checks
-- **Pre-merge (3 gates):** CI status — blocks --admin, verifies CI passed via API
+## Active Hooks (simplified until AWS deployment)
+- **PreToolUse (Edit|Write):** block-env-files.sh — prevents .env file creation
+- **PostToolUse (Edit|Write):** rustfmt auto-format on .rs files
+- **Pre-PR (5 gates):** branch check, naming, clean tree, quality state, commit format
+- **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage)
 
 ## State File (.last-quality-pass)
-- Written by pre-commit and pre-push on success
-- Read by pre-PR to avoid triple-testing
+- Written by pre-PR quality check on success
 - Format: `<commit-hash> <unix-timestamp> <test-count>`
 - Fresh = same HEAD + age < 5 minutes
 - Gitignored (local machine state)

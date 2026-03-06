@@ -167,13 +167,13 @@
 
 | # | Dimension | Description | Trading Relevance | Status | Enforcement | File/Tool |
 |---|-----------|-------------|-------------------|--------|-------------|-----------|
-| 8.1 | Git history integrity | Conventional commits, branch protection | Regulatory audit trail — what changed, when, why | `ENFORCED` | commit-msg hook, pre-PR gate, branch protection | `scripts/git-hooks/commit-msg` |
-| 8.2 | Change tracking | All changes via PRs with CI passing | Complete traceability from requirement to code | `ENFORCED` | pre-merge-gate.sh (CI status check) | `.claude/hooks/pre-merge-gate.sh` |
+| 8.1 | Git history integrity | Conventional commits, CI commit lint | Regulatory audit trail — what changed, when, why | `ENFORCED` | CI commit-lint job, pre-PR gate | `.github/workflows/ci.yml` |
+| 8.2 | Change tracking | All changes via PRs with CI passing | Complete traceability from requirement to code | `ENFORCED` | CI pipeline on PRs to main | `.github/workflows/ci.yml` |
 | 8.3 | Data retention (SEBI) | 5-year minimum for all trading records | Regulatory requirement — non-compliance = penalties | `DOCUMENTED` | Retention periods defined, QuestDB + S3 lifecycle not configured | `data_integrity.md` |
 | 8.4 | Order audit trail | Every OMS state transition logged and persisted | Complete order lifecycle: New→Pending→Filled→Reconciled | `DOCUMENTED` | statig 0.3.0 in deps, architecture defined, implementation pending | Phase 2 (OMS) |
 | 8.5 | Position reconciliation | Broker vs local position match after every fill | Mismatch = money at risk, halt trading + alert | `CONFIGURED` | Architecture in data_integrity.md, implementation pending | Phase 2 (OMS) |
 | 8.6 | Access control | SSM-only secrets, IAM-based access | Only authorized access to trading credentials | `ENFORCED` | aws-sdk-ssm auth flow, secret-scanner blocks hardcoded | `crates/core/src/auth/` |
-| 8.7 | Branch protection | main requires CI green + PR review | Prevents untested code from reaching production | `CONFIGURED` | GitHub settings + pre-merge-gate, local enforcement | `.claude/hooks/pre-merge-gate.sh` |
+| 8.7 | Branch protection | Deferred until AWS deployment | Will be re-enabled for production | `DEFERRED` | CI runs on PRs to main | `.github/workflows/ci.yml` |
 | 8.8 | Auto-merge governance | Only approved actors (renovate, SJParthi, claude/) | Zero human intervention — CI is sole gatekeeper | `ENFORCED` | auto-merge.yml conditional checks | `.github/workflows/auto-merge.yml` |
 
 ---
@@ -589,12 +589,9 @@ services:
 
 | Enforcement Layer | Files | Gates |
 |-------------------|-------|-------|
-| **Layer 1: Pre-Commit** | `.claude/hooks/pre-commit-gate.sh` | 8 gates (fmt, clippy, test, banned, O(1), secrets, versions, test count) |
-| **Layer 1: Scanners** | `banned-pattern-scanner.sh`, `dedup-latency-scanner.sh`, `secret-scanner.sh` | 25+ banned patterns, 15+ O(n) patterns, 16 secret patterns |
-| **Layer 1: Blockers** | `block-env-files.sh`, `test-count-guard.sh` | .env prevention, ratcheting baseline |
-| **Layer 2: Pre-Push** | `.claude/hooks/pre-push-gate.sh` | 7 gates (fmt, clippy, test, banned, test count, audit, deny) |
-| **Layer 3: Pre-PR** | `.claude/hooks/pre-pr-gate.sh` | 5 gates (branch, naming, clean tree, quality state, commit format) |
-| **Layer 4: Pre-Merge** | `.claude/hooks/pre-merge-gate.sh` | 3 gates (no --admin, PR number, CI status) |
+| **Layer 1: Edit Guard** | `block-env-files.sh` | .env file prevention |
+| **Layer 1: Auto-format** | PostToolUse rustfmt hook | Auto-formats .rs files on save |
+| **Layer 2: Pre-PR** | `.claude/hooks/pre-pr-gate.sh` | 5 gates (branch, naming, clean tree, quality state, commit format) |
 | **Layer 5: CI** | `.github/workflows/ci.yml` | 6 stages (compile, lint, test, security, perf, coverage) |
 | **Layer 5: Security** | `.github/workflows/security-audit.yml` | Weekly CVE + yanked crate scan |
 | **Layer 5: Secrets** | `.github/workflows/secret-scan.yml` | Server-side secret detection |
