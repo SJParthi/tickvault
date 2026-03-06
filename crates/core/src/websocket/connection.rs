@@ -395,8 +395,23 @@ impl WebSocketConnection {
                     }
                     Some(Ok(Message::Ping(data))) => {
                         // Server ping — respond with pong to keep connection alive.
+                        // Timeout prevents hang if TCP buffer is full on a dead connection.
+                        let pong_timeout = Duration::from_secs(self.ws_config.pong_timeout_secs);
                         let mut sink = write.lock().await;
-                        let _ = sink.send(Message::Pong(data)).await;
+                        if time::timeout(pong_timeout, sink.send(Message::Pong(data)))
+                            .await
+                            .is_err()
+                        {
+                            warn!(
+                                connection_id = self.connection_id,
+                                timeout_secs = self.ws_config.pong_timeout_secs,
+                                "Pong send timed out — connection likely dead"
+                            );
+                            return Err(WebSocketError::ReadTimeout {
+                                connection_id: self.connection_id,
+                                timeout_secs: self.ws_config.pong_timeout_secs,
+                            });
+                        }
                     }
                     Some(Ok(Message::Pong(_))) => {
                         // Pong from server (e.g., echo of our pong). Ignore.

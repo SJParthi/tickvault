@@ -440,19 +440,31 @@ async fn main() -> Result<()> {
     info!("shutdown signal received — stopping gracefully");
     notifier.notify(NotificationEvent::ShutdownInitiated);
 
-    // Cancel background tasks
+    // 1. Stop token renewal (no dependencies).
     renewal_handle.abort();
-    if let Some(handle) = processor_handle {
-        handle.abort();
-    }
-    api_handle.abort();
 
-    // Wait briefly for clean shutdown
+    // 2. Abort WebSocket connections. This drops all frame_sender handles,
+    //    which causes the tick processor's recv() to return None and exit
+    //    its loop — triggering the final QuestDB flush.
     for handle in ws_handles {
         handle.abort();
     }
 
-    // Flush pending OpenTelemetry spans before exit (Drop triggers batch flush)
+    // 3. Wait for the tick processor to finish its final flush (bounded).
+    if let Some(handle) = processor_handle {
+        let shutdown_timeout = std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+        );
+        match tokio::time::timeout(shutdown_timeout, handle).await {
+            Ok(_) => info!("tick processor shut down gracefully"),
+            Err(_) => warn!("tick processor shutdown timed out — aborting"),
+        }
+    }
+
+    // 4. Stop API server.
+    api_handle.abort();
+
+    // 5. Flush pending OpenTelemetry spans before exit (Drop triggers batch flush).
     drop(otel_provider);
 
     info!("dhan-live-trader stopped");

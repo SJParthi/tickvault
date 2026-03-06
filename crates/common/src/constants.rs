@@ -784,6 +784,14 @@ pub const STOCK_CONTRACTS_PER_EXPIRY: usize =
     (1 + STOCK_ATM_STRIKES_ABOVE + STOCK_ATM_STRIKES_BELOW) * 2 + 1;
 
 // ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/// Maximum time to wait for the tick processor to complete its final QuestDB
+/// flush during graceful shutdown. After this, the processor is force-aborted.
+pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+// ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
 
