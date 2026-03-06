@@ -681,6 +681,8 @@ impl rkyv::with::ArchiveWith<Duration> for DurationAsMillis {
     type Resolver = ();
 
     fn resolve_with(field: &Duration, _resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        #[allow(clippy::arithmetic_side_effects)]
+        // APPROVED: Duration::as_millis() truncation u128→u64 is safe — won't overflow until year 584M+
         let millis = field.as_millis() as u64;
         let value = rkyv::rend::u64_le::from_native(millis);
         rkyv::Archive::resolve(&value, (), out);

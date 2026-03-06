@@ -63,7 +63,7 @@ pub async fn run_tick_processor(
 
     while let Some(raw_frame) = frame_receiver.recv().await {
         let tick_start = Instant::now();
-        frames_processed += 1;
+        frames_processed = frames_processed.saturating_add(1);
         m_frames.increment(1);
         let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -71,7 +71,7 @@ pub async fn run_tick_processor(
         let parsed = match dispatch_frame(&raw_frame, received_at_nanos) {
             Ok(frame) => frame,
             Err(err) => {
-                parse_errors += 1;
+                parse_errors = parse_errors.saturating_add(1);
                 m_parse_errors.increment(1);
                 if parse_errors <= 100 {
                     warn!(
@@ -88,7 +88,7 @@ pub async fn run_tick_processor(
         // Process based on frame type
         match parsed {
             ParsedFrame::Tick(tick) => {
-                ticks_processed += 1;
+                ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
                 // Filter junk ticks: initialization/heartbeat frames from Dhan
@@ -97,7 +97,7 @@ pub async fn run_tick_processor(
                 if tick.last_traded_price <= 0.0
                     || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
                 {
-                    junk_ticks_filtered += 1;
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
                         debug!(
@@ -115,7 +115,7 @@ pub async fn run_tick_processor(
                 if let Some(ref mut writer) = tick_writer
                     && let Err(err) = writer.append_tick(&tick)
                 {
-                    storage_errors += 1;
+                    storage_errors = storage_errors.saturating_add(1);
                     m_storage_errors.increment(1);
                     if storage_errors <= 100 {
                         warn!(
@@ -134,7 +134,7 @@ pub async fn run_tick_processor(
                 );
             }
             ParsedFrame::TickWithDepth(tick, depth) => {
-                ticks_processed += 1;
+                ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
                 // Depth data is ALWAYS persisted — Market Depth standalone packets
@@ -149,7 +149,7 @@ pub async fn run_tick_processor(
                     if let Some(ref mut writer) = tick_writer
                         && let Err(err) = writer.append_tick(&tick)
                     {
-                        storage_errors += 1;
+                        storage_errors = storage_errors.saturating_add(1);
                         m_storage_errors.increment(1);
                         if storage_errors <= 100 {
                             warn!(
@@ -162,7 +162,7 @@ pub async fn run_tick_processor(
                     }
                 } else if tick.last_traded_price <= 0.0 {
                     // LTP invalid — skip depth too (truly junk frame)
-                    junk_ticks_filtered += 1;
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
                         debug!(
@@ -188,7 +188,7 @@ pub async fn run_tick_processor(
                         &depth,
                     )
                 {
-                    storage_errors += 1;
+                    storage_errors = storage_errors.saturating_add(1);
                     m_storage_errors.increment(1);
                     if storage_errors <= 100 {
                         warn!(
@@ -236,7 +236,7 @@ pub async fn run_tick_processor(
                         received_at_nanos,
                     )
                 {
-                    storage_errors += 1;
+                    storage_errors = storage_errors.saturating_add(1);
                     m_storage_errors.increment(1);
                     if storage_errors <= 100 {
                         warn!(
@@ -313,6 +313,7 @@ pub async fn run_tick_processor(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic (casts, indexing) is safe
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::{

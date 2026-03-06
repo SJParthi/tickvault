@@ -12,6 +12,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — one `from_le_bytes` read + enum match.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by DISCONNECT_PACKET_SIZE check
 pub fn parse_disconnect_packet(
     raw: &[u8],
     _header: &PacketHeader,
@@ -29,6 +30,7 @@ pub fn parse_disconnect_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::{

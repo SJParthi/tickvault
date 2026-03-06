@@ -985,13 +985,16 @@ mod tests {
                     );
                     let _ =
                         tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut socket).await;
+                    // Allow TCP stack to drain the 1 MB send buffer before closing
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
                 });
             }
         });
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
         let url = format!("http://{}/test", addr);
@@ -1033,6 +1036,8 @@ mod tests {
                     );
                     let _ =
                         tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut socket).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
                 });
             }

@@ -13,6 +13,7 @@ use dhan_live_trader_common::tick_types::ParsedTick;
 use super::types::{PacketHeader, ParseError};
 
 /// Helper: reads a little-endian f32 from a byte slice at the given offset.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes([
@@ -24,6 +25,7 @@ fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
 }
 
 /// Helper: reads a little-endian u32 from a byte slice at the given offset.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
@@ -40,6 +42,7 @@ fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
 ///
 /// # Performance
 /// O(1) — eleven `from_le_bytes` reads.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by QUOTE_PACKET_SIZE check
 pub fn parse_quote_packet(
     raw: &[u8],
     header: &PacketHeader,
@@ -84,6 +87,7 @@ pub fn parse_quote_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;

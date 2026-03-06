@@ -19,6 +19,7 @@ pub struct PreviousCloseData {
 ///
 /// # Performance
 /// O(1) — two `from_le_bytes` reads.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by PREVIOUS_CLOSE_PACKET_SIZE check
 pub fn parse_previous_close_packet(
     raw: &[u8],
     _header: &PacketHeader,
@@ -50,6 +51,7 @@ pub fn parse_previous_close_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets
 mod tests {
     use super::*;
 

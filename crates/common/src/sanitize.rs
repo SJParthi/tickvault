@@ -107,17 +107,17 @@ fn redact_param_value(input: &str, key: &str) -> String {
     let mut search_from = 0;
 
     while let Some(pos) = input[search_from..].find(key) {
-        let abs_pos = search_from + pos;
+        let abs_pos = search_from.saturating_add(pos);
         // Copy everything before this match
         result.push_str(&input[search_from..abs_pos]);
         result.push_str(key);
         result.push_str("[REDACTED]");
 
         // Skip past the value using char-aware scanning
-        let value_start = abs_pos + key.len();
+        let value_start = abs_pos.saturating_add(key.len());
         let value_end = input[value_start..]
             .find(|c: char| c == '&' || c.is_whitespace() || c == ')')
-            .map(|i| value_start + i)
+            .map(|i| value_start.saturating_add(i))
             .unwrap_or(input.len());
 
         search_from = value_end;
