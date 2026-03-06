@@ -22,6 +22,7 @@ use dhan_live_trader_common::instrument_types::{ArchivedFnoUniverse, FnoUniverse
 const CACHE_MAGIC: &[u8; 4] = b"RKYV";
 
 /// Cache format version. Bump when rkyv version or type layout changes.
+/// V2: header padded to 8 bytes for rkyv alignment (was 5 bytes in V1).
 const CACHE_VERSION: u8 = 2;
 
 /// Total header size: 8 bytes (4 magic + 1 version + 3 padding).
@@ -370,7 +371,7 @@ mod tests {
         let path = dir.join(BINARY_CACHE_FILENAME);
         let mut data = vec![0u8; 300];
         data[..4].copy_from_slice(CACHE_MAGIC);
-        data[4] = CACHE_VERSION + 1; // wrong version
+        data[4] = CACHE_VERSION.wrapping_add(1); // wrong version
         std::fs::write(&path, &data).unwrap();
 
         let result = read_binary_cache(dir.to_str().unwrap());
@@ -438,8 +439,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = dir.join(BINARY_CACHE_FILENAME);
-        // 100 bytes is below MIN_RKYV_CACHE_BYTES (256)
-        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        // 16 bytes is below MIN_RKYV_CACHE_BYTES (HEADER_LEN + 16 = 24)
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
         assert!(result.is_err(), "too-small rkyv file should return Err");

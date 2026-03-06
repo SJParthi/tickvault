@@ -180,8 +180,7 @@ jobs:
   security-and-audit:
     name: "Security & Audit"
     needs: build-and-verify
-    # Skip on main — same code already passed on develop
-    if: github.base_ref == 'develop' || github.ref == 'refs/heads/develop'
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -220,8 +219,7 @@ jobs:
   coverage-and-perf:
     name: "Coverage & Perf"
     needs: build-and-verify
-    # Skip on main — same code already passed on develop
-    if: github.base_ref == 'develop' || github.ref == 'refs/heads/develop'
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
