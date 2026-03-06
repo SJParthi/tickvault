@@ -57,8 +57,35 @@ if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)" -gt 51
   tail -50 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
 
+# ── Lock awareness ─────────────────────────────────────────────
+# Avoid pushing while user's git push is in progress
+PUSH_LOCK="$CWD/.claude/hooks/.push-in-progress"
+
+is_push_safe() {
+  # Check git index lock (another git operation in progress)
+  if [ -f "$CWD/.git/index.lock" ]; then
+    return 1
+  fi
+  # Check if user push is in progress (set by pre-push-gate)
+  if [ -f "$PUSH_LOCK" ]; then
+    local lock_age
+    lock_age=$(( $(date +%s) - $(stat -c %Y "$PUSH_LOCK" 2>/dev/null || echo 0) ))
+    # Stale lock (>120s) — ignore it
+    if [ "$lock_age" -lt 120 ]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # ── Push function ───────────────────────────────────────────────
 push_to_remote() {
+  # Skip if user push is active to avoid contention
+  if ! is_push_safe; then
+    log "SKIP-PUSH: User push or git op in progress, deferring to next cycle"
+    return
+  fi
+
   local push_ok=0
   local retries=2
   local delay=5

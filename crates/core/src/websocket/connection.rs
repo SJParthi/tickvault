@@ -505,6 +505,7 @@ mod tests {
             reconnect_max_delay_ms: 30000,
             reconnect_max_attempts: 10,
             subscription_batch_size: 100,
+            connection_stagger_ms: 0,
         }
     }
 
@@ -1674,6 +1675,7 @@ mod tests {
             reconnect_max_delay_ms: 5000,
             reconnect_max_attempts: 7,
             subscription_batch_size: 50,
+            connection_stagger_ms: 0,
         };
         let instruments: Vec<_> = (0..250)
             .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 3000 + i))
@@ -1906,6 +1908,7 @@ mod tests {
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 subscription_batch_size: 100,
+                connection_stagger_ms: 0,
             },
             vec![],
             FeedMode::Ticker,
