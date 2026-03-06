@@ -1,7 +1,7 @@
 # =============================================================================
 # dhan-live-trader — CI Pipeline (Optimized: 3 Jobs)
 # =============================================================================
-# Runs on every push to main/develop and every PR — but ONLY for code changes.
+# Runs on every push to main and every PR — but ONLY for code changes.
 # All checks must pass. Failure = build is RED. No merging.
 #
 # Cost optimization: Heavy jobs (Build, Security, Coverage) SKIP on draft PRs.
@@ -27,7 +27,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - 'crates/**'
       - 'Cargo.toml'
@@ -36,7 +36,7 @@ on:
       - 'deny.toml'
       - '.github/workflows/ci.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/**'

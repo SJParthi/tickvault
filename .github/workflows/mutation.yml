@@ -16,7 +16,7 @@ on:
     - cron: '0 3 * * 1'  # Weekly Monday 3 AM UTC — catches untested code without burning daily minutes
   workflow_dispatch: # Manual trigger for on-demand mutation testing
   pull_request:
-    branches: [main]    # Only gate main merges, not develop (saves ~50% runs)
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/core/**/*.rs'

@@ -21,11 +21,10 @@ Every change must pass all three. No exceptions.
 ## Branch Naming
 
 ```
-main                        # production
-develop                     # integration
+main                        # single branch (until AWS deployment)
 feature/<phase>/<name>      # new work
 fix/<description>           # bug fixes
-hotfix/<description>        # urgent production fixes
+claude/<id>                 # Claude Code sessions
 ```
 
 ## Commit Messages
@@ -56,7 +55,7 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 /quality
 ```
 
-The pre-commit hook enforces 10 gates. The pre-push hook enforces 8 gates. CI enforces 7 stages. All must pass.
+CI enforces checks on PRs to main. All must pass.
 
 ## Code Review Checklist
 

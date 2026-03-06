@@ -4,7 +4,7 @@
 # Exit 2 = BLOCK PR creation.
 #
 # Gates:
-#   1. Branch check (not main/develop)
+#   1. Branch check (not main)
 #   2. Branch naming convention
 #   3. Clean working tree
 #   4. Quality state check (state file or full re-run)
@@ -51,21 +51,9 @@ fi
 BASE_FROM_CMD_G1=$(echo "$CMD_FLAGS" | grep -oE '\-\-base[[:space:]]+([a-zA-Z0-9_/-]+)' | head -1 | awk '{print $2}')
 
 # ─────────────────────────────────────────────
-# EARLY EXIT: Allow develop→main release PRs
+# GATE 1: Branch check — can't PR from main
 # ─────────────────────────────────────────────
-if [ "$HEAD_BRANCH" = "develop" ] && [ "$BASE_FROM_CMD_G1" = "main" ]; then
-  echo "  INFO: Release PR (develop→main) — skipping branch gates." >&2
-  echo "" >&2
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  RELEASE PR ALLOWED — develop→main           ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-  exit 0
-fi
-
-# ─────────────────────────────────────────────
-# GATE 1: Branch check — can't PR from main/develop
-# ─────────────────────────────────────────────
-if [ "$HEAD_BRANCH" = "main" ] || [ "$HEAD_BRANCH" = "master" ] || [ "$HEAD_BRANCH" = "develop" ]; then
+if [ "$HEAD_BRANCH" = "main" ] || [ "$HEAD_BRANCH" = "master" ]; then
   echo "  FAIL: Cannot create PR from '$HEAD_BRANCH'. Use a feature branch." >&2
   FAILED=1
 else
@@ -193,9 +181,8 @@ fi
 # ─────────────────────────────────────────────
 echo "  Checking commit message format..." >&2
 
-# Determine base branch from the PR command flags (--base flag) or default to develop
-# Re-extract CMD_FLAGS in case command was modified
-BASE_BRANCH="develop"
+# Determine base branch from the PR command flags (--base flag) or default to main
+BASE_BRANCH="main"
 BASE_FROM_CMD=$(echo "$CMD_FLAGS" | grep -oE '\-\-base[[:space:]]+[a-zA-Z0-9_/-]+' | head -1 | awk '{print $2}')
 if [ -n "$BASE_FROM_CMD" ]; then
   BASE_BRANCH="$BASE_FROM_CMD"

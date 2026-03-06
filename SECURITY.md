@@ -43,5 +43,4 @@ This project follows strict security practices defined in `CLAUDE.md`:
 | Version | Supported |
 |---------|-----------|
 | Latest `main` | Yes |
-| `develop` | Yes (pre-release) |
 | Older tags | No |
