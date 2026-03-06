@@ -14,6 +14,7 @@ name: Auto-Merge
 on:
   pull_request:
     branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: write
@@ -28,12 +29,14 @@ jobs:
     name: "Enable Auto-Merge"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only auto-merge for trusted actors
+    # Only auto-merge for trusted actors, skip draft PRs
     if: >-
+      github.event.pull_request.draft != true && (
       github.actor == 'dependabot[bot]' ||
       github.actor == 'renovate[bot]' ||
       github.actor == 'SJParthi' ||
       startsWith(github.head_ref, 'claude/')
+      )
     steps:
       - name: Enable auto-merge (squash)
         run: gh pr merge --auto --squash "$PR_URL"
