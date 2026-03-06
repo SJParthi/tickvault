@@ -409,10 +409,10 @@ impl WebSocketConnection {
                         // Forward raw binary frame to downstream with timeout.
                         // If the tick processor is blocked, we drop the frame
                         // rather than blocking the entire WS read loop.
-                        let send_timeout = Duration::from_secs(
+                        const SEND_TIMEOUT: Duration = Duration::from_secs(
                             dhan_live_trader_common::constants::FRAME_SEND_TIMEOUT_SECS,
                         );
-                        match time::timeout(send_timeout, self.frame_sender.send(data)).await {
+                        match time::timeout(SEND_TIMEOUT, self.frame_sender.send(data)).await {
                             Ok(Ok(())) => {} // sent successfully
                             Ok(Err(_)) => {
                                 warn!(

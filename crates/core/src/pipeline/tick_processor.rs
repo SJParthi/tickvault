@@ -25,6 +25,19 @@ use dhan_live_trader_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, build_previous_close_row,
 };
 
+use dhan_live_trader_common::tick_types::MarketDepthLevel;
+
+/// Returns `true` if all 5 depth levels have finite bid/ask prices.
+///
+/// # Performance
+/// O(1) — exactly 10 `is_finite()` checks (single CPU instruction each).
+#[inline(always)]
+fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
+    depth
+        .iter()
+        .all(|level| level.bid_price.is_finite() && level.ask_price.is_finite())
+}
+
 // ---------------------------------------------------------------------------
 // O(1) Tick Deduplication Ring Buffer
 // ---------------------------------------------------------------------------
@@ -287,6 +300,13 @@ pub async fn run_tick_processor(
                 // else: LTP valid but no exchange_timestamp (Market Depth code 3)
                 // — skip tick persistence, still persist depth below
 
+                // Guard: skip depth with NaN/Infinity bid/ask prices
+                if !depth_prices_are_finite(&depth) {
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
+                    m_junk_filtered.increment(1);
+                    continue;
+                }
+
                 // Persist 5-level depth to QuestDB (separate table)
                 m_depth_snapshots.increment(1);
                 if let Some(ref mut dw) = depth_writer
@@ -333,6 +353,13 @@ pub async fn run_tick_processor(
                 previous_oi,
             } => {
                 m_prev_close_updates.increment(1);
+
+                // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame)
+                if !previous_close.is_finite() {
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
+                    m_junk_filtered.increment(1);
+                    continue;
+                }
 
                 // Persist previous close to QuestDB
                 if let Some(ref mut writer) = tick_writer
@@ -1832,6 +1859,86 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth NaN/Infinity guard tests
+    // -----------------------------------------------------------------------
+
+    /// Build a Market Depth frame with a NaN bid_price in level 0.
+    fn make_market_depth_frame_with_nan_bid(security_id: u32, ltp: f32) -> Vec<u8> {
+        let mut buf = make_market_depth_frame(security_id, ltp);
+        // Level 0 bid_price at MARKET_DEPTH_OFFSET_DEPTH_START + 12 = 24
+        buf[24..28].copy_from_slice(&f32::NAN.to_le_bytes());
+        buf
+    }
+
+    /// Build a Market Depth frame with an Infinity ask_price in level 0.
+    fn make_market_depth_frame_with_inf_ask(security_id: u32, ltp: f32) -> Vec<u8> {
+        let mut buf = make_market_depth_frame(security_id, ltp);
+        // Level 0 ask_price at MARKET_DEPTH_OFFSET_DEPTH_START + 16 = 28
+        buf[28..32].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_depth_nan_bid_price_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame_with_nan_bid(13, 24500.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_depth_inf_ask_price_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame_with_inf_ask(13, 24500.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // PreviousClose NaN/Infinity guard tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_nan_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut buf = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        buf[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(buf)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_infinity_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut buf = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        buf[8..12].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(buf)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
     }

@@ -503,4 +503,27 @@ mod tests {
         assert!((pc - 0.0).abs() < f32::EPSILON);
         assert_eq!(poi, 0);
     }
+
+    #[test]
+    fn test_dispatch_response_code_zero_is_unknown() {
+        let buf = make_minimal_packet(0, 8);
+        let err = dispatch_frame(&buf, 0).unwrap_err();
+        assert!(matches!(err, ParseError::UnknownResponseCode(0)));
+    }
+
+    #[test]
+    fn test_dispatch_zero_length_frame() {
+        let (expected, actual) = unwrap_insufficient_bytes(dispatch_frame(&[], 0).unwrap_err());
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 0);
+    }
+
+    #[test]
+    fn test_dispatch_oversized_frame_parses_normally() {
+        // Extra bytes beyond packet size are silently ignored
+        let mut buf = make_minimal_packet(RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE);
+        buf.extend_from_slice(&[0xFF; 500]);
+        let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.security_id, 42);
+    }
 }
