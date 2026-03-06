@@ -46,7 +46,7 @@ pub fn write_binary_cache(universe: &FnoUniverse, cache_dir: &str) -> Result<()>
     }
 
     // Build payload: 8-byte aligned header + rkyv bytes
-    let mut payload = Vec::with_capacity(HEADER_LEN + rkyv_bytes.len());
+    let mut payload = Vec::with_capacity(HEADER_LEN.saturating_add(rkyv_bytes.len()));
     payload.extend_from_slice(CACHE_MAGIC);
     payload.push(CACHE_VERSION);
     payload.extend_from_slice(&[0u8; HEADER_LEN - CACHE_MAGIC.len() - 1]); // padding
@@ -149,7 +149,7 @@ pub struct MappedUniverse {
 
 /// Minimum valid rkyv cache file size (header + smallest possible rkyv payload).
 /// An empty FnoUniverse serializes to ~136 bytes + 8 header = 144 bytes.
-const MIN_RKYV_CACHE_BYTES: u64 = HEADER_LEN as u64 + 16;
+const MIN_RKYV_CACHE_BYTES: u64 = (HEADER_LEN as u64).saturating_add(16);
 
 impl MappedUniverse {
     /// Load and validate the rkyv binary cache. Sub-0.5ms.

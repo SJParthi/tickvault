@@ -115,12 +115,12 @@ pub fn parse_instrument_csv(csv_text: &str) -> Result<(usize, Vec<ParsedInstrume
     let mut skipped_parse_error_count: usize = 0;
 
     for result in reader.records() {
-        total_row_count += 1;
+        total_row_count = total_row_count.saturating_add(1);
         let record = match result {
             Ok(record) => record,
             Err(error) => {
                 warn!(row = total_row_count, %error, "skipping malformed CSV row");
-                skipped_parse_error_count += 1;
+                skipped_parse_error_count = skipped_parse_error_count.saturating_add(1);
                 continue;
             }
         };
@@ -130,7 +130,7 @@ pub fn parse_instrument_csv(csv_text: &str) -> Result<(usize, Vec<ParsedInstrume
         let segment_str = record.get(indices.segment).unwrap_or("");
 
         if !should_include_row(exchange_str, segment_str) {
-            skipped_filter_count += 1;
+            skipped_filter_count = skipped_filter_count.saturating_add(1);
             continue;
         }
 
@@ -142,7 +142,7 @@ pub fn parse_instrument_csv(csv_text: &str) -> Result<(usize, Vec<ParsedInstrume
                     %error,
                     "skipping row due to parse error"
                 );
-                skipped_parse_error_count += 1;
+                skipped_parse_error_count = skipped_parse_error_count.saturating_add(1);
             }
         }
     }
@@ -360,6 +360,7 @@ fn parse_expiry_date(date_str: &str) -> Option<NaiveDate> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
 

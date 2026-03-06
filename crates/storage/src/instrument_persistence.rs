@@ -697,6 +697,7 @@ fn write_single_subscribed_index(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
     use chrono::{FixedOffset, NaiveDate};

@@ -485,6 +485,9 @@ fn build_depth_rows(
     let received_nanos = TimestampNanos::new(received_at_nanos);
 
     for (i, level) in depth.iter().enumerate() {
+        // APPROVED: depth is [_; 5], so i is 0..4 — always fits i64
+        #[allow(clippy::arithmetic_side_effects)]
+        let depth_level = (i as i64).saturating_add(1);
         buffer
             .table(QUESTDB_TABLE_MARKET_DEPTH)
             .context("depth table name")?
@@ -492,7 +495,7 @@ fn build_depth_rows(
             .context("depth segment")?
             .column_i64("security_id", i64::from(security_id))
             .context("depth security_id")?
-            .column_i64("level", (i as i64).saturating_add(1))
+            .column_i64("level", depth_level)
             .context("depth level")?
             .column_i64("bid_qty", i64::from(level.bid_quantity))
             .context("depth bid_qty")?
@@ -691,6 +694,7 @@ fn current_time_ms() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
     use questdb::ingress::ProtocolVersion;

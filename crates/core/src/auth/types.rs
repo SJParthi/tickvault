@@ -169,7 +169,8 @@ impl TokenState {
     /// Creates a new `TokenState` from a Dhan auth response (renewal/legacy).
     pub fn from_response(response: &DhanAuthResponseData) -> Self {
         let now_ist = Utc::now().with_timezone(&ist_offset());
-        let expires_at = now_ist + Duration::seconds(i64::from(response.expires_in));
+        let delta = Duration::seconds(i64::from(response.expires_in));
+        let expires_at = now_ist.checked_add_signed(delta).unwrap_or(now_ist);
 
         Self {
             access_token: SecretString::from(response.access_token.clone()),
@@ -187,7 +188,9 @@ impl TokenState {
 
         let expires_at = parse_expiry_time(&response.expiry_time).unwrap_or_else(|| {
             // Default: 24 hours from now (Dhan standard token validity)
-            now_ist + Duration::hours(24)
+            now_ist
+                .checked_add_signed(Duration::hours(24))
+                .unwrap_or(now_ist)
         });
 
         Self {
@@ -230,7 +233,10 @@ impl TokenState {
         #[allow(clippy::cast_possible_wrap)]
         // APPROVED: safe cast — clamped to 8760 before widening
         let hours = refresh_before_expiry_hours.min(8760) as i64;
-        let refresh_threshold = self.expires_at - Duration::hours(hours);
+        let refresh_threshold = self
+            .expires_at
+            .checked_sub_signed(Duration::hours(hours))
+            .unwrap_or(self.expires_at);
         now_ist >= refresh_threshold
     }
 
@@ -242,11 +248,15 @@ impl TokenState {
         #[allow(clippy::cast_possible_wrap)]
         // APPROVED: safe cast — clamped to 8760 before widening
         let hours = refresh_before_expiry_hours.min(8760) as i64;
-        let refresh_at = self.expires_at - Duration::hours(hours);
+        let refresh_at = self
+            .expires_at
+            .checked_sub_signed(Duration::hours(hours))
+            .unwrap_or(self.expires_at);
         if now_ist >= refresh_at {
             std::time::Duration::ZERO
         } else {
-            (refresh_at - now_ist)
+            refresh_at
+                .signed_duration_since(now_ist)
                 .to_std()
                 .unwrap_or(std::time::Duration::ZERO)
         }
@@ -255,9 +265,10 @@ impl TokenState {
     /// Returns the token age in hours (for logging only).
     ///
     /// Uses seconds-based precision. Clamps negative durations to zero.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: logging-only cold path, f64 division safe
     pub fn age_hours(&self) -> f64 {
         let now_ist = Utc::now().with_timezone(&ist_offset());
-        let age = now_ist - self.issued_at;
+        let age = now_ist.signed_duration_since(self.issued_at);
         let seconds = age.num_seconds().max(0);
         seconds as f64 / 3600.0
     }
@@ -361,6 +372,7 @@ impl fmt::Debug for DhanAuthResponseData {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use secrecy::{ExposeSecret, SecretString};
 

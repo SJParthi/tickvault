@@ -410,12 +410,14 @@ fn mask_phone(phone: &str) -> String {
     }
     let keep_prefix = 3;
     let keep_suffix = 5;
-    let mask_len = phone.len().saturating_sub(keep_prefix + keep_suffix);
+    let mask_len = phone
+        .len()
+        .saturating_sub(keep_prefix.saturating_add(keep_suffix));
     format!(
         "{}{}{}",
         &phone[..keep_prefix],
         "X".repeat(mask_len),
-        &phone[phone.len() - keep_suffix..]
+        &phone[phone.len().saturating_sub(keep_suffix)..]
     )
 }
 
@@ -424,6 +426,7 @@ fn mask_phone(phone: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
 
