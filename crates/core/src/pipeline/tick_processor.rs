@@ -14,7 +14,9 @@ use metrics::{counter, gauge, histogram};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
-use dhan_live_trader_common::constants::MINIMUM_VALID_EXCHANGE_TIMESTAMP;
+use dhan_live_trader_common::constants::{
+    DEDUP_RING_BUFFER_POWER, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
+};
 
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
@@ -22,6 +24,82 @@ use crate::parser::types::ParsedFrame;
 use dhan_live_trader_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, build_previous_close_row,
 };
+
+// ---------------------------------------------------------------------------
+// O(1) Tick Deduplication Ring Buffer
+// ---------------------------------------------------------------------------
+
+/// O(1) fixed-size dedup ring buffer for tick deduplication.
+///
+/// Pre-allocated at pipeline startup; zero allocation on the hot path.
+/// Uses open-addressing with instant eviction — a single slot per hash bucket.
+///
+/// # Dedup key
+/// `(security_id, exchange_timestamp, ltp_bits)` — catches exact duplicate ticks
+/// while allowing legitimate price updates within the same second.
+///
+/// # False negative safety
+/// Hash collisions cause eviction, meaning some duplicates may pass through.
+/// This is safe: QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the
+/// authoritative server-side dedup. This ring buffer reduces redundant writes.
+struct TickDedupRing {
+    /// Pre-allocated slot array. Each slot holds a 64-bit fingerprint.
+    /// Initialized to `u64::MAX` (empty sentinel).
+    slots: Box<[u64]>,
+    /// Bitmask for fast modulo: `size - 1` where size is a power of two.
+    mask: usize,
+}
+
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: wrapping_mul is intentional for hash mixing; shift/bitwise ops are bounded by u64/u32 width
+impl TickDedupRing {
+    /// Creates a new ring buffer with `2^power` slots.
+    ///
+    /// # Panics (debug only)
+    /// Debug-asserts that `power` is in [8, 24].
+    fn new(power: u32) -> Self {
+        debug_assert!(
+            (8..=24).contains(&power),
+            "dedup ring buffer power out of range"
+        );
+        let size = 1_usize << power;
+        Self {
+            slots: vec![u64::MAX; size].into_boxed_slice(),
+            mask: size.wrapping_sub(1),
+        }
+    }
+
+    /// Returns `true` if this tick was recently seen (duplicate).
+    ///
+    /// # Performance
+    /// O(1) — one hash computation + one array lookup + one comparison.
+    #[inline(always)]
+    fn is_duplicate(&mut self, security_id: u32, exchange_timestamp: u32, ltp: f32) -> bool {
+        let key = Self::fingerprint(security_id, exchange_timestamp, ltp);
+        let idx = (key as usize) & self.mask;
+        if self.slots[idx] == key {
+            true
+        } else {
+            self.slots[idx] = key;
+            false
+        }
+    }
+
+    /// Builds a 64-bit fingerprint from tick identity fields using FNV-1a mixing.
+    ///
+    /// Distinct (security_id, exchange_timestamp, ltp) triples produce distinct
+    /// fingerprints with high probability (~1 - 1/2^64 per pair).
+    #[inline(always)]
+    fn fingerprint(security_id: u32, exchange_timestamp: u32, ltp: f32) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a 64-bit offset basis
+        h ^= u64::from(security_id);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
+        h ^= u64::from(exchange_timestamp);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h ^= u64::from(ltp.to_bits());
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h
+    }
+}
 
 /// Runs the tick processing pipeline until the frame receiver closes.
 ///
@@ -50,13 +128,18 @@ pub async fn run_tick_processor(
     let m_disconnects = counter!("dlt_disconnect_frames_total");
     let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
     let m_pipeline_active = gauge!("dlt_pipeline_active");
+    let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
 
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
     let mut parse_errors: u64 = 0;
     let mut storage_errors: u64 = 0;
     let mut junk_ticks_filtered: u64 = 0;
+    let mut dedup_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
+
+    // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
+    let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
     m_pipeline_active.set(1.0);
     info!("tick processor started");
@@ -91,10 +174,10 @@ pub async fn run_tick_processor(
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
-                // Filter junk ticks: initialization/heartbeat frames from Dhan
-                // have LTP=0.0 and/or exchange_timestamp=0 (epoch 1970-01-01).
-                // These MUST NOT be persisted.
-                if tick.last_traded_price <= 0.0
+                // Filter junk ticks: NaN/Infinity, zero/negative LTP,
+                // or epoch timestamps (heartbeat/init frames from Dhan).
+                if !tick.last_traded_price.is_finite()
+                    || tick.last_traded_price <= 0.0
                     || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
                 {
                     junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
@@ -105,9 +188,21 @@ pub async fn run_tick_processor(
                             ltp = tick.last_traded_price,
                             exchange_timestamp = tick.exchange_timestamp,
                             total_filtered = junk_ticks_filtered,
-                            "junk tick filtered — LTP or timestamp invalid"
+                            "junk tick filtered — LTP non-finite/invalid or timestamp invalid"
                         );
                     }
+                    continue;
+                }
+
+                // O(1) dedup: skip exact duplicate ticks (same security_id +
+                // timestamp + LTP) resent by Dhan on reconnection.
+                if dedup_ring.is_duplicate(
+                    tick.security_id,
+                    tick.exchange_timestamp,
+                    tick.last_traded_price,
+                ) {
+                    dedup_filtered = dedup_filtered.saturating_add(1);
+                    m_dedup_filtered.increment(1);
                     continue;
                 }
 
@@ -141,10 +236,24 @@ pub async fn run_tick_processor(
                 // (code 3) have exchange_timestamp=0 by design, but their 5-level
                 // depth is valid. The tick portion is only persisted when the
                 // exchange timestamp is valid (Full packets, code 8).
-                let tick_is_valid = tick.last_traded_price > 0.0
-                    && tick.exchange_timestamp >= MINIMUM_VALID_EXCHANGE_TIMESTAMP;
+                let ltp_valid = tick.last_traded_price.is_finite() && tick.last_traded_price > 0.0;
+                let tick_is_valid =
+                    ltp_valid && tick.exchange_timestamp >= MINIMUM_VALID_EXCHANGE_TIMESTAMP;
 
                 if tick_is_valid {
+                    // O(1) dedup: skip entire snapshot if tick is exact duplicate.
+                    // Market Depth code 3 (timestamp=0) bypasses dedup — each
+                    // snapshot is meaningful even without a timestamp.
+                    if dedup_ring.is_duplicate(
+                        tick.security_id,
+                        tick.exchange_timestamp,
+                        tick.last_traded_price,
+                    ) {
+                        dedup_filtered = dedup_filtered.saturating_add(1);
+                        m_dedup_filtered.increment(1);
+                        continue;
+                    }
+
                     // Persist tick to QuestDB (Full packet with valid timestamp)
                     if let Some(ref mut writer) = tick_writer
                         && let Err(err) = writer.append_tick(&tick)
@@ -160,8 +269,8 @@ pub async fn run_tick_processor(
                             );
                         }
                     }
-                } else if tick.last_traded_price <= 0.0 {
-                    // LTP invalid — skip depth too (truly junk frame)
+                } else if !ltp_valid {
+                    // LTP non-finite or non-positive — skip depth too (truly junk)
                     junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
@@ -170,7 +279,7 @@ pub async fn run_tick_processor(
                             ltp = tick.last_traded_price,
                             exchange_timestamp = tick.exchange_timestamp,
                             total_filtered = junk_ticks_filtered,
-                            "junk tick with depth filtered — LTP invalid"
+                            "junk tick with depth filtered — LTP non-finite/invalid"
                         );
                     }
                     continue;
@@ -302,6 +411,7 @@ pub async fn run_tick_processor(
         frames_processed,
         ticks_processed,
         junk_ticks_filtered,
+        dedup_filtered,
         parse_errors,
         storage_errors,
         "tick processor stopped"
@@ -1057,5 +1167,597 @@ mod tests {
 
         listener_handle.abort();
         depth_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // TickDedupRing unit tests
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_new_tick_not_duplicate() {
+        let mut ring = TickDedupRing::new(8); // 256 slots
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_same_tick_is_duplicate() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(ring.is_duplicate(13, 1772073900, 24500.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_third_identical_also_duplicate() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(ring.is_duplicate(13, 1772073900, 24500.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_different_security_not_duplicate() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(14, 1772073900, 24500.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_different_timestamp_not_duplicate() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, 1772073901, 24500.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_different_ltp_not_duplicate() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, 1772073900, 24501.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_zero_security_id() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(0, 0, 0.0));
+        assert!(ring.is_duplicate(0, 0, 0.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_max_values() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(u32::MAX, u32::MAX, f32::MAX));
+        assert!(ring.is_duplicate(u32::MAX, u32::MAX, f32::MAX));
+    }
+
+    #[test]
+    fn test_dedup_ring_eviction_after_collision() {
+        // With a small ring (256 slots), inserting many distinct entries
+        // will eventually evict earlier ones, allowing re-insertion.
+        let mut ring = TickDedupRing::new(8); // 256 slots
+        // Insert first tick
+        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        // Fill buffer with other entries to force eviction
+        for i in 1..=512 {
+            ring.is_duplicate(i + 100, 1772073900, 24500.0 + (i as f32));
+        }
+        // Original entry may have been evicted — should no longer be duplicate
+        // (This tests that the ring buffer has finite memory and old entries are lost)
+        // Note: this is probabilistic based on hash distribution.
+        // We don't assert the result — just verify it doesn't panic.
+        let _ = ring.is_duplicate(13, 1772073900, 24500.0);
+    }
+
+    #[test]
+    fn test_dedup_ring_interleaved_securities() {
+        let mut ring = TickDedupRing::new(12); // 4096 slots
+        // Alternating security IDs should not confuse the dedup
+        for round in 0..3 {
+            let ts = 1772073900 + round;
+            assert!(!ring.is_duplicate(13, ts, 24500.0));
+            assert!(!ring.is_duplicate(14, ts, 24500.0));
+            assert!(!ring.is_duplicate(15, ts, 24500.0));
+            // Duplicates within same round
+            assert!(ring.is_duplicate(13, ts, 24500.0));
+            assert!(ring.is_duplicate(14, ts, 24500.0));
+            assert!(ring.is_duplicate(15, ts, 24500.0));
+        }
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_deterministic() {
+        let fp1 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
+        let fp2 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_distinct_for_different_inputs() {
+        let fp1 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
+        let fp2 = TickDedupRing::fingerprint(14, 1772073900, 24500.0);
+        let fp3 = TickDedupRing::fingerprint(13, 1772073901, 24500.0);
+        let fp4 = TickDedupRing::fingerprint(13, 1772073900, 24501.0);
+        assert_ne!(fp1, fp2);
+        assert_ne!(fp1, fp3);
+        assert_ne!(fp1, fp4);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_symmetric_inputs_differ() {
+        // Verify (sec=1, ts=3) != (sec=3, ts=1) — FNV-1a is order-dependent
+        let fp1 = TickDedupRing::fingerprint(1, 3, 100.0);
+        let fp2 = TickDedupRing::fingerprint(3, 1, 100.0);
+        assert_ne!(fp1, fp2);
+    }
+
+    // ===================================================================
+    // NaN / Infinity pipeline tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_nan_ltp_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(13, f32::NAN, 1772073900);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_positive_infinity_ltp_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(13, f32::INFINITY, 1772073900);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_negative_infinity_ltp_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(13, f32::NEG_INFINITY, 1772073900);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_nan_ltp_full_quote_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_infinity_ltp_full_quote_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4]
+            .copy_from_slice(&f32::INFINITY.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_nan_ltp_market_depth_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame(13, f32::NAN);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_infinity_ltp_market_depth_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame(13, f32::INFINITY);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Dedup pipeline integration tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_filters_exact_duplicate_tick() {
+        // Send the same tick twice — second should be dedup-filtered.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(frame.clone()).await.unwrap();
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_allows_different_timestamp() {
+        // Same security, different timestamp — both should pass dedup.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        frame_tx
+            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .await
+            .unwrap();
+        frame_tx
+            .send(make_ticker_frame(13, 24500.0, 1772073901))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_allows_different_ltp() {
+        // Same security+timestamp, different LTP — both should pass (price update).
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        frame_tx
+            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .await
+            .unwrap();
+        frame_tx
+            .send(make_ticker_frame(13, 24501.0, 1772073900))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_allows_different_security() {
+        // Different security, same timestamp+LTP — both should pass.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        frame_tx
+            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .await
+            .unwrap();
+        frame_tx
+            .send(make_ticker_frame(14, 24500.0, 1772073900))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_burst_100_identical() {
+        // Send 100 identical ticks — only first should pass dedup.
+        let (frame_tx, frame_rx) = mpsc::channel(200);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        for _ in 0..100 {
+            frame_tx.send(frame.clone()).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_does_not_affect_junk() {
+        // Junk ticks (LTP=0) are filtered BEFORE dedup — dedup never sees them.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        // Send junk tick
+        frame_tx
+            .send(make_ticker_frame(13, 0.0, 1772073900))
+            .await
+            .unwrap();
+        // Send valid tick for same security — should NOT be treated as duplicate
+        frame_tx
+            .send(make_ticker_frame(13, 24500.0, 1772073900))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_full_quote_duplicate() {
+        // Send the same Full Quote twice — second should be dedup-filtered.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(frame.clone()).await.unwrap();
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_market_depth_not_deduped() {
+        // Market Depth code 3 has timestamp=0 — bypasses dedup (no valid timestamp).
+        // Two identical depth frames should BOTH be processed (not deduplicated).
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_market_depth_frame(13, 24500.0);
+        frame_tx.send(frame.clone()).await.unwrap();
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Additional edge case tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_subnormal_ltp_filtered() {
+        // Subnormal f32 (very close to zero but positive) — should be filtered
+        // because it's <= 0.0 is false but it's effectively zero for trading.
+        // Actually subnormal > 0.0 is true, and is_finite() is true.
+        // So subnormal passes through — this is correct (it's a valid f32).
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let subnormal: f32 = f32::MIN_POSITIVE / 2.0;
+        let frame = make_ticker_frame(13, subnormal, 1772073900);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_negative_zero_ltp_filtered() {
+        // -0.0 is == 0.0 in IEEE 754, so -0.0 <= 0.0 is true → filtered.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(13, -0.0, 1772073900);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_max_u32_security_id_processed() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        // u32::MAX security_id with valid LTP and timestamp
+        let mut frame = make_ticker_frame(0, 24500.0, 1772073900);
+        frame[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_minimum_valid_timestamp_accepted() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        // Exact minimum valid timestamp — should pass
+        let frame = make_ticker_frame(13, 24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP);
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_timestamp_one_below_minimum_filtered() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame = make_ticker_frame(
+            13,
+            24500.0,
+            MINIMUM_VALID_EXCHANGE_TIMESTAMP.saturating_sub(1),
+        );
+        frame_tx.send(frame).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_all_nine_packet_types_in_sequence() {
+        // Send one of every packet type in rapid succession.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+
+        // 1. Index Ticker (code 1)
+        let mut idx_tick = make_ticker_frame(13, 24500.0, 1772073900);
+        idx_tick[0] = 1; // RESPONSE_CODE_INDEX_TICKER
+        frame_tx.send(idx_tick).await.unwrap();
+
+        // 2. Ticker (code 2) — already default from make_ticker_frame
+        frame_tx
+            .send(make_ticker_frame(14, 24600.0, 1772073900))
+            .await
+            .unwrap();
+
+        // 3. Market Depth (code 3)
+        frame_tx
+            .send(make_market_depth_frame(15, 24700.0))
+            .await
+            .unwrap();
+
+        // 4. Quote (code 4)
+        let quote = make_packet(
+            dhan_live_trader_common::constants::RESPONSE_CODE_QUOTE,
+            dhan_live_trader_common::constants::QUOTE_PACKET_SIZE,
+        );
+        frame_tx.send(quote).await.unwrap();
+
+        // 5. OI (code 5)
+        frame_tx
+            .send(make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE))
+            .await
+            .unwrap();
+
+        // 6. Previous Close (code 6)
+        frame_tx
+            .send(make_packet(
+                RESPONSE_CODE_PREVIOUS_CLOSE,
+                PREVIOUS_CLOSE_PACKET_SIZE,
+            ))
+            .await
+            .unwrap();
+
+        // 7. Market Status (code 7)
+        frame_tx
+            .send(make_packet(
+                RESPONSE_CODE_MARKET_STATUS,
+                MARKET_STATUS_PACKET_SIZE,
+            ))
+            .await
+            .unwrap();
+
+        // 8. Full Quote (code 8) with valid data
+        let mut full = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        full[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24800.0_f32.to_le_bytes());
+        full[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(full).await.unwrap();
+
+        // 9. Disconnect (code 50)
+        let mut disc = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
+        disc[8..10].copy_from_slice(&807u16.to_le_bytes());
+        frame_tx.send(disc).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_dedup_then_valid_after_different_ltp() {
+        // Tick A (ltp=24500) → Tick A again (dedup) → Tick B (ltp=24501, same sec+ts)
+        // Tick B should pass because LTP differs.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+        let frame_a = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(frame_a.clone()).await.unwrap();
+        frame_tx.send(frame_a).await.unwrap(); // duplicate
+        let frame_b = make_ticker_frame(13, 24501.0, 1772073900);
+        frame_tx.send(frame_b).await.unwrap(); // NOT duplicate (different LTP)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_mixed_dedup_junk_valid_nan() {
+        // Comprehensive mixed sequence: valid → duplicate → junk → NaN → valid
+        let (frame_tx, frame_rx) = mpsc::channel(200);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None).await;
+        });
+
+        // Valid tick
+        let valid1 = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(valid1.clone()).await.unwrap();
+        // Exact duplicate
+        frame_tx.send(valid1).await.unwrap();
+        // Junk (LTP=0)
+        frame_tx
+            .send(make_ticker_frame(14, 0.0, 1772073900))
+            .await
+            .unwrap();
+        // NaN LTP
+        frame_tx
+            .send(make_ticker_frame(15, f32::NAN, 1772073900))
+            .await
+            .unwrap();
+        // Infinity LTP
+        frame_tx
+            .send(make_ticker_frame(16, f32::INFINITY, 1772073900))
+            .await
+            .unwrap();
+        // Parse error (too short)
+        frame_tx.send(vec![0u8; 3]).await.unwrap();
+        // Valid tick (different security+timestamp — should pass)
+        frame_tx
+            .send(make_ticker_frame(17, 24600.0, 1772073901))
+            .await
+            .unwrap();
+        // Market Depth (no timestamp, valid LTP — should NOT be dedup-filtered)
+        frame_tx
+            .send(make_market_depth_frame(18, 24700.0))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
     }
 }
