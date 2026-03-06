@@ -21,10 +21,16 @@ use dhan_live_trader_common::instrument_types::{ArchivedFnoUniverse, FnoUniverse
 const CACHE_MAGIC: &[u8; 4] = b"RKYV";
 
 /// Cache format version. Bump when rkyv version or type layout changes.
-const CACHE_VERSION: u8 = 1;
+/// V2: header padded to 8 bytes for rkyv alignment (was 5 bytes in V1).
+const CACHE_VERSION: u8 = 2;
 
-/// Total header size: 4 (magic) + 1 (version).
-const HEADER_LEN: usize = CACHE_MAGIC.len() + 1;
+/// Total header size: 8 bytes (4 magic + 1 version + 3 padding).
+///
+/// Padded to 8 bytes so the rkyv payload starts at an 8-byte aligned offset.
+/// rkyv 0.8 with `bytecheck` requires proper alignment for types containing
+/// `u64`/`f64` fields. Without this padding, `from_bytes` rejects the buffer
+/// with an "unaligned pointer" error.
+const HEADER_LEN: usize = 8;
 
 /// Serialize `FnoUniverse` to rkyv binary file.
 ///
@@ -41,10 +47,11 @@ pub fn write_binary_cache(universe: &FnoUniverse, cache_dir: &str) -> Result<()>
             .with_context(|| format!("failed to create cache dir: {}", parent.display()))?;
     }
 
-    // Build payload: header + rkyv bytes
+    // Build payload: header (8 bytes, aligned) + rkyv bytes
     let mut payload = Vec::with_capacity(HEADER_LEN + rkyv_bytes.len());
     payload.extend_from_slice(CACHE_MAGIC);
     payload.push(CACHE_VERSION);
+    payload.extend_from_slice(&[0u8; 3]); // 3 padding bytes → 8-byte aligned rkyv payload
     payload.extend_from_slice(&rkyv_bytes);
 
     // Atomic write: temp file → rename (prevents readers from seeing partial data)
@@ -143,7 +150,11 @@ pub struct MappedUniverse {
 }
 
 /// Minimum valid rkyv cache file size (header + smallest valid rkyv payload).
-const MIN_RKYV_CACHE_BYTES: u64 = 256;
+///
+/// An empty `FnoUniverse` serializes to ~136 rkyv bytes + 8-byte header = ~144.
+/// Set to 64 to catch obviously truncated/corrupt files while allowing small
+/// valid universes (e.g., test fixtures).
+const MIN_RKYV_CACHE_BYTES: u64 = 64;
 
 impl MappedUniverse {
     /// Load and validate the rkyv binary cache. Sub-0.5ms.
@@ -365,7 +376,7 @@ mod tests {
         let path = dir.join(BINARY_CACHE_FILENAME);
         let mut data = vec![0u8; 300];
         data[..4].copy_from_slice(CACHE_MAGIC);
-        data[4] = CACHE_VERSION + 1; // wrong version
+        data[4] = CACHE_VERSION.wrapping_add(1); // wrong version
         std::fs::write(&path, &data).unwrap();
 
         let result = read_binary_cache(dir.to_str().unwrap());
@@ -433,8 +444,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = dir.join(BINARY_CACHE_FILENAME);
-        // 100 bytes is below MIN_RKYV_CACHE_BYTES (256)
-        std::fs::write(&path, &vec![0u8; 100]).unwrap();
+        // 32 bytes is below MIN_RKYV_CACHE_BYTES (64)
+        std::fs::write(&path, &vec![0u8; 32]).unwrap();
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
         assert!(result.is_err(), "too-small rkyv file should return Err");
