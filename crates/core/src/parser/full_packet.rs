@@ -4,6 +4,8 @@
 //! CRITICAL: Diverges from Quote at offset 34. Full has OI fields where Quote has OHLC.
 
 use dhan_live_trader_common::constants::{
+    DEPTH_LEVEL_OFFSET_ASK_ORDERS, DEPTH_LEVEL_OFFSET_ASK_PRICE, DEPTH_LEVEL_OFFSET_ASK_QTY,
+    DEPTH_LEVEL_OFFSET_BID_ORDERS, DEPTH_LEVEL_OFFSET_BID_PRICE, DEPTH_LEVEL_OFFSET_BID_QTY,
     FULL_OFFSET_CLOSE, FULL_OFFSET_DEPTH_START, FULL_OFFSET_HIGH, FULL_OFFSET_LOW, FULL_OFFSET_OI,
     FULL_OFFSET_OI_DAY_HIGH, FULL_OFFSET_OI_DAY_LOW, FULL_OFFSET_OPEN, FULL_QUOTE_PACKET_SIZE,
     MARKET_DEPTH_LEVEL_SIZE, MARKET_DEPTH_LEVELS, QUOTE_OFFSET_ATP, QUOTE_OFFSET_LTP,
@@ -89,12 +91,12 @@ pub fn parse_full_packet(
     for (i, level) in depth.iter_mut().enumerate() {
         let base = FULL_OFFSET_DEPTH_START + i * MARKET_DEPTH_LEVEL_SIZE;
         *level = MarketDepthLevel {
-            bid_quantity: read_u32_le(raw, base),
-            ask_quantity: read_u32_le(raw, base + 4),
-            bid_orders: read_u16_le(raw, base + 8),
-            ask_orders: read_u16_le(raw, base + 10),
-            bid_price: read_f32_le(raw, base + 12),
-            ask_price: read_f32_le(raw, base + 16),
+            bid_quantity: read_u32_le(raw, base + DEPTH_LEVEL_OFFSET_BID_QTY),
+            ask_quantity: read_u32_le(raw, base + DEPTH_LEVEL_OFFSET_ASK_QTY),
+            bid_orders: read_u16_le(raw, base + DEPTH_LEVEL_OFFSET_BID_ORDERS),
+            ask_orders: read_u16_le(raw, base + DEPTH_LEVEL_OFFSET_ASK_ORDERS),
+            bid_price: read_f32_le(raw, base + DEPTH_LEVEL_OFFSET_BID_PRICE),
+            ask_price: read_f32_le(raw, base + DEPTH_LEVEL_OFFSET_ASK_PRICE),
         };
     }
 

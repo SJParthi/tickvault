@@ -233,6 +233,30 @@ pub const FEED_UNSUBSCRIBE_FULL: u8 = 22;
 pub const MARKET_DEPTH_LEVELS: usize = 5;
 
 // ---------------------------------------------------------------------------
+// Market Depth — Per-Level Field Offsets (within a single 20-byte level)
+// Source: Dhan Python SDK `<IIHHff>` format string.
+// Used in Full (code 8) and Market Depth standalone (code 3) packets.
+// ---------------------------------------------------------------------------
+
+/// Bid quantity (u32 LE) offset within a depth level.
+pub const DEPTH_LEVEL_OFFSET_BID_QTY: usize = 0;
+
+/// Ask quantity (u32 LE) offset within a depth level.
+pub const DEPTH_LEVEL_OFFSET_ASK_QTY: usize = 4;
+
+/// Bid orders count (u16 LE) offset within a depth level.
+pub const DEPTH_LEVEL_OFFSET_BID_ORDERS: usize = 8;
+
+/// Ask orders count (u16 LE) offset within a depth level.
+pub const DEPTH_LEVEL_OFFSET_ASK_ORDERS: usize = 10;
+
+/// Bid price (f32 LE) offset within a depth level.
+pub const DEPTH_LEVEL_OFFSET_BID_PRICE: usize = 12;
+
+/// Ask price (f32 LE) offset within a depth level.
+pub const DEPTH_LEVEL_OFFSET_ASK_PRICE: usize = 16;
+
+// ---------------------------------------------------------------------------
 // Deep Depth Protocol — 20-Level & 200-Level WebSocket Feeds
 // Source: DhanHQ Python SDK (src/dhanhq/marketfeed.py), Dhan API docs.
 // Separate WebSocket endpoints from the standard feed.
@@ -253,6 +277,20 @@ pub const DEEP_DEPTH_HEADER_SIZE: usize = 12;
 /// Deep depth level size in bytes.
 /// Format: price(f64) + quantity(u32) + orders(u32) = 16 bytes.
 pub const DEEP_DEPTH_LEVEL_SIZE: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Deep Depth — Per-Level Field Offsets (within a single 16-byte level)
+// Source: Dhan Python SDK `<dII>` format string in fulldepth.py.
+// ---------------------------------------------------------------------------
+
+/// Price (f64 LE) offset within a deep depth level.
+pub const DEEP_DEPTH_LEVEL_OFFSET_PRICE: usize = 0;
+
+/// Quantity (u32 LE) offset within a deep depth level.
+pub const DEEP_DEPTH_LEVEL_OFFSET_QUANTITY: usize = 8;
+
+/// Orders count (u32 LE) offset within a deep depth level.
+pub const DEEP_DEPTH_LEVEL_OFFSET_ORDERS: usize = 12;
 
 /// Feed response code indicating a BID-side depth packet.
 pub const DEEP_DEPTH_FEED_CODE_BID: u8 = 41;
@@ -974,3 +1012,126 @@ const _: () = assert!(
     INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two(),
     "INDICATOR_RING_BUFFER_CAPACITY must be power of 2"
 );
+
+// ---------------------------------------------------------------------------
+// Compile-Time Assertions — Binary Protocol Offset Chain Verification
+// Source: Dhan Python SDK struct.unpack format strings.
+// Ensures every offset = previous_offset + previous_field_size.
+// ---------------------------------------------------------------------------
+
+// Header offset chain: <BHBi> = response_code(1) + msg_length(2) + segment(1) + security_id(4) = 8
+const _: () = assert!(
+    HEADER_OFFSET_RESPONSE_CODE == 0,
+    "header: response_code at 0"
+);
+const _: () = assert!(HEADER_OFFSET_MESSAGE_LENGTH == 1, "header: msg_length at 1");
+const _: () = assert!(HEADER_OFFSET_EXCHANGE_SEGMENT == 3, "header: segment at 3");
+const _: () = assert!(HEADER_OFFSET_SECURITY_ID == 4, "header: security_id at 4");
+const _: () = assert!(BINARY_HEADER_SIZE == 8, "header total = 8");
+
+// Ticker offset chain: header(8) + LTP(f32=4) + LTT(u32=4) = 16
+const _: () = assert!(TICKER_OFFSET_LTP == 8, "ticker: LTP at 8");
+const _: () = assert!(TICKER_OFFSET_LTT == 12, "ticker: LTT at 12");
+const _: () = assert!(TICKER_PACKET_SIZE == 16, "ticker total = 16");
+
+// Quote offset chain: <BHBIfHIfIIIffff> = 50
+const _: () = assert!(QUOTE_OFFSET_LTP == 8, "quote: LTP at 8");
+const _: () = assert!(QUOTE_OFFSET_LTQ == 12, "quote: LTQ at 12");
+const _: () = assert!(QUOTE_OFFSET_LTT == 14, "quote: LTT at 14");
+const _: () = assert!(QUOTE_OFFSET_ATP == 18, "quote: ATP at 18");
+const _: () = assert!(QUOTE_OFFSET_VOLUME == 22, "quote: volume at 22");
+const _: () = assert!(QUOTE_OFFSET_TOTAL_SELL_QTY == 26, "quote: total_sell at 26");
+const _: () = assert!(QUOTE_OFFSET_TOTAL_BUY_QTY == 30, "quote: total_buy at 30");
+const _: () = assert!(QUOTE_OFFSET_OPEN == 34, "quote: open at 34");
+const _: () = assert!(QUOTE_OFFSET_CLOSE == 38, "quote: close at 38");
+const _: () = assert!(QUOTE_OFFSET_HIGH == 42, "quote: high at 42");
+const _: () = assert!(QUOTE_OFFSET_LOW == 46, "quote: low at 46");
+const _: () = assert!(QUOTE_PACKET_SIZE == 50, "quote total = 50");
+
+// Full packet offset chain: diverges from Quote at 34
+// <BHBIfHIfIIIIIIffff100s> = 162
+const _: () = assert!(FULL_OFFSET_OI == 34, "full: OI at 34");
+const _: () = assert!(FULL_OFFSET_OI_DAY_HIGH == 38, "full: OI high at 38");
+const _: () = assert!(FULL_OFFSET_OI_DAY_LOW == 42, "full: OI low at 42");
+const _: () = assert!(FULL_OFFSET_OPEN == 46, "full: open at 46");
+const _: () = assert!(FULL_OFFSET_CLOSE == 50, "full: close at 50");
+const _: () = assert!(FULL_OFFSET_HIGH == 54, "full: high at 54");
+const _: () = assert!(FULL_OFFSET_LOW == 58, "full: low at 58");
+const _: () = assert!(FULL_OFFSET_DEPTH_START == 62, "full: depth at 62");
+const _: () = assert!(
+    FULL_QUOTE_PACKET_SIZE
+        == FULL_OFFSET_DEPTH_START + MARKET_DEPTH_LEVELS * MARKET_DEPTH_LEVEL_SIZE,
+    "full total = 62 + 5*20 = 162"
+);
+
+// Market Depth standalone offset chain: <BHBIf100s> = 112
+const _: () = assert!(MARKET_DEPTH_OFFSET_LTP == 8, "mkt_depth: LTP at 8");
+const _: () = assert!(
+    MARKET_DEPTH_OFFSET_DEPTH_START == 12,
+    "mkt_depth: depth at 12"
+);
+const _: () = assert!(
+    MARKET_DEPTH_PACKET_SIZE
+        == MARKET_DEPTH_OFFSET_DEPTH_START + MARKET_DEPTH_LEVELS * MARKET_DEPTH_LEVEL_SIZE,
+    "mkt_depth total = 12 + 5*20 = 112"
+);
+
+// Per-level offset chain: <IIHHff> = 20 bytes
+const _: () = assert!(DEPTH_LEVEL_OFFSET_BID_QTY == 0, "level: bid_qty at 0");
+const _: () = assert!(DEPTH_LEVEL_OFFSET_ASK_QTY == 4, "level: ask_qty at 4");
+const _: () = assert!(DEPTH_LEVEL_OFFSET_BID_ORDERS == 8, "level: bid_orders at 8");
+const _: () = assert!(
+    DEPTH_LEVEL_OFFSET_ASK_ORDERS == 10,
+    "level: ask_orders at 10"
+);
+const _: () = assert!(DEPTH_LEVEL_OFFSET_BID_PRICE == 12, "level: bid_price at 12");
+const _: () = assert!(DEPTH_LEVEL_OFFSET_ASK_PRICE == 16, "level: ask_price at 16");
+const _: () = assert!(MARKET_DEPTH_LEVEL_SIZE == 20, "level total = 20");
+
+// Deep depth per-level offset chain: <dII> = 16 bytes
+const _: () = assert!(DEEP_DEPTH_LEVEL_OFFSET_PRICE == 0, "deep_level: price at 0");
+const _: () = assert!(
+    DEEP_DEPTH_LEVEL_OFFSET_QUANTITY == 8,
+    "deep_level: qty at 8"
+);
+const _: () = assert!(
+    DEEP_DEPTH_LEVEL_OFFSET_ORDERS == 12,
+    "deep_level: orders at 12"
+);
+const _: () = assert!(DEEP_DEPTH_LEVEL_SIZE == 16, "deep_level total = 16");
+
+// Deep depth header offset chain: <hBBiI> = 12 bytes
+const _: () = assert!(
+    DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH == 0,
+    "deep_hdr: msg_len at 0"
+);
+const _: () = assert!(
+    DEEP_DEPTH_HEADER_OFFSET_FEED_CODE == 2,
+    "deep_hdr: feed_code at 2"
+);
+const _: () = assert!(
+    DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT == 3,
+    "deep_hdr: segment at 3"
+);
+const _: () = assert!(
+    DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID == 4,
+    "deep_hdr: security_id at 4"
+);
+const _: () = assert!(
+    DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE == 8,
+    "deep_hdr: sequence at 8"
+);
+const _: () = assert!(DEEP_DEPTH_HEADER_SIZE == 12, "deep_hdr total = 12");
+
+// OI packet: <BHBII> = 12 bytes
+const _: () = assert!(OI_OFFSET_VALUE == 8, "oi: value at 8");
+const _: () = assert!(OI_PACKET_SIZE == 12, "oi total = 12");
+
+// Previous Close packet: <BHBIfI> = 16 bytes
+const _: () = assert!(PREV_CLOSE_OFFSET_PRICE == 8, "prev_close: price at 8");
+const _: () = assert!(PREV_CLOSE_OFFSET_OI == 12, "prev_close: OI at 12");
+const _: () = assert!(PREVIOUS_CLOSE_PACKET_SIZE == 16, "prev_close total = 16");
+
+// Disconnect packet: <BHBIH> = 10 bytes
+const _: () = assert!(DISCONNECT_OFFSET_CODE == 8, "disconnect: code at 8");
+const _: () = assert!(DISCONNECT_PACKET_SIZE == 10, "disconnect total = 10");
