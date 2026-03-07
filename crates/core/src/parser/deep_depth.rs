@@ -17,8 +17,9 @@ use dhan_live_trader_common::constants::{
     DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT,
     DEEP_DEPTH_HEADER_OFFSET_FEED_CODE, DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH,
     DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE, DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID,
-    DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS, TWENTY_DEPTH_PACKET_SIZE,
-    TWO_HUNDRED_DEPTH_LEVELS, TWO_HUNDRED_DEPTH_PACKET_SIZE,
+    DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_OFFSET_ORDERS, DEEP_DEPTH_LEVEL_OFFSET_PRICE,
+    DEEP_DEPTH_LEVEL_OFFSET_QUANTITY, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
+    TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_LEVELS, TWO_HUNDRED_DEPTH_PACKET_SIZE,
 };
 use dhan_live_trader_common::tick_types::DeepDepthLevel;
 
@@ -165,9 +166,9 @@ fn parse_deep_depth_levels(
     for i in 0..level_count {
         let base = DEEP_DEPTH_HEADER_SIZE + i * DEEP_DEPTH_LEVEL_SIZE;
         levels.push(DeepDepthLevel {
-            price: read_f64_le(raw, base),
-            quantity: read_u32_le(raw, base + 8),
-            orders: read_u32_le(raw, base + 12),
+            price: read_f64_le(raw, base + DEEP_DEPTH_LEVEL_OFFSET_PRICE),
+            quantity: read_u32_le(raw, base + DEEP_DEPTH_LEVEL_OFFSET_QUANTITY),
+            orders: read_u32_le(raw, base + DEEP_DEPTH_LEVEL_OFFSET_ORDERS),
         });
     }
 
