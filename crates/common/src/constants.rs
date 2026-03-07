@@ -956,8 +956,6 @@ pub const MAX_INDICATOR_INSTRUMENTS: usize = 25_000;
 pub const MAX_STRATEGY_INSTANCES: usize = 256;
 
 // ---------------------------------------------------------------------------
-// Frontend — Tick Broadcast Channel
-// ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
 

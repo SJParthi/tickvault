@@ -447,16 +447,10 @@ async fn main() -> Result<()> {
         mode,
         "system ready — press Ctrl+C to stop\n\
          \n\
-           Terminal:   http://{bind_addr}/\n\
            Health:     http://{bind_addr}/health\n\
            Stats:      http://{bind_addr}/api/stats\n\
            Portal:     http://{bind_addr}/portal\n\
-           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n\
-         \n\
-           Grafana:    http://localhost:3000\n\
-           Prometheus: http://localhost:9090\n\
-           Jaeger:     http://localhost:16686\n\
-           QuestDB:    http://localhost:9000\n"
+           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n"
     );
 
     notifier.notify(NotificationEvent::StartupComplete { mode });

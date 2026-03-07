@@ -288,4 +288,4 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 - **Block 04**: Binary Protocol Parser — dispatch_frame() routes 7 packet types
 - **Block 05**: Tick Pipeline — pure capture: frame → parse → filter → persist
 - **Subscription Planner**: InstrumentRegistry (O(1) lookup) + SubscriptionPlanner (FnoUniverse → filtered instruments)
-- **Frontend stripped**: TradingView chart, candle aggregation, candle broadcast all removed — pure tick capture backend
+- **Frontend removed**: All frontend code (TradingView chart, WASM indicators, terminal handlers, tick broadcast) fully removed — pure backend

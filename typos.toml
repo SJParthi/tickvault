@@ -58,7 +58,4 @@ extend-exclude = [
     ".git/",
     "*.pdf",
     "deploy/docker/",
-    # Minified third-party JS bundles (TradingView lightweight-charts)
-    "crates/api/static/*.js",
-    "frontend/package-lock.json",
 ]
