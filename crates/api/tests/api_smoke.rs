@@ -10,8 +10,10 @@ use tower::ServiceExt;
 use dhan_live_trader_api::build_router;
 use dhan_live_trader_api::state::SharedAppState;
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use dhan_live_trader_common::tick_types::ParsedTick;
 
 fn test_state() -> SharedAppState {
+    let (tx, _) = tokio::sync::broadcast::channel::<ParsedTick>(16);
     SharedAppState::new(
         QuestDbConfig {
             host: "localhost".to_string(),
@@ -36,6 +38,7 @@ fn test_state() -> SharedAppState {
             build_window_start: "06:00:00".to_string(),
             build_window_end: "09:15:00".to_string(),
         },
+        tx,
     )
 }
 

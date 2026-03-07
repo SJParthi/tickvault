@@ -4,3 +4,4 @@ pub mod health;
 pub mod instruments;
 pub mod static_file;
 pub mod stats;
+pub mod terminal;

@@ -956,6 +956,18 @@ pub const MAX_INDICATOR_INSTRUMENTS: usize = 25_000;
 pub const MAX_STRATEGY_INSTANCES: usize = 256;
 
 // ---------------------------------------------------------------------------
+// Frontend — Tick Broadcast Channel
+// ---------------------------------------------------------------------------
+
+/// Broadcast channel capacity for tick fan-out to browser WebSocket clients.
+///
+/// Fixed-size ring buffer — O(1) send. Lagging receivers skip stale ticks
+/// (acceptable: the chart only needs the latest price, not every historical tick).
+///
+/// 16,384 slots × ~72 bytes (ParsedTick is Copy) ≈ 1.1 MiB.
+pub const TICK_BROADCAST_CHANNEL_CAPACITY: usize = 16_384;
+
+// ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
 
