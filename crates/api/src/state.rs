@@ -3,10 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use tokio::sync::broadcast;
-
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
-use dhan_live_trader_common::tick_types::ParsedTick;
 
 /// Shared state available to all API handlers via axum's `State` extractor.
 #[derive(Clone)]
@@ -23,9 +20,6 @@ struct AppStateInner {
     instrument_config: InstrumentConfig,
     /// Concurrency guard: prevents concurrent instrument rebuilds.
     rebuild_in_progress: AtomicBool,
-    /// Broadcast sender for tick fan-out to browser WebSocket clients.
-    /// Each `/ws/ticks` handler subscribes via `sender.subscribe()`.
-    tick_broadcast: broadcast::Sender<ParsedTick>,
 }
 
 impl SharedAppState {
@@ -34,7 +28,6 @@ impl SharedAppState {
         questdb_config: QuestDbConfig,
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
-        tick_broadcast: broadcast::Sender<ParsedTick>,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
@@ -42,7 +35,6 @@ impl SharedAppState {
                 dhan_config,
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
-                tick_broadcast,
             }),
         }
     }
@@ -65,12 +57,6 @@ impl SharedAppState {
     /// Returns the rebuild-in-progress atomic flag.
     pub fn rebuild_in_progress(&self) -> &AtomicBool {
         &self.inner.rebuild_in_progress
-    }
-
-    /// Returns a new broadcast receiver for tick fan-out to browser clients.
-    /// O(1) subscribe — clones the sender's Arc internally.
-    pub fn subscribe_ticks(&self) -> broadcast::Receiver<ParsedTick> {
-        self.inner.tick_broadcast.subscribe()
     }
 }
 
@@ -112,8 +98,7 @@ mod tests {
             pg_port: 8812,
             ilp_port: 9009,
         };
-        let (tx, _) = broadcast::channel(16);
-        let state = SharedAppState::new(config, test_dhan_config(), test_instrument_config(), tx);
+        let state = SharedAppState::new(config, test_dhan_config(), test_instrument_config());
         assert_eq!(state.questdb_config().host, "test-host");
         assert_eq!(state.questdb_config().ilp_port, 9009);
         assert_eq!(state.questdb_config().http_port, 9000);
@@ -127,8 +112,7 @@ mod tests {
             pg_port: 8812,
             ilp_port: 9009,
         };
-        let (tx, _) = broadcast::channel(16);
-        let state1 = SharedAppState::new(config, test_dhan_config(), test_instrument_config(), tx);
+        let state1 = SharedAppState::new(config, test_dhan_config(), test_instrument_config());
         let state2 = state1.clone();
         assert_eq!(state2.questdb_config().host, "clone-test");
     }
