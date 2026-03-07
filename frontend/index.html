@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DLT Terminal — dhan-live-trader</title>
+    <link rel="stylesheet" href="src/styles/terminal.css">
+</head>
+<body>
+    <!-- Top Toolbar -->
+    <div id="toolbar" class="toolbar"></div>
+
+    <!-- Main Chart Area -->
+    <div id="chart-container" class="chart-container"></div>
+
+    <!-- Status Bar -->
+    <div id="status-bar" class="status-bar">
+        <span id="ohlcv-display" class="status-ohlcv">O — H — L — C — V —</span>
+        <span class="status-spacer"></span>
+        <span id="latency-display" class="status-latency">— ms</span>
+        <span class="status-separator">·</span>
+        <span class="status-version">DLT v0.1.0</span>
+    </div>
+
+    <!-- Script (bundled by esbuild) -->
+    <script type="module" src="dist/terminal.js"></script>
+</body>
+</html>
