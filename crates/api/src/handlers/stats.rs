@@ -129,7 +129,9 @@ mod tests {
         use crate::state::SharedAppState;
         use axum::extract::State;
         use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+        use dhan_live_trader_common::tick_types::ParsedTick;
 
+        let (tx, _) = tokio::sync::broadcast::channel::<ParsedTick>(16);
         let state = SharedAppState::new(
             QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -154,6 +156,7 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
+            tx,
         );
         let result = get_stats(State(state)).await;
         assert!(!result.questdb_reachable);
@@ -493,6 +496,8 @@ mod tests {
         // We need to extract port from the mock server URL.
         let port: u16 = base_url.rsplit(':').next().unwrap().parse().unwrap();
 
+        let (tx, _) =
+            tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(16);
         let state = SharedAppState::new(
             dhan_live_trader_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -517,6 +522,7 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
+            tx,
         );
         let result = get_stats(axum::extract::State(state)).await;
         assert!(result.questdb_reachable);
