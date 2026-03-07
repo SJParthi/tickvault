@@ -1,5 +1,5 @@
 /**
- * Toolbar — Symbol selector, timeframe picker, and controls.
+ * Toolbar — Symbol selector, timeframe picker, indicator button, and controls.
  *
  * Provides the top toolbar UI for the trading terminal.
  */
@@ -7,6 +7,9 @@
 import { ChartManager } from "../chart-manager";
 import { WsClient } from "../ws-client";
 import { PipelineManager } from "../pipeline-manager";
+import { IndicatorController } from "../indicator-controller";
+import { IndicatorPicker } from "./indicator-picker";
+import { INDICATOR_CATALOG, type IndicatorMeta } from "../wasm-bridge";
 
 // ---------------------------------------------------------------------------
 // Timeframe definitions
@@ -40,6 +43,8 @@ export class Toolbar {
     private _chart: ChartManager;
     private _ws: WsClient;
     private pipeline: PipelineManager;
+    private indicatorController: IndicatorController | null = null;
+    private indicatorPicker: IndicatorPicker | null = null;
     private activeTimeframe = 60; // 1m default
 
     constructor(
@@ -52,6 +57,11 @@ export class Toolbar {
         this._chart = chart;
         this._ws = ws;
         this.pipeline = pipeline;
+    }
+
+    /** Sets the indicator controller for the picker. */
+    setIndicatorController(controller: IndicatorController): void {
+        this.indicatorController = controller;
     }
 
     /** Renders the toolbar UI. */
@@ -83,13 +93,13 @@ export class Toolbar {
         // Separator
         this.container.appendChild(this.createSeparator());
 
-        // Indicators button (placeholder)
+        // Indicators button
         const indicatorBtn = document.createElement("button");
         indicatorBtn.className = "toolbar-btn toolbar-btn-accent";
         indicatorBtn.textContent = "Indicators";
-        indicatorBtn.addEventListener("click", () => {
-            // Future: open indicator picker dropdown
-            console.info("[Toolbar] Indicator picker — coming soon");
+        indicatorBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.onIndicatorClick(indicatorBtn);
         });
         this.container.appendChild(indicatorBtn);
 
@@ -116,12 +126,30 @@ export class Toolbar {
     // ---------------------------------------------------------------------------
 
     private onTimeframeClick(seconds: number, btn: HTMLButtonElement, group: HTMLElement): void {
-        // Update active state
         group.querySelectorAll(".toolbar-btn").forEach((el) => el.classList.remove("active"));
         btn.classList.add("active");
 
         this.activeTimeframe = seconds;
         this.pipeline.setTimeframe(seconds);
+    }
+
+    private onIndicatorClick(anchorBtn: HTMLElement): void {
+        // Lazy-create the picker
+        if (!this.indicatorPicker) {
+            this.indicatorPicker = new IndicatorPicker((id: string, active: boolean) => {
+                if (!this.indicatorController) return;
+                if (active) {
+                    this.indicatorController.addIndicator(id);
+                } else {
+                    this.indicatorController.removeIndicator(id);
+                }
+            });
+        }
+
+        const indicators: IndicatorMeta[] = INDICATOR_CATALOG;
+        const activeIds = this.indicatorController?.activeIds() ?? new Set<string>();
+
+        this.indicatorPicker.toggle(anchorBtn, indicators, activeIds);
     }
 
     private createSeparator(): HTMLElement {
