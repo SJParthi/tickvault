@@ -118,6 +118,74 @@ pub fn build_disconnect_message() -> String {
     .to_string() // O(1) EXEMPT: disconnect message — once at shutdown
 }
 
+/// Builds subscription JSON messages for the 20-level depth WebSocket feed.
+///
+/// Uses RequestCode 23. The 20-depth feed has a limit of 50 instruments per connection.
+/// Each subscription message is batched to at most `batch_size` instruments (Dhan limit: 100).
+///
+/// # Arguments
+/// * `instruments` — List of instruments to subscribe for 20-level depth.
+/// * `batch_size` — Max instruments per message (use config value, max 100).
+///
+/// # Returns
+/// Vec of serialized JSON strings, each ready to send over WebSocket.
+pub fn build_twenty_depth_subscription_messages(
+    instruments: &[InstrumentSubscription],
+    batch_size: usize,
+) -> Vec<String> {
+    // O(1) EXEMPT: begin — subscription building runs once at connect time
+    if instruments.is_empty() {
+        return Vec::new();
+    }
+
+    let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
+    let request_code = dhan_live_trader_common::constants::FEED_REQUEST_TWENTY_DEPTH;
+
+    #[allow(clippy::expect_used)] // APPROVED: SubscriptionRequest is infallible to serialize
+    instruments
+        .chunks(effective_batch)
+        .map(|chunk| {
+            let request = SubscriptionRequest {
+                request_code,
+                instrument_count: chunk.len(),
+                instrument_list: chunk.to_vec(),
+            };
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible serialize
+        })
+        .collect()
+    // O(1) EXEMPT: end
+}
+
+/// Builds unsubscription JSON messages for the 20-level depth WebSocket feed.
+///
+/// Uses RequestCode 24 (= 23 + 1).
+pub fn build_twenty_depth_unsubscription_messages(
+    instruments: &[InstrumentSubscription],
+    batch_size: usize,
+) -> Vec<String> {
+    // O(1) EXEMPT: begin — unsubscription building runs once at disconnect time
+    if instruments.is_empty() {
+        return Vec::new();
+    }
+
+    let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
+    let unsubscribe_code = dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
+
+    #[allow(clippy::expect_used)] // APPROVED: SubscriptionRequest is infallible to serialize
+    instruments
+        .chunks(effective_batch)
+        .map(|chunk| {
+            let request = SubscriptionRequest {
+                request_code: unsubscribe_code,
+                instrument_count: chunk.len(),
+                instrument_list: chunk.to_vec(),
+            };
+            serde_json::to_string(&request).expect("SubscriptionRequest serialization cannot fail") // APPROVED: infallible serialize
+        })
+        .collect()
+    // O(1) EXEMPT: end
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -340,5 +408,54 @@ mod tests {
         assert_eq!(parsed["RequestCode"], 21);
         assert_eq!(parsed["InstrumentCount"], 3);
         assert_eq!(parsed["InstrumentList"].as_array().unwrap().len(), 3);
+    }
+
+    // --- 20-depth subscription ---
+
+    #[test]
+    fn test_twenty_depth_subscription_request_code_23() {
+        let instruments = make_instruments(1);
+        let messages = build_twenty_depth_subscription_messages(&instruments, 100);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("\"RequestCode\":23"));
+    }
+
+    #[test]
+    fn test_twenty_depth_subscription_empty() {
+        let messages = build_twenty_depth_subscription_messages(&[], 100);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_twenty_depth_subscription_batching() {
+        let instruments = make_instruments(150);
+        let messages = build_twenty_depth_subscription_messages(&instruments, 100);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].contains("\"InstrumentCount\":100"));
+        assert!(messages[1].contains("\"InstrumentCount\":50"));
+    }
+
+    #[test]
+    fn test_twenty_depth_unsubscription_request_code_24() {
+        let instruments = make_instruments(3);
+        let messages = build_twenty_depth_unsubscription_messages(&instruments, 100);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("\"RequestCode\":24"));
+    }
+
+    #[test]
+    fn test_twenty_depth_unsubscription_empty() {
+        let messages = build_twenty_depth_unsubscription_messages(&[], 100);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_twenty_depth_subscription_valid_json() {
+        let instruments = make_instruments(5);
+        let messages = build_twenty_depth_subscription_messages(&instruments, 100);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["RequestCode"], 23);
+        assert_eq!(parsed["InstrumentCount"], 5);
+        assert_eq!(parsed["InstrumentList"].as_array().unwrap().len(), 5);
     }
 }

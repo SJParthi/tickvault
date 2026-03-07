@@ -521,76 +521,82 @@ If server doesn't receive ping within 40 seconds → disconnects (code 806)
 | Parameter | Value |
 |-----------|-------|
 | Endpoint | `wss://depth-api-feed.dhan.co/twentydepth` (from config) |
-| Auth | Same as live feed (access-token + client-id headers) |
-| Max connections | 5 |
-| Max instruments per connection | 5,000 |
+| Auth | Token + client ID as URL query params (`?token=<JWT>&clientId=<id>&authType=2`) |
+| Max connections | 5 (shared limit with standard feed) |
+| Max instruments per connection | 50 |
 | Protocol | Binary, Little Endian |
+| Segments | NSE Equity and NSE Derivatives ONLY |
 
-**Subscription request:** Same JSON format as live feed but with `RequestCode: 21`.
+**Subscription request:** Same JSON format as live feed but with `RequestCode: 23`.
+
+```json
+{
+  "RequestCode": 23,
+  "InstrumentCount": 1,
+  "InstrumentList": [
+    {"ExchangeSegment": "NSE_EQ", "SecurityId": "2885"}
+  ]
+}
+```
 
 **Response packet structure:**
 
-20-Level Depth Header:
+Bid and Ask sides arrive as **SEPARATE** binary packets (unlike the standard 5-level feed which combines them). Each packet has feed code 41 (Bid) or 51 (Ask).
+
+12-Byte Deep Depth Header:
 ```
-Bytes 0-1:   Message Length (i16 LE) — total packet size
-Byte 2:      Exchange Segment code (u8)
-Bytes 3-6:   Security ID (i32 LE)
+Bytes 0-1:   Message Length (u16 LE) — total packet size
+Byte 2:      Feed Response Code (u8) — 41=Bid, 51=Ask
+Byte 3:      Exchange Segment code (u8)
+Bytes 4-7:   Security ID (u32 LE)
+Bytes 8-11:  Message Sequence (u32 LE)
 ```
 
-Note: The 20-level depth has a DIFFERENT header layout than the live feed — only 7 bytes, no response_code byte.
-
-20-Level Depth Body:
+Body (per side):
 ```
-Each level = 20 bytes (same as 5-level depth format):
-  Bid Quantity (i32 LE)
-  Bid Orders (i16 LE)
-  Bid Price (f32 LE — divide by 100)
-  Ask Price (f32 LE — divide by 100)
-  Ask Quantity (i32 LE)
-  Ask Orders (i16 LE)
+Each level = 16 bytes:
+  Price (f64 LE — 8 bytes, rupees, NO division needed)
+  Quantity (u32 LE — 4 bytes)
+  Orders (u32 LE — 4 bytes)
 
-20 levels × 20 bytes = 400 bytes
-Total packet: 7 (header) + 400 (body) = 407 bytes
+20 levels × 16 bytes = 320 bytes
+Total per-side packet: 12 (header) + 320 (body) = 332 bytes
 ```
+
+**Stacking:** When multiple instruments are subscribed, packets are stacked sequentially in a single WebSocket message. Parse by splitting on message length boundaries: instrument1-bid, instrument1-ask, instrument2-bid, instrument2-ask, etc.
+
+**Key differences from 5-level depth:**
+- Separate WebSocket endpoint (not `api-feed.dhan.co`)
+- 12-byte header (vs 8-byte standard header)
+- Bid/Ask arrive as separate packets (feed codes 41/51)
+- Prices are f64 (double, 8 bytes) instead of f32 (4 bytes)
+- Per-level layout differs: `price(f64) + qty(u32) + orders(u32)` = 16 bytes vs `bid_qty(u32) + ask_qty(u32) + bid_orders(u16) + ask_orders(u16) + bid_price(f32) + ask_price(f32)` = 20 bytes
 
 ### 200-Level Depth WebSocket
 
 | Parameter | Value |
 |-----------|-------|
 | Endpoint | `wss://full-depth-api.dhan.co/twohundreddepth` (from config) |
-| Auth | Same as live feed |
-| Max connections | 5 |
-| Max instruments per connection | 5,000 |
+| Auth | Token + client ID as URL query params (same as 20-depth) |
+| Max connections | 5 (shared limit) |
+| Max instruments per connection | **1** (critical limitation) |
+| Segments | NSE Equity and NSE Derivatives ONLY |
 
 **Response packet structure:**
 
-200-Level Depth Header:
+Identical format to 20-level depth, but with 200 levels per side instead of 20.
+
+12-Byte Header: Same as 20-depth (feed codes 41/51).
+
+Body (per side):
 ```
-Bytes 0-1:   Message Length (i16 LE)
-Byte 2:      Exchange Segment code (u8)
-Bytes 3-6:   Security ID (i32 LE)
-Bytes 7-10:  Last Traded Price (f32 LE — divide by 100)
-Bytes 11-14: Last Traded Time (i32 LE — Unix epoch)
-Bytes 15-18: Last Traded Quantity (i32 LE)
-Bytes 19:    Number of Bid Levels (u8)
-Bytes 20:    Number of Ask Levels (u8)
+200 levels × 16 bytes = 3,200 bytes
+Total per-side packet: 12 (header) + 3,200 (body) = 3,212 bytes
 ```
 
-200-Level Bid/Ask entries (variable count):
-```
-Each bid entry = 12 bytes:
-  Bid Price (f32 LE — divide by 100)
-  Bid Quantity (i32 LE)
-  Bid Orders (i32 LE)
+**Limitation:** No total volume traded data in the 200-depth feed — only price, quantity, and orders per level.
 
-Each ask entry = 12 bytes:
-  Ask Price (f32 LE — divide by 100)
-  Ask Quantity (i32 LE)
-  Ask Orders (i32 LE)
-
-Max: 200 bid levels + 200 ask levels
-Max packet size: 21 + (200 × 12) + (200 × 12) = 4,821 bytes
-```
+**NOTE:** 200-depth is limited to **1 instrument per connection**. To monitor N instruments at 200-level depth, N WebSocket connections are required.
 
 ---
 
@@ -914,35 +920,71 @@ Authorization: <access_token>
 |-----------|-------|
 | Endpoint | `wss://api-order-update.dhan.co` (from config) |
 | Protocol | JSON (NOT binary — different from market feed) |
-| Auth | Same headers (access-token + client-id) |
+| Auth | Login message sent after connection (NOT URL params) |
 | Purpose | Real-time order status updates pushed by Dhan |
 
-### Subscription
+### Authentication
 
-No subscription message needed. Upon connection with valid auth, Dhan automatically pushes all order updates for the authenticated account.
-
-### Order Update Message Format
+After connecting, send a JSON login message:
 
 ```json
 {
-    "type": "order_update",
-    "data": {
-        "orderId": "1234567890",
-        "orderStatus": "TRADED",
-        "exchangeSegment": "NSE_FNO",
-        "transactionType": "BUY",
-        "productType": "INTRADAY",
-        "securityId": "52432",
-        "quantity": 50,
-        "price": 245.50,
-        "tradedQuantity": 50,
-        "tradedPrice": 245.50,
-        "averageTradePrice": 245.50,
-        "remainingQuantity": 0,
-        "exchangeOrderId": "NSE-1234567",
-        "exchangeTime": "2026-03-15T10:30:45",
-        "updateTime": "2026-03-15T10:30:45",
-        "rejectionReason": ""
+    "LoginReq": {
+        "MsgCode": 42,
+        "ClientId": "1000000001",
+        "Token": "JWT_ACCESS_TOKEN"
+    },
+    "UserType": "SELF"
+}
+```
+
+Upon successful login, Dhan automatically pushes all order updates for the authenticated account. No subscription message needed.
+
+### Order Update Message Format
+
+Messages arrive as JSON with a `"Data"` wrapper. Fields use **PascalCase** (unlike REST API which uses camelCase).
+
+```json
+{
+    "Data": {
+        "Exchange": "NSE",
+        "Segment": "D",
+        "SecurityId": "52432",
+        "ClientId": "1000000001",
+        "OrderNo": "1234567890",
+        "ExchOrderNo": "NSE-1234567",
+        "Product": "I",
+        "TxnType": "B",
+        "OrderType": "LMT",
+        "Validity": "DAY",
+        "Quantity": 50,
+        "TradedQty": 50,
+        "RemainingQuantity": 0,
+        "Price": 245.50,
+        "TriggerPrice": 0.0,
+        "TradedPrice": 245.50,
+        "AvgTradedPrice": 245.50,
+        "Status": "TRADED",
+        "Symbol": "NIFTY",
+        "DisplayName": "NIFTY 27MAR 24500 CE",
+        "CorrelationId": "uuid-123",
+        "Remarks": "",
+        "ReasonDescription": "CONFIRMED",
+        "OrderDateTime": "2026-03-15 10:30:45",
+        "ExchOrderTime": "2026-03-15 10:30:45",
+        "LastUpdatedTime": "2026-03-15 10:30:46",
+        "Instrument": "OPTIDX",
+        "LotSize": 50,
+        "StrikePrice": 24500.0,
+        "ExpiryDate": "2026-03-27",
+        "OptType": "CE",
+        "Isin": "",
+        "DiscQuantity": 0,
+        "DiscQtyRem": 0,
+        "LegNo": 0,
+        "ProductName": "INTRADAY",
+        "refLtp": 245.0,
+        "tickSize": 0.05
     }
 }
 ```

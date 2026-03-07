@@ -13,6 +13,7 @@
 //! - Full (162 bytes, code 8) — Quote + OI + 5-level depth
 //! - Disconnect (10 bytes, code 50) — disconnect reason code
 
+pub mod deep_depth;
 pub mod disconnect;
 pub mod dispatcher;
 pub mod full_packet;
@@ -20,11 +21,17 @@ pub mod header;
 pub mod market_depth;
 pub mod market_status;
 pub mod oi;
+pub mod order_update;
 pub mod previous_close;
 pub mod quote;
 pub mod ticker;
 pub mod types;
 
 // Re-export the main entry point and types for convenient use.
+pub use deep_depth::{
+    DeepDepthHeader, DepthSide, ParsedDeepDepth, parse_twenty_depth_packet,
+    parse_two_hundred_depth_packet,
+};
 pub use dispatcher::dispatch_frame;
+pub use order_update::{OrderUpdateParseError, build_order_update_login, parse_order_update};
 pub use types::{PacketHeader, ParseError, ParsedFrame};
