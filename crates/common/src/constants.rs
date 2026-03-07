@@ -694,6 +694,34 @@ pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 /// Endpoint: GET <https://api.dhan.co/v2/RenewToken>
 pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 
+/// Path for intraday minute candle data (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/charts/intraday>
+pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
+
+// ---------------------------------------------------------------------------
+// Historical Data — Candle Fetch Constants
+// ---------------------------------------------------------------------------
+
+/// 1-minute candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_1MIN: &str = "1";
+
+/// Maximum days of intraday data per API request (Dhan limit: 90 days).
+pub const DHAN_INTRADAY_MAX_DAYS_PER_REQUEST: u32 = 90;
+
+/// NSE F&O market open time as HH:MM:SS in IST.
+pub const MARKET_OPEN_TIME_IST: &str = "09:15:00";
+
+/// NSE F&O last 1-minute candle start time as HH:MM:SS in IST.
+/// The last 1-minute candle runs from 15:29:00 to 15:29:59 IST.
+pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
+
+/// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
+/// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
+pub const CANDLES_PER_TRADING_DAY: usize = 375;
+
+/// Batch size for QuestDB ILP flushes during historical candle ingestion.
+pub const CANDLE_FLUSH_BATCH_SIZE: usize = 500;
+
 // ---------------------------------------------------------------------------
 // Authentication — SSM Path Construction
 // ---------------------------------------------------------------------------
@@ -856,6 +884,9 @@ pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
 
 /// QuestDB table: previous close reference data from code 6 packets.
 pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
+
+/// QuestDB table: 1-minute OHLCV candles from Dhan historical API.
+pub const QUESTDB_TABLE_CANDLES_1M: &str = "candles_1m";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants

@@ -121,6 +121,82 @@ pub struct DeepDepthLevel {
 }
 
 // ---------------------------------------------------------------------------
+// Historical Candle — 1-minute OHLCV from Dhan intraday API
+// ---------------------------------------------------------------------------
+
+/// A single 1-minute OHLCV candle from Dhan's historical intraday API.
+///
+/// Used for cross-verification against live tick data and for backfill.
+/// Timestamps are UTC epoch seconds (converted from IST by the fetcher).
+#[derive(Debug, Clone, Copy)]
+pub struct HistoricalCandle {
+    /// Candle open timestamp as UTC epoch seconds.
+    pub timestamp_utc_secs: i64,
+    /// Dhan security identifier.
+    pub security_id: u32,
+    /// Exchange segment code (matches `ParsedTick::exchange_segment_code`).
+    pub exchange_segment_code: u8,
+    /// Open price in rupees.
+    pub open: f64,
+    /// High price in rupees.
+    pub high: f64,
+    /// Low price in rupees.
+    pub low: f64,
+    /// Close price in rupees.
+    pub close: f64,
+    /// Volume for this candle interval.
+    pub volume: i64,
+    /// Open interest (F&O instruments only; 0 for equity).
+    pub open_interest: i64,
+}
+
+/// Response from Dhan's intraday charts API.
+///
+/// Each field is a parallel array — index N across all arrays forms one candle.
+/// Dhan returns timestamps as IST-naive epoch seconds (same as WebSocket feed).
+#[derive(Debug, serde::Deserialize)]
+pub struct DhanIntradayResponse {
+    /// Opening prices per candle.
+    pub open: Vec<f64>,
+    /// High prices per candle.
+    pub high: Vec<f64>,
+    /// Low prices per candle.
+    pub low: Vec<f64>,
+    /// Closing prices per candle.
+    pub close: Vec<f64>,
+    /// Volume per candle.
+    pub volume: Vec<i64>,
+    /// Timestamps as epoch seconds (IST-naive from Dhan).
+    pub timestamp: Vec<i64>,
+    /// Open interest per candle (present when `oi: true` in request).
+    #[serde(default)]
+    pub open_interest: Vec<i64>,
+}
+
+impl DhanIntradayResponse {
+    /// Returns the number of candles in this response.
+    pub fn len(&self) -> usize {
+        self.timestamp.len()
+    }
+
+    /// Returns true if the response contains no candles.
+    pub fn is_empty(&self) -> bool {
+        self.timestamp.is_empty()
+    }
+
+    /// Validates that all parallel arrays have the same length.
+    pub fn is_consistent(&self) -> bool {
+        let n = self.timestamp.len();
+        self.open.len() == n
+            && self.high.len() == n
+            && self.low.len() == n
+            && self.close.len() == n
+            && self.volume.len() == n
+            && (self.open_interest.is_empty() || self.open_interest.len() == n)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -196,5 +272,87 @@ mod tests {
             orders: 1,
         };
         assert!((level.price - 24500.123456789).abs() < 1e-9);
+    }
+
+    // --- DhanIntradayResponse ---
+
+    #[test]
+    fn test_intraday_response_empty() {
+        let resp = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        assert!(resp.is_empty());
+        assert_eq!(resp.len(), 0);
+        assert!(resp.is_consistent());
+    }
+
+    #[test]
+    fn test_intraday_response_consistent() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![5000, 6000],
+        };
+        assert!(!resp.is_empty());
+        assert_eq!(resp.len(), 2);
+        assert!(resp.is_consistent());
+    }
+
+    #[test]
+    fn test_intraday_response_inconsistent_lengths() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0],
+            close: vec![101.0],
+            volume: vec![1000],
+            timestamp: vec![1700000000],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_intraday_response_oi_optional() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![102.0],
+            low: vec![99.0],
+            close: vec![101.0],
+            volume: vec![1000],
+            timestamp: vec![1700000000],
+            open_interest: vec![], // No OI — still consistent
+        };
+        assert!(resp.is_consistent());
+    }
+
+    // --- HistoricalCandle ---
+
+    #[test]
+    fn test_historical_candle_is_copy() {
+        let candle = HistoricalCandle {
+            timestamp_utc_secs: 1700000000,
+            security_id: 42,
+            exchange_segment_code: 2,
+            open: 100.0,
+            high: 102.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1000,
+            open_interest: 5000,
+        };
+        let copy = candle;
+        assert_eq!(candle.security_id, copy.security_id);
+        assert_eq!(candle.timestamp_utc_secs, copy.timestamp_utc_secs);
     }
 }
