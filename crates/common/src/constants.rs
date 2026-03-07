@@ -934,6 +934,28 @@ pub const FRAME_SEND_TIMEOUT_SECS: u64 = 5;
 pub const DEDUP_RING_BUFFER_POWER: u32 = 16;
 
 // ---------------------------------------------------------------------------
+// Indicator Engine — Ring Buffer & Warmup
+// ---------------------------------------------------------------------------
+
+/// Ring buffer capacity for windowed indicators (SMA, Stochastic, MFI).
+/// Must be a power of two for bitmask-based O(1) indexing.
+/// 64 slots covers periods up to 64 (SMA-50, RSI-14, ATR-14, etc.).
+pub const INDICATOR_RING_BUFFER_CAPACITY: usize = 64;
+
+/// Minimum ticks required before indicator values are considered reliable.
+/// Equal to the longest standard indicator warmup (EMA-26 needs ~26 ticks).
+/// After this many ticks, `IndicatorState::is_warm()` returns true.
+pub const MAX_INDICATOR_WARMUP_TICKS: u16 = 30;
+
+/// Maximum number of instruments the indicator engine can track.
+/// Pre-allocated at startup; O(1) index lookup by security_id.
+/// 25,000 covers full Dhan universe (5 connections × 5,000 instruments).
+pub const MAX_INDICATOR_INSTRUMENTS: usize = 25_000;
+
+/// Maximum number of strategy FSM instances.
+pub const MAX_STRATEGY_INSTANCES: usize = 256;
+
+// ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
 
@@ -983,6 +1005,12 @@ const _: () = assert!(
 const _: () = assert!(
     DEDUP_RING_BUFFER_POWER >= 8 && DEDUP_RING_BUFFER_POWER <= 24,
     "DEDUP_RING_BUFFER_POWER must be in [8, 24]"
+);
+
+// Sanity: indicator ring buffer capacity must be a power of two (bitmask indexing).
+const _: () = assert!(
+    INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two(),
+    "INDICATOR_RING_BUFFER_CAPACITY must be power of 2"
 );
 
 // ---------------------------------------------------------------------------
