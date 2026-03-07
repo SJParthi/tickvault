@@ -104,12 +104,40 @@ html, body {
     padding: 0 8px;
 }
 
-/* --- Chart Container --- */
+/* --- Chart Area (main chart + indicator panes) --- */
+
+.chart-area {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 38px - 28px); /* viewport - toolbar - statusbar */
+}
 
 .chart-container {
-    width: 100%;
-    height: calc(100vh - 38px - 28px); /* viewport - toolbar - statusbar */
+    flex: 1;
+    min-height: 0;
     background: var(--bg-primary);
+}
+
+/* --- Indicator Pane Sub-Charts --- */
+
+.pane-chart {
+    height: 120px;
+    min-height: 80px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-primary);
+    position: relative;
+}
+
+.pane-label {
+    position: absolute;
+    top: 4px;
+    left: 8px;
+    font-size: 10px;
+    color: var(--text-dim);
+    z-index: 10;
+    pointer-events: none;
+    font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+    letter-spacing: 0.3px;
 }
 
 /* --- Status Bar --- */
@@ -146,6 +174,78 @@ html, body {
 
 .status-version {
     color: var(--text-dim);
+}
+
+/* --- Indicator Picker Dropdown --- */
+
+.indicator-picker-overlay {
+    position: fixed;
+    z-index: 1000;
+    background: var(--bg-toolbar);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    min-width: 260px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    font-family: inherit;
+}
+
+.indicator-picker-header {
+    padding: 10px 14px;
+    font-weight: 600;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-primary);
+}
+
+.indicator-picker-list {
+    padding: 4px 0;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.indicator-picker-row {
+    display: flex;
+    align-items: center;
+    padding: 7px 14px;
+    gap: 10px;
+    cursor: pointer;
+    transition: background 0.1s ease;
+}
+
+.indicator-picker-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.indicator-picker-checkbox {
+    accent-color: var(--accent-blue);
+    cursor: pointer;
+    width: 14px;
+    height: 14px;
+}
+
+.indicator-picker-name {
+    flex: 1;
+    font-size: 12px;
+    color: var(--text-primary);
+}
+
+.indicator-picker-badge {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+}
+
+.indicator-picker-badge--overlay {
+    background: rgba(41, 98, 255, 0.15);
+    color: var(--accent-blue);
+}
+
+.indicator-picker-badge--pane {
+    background: rgba(255, 171, 0, 0.15);
+    color: var(--accent-yellow);
 }
 
 /* --- Scrollbar styling (Chromium) --- */

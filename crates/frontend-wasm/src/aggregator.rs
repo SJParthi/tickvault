@@ -43,6 +43,25 @@ impl Timeframe {
         self as u64
     }
 
+    /// Creates a Timeframe from seconds. Returns None if not a valid timeframe.
+    pub fn from_seconds(s: u64) -> Option<Self> {
+        match s {
+            1 => Some(Self::S1),
+            5 => Some(Self::S5),
+            15 => Some(Self::S15),
+            30 => Some(Self::S30),
+            60 => Some(Self::M1),
+            180 => Some(Self::M3),
+            300 => Some(Self::M5),
+            900 => Some(Self::M15),
+            1800 => Some(Self::M30),
+            3600 => Some(Self::H1),
+            14400 => Some(Self::H4),
+            86400 => Some(Self::D1),
+            _ => None,
+        }
+    }
+
     /// Aligns a UTC epoch timestamp to the start of its timeframe bucket.
     ///
     /// # IST Alignment
