@@ -472,11 +472,18 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor
     // -----------------------------------------------------------------------
+    let (tick_broadcast_sender, _initial_receiver) = tokio::sync::broadcast::channel(
+        dhan_live_trader_common::constants::TICK_BROADCAST_CHANNEL_CAPACITY,
+    );
+    // Drop the initial receiver — browser clients subscribe on WebSocket connect.
+    drop(_initial_receiver);
+
     let processor_handle = if let Some(receiver) = frame_receiver {
+        let broadcast_sender = tick_broadcast_sender.clone();
         let handle = tokio::spawn(async move {
-            run_tick_processor(receiver, tick_writer, depth_writer).await;
+            run_tick_processor(receiver, tick_writer, depth_writer, Some(broadcast_sender)).await;
         });
-        info!("tick processor started");
+        info!("tick processor started (broadcast enabled)");
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
@@ -490,6 +497,7 @@ async fn main() -> Result<()> {
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
+        tick_broadcast_sender,
     );
 
     let router = build_router(api_state);
@@ -524,6 +532,7 @@ async fn main() -> Result<()> {
         mode,
         "system ready — press Ctrl+C to stop\n\
          \n\
+           Terminal:   http://{bind_addr}/\n\
            Health:     http://{bind_addr}/health\n\
            Stats:      http://{bind_addr}/api/stats\n\
            Portal:     http://{bind_addr}/portal\n\
