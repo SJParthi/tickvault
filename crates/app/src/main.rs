@@ -393,20 +393,13 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 9: Create tick broadcast channel + spawn tick processor
+    // Step 9: Spawn tick processor
     // -----------------------------------------------------------------------
-    let (tick_broadcast_sender, _initial_receiver) = tokio::sync::broadcast::channel(
-        dhan_live_trader_common::constants::TICK_BROADCAST_CHANNEL_CAPACITY,
-    );
-    // Drop the initial receiver — browser clients subscribe on WebSocket connect.
-    drop(_initial_receiver);
-
     let processor_handle = if let Some(receiver) = frame_receiver {
-        let broadcast_sender = tick_broadcast_sender.clone();
         let handle = tokio::spawn(async move {
-            run_tick_processor(receiver, tick_writer, depth_writer, Some(broadcast_sender)).await;
+            run_tick_processor(receiver, tick_writer, depth_writer).await;
         });
-        info!("tick processor started (broadcast enabled)");
+        info!("tick processor started");
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
@@ -420,7 +413,6 @@ async fn main() -> Result<()> {
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
-        tick_broadcast_sender,
     );
 
     let router = build_router(api_state);
@@ -433,11 +425,7 @@ async fn main() -> Result<()> {
         .await
         .context("failed to bind API server")?;
 
-    info!(
-        address = %bind_addr,
-        "API server listening — open http://{} in browser",
-        bind_addr
-    );
+    info!(address = %bind_addr, "API server listening");
 
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
