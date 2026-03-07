@@ -19,6 +19,7 @@ use chrono::{FixedOffset, Utc};
 use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
@@ -34,6 +35,11 @@ use crate::auth::types::TokenState;
 
 /// Type alias for the token handle used across the codebase.
 type TokenHandle = std::sync::Arc<ArcSwap<Option<TokenState>>>;
+
+/// Maximum response body size for Dhan intraday API (10 MB).
+/// Prevents OOM from malicious/corrupted responses. A single instrument's
+/// 90-day × 375-candle response is ~100 KB of JSON — 10 MB is 100× headroom.
+const MAX_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Request / Response Types
@@ -191,10 +197,12 @@ pub async fn fetch_historical_candles(
             tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
         }
 
-        // Load current access token
+        // Load current access token (Zeroizing ensures the plaintext is wiped from heap on drop)
         let token_guard = token_handle.load();
         let access_token = match token_guard.as_ref() {
-            Some(token_state) => token_state.access_token().expose_secret().to_string(),
+            Some(token_state) => {
+                Zeroizing::new(token_state.access_token().expose_secret().to_string())
+            }
             None => {
                 warn!("no access token available — skipping historical fetch");
                 instruments_failed = instruments_failed.saturating_add(1);
@@ -224,7 +232,7 @@ pub async fn fetch_historical_candles(
 
             let result = http_client
                 .post(&endpoint)
-                .header("access-token", &access_token)
+                .header("access-token", access_token.as_str())
                 .header("client-id", client_id.expose_secret())
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
@@ -254,7 +262,38 @@ pub async fn fetch_historical_candles(
                         break;
                     }
 
-                    match response.json::<DhanIntradayResponse>().await {
+                    // Read body with size limit to prevent OOM from oversized responses
+                    let body_bytes = match response.bytes().await {
+                        Ok(b) => b,
+                        Err(err) => {
+                            if attempt < historical_config.max_retries {
+                                debug!(
+                                    ?err,
+                                    security_id, attempt, "failed to read response body — retrying"
+                                );
+                                continue;
+                            }
+                            warn!(
+                                ?err,
+                                security_id, "failed to read response body after all retries"
+                            );
+                            m_api_errors.increment(1);
+                            break;
+                        }
+                    };
+
+                    if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                        warn!(
+                            security_id,
+                            body_size = body_bytes.len(),
+                            max = MAX_RESPONSE_BODY_SIZE,
+                            "response body exceeds size limit — skipping"
+                        );
+                        m_api_errors.increment(1);
+                        break;
+                    }
+
+                    match serde_json::from_slice::<DhanIntradayResponse>(&body_bytes) {
                         Ok(data) => {
                             if data.is_empty() {
                                 debug!(security_id, "no candle data returned");
@@ -275,6 +314,26 @@ pub async fn fetch_historical_candles(
 
                             // Convert parallel arrays to candles and persist
                             for i in 0..data.len() {
+                                let open = data.open[i];
+                                let high = data.high[i];
+                                let low = data.low[i];
+                                let close = data.close[i];
+
+                                // Reject NaN/Infinity prices — corrupted data must not reach QuestDB
+                                if !open.is_finite()
+                                    || !high.is_finite()
+                                    || !low.is_finite()
+                                    || !close.is_finite()
+                                {
+                                    warn!(
+                                        security_id,
+                                        idx = i,
+                                        "NaN/Inf price in API response — skipping candle"
+                                    );
+                                    m_api_errors.increment(1);
+                                    continue;
+                                }
+
                                 // Convert IST-naive timestamp to UTC
                                 let ist_epoch = data.timestamp[i];
                                 let utc_epoch =
@@ -290,10 +349,10 @@ pub async fn fetch_historical_candles(
                                     timestamp_utc_secs: utc_epoch,
                                     security_id,
                                     exchange_segment_code: segment_code,
-                                    open: data.open[i],
-                                    high: data.high[i],
-                                    low: data.low[i],
-                                    close: data.close[i],
+                                    open,
+                                    high,
+                                    low,
+                                    close,
                                     volume: data.volume[i],
                                     open_interest: oi_value,
                                 };
@@ -349,6 +408,8 @@ pub async fn fetch_historical_candles(
             fetched_security_ids.insert(security_id);
             instruments_fetched = instruments_fetched.saturating_add(1);
             total_candles = total_candles.saturating_add(candles_for_instrument);
+            // APPROVED: usize->u64 is lossless on 64-bit targets (our only deployment target)
+            #[allow(clippy::cast_possible_truncation)]
             m_fetched.increment(candles_for_instrument as u64);
         } else {
             instruments_failed = instruments_failed.saturating_add(1);

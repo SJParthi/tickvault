@@ -140,7 +140,7 @@ pub async fn verify_candle_integrity(questdb_config: &QuestDbConfig) -> CrossVer
                         if row.len() < 2 {
                             continue;
                         }
-                        let candle_count = row[1].as_i64().unwrap_or(0) as usize;
+                        let candle_count = row[1].as_i64().unwrap_or(0).max(0) as usize;
                         total_candles = total_candles.saturating_add(candle_count);
 
                         if candle_count >= min_candles {

@@ -357,45 +357,51 @@ async fn main() -> Result<()> {
             match CandlePersistenceWriter::new(&config.questdb) {
                 Ok(mut candle_writer) => {
                     let token_handle = token_manager.token_handle();
-                    let client_id = {
-                        let credentials = secret_manager::fetch_dhan_credentials()
-                            .await
-                            .context("failed to fetch Dhan client ID for historical fetch")?;
-                        credentials.client_id.clone()
-                    };
+                    // Historical fetch is non-critical — credential failure must not crash
+                    match secret_manager::fetch_dhan_credentials().await {
+                        Ok(credentials) => {
+                            let client_id = credentials.client_id.clone();
 
-                    let fetch_summary = fetch_historical_candles(
-                        &plan.registry,
-                        &config.dhan,
-                        &config.historical,
-                        &token_handle,
-                        &client_id,
-                        &mut candle_writer,
-                    )
-                    .await;
+                            let fetch_summary = fetch_historical_candles(
+                                &plan.registry,
+                                &config.dhan,
+                                &config.historical,
+                                &token_handle,
+                                &client_id,
+                                &mut candle_writer,
+                            )
+                            .await;
 
-                    info!(
-                        instruments_fetched = fetch_summary.instruments_fetched,
-                        instruments_failed = fetch_summary.instruments_failed,
-                        total_candles = fetch_summary.total_candles,
-                        "historical candle fetch complete"
-                    );
+                            info!(
+                                instruments_fetched = fetch_summary.instruments_fetched,
+                                instruments_failed = fetch_summary.instruments_failed,
+                                total_candles = fetch_summary.total_candles,
+                                "historical candle fetch complete"
+                            );
 
-                    // Cross-verify candle integrity
-                    let verify_report = verify_candle_integrity(&config.questdb).await;
-                    if verify_report.passed {
-                        info!(
-                            instruments_checked = verify_report.instruments_checked,
-                            instruments_complete = verify_report.instruments_complete,
-                            "candle cross-verification PASSED"
-                        );
-                    } else {
-                        warn!(
-                            instruments_checked = verify_report.instruments_checked,
-                            instruments_with_gaps = verify_report.instruments_with_gaps,
-                            total_candles = verify_report.total_candles_in_db,
-                            "candle cross-verification: some instruments have gaps"
-                        );
+                            // Cross-verify candle integrity
+                            let verify_report = verify_candle_integrity(&config.questdb).await;
+                            if verify_report.passed {
+                                info!(
+                                    instruments_checked = verify_report.instruments_checked,
+                                    instruments_complete = verify_report.instruments_complete,
+                                    "candle cross-verification PASSED"
+                                );
+                            } else {
+                                warn!(
+                                    instruments_checked = verify_report.instruments_checked,
+                                    instruments_with_gaps = verify_report.instruments_with_gaps,
+                                    total_candles = verify_report.total_candles_in_db,
+                                    "candle cross-verification: some instruments have gaps"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                "failed to fetch credentials for historical fetch — skipping"
+                            );
+                        }
                     }
                 }
                 Err(err) => {
