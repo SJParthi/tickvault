@@ -67,7 +67,7 @@ pub struct WebSocketConnection {
     instruments: Vec<InstrumentSubscription>,
 
     /// Channel sender for forwarding raw binary frames to downstream.
-    frame_sender: mpsc::Sender<Vec<u8>>,
+    frame_sender: mpsc::Sender<bytes::Bytes>,
 
     /// Current connection state (tracked for health reporting).
     state: std::sync::Mutex<ConnectionState>,
@@ -93,7 +93,7 @@ impl WebSocketConnection {
         ws_config: WebSocketConfig,
         instruments: Vec<InstrumentSubscription>,
         feed_mode: FeedMode,
-        frame_sender: mpsc::Sender<Vec<u8>>,
+        frame_sender: mpsc::Sender<bytes::Bytes>,
     ) -> Self {
         let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
 
@@ -302,7 +302,9 @@ impl WebSocketConnection {
 
         // Connect with timeout.
         let connect_timeout = Duration::from_millis(
-            self.dhan_config.max_instruments_per_connection as u64 * 10 + 10000,
+            (self.dhan_config.max_instruments_per_connection as u64)
+                .saturating_mul(10)
+                .saturating_add(10000),
         );
         let connect_result = time::timeout(
             connect_timeout,
@@ -348,7 +350,7 @@ impl WebSocketConnection {
                 })?;
             // Yield between batches to avoid starving other tasks.
             // Skip yield after the last batch (nothing to wait for).
-            if batch_index < self.cached_subscription_messages.len() - 1 {
+            if batch_index < self.cached_subscription_messages.len().saturating_sub(1) {
                 tokio::task::yield_now().await;
             }
         }
@@ -407,12 +409,10 @@ impl WebSocketConnection {
                         // Forward raw binary frame to downstream with timeout.
                         // If the tick processor is blocked, we drop the frame
                         // rather than blocking the entire WS read loop.
-                        let send_timeout = Duration::from_secs(
+                        const SEND_TIMEOUT: Duration = Duration::from_secs(
                             dhan_live_trader_common::constants::FRAME_SEND_TIMEOUT_SECS,
                         );
-                        match time::timeout(send_timeout, self.frame_sender.send(data.to_vec()))
-                            .await
-                        {
+                        match time::timeout(SEND_TIMEOUT, self.frame_sender.send(data)).await {
                             Ok(Ok(())) => {} // sent successfully
                             Ok(Err(_)) => {
                                 warn!(
@@ -544,7 +544,7 @@ impl WebSocketConnection {
                 return;
             }
             time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
-            waited += POLL_INTERVAL_SECS;
+            waited = waited.saturating_add(POLL_INTERVAL_SECS);
         }
         warn!(
             connection_id = self.connection_id,
@@ -1978,7 +1978,9 @@ mod tests {
     }
 
     /// Helper: creates a `WebSocketConnection` with tiny timeouts for fast tests.
-    fn make_test_conn_for_read_loop(frame_sender: mpsc::Sender<Vec<u8>>) -> WebSocketConnection {
+    fn make_test_conn_for_read_loop(
+        frame_sender: mpsc::Sender<bytes::Bytes>,
+    ) -> WebSocketConnection {
         WebSocketConnection::new(
             0,
             make_test_token_handle(),

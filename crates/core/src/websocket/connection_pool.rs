@@ -37,7 +37,7 @@ pub struct WebSocketConnectionPool {
     connections: Vec<Arc<WebSocketConnection>>,
 
     /// Receiver for raw binary frames from all connections.
-    frame_receiver: mpsc::Receiver<Vec<u8>>,
+    frame_receiver: mpsc::Receiver<bytes::Bytes>,
 
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
@@ -85,7 +85,7 @@ impl WebSocketConnectionPool {
 
         // Dynamic capacity: effective limit depends on config, not hardcoded 25K.
         // If max_per_conn=2000, num_connections=5 → effective capacity = 10,000.
-        let effective_capacity = max_per_conn * num_connections;
+        let effective_capacity = max_per_conn.saturating_mul(num_connections);
         if total > effective_capacity {
             return Err(WebSocketError::CapacityExceeded {
                 requested: total,
@@ -103,7 +103,9 @@ impl WebSocketConnectionPool {
             (0..num_connections).map(|_| Vec::new()).collect();
 
         for (idx, instrument) in instruments.into_iter().enumerate() {
-            connection_instruments[idx % num_connections].push(instrument);
+            // SAFETY: num_connections guaranteed > 0 by config validation + .min(MAX_WEBSOCKET_CONNECTIONS=5)
+            let slot = idx.checked_rem(num_connections).unwrap_or(0);
+            connection_instruments[slot].push(instrument);
         }
 
         let connections: Vec<Arc<WebSocketConnection>> = connection_instruments
@@ -176,7 +178,7 @@ impl WebSocketConnectionPool {
     ///
     /// The caller owns this receiver and reads raw binary frames from
     /// all active connections. Each frame is a complete Dhan binary packet.
-    pub fn take_frame_receiver(&mut self) -> mpsc::Receiver<Vec<u8>> {
+    pub fn take_frame_receiver(&mut self) -> mpsc::Receiver<bytes::Bytes> {
         // Replace with a dummy channel — receiver can only be taken once.
         let (_, dummy) = mpsc::channel(1);
         std::mem::replace(&mut self.frame_receiver, dummy)
@@ -206,6 +208,7 @@ impl WebSocketConnectionPool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
     use crate::websocket::types::ConnectionState;

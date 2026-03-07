@@ -131,7 +131,7 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
             .underlyings
             .contains_key(&contract.underlying_symbol)
         {
-            orphan_derivatives += 1;
+            orphan_derivatives = orphan_derivatives.saturating_add(1);
             if orphan_derivatives <= 5 {
                 warn!(
                     security_id = contract.security_id,
@@ -158,7 +158,7 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
         if let Some(future_id) = chain.future_security_id
             && !universe.derivative_contracts.contains_key(&future_id)
         {
-            orphan_futures += 1;
+            orphan_futures = orphan_futures.saturating_add(1);
             if orphan_futures <= 5 {
                 warn!(
                     future_id,
@@ -183,7 +183,7 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
     let mut orphan_calendars: usize = 0;
     for symbol in universe.expiry_calendars.keys() {
         if !universe.underlyings.contains_key(symbol) {
-            orphan_calendars += 1;
+            orphan_calendars = orphan_calendars.saturating_add(1);
             if orphan_calendars <= 5 {
                 warn!(
                     symbol = %symbol,
@@ -210,7 +210,7 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
             .instrument_info
             .contains_key(&underlying.price_feed_security_id)
         {
-            missing_price_feeds += 1;
+            missing_price_feeds = missing_price_feeds.saturating_add(1);
             if missing_price_feeds <= 5 {
                 warn!(
                     symbol = %underlying.underlying_symbol,
@@ -244,6 +244,7 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
     use std::collections::HashMap;

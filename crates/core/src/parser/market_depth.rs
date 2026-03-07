@@ -206,4 +206,93 @@ mod tests {
             assert_eq!(level.ask_price, 0.0);
         }
     }
+
+    #[test]
+    fn test_parse_market_depth_nan_ltp_parses_without_panic() {
+        let (buf, hdr) = make_market_depth_packet(2, 13, f32::NAN, None);
+        let (tick, _) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_market_depth_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_market_depth_packet(2, 13, f32::INFINITY, None);
+        let (tick, _) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+    }
+
+    #[test]
+    fn test_parse_market_depth_neg_infinity_ltp_parses_without_panic() {
+        let (buf, hdr) = make_market_depth_packet(2, 13, f32::NEG_INFINITY, None);
+        let (tick, _) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price.is_infinite());
+        assert!(tick.last_traded_price.is_sign_negative());
+    }
+
+    #[test]
+    fn test_parse_market_depth_negative_zero_ltp() {
+        let (buf, hdr) = make_market_depth_packet(2, 13, -0.0, None);
+        let (tick, _) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.last_traded_price, 0.0); // -0.0 == 0.0 in IEEE 754
+    }
+
+    #[test]
+    fn test_parse_market_depth_nan_depth_prices_parse_without_panic() {
+        let depth_data = [
+            (1000u32, 500u32, 10u16, 5u16, f32::NAN, f32::NAN),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+        ];
+        let (buf, hdr) = make_market_depth_packet(2, 13, 24500.0, Some(depth_data));
+        let (_, depth) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert!(depth[0].bid_price.is_nan());
+        assert!(depth[0].ask_price.is_nan());
+    }
+
+    #[test]
+    fn test_parse_market_depth_infinity_depth_prices_parse_without_panic() {
+        let depth_data = [
+            (
+                1000u32,
+                500u32,
+                10u16,
+                5u16,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+            (0, 0, 0, 0, 0.0, 0.0),
+        ];
+        let (buf, hdr) = make_market_depth_packet(2, 13, 24500.0, Some(depth_data));
+        let (_, depth) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert!(depth[0].bid_price.is_infinite());
+        assert!(depth[0].ask_price.is_infinite());
+        assert!(depth[0].ask_price.is_sign_negative());
+    }
+
+    #[test]
+    fn test_parse_market_depth_extra_bytes_ignored() {
+        let (mut buf, hdr) = make_market_depth_packet(2, 13, 24500.0, None);
+        buf.extend_from_slice(&[0xFF; 20]); // extra garbage
+        let (tick, _) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert!((tick.last_traded_price - 24500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_market_depth_defaults_zero() {
+        let (buf, hdr) = make_market_depth_packet(0, 1, 100.0, None);
+        let (tick, _) = parse_market_depth_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.exchange_timestamp, 0);
+        assert_eq!(tick.volume, 0);
+        assert_eq!(tick.open_interest, 0);
+        assert_eq!(tick.average_traded_price, 0.0);
+        assert_eq!(tick.day_open, 0.0);
+        assert_eq!(tick.day_close, 0.0);
+        assert_eq!(tick.day_high, 0.0);
+        assert_eq!(tick.day_low, 0.0);
+    }
 }

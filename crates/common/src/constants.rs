@@ -226,11 +226,92 @@ pub const FEED_REQUEST_FULL: u8 = 21;
 pub const FEED_UNSUBSCRIBE_FULL: u8 = 22;
 
 // ---------------------------------------------------------------------------
-// Market Depth
+// Market Depth — Standard (5-Level)
 // ---------------------------------------------------------------------------
 
 /// Number of market depth levels in full quote.
 pub const MARKET_DEPTH_LEVELS: usize = 5;
+
+// ---------------------------------------------------------------------------
+// Deep Depth Protocol — 20-Level & 200-Level WebSocket Feeds
+// Source: DhanHQ Python SDK (src/dhanhq/marketfeed.py), Dhan API docs.
+// Separate WebSocket endpoints from the standard feed.
+// Bid and ask sides arrive as SEPARATE binary packets.
+// ---------------------------------------------------------------------------
+
+/// 20-level depth: number of price levels per side.
+pub const TWENTY_DEPTH_LEVELS: usize = 20;
+
+/// 200-level depth: number of price levels per side.
+pub const TWO_HUNDRED_DEPTH_LEVELS: usize = 200;
+
+/// Deep depth header size in bytes.
+/// Format: msg_length(u16) + feed_response_code(u8) + exchange_segment(u8)
+///       + security_id(u32) + msg_sequence(u32) = 12 bytes.
+pub const DEEP_DEPTH_HEADER_SIZE: usize = 12;
+
+/// Deep depth level size in bytes.
+/// Format: price(f64) + quantity(u32) + orders(u32) = 16 bytes.
+pub const DEEP_DEPTH_LEVEL_SIZE: usize = 16;
+
+/// Feed response code indicating a BID-side depth packet.
+pub const DEEP_DEPTH_FEED_CODE_BID: u8 = 41;
+
+/// Feed response code indicating an ASK-side depth packet.
+pub const DEEP_DEPTH_FEED_CODE_ASK: u8 = 51;
+
+/// 20-level depth body size per side (20 levels × 16 bytes).
+pub const TWENTY_DEPTH_BODY_SIZE: usize = TWENTY_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE;
+
+/// 20-level depth total packet size per side (header + body).
+pub const TWENTY_DEPTH_PACKET_SIZE: usize = DEEP_DEPTH_HEADER_SIZE + TWENTY_DEPTH_BODY_SIZE;
+
+/// 200-level depth body size per side (200 levels × 16 bytes).
+pub const TWO_HUNDRED_DEPTH_BODY_SIZE: usize = TWO_HUNDRED_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE;
+
+/// 200-level depth total packet size per side (header + body).
+pub const TWO_HUNDRED_DEPTH_PACKET_SIZE: usize =
+    DEEP_DEPTH_HEADER_SIZE + TWO_HUNDRED_DEPTH_BODY_SIZE;
+
+/// Maximum instruments per 20-depth WebSocket connection (Dhan limit).
+pub const MAX_INSTRUMENTS_PER_TWENTY_DEPTH_CONNECTION: usize = 50;
+
+/// Maximum instruments per 200-depth WebSocket connection (Dhan limit: 1).
+pub const MAX_INSTRUMENTS_PER_TWO_HUNDRED_DEPTH_CONNECTION: usize = 1;
+
+/// Subscription request code for 20-level depth feed.
+pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
+
+/// Unsubscription request code for 20-level depth feed.
+pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 24;
+
+// ---------------------------------------------------------------------------
+// Deep Depth Protocol — Header Byte Offsets
+// ---------------------------------------------------------------------------
+
+/// Message length (u16 LE) offset in deep depth header.
+pub const DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH: usize = 0;
+
+/// Feed response code (u8) offset in deep depth header.
+pub const DEEP_DEPTH_HEADER_OFFSET_FEED_CODE: usize = 2;
+
+/// Exchange segment (u8) offset in deep depth header.
+pub const DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT: usize = 3;
+
+/// Security ID (u32 LE) offset in deep depth header.
+pub const DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID: usize = 4;
+
+/// Message sequence number (u32 LE) offset in deep depth header.
+pub const DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Live Order Update WebSocket
+// Source: DhanHQ API docs, Python SDK.
+// Separate JSON-based WebSocket (NOT binary).
+// ---------------------------------------------------------------------------
+
+/// Message code for order update WebSocket login request.
+pub const ORDER_UPDATE_LOGIN_MSG_CODE: u16 = 42;
 
 // ---------------------------------------------------------------------------
 // SEBI Compliance
@@ -804,6 +885,16 @@ pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
 /// after this timeout instead of blocking forever.
 pub const FRAME_SEND_TIMEOUT_SECS: u64 = 5;
 
+/// Power-of-two exponent for the tick deduplication ring buffer.
+///
+/// Size = 2^16 = 65,536 slots x 8 bytes = 512 KiB.
+/// Catches exact duplicate ticks (same security_id + timestamp + LTP)
+/// resent by Dhan on WebSocket reconnection.
+///
+/// False negatives (missed duplicates due to hash collision/eviction) are safe:
+/// QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the authoritative dedup layer.
+pub const DEDUP_RING_BUFFER_POWER: u32 = 16;
+
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
@@ -835,4 +926,23 @@ const _: () = assert!(
 const _: () = assert!(
     ORDER_EVENT_RING_BUFFER_CAPACITY.is_power_of_two(),
     "ORDER_EVENT_RING_BUFFER_CAPACITY must be power of 2"
+);
+
+// Sanity: deep depth packet sizes are consistent.
+const _: () = assert!(
+    TWENTY_DEPTH_PACKET_SIZE
+        == DEEP_DEPTH_HEADER_SIZE + TWENTY_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE,
+    "TWENTY_DEPTH_PACKET_SIZE mismatch"
+);
+const _: () = assert!(
+    TWO_HUNDRED_DEPTH_PACKET_SIZE
+        == DEEP_DEPTH_HEADER_SIZE + TWO_HUNDRED_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE,
+    "TWO_HUNDRED_DEPTH_PACKET_SIZE mismatch"
+);
+
+// Sanity: dedup ring buffer power must be in range [8, 24].
+// 2^8 = 256 (minimum useful), 2^24 = 16M (8 bytes × 16M = 128 MiB max).
+const _: () = assert!(
+    DEDUP_RING_BUFFER_POWER >= 8 && DEDUP_RING_BUFFER_POWER <= 24,
+    "DEDUP_RING_BUFFER_POWER must be in [8, 24]"
 );
