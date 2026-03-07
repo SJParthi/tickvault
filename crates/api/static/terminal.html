@@ -4,28 +4,469 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DLT Terminal — dhan-live-trader</title>
-    <link rel="stylesheet" href="/static/terminal.css">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #131722;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            color: #d1d4dc;
+        }
+
+        /* Top ticker bar */
+        .ticker-bar {
+            display: flex;
+            align-items: center;
+            height: 36px;
+            background: #1e222d;
+            border-bottom: 1px solid #2a2e39;
+            padding: 0 12px;
+            gap: 24px;
+            overflow-x: auto;
+            white-space: nowrap;
+            font-size: 12px;
+        }
+
+        .ticker-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .ticker-name {
+            color: #d1d4dc;
+            font-weight: 500;
+        }
+
+        .ticker-price {
+            color: #d1d4dc;
+        }
+
+        .ticker-change.positive {
+            color: #26a69a;
+        }
+
+        .ticker-change.negative {
+            color: #ef5350;
+        }
+
+        /* DLT brand header */
+        .brand-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 40px;
+            background: #1e222d;
+            border-bottom: 1px solid #2a2e39;
+            padding: 0 16px;
+        }
+
+        .brand-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand-logo {
+            font-size: 16px;
+            font-weight: 700;
+            color: #2962ff;
+            letter-spacing: -0.5px;
+        }
+
+        .brand-symbol {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: #787b86;
+        }
+
+        .brand-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            font-size: 12px;
+        }
+
+        .nav-link {
+            color: #787b86;
+            text-decoration: none;
+            transition: color 0.2s;
+            cursor: pointer;
+        }
+
+        .nav-link:hover {
+            color: #d1d4dc;
+        }
+
+        .nav-link.active {
+            color: #d1d4dc;
+            font-weight: 500;
+        }
+
+        .live-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #26a69a;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: #787b86;
+        }
+
+        /* Main chart container */
+        .chart-wrapper {
+            width: 100%;
+            height: calc(100vh - 36px - 40px - 28px);
+            position: relative;
+        }
+
+        .tradingview-widget-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        .tradingview-widget-container__widget {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Bottom status bar */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 28px;
+            background: #1e222d;
+            border-top: 1px solid #2a2e39;
+            padding: 0 12px;
+            font-size: 11px;
+            color: #787b86;
+        }
+
+        .status-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .status-label {
+            color: #555;
+        }
+
+        .status-value {
+            color: #787b86;
+        }
+
+        .status-value.connected {
+            color: #26a69a;
+        }
+
+        /* Right sidebar icons (mimicking Dhan/Groww) */
+        .right-sidebar {
+            position: fixed;
+            right: 0;
+            top: 76px;
+            bottom: 28px;
+            width: 42px;
+            background: #1e222d;
+            border-left: 1px solid #2a2e39;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 8px;
+            gap: 4px;
+            z-index: 10;
+        }
+
+        .sidebar-btn {
+            width: 34px;
+            height: 34px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            color: #787b86;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-size: 10px;
+            text-align: center;
+            line-height: 1.1;
+            border: none;
+            background: none;
+        }
+
+        .sidebar-btn:hover {
+            background: #2a2e39;
+            color: #d1d4dc;
+        }
+
+        .sidebar-btn.active {
+            color: #2962ff;
+        }
+
+        .sidebar-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+    </style>
 </head>
 <body>
-    <!-- Top Toolbar -->
-    <div id="toolbar" class="toolbar"></div>
-
-    <!-- Chart Area (main chart + dynamic indicator panes) -->
-    <div id="chart-area" class="chart-area">
-        <div id="chart-container" class="chart-container"></div>
-        <!-- Indicator pane sub-charts are appended here dynamically -->
+    <!-- Top Ticker Bar -->
+    <div class="ticker-bar" id="ticker-bar">
+        <div class="ticker-item">
+            <span class="ticker-name">NIFTY</span>
+            <span class="ticker-price" id="nifty-price">24,450.45</span>
+            <span class="ticker-change negative" id="nifty-change">-315.45 (-1.27%)</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">SENSEX</span>
+            <span class="ticker-price">78,918.90</span>
+            <span class="ticker-change negative">-1,097.00 (-1.37%)</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">BANKNIFTY</span>
+            <span class="ticker-price">57,783.25</span>
+            <span class="ticker-change negative">-1,272.60 (-2.15%)</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">FINNIFTY</span>
+            <span class="ticker-price">25,120.30</span>
+            <span class="ticker-change negative">-380.15 (-1.49%)</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">CRUDE OIL</span>
+            <span class="ticker-price">8,325.00</span>
+            <span class="ticker-change positive">+1,009.00 (+13.79%)</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">NATURAL GAS</span>
+            <span class="ticker-price">294.50</span>
+            <span class="ticker-change positive">+20.90 (+7.64%)</span>
+        </div>
     </div>
 
-    <!-- Status Bar -->
-    <div id="status-bar" class="status-bar">
-        <span id="ohlcv-display" class="status-ohlcv">O — H — L — C — V —</span>
-        <span class="status-spacer"></span>
-        <span id="latency-display" class="status-latency">— ms</span>
-        <span class="status-separator">·</span>
-        <span class="status-version">DLT v0.1.0</span>
+    <!-- Brand / Navigation Bar -->
+    <div class="brand-bar">
+        <div class="brand-left">
+            <span class="brand-logo">DLT Terminal</span>
+            <span class="brand-symbol">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#787b86" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <path d="M21 21l-4.35-4.35"></path>
+                </svg>
+                Search for Stocks, F&O, Indices etc.
+            </span>
+        </div>
+        <div class="brand-right">
+            <a class="nav-link active" href="/">Terminal</a>
+            <a class="nav-link" href="/portal">Portal</a>
+            <a class="nav-link" href="/health">Health</a>
+            <div class="status-badge">
+                <div class="live-dot"></div>
+                <span id="ws-status">Live</span>
+            </div>
+        </div>
     </div>
 
-    <!-- Script (bundled by esbuild) -->
-    <script type="module" src="/static/terminal.js"></script>
+    <!-- TradingView Advanced Chart Widget -->
+    <div class="chart-wrapper">
+        <div class="tradingview-widget-container" style="height:100%;width:calc(100% - 42px);">
+            <div class="tradingview-widget-container__widget" style="height:calc(100% - 32px);width:100%"></div>
+            <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+            {
+                "autosize": true,
+                "symbol": "NSE:NIFTY",
+                "interval": "5",
+                "timezone": "Asia/Kolkata",
+                "theme": "dark",
+                "style": "1",
+                "locale": "en",
+                "backgroundColor": "rgba(19, 23, 34, 1)",
+                "gridColor": "rgba(42, 46, 57, 0.3)",
+                "hide_top_toolbar": false,
+                "hide_legend": false,
+                "allow_symbol_change": true,
+                "save_image": true,
+                "calendar": false,
+                "hide_volume": false,
+                "support_host": "https://www.tradingview.com",
+                "withdateranges": true,
+                "details": true,
+                "hotlist": true,
+                "show_popup_button": true,
+                "popup_width": "1000",
+                "popup_height": "650",
+                "studies": [
+                    "STD;VWAP"
+                ],
+                "watchlist": [
+                    "NSE:NIFTY",
+                    "NSE:BANKNIFTY",
+                    "NSE:RELIANCE",
+                    "NSE:TCS",
+                    "NSE:INFY",
+                    "NSE:HDFCBANK",
+                    "NSE:ICICIBANK",
+                    "NSE:SBIN",
+                    "NSE:AXISBANK",
+                    "NSE:KOTAKBANK"
+                ]
+            }
+            </script>
+        </div>
+    </div>
+
+    <!-- Right Sidebar -->
+    <div class="right-sidebar">
+        <button class="sidebar-btn" title="Positions">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+            </svg>
+        </button>
+        <button class="sidebar-btn" title="Option Chain">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/>
+            </svg>
+        </button>
+        <button class="sidebar-btn" title="Orders">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M9 5l7 7-7 7"/>
+            </svg>
+        </button>
+        <button class="sidebar-btn" title="Watchlist">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
+            </svg>
+        </button>
+        <button class="sidebar-btn" title="Market Depth">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M3 4h18M3 8h14M3 12h10M3 16h6M3 20h2"/>
+            </svg>
+        </button>
+        <button class="sidebar-btn" title="Holdings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                <path d="M12 8v4l3 3"/>
+            </svg>
+        </button>
+        <button class="sidebar-btn" title="Balance">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+        </button>
+    </div>
+
+    <!-- Bottom Status Bar -->
+    <div class="status-bar">
+        <div class="status-left">
+            <div class="status-item">
+                <span class="status-label">DLT</span>
+                <span class="status-value">v0.1.0</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">WS</span>
+                <span class="status-value connected" id="ws-indicator">Connected</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Latency</span>
+                <span class="status-value connected" id="latency-display">0 ms</span>
+            </div>
+        </div>
+        <div class="status-right">
+            <div class="status-item">
+                <span class="status-value" id="clock-display"></span>
+            </div>
+            <div class="status-item">
+                <span class="status-value">IST UTC+5:30</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Live IST clock
+        function updateClock() {
+            const now = new Date();
+            const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) - (now.getTimezoneOffset() * 60 * 1000));
+            const h = String(ist.getUTCHours()).padStart(2, '0');
+            const m = String(ist.getUTCMinutes()).padStart(2, '0');
+            const s = String(ist.getUTCSeconds()).padStart(2, '0');
+            document.getElementById('clock-display').textContent = h + ':' + m + ':' + s;
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        // WebSocket connection status + live ticker updates
+        (function() {
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = wsProtocol + '//' + location.host + '/ws/ticks';
+            let ws = null;
+            let retryDelay = 1000;
+
+            function connect() {
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = function() {
+                    retryDelay = 1000;
+                    document.getElementById('ws-status').textContent = 'Live';
+                    document.getElementById('ws-indicator').textContent = 'Connected';
+                    document.getElementById('ws-indicator').classList.add('connected');
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        const tick = JSON.parse(event.data);
+                        // Update NIFTY ticker if it matches (security_id for NIFTY 50 index)
+                        if (tick.ltp) {
+                            const price = tick.ltp.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                            const latency = Date.now() - (tick.timestamp * 1000);
+                            document.getElementById('latency-display').textContent = Math.max(0, latency) + ' ms';
+                        }
+                    } catch (e) { /* ignore parse errors */ }
+                };
+
+                ws.onclose = function() {
+                    document.getElementById('ws-status').textContent = 'Disconnected';
+                    document.getElementById('ws-indicator').textContent = 'Disconnected';
+                    document.getElementById('ws-indicator').classList.remove('connected');
+                    setTimeout(connect, retryDelay);
+                    retryDelay = Math.min(retryDelay * 2, 30000);
+                };
+
+                ws.onerror = function() {
+                    ws.close();
+                };
+            }
+
+            connect();
+        })();
+    </script>
 </body>
 </html>
