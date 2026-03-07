@@ -100,6 +100,27 @@ pub struct MarketDepthLevel {
 }
 
 // ---------------------------------------------------------------------------
+// Deep Depth Level — from 20-level / 200-level depth feeds
+// ---------------------------------------------------------------------------
+
+/// A single level of market depth from the 20-level or 200-level depth feed.
+///
+/// These feeds use f64 prices (unlike the standard 5-level feed which uses f32)
+/// and send bid/ask sides as separate packets. Each level contains
+/// price, quantity, and order count for one side only.
+///
+/// Wire format per level: price(f64 LE, 8 bytes) + quantity(u32 LE, 4 bytes) + orders(u32 LE, 4 bytes) = 16 bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DeepDepthLevel {
+    /// Price at this level (rupees, f64 — higher precision than 5-level f32).
+    pub price: f64,
+    /// Quantity at this level.
+    pub quantity: u32,
+    /// Number of orders at this level.
+    pub orders: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -142,5 +163,38 @@ mod tests {
         assert_eq!(level.ask_orders, 0);
         assert_eq!(level.bid_price, 0.0);
         assert_eq!(level.ask_price, 0.0);
+    }
+
+    // --- DeepDepthLevel ---
+
+    #[test]
+    fn test_deep_depth_level_default() {
+        let level = DeepDepthLevel::default();
+        assert_eq!(level.price, 0.0);
+        assert_eq!(level.quantity, 0);
+        assert_eq!(level.orders, 0);
+    }
+
+    #[test]
+    fn test_deep_depth_level_is_copy() {
+        let level = DeepDepthLevel {
+            price: 24500.50,
+            quantity: 1000,
+            orders: 42,
+        };
+        let copy = level; // Copy, not move
+        assert_eq!(level.price, copy.price);
+        assert_eq!(level.quantity, copy.quantity);
+        assert_eq!(level.orders, copy.orders);
+    }
+
+    #[test]
+    fn test_deep_depth_level_f64_precision() {
+        let level = DeepDepthLevel {
+            price: 24500.123456789,
+            quantity: 1,
+            orders: 1,
+        };
+        assert!((level.price - 24500.123456789).abs() < 1e-9);
     }
 }
