@@ -1076,7 +1076,7 @@ app → api → trading → core → storage → common
 | `core` | WebSocket client, binary parser, tick pipeline, candle builder | tokio, tokio-tungstenite, zerocopy, rtrb, crossbeam |
 | `trading` | OMS state machine, risk engine, order API client, strategy trait | statig, governor, failsafe, blackscholes |
 | `storage` | QuestDB ILP writer, Valkey cache, instrument persistence | questdb-rs, redis/deadpool-redis |
-| `api` | HTTP server, REST endpoints, WebSocket proxy to frontend | axum, tower, tower-http |
+| `api` | HTTP server, REST endpoints, health/stats/instruments | axum, tower, tower-http |
 | `app` | main(), boot sequence, signal handling, orchestration | clap, signal-hook, sd-notify |
 
 ---
@@ -1356,8 +1356,7 @@ Response: Array of OHLCV candles with timestamps.
 
 - [ ] axum server with tower middleware
 - [ ] CORS, compression, tracing middleware
-- [ ] REST endpoints: ticks, candles, option chains, orders, positions
-- [ ] WebSocket proxy for live data to frontend
+- [ ] REST endpoints: candles, option chains, orders, positions
 - [ ] Health check endpoint
 
 ### Block 13: Observability Stack

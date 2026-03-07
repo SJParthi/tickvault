@@ -34,6 +34,8 @@ use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_manager::TokenManager;
+use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
+use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
 use dhan_live_trader_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
     run_instrument_diagnostic,
@@ -43,6 +45,9 @@ use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::types::InstrumentSubscription;
 
+use dhan_live_trader_storage::candle_persistence::{
+    CandlePersistenceWriter, ensure_candle_table_dedup_keys,
+};
 use dhan_live_trader_storage::instrument_persistence::ensure_instrument_tables;
 use dhan_live_trader_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
@@ -228,11 +233,12 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 6: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!("setting up QuestDB tables (ticks + instruments + depth + previous_close)");
+    info!("setting up QuestDB tables (ticks + instruments + depth + previous_close + candles_1m)");
 
     ensure_tick_table_dedup_keys(&config.questdb).await;
     ensure_depth_and_prev_close_tables(&config.questdb).await;
     ensure_instrument_tables(&config.questdb).await;
+    ensure_candle_table_dedup_keys(&config.questdb).await;
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(writer) => {
@@ -342,6 +348,77 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 7.5: Fetch historical candles + cross-verify (automated, no human intervention)
+    // -----------------------------------------------------------------------
+    if config.historical.enabled {
+        if let Some(plan) = &subscription_plan {
+            info!("fetching historical 1-minute candles from Dhan API");
+
+            match CandlePersistenceWriter::new(&config.questdb) {
+                Ok(mut candle_writer) => {
+                    let token_handle = token_manager.token_handle();
+                    // Historical fetch is non-critical — credential failure must not crash
+                    match secret_manager::fetch_dhan_credentials().await {
+                        Ok(credentials) => {
+                            let client_id = credentials.client_id.clone();
+
+                            let fetch_summary = fetch_historical_candles(
+                                &plan.registry,
+                                &config.dhan,
+                                &config.historical,
+                                &token_handle,
+                                &client_id,
+                                &mut candle_writer,
+                            )
+                            .await;
+
+                            info!(
+                                instruments_fetched = fetch_summary.instruments_fetched,
+                                instruments_failed = fetch_summary.instruments_failed,
+                                total_candles = fetch_summary.total_candles,
+                                "historical candle fetch complete"
+                            );
+
+                            // Cross-verify candle integrity
+                            let verify_report = verify_candle_integrity(&config.questdb).await;
+                            if verify_report.passed {
+                                info!(
+                                    instruments_checked = verify_report.instruments_checked,
+                                    instruments_complete = verify_report.instruments_complete,
+                                    "candle cross-verification PASSED"
+                                );
+                            } else {
+                                warn!(
+                                    instruments_checked = verify_report.instruments_checked,
+                                    instruments_with_gaps = verify_report.instruments_with_gaps,
+                                    total_candles = verify_report.total_candles_in_db,
+                                    "candle cross-verification: some instruments have gaps"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                "failed to fetch credentials for historical fetch — skipping"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "QuestDB candle writer unavailable — skipping historical fetch"
+                    );
+                }
+            }
+        } else {
+            info!("historical fetch skipped — no subscription plan available");
+        }
+    } else {
+        info!("historical candle fetch disabled in config");
+    }
+
+    // -----------------------------------------------------------------------
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let (frame_receiver, ws_handles) = if let Some(plan) = &subscription_plan {
@@ -393,20 +470,13 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 9: Create tick broadcast channel + spawn tick processor
+    // Step 9: Spawn tick processor
     // -----------------------------------------------------------------------
-    let (tick_broadcast_sender, _initial_receiver) = tokio::sync::broadcast::channel(
-        dhan_live_trader_common::constants::TICK_BROADCAST_CHANNEL_CAPACITY,
-    );
-    // Drop the initial receiver — browser clients subscribe on WebSocket connect.
-    drop(_initial_receiver);
-
     let processor_handle = if let Some(receiver) = frame_receiver {
-        let broadcast_sender = tick_broadcast_sender.clone();
         let handle = tokio::spawn(async move {
-            run_tick_processor(receiver, tick_writer, depth_writer, Some(broadcast_sender)).await;
+            run_tick_processor(receiver, tick_writer, depth_writer, None).await;
         });
-        info!("tick processor started (broadcast enabled)");
+        info!("tick processor started");
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
@@ -420,7 +490,6 @@ async fn main() -> Result<()> {
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
-        tick_broadcast_sender,
     );
 
     let router = build_router(api_state);
@@ -433,11 +502,7 @@ async fn main() -> Result<()> {
         .await
         .context("failed to bind API server")?;
 
-    info!(
-        address = %bind_addr,
-        "API server listening — open http://{} in browser",
-        bind_addr
-    );
+    info!(address = %bind_addr, "API server listening");
 
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
@@ -463,12 +528,7 @@ async fn main() -> Result<()> {
            Health:     http://{bind_addr}/health\n\
            Stats:      http://{bind_addr}/api/stats\n\
            Portal:     http://{bind_addr}/portal\n\
-           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n\
-         \n\
-           Grafana:    http://localhost:3000\n\
-           Prometheus: http://localhost:9090\n\
-           Jaeger:     http://localhost:16686\n\
-           QuestDB:    http://localhost:9000\n"
+           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n"
     );
 
     notifier.notify(NotificationEvent::StartupComplete { mode });

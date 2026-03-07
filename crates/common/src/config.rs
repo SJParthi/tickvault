@@ -30,6 +30,8 @@ pub struct ApplicationConfig {
     pub notification: NotificationConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub historical: HistoricalDataConfig,
 }
 
 /// Trading session timing configuration.
@@ -318,6 +320,37 @@ impl SubscriptionConfig {
     }
 }
 
+/// Historical data fetching configuration.
+///
+/// Controls automated fetching of 1-minute OHLCV candles from Dhan's
+/// intraday charts API for cross-verification with live tick data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoricalDataConfig {
+    /// Enable automated historical candle fetching after market close.
+    pub enabled: bool,
+    /// Number of past trading days to fetch on startup for cross-verification.
+    /// Dhan allows up to 90 days per request.
+    pub lookback_days: u32,
+    /// HTTP request timeout in seconds for historical data API calls.
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts for failed API requests.
+    pub max_retries: u32,
+    /// Delay in milliseconds between consecutive API requests (rate limiting).
+    pub request_delay_ms: u64,
+}
+
+impl Default for HistoricalDataConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lookback_days: 5,
+            request_timeout_secs: 30,
+            max_retries: 3,
+            request_delay_ms: 500,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration Validation
 // ---------------------------------------------------------------------------
@@ -491,6 +524,23 @@ impl ApplicationConfig {
             bail!("notification.send_timeout_ms must be > 0");
         }
 
+        // Historical: validate if enabled.
+        if self.historical.enabled {
+            if self.historical.lookback_days == 0
+                || self.historical.lookback_days
+                    > crate::constants::DHAN_INTRADAY_MAX_DAYS_PER_REQUEST
+            {
+                bail!(
+                    "historical.lookback_days must be in [1, {}], got {}",
+                    crate::constants::DHAN_INTRADAY_MAX_DAYS_PER_REQUEST,
+                    self.historical.lookback_days
+                );
+            }
+            if self.historical.request_timeout_secs == 0 {
+                bail!("historical.request_timeout_secs must be > 0");
+            }
+        }
+
         Ok(())
     }
 }
@@ -586,6 +636,7 @@ mod tests {
             subscription: SubscriptionConfig::default(),
             notification: NotificationConfig::default(),
             observability: ObservabilityConfig::default(),
+            historical: HistoricalDataConfig::default(),
         }
     }
 

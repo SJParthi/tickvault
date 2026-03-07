@@ -22,6 +22,7 @@
 //! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route
 
 pub mod auth;
+pub mod historical;
 pub mod instrument;
 pub mod notification;
 pub mod parser;

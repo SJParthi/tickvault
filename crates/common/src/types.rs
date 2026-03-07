@@ -87,6 +87,18 @@ impl ExchangeSegment {
             Self::McxComm => "MCX_COMM",
         }
     }
+
+    /// Returns the binary wire code used in Dhan WebSocket V2 protocol.
+    pub fn binary_code(&self) -> u8 {
+        match self {
+            Self::IdxI => 0,
+            Self::NseEquity => 1,
+            Self::NseFno => 2,
+            Self::BseEquity => 4,
+            Self::BseFno => 7,
+            Self::McxComm => 5,
+        }
+    }
 }
 
 impl fmt::Display for ExchangeSegment {
@@ -170,6 +182,22 @@ impl InstrumentType {
             Self::Equity => "Equity",
             Self::Future => "Future",
             Self::Option => "Option",
+        }
+    }
+
+    /// Returns the Dhan REST API instrument type string for historical data requests.
+    ///
+    /// Dhan API uses specific instrument strings (e.g., "FUTIDX", "OPTIDX")
+    /// that differ from our internal classification. The `is_index_underlying`
+    /// flag disambiguates index vs stock derivatives.
+    pub fn dhan_api_instrument_type(&self, is_index_underlying: bool) -> &'static str {
+        match (self, is_index_underlying) {
+            (Self::Index, _) => "INDEX",
+            (Self::Equity, _) => "EQUITY",
+            (Self::Future, true) => "FUTIDX",
+            (Self::Future, false) => "FUTSTK",
+            (Self::Option, true) => "OPTIDX",
+            (Self::Option, false) => "OPTSTK",
         }
     }
 }

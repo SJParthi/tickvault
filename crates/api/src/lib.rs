@@ -26,22 +26,6 @@ pub fn build_router(state: SharedAppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        // Terminal frontend
-        .route("/", axum::routing::get(handlers::terminal::terminal_page))
-        .route(
-            "/static/terminal.js",
-            axum::routing::get(handlers::terminal::terminal_js),
-        )
-        .route(
-            "/static/terminal.css",
-            axum::routing::get(handlers::terminal::terminal_css),
-        )
-        // WebSocket tick stream for browser
-        .route(
-            "/ws/ticks",
-            axum::routing::get(handlers::terminal::websocket_ticks),
-        )
-        // Existing API routes
         .route(
             "/health",
             axum::routing::get(handlers::health::health_check),
