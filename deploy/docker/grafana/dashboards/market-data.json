@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader — Live market data explorer. Ticks, candles, instruments — zero SQL required.",
+  "description": "dhan-live-trader — Live market data explorer. Ticks, candles, candlestick charts, instruments — zero SQL required.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -179,6 +179,157 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 150,
+      "title": "Candlestick Charts (select instrument above)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "description": "Historical 1-minute OHLCV candlestick chart from Dhan REST API data. Select segment and security_id from dropdowns above. SMA 20 overlay included.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false }
+          },
+          "color": { "mode": "fixed" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "open" },
+            "properties": [
+              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "SMA 20" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "#FF9800", "mode": "fixed" } },
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "volume" },
+            "properties": [
+              { "id": "unit", "value": "locale" },
+              { "id": "custom.hideFrom", "value": { "legend": false, "tooltip": false, "viz": false } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 6 },
+      "id": 11,
+      "options": {
+        "mode": 2,
+        "candleStyle": "candles",
+        "colorStrategy": "open-close",
+        "colors": { "up": "green", "down": "red", "flat": "gray" },
+        "includeAllFields": true
+      },
+      "title": "Historical Candles — ${segment} / ${security_id}",
+      "type": "candlestick",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "refId": "OHLCV"
+        },
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS time,\n  avg(close) OVER (ORDER BY ts ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM historical_candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "refId": "SMA",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "description": "Live 1-minute OHLCV candlestick chart aggregated from real-time ticks via QuestDB materialized views. SMA 20 overlay included.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false }
+          },
+          "color": { "mode": "fixed" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "open" },
+            "properties": [
+              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "SMA 20" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "#2196F3", "mode": "fixed" } },
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "volume" },
+            "properties": [
+              { "id": "unit", "value": "locale" },
+              { "id": "custom.hideFrom", "value": { "legend": false, "tooltip": false, "viz": false } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 22 },
+      "id": 12,
+      "options": {
+        "mode": 2,
+        "candleStyle": "candles",
+        "colorStrategy": "open-close",
+        "colors": { "up": "green", "down": "red", "flat": "gray" },
+        "includeAllFields": true
+      },
+      "title": "Live Candles (Ticks → 1m) — ${segment} / ${security_id}",
+      "type": "candlestick",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "refId": "OHLCV"
+        },
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS time,\n  avg(close) OVER (ORDER BY ts ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "refId": "SMA",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
       "id": 200,
       "title": "Latest Ticks (Live Feed)",
       "type": "row"
@@ -226,7 +377,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 39 },
       "id": 10,
       "options": {
         "showHeader": true,
@@ -250,7 +401,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
       "id": 300,
       "title": "Historical Candles (1 Min)",
       "type": "row"
@@ -299,7 +450,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 19 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 52 },
       "id": 20,
       "options": {
         "showHeader": true,
@@ -323,7 +474,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
       "id": 400,
       "title": "Live Candles (Aggregated from Ticks)",
       "type": "row"
@@ -372,7 +523,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 65 },
       "id": 25,
       "options": {
         "showHeader": true,
@@ -396,7 +547,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 },
       "id": 500,
       "title": "F&O Universe",
       "type": "row"
@@ -416,7 +567,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 45 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 78 },
       "id": 30,
       "options": {
         "showHeader": true,
@@ -458,7 +609,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 55 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 88 },
       "id": 31,
       "options": {
         "showHeader": true,
@@ -482,7 +633,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 100 },
       "id": 600,
       "title": "Subscribed Indices",
       "type": "row"
@@ -502,7 +653,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 68 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 101 },
       "id": 40,
       "options": {
         "showHeader": true,
@@ -526,7 +677,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
       "id": 700,
       "title": "Market Depth",
       "type": "row"
@@ -579,7 +730,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 79 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 112 },
       "id": 50,
       "options": {
         "showHeader": true,
@@ -603,7 +754,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 124 },
       "id": 800,
       "title": "Previous Close",
       "type": "row"
@@ -628,7 +779,7 @@
           }
         ]
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 92 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 125 },
       "id": 60,
       "options": {
         "showHeader": true,
@@ -652,7 +803,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 135 },
       "id": 900,
       "title": "Instrument Build Metadata",
       "type": "row"
@@ -677,7 +828,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 103 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 136 },
       "id": 70,
       "options": {
         "showHeader": true,
@@ -702,12 +853,51 @@
   ],
   "refresh": "5s",
   "schemaVersion": 40,
-  "tags": ["dhan-live-trader", "market-data", "questdb"],
-  "templating": { "list": [] },
+  "tags": ["dhan-live-trader", "market-data", "questdb", "candlestick"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "NSE_FNO", "value": "NSE_FNO" },
+        "datasource": { "type": "postgres", "uid": "questdb" },
+        "definition": "SELECT DISTINCT segment FROM historical_candles_1m ORDER BY segment;",
+        "description": "Exchange segment filter for candlestick charts",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Segment",
+        "multi": false,
+        "name": "segment",
+        "options": [],
+        "query": "SELECT DISTINCT segment FROM historical_candles_1m ORDER BY segment;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "", "value": "" },
+        "datasource": { "type": "postgres", "uid": "questdb" },
+        "definition": "SELECT DISTINCT security_id FROM historical_candles_1m WHERE segment = '${segment}' ORDER BY security_id LIMIT 200;",
+        "description": "Security ID filter for candlestick charts",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Security ID",
+        "multi": false,
+        "name": "security_id",
+        "options": [],
+        "query": "SELECT DISTINCT security_id FROM historical_candles_1m WHERE segment = '${segment}' ORDER BY security_id LIMIT 200;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 3,
+        "type": "query"
+      }
+    ]
+  },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 1
+  "version": 2
 }
