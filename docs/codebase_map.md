@@ -2,7 +2,7 @@
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
 > Bible: `tech_stack_bible_v6.md` — read ONLY when adding a new dependency.
-> Updated: 2026-03-01 (477 tests).
+> Updated: 2026-03-08 (1458 tests).
 
 ## File Tree
 
@@ -43,35 +43,55 @@ dhan-live-trader/
 │   │   │   ├── tls.rs                 # TLS connector with rustls (aws-lc-rs provider)
 │   │   │   ├── subscription_builder.rs # JSON batch builder (subscribe/unsubscribe/disconnect)
 │   │   │   ├── connection.rs          # Single WebSocket lifecycle (URL query auth, subscribe, read)
-│   │   │   └── connection_pool.rs     # Multi-connection pool (up to 5 connections, 25K instruments)
+│   │   │   ├── connection_pool.rs     # Multi-connection pool (up to 5 connections, 25K instruments)
+│   │   │   └── order_update_connection.rs # Order update WebSocket connection (separate feed)
 │   │   ├── parser/
 │   │   │   ├── mod.rs                  # Re-exports parser submodules
 │   │   │   ├── types.rs               # ParsedTick, PacketHeader, MarketDepthLevel, ParsedFrame, ParseError
+│   │   │   ├── read_helpers.rs        # Shared read utilities for binary parsing
 │   │   │   ├── header.rs              # parse_header() — 8-byte packet header
 │   │   │   ├── ticker.rs             # parse_ticker_packet() — 16 bytes
 │   │   │   ├── quote.rs              # parse_quote_packet() — 50 bytes (OHLC at offset 34)
 │   │   │   ├── full_packet.rs        # parse_full_packet() — 162 bytes (OI at 34, OHLC at 46, depth at 62)
+│   │   │   ├── market_depth.rs       # parse_market_depth_packet() — 20 bytes per level
+│   │   │   ├── deep_depth.rs         # parse_deep_depth_packet() — extended depth (20 levels)
 │   │   │   ├── oi.rs                  # parse_oi_packet() — 12 bytes
 │   │   │   ├── previous_close.rs     # parse_previous_close_packet() — 16 bytes
-│   │   │   ├── market_status.rs      # parse_market_status_packet() — 8 bytes
+│   │   │   ├── market_status.rs      # validate_market_status_packet() — 8 bytes
 │   │   │   ├── disconnect.rs         # parse_disconnect_packet() — 10 bytes
+│   │   │   ├── order_update.rs       # parse_order_update_packet() — order update binary frames
 │   │   │   └── dispatcher.rs         # dispatch_frame() — top-level entry, routes by response_code
+│   │   ├── notification/
+│   │   │   ├── mod.rs                 # Re-exports notification submodules
+│   │   │   ├── service.rs            # NotificationService (Telegram alerts via AWS SSM)
+│   │   │   └── events.rs             # NotificationEvent enum (auth, instrument, custom alerts)
+│   │   ├── historical/
+│   │   │   ├── mod.rs                 # Re-exports historical submodules
+│   │   │   ├── candle_fetcher.rs     # Fetch 1-min candles from Dhan REST API
+│   │   │   └── cross_verify.rs       # Cross-verify fetched candles against live data
 │   │   └── pipeline/
 │   │       ├── mod.rs                 # Re-exports pipeline submodules
-│   │       └── tick_processor.rs     # Main loop: frame → parse → filter junk → persist to QuestDB
+│   │       ├── tick_processor.rs     # Main loop: frame → parse → filter junk → dedup → persist
+│   │       ├── candle_aggregator.rs  # Real-time 1-min candle aggregation from ticks
+│   │       └── top_movers.rs         # Top movers by change_pct (shared snapshot for API)
 │   ├── storage/src/                    # Persistence layer
-│   │   ├── lib.rs                      # Re-exports: instrument_persistence, tick_persistence
+│   │   ├── lib.rs                      # Re-exports: instrument_persistence, tick_persistence, candle_persistence
 │   │   ├── instrument_persistence.rs   # QuestDB ILP writer (4 tables)
-│   │   └── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys()
+│   │   ├── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys()
+│   │   ├── candle_persistence.rs      # QuestDB ILP writer for candles_1m table
+│   │   ├── materialized_views.rs      # QuestDB materialized views (candle aggregation)
+│   │   └── valkey_cache.rs            # Valkey (Redis) cache for rkyv-serialized instrument data
 │   ├── trading/src/
 │   │   └── lib.rs                      # SKELETON — OMS, risk (not started)
 │   ├── api/src/
-│   │   ├── lib.rs                      # build_router() — axum router with CORS: /health, /api/stats, /portal
-│   │   ├── state.rs                    # SharedAppState (questdb_config only)
+│   │   ├── lib.rs                      # build_router() — axum router with CORS
+│   │   ├── state.rs                    # SharedAppState (questdb_config, dhan_config, top_movers snapshot)
 │   │   └── handlers/
 │   │       ├── mod.rs                  # Re-exports handler submodules
 │   │       ├── health.rs              # GET /health → JSON status + version
 │   │       ├── stats.rs               # GET /api/stats → QuestDB table counts (proxied, no CORS)
+│   │       ├── instruments.rs         # POST /api/instruments/rebuild → trigger instrument rebuild
+│   │       ├── top_movers.rs          # GET /api/top-movers → top movers by change_pct
 │   │       └── static_file.rs         # GET /portal → portal.html (DLT Control Panel, embedded at compile time)
 │   │   └── static/
 │   │       └── portal.html            # DLT Control Panel — nav dashboard with live status + stats
@@ -193,11 +213,22 @@ ParsedFrame { Tick(ParsedTick), TickWithDepth(ParsedTick, [MarketDepthLevel; 5])
 
 ### core::pipeline
 ```rust
-// Pure capture loop: parse → filter junk → persist to QuestDB
+// Main loop: parse → filter junk → dedup → candle aggregation → persist
 run_tick_processor(
     frame_receiver: mpsc::Receiver<Vec<u8>>,
     tick_writer: Option<TickPersistenceWriter>,
+    depth_writer: Option<DepthPersistenceWriter>,
+    registry: Option<Arc<InstrumentRegistry>>,
+    top_movers_snapshot: SharedTopMoversSnapshot,
 ) -> ()  // async — runs until receiver closes
+
+// Real-time candle aggregation
+CandleAggregator::new() -> Self
+CandleAggregator::update(&mut self, tick: &ParsedTick)
+
+// Top movers tracking
+TopMoversTracker::new() -> Self
+TopMoversTracker::update(&mut self, tick: &ParsedTick, registry: &InstrumentRegistry)
 ```
 
 ### core::websocket
@@ -220,12 +251,14 @@ instrument_persistence::persist_instrument_snapshot(universe, questdb_config) ->
 ### api
 ```rust
 build_router(state: SharedAppState) -> Router
-SharedAppState::new(questdb: QuestDbConfig) -> Self
+SharedAppState::new(questdb, dhan, instrument, top_movers_snapshot) -> Self
 
 // Endpoints
-GET  /portal        → DLT Control Panel (nav dashboard with live status, stats, service links)
-GET  /health        → { "status": "ok", "version": "0.1.0" }
-GET  /api/stats     → { questdb_reachable, tables, underlyings, derivatives, subscribed_indices, ticks }
+GET   /portal                → DLT Control Panel (nav dashboard with live status, stats, service links)
+GET   /health                → { "status": "ok", "version": "0.1.0" }
+GET   /api/stats             → { questdb_reachable, tables, underlyings, derivatives, subscribed_indices, ticks }
+GET   /api/top-movers        → Top movers by change_pct (from shared snapshot)
+POST  /api/instruments/rebuild → Trigger instrument rebuild outside build window
 ```
 
 ## Byte Layouts — Dhan WebSocket V2 Binary Protocol (SDK-verified)
@@ -243,15 +276,17 @@ Disconnect (10):      Header + [code:u16LE]
 CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT paise).
 ```
 
-## Test Counts (477 total)
+## Test Counts (1458 total)
 
 | Crate | Tests |
 |-------|-------|
-| common | 88 |
-| core | 349 |
-| storage | 37 |
-| api | 3 |
-| **Total** | **477** |
+| common | 132 |
+| core | 1012 (unit) + 5 (integration) |
+| storage | 187 |
+| trading | 86 |
+| api | 31 (unit) + 3 (integration) |
+| app | 6 |
+| **Total** | **1458** |
 
 ## QuestDB Tables (5) — DEDUP UPSERT KEYS enabled on all
 
@@ -263,20 +298,24 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 | subscribed_indices | timestamp, security_id | Index subscriptions |
 | ticks | ts, security_id | Raw tick data (PARTITION BY HOUR) |
 
-## App Boot Sequence (main.rs) — 10 steps
+## App Boot Sequence (main.rs) — 14 steps
 
 ```
-0. Install rustls CryptoProvider (aws_lc_rs)
-1. Load config/base.toml → ApplicationConfig → validate()
-2. Initialize tracing (structured logging)
-3. Authenticate: SSM → TOTP → POST auth.dhan.co → JWT (graceful: OFFLINE mode if fails)
-4. QuestDB: ensure ticks table with DEDUP UPSERT KEYS
-5. Build F&O universe + subscription plan
-6. WebSocket pool: dynamic instruments from SubscriptionPlan
-7. Tick processor task (pure capture: parse → filter junk → persist)
-8. axum API server on 0.0.0.0:3001 (health, stats, portal)
-9. Token renewal background task
-10. Await Ctrl+C → graceful shutdown
+ 0. Install rustls CryptoProvider (aws_lc_rs)
+ 1. Load config/base.toml → ApplicationConfig → validate()
+ 2. Initialize observability (Prometheus metrics exporter)
+ 3. Initialize structured logging + OpenTelemetry tracing layer
+ 4. Initialize notification service (Telegram via AWS SSM, best-effort)
+ 5. Authenticate: SSM → TOTP → POST auth.dhan.co → JWT (timeout + graceful failure)
+ 6. QuestDB: ensure tables (ticks, depth, instruments, candles, materialized views)
+ 7. Build F&O universe + subscription plan (three-layer: fresh build / rkyv cache / unavailable)
+ 7.5. Fetch historical 1-min candles + cross-verify (automated, non-critical)
+ 8. WebSocket pool: dynamic instruments from SubscriptionPlan
+ 9. Tick processor task (parse → filter → dedup → candle aggregation → persist)
+10. Order update WebSocket connection (separate feed)
+11. axum API server on 0.0.0.0:3001 (health, stats, portal, top-movers, instruments)
+12. Token renewal background task
+13. Await Ctrl+C → graceful shutdown
 ```
 
 ## Completed Blocks
@@ -285,7 +324,14 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 - **Block 01.1**: QuestDB persistence (4 tables via ILP, DEDUP UPSERT KEYS)
 - **Block 02**: Auth pipeline (SSM → TOTP → JWT → arc-swap → auto-renew)
 - **Block 03**: WebSocket Connection Manager (types, subscription builder, connection lifecycle, pool)
-- **Block 04**: Binary Protocol Parser — dispatch_frame() routes 7 packet types
-- **Block 05**: Tick Pipeline — pure capture: frame → parse → filter → persist
+- **Block 04**: Binary Protocol Parser — dispatch_frame() routes 9 packet types (incl. market_depth, deep_depth, order_update)
+- **Block 05**: Tick Pipeline — parse → filter junk → dedup → candle aggregation → top movers → persist
 - **Subscription Planner**: InstrumentRegistry (O(1) lookup) + SubscriptionPlanner (FnoUniverse → filtered instruments)
-- **Frontend removed**: All frontend code (TradingView chart, WASM indicators, terminal handlers, tick broadcast) fully removed — pure backend
+- **Notification**: Telegram alerts via AWS SSM (auth events, instrument builds, custom)
+- **Historical candles**: Fetch + cross-verify 1-min candles from Dhan REST API
+- **Order update WebSocket**: Separate feed for order status updates
+- **Candle aggregation**: Real-time 1-min candle aggregation from tick stream
+- **Top movers**: Real-time top movers by change_pct (shared snapshot for API)
+- **Observability**: Prometheus metrics + OpenTelemetry tracing
+- **Valkey cache**: rkyv-serialized instrument cache for zero-copy deserialization
+- **Trading crate**: OMS state machine, order types, position tracking (86 tests)
