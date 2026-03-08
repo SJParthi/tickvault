@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn pool_checkout_timeout_is_reasonable() {
         // 500ms is long enough for local Docker, short enough to not block pipeline
-        assert!(POOL_CHECKOUT_TIMEOUT_MS >= 100);
-        assert!(POOL_CHECKOUT_TIMEOUT_MS <= 5000);
+        const _: () = assert!(POOL_CHECKOUT_TIMEOUT_MS >= 100);
+        const _: () = assert!(POOL_CHECKOUT_TIMEOUT_MS <= 5000);
     }
 
     #[test]
