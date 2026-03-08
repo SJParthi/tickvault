@@ -52,17 +52,22 @@ pub struct TradingConfig {
     pub timezone: String,
     /// Maximum orders per second (SEBI limit).
     pub max_orders_per_second: u32,
-    /// NSE trading holidays for 2025 (YYYY-MM-DD strings).
-    /// Source: official NSE circular NSE/CMTR/65587.
+    /// NSE trading holidays with names for display.
+    /// Source: official NSE circular (update annually).
     #[serde(default)]
-    pub nse_holidays_2025: Vec<String>,
-    /// NSE trading holidays for 2026 (YYYY-MM-DD strings).
-    /// Source: official NSE circular NSE/CMTR/71775.
-    #[serde(default)]
-    pub nse_holidays_2026: Vec<String>,
+    pub nse_holidays: Vec<NseHolidayEntry>,
     /// Muhurat Trading dates — special sessions on otherwise closed days.
     #[serde(default)]
-    pub muhurat_trading_dates: Vec<String>,
+    pub muhurat_trading_dates: Vec<NseHolidayEntry>,
+}
+
+/// A single NSE holiday or Muhurat trading date with display name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NseHolidayEntry {
+    /// Date in YYYY-MM-DD format (IST).
+    pub date: String,
+    /// Human-readable holiday name for display.
+    pub name: String,
 }
 
 /// Dhan API and WebSocket connection configuration.
@@ -584,9 +589,20 @@ mod tests {
                 data_collection_end: "16:00:00".to_string(),
                 timezone: "Asia/Kolkata".to_string(),
                 max_orders_per_second: 10,
-                nse_holidays_2025: vec!["2025-02-26".to_string()],
-                nse_holidays_2026: vec!["2026-01-26".to_string()],
-                muhurat_trading_dates: vec!["2025-10-21".to_string()],
+                nse_holidays: vec![
+                    NseHolidayEntry {
+                        date: "2026-01-26".to_string(),
+                        name: "Republic Day".to_string(),
+                    },
+                    NseHolidayEntry {
+                        date: "2026-03-03".to_string(),
+                        name: "Holi".to_string(),
+                    },
+                ],
+                muhurat_trading_dates: vec![NseHolidayEntry {
+                    date: "2026-11-08".to_string(),
+                    name: "Diwali 2026".to_string(),
+                }],
             },
             dhan: DhanConfig {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),

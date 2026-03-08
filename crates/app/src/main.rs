@@ -56,6 +56,7 @@ use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::order_update_connection::run_order_update_connection;
 use dhan_live_trader_core::websocket::types::{InstrumentSubscription, WebSocketError};
 
+use dhan_live_trader_storage::calendar_persistence;
 use dhan_live_trader_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
@@ -303,10 +304,13 @@ async fn main() -> Result<()> {
                     ensure_depth_and_prev_close_tables(&config.questdb),
                     ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
+                    calendar_persistence::ensure_calendar_table(&config.questdb),
                     dhan_live_trader_storage::materialized_views::ensure_candle_views(
                         &config.questdb
                     ),
                 );
+                // Persist trading calendar to QuestDB (best-effort, non-blocking).
+                let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
                 info!("QuestDB DDL complete (background)");
             },
             // SSM validation + TokenManager for renewal
@@ -494,8 +498,12 @@ async fn main() -> Result<()> {
         ensure_depth_and_prev_close_tables(&config.questdb),
         ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
+        calendar_persistence::ensure_calendar_table(&config.questdb),
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
     );
+
+    // Persist trading calendar to QuestDB (best-effort, non-blocking).
+    let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(writer) => {

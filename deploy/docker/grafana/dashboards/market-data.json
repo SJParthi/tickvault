@@ -9,6 +9,22 @@
         "iconColor": "rgba(0, 211, 255, 1)",
         "name": "Annotations & Alerts",
         "type": "dashboard"
+      },
+      {
+        "datasource": { "type": "postgres", "uid": "questdb" },
+        "enable": true,
+        "hide": false,
+        "iconColor": "#FF5722",
+        "name": "NSE Holidays",
+        "rawQuery": true,
+        "showIn": 0,
+        "target": {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, name || ' (' || holiday_type || ')' AS text, holiday_type AS tags FROM nse_holidays ORDER BY ts;",
+          "refId": "holidays"
+        }
       }
     ]
   },
@@ -849,6 +865,72 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 144 },
+      "id": 1000,
+      "title": "NSE Trading Calendar",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "holiday_type" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "mappings", "value": [
+                { "type": "value", "options": { "Holiday": { "color": "red", "index": 0, "text": "Holiday" }, "Muhurat Trading": { "color": "orange", "index": 1, "text": "Muhurat Trading" } } }
+              ] }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "holiday_date_ist" },
+            "properties": [
+              { "id": "custom.width", "value": 150 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "day_of_week" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 145 },
+      "id": 80,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "holiday_date_ist" }]
+      },
+      "title": "NSE Holidays & Muhurat Trading Sessions (2026)",
+      "description": "Complete NSE trading calendar loaded from config. Holidays (market closed) and Muhurat Trading sessions (special evening hours on Diwali). Source: NSE Circular NSE/CMTR/71775.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  name,\n  holiday_type,\n  dateadd('s', 19800, ts) AS holiday_date_ist\nFROM nse_holidays\nORDER BY ts;",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "5s",
@@ -938,5 +1020,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 3
+  "version": 4
 }

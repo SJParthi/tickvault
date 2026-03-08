@@ -15,55 +15,78 @@ timezone = "Asia/Kolkata"
 max_orders_per_second = 10
 
 # ---------------------------------------------------------------------------
-# NSE Trading Holidays — Official NSE Circulars
+# NSE Trading Holidays — Official NSE Circular NSE/CMTR/71775
 # ---------------------------------------------------------------------------
 # Update annually when NSE publishes the next calendar year's circular.
-# 2025: NSE/CMTR/65587 | 2026: NSE/CMTR/71775
-# Format: YYYY-MM-DD (IST date). Weekends are excluded automatically.
-# Only weekday holidays need to be listed here.
+# Format: { date = "YYYY-MM-DD", name = "..." }
+# Weekends are excluded automatically — only list weekday holidays.
 
-nse_holidays_2025 = [
-    "2025-02-26",  # Mahashivratri
-    "2025-03-14",  # Holi
-    "2025-03-31",  # Id-Ul-Fitr (Ramadan Eid)
-    "2025-04-10",  # Shri Mahavir Jayanti
-    "2025-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
-    "2025-04-18",  # Good Friday
-    "2025-05-01",  # Maharashtra Day
-    "2025-06-17",  # Bakri Eid (Eid ul-Adha)
-    "2025-08-15",  # Independence Day
-    "2025-08-27",  # Ganesh Chaturthi
-    "2025-10-02",  # Mahatma Gandhi Jayanti / Dussehra
-    "2025-10-21",  # Diwali Laxmi Pujan (Muhurat Trading)
-    "2025-10-22",  # Diwali Balipratipada
-    "2025-11-05",  # Prakash Gurpurb Sri Guru Nanak Dev
-    "2025-12-25",  # Christmas
-]
+[[trading.nse_holidays]]
+date = "2026-01-26"
+name = "Republic Day"
 
-nse_holidays_2026 = [
-    "2026-01-26",  # Republic Day
-    "2026-03-03",  # Holi
-    "2026-03-26",  # Shri Ram Navami
-    "2026-03-31",  # Shri Mahavir Jayanti
-    "2026-04-03",  # Good Friday
-    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
-    "2026-05-01",  # Maharashtra Day
-    "2026-05-28",  # Bakri Eid (Eid ul-Adha)
-    "2026-06-26",  # Muharram
-    "2026-09-14",  # Ganesh Chaturthi
-    "2026-10-02",  # Mahatma Gandhi Jayanti
-    "2026-10-20",  # Dussehra
-    "2026-11-10",  # Diwali Balipratipada
-    "2026-11-24",  # Prakash Gurpurb Sri Guru Nanak Dev
-    "2026-12-25",  # Christmas
-]
+[[trading.nse_holidays]]
+date = "2026-03-03"
+name = "Holi"
+
+[[trading.nse_holidays]]
+date = "2026-03-26"
+name = "Shri Ram Navami"
+
+[[trading.nse_holidays]]
+date = "2026-03-31"
+name = "Shri Mahavir Jayanti"
+
+[[trading.nse_holidays]]
+date = "2026-04-03"
+name = "Good Friday"
+
+[[trading.nse_holidays]]
+date = "2026-04-14"
+name = "Dr. Baba Saheb Ambedkar Jayanti"
+
+[[trading.nse_holidays]]
+date = "2026-05-01"
+name = "Maharashtra Day"
+
+[[trading.nse_holidays]]
+date = "2026-05-28"
+name = "Bakri Eid (Eid ul-Adha)"
+
+[[trading.nse_holidays]]
+date = "2026-06-26"
+name = "Muharram"
+
+[[trading.nse_holidays]]
+date = "2026-09-14"
+name = "Ganesh Chaturthi"
+
+[[trading.nse_holidays]]
+date = "2026-10-02"
+name = "Mahatma Gandhi Jayanti"
+
+[[trading.nse_holidays]]
+date = "2026-10-20"
+name = "Dussehra"
+
+[[trading.nse_holidays]]
+date = "2026-11-10"
+name = "Diwali Balipratipada"
+
+[[trading.nse_holidays]]
+date = "2026-11-24"
+name = "Prakash Gurpurb Sri Guru Nanak Dev"
+
+[[trading.nse_holidays]]
+date = "2026-12-25"
+name = "Christmas"
 
 # Special trading sessions (market normally closed but opens for limited hours).
 # Muhurat Trading: ~1 hour evening session on Diwali.
-muhurat_trading_dates = [
-    "2025-10-21",  # Diwali 2025 (Tuesday)
-    "2026-11-08",  # Diwali 2026 (Sunday — special session)
-]
+
+[[trading.muhurat_trading_dates]]
+date = "2026-11-08"
+name = "Diwali 2026 (Sunday — special session)"
 
 [dhan]
 websocket_url = "wss://api-feed.dhan.co"

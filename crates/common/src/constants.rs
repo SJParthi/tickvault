@@ -672,6 +672,9 @@ pub const QUESTDB_TABLE_DERIVATIVE_CONTRACTS: &str = "derivative_contracts";
 /// QuestDB table: daily subscribed index snapshots (8 F&O + 23 Display = 31).
 pub const QUESTDB_TABLE_SUBSCRIBED_INDICES: &str = "subscribed_indices";
 
+/// QuestDB table: NSE trading calendar (holidays + Muhurat sessions).
+pub const QUESTDB_TABLE_NSE_HOLIDAYS: &str = "nse_holidays";
+
 // ---------------------------------------------------------------------------
 // QuestDB ILP — Ingestion Configuration
 // ---------------------------------------------------------------------------
