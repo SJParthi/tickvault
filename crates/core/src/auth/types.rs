@@ -224,6 +224,22 @@ impl TokenState {
         }
     }
 
+    /// Creates a `TokenState` from cached values (used by token_cache module).
+    ///
+    /// Bypasses the Dhan API response parsing — used only when loading a
+    /// previously-validated token from the local cache file.
+    pub(crate) fn from_cached(
+        access_token: SecretString,
+        expires_at: DateTime<FixedOffset>,
+        issued_at: DateTime<FixedOffset>,
+    ) -> Self {
+        Self {
+            access_token,
+            expires_at,
+            issued_at,
+        }
+    }
+
     /// Returns a reference to the access token secret.
     ///
     /// Callers must use `expose_secret()` to extract the raw value

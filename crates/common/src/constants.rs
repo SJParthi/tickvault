@@ -1023,6 +1023,23 @@ pub const MAX_STRATEGY_INSTANCES: usize = 256;
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Token Cache — Fast Restart
+// ---------------------------------------------------------------------------
+
+/// File path for the cached JWT token (inside Docker container).
+///
+/// `/tmp` is ephemeral on container restart but survives process crashes
+/// within the same container — exactly the right lifetime for crash recovery.
+/// Security: file permissions 0600, container isolation, 24h TTL token.
+pub const TOKEN_CACHE_FILE_PATH: &str = "/tmp/dlt-token-cache";
+
+/// Minimum remaining token validity (hours) to accept a cached token.
+///
+/// If the cached token expires in less than this, a full re-auth is performed.
+/// 1 hour gives the renewal loop time to refresh before expiry.
+pub const TOKEN_CACHE_MIN_REMAINING_HOURS: i64 = 1;
+
+// ---------------------------------------------------------------------------
 // Compile-Time Assertions
 // ---------------------------------------------------------------------------
 

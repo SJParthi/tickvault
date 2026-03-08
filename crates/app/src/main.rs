@@ -3,22 +3,25 @@
 //! Orchestrates the complete boot sequence:
 //! Config → Observability → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
 //!
-//! # Boot Sequence
-//! 1. Load and validate configuration from `config/base.toml`
+//! # Boot Sequence (optimized for fast restart)
+//!
+//! Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips
+//! the Dhan HTTP auth call on crash recovery (~500ms-2s saved).
+//!
+//! 1. Load and validate configuration
 //! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
 //! 3. Initialize structured logging with OpenTelemetry layer
-//! 4. Initialize Telegram notification service (best-effort)
-//! 5. Ensure Docker infrastructure is running (auto-start if needed)
-//! 6. Authenticate with Dhan API (SSM → TOTP → JWT)
-//! 7. Set up QuestDB tick persistence (best-effort)
-//! 8. Build F&O universe + subscription plan from instrument CSV
-//! 9. Build WebSocket connection pool with planned instruments
-//! 10. Spawn tick processing pipeline (pure capture — parse → filter → persist)
-//! 11. Spawn background historical candle fetch (cold path — never blocks live)
-//! 12. Spawn order update WebSocket connection (JSON-based, separate from binary feed)
-//! 13. Start axum API server (health, stats, portal)
-//! 14. Spawn token renewal background task
-//! 15. Await shutdown signal (Ctrl+C)
+//! 4. (parallel) Notification service + Docker infra check
+//! 5. Authenticate (token cache → SSM → TOTP → JWT)
+//! 6. (parallel) QuestDB table setup (5 DDL queries concurrent)
+//! 7. Build F&O universe + subscription plan
+//! 8. Build WebSocket connection pool
+//! 9. Spawn tick processing pipeline
+//! 10. Spawn background historical candle fetch (cold path)
+//! 11. Spawn order update WebSocket
+//! 12. Start API server
+//! 13. Spawn token renewal task
+//! 14. Await shutdown signal
 
 mod infra;
 mod observability;
@@ -189,15 +192,13 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Step 4: Initialize notification service (best-effort — no-op if SSM unavailable)
+    // Steps 4+5: Notification + Docker infra (parallel — independent of each other)
     // -----------------------------------------------------------------------
-    info!("initializing Telegram notification service");
-    let notifier = NotificationService::initialize(&config.notification).await;
-
-    // -----------------------------------------------------------------------
-    // Step 5: Ensure Docker infrastructure is running (auto-start if needed)
-    // -----------------------------------------------------------------------
-    infra::ensure_infra_running(&config.questdb).await;
+    info!("initializing notification service + checking Docker infra (parallel)");
+    let (notifier, _) = tokio::join!(
+        NotificationService::initialize(&config.notification),
+        infra::ensure_infra_running(&config.questdb),
+    );
 
     // -----------------------------------------------------------------------
     // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
@@ -247,11 +248,14 @@ async fn main() -> Result<()> {
         "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles_1m + materialized views)"
     );
 
-    ensure_tick_table_dedup_keys(&config.questdb).await;
-    ensure_depth_and_prev_close_tables(&config.questdb).await;
-    ensure_instrument_tables(&config.questdb).await;
-    ensure_candle_table_dedup_keys(&config.questdb).await;
-    dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb).await;
+    // All table creation queries are independent — run in parallel for faster boot.
+    tokio::join!(
+        ensure_tick_table_dedup_keys(&config.questdb),
+        ensure_depth_and_prev_close_tables(&config.questdb),
+        ensure_instrument_tables(&config.questdb),
+        ensure_candle_table_dedup_keys(&config.questdb),
+        dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
+    );
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(writer) => {

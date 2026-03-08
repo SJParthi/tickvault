@@ -28,6 +28,7 @@ use dhan_live_trader_common::error::ApplicationError;
 use dhan_live_trader_common::sanitize::redact_url_params;
 
 use super::secret_manager;
+use super::token_cache;
 use super::totp_generator::generate_totp_code;
 use super::types::{DhanCredentials, DhanGenerateTokenResponse, TokenState};
 use crate::notification::events::NotificationEvent;
@@ -158,6 +159,21 @@ impl TokenManager {
             notifier: Arc::clone(notifier),
         });
 
+        // Fast path: try loading a cached token from a previous run.
+        // This skips the Dhan HTTP auth call (~500ms-2s), saving significant
+        // boot time on crash recovery. SSM credentials are still fetched above
+        // (needed for the renewal loop).
+        if let Some(cached_token) = token_cache::load_token_cache(&manager.credentials.client_id) {
+            manager.token.store(Arc::new(Some(cached_token)));
+            info!(
+                expires_at = %manager.current_expiry_display(),
+                "using cached token — skipped Dhan auth HTTP call"
+            );
+            notifier.notify(NotificationEvent::AuthenticationSuccess);
+            return Ok(manager);
+        }
+
+        // Slow path: full auth via Dhan API.
         // Infinite retry for transient errors, fail fast for permanent errors.
         // TOTP errors get limited retries (window boundary timing can cause
         // valid secrets to produce rejected codes).
@@ -376,6 +392,9 @@ impl TokenManager {
         let token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(token_state)));
 
+        // Cache for fast restart on crash recovery
+        self.save_current_token_to_cache();
+
         Ok(())
     }
 
@@ -445,6 +464,9 @@ impl TokenManager {
 
         let new_token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(new_token_state)));
+
+        // Update cache for fast restart
+        self.save_current_token_to_cache();
 
         Ok(())
     }
@@ -579,6 +601,14 @@ impl TokenManager {
         match guard.as_ref().as_ref() {
             Some(state) => state.time_until_refresh(self.token_config.refresh_before_expiry_hours),
             None => Duration::ZERO, // No token — refresh immediately
+        }
+    }
+
+    /// Saves the current token to the disk cache for fast crash recovery.
+    fn save_current_token_to_cache(&self) {
+        let guard = self.token.load();
+        if let Some(token_state) = guard.as_ref().as_ref() {
+            token_cache::save_token_cache(token_state, &self.credentials.client_id);
         }
     }
 
