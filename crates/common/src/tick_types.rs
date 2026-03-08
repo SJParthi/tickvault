@@ -172,6 +172,8 @@ pub struct DhanIntradayResponse {
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub volume: Vec<i64>,
     /// Timestamps as epoch seconds (IST-naive from Dhan).
+    /// Dhan may return as int or float.
+    #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub timestamp: Vec<i64>,
     /// Open interest per candle (present when `oi: true` in request).
     /// Dhan may return as int or float.
