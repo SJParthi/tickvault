@@ -249,4 +249,62 @@ mod tests {
         assert_eq!(status.size, 0);
         assert_eq!(status.available, 0);
     }
+
+    #[test]
+    fn url_with_custom_port() {
+        let config = ValkeyConfig {
+            host: "cache-server".to_string(),
+            port: 6380,
+            max_connections: 4,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        assert_eq!(url, "redis://cache-server:6380");
+    }
+
+    #[test]
+    fn pool_with_single_connection() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).expect("single connection pool must succeed");
+        let status = pool.pool.status();
+        assert_eq!(status.max_size, 1);
+    }
+
+    #[test]
+    fn pool_with_large_connection_count() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 128,
+        };
+        let pool = ValkeyPool::new(&config).expect("large pool must succeed");
+        let status = pool.pool.status();
+        assert_eq!(status.max_size, 128);
+    }
+
+    #[test]
+    fn url_uses_redis_scheme() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        assert!(url.starts_with("redis://"), "URL must use redis:// scheme");
+    }
+
+    #[test]
+    fn pool_status_initially_zero_waiters() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+        let status = pool.pool.status();
+        assert_eq!(status.waiting, 0, "no waiters initially");
+    }
 }

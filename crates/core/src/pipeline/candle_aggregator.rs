@@ -408,4 +408,136 @@ mod tests {
         assert!(CANDLE_MAP_INITIAL_CAPACITY >= 1024);
         assert!(CANDLE_MAP_INITIAL_CAPACITY <= 65536);
     }
+
+    #[test]
+    fn default_impl_matches_new() {
+        let a = CandleAggregator::new();
+        let b = CandleAggregator::default();
+        assert_eq!(a.active_count(), b.active_count());
+        assert_eq!(a.total_completed(), b.total_completed());
+    }
+
+    #[test]
+    fn rapid_second_transitions() {
+        let mut agg = CandleAggregator::new();
+        // Simulate ticks across 10 seconds
+        for ts in 1000..1010u32 {
+            agg.update(&make_tick(100, 2, 500.0 + ts as f32, ts, ts * 10));
+        }
+        // 9 completed candles (first tick starts a candle, each subsequent second completes previous)
+        assert_eq!(agg.total_completed(), 9);
+        assert_eq!(agg.active_count(), 1);
+    }
+
+    #[test]
+    fn same_security_different_segments_tracked_separately() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 100)); // NSE_FNO
+        agg.update(&make_tick(100, 1, 505.0, 1000, 200)); // NSE_EQ
+        assert_eq!(agg.active_count(), 2);
+    }
+
+    #[test]
+    fn volume_is_snapshot_not_incremental() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 100));
+        agg.update(&make_tick(100, 2, 510.0, 1000, 500)); // Volume jumps
+        agg.update(&make_tick(100, 2, 505.0, 1000, 300)); // Volume drops (correction)
+
+        let candle = agg.candles.get(&(100, 2)).expect("candle must exist");
+        assert_eq!(
+            candle.volume, 300,
+            "volume should be latest snapshot, not cumulative"
+        );
+    }
+
+    #[test]
+    fn completed_candle_is_copy() {
+        let c = CompletedCandle {
+            security_id: 1,
+            exchange_segment_code: 2,
+            timestamp_secs: 1000,
+            open: 100.0,
+            high: 110.0,
+            low: 95.0,
+            close: 105.0,
+            volume: 500,
+        };
+        let copy = c; // Copy
+        assert_eq!(c.security_id, copy.security_id);
+        assert_eq!(c.open, copy.open);
+    }
+
+    #[test]
+    fn sweep_at_exact_threshold_boundary() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 100));
+
+        // Sweep at exactly threshold boundary (1000 + 5 = 1005)
+        agg.sweep_stale(1005);
+        assert_eq!(
+            agg.active_count(),
+            1,
+            "at exact boundary, candle should remain"
+        );
+
+        // Sweep one second past threshold
+        agg.sweep_stale(1006);
+        assert_eq!(
+            agg.active_count(),
+            0,
+            "past threshold, candle should be swept"
+        );
+    }
+
+    #[test]
+    fn multiple_sweeps_are_idempotent() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 100));
+
+        agg.sweep_stale(1010);
+        let first = agg.drain_completed();
+        assert_eq!(first.len(), 1);
+
+        agg.sweep_stale(1020);
+        let second = agg.drain_completed();
+        assert!(second.is_empty(), "second sweep should find nothing");
+    }
+
+    #[test]
+    fn flush_all_after_partial_drain() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 100));
+        agg.update(&make_tick(100, 2, 510.0, 1001, 200)); // Completes first candle
+        agg.update(&make_tick(200, 2, 300.0, 1000, 50)); // Active candle
+
+        // Drain the completed candle first
+        let drained = agg.drain_completed();
+        assert_eq!(drained.len(), 1);
+
+        // Now flush remaining active candles
+        agg.flush_all();
+        let remaining = agg.drain_completed();
+        assert_eq!(remaining.len(), 2); // Security 100 at ts 1001 + security 200
+    }
+
+    #[test]
+    fn high_throughput_many_securities() {
+        let mut agg = CandleAggregator::new();
+        // Simulate 1000 securities each with 5 ticks across 3 seconds
+        for sec in 0..1000u32 {
+            for ts in 0..3u32 {
+                agg.update(&make_tick(
+                    sec,
+                    2,
+                    100.0 + ts as f32,
+                    1000 + ts,
+                    sec * 10 + ts,
+                ));
+            }
+        }
+        // Each security has 3 seconds → 2 completed candles per security
+        assert_eq!(agg.total_completed(), 2000);
+        assert_eq!(agg.active_count(), 1000);
+    }
 }

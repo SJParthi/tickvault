@@ -371,4 +371,152 @@ mod tests {
         assert!(MIN_CHANGE_PCT_THRESHOLD > 0.0 && MIN_CHANGE_PCT_THRESHOLD < 1.0);
         assert!(TRACKER_MAP_INITIAL_CAPACITY >= 1024);
     }
+
+    #[test]
+    fn default_impl_matches_new() {
+        let a = TopMoversTracker::new();
+        let b = TopMoversTracker::default();
+        assert_eq!(a.tracked_count(), b.tracked_count());
+        assert_eq!(a.ticks_processed(), b.ticks_processed());
+    }
+
+    #[test]
+    fn negative_close_is_skipped() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, -100.0, 1000));
+        assert_eq!(tracker.tracked_count(), 0);
+    }
+
+    #[test]
+    fn nan_close_is_skipped() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, f32::NAN, 1000));
+        assert_eq!(tracker.tracked_count(), 0);
+    }
+
+    #[test]
+    fn infinity_close_is_skipped() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, f32::INFINITY, 1000));
+        assert_eq!(tracker.tracked_count(), 0);
+    }
+
+    #[test]
+    fn price_update_replaces_previous() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, 100.0, 1000)); // +10%
+        tracker.update(&make_tick(100, 2, 120.0, 100.0, 2000)); // +20%
+
+        assert_eq!(tracker.tracked_count(), 1); // Same security
+        let snapshot = tracker.compute_snapshot();
+        let pct = snapshot.gainers[0].change_pct;
+        assert!((pct - 20.0).abs() < 0.01, "should use latest price");
+    }
+
+    #[test]
+    fn flat_security_excluded_from_gainers_and_losers() {
+        let mut tracker = TopMoversTracker::new();
+        // Price == prev_close → 0% change (below threshold)
+        tracker.update(&make_tick(100, 2, 100.0, 100.0, 1000));
+
+        let snapshot = tracker.compute_snapshot();
+        assert!(
+            snapshot.gainers.is_empty(),
+            "flat security should not be a gainer"
+        );
+        assert!(
+            snapshot.losers.is_empty(),
+            "flat security should not be a loser"
+        );
+        assert_eq!(
+            snapshot.most_active.len(),
+            1,
+            "flat security still most active"
+        );
+    }
+
+    #[test]
+    fn mover_entry_is_copy() {
+        let entry = MoverEntry {
+            security_id: 42,
+            exchange_segment_code: 2,
+            last_traded_price: 100.0,
+            change_pct: 5.0,
+            volume: 1000,
+        };
+        let copy = entry;
+        assert_eq!(entry.security_id, copy.security_id);
+        assert_eq!(entry.change_pct, copy.change_pct);
+    }
+
+    #[test]
+    fn snapshot_total_tracked_matches() {
+        let mut tracker = TopMoversTracker::new();
+        for i in 1..=10u32 {
+            tracker.update(&make_tick(i, 2, 100.0 + i as f32, 100.0, i * 100));
+        }
+
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(snapshot.total_tracked, 10);
+    }
+
+    #[test]
+    fn same_security_different_segments() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 1, 110.0, 100.0, 1000)); // NSE_EQ
+        tracker.update(&make_tick(100, 2, 120.0, 100.0, 2000)); // NSE_FNO
+
+        assert_eq!(
+            tracker.tracked_count(),
+            2,
+            "different segments should be tracked separately"
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_when_no_data() {
+        let mut tracker = TopMoversTracker::new();
+        let snapshot = tracker.compute_snapshot();
+        assert!(snapshot.gainers.is_empty());
+        assert!(snapshot.losers.is_empty());
+        assert!(snapshot.most_active.is_empty());
+        assert_eq!(snapshot.total_tracked, 0);
+    }
+
+    #[test]
+    fn large_negative_change() {
+        let mut tracker = TopMoversTracker::new();
+        // Circuit breaker scenario: -20% drop
+        tracker.update(&make_tick(100, 2, 80.0, 100.0, 5000));
+
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(snapshot.losers.len(), 1);
+        let pct = snapshot.losers[0].change_pct;
+        assert!((pct - (-20.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn ticks_processed_counts_all_including_skipped() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000)); // Tracked
+        tracker.update(&make_tick(2, 2, 110.0, 0.0, 1000)); // Skipped (no close)
+        tracker.update(&make_tick(3, 2, 110.0, -1.0, 1000)); // Skipped (negative close)
+
+        assert_eq!(tracker.ticks_processed(), 3);
+        assert_eq!(tracker.tracked_count(), 1);
+    }
+
+    #[test]
+    fn consecutive_snapshots_independent() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000));
+
+        let s1 = tracker.compute_snapshot();
+        assert_eq!(s1.gainers.len(), 1);
+
+        // Update price to flat
+        tracker.update(&make_tick(1, 2, 100.0, 100.0, 1000));
+        let s2 = tracker.compute_snapshot();
+        assert!(s2.gainers.is_empty(), "should reflect updated price");
+    }
 }

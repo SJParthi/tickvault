@@ -287,4 +287,84 @@ mod tests {
         assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS >= 5);
         assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS <= 20);
     }
+
+    #[test]
+    fn test_read_timeout_is_reasonable() {
+        // Must be long enough for idle periods but short enough to detect dead connections
+        assert!(ORDER_UPDATE_READ_TIMEOUT_SECS >= 30);
+        assert!(ORDER_UPDATE_READ_TIMEOUT_SECS <= 600);
+    }
+
+    #[test]
+    fn test_reconnect_initial_delay_positive() {
+        assert!(ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS > 0);
+        assert!(ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS <= 10000);
+    }
+
+    #[test]
+    fn test_reconnect_max_delay_greater_than_initial() {
+        assert!(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS > ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+    }
+
+    #[test]
+    fn test_backoff_does_not_overflow() {
+        // Ensure backoff calculation handles large failure counts
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+
+        // Simulate many failures — must not panic or overflow
+        for failures in 0..100_u32 {
+            let shift = failures.min(63);
+            let delay = initial.saturating_mul(1_u64 << shift).min(max);
+            assert!(delay <= max, "delay exceeded max for failures={failures}");
+            assert!(delay > 0, "delay must be positive for failures={failures}");
+        }
+    }
+
+    #[test]
+    fn test_error_variants_are_distinct() {
+        let errors = [
+            OrderUpdateConnectionError::NoToken.to_string(),
+            OrderUpdateConnectionError::TokenExpired.to_string(),
+            OrderUpdateConnectionError::Tls("x".to_string()).to_string(),
+            OrderUpdateConnectionError::Connect("x".to_string()).to_string(),
+            OrderUpdateConnectionError::Send("x".to_string()).to_string(),
+            OrderUpdateConnectionError::Read("x".to_string()).to_string(),
+            OrderUpdateConnectionError::ReadTimeout.to_string(),
+        ];
+
+        // All error messages should be unique
+        for (i, a) in errors.iter().enumerate() {
+            for (j, b) in errors.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "error variants {i} and {j} have identical messages");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_error_debug_formatting() {
+        let err = OrderUpdateConnectionError::Connect("connection refused".to_string());
+        let debug_str = format!("{err:?}");
+        assert!(debug_str.contains("Connect"));
+        assert!(debug_str.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_backoff_doubling_pattern() {
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+
+        let mut prev_delay = 0_u64;
+        for failures in 1..=5_u32 {
+            let shift = failures.saturating_sub(1).min(63);
+            let delay = initial.saturating_mul(1_u64 << shift).min(max);
+
+            if delay < max && prev_delay > 0 && prev_delay < max {
+                assert_eq!(delay, prev_delay * 2, "backoff should double each attempt");
+            }
+            prev_delay = delay;
+        }
+    }
 }
