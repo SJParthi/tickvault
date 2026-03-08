@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KlineCharts Demo — dhan-live-trader</title>
+  <script src="https://unpkg.com/klinecharts/dist/klinecharts.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e; color: #e0e0e0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 20px; background: #16213e; border-bottom: 1px solid #0f3460;
+    }
+    .header h1 { font-size: 16px; color: #e94560; }
+    .header .pair { font-size: 14px; color: #00d2ff; font-weight: 600; }
+    .toolbar {
+      display: flex; gap: 8px; padding: 8px 20px;
+      background: #16213e; border-bottom: 1px solid #0f3460;
+    }
+    .toolbar button {
+      padding: 6px 14px; border: 1px solid #0f3460; background: #1a1a2e;
+      color: #e0e0e0; border-radius: 4px; cursor: pointer; font-size: 12px;
+    }
+    .toolbar button:hover { background: #0f3460; }
+    .toolbar button.active { background: #e94560; border-color: #e94560; color: #fff; }
+    #chart { width: 100%; height: calc(100vh - 90px); }
+    .indicator-bar {
+      display: flex; gap: 6px; padding: 4px 20px;
+      background: #16213e; border-bottom: 1px solid #0f3460; flex-wrap: wrap;
+    }
+    .indicator-bar button {
+      padding: 4px 10px; border: 1px solid #0f3460; background: #1a1a2e;
+      color: #8e8ea0; border-radius: 3px; cursor: pointer; font-size: 11px;
+    }
+    .indicator-bar button:hover { color: #00d2ff; border-color: #00d2ff; }
+    .indicator-bar button.on { color: #00d2ff; border-color: #00d2ff; background: #0f3460; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>dhan-live-trader</h1>
+  <span class="pair">NIFTY 25,400.50 <span style="color:#4caf50">+125.30 (+0.50%)</span></span>
+</div>
+
+<div class="toolbar">
+  <button onclick="setInterval_('1')">1m</button>
+  <button onclick="setInterval_('5')" class="active">5m</button>
+  <button onclick="setInterval_('15')">15m</button>
+  <button onclick="setInterval_('60')">1H</button>
+  <button onclick="setInterval_('D')">1D</button>
+  <button onclick="setInterval_('W')">1W</button>
+</div>
+
+<div class="indicator-bar">
+  <button id="btn-ma" class="on" onclick="toggleIndicator('MA','candle_pane',this)">MA</button>
+  <button id="btn-ema" onclick="toggleIndicator('EMA','candle_pane',this)">EMA</button>
+  <button id="btn-boll" onclick="toggleIndicator('BOLL','candle_pane',this)">BOLL</button>
+  <button id="btn-vol" class="on" onclick="toggleIndicator('VOL','vol_pane',this)">VOL</button>
+  <button id="btn-macd" onclick="toggleIndicator('MACD',null,this)">MACD</button>
+  <button id="btn-rsi" onclick="toggleIndicator('RSI',null,this)">RSI</button>
+  <button id="btn-kdj" onclick="toggleIndicator('KDJ',null,this)">KDJ</button>
+  <button id="btn-sar" onclick="toggleIndicator('SAR','candle_pane',this)">SAR</button>
+</div>
+
+<div id="chart"></div>
+
+<script>
+// Generate realistic OHLCV data
+function generateData(count) {
+  const data = [];
+  let basePrice = 25000;
+  let baseTime = Date.now() - count * 5 * 60 * 1000;
+
+  for (let i = 0; i < count; i++) {
+    const change = (Math.random() - 0.48) * 80;
+    const open = basePrice + change;
+    const high = open + Math.random() * 60;
+    const low = open - Math.random() * 60;
+    const close = low + Math.random() * (high - low);
+    const volume = Math.floor(50000 + Math.random() * 200000);
+
+    data.push({
+      timestamp: baseTime + i * 5 * 60 * 1000,
+      open: parseFloat(open.toFixed(2)),
+      high: parseFloat(high.toFixed(2)),
+      low: parseFloat(low.toFixed(2)),
+      close: parseFloat(close.toFixed(2)),
+      volume: volume
+    });
+    basePrice = close;
+  }
+  return data;
+}
+
+// Create chart
+const chart = klinecharts.init('chart', {
+  styles: {
+    grid: {
+      show: true,
+      horizontal: { color: 'rgba(255,255,255,0.04)' },
+      vertical: { color: 'rgba(255,255,255,0.04)' }
+    },
+    candle: {
+      bar: {
+        upColor: '#4caf50',
+        downColor: '#e94560',
+        upBorderColor: '#4caf50',
+        downBorderColor: '#e94560',
+        upWickColor: '#4caf50',
+        downWickColor: '#e94560'
+      },
+      priceMark: {
+        last: { show: true, upColor: '#4caf50', downColor: '#e94560' }
+      }
+    },
+    indicator: {
+      lineColors: ['#00d2ff', '#e94560', '#ffd700', '#9c27b0', '#ff9800']
+    },
+    xAxis: { tickText: { color: '#8e8ea0' } },
+    yAxis: { tickText: { color: '#8e8ea0' } },
+    crosshair: {
+      horizontal: { line: { color: '#0f3460' } },
+      vertical: { line: { color: '#0f3460' } }
+    },
+    separator: { color: '#0f3460' }
+  }
+});
+
+// Load data
+chart.applyNewData(generateData(500));
+
+// Default indicators
+chart.createIndicator('MA', true, { id: 'candle_pane' });
+const volPane = chart.createIndicator('VOL', false);
+
+// Track active indicators
+const activePanes = { 'VOL': volPane };
+
+function toggleIndicator(name, paneId, btn) {
+  if (btn.classList.contains('on')) {
+    btn.classList.remove('on');
+    if (paneId === 'candle_pane') {
+      chart.removeIndicator('candle_pane', name);
+    } else if (activePanes[name]) {
+      chart.removeIndicator(activePanes[name], name);
+      delete activePanes[name];
+    }
+  } else {
+    btn.classList.add('on');
+    if (paneId === 'candle_pane') {
+      chart.createIndicator(name, true, { id: 'candle_pane' });
+    } else {
+      const pane = chart.createIndicator(name, false);
+      activePanes[name] = pane;
+    }
+  }
+}
+
+// Simulate real-time tick
+setInterval(() => {
+  const data = chart.getDataList();
+  const last = data[data.length - 1];
+  const tick = (Math.random() - 0.48) * 10;
+  const newClose = parseFloat((last.close + tick).toFixed(2));
+
+  chart.updateData({
+    timestamp: last.timestamp,
+    open: last.open,
+    high: Math.max(last.high, newClose),
+    low: Math.min(last.low, newClose),
+    close: newClose,
+    volume: last.volume + Math.floor(Math.random() * 1000)
+  });
+}, 1000);
+
+function setInterval_(tf) {
+  document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  chart.applyNewData(generateData(500));
+}
+</script>
+
+</body>
+</html>
