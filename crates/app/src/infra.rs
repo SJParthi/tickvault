@@ -39,6 +39,9 @@ const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
 /// macOS Docker Desktop application name for `open -a`.
 const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 
+/// Grafana dashboard URL — auto-opened in browser after infrastructure starts.
+const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -142,8 +145,12 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Wait for QuestDB to become healthy.
+    // Wait for QuestDB and Grafana to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
+    wait_for_service_healthy("Grafana", "127.0.0.1", 3000).await;
+
+    // Auto-open Grafana dashboards in the default browser.
+    open_in_browser(GRAFANA_DASHBOARD_URL).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +242,38 @@ async fn ensure_docker_daemon_running() -> bool {
         "Docker daemon did not start within timeout"
     );
     false
+}
+
+/// Opens a URL in the default browser.
+///
+/// Uses `open` on macOS, `xdg-open` on Linux. Best-effort — logs a warning
+/// if the browser cannot be launched.
+async fn open_in_browser(url: &str) {
+    use tokio::process::Command;
+
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    match Command::new(program)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) if status.success() => {
+            info!(url, "opened dashboard in browser");
+        }
+        Ok(status) => {
+            warn!(url, exit_code = ?status.code(), "failed to open browser");
+        }
+        Err(err) => {
+            warn!(url, ?err, "failed to launch browser command");
+        }
+    }
 }
 
 /// TCP probe — returns true if a TCP connection can be established.
