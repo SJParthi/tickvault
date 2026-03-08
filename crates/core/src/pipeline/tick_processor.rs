@@ -152,6 +152,7 @@ pub async fn run_tick_processor(
     let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
     let m_pipeline_active = gauge!("dlt_pipeline_active");
     let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
+    let m_crossed_market = counter!("dlt_crossed_market_total");
 
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
@@ -332,6 +333,21 @@ pub async fn run_tick_processor(
                     junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     continue;
+                }
+
+                // O(1) crossed market detection: bid > ask at best level.
+                // Occurs during auction periods — metric only, do NOT filter.
+                if depth[0].bid_price > depth[0].ask_price
+                    && depth[0].bid_price > 0.0
+                    && depth[0].ask_price > 0.0
+                {
+                    m_crossed_market.increment(1);
+                    debug!(
+                        security_id = tick.security_id,
+                        bid = depth[0].bid_price,
+                        ask = depth[0].ask_price,
+                        "crossed market detected (bid > ask at best level)"
+                    );
                 }
 
                 // Persist 5-level depth to QuestDB (separate table)

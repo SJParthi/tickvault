@@ -168,6 +168,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ticker_negative_ltp_parses_without_panic() {
+        let (buf, hdr) = make_ticker_packet(2, 13, -500.0, 1772073900);
+        let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price < 0.0);
+        // Parser accepts negative LTP — tick_processor filters it downstream
+    }
+
+    #[test]
     fn test_parse_ticker_negative_zero_ltp() {
         let (buf, hdr) = make_ticker_packet(2, 13, -0.0, 100);
         let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();

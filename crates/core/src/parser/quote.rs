@@ -367,6 +367,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_quote_negative_ltp_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2, 13, -500.0, 1, 1772073900, 100.0, 1000, 500, 500, 99.0, 98.0, 101.0, 97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price < 0.0);
+        // Parser accepts negative LTP — tick_processor filters it downstream
+    }
+
+    #[test]
     fn test_parse_quote_negative_zero_ltp() {
         let (buf, hdr) = make_quote_packet(
             2, 13, -0.0, 1, 100, 100.0, 1000, 500, 500, 99.0, 98.0, 101.0, 97.0,
