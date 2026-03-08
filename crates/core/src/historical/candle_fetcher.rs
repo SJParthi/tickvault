@@ -1,8 +1,11 @@
 //! Dhan intraday candle fetcher — fully automated 1-minute OHLCV retrieval.
 //!
-//! Fetches historical candles from Dhan's REST API for all subscribed
-//! instruments, converts IST timestamps to UTC, and persists to QuestDB
-//! via the `CandlePersistenceWriter`.
+//! Fetches historical candles from Dhan's V2 REST API for all subscribed
+//! instruments and persists to QuestDB via the `CandlePersistenceWriter`.
+//!
+//! # Timestamp Format
+//! Dhan V2 REST API returns standard UNIX epoch seconds (UTC).
+//! This differs from the WebSocket binary feed which sends IST-naive epochs.
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
@@ -24,7 +27,6 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS,
-    IST_UTC_OFFSET_SECONDS_I64,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{DhanIntradayResponse, HistoricalCandle};
@@ -329,10 +331,11 @@ pub async fn fetch_historical_candles(
                                     continue;
                                 }
 
-                                // Convert IST-naive timestamp to UTC
-                                let ist_epoch = data.timestamp[i];
-                                let utc_epoch =
-                                    ist_epoch.saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+                                // Dhan V2 REST Charts Intraday API returns standard UNIX
+                                // epoch seconds (UTC). No timezone conversion needed.
+                                // NOTE: This differs from the WebSocket binary feed which
+                                // sends IST-naive epoch seconds requiring -5h30m adjustment.
+                                let utc_epoch = data.timestamp[i];
 
                                 let oi_value = if i < data.open_interest.len() {
                                     data.open_interest[i]

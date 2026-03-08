@@ -153,7 +153,8 @@ pub struct HistoricalCandle {
 /// Response from Dhan's intraday charts API.
 ///
 /// Each field is a parallel array — index N across all arrays forms one candle.
-/// Dhan returns timestamps as IST-naive epoch seconds (same as WebSocket feed).
+/// Dhan V2 REST API returns timestamps as standard UNIX epoch seconds (UTC).
+/// NOTE: This differs from the WebSocket binary feed which sends IST-naive epochs.
 ///
 /// Note: Dhan sometimes returns integer fields (volume, open_interest) as floats
 /// (e.g., `105600.0` instead of `105600`). The `deserialize_f64_as_i64_vec`
@@ -171,7 +172,7 @@ pub struct DhanIntradayResponse {
     /// Volume per candle (Dhan may return as int or float).
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub volume: Vec<i64>,
-    /// Timestamps as epoch seconds (IST-naive from Dhan).
+    /// Timestamps as UNIX epoch seconds (UTC) from Dhan V2 REST API.
     /// Dhan may return as int or float.
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub timestamp: Vec<i64>,
