@@ -14,11 +14,13 @@
 
 pub mod connection;
 pub mod connection_pool;
+pub mod order_update_connection;
 pub mod subscription_builder;
 pub mod tls;
 pub mod types;
 
 pub use connection::WebSocketConnection;
 pub use connection_pool::WebSocketConnectionPool;
+pub use order_update_connection::run_order_update_connection;
 pub use subscription_builder::build_subscription_messages;
 pub use types::{ConnectionId, ConnectionState, DisconnectCode, WebSocketError};

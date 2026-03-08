@@ -1,7 +1,7 @@
 //! Binary entry point for the dhan-live-trader application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Observability → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → HTTP → Shutdown
+//! Config → Observability → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
 //!
 //! # Boot Sequence
 //! 1. Load and validate configuration from `config/base.toml`
@@ -13,9 +13,10 @@
 //! 7. Build F&O universe + subscription plan from instrument CSV
 //! 8. Build WebSocket connection pool with planned instruments
 //! 9. Spawn tick processing pipeline (pure capture — parse → filter → persist)
-//! 10. Start axum API server (health, stats, portal)
-//! 11. Spawn token renewal background task
-//! 12. Await shutdown signal (Ctrl+C)
+//! 10. Spawn order update WebSocket connection (JSON-based, separate from binary feed)
+//! 11. Start axum API server (health, stats, portal)
+//! 12. Spawn token renewal background task
+//! 13. Await shutdown signal (Ctrl+C)
 
 mod observability;
 
@@ -43,6 +44,7 @@ use dhan_live_trader_core::instrument::{
 use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
+use dhan_live_trader_core::websocket::order_update_connection::run_order_update_connection;
 use dhan_live_trader_core::websocket::types::InstrumentSubscription;
 
 use dhan_live_trader_storage::candle_persistence::{
@@ -484,7 +486,29 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 10: Start axum API server
+    // Step 10: Spawn order update WebSocket connection
+    // -----------------------------------------------------------------------
+    let (order_update_sender, _order_update_receiver) =
+        tokio::sync::broadcast::channel::<dhan_live_trader_common::order_types::OrderUpdate>(256);
+
+    let order_update_handle = {
+        let url = config.dhan.order_update_websocket_url.clone();
+        let client_id = {
+            let credentials = secret_manager::fetch_dhan_credentials()
+                .await
+                .context("failed to fetch Dhan client ID for order update WebSocket")?;
+            credentials.client_id.expose_secret().to_string()
+        };
+        let token = token_manager.token_handle();
+        let sender = order_update_sender.clone();
+        tokio::spawn(async move {
+            run_order_update_connection(url, client_id, token, sender).await;
+        })
+    };
+    info!("order update WebSocket started");
+
+    // -----------------------------------------------------------------------
+    // Step 11: Start axum API server
     // -----------------------------------------------------------------------
     let api_state = SharedAppState::new(
         config.questdb.clone(),
@@ -511,13 +535,13 @@ async fn main() -> Result<()> {
     });
 
     // -----------------------------------------------------------------------
-    // Step 11: Spawn token renewal background task
+    // Step 12: Spawn token renewal background task
     // -----------------------------------------------------------------------
     let renewal_handle = token_manager.spawn_renewal_task();
     info!("token renewal task started");
 
     // -----------------------------------------------------------------------
-    // Step 12: Await shutdown signal
+    // Step 13: Await shutdown signal
     // -----------------------------------------------------------------------
     let mode = "LIVE";
     info!(
@@ -551,14 +575,17 @@ async fn main() -> Result<()> {
     // 1. Stop token renewal (no dependencies).
     renewal_handle.abort();
 
-    // 2. Abort WebSocket connections. This drops all frame_sender handles,
+    // 2. Abort order update WebSocket (no downstream dependencies).
+    order_update_handle.abort();
+
+    // 3. Abort WebSocket connections. This drops all frame_sender handles,
     //    which causes the tick processor's recv() to return None and exit
     //    its loop — triggering the final QuestDB flush.
     for handle in ws_handles {
         handle.abort();
     }
 
-    // 3. Wait for the tick processor to finish its final flush (bounded).
+    // 4. Wait for the tick processor to finish its final flush (bounded).
     if let Some(handle) = processor_handle {
         let shutdown_timeout = std::time::Duration::from_secs(
             dhan_live_trader_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
@@ -569,10 +596,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 4. Stop API server.
+    // 5. Stop API server.
     api_handle.abort();
 
-    // 5. Flush pending OpenTelemetry spans before exit (Drop triggers batch flush).
+    // 6. Flush pending OpenTelemetry spans before exit (Drop triggers batch flush).
     drop(otel_provider);
 
     info!("dhan-live-trader stopped");

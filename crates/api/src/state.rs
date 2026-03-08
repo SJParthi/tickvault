@@ -68,6 +68,7 @@ mod tests {
     fn test_dhan_config() -> DhanConfig {
         DhanConfig {
             websocket_url: "wss://api-feed.dhan.co".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
             rest_api_base_url: "https://api.dhan.co/v2".to_string(),
             auth_base_url: "https://auth.dhan.co".to_string(),
             instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"

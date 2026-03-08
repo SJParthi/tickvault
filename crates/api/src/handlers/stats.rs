@@ -139,6 +139,7 @@ mod tests {
             },
             DhanConfig {
                 websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
                 auth_base_url: "https://test".to_string(),
                 instrument_csv_url: "https://test".to_string(),
@@ -502,6 +503,7 @@ mod tests {
             },
             dhan_live_trader_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
                 auth_base_url: "https://test".to_string(),
                 instrument_csv_url: "https://test".to_string(),
