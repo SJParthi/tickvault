@@ -1,7 +1,7 @@
 //! Cross-verification of live tick data against historical candles.
 //!
 //! Queries QuestDB to compare live ticks stored in the `ticks` table against
-//! 1-minute candles in `candles_1m`. Reports discrepancies to detect data
+//! 1-minute candles in `historical_candles_1m`. Reports discrepancies to detect data
 //! quality issues, missed ticks, or stale feeds.
 //!
 //! # Verification Checks

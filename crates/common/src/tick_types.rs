@@ -154,6 +154,10 @@ pub struct HistoricalCandle {
 ///
 /// Each field is a parallel array — index N across all arrays forms one candle.
 /// Dhan returns timestamps as IST-naive epoch seconds (same as WebSocket feed).
+///
+/// Note: Dhan sometimes returns integer fields (volume, open_interest) as floats
+/// (e.g., `105600.0` instead of `105600`). The `deserialize_f64_as_i64_vec`
+/// deserializer handles both forms by truncating floats to i64.
 #[derive(Debug, serde::Deserialize)]
 pub struct DhanIntradayResponse {
     /// Opening prices per candle.
@@ -164,13 +168,35 @@ pub struct DhanIntradayResponse {
     pub low: Vec<f64>,
     /// Closing prices per candle.
     pub close: Vec<f64>,
-    /// Volume per candle.
+    /// Volume per candle (Dhan may return as int or float).
+    #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub volume: Vec<i64>,
     /// Timestamps as epoch seconds (IST-naive from Dhan).
     pub timestamp: Vec<i64>,
     /// Open interest per candle (present when `oi: true` in request).
-    #[serde(default)]
+    /// Dhan may return as int or float.
+    #[serde(default, deserialize_with = "deserialize_f64_as_i64_vec_or_default")]
     pub open_interest: Vec<i64>,
+}
+
+/// Deserializes a JSON array of numbers (int or float) into `Vec<i64>`.
+///
+/// Dhan API inconsistently returns some integer fields as floats
+/// (e.g., volume `105600.0` instead of `105600`). This handles both.
+fn deserialize_f64_as_i64_vec<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values: Vec<f64> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(values.into_iter().map(|v| v as i64).collect())
+}
+
+/// Same as `deserialize_f64_as_i64_vec` but defaults to empty vec if absent.
+fn deserialize_f64_as_i64_vec_or_default<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_f64_as_i64_vec(deserializer)
 }
 
 impl DhanIntradayResponse {

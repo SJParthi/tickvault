@@ -243,7 +243,7 @@ async fn main() -> Result<()> {
     // Step 6: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!(
-        "setting up QuestDB tables (ticks + instruments + depth + previous_close + candles_1m + materialized views)"
+        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles_1m + materialized views)"
     );
 
     ensure_tick_table_dedup_keys(&config.questdb).await;

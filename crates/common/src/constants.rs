@@ -909,7 +909,9 @@ pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
 pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 
 /// QuestDB table: 1-minute OHLCV candles from Dhan historical API.
-pub const QUESTDB_TABLE_CANDLES_1M: &str = "candles_1m";
+/// Named `historical_candles_1m` to avoid collision with the `candles_1m`
+/// materialized view (which aggregates live 1s candles).
+pub const QUESTDB_TABLE_CANDLES_1M: &str = "historical_candles_1m";
 
 /// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
 pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
