@@ -8,6 +8,7 @@ use chrono::NaiveTime;
 use serde::Deserialize;
 
 use crate::constants::SEBI_MAX_ORDERS_PER_SECOND;
+use crate::trading_calendar::TradingCalendar;
 
 /// Root application configuration.
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,17 @@ pub struct TradingConfig {
     pub timezone: String,
     /// Maximum orders per second (SEBI limit).
     pub max_orders_per_second: u32,
+    /// NSE trading holidays for 2025 (YYYY-MM-DD strings).
+    /// Source: official NSE circular NSE/CMTR/65587.
+    #[serde(default)]
+    pub nse_holidays_2025: Vec<String>,
+    /// NSE trading holidays for 2026 (YYYY-MM-DD strings).
+    /// Source: official NSE circular NSE/CMTR/71775.
+    #[serde(default)]
+    pub nse_holidays_2026: Vec<String>,
+    /// Muhurat Trading dates — special sessions on otherwise closed days.
+    #[serde(default)]
+    pub muhurat_trading_dates: Vec<String>,
 }
 
 /// Dhan API and WebSocket connection configuration.
@@ -526,6 +538,11 @@ impl ApplicationConfig {
             bail!("notification.send_timeout_ms must be > 0");
         }
 
+        // Trading calendar: validate all holiday date strings parse correctly
+        // and none fall on weekends. This also constructs the calendar to verify
+        // internal consistency.
+        TradingCalendar::from_config(&self.trading)?;
+
         // Historical: validate if enabled.
         if self.historical.enabled {
             if self.historical.lookback_days == 0
@@ -567,6 +584,9 @@ mod tests {
                 data_collection_end: "16:00:00".to_string(),
                 timezone: "Asia/Kolkata".to_string(),
                 max_orders_per_second: 10,
+                nse_holidays_2025: vec!["2025-02-26".to_string()],
+                nse_holidays_2026: vec!["2026-01-26".to_string()],
+                muhurat_trading_dates: vec!["2025-10-21".to_string()],
             },
             dhan: DhanConfig {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),

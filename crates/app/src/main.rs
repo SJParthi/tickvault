@@ -39,6 +39,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
+use dhan_live_trader_common::trading_calendar::TradingCalendar;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
@@ -107,6 +108,12 @@ async fn main() -> Result<()> {
         .validate()
         .context("configuration validation failed")?;
 
+    // Build trading calendar (validated inside config.validate() already).
+    let trading_calendar = std::sync::Arc::new(
+        TradingCalendar::from_config(&config.trading)
+            .context("failed to build trading calendar")?,
+    );
+
     // -----------------------------------------------------------------------
     // Step 2: Initialize observability (Prometheus metrics exporter)
     // -----------------------------------------------------------------------
@@ -155,6 +162,19 @@ async fn main() -> Result<()> {
         tracing_enabled = config.observability.tracing_enabled,
         "dhan-live-trader starting"
     );
+
+    // Log trading day status — critical for operational awareness.
+    let is_trading = trading_calendar.is_trading_day_today();
+    let is_muhurat = trading_calendar.is_muhurat_trading_today();
+    info!(
+        is_trading_day = is_trading,
+        is_muhurat_session = is_muhurat,
+        holidays_loaded = trading_calendar.holiday_count(),
+        "NSE trading calendar loaded"
+    );
+    if !is_trading {
+        warn!("today is NOT a regular NSE trading day — market data and orders will be limited");
+    }
 
     // -----------------------------------------------------------------------
     // CLI: --instrument-diagnostic (run diagnostic and exit)
@@ -343,8 +363,9 @@ async fn main() -> Result<()> {
             let ws_client_id = client_id.clone();
             let token = token_handle.clone();
             let sender = order_update_sender.clone();
+            let cal = trading_calendar.clone();
             tokio::spawn(async move {
-                run_order_update_connection(url, ws_client_id, token, sender).await;
+                run_order_update_connection(url, ws_client_id, token, sender, cal).await;
             })
         };
         info!("order update WebSocket started (background)");
@@ -586,8 +607,9 @@ async fn main() -> Result<()> {
         };
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
+        let cal = trading_calendar.clone();
         tokio::spawn(async move {
-            run_order_update_connection(url, ws_client_id, token, sender).await;
+            run_order_update_connection(url, ws_client_id, token, sender, cal).await;
         })
     };
     info!("order update WebSocket started");

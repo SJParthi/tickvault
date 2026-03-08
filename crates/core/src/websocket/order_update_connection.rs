@@ -11,6 +11,7 @@
 //! # Performance
 //! Cold path — orders are infrequent (~1-100/day). Allocations are acceptable here.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -22,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
 
-use chrono::{Datelike, FixedOffset, NaiveTime, Utc};
+use chrono::{FixedOffset, NaiveTime, Utc};
 
 use dhan_live_trader_common::constants::{
     IST_UTC_OFFSET_SECONDS, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS,
@@ -30,6 +31,7 @@ use dhan_live_trader_common::constants::{
     ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
 };
 use dhan_live_trader_common::order_types::OrderUpdate;
+use dhan_live_trader_common::trading_calendar::TradingCalendar;
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
@@ -56,13 +58,21 @@ pub async fn run_order_update_connection(
     client_id: String,
     token_handle: TokenHandle,
     order_sender: broadcast::Sender<OrderUpdate>,
+    calendar: Arc<TradingCalendar>,
 ) {
     let mut consecutive_failures: u32 = 0;
 
     info!("order update WebSocket starting");
 
     loop {
-        match connect_and_listen(&order_update_url, &client_id, &token_handle, &order_sender).await
+        match connect_and_listen(
+            &order_update_url,
+            &client_id,
+            &token_handle,
+            &order_sender,
+            &calendar,
+        )
+        .await
         {
             Ok(()) => {
                 // Clean disconnect — reset backoff and reconnect.
@@ -73,7 +83,7 @@ pub async fn run_order_update_connection(
                 // Off-hours ReadTimeout is expected (no orders outside market hours).
                 // Log at debug level and reset backoff to avoid noise.
                 if matches!(err, OrderUpdateConnectionError::ReadTimeout)
-                    && !is_within_market_hours()
+                    && !is_within_market_hours(&calendar)
                 {
                     debug!(
                         "order update WebSocket idle timeout outside market hours — reconnecting"
@@ -117,6 +127,7 @@ async fn connect_and_listen(
     client_id: &str,
     token_handle: &TokenHandle,
     order_sender: &broadcast::Sender<OrderUpdate>,
+    calendar: &TradingCalendar,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -159,7 +170,7 @@ async fn connect_and_listen(
     debug!("order update WebSocket login sent");
 
     // Use longer timeout outside market hours to avoid reconnect noise.
-    let timeout_secs = if is_within_market_hours() {
+    let timeout_secs = if is_within_market_hours(calendar) {
         ORDER_UPDATE_READ_TIMEOUT_SECS
     } else {
         ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
@@ -231,20 +242,20 @@ async fn connect_and_listen(
 const DATA_COLLECTION_START: (u32, u32) = (9, 0);
 const DATA_COLLECTION_END: (u32, u32) = (16, 0);
 
-/// Returns `true` if the current IST time is within data collection hours.
+/// Returns `true` if the current IST time is within data collection hours
+/// AND today is a trading day (not weekend, not NSE holiday).
 ///
 /// Cold path — called once per connection lifecycle. Allocation-free.
-fn is_within_market_hours() -> bool {
+fn is_within_market_hours(calendar: &TradingCalendar) -> bool {
+    // Check trading day first (weekend + holiday check via calendar).
+    if !calendar.is_trading_day_today() {
+        return false;
+    }
+
     #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
     let ist =
         FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
     let now_ist = Utc::now().with_timezone(&ist).time();
-
-    // Also check weekday — no orders on Saturday/Sunday.
-    let today = Utc::now().with_timezone(&ist).weekday();
-    if matches!(today, chrono::Weekday::Sat | chrono::Weekday::Sun) {
-        return false;
-    }
 
     #[allow(clippy::expect_used)] // APPROVED: compile-time provable constants
     let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0)
