@@ -1,0 +1,713 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "dhan-live-trader — Live market data explorer. Ticks, candles, instruments — zero SQL required.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Overview",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Total Ticks",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count() AS total FROM ticks;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Historical Candles (1m)",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count() AS total FROM historical_candles_1m;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "F&O Underlyings",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count() AS total FROM fno_underlyings;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Derivative Contracts",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count() AS total FROM derivative_contracts;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 5,
+      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Subscribed Indices",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count() AS total FROM subscribed_indices;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "semi-dark-red", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Unique Securities (Ticks)",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count_distinct(security_id) AS total FROM ticks;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 200,
+      "title": "Latest Ticks (Live Feed)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "ltp" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "volume" },
+            "properties": [
+              { "id": "unit", "value": "locale" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "exchange_time_ist" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "received_ist" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 6 },
+      "id": 10,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "exchange_time_ist" }]
+      },
+      "title": "Latest Ticks — All Instruments",
+      "description": "Most recent ticks. Exchange time & received time shown in IST. Auto-refreshes every 5s.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  dateadd('s', 19800, ts) AS exchange_time_ist,\n  dateadd('s', 19800, received_at) AS received_ist\nFROM ticks\nORDER BY ts DESC\nLIMIT 200;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "id": 300,
+      "title": "Historical Candles (1 Min)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "open" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "high" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "low" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "close" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "candle_time_ist" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "volume" },
+            "properties": [
+              { "id": "unit", "value": "locale" }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 19 },
+      "id": 20,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "candle_time_ist" }]
+      },
+      "title": "Historical Candles 1m — All Instruments",
+      "description": "1-minute historical candles from Dhan REST API. Timestamps shown in IST.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM historical_candles_1m\nORDER BY ts DESC\nLIMIT 500;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "id": 400,
+      "title": "Live Candles (Aggregated from Ticks)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "open" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "high" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "low" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "close" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "candle_time_ist" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "volume" },
+            "properties": [
+              { "id": "unit", "value": "locale" }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 32 },
+      "id": 25,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "candle_time_ist" }]
+      },
+      "title": "Live 1-Minute Candles (from Materialized View)",
+      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. IST aligned.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM candles_1m\nORDER BY ts DESC\nLIMIT 500;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+      "id": 500,
+      "title": "F&O Universe",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 45 },
+      "id": 30,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "underlying_symbol" }]
+      },
+      "title": "F&O Underlyings",
+      "description": "All F&O underlying instruments loaded from Dhan instrument CSV.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  underlying_symbol,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  dateadd('s', 19800, timestamp) AS loaded_ist\nFROM fno_underlyings\nORDER BY underlying_symbol;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "strike_price" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 55 },
+      "id": 31,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "underlying_symbol" }]
+      },
+      "title": "Derivative Contracts",
+      "description": "All derivative contracts (options + futures) loaded from Dhan instrument CSV. Filter by underlying, type, expiry.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  dateadd('s', 19800, timestamp) AS loaded_ist\nFROM derivative_contracts\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "id": 600,
+      "title": "Subscribed Indices",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 68 },
+      "id": 40,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "symbol" }]
+      },
+      "title": "Subscribed Indices",
+      "description": "All market indices being tracked for live price feeds.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  symbol,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  dateadd('s', 19800, timestamp) AS loaded_ist\nFROM subscribed_indices\nORDER BY symbol;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 },
+      "id": 700,
+      "title": "Market Depth",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "bid_price" },
+            "properties": [
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ask_price" },
+            "properties": [
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "bid_qty" },
+            "properties": [
+              { "id": "unit", "value": "locale" },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ask_qty" },
+            "properties": [
+              { "id": "unit", "value": "locale" },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 79 },
+      "id": 50,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "depth_time_ist" }]
+      },
+      "title": "Market Depth (Latest)",
+      "description": "5-level bid/ask order book data. Bid in green, ask in red.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  dateadd('s', 19800, ts) AS depth_time_ist\nFROM market_depth\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
+      "id": 800,
+      "title": "Previous Close",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "prev_close" },
+            "properties": [{ "id": "decimals", "value": 2 }]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 92 },
+      "id": 60,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "security_id" }]
+      },
+      "title": "Previous Close Prices",
+      "description": "Previous session close prices and open interest for all subscribed instruments.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  dateadd('s', 19800, ts) AS time_ist\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
+      "id": 900,
+      "title": "Instrument Build Metadata",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "build_duration_ms" },
+            "properties": [{ "id": "unit", "value": "ms" }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 103 },
+      "id": 70,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "build_time_ist" }]
+      },
+      "title": "Instrument Build History",
+      "description": "Daily instrument CSV parse stats — how many underlyings, derivatives, options were loaded.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  csv_source,\n  csv_row_count,\n  parsed_row_count,\n  index_count,\n  equity_count,\n  underlying_count,\n  derivative_count,\n  option_chain_count,\n  build_duration_ms,\n  dateadd('s', 19800, timestamp) AS build_time_ist\nFROM instrument_build_metadata\nORDER BY timestamp DESC\nLIMIT 50;",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 40,
+  "tags": ["dhan-live-trader", "market-data", "questdb"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "Asia/Kolkata",
+  "title": "Market Data Explorer",
+  "uid": "dlt-market-data",
+  "version": 1
+}
