@@ -682,6 +682,11 @@ pub const TOTP_PERIOD_SECS: u64 = 30;
 /// TOTP skew tolerance (number of periods to accept before/after current).
 pub const TOTP_SKEW: u8 = 1;
 
+/// Maximum TOTP retry attempts before treating as permanent failure.
+/// TOTP can fail due to window boundary timing — retrying with a fresh
+/// 30-second window resolves transient issues without masking bad secrets.
+pub const TOTP_MAX_RETRIES: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Authentication — Dhan REST API Endpoint Paths
 // ---------------------------------------------------------------------------

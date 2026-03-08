@@ -22,7 +22,7 @@ use tracing::{error, info, instrument, warn};
 use dhan_live_trader_common::config::{DhanConfig, NetworkConfig, TokenConfig};
 use dhan_live_trader_common::constants::{
     AUTH_RETRY_MAX_BACKOFF_SECS, DHAN_GENERATE_TOKEN_PATH, DHAN_RENEW_TOKEN_PATH,
-    DHAN_TOKEN_GENERATION_COOLDOWN_SECS,
+    DHAN_TOKEN_GENERATION_COOLDOWN_SECS, TOTP_MAX_RETRIES, TOTP_PERIOD_SECS,
 };
 use dhan_live_trader_common::error::ApplicationError;
 use dhan_live_trader_common::sanitize::redact_url_params;
@@ -159,7 +159,10 @@ impl TokenManager {
         });
 
         // Infinite retry for transient errors, fail fast for permanent errors.
+        // TOTP errors get limited retries (window boundary timing can cause
+        // valid secrets to produce rejected codes).
         let mut attempt = 0u32;
+        let mut totp_retries = 0u32;
         let mut delay = Duration::from_millis(network_config.retry_initial_delay_ms);
         let max_delay = Duration::from_secs(AUTH_RETRY_MAX_BACKOFF_SECS);
 
@@ -185,6 +188,48 @@ impl TokenManager {
                             reason: format!("PERMANENT: {reason} — check SSM credentials"),
                         });
                         return Err(err);
+                    }
+
+                    // TOTP errors — retry with a fresh 30-second window, but cap retries
+                    // to avoid infinite loops when the secret is genuinely wrong.
+                    if is_totp_error(&reason) {
+                        totp_retries = totp_retries.saturating_add(1);
+                        if totp_retries > TOTP_MAX_RETRIES {
+                            error!(
+                                attempt,
+                                totp_retries,
+                                error = %reason,
+                                "TOTP failed after {TOTP_MAX_RETRIES} retries — verify TOTP secret in SSM"
+                            );
+                            notifier.notify(NotificationEvent::AuthenticationFailed {
+                                reason: format!(
+                                    "TOTP invalid after {TOTP_MAX_RETRIES} retries — check /dlt/<env>/dhan/totp-secret in SSM"
+                                ),
+                            });
+                            return Err(err);
+                        }
+                        warn!(
+                            attempt,
+                            totp_retries,
+                            max = TOTP_MAX_RETRIES,
+                            "TOTP rejected — waiting for next 30s window before retry"
+                        );
+                        notifier.notify(NotificationEvent::AuthenticationFailed {
+                            reason: format!(
+                                "TOTP rejected (retry {totp_retries}/{TOTP_MAX_RETRIES}) — waiting 30s for fresh window"
+                            ),
+                        });
+                        // Wait for the next TOTP window (30s) to get a fresh code.
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_secs(TOTP_PERIOD_SECS)) => {}
+                            _ = tokio::signal::ctrl_c() => {
+                                info!("shutdown signal received during TOTP retry wait");
+                                return Err(ApplicationError::AuthenticationFailed {
+                                    reason: "shutdown during TOTP retry wait".to_string(),
+                                });
+                            }
+                        }
+                        continue;
                     }
 
                     // Dhan rate limit — use the 125-second cooldown.
@@ -555,14 +600,26 @@ impl TokenManager {
 ///
 /// Permanent errors indicate wrong credentials in SSM or a blocked account.
 /// The system should notify the user and exit, not retry indefinitely.
+///
+/// Note: TOTP errors are excluded — they may be transient due to window
+/// boundary timing. Use [`is_totp_error`] to handle TOTP retries separately.
 fn is_permanent_auth_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
     lower.contains("invalid pin")
         || lower.contains("invalid client")
-        || lower.contains("totp") && (lower.contains("invalid") || lower.contains("failed"))
         || lower.contains("blocked")
         || lower.contains("suspended")
         || lower.contains("disabled")
+}
+
+/// Returns `true` if the error is a TOTP-related auth failure.
+///
+/// TOTP errors are retryable up to [`TOTP_MAX_RETRIES`] times because they
+/// can fail when the code is generated near a 30-second window boundary
+/// and expires during HTTP transit to Dhan's servers.
+fn is_totp_error(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    lower.contains("totp") && (lower.contains("invalid") || lower.contains("failed"))
 }
 
 /// Returns `true` if the error is Dhan's token generation rate limit.
@@ -1946,9 +2003,18 @@ mod tests {
     }
 
     #[test]
-    fn test_totp_invalid_is_permanent() {
-        assert!(is_permanent_auth_error("TOTP verification failed"));
-        assert!(is_permanent_auth_error("Dhan auth error: Invalid TOTP"));
+    fn test_totp_invalid_is_not_permanent() {
+        // TOTP errors are retryable (window boundary timing), not permanent.
+        assert!(!is_permanent_auth_error("TOTP verification failed"));
+        assert!(!is_permanent_auth_error("Dhan auth error: Invalid TOTP"));
+    }
+
+    #[test]
+    fn test_totp_error_detected() {
+        assert!(is_totp_error("TOTP verification failed"));
+        assert!(is_totp_error("Dhan auth error: Invalid TOTP"));
+        assert!(!is_totp_error("Invalid Pin"));
+        assert!(!is_totp_error("network error"));
     }
 
     #[test]
