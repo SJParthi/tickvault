@@ -27,11 +27,17 @@ const INFRA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wait time for Docker services to become healthy.
 const INFRA_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum wait time for Docker daemon to start after launching Docker Desktop.
+const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Path to docker-compose file relative to project root.
 const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
+
+/// macOS Docker Desktop application name for `open -a`.
+const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -57,6 +63,12 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
     }
 
     info!("infrastructure not running — auto-starting Docker services");
+
+    // Ensure Docker daemon is running (launches Docker Desktop on macOS if needed).
+    if !ensure_docker_daemon_running().await {
+        warn!("Docker daemon is not available — cannot auto-start infrastructure");
+        return;
+    }
 
     // Fetch infra credentials from SSM concurrently.
     let (questdb_creds, grafana_creds, telegram_creds) = match tokio::join!(
@@ -137,6 +149,93 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+/// Checks if the Docker daemon is responding to `docker info`.
+async fn is_docker_daemon_running() -> bool {
+    use tokio::process::Command;
+
+    match Command::new("docker")
+        .args(["info"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Ensures the Docker daemon is running. On macOS, launches Docker Desktop
+/// if the daemon is not responding and waits for it to become ready.
+///
+/// Returns `true` if the daemon is available, `false` if it could not be started.
+async fn ensure_docker_daemon_running() -> bool {
+    if is_docker_daemon_running().await {
+        debug!("Docker daemon is already running");
+        return true;
+    }
+
+    info!("Docker daemon not running — attempting to launch Docker Desktop");
+
+    // On macOS, launch Docker Desktop via `open -a Docker`.
+    // On Linux, Docker is typically a systemd service (always running).
+    if !cfg!(target_os = "macos") {
+        warn!("Docker daemon not running and auto-launch is only supported on macOS");
+        return false;
+    }
+
+    {
+        use tokio::process::Command;
+
+        let launch_result = Command::new("open")
+            .args(["-a", DOCKER_DESKTOP_APP_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+
+        match launch_result {
+            Ok(status) if status.success() => {
+                info!("Docker Desktop launch command sent — waiting for daemon to start");
+            }
+            Ok(status) => {
+                warn!(
+                    exit_code = ?status.code(),
+                    "failed to launch Docker Desktop — is it installed?"
+                );
+                return false;
+            }
+            Err(err) => {
+                warn!(?err, "failed to execute `open -a Docker`");
+                return false;
+            }
+        }
+    }
+
+    // Poll until Docker daemon is ready or timeout expires.
+    let start = std::time::Instant::now();
+    while start.elapsed() < DOCKER_DAEMON_TIMEOUT {
+        if is_docker_daemon_running().await {
+            info!(
+                elapsed_secs = start.elapsed().as_secs(),
+                "Docker daemon is now running"
+            );
+            return true;
+        }
+        debug!(
+            elapsed_secs = start.elapsed().as_secs(),
+            "waiting for Docker daemon to start"
+        );
+        tokio::time::sleep(INFRA_HEALTH_POLL_INTERVAL).await;
+    }
+
+    warn!(
+        timeout_secs = DOCKER_DAEMON_TIMEOUT.as_secs(),
+        "Docker daemon did not start within timeout"
+    );
+    false
+}
 
 /// TCP probe — returns true if a TCP connection can be established.
 fn is_service_reachable(host: &str, port: u16) -> bool {
@@ -246,5 +345,16 @@ mod tests {
     #[test]
     fn test_health_poll_interval_less_than_timeout() {
         assert!(INFRA_HEALTH_POLL_INTERVAL < INFRA_HEALTH_TIMEOUT);
+    }
+
+    #[test]
+    fn test_docker_daemon_timeout_is_reasonable() {
+        assert!(DOCKER_DAEMON_TIMEOUT.as_secs() >= 30);
+        assert!(DOCKER_DAEMON_TIMEOUT.as_secs() <= 180);
+    }
+
+    #[test]
+    fn test_docker_desktop_app_name_is_not_empty() {
+        assert!(!DOCKER_DESKTOP_APP_NAME.is_empty());
     }
 }
