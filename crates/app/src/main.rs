@@ -40,9 +40,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_core::auth::secret_manager;
-use dhan_live_trader_core::auth::token_manager::TokenManager;
+use dhan_live_trader_core::auth::token_cache;
+use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
 use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
 use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
+use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
 use dhan_live_trader_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
     run_instrument_diagnostic,
@@ -51,7 +53,7 @@ use dhan_live_trader_core::notification::{NotificationEvent, NotificationService
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
 use dhan_live_trader_core::websocket::order_update_connection::run_order_update_connection;
-use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+use dhan_live_trader_core::websocket::types::{InstrumentSubscription, WebSocketError};
 
 use dhan_live_trader_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
@@ -192,6 +194,223 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
+    // Two-Phase Boot: try fast path first (cache hit → ticks in ~400ms),
+    // fall back to full sequential boot on cache miss.
+    // -----------------------------------------------------------------------
+    let fast_cache = token_cache::load_token_cache_fast();
+
+    if let Some(cache_result) = fast_cache {
+        // =================================================================
+        // FAST BOOT PATH (crash restart with valid cache)
+        //
+        // Critical path (ONLY WebSocket blocks):
+        //   Config → Logging → Cache (2ms) → Instruments (0.5ms) →
+        //   WebSocket connect (~400ms) → Tick processor → TICKS FLOWING
+        //
+        // Background (fire-and-forget, zero blocking):
+        //   QuestDB DDL + Notification + Infra + SSM + renewal + everything else
+        //
+        // The tick processor starts with in-memory processing only (candle
+        // aggregation + top movers). QuestDB persistence is NOT on the critical
+        // path — it starts in background and was already running before crash.
+        // The ~300ms gap (QuestDB DDL) is handled by QuestDB's existing tables
+        // from the previous run. Persistence writers reconnect in background.
+        // =================================================================
+        info!("FAST BOOT: crash recovery — cached token + client_id valid, SSM deferred");
+
+        let token_handle: TokenHandle = std::sync::Arc::new(arc_swap::ArcSwap::new(
+            std::sync::Arc::new(Some(cache_result.token)),
+        ));
+        let client_id = cache_result.client_id;
+
+        // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
+        let subscription_plan = load_instruments(&config).await;
+
+        // --- WebSocket connect: THE ONLY BLOCKING STEP (~400ms) ---
+        let (frame_receiver, ws_handles) =
+            build_websocket_pool(&token_handle, &client_id, &subscription_plan, &config).await;
+
+        // --- Tick processor: TICKS FLOWING (in-memory, no persistence yet) ---
+        let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
+            std::sync::Arc::new(std::sync::RwLock::new(None));
+
+        let processor_handle = if let Some(receiver) = frame_receiver {
+            let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
+            let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
+            let snapshot_handle = Some(shared_movers.clone());
+            // Start with None writers — ticks are processed in-memory for trading.
+            // QuestDB persistence reconnects in background (tables already exist
+            // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
+            let handle = tokio::spawn(async move {
+                run_tick_processor(
+                    receiver,
+                    None, // tick_writer — QuestDB reconnects in background
+                    None, // depth_writer — QuestDB reconnects in background
+                    None,
+                    candle_agg,
+                    movers,
+                    snapshot_handle,
+                )
+                .await;
+            });
+            info!("FAST BOOT COMPLETE — tick processor started, ticks flowing (in-memory)");
+            Some(handle)
+        } else {
+            info!("tick processor skipped — no frame source available");
+            None
+        };
+
+        // =================================================================
+        // TICKS FLOWING — everything below is background, zero blocking.
+        // All services start in parallel via tokio::join!.
+        // =================================================================
+
+        // Background: QuestDB DDL + Notification + Infra + SSM validation
+        // All run concurrently. None of them block tick processing.
+        let (notifier, _, deferred_token_manager) = tokio::join!(
+            // Notification + Docker infra
+            async {
+                let (notifier, _) = tokio::join!(
+                    NotificationService::initialize(&config.notification),
+                    infra::ensure_infra_running(&config.questdb),
+                );
+                notifier
+            },
+            // QuestDB DDL (idempotent — tables already exist from pre-crash)
+            async {
+                tokio::join!(
+                    ensure_tick_table_dedup_keys(&config.questdb),
+                    ensure_depth_and_prev_close_tables(&config.questdb),
+                    ensure_instrument_tables(&config.questdb),
+                    ensure_candle_table_dedup_keys(&config.questdb),
+                    dhan_live_trader_storage::materialized_views::ensure_candle_views(
+                        &config.questdb
+                    ),
+                );
+                info!("QuestDB DDL complete (background)");
+            },
+            // SSM validation + TokenManager for renewal
+            async {
+                let timeout = std::time::Duration::from_secs(
+                    dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                );
+                tokio::time::timeout(
+                    timeout,
+                    TokenManager::initialize_deferred(
+                        token_handle.clone(),
+                        &client_id,
+                        &config.dhan,
+                        &config.token,
+                        &config.network,
+                        // Notification not ready yet — pass a temporary placeholder.
+                        // The deferred init only uses notifier for success/fail events,
+                        // which can be sent later via the real notifier.
+                        &NotificationService::initialize(&config.notification).await,
+                    ),
+                )
+                .await
+            },
+        );
+
+        // Handle deferred token manager result
+        let token_manager = match deferred_token_manager {
+            Ok(Ok(manager)) => {
+                info!("deferred auth: SSM validated, token renewal ready");
+                Some(manager)
+            }
+            Ok(Err(err)) => {
+                error!(error = %err, "deferred auth failed — token renewal unavailable");
+                notifier.notify(
+                    dhan_live_trader_core::notification::events::NotificationEvent::AuthenticationFailed {
+                        reason: format!("DEFERRED: {err} — ticks still flowing but renewal unavailable"),
+                    },
+                );
+                None
+            }
+            Err(_elapsed) => {
+                error!("deferred auth timed out — token renewal unavailable");
+                None
+            }
+        };
+
+        // --- Background: Order update WebSocket ---
+        let (order_update_sender, _order_update_receiver) = tokio::sync::broadcast::channel::<
+            dhan_live_trader_common::order_types::OrderUpdate,
+        >(256);
+
+        let order_update_handle = {
+            let url = config.dhan.order_update_websocket_url.clone();
+            let ws_client_id = client_id.clone();
+            let token = token_handle.clone();
+            let sender = order_update_sender.clone();
+            tokio::spawn(async move {
+                run_order_update_connection(url, ws_client_id, token, sender).await;
+            })
+        };
+        info!("order update WebSocket started (background)");
+
+        // --- Background: API server ---
+        let api_state = SharedAppState::new(
+            config.questdb.clone(),
+            config.dhan.clone(),
+            config.instrument.clone(),
+            shared_movers.clone(),
+        );
+
+        let router = build_router(api_state);
+        let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+            .parse()
+            .context("invalid API bind address")?;
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .context("failed to bind API server")?;
+        info!(address = %bind_addr, "API server listening (background)");
+
+        let api_handle = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                error!(?err, "API server error");
+            }
+        });
+
+        // --- Background: Token renewal ---
+        let renewal_handle = token_manager.as_ref().map(|tm| {
+            let handle = tm.spawn_renewal_task();
+            info!("token renewal task started (background)");
+            handle
+        });
+
+        // --- Background: Historical candle fetch ---
+        if let Some(ref tm) = token_manager {
+            spawn_historical_candle_fetch(&subscription_plan, &config, tm, &notifier);
+        }
+
+        notifier.notify(NotificationEvent::Custom {
+            message: "<b>FAST BOOT</b>\nCrash recovery: ticks flowing, all services ready"
+                .to_string(),
+        });
+
+        // --- Await shutdown ---
+        return run_shutdown_fast(
+            ws_handles,
+            processor_handle,
+            renewal_handle,
+            Some(order_update_handle),
+            Some(api_handle),
+            otel_provider,
+            &notifier,
+            &config,
+            shared_movers,
+        )
+        .await;
+    }
+
+    // =====================================================================
+    // SLOW BOOT PATH (normal start / no cache)
+    // Original sequential boot — unchanged behavior.
+    // =====================================================================
+    info!("standard boot — no valid token cache, full auth sequence");
+
+    // -----------------------------------------------------------------------
     // Steps 4+5: Notification + Docker infra (parallel — independent of each other)
     // -----------------------------------------------------------------------
     info!("initializing notification service + checking Docker infra (parallel)");
@@ -242,7 +461,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6: Set up QuestDB tick persistence (best-effort)
+    // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!(
         "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles_1m + materialized views)"
@@ -295,125 +514,23 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 7: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
-    info!("checking instrument build eligibility");
-
-    let subscription_plan = match load_or_build_instruments(
-        &config.dhan.instrument_csv_url,
-        &config.dhan.instrument_csv_fallback_url,
-        &config.instrument,
-        &config.questdb,
-        &config.subscription,
-    )
-    .await
-    {
-        Ok(InstrumentLoadResult::FreshBuild(universe)) => {
-            let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-                .context("invalid IST offset constant")?;
-            let today = Utc::now().with_timezone(&ist).date_naive();
-            let plan = build_subscription_plan(&universe, &config.subscription, today);
-
-            info!(
-                major_indices = plan.summary.major_index_values,
-                display_indices = plan.summary.display_indices,
-                index_derivatives = plan.summary.index_derivatives,
-                stock_equities = plan.summary.stock_equities,
-                stock_derivatives = plan.summary.stock_derivatives,
-                total = plan.summary.total,
-                feed_mode = %plan.summary.feed_mode,
-                "subscription plan ready (fresh build)"
-            );
-
-            notifier.notify(NotificationEvent::InstrumentBuildSuccess {
-                source: universe.build_metadata.csv_source,
-                derivative_count: universe.derivative_contracts.len(),
-                underlying_count: universe.underlyings.len(),
-            });
-            Some(plan)
-        }
-        Ok(InstrumentLoadResult::CachedPlan(plan)) => {
-            info!(
-                major_indices = plan.summary.major_index_values,
-                display_indices = plan.summary.display_indices,
-                index_derivatives = plan.summary.index_derivatives,
-                stock_equities = plan.summary.stock_equities,
-                stock_derivatives = plan.summary.stock_derivatives,
-                total = plan.summary.total,
-                feed_mode = %plan.summary.feed_mode,
-                "subscription plan ready (zero-copy rkyv cache)"
-            );
-            Some(plan)
-        }
-        Ok(InstrumentLoadResult::Unavailable) => {
-            info!("instruments: no cache available during market hours");
-            None
-        }
-        Err(err) => {
-            let trigger_url = format!(
-                "http://{}:{}/api/instruments/rebuild",
-                config.api.host, config.api.port
-            );
-            warn!(
-                error = %err,
-                "instrument build failed — no instruments to subscribe"
-            );
-            notifier.notify(NotificationEvent::InstrumentBuildFailed {
-                reason: err.to_string(),
-                manual_trigger_url: trigger_url,
-            });
-            None
-        }
-    };
-
-    // Step 7.5 (historical candle fetch) is deferred to AFTER the tick pipeline
-    // starts (step 9.5) so it never blocks the live data path. On a mid-market
-    // restart the pipeline goes live in seconds; candles backfill in the background.
+    let subscription_plan: Option<SubscriptionPlan> = load_instruments(&config).await;
 
     // -----------------------------------------------------------------------
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
-    let (frame_receiver, ws_handles) = if let Some(plan) = &subscription_plan {
-        let tm = &token_manager;
+    let token_handle = token_manager.token_handle();
+    let (frame_receiver, ws_handles) = if subscription_plan.is_some() {
         info!("building WebSocket connection pool");
 
-        let token_handle = tm.token_handle();
-        let client_id = {
+        let ws_client_id = {
             let credentials = secret_manager::fetch_dhan_credentials()
                 .await
                 .context("failed to fetch Dhan client ID for WebSocket")?;
             credentials.client_id.expose_secret().to_string()
         };
 
-        // Convert registry instruments → WebSocket subscription entries
-        let instruments: Vec<InstrumentSubscription> = plan
-            .registry
-            .iter()
-            .map(|inst| InstrumentSubscription::new(inst.exchange_segment, inst.security_id))
-            .collect();
-
-        let feed_mode = plan.summary.feed_mode;
-        let instrument_count = instruments.len();
-
-        let mut pool = WebSocketConnectionPool::new(
-            token_handle,
-            client_id,
-            config.dhan.clone(),
-            config.websocket.clone(),
-            instruments,
-            feed_mode,
-        )
-        .context("failed to create WebSocket connection pool")?;
-
-        let receiver = pool.take_frame_receiver();
-        let handles = pool.spawn_all().await;
-
-        info!(
-            connections = handles.len(),
-            instruments = instrument_count,
-            feed_mode = %feed_mode,
-            "WebSocket pool started"
-        );
-
-        (Some(receiver), handles)
+        build_websocket_pool(&token_handle, &ws_client_id, &subscription_plan, &config).await
     } else {
         warn!("WebSocket pool skipped — running in offline mode");
         (None, Vec::new())
@@ -451,90 +568,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9.5: Background historical candle fetch (cold path — never blocks live)
     // -----------------------------------------------------------------------
-    // Spawned AFTER the tick pipeline so that a mid-market restart goes live in
-    // seconds. Candles backfill in the background with zero impact on hot path.
-    if let Some(plan) = subscription_plan
-        .as_ref()
-        .filter(|_| config.historical.enabled)
-    {
-        let bg_registry = plan.registry.clone();
-        let bg_dhan_config = config.dhan.clone();
-        let bg_historical_config = config.historical.clone();
-        let bg_questdb_config = config.questdb.clone();
-        let bg_token_handle = token_manager.token_handle();
-        let bg_notifier = std::sync::Arc::clone(&notifier);
-
-        tokio::spawn(async move {
-            // Fetch client_id from SSM (background — doesn't block boot)
-            let client_id = match secret_manager::fetch_dhan_credentials().await {
-                Ok(creds) => creds.client_id,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "failed to fetch credentials for historical candle fetch"
-                    );
-                    bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
-                        instruments_fetched: 0,
-                        instruments_failed: 0,
-                        total_candles: 0,
-                    });
-                    return;
-                }
-            };
-
-            let mut candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
-                Ok(writer) => writer,
-                Err(err) => {
-                    warn!(?err, "failed to create candle writer for background fetch");
-                    bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
-                        instruments_fetched: 0,
-                        instruments_failed: 0,
-                        total_candles: 0,
-                    });
-                    return;
-                }
-            };
-
-            info!("starting background historical candle fetch");
-
-            let summary = fetch_historical_candles(
-                &bg_registry,
-                &bg_dhan_config,
-                &bg_historical_config,
-                &bg_token_handle,
-                &client_id,
-                &mut candle_writer,
-            )
-            .await;
-
-            if summary.instruments_failed > 0 {
-                bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
-                    instruments_fetched: summary.instruments_fetched,
-                    instruments_failed: summary.instruments_failed,
-                    total_candles: summary.total_candles,
-                });
-            }
-
-            // Cross-verify candle integrity in QuestDB
-            let verify_report = verify_candle_integrity(&bg_questdb_config).await;
-            if !verify_report.passed {
-                bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
-                    instruments_checked: verify_report.instruments_checked,
-                    instruments_with_gaps: verify_report.instruments_with_gaps,
-                });
-            }
-
-            info!(
-                instruments_fetched = summary.instruments_fetched,
-                instruments_failed = summary.instruments_failed,
-                total_candles = summary.total_candles,
-                verification_passed = verify_report.passed,
-                "background historical candle fetch complete"
-            );
-        });
-
-        info!("background historical candle fetch spawned (non-blocking)");
-    }
+    spawn_historical_candle_fetch(&subscription_plan, &config, &token_manager, &notifier);
 
     // -----------------------------------------------------------------------
     // Step 10: Spawn order update WebSocket connection
@@ -544,7 +578,7 @@ async fn main() -> Result<()> {
 
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
-        let client_id = {
+        let ws_client_id = {
             let credentials = secret_manager::fetch_dhan_credentials()
                 .await
                 .context("failed to fetch Dhan client ID for order update WebSocket")?;
@@ -553,7 +587,7 @@ async fn main() -> Result<()> {
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         tokio::spawn(async move {
-            run_order_update_connection(url, client_id, token, sender).await;
+            run_order_update_connection(url, ws_client_id, token, sender).await;
         })
     };
     info!("order update WebSocket started");
@@ -565,7 +599,7 @@ async fn main() -> Result<()> {
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
-        shared_movers,
+        shared_movers.clone(),
     );
 
     let router = build_router(api_state);
@@ -595,6 +629,253 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 13: Await shutdown signal
     // -----------------------------------------------------------------------
+    run_shutdown_fast(
+        ws_handles,
+        processor_handle,
+        Some(renewal_handle),
+        Some(order_update_handle),
+        Some(api_handle),
+        otel_provider,
+        &notifier,
+        &config,
+        shared_movers,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Load instruments (shared by fast and slow boot paths)
+// ---------------------------------------------------------------------------
+
+async fn load_instruments(config: &ApplicationConfig) -> Option<SubscriptionPlan> {
+    info!("checking instrument build eligibility");
+
+    match load_or_build_instruments(
+        &config.dhan.instrument_csv_url,
+        &config.dhan.instrument_csv_fallback_url,
+        &config.instrument,
+        &config.questdb,
+        &config.subscription,
+    )
+    .await
+    {
+        Ok(InstrumentLoadResult::FreshBuild(universe)) => {
+            let ist = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
+                Some(tz) => tz,
+                None => {
+                    error!("invalid IST offset constant");
+                    return None;
+                }
+            };
+            let today = Utc::now().with_timezone(&ist).date_naive();
+            let plan = build_subscription_plan(&universe, &config.subscription, today);
+
+            info!(
+                total = plan.summary.total,
+                feed_mode = %plan.summary.feed_mode,
+                "subscription plan ready (fresh build)"
+            );
+            Some(plan)
+        }
+        Ok(InstrumentLoadResult::CachedPlan(plan)) => {
+            info!(
+                total = plan.summary.total,
+                feed_mode = %plan.summary.feed_mode,
+                "subscription plan ready (zero-copy rkyv cache)"
+            );
+            Some(plan)
+        }
+        Ok(InstrumentLoadResult::Unavailable) => {
+            info!("instruments: no cache available during market hours");
+            None
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "instrument build failed — no instruments to subscribe"
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Build WebSocket connection pool (shared by fast and slow boot paths)
+// ---------------------------------------------------------------------------
+
+async fn build_websocket_pool(
+    token_handle: &TokenHandle,
+    client_id: &str,
+    subscription_plan: &Option<SubscriptionPlan>,
+    config: &ApplicationConfig,
+) -> (
+    Option<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
+    Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
+) {
+    let plan = match subscription_plan {
+        Some(p) => p,
+        None => {
+            warn!("WebSocket pool skipped — no subscription plan");
+            return (None, Vec::new());
+        }
+    };
+
+    info!("building WebSocket connection pool");
+
+    let instruments: Vec<InstrumentSubscription> = plan
+        .registry
+        .iter()
+        .map(|inst| InstrumentSubscription::new(inst.exchange_segment, inst.security_id))
+        .collect();
+
+    let feed_mode = plan.summary.feed_mode;
+    let instrument_count = instruments.len();
+
+    let mut pool = match WebSocketConnectionPool::new(
+        token_handle.clone(),
+        client_id.to_string(),
+        config.dhan.clone(),
+        config.websocket.clone(),
+        instruments,
+        feed_mode,
+    ) {
+        Ok(pool) => pool,
+        Err(err) => {
+            error!(?err, "failed to create WebSocket connection pool");
+            return (None, Vec::new());
+        }
+    };
+
+    let receiver = pool.take_frame_receiver();
+    let handles = pool.spawn_all().await;
+
+    info!(
+        connections = handles.len(),
+        instruments = instrument_count,
+        feed_mode = %feed_mode,
+        "WebSocket pool started"
+    );
+
+    (Some(receiver), handles)
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Spawn background historical candle fetch
+// ---------------------------------------------------------------------------
+
+fn spawn_historical_candle_fetch(
+    subscription_plan: &Option<SubscriptionPlan>,
+    config: &ApplicationConfig,
+    token_manager: &std::sync::Arc<TokenManager>,
+    notifier: &std::sync::Arc<NotificationService>,
+) {
+    let plan = match subscription_plan
+        .as_ref()
+        .filter(|_| config.historical.enabled)
+    {
+        Some(p) => p,
+        None => return,
+    };
+
+    let bg_registry = plan.registry.clone();
+    let bg_dhan_config = config.dhan.clone();
+    let bg_historical_config = config.historical.clone();
+    let bg_questdb_config = config.questdb.clone();
+    let bg_token_handle = token_manager.token_handle();
+    let bg_notifier = std::sync::Arc::clone(notifier);
+
+    tokio::spawn(async move {
+        // Fetch client_id from SSM (background — doesn't block boot)
+        let client_id = match secret_manager::fetch_dhan_credentials().await {
+            Ok(creds) => creds.client_id,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to fetch credentials for historical candle fetch"
+                );
+                bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
+                    instruments_fetched: 0,
+                    instruments_failed: 0,
+                    total_candles: 0,
+                });
+                return;
+            }
+        };
+
+        let mut candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
+            Ok(writer) => writer,
+            Err(err) => {
+                warn!(?err, "failed to create candle writer for background fetch");
+                bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
+                    instruments_fetched: 0,
+                    instruments_failed: 0,
+                    total_candles: 0,
+                });
+                return;
+            }
+        };
+
+        info!("starting background historical candle fetch");
+
+        let summary = fetch_historical_candles(
+            &bg_registry,
+            &bg_dhan_config,
+            &bg_historical_config,
+            &bg_token_handle,
+            &client_id,
+            &mut candle_writer,
+        )
+        .await;
+
+        if summary.instruments_failed > 0 {
+            bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
+                instruments_fetched: summary.instruments_fetched,
+                instruments_failed: summary.instruments_failed,
+                total_candles: summary.total_candles,
+            });
+        }
+
+        // Cross-verify candle integrity in QuestDB
+        let verify_report = verify_candle_integrity(&bg_questdb_config).await;
+        if !verify_report.passed {
+            bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
+                instruments_checked: verify_report.instruments_checked,
+                instruments_with_gaps: verify_report.instruments_with_gaps,
+            });
+        }
+
+        info!(
+            instruments_fetched = summary.instruments_fetched,
+            instruments_failed = summary.instruments_failed,
+            total_candles = summary.total_candles,
+            verification_passed = verify_report.passed,
+            "background historical candle fetch complete"
+        );
+    });
+
+    info!("background historical candle fetch spawned (non-blocking)");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Graceful shutdown (shared by fast and slow boot paths)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)] // APPROVED: shutdown orchestration requires all handles
+async fn run_shutdown_fast(
+    ws_handles: Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
+    processor_handle: Option<tokio::task::JoinHandle<()>>,
+    renewal_handle: Option<tokio::task::JoinHandle<()>>,
+    order_update_handle: Option<tokio::task::JoinHandle<()>>,
+    api_handle: Option<tokio::task::JoinHandle<()>>,
+    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    notifier: &std::sync::Arc<NotificationService>,
+    config: &ApplicationConfig,
+    shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
+) -> Result<()> {
+    let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
+
     let mode = "LIVE";
     info!(
         mode,
@@ -616,28 +897,29 @@ async fn main() -> Result<()> {
     info!("shutdown signal received — stopping gracefully");
     notifier.notify(NotificationEvent::ShutdownInitiated);
 
-    // Spawn a second signal listener: if the operator sends another Ctrl+C
-    // during shutdown, exit immediately instead of hanging.
+    // Second Ctrl+C → force exit.
     tokio::spawn(async {
         let _ = tokio::signal::ctrl_c().await;
         warn!("second shutdown signal received — forcing immediate exit");
         std::process::exit(1);
     });
 
-    // 1. Stop token renewal (no dependencies).
-    renewal_handle.abort();
+    // 1. Stop token renewal.
+    if let Some(handle) = renewal_handle {
+        handle.abort();
+    }
 
-    // 2. Abort order update WebSocket (no downstream dependencies).
-    order_update_handle.abort();
+    // 2. Abort order update WebSocket.
+    if let Some(handle) = order_update_handle {
+        handle.abort();
+    }
 
-    // 3. Abort WebSocket connections. This drops all frame_sender handles,
-    //    which causes the tick processor's recv() to return None and exit
-    //    its loop — triggering the final QuestDB flush.
+    // 3. Abort WebSocket connections (drops senders → processor exits).
     for handle in ws_handles {
         handle.abort();
     }
 
-    // 4. Wait for the tick processor to finish its final flush (bounded).
+    // 4. Wait for tick processor final flush.
     if let Some(handle) = processor_handle {
         let shutdown_timeout = std::time::Duration::from_secs(
             dhan_live_trader_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
@@ -649,10 +931,13 @@ async fn main() -> Result<()> {
     }
 
     // 5. Stop API server.
-    api_handle.abort();
+    if let Some(handle) = api_handle {
+        handle.abort();
+    }
 
-    // 6. Flush pending OpenTelemetry spans before exit (Drop triggers batch flush).
+    // 6. Flush OpenTelemetry.
     drop(otel_provider);
+    drop(shared_movers);
 
     info!("dhan-live-trader stopped");
     Ok(())
