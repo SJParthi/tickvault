@@ -10,11 +10,9 @@
 //!
 //! # Modules
 //! - `instrument_persistence` — daily instrument snapshot to QuestDB (Block 01.1)
-//!
-//! # Key Modules (to be built)
-//! - `questdb_writer` — ILP ingestion for tick data, SQL for orders
-//! - `valkey_cache` — deadpool connection pool, state caching
-//! - `recovery` — memmap2-based crash recovery
+//! - `tick_persistence` — batched ILP writer for live ticks + market depth
+//! - `candle_persistence` — 1-minute candle persistence from historical fetch
+//! - `valkey_cache` — deadpool-redis async connection pool with typed helpers
 //!
 //! # Boot Sequence Position
 //! OMS -> **QuestDB -> Valkey** -> HTTP API
@@ -22,3 +20,4 @@
 pub mod candle_persistence;
 pub mod instrument_persistence;
 pub mod tick_persistence;
+pub mod valkey_cache;

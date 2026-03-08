@@ -475,10 +475,20 @@ async fn main() -> Result<()> {
     // Step 9: Spawn tick processor
     // -----------------------------------------------------------------------
     let processor_handle = if let Some(receiver) = frame_receiver {
+        let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
+        let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
         let handle = tokio::spawn(async move {
-            run_tick_processor(receiver, tick_writer, depth_writer, None).await;
+            run_tick_processor(
+                receiver,
+                tick_writer,
+                depth_writer,
+                None,
+                candle_agg,
+                movers,
+            )
+            .await;
         });
-        info!("tick processor started");
+        info!("tick processor started (with candle aggregation + top movers)");
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
