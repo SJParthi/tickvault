@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader — Live market data explorer. Ticks, candles, candlestick charts, instruments — zero SQL required.",
+  "description": "dhan-live-trader — Live market data explorer. Pick underlying, instrument, timeframe — charts load automatically. TradingView-style UX.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -180,12 +180,12 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
       "id": 150,
-      "title": "Candlestick Charts (select instrument above)",
+      "title": "Candlestick Charts",
       "type": "row"
     },
     {
       "datasource": { "type": "postgres", "uid": "questdb" },
-      "description": "Historical 1-minute OHLCV candlestick chart from Dhan REST API data. Select segment and security_id from dropdowns above. SMA 20 overlay included.",
+      "description": "Historical OHLCV candlestick chart from Dhan REST API. Pick Underlying → Instrument → Timeframe from dropdowns above. 1m candles aggregated via SAMPLE BY into selected timeframe. SMA 20 overlay.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -233,7 +233,7 @@
         "colors": { "up": "green", "down": "red", "flat": "gray" },
         "includeAllFields": true
       },
-      "title": "Historical Candles — ${segment} / ${security_id}",
+      "title": "Historical — ${security_id:text}  [${timeframe}]",
       "type": "candlestick",
       "targets": [
         {
@@ -241,7 +241,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM historical_candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nSAMPLE BY ${timeframe}\nORDER BY ts;",
           "refId": "OHLCV"
         },
         {
@@ -249,7 +249,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  avg(close) OVER (ORDER BY ts ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM historical_candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM historical_candles_1m\n  WHERE security_id = ${security_id}\n    AND segment = '${segment}'\n    AND $__timeFilter(ts)\n  SAMPLE BY ${timeframe}\n  ORDER BY ts\n);",
           "refId": "SMA",
           "hide": false
         }
@@ -257,7 +257,7 @@
     },
     {
       "datasource": { "type": "postgres", "uid": "questdb" },
-      "description": "Live 1-minute OHLCV candlestick chart aggregated from real-time ticks via QuestDB materialized views. SMA 20 overlay included.",
+      "description": "Live OHLCV candlestick chart aggregated from real-time ticks via QuestDB materialized views. 1m candles aggregated via SAMPLE BY into selected timeframe. SMA 20 overlay. Auto-refreshes every 5s.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -305,7 +305,7 @@
         "colors": { "up": "green", "down": "red", "flat": "gray" },
         "includeAllFields": true
       },
-      "title": "Live Candles (Ticks → 1m) — ${segment} / ${security_id}",
+      "title": "Live (Ticks) — ${security_id:text}  [${timeframe}]",
       "type": "candlestick",
       "targets": [
         {
@@ -313,7 +313,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nSAMPLE BY ${timeframe}\nORDER BY ts;",
           "refId": "OHLCV"
         },
         {
@@ -321,7 +321,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  avg(close) OVER (ORDER BY ts ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nORDER BY ts;",
+          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM candles_1m\n  WHERE security_id = ${security_id}\n    AND segment = '${segment}'\n    AND $__timeFilter(ts)\n  SAMPLE BY ${timeframe}\n  ORDER BY ts\n);",
           "refId": "SMA",
           "hide": false
         }
@@ -857,17 +857,17 @@
   "templating": {
     "list": [
       {
-        "current": { "selected": false, "text": "NSE_FNO", "value": "NSE_FNO" },
+        "current": {},
         "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT DISTINCT segment FROM historical_candles_1m ORDER BY segment;",
-        "description": "Exchange segment filter for candlestick charts",
+        "definition": "SELECT DISTINCT underlying_symbol FROM fno_underlyings ORDER BY underlying_symbol;",
+        "description": "Pick underlying (NIFTY, BANKNIFTY, etc.)",
         "hide": 0,
         "includeAll": false,
-        "label": "Segment",
+        "label": "Underlying",
         "multi": false,
-        "name": "segment",
+        "name": "underlying",
         "options": [],
-        "query": "SELECT DISTINCT segment FROM historical_candles_1m ORDER BY segment;",
+        "query": "SELECT DISTINCT underlying_symbol FROM fno_underlyings ORDER BY underlying_symbol;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
@@ -875,22 +875,61 @@
         "type": "query"
       },
       {
-        "current": { "selected": false, "text": "", "value": "" },
+        "current": {},
         "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT DISTINCT security_id FROM historical_candles_1m WHERE segment = '${segment}' ORDER BY security_id LIMIT 200;",
-        "description": "Security ID filter for candlestick charts",
+        "definition": "SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${underlying}' ORDER BY expiry_date, option_type, strike_price LIMIT 300;",
+        "description": "Pick contract — shows display name, resolves to security_id",
         "hide": 0,
         "includeAll": false,
-        "label": "Security ID",
+        "label": "Instrument",
         "multi": false,
         "name": "security_id",
         "options": [],
-        "query": "SELECT DISTINCT security_id FROM historical_candles_1m WHERE segment = '${segment}' ORDER BY security_id LIMIT 200;",
+        "query": "SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${underlying}' ORDER BY expiry_date, option_type, strike_price LIMIT 300;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
-        "sort": 3,
+        "sort": 0,
         "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": { "type": "postgres", "uid": "questdb" },
+        "definition": "SELECT exchange_segment FROM derivative_contracts WHERE security_id = ${security_id} LIMIT 1;",
+        "description": "Auto-derived from selected instrument",
+        "hide": 2,
+        "includeAll": false,
+        "label": "Segment",
+        "multi": false,
+        "name": "segment",
+        "options": [],
+        "query": "SELECT exchange_segment FROM derivative_contracts WHERE security_id = ${security_id} LIMIT 1;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": true, "text": "5m", "value": "5m" },
+        "description": "Candlestick timeframe — 1m candles aggregated via QuestDB SAMPLE BY",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Timeframe",
+        "multi": false,
+        "name": "timeframe",
+        "options": [
+          { "selected": false, "text": "1m", "value": "1m" },
+          { "selected": true, "text": "5m", "value": "5m" },
+          { "selected": false, "text": "15m", "value": "15m" },
+          { "selected": false, "text": "30m", "value": "30m" },
+          { "selected": false, "text": "1h", "value": "1h" },
+          { "selected": false, "text": "4h", "value": "4h" },
+          { "selected": false, "text": "1d", "value": "1d" }
+        ],
+        "query": "1m,5m,15m,30m,1h,4h,1d",
+        "skipUrlSync": false,
+        "type": "custom"
       }
     ]
   },
@@ -899,5 +938,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 2
+  "version": 3
 }
