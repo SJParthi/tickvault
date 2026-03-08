@@ -310,7 +310,7 @@ fi
 # ---- Step 9: Wait for all services ----
 step "Waiting for services to be healthy"
 HEALTH_FAIL=0
-wait_for_http "QuestDB"         "http://localhost:9000"             60 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
+wait_for_http "QuestDB"         "http://localhost:9000"            120 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Prometheus"      "http://localhost:9090/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Grafana"         "http://localhost:3000/api/health"  45 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Jaeger UI"       "http://localhost:16686"            30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
@@ -335,7 +335,7 @@ if [ -n "$PROM_TARGETS" ]; then
     info "Targets: ${UP_COUNT}/${TOTAL_TARGETS} UP"
     if [ "$DOWN_COUNT" -gt 0 ]; then
         # Extract down job names
-        echo "$PROM_TARGETS" | grep -oP '"job":"[^"]*"[^}]*"health":"down"' | grep -oP '"job":"[^"]*"' | sort -u | while read -r line; do
+        echo "$PROM_TARGETS" | grep -o '"job":"[^"]*"[^}]*"health":"down"' | grep -o '"job":"[^"]*"' | sort -u | while read -r line; do
             warn "Target DOWN: $line"
         done
     fi
@@ -376,7 +376,7 @@ if [ -n "$DASH_JSON" ] && [ "$DASH_JSON" != "[]" ]; then
     DASH_COUNT=$(echo "$DASH_JSON" | grep -o '"uid"' | wc -l | tr -d ' ')
     # Check for expected dashboards by UID
     for uid in dlt-system-overview dlt-traefik dlt-logs; do
-        DASH_TITLE=$(echo "$DASH_JSON" | grep -oP "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" | grep -oP '"title":"[^"]*"' | head -1 || echo "")
+        DASH_TITLE=$(echo "$DASH_JSON" | grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" | grep -o '"title":"[^"]*"' | head -1 || echo "")
         if [ -n "$DASH_TITLE" ]; then
             info "  ${uid}: loaded"
         else

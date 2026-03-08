@@ -128,11 +128,11 @@ fi
 # GATE 6: Commit message format (conventional commits)
 # ─────────────────────────────────────────────
 echo "  [6/7] Commit message format..." >&2
-# Extract -m "message" from the git commit command
-COMMIT_MSG=$(echo "$COMMAND" | grep -oP '(?<=-m\s["\x27])[^"\x27]+' 2>/dev/null | head -1 || true)
+# Extract -m "message" from the git commit command (macOS-compatible, no grep -P)
+COMMIT_MSG=$(echo "$COMMAND" | sed -n "s/.*-m [\"'][^\"']*[\"'].*/&/p" 2>/dev/null | sed "s/.*-m [\"']//" | sed "s/[\"'].*//" | head -1 || true)
 if [ -z "$COMMIT_MSG" ]; then
   # Try extracting from heredoc pattern: -m "$(cat <<'EOF' ... EOF )"
-  COMMIT_MSG=$(echo "$COMMAND" | grep -oP '(?<=-m\s").*' 2>/dev/null | head -1 || true)
+  COMMIT_MSG=$(echo "$COMMAND" | sed -n 's/.*-m "\(.*\)/\1/p' 2>/dev/null | head -1 || true)
 fi
 if [ -n "$COMMIT_MSG" ]; then
   # Extract first line only
