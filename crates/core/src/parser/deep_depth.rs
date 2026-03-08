@@ -23,6 +23,7 @@ use dhan_live_trader_common::constants::{
 };
 use dhan_live_trader_common::tick_types::DeepDepthLevel;
 
+use super::read_helpers::{read_f64_le, read_u16_le, read_u32_le};
 use super::types::ParseError;
 
 // ---------------------------------------------------------------------------
@@ -53,45 +54,6 @@ pub enum DepthSide {
     Bid,
     /// Ask (sell) side — feed code 51.
     Ask,
-}
-
-// ---------------------------------------------------------------------------
-// Byte reading helpers
-// ---------------------------------------------------------------------------
-
-/// Reads a little-endian u16 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([raw[offset], raw[offset + 1]])
-}
-
-/// Reads a little-endian u32 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-    ])
-}
-
-/// Reads a little-endian f64 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_f64_le(raw: &[u8], offset: usize) -> f64 {
-    f64::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-        raw[offset + 4],
-        raw[offset + 5],
-        raw[offset + 6],
-        raw[offset + 7],
-    ])
 }
 
 // ---------------------------------------------------------------------------

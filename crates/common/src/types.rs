@@ -67,12 +67,16 @@ pub enum ExchangeSegment {
     NseEquity,
     /// NSE Futures & Options segment.
     NseFno,
+    /// NSE Currency derivatives segment.
+    NseCurrency,
     /// BSE Equity segment.
     BseEquity,
-    /// BSE Futures & Options segment.
-    BseFno,
     /// MCX Commodity segment.
     McxComm,
+    /// BSE Currency derivatives segment.
+    BseCurrency,
+    /// BSE Futures & Options segment.
+    BseFno,
 }
 
 impl ExchangeSegment {
@@ -82,21 +86,28 @@ impl ExchangeSegment {
             Self::IdxI => "IDX_I",
             Self::NseEquity => "NSE_EQ",
             Self::NseFno => "NSE_FNO",
+            Self::NseCurrency => "NSE_CURRENCY",
             Self::BseEquity => "BSE_EQ",
-            Self::BseFno => "BSE_FNO",
             Self::McxComm => "MCX_COMM",
+            Self::BseCurrency => "BSE_CURRENCY",
+            Self::BseFno => "BSE_FNO",
         }
     }
 
     /// Returns the binary wire code used in Dhan WebSocket V2 protocol.
+    ///
+    /// Codes sourced from Dhan Python SDK: IDX_I=0, NSE_EQ=1, NSE_FNO=2,
+    /// NSE_CURRENCY=3, BSE_EQ=4, MCX_COMM=5, BSE_CURRENCY=7, BSE_FNO=8.
     pub fn binary_code(&self) -> u8 {
         match self {
             Self::IdxI => 0,
             Self::NseEquity => 1,
             Self::NseFno => 2,
+            Self::NseCurrency => 3,
             Self::BseEquity => 4,
-            Self::BseFno => 7,
             Self::McxComm => 5,
+            Self::BseCurrency => 7,
+            Self::BseFno => 8,
         }
     }
 }
@@ -265,9 +276,11 @@ impl From<&ArchivedExchangeSegment> for ExchangeSegment {
             ArchivedExchangeSegment::IdxI => Self::IdxI,
             ArchivedExchangeSegment::NseEquity => Self::NseEquity,
             ArchivedExchangeSegment::NseFno => Self::NseFno,
+            ArchivedExchangeSegment::NseCurrency => Self::NseCurrency,
             ArchivedExchangeSegment::BseEquity => Self::BseEquity,
-            ArchivedExchangeSegment::BseFno => Self::BseFno,
             ArchivedExchangeSegment::McxComm => Self::McxComm,
+            ArchivedExchangeSegment::BseCurrency => Self::BseCurrency,
+            ArchivedExchangeSegment::BseFno => Self::BseFno,
         }
     }
 }
@@ -334,9 +347,11 @@ mod tests {
         assert_eq!(ExchangeSegment::IdxI.as_str(), "IDX_I");
         assert_eq!(ExchangeSegment::NseEquity.as_str(), "NSE_EQ");
         assert_eq!(ExchangeSegment::NseFno.as_str(), "NSE_FNO");
+        assert_eq!(ExchangeSegment::NseCurrency.as_str(), "NSE_CURRENCY");
         assert_eq!(ExchangeSegment::BseEquity.as_str(), "BSE_EQ");
-        assert_eq!(ExchangeSegment::BseFno.as_str(), "BSE_FNO");
         assert_eq!(ExchangeSegment::McxComm.as_str(), "MCX_COMM");
+        assert_eq!(ExchangeSegment::BseCurrency.as_str(), "BSE_CURRENCY");
+        assert_eq!(ExchangeSegment::BseFno.as_str(), "BSE_FNO");
     }
 
     #[test]
@@ -420,6 +435,47 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let deserialized: OptionType = serde_json::from_str(&json).unwrap();
         assert_eq!(original, deserialized);
+    }
+
+    // --- binary_code correctness (must match constants.rs) ---
+
+    #[test]
+    fn test_exchange_segment_binary_code_matches_constants() {
+        use crate::constants::{
+            EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
+            EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
+            EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
+        };
+
+        assert_eq!(ExchangeSegment::IdxI.binary_code(), EXCHANGE_SEGMENT_IDX_I);
+        assert_eq!(
+            ExchangeSegment::NseEquity.binary_code(),
+            EXCHANGE_SEGMENT_NSE_EQ
+        );
+        assert_eq!(
+            ExchangeSegment::NseFno.binary_code(),
+            EXCHANGE_SEGMENT_NSE_FNO
+        );
+        assert_eq!(
+            ExchangeSegment::NseCurrency.binary_code(),
+            EXCHANGE_SEGMENT_NSE_CURRENCY
+        );
+        assert_eq!(
+            ExchangeSegment::BseEquity.binary_code(),
+            EXCHANGE_SEGMENT_BSE_EQ
+        );
+        assert_eq!(
+            ExchangeSegment::McxComm.binary_code(),
+            EXCHANGE_SEGMENT_MCX_COMM
+        );
+        assert_eq!(
+            ExchangeSegment::BseCurrency.binary_code(),
+            EXCHANGE_SEGMENT_BSE_CURRENCY
+        );
+        assert_eq!(
+            ExchangeSegment::BseFno.binary_code(),
+            EXCHANGE_SEGMENT_BSE_FNO
+        );
     }
 
     // --- Hash consistency (used as HashMap keys) ---

@@ -364,98 +364,101 @@ Bytes 4-7:  Security ID (i32, Little Endian)
 | 2 | NSE_FNO |
 | 3 | NSE_CURRENCY |
 | 4 | BSE_EQ |
-| 5 | BSE_FNO |
-| 7 | MCX_COMM |
+| 5 | MCX_COMM |
+| 7 | BSE_CURRENCY |
+| 8 | BSE_FNO |
 
-### Response Code 2 — Ticker Packet (25 bytes total)
+### Response Code 2 — Ticker Packet (16 bytes total)
+
+SDK format: `<BHBIfI>`
 
 ```
 Bytes 0-7:   Header (response_code=2, length, segment, security_id)
-Bytes 8-11:  LTP (f32, Little Endian)  — divide by 100 for actual price
-Bytes 12-15: Reserved
-Bytes 16-17: Open (i16, Little Endian)  — offset from LTP
-Bytes 18-19: High (i16, Little Endian)  — offset from LTP
-Bytes 20-21: Low (i16, Little Endian)   — offset from LTP
-Bytes 22-23: Close (i16, Little Endian) — offset from LTP (prev close)
-Byte 24:     Reserved
+Bytes 8-11:  LTP (f32, Little Endian) — direct price in rupees, NO division
+Bytes 12-15: LTT (u32, Little Endian) — last trade time (epoch seconds, IST-naive)
 ```
 
 **Price decoding for Ticker:**
-- LTP: Read f32 at offset 8, divide by 100
-- Open: LTP + (read i16 at offset 16) / 100
-- High: LTP + (read i16 at offset 18) / 100
-- Low: LTP + (read i16 at offset 20) / 100
-- Close (prev): LTP + (read i16 at offset 22) / 100
+- LTP: Read f32 at offset 8 — value IS the price in rupees (no /100)
+- LTT: Read u32 at offset 12 — IST-naive epoch seconds
 
-### Response Code 4 — Quote Packet (51 bytes total)
+### Response Code 4 — Quote Packet (50 bytes total)
+
+SDK format: `<BHBIfHIfIIIffff>`
+
+CRITICAL: OHLC starts at offset 34 (diverges from Full packet at this point).
 
 ```
 Bytes 0-7:   Header (response_code=4)
 Bytes 8-11:  LTP (f32 LE)
-Bytes 12-15: Reserved
-Bytes 16-17: Open offset (i16)
-Bytes 18-19: High offset (i16)
-Bytes 20-21: Low offset (i16)
-Bytes 22-23: Close offset (i16)
-Byte 24:     Reserved
-Bytes 25-28: Volume (i32 LE)
-Bytes 29-32: Reserved
-Bytes 33-36: Avg Trade Price (f32 LE)
-Bytes 37-40: Reserved (Total Buy Qty placeholder)
-Bytes 41-44: Reserved (Total Sell Qty placeholder)
-Bytes 45-48: Reserved
-Bytes 49-50: Reserved
+Bytes 12-13: LTQ — Last Trade Quantity (u16 LE)
+Bytes 14-17: LTT — Last Trade Time (u32 LE, epoch seconds)
+Bytes 18-21: ATP — Average Traded Price (f32 LE)
+Bytes 22-25: Volume (u32 LE)
+Bytes 26-29: Total Sell Quantity (u32 LE)
+Bytes 30-33: Total Buy Quantity (u32 LE)
+Bytes 34-37: Day Open (f32 LE)
+Bytes 38-41: Day Close / Prev Close (f32 LE)
+Bytes 42-45: Day High (f32 LE)
+Bytes 46-49: Day Low (f32 LE)
 ```
 
 ### Response Code 8 — Full Packet (162 bytes total)
 
+SDK format: `<BHBIfHIfIIIIIIffff100s>`
+
+CRITICAL: Diverges from Quote at offset 34. Full has OI (u32) where Quote has OHLC (f32).
+
 ```
 Bytes 0-7:   Header (response_code=8)
-Bytes 8-24:  Ticker fields (same layout as Response Code 2)
-Byte 24:     Reserved
-Bytes 25-28: Volume (i32 LE)
-Bytes 29-32: OI (Open Interest) (i32 LE)
-Bytes 33-36: Avg Trade Price (f32 LE)
-Bytes 37-40: Reserved
-Bytes 41-44: Reserved
-Bytes 45-48: Reserved
-Bytes 49-50: Last Traded Quantity (i16 LE)
-Bytes 51-54: Last Trade Time (i32 LE — Unix epoch seconds)
-Bytes 55-58: Reserved
+Bytes 8-11:  LTP (f32 LE)
+Bytes 12-13: LTQ — Last Trade Quantity (u16 LE)
+Bytes 14-17: LTT — Last Trade Time (u32 LE, epoch seconds)
+Bytes 18-21: ATP — Average Traded Price (f32 LE)
+Bytes 22-25: Volume (u32 LE)
+Bytes 26-29: Total Sell Quantity (u32 LE)
+Bytes 30-33: Total Buy Quantity (u32 LE)
+Bytes 34-37: OI — Open Interest (u32 LE)        ← Quote has Day Open here!
+Bytes 38-41: OI Day High (u32 LE)               ← Quote has Day Close here!
+Bytes 42-45: OI Day Low (u32 LE)                ← Quote has Day High here!
+Bytes 46-49: Day Open (f32 LE)
+Bytes 50-53: Day Close / Prev Close (f32 LE)
+Bytes 54-57: Day High (f32 LE)
+Bytes 58-61: Day Low (f32 LE)
 
--- 5-Level Market Depth (Bytes 59-161) --
+-- 5-Level Market Depth (Bytes 62-161) --
 Each level = 20 bytes:
-  Bytes 0-3:   Bid Quantity (i32 LE)
-  Bytes 4-5:   Bid Orders (i16 LE)
-  Bytes 6-9:   Bid Price (f32 LE — divide by 100)
-  Bytes 10-13: Ask Price (f32 LE — divide by 100)
-  Bytes 14-17: Ask Quantity (i32 LE)
-  Bytes 18-19: Ask Orders (i16 LE)
+  Bytes 0-3:   Bid Quantity (u32 LE)
+  Bytes 4-7:   Ask Quantity (u32 LE)
+  Bytes 8-9:   Bid Orders (u16 LE)
+  Bytes 10-11: Ask Orders (u16 LE)
+  Bytes 12-15: Bid Price (f32 LE)
+  Bytes 16-19: Ask Price (f32 LE)
 
-5 levels × 20 bytes = 100 bytes (offsets 59-158)
-Bytes 159-161: Reserved/padding (3 bytes)
+5 levels × 20 bytes = 100 bytes (offsets 62-161)
 ```
 
-### Response Code 1 — Index Ticker (25 bytes)
+### Response Code 1 — Index Ticker (16 bytes)
 
-Same structure as Response Code 2 (Ticker), but specifically for IDX_I segment instruments. Same field layout, same decoding rules.
+Same structure as Response Code 2 (Ticker), but specifically for IDX_I segment instruments. Same 16-byte layout, same decoding rules.
 
-### Response Code 5 — OI Data (17 bytes total)
+### Response Code 5 — OI Data (12 bytes total)
+
+SDK format: `<BHBII>`
 
 ```
 Bytes 0-7:   Header (response_code=5)
-Bytes 8-11:  Open Interest (i32 LE)
-Bytes 12-15: OI Day High (i32 LE)
-Bytes 16:    OI Day Low or padding
+Bytes 8-11:  Open Interest (u32 LE)
 ```
 
-### Response Code 6 — Previous Close (20 bytes total)
+### Response Code 6 — Previous Close (16 bytes total)
+
+SDK format: `<BHBIfI>`
 
 ```
 Bytes 0-7:   Header (response_code=6)
-Bytes 8-11:  Previous Close Price (f32 LE — divide by 100)
-Bytes 12-15: Previous OI (i32 LE)
-Bytes 16-19: Previous Volume (i32 LE)
+Bytes 8-11:  Previous Close Price (f32 LE) — direct price, NO division
+Bytes 12-15: Previous OI (u32 LE)
 ```
 
 **When received:** Sent once per instrument on subscription or market open. Used to calculate day change percentages.
@@ -1151,7 +1154,7 @@ Stage 2:  Frame validation (length check, min size)
 Stage 3:  Header parse — extract response_code, segment, security_id (zerocopy)
 Stage 4:  Response code dispatch (enum_dispatch — jump table, no dyn)
 Stage 5:  Body parse — decode fields per response code (zerocopy)
-Stage 6:  Price decode — divide by 100, apply offsets (f32/i16 math)
+Stage 6:  Price decode — direct f32 read from wire (no division needed in V2)
 Stage 7:  Instrument lookup — security_id → InstrumentInfo (nohash HashMap)
 Stage 8:  Tick struct assembly — TickData on stack (arrayvec, no heap)
 Stage 9:  Dedup check — skip if duplicate (ring buffer hash check)
@@ -1281,13 +1284,13 @@ Response: Array of OHLCV candles with timestamps.
 
 - [ ] 8-byte header parser (zerocopy)
 - [ ] Response code dispatcher (enum_dispatch)
-- [ ] Ticker packet parser (25 bytes)
-- [ ] Quote packet parser (51 bytes)
-- [ ] Full packet parser (162 bytes)
-- [ ] OI packet parser (17 bytes)
-- [ ] Previous close parser (20 bytes)
-- [ ] Market status parser (10 bytes)
-- [ ] Price decoding (f32/100 + i16 offsets)
+- [ ] Ticker packet parser (16 bytes, `<BHBIfI>`)
+- [ ] Quote packet parser (50 bytes, `<BHBIfHIfIIIffff>`)
+- [ ] Full packet parser (162 bytes, `<BHBIfHIfIIIIIIffff100s>`)
+- [ ] OI packet parser (12 bytes, `<BHBII>`)
+- [ ] Previous close parser (16 bytes, `<BHBIfI>`)
+- [ ] Market status parser (8 bytes, `<BHBI>`)
+- [ ] Price decoding (direct f32 read — no /100 in V2)
 - [ ] 5-level market depth parser
 - [ ] Fuzz tests for malformed packets
 - [ ] Benchmark: <10ns per packet parse
