@@ -355,6 +355,11 @@ pub const ORDER_UPDATE_LOGIN_MSG_CODE: u16 = 42;
 /// Order updates are infrequent — use longer timeout than market feed.
 pub const ORDER_UPDATE_READ_TIMEOUT_SECS: u64 = 120;
 
+/// Read timeout for order update WebSocket outside market hours (seconds).
+/// Off-hours: no orders expected, Dhan sends no data. Use 10 minutes to
+/// avoid noisy reconnect loops while still detecting dead connections.
+pub const ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS: u64 = 600;
+
 /// Maximum reconnection attempts for order update WebSocket.
 pub const ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS: u32 = 10;
 
