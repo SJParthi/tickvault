@@ -214,6 +214,11 @@ impl TokenManager {
                             max = TOTP_MAX_RETRIES,
                             "TOTP rejected — waiting for next 30s window before retry"
                         );
+                        notifier.notify(NotificationEvent::AuthenticationFailed {
+                            reason: format!(
+                                "TOTP rejected (retry {totp_retries}/{TOTP_MAX_RETRIES}) — waiting 30s for fresh window"
+                            ),
+                        });
                         // Wait for the next TOTP window (30s) to get a fresh code.
                         tokio::select! {
                             () = tokio::time::sleep(Duration::from_secs(TOTP_PERIOD_SECS)) => {}
