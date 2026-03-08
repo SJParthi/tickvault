@@ -8,8 +8,9 @@
 //! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
 //! 3. Initialize structured logging with OpenTelemetry layer
 //! 4. Initialize Telegram notification service (best-effort)
-//! 5. Authenticate with Dhan API (SSM → TOTP → JWT)
-//! 6. Set up QuestDB tick persistence (best-effort)
+//! 5. Ensure Docker infrastructure is running (auto-start if needed)
+//! 6. Authenticate with Dhan API (SSM → TOTP → JWT)
+//! 7. Set up QuestDB tick persistence (best-effort)
 //! 7. Build F&O universe + subscription plan from instrument CSV
 //! 8. Build WebSocket connection pool with planned instruments
 //! 9. Spawn tick processing pipeline (pure capture — parse → filter → persist)
@@ -18,6 +19,7 @@
 //! 12. Spawn token renewal background task
 //! 13. Await shutdown signal (Ctrl+C)
 
+mod infra;
 mod observability;
 
 use std::net::SocketAddr;
@@ -192,7 +194,12 @@ async fn main() -> Result<()> {
     let notifier = NotificationService::initialize(&config.notification).await;
 
     // -----------------------------------------------------------------------
-    // Step 5: Authenticate with Dhan API (infinite retry for transient errors)
+    // Step 5: Ensure Docker infrastructure is running (auto-start if needed)
+    // -----------------------------------------------------------------------
+    infra::ensure_infra_running(&config.questdb).await;
+
+    // -----------------------------------------------------------------------
+    // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
     // -----------------------------------------------------------------------
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 

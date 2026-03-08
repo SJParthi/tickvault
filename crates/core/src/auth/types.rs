@@ -144,6 +144,30 @@ impl fmt::Debug for GrafanaCredentials {
 }
 
 // ---------------------------------------------------------------------------
+// Telegram Credentials (from SSM)
+// ---------------------------------------------------------------------------
+
+/// Telegram bot credentials fetched from AWS SSM Parameter Store.
+///
+/// Used by the infra orchestrator to inject into docker-compose
+/// environment variables for Grafana alerting.
+pub struct TelegramCredentials {
+    /// Telegram bot token.
+    pub bot_token: SecretString,
+    /// Telegram chat ID.
+    pub chat_id: SecretString,
+}
+
+impl fmt::Debug for TelegramCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramCredentials")
+            .field("bot_token", &"[REDACTED]")
+            .field("chat_id", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token State (stored in ArcSwap)
 // ---------------------------------------------------------------------------
 

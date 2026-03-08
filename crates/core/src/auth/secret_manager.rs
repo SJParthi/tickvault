@@ -17,7 +17,7 @@ use dhan_live_trader_common::constants::{
 };
 use dhan_live_trader_common::error::ApplicationError;
 
-use super::types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials};
+use super::types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials, TelegramCredentials};
 
 // ---------------------------------------------------------------------------
 // SSM Path Construction
@@ -241,6 +241,49 @@ pub async fn fetch_grafana_credentials() -> Result<GrafanaCredentials, Applicati
         admin_user,
         admin_password,
     })
+}
+
+/// Fetches Telegram bot credentials from AWS SSM Parameter Store.
+///
+/// Retrieves bot-token and chat-id, both wrapped in `SecretString`.
+/// Used by the infra orchestrator to inject into docker-compose
+/// environment variables for Grafana alerting.
+///
+/// # Errors
+///
+/// Returns `ApplicationError::SecretRetrieval` if any secret cannot be fetched.
+#[instrument(skip_all, fields(environment))]
+pub async fn fetch_telegram_credentials() -> Result<TelegramCredentials, ApplicationError> {
+    use dhan_live_trader_common::constants::{
+        SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET, TELEGRAM_CHAT_ID_SECRET,
+    };
+
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+
+    let bot_token_path = build_ssm_path(
+        &environment,
+        SSM_TELEGRAM_SERVICE,
+        TELEGRAM_BOT_TOKEN_SECRET,
+    );
+    let chat_id_path = build_ssm_path(&environment, SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET);
+
+    info!(
+        bot_token_path = %bot_token_path,
+        chat_id_path = %chat_id_path,
+        "fetching Telegram credentials from SSM"
+    );
+
+    let (bot_token, chat_id) = tokio::try_join!(
+        fetch_secret(&ssm_client, &bot_token_path),
+        fetch_secret(&ssm_client, &chat_id_path),
+    )?;
+
+    info!("all Telegram credentials fetched successfully from SSM");
+
+    Ok(TelegramCredentials { bot_token, chat_id })
 }
 
 // ---------------------------------------------------------------------------

@@ -22,8 +22,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
 
+use chrono::{Datelike, FixedOffset, NaiveTime, Utc};
+
 use dhan_live_trader_common::constants::{
-    ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS, ORDER_UPDATE_READ_TIMEOUT_SECS,
+    IST_UTC_OFFSET_SECONDS, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS,
+    ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS, ORDER_UPDATE_READ_TIMEOUT_SECS,
     ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
 };
 use dhan_live_trader_common::order_types::OrderUpdate;
@@ -67,19 +70,30 @@ pub async fn run_order_update_connection(
                 info!("order update WebSocket disconnected cleanly — reconnecting");
             }
             Err(err) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
-                    error!(
-                        attempts = consecutive_failures,
-                        "order update WebSocket exhausted reconnection attempts"
+                // Off-hours ReadTimeout is expected (no orders outside market hours).
+                // Log at debug level and reset backoff to avoid noise.
+                if matches!(err, OrderUpdateConnectionError::ReadTimeout)
+                    && !is_within_market_hours()
+                {
+                    debug!(
+                        "order update WebSocket idle timeout outside market hours — reconnecting"
                     );
-                    return;
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
+                        error!(
+                            attempts = consecutive_failures,
+                            "order update WebSocket exhausted reconnection attempts"
+                        );
+                        return;
+                    }
+                    warn!(
+                        ?err,
+                        attempt = consecutive_failures,
+                        "order update WebSocket error — will reconnect"
+                    );
                 }
-                warn!(
-                    ?err,
-                    attempt = consecutive_failures,
-                    "order update WebSocket error — will reconnect"
-                );
             }
         }
 
@@ -144,7 +158,13 @@ async fn connect_and_listen(
 
     debug!("order update WebSocket login sent");
 
-    let read_timeout = Duration::from_secs(ORDER_UPDATE_READ_TIMEOUT_SECS);
+    // Use longer timeout outside market hours to avoid reconnect noise.
+    let timeout_secs = if is_within_market_hours() {
+        ORDER_UPDATE_READ_TIMEOUT_SECS
+    } else {
+        ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
+    };
+    let read_timeout = Duration::from_secs(timeout_secs);
 
     // Read loop — receive order updates until disconnect.
     loop {
@@ -200,6 +220,40 @@ async fn connect_and_listen(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Market hours check
+// ---------------------------------------------------------------------------
+
+/// Data collection window boundaries (IST).
+/// Orders can only arrive during market hours (09:00 – 16:00 IST).
+const DATA_COLLECTION_START: (u32, u32) = (9, 0);
+const DATA_COLLECTION_END: (u32, u32) = (16, 0);
+
+/// Returns `true` if the current IST time is within data collection hours.
+///
+/// Cold path — called once per connection lifecycle. Allocation-free.
+fn is_within_market_hours() -> bool {
+    #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
+    let ist =
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+    let now_ist = Utc::now().with_timezone(&ist).time();
+
+    // Also check weekday — no orders on Saturday/Sunday.
+    let today = Utc::now().with_timezone(&ist).weekday();
+    if matches!(today, chrono::Weekday::Sat | chrono::Weekday::Sun) {
+        return false;
+    }
+
+    #[allow(clippy::expect_used)] // APPROVED: compile-time provable constants
+    let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0)
+        .expect("09:00:00 is always valid"); // APPROVED: compile-time provable constant
+    #[allow(clippy::expect_used)] // APPROVED: compile-time provable constants
+    let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0)
+        .expect("16:00:00 is always valid"); // APPROVED: compile-time provable constant
+
+    now_ist >= start && now_ist < end
 }
 
 // ---------------------------------------------------------------------------
