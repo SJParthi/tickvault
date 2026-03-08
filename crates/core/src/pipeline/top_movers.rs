@@ -367,9 +367,9 @@ mod tests {
 
     #[test]
     fn constants_are_reasonable() {
-        assert!(TOP_N >= 5 && TOP_N <= 100);
-        assert!(MIN_CHANGE_PCT_THRESHOLD > 0.0 && MIN_CHANGE_PCT_THRESHOLD < 1.0);
-        assert!(TRACKER_MAP_INITIAL_CAPACITY >= 1024);
+        const _: () = assert!(TOP_N >= 5 && TOP_N <= 100);
+        const _: () = assert!(MIN_CHANGE_PCT_THRESHOLD > 0.0 && MIN_CHANGE_PCT_THRESHOLD < 1.0);
+        const _: () = assert!(TRACKER_MAP_INITIAL_CAPACITY >= 1024);
     }
 
     #[test]

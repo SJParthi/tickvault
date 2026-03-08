@@ -284,26 +284,26 @@ mod tests {
 
     #[test]
     fn test_max_reconnect_attempts_constant() {
-        assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS >= 5);
-        assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS <= 20);
+        const _: () = assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS >= 5);
+        const _: () = assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS <= 20);
     }
 
     #[test]
     fn test_read_timeout_is_reasonable() {
         // Must be long enough for idle periods but short enough to detect dead connections
-        assert!(ORDER_UPDATE_READ_TIMEOUT_SECS >= 30);
-        assert!(ORDER_UPDATE_READ_TIMEOUT_SECS <= 600);
+        const _: () = assert!(ORDER_UPDATE_READ_TIMEOUT_SECS >= 30);
+        const _: () = assert!(ORDER_UPDATE_READ_TIMEOUT_SECS <= 600);
     }
 
     #[test]
     fn test_reconnect_initial_delay_positive() {
-        assert!(ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS > 0);
-        assert!(ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS <= 10000);
+        const _: () = assert!(ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS > 0);
+        const _: () = assert!(ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS <= 10000);
     }
 
     #[test]
     fn test_reconnect_max_delay_greater_than_initial() {
-        assert!(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS > ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+        const _: () = assert!(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS > ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
     }
 
     #[test]

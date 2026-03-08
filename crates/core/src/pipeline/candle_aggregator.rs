@@ -399,14 +399,14 @@ mod tests {
 
     #[test]
     fn stale_threshold_is_reasonable() {
-        assert!(STALE_CANDLE_THRESHOLD_SECS >= 2, "too aggressive");
-        assert!(STALE_CANDLE_THRESHOLD_SECS <= 30, "too lenient");
+        const _: () = assert!(STALE_CANDLE_THRESHOLD_SECS >= 2, "too aggressive");
+        const _: () = assert!(STALE_CANDLE_THRESHOLD_SECS <= 30, "too lenient");
     }
 
     #[test]
     fn initial_capacity_is_reasonable() {
-        assert!(CANDLE_MAP_INITIAL_CAPACITY >= 1024);
-        assert!(CANDLE_MAP_INITIAL_CAPACITY <= 65536);
+        const _: () = assert!(CANDLE_MAP_INITIAL_CAPACITY >= 1024);
+        const _: () = assert!(CANDLE_MAP_INITIAL_CAPACITY <= 65536);
     }
 
     #[test]
