@@ -268,7 +268,20 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     );
     execute_ddl(&client, &base_url, &dedup_sql, "candles_1s DEDUP").await;
 
-    // Step 3: Create materialized views in dependency order.
+    // Step 3: Drop legacy `candles_1m` TABLE if it exists.
+    // Previously, historical candles used the name `candles_1m` which conflicts
+    // with the `candles_1m` materialized view. Historical data now goes to
+    // `historical_candles_1m`. This DROP is idempotent — once the old table is
+    // gone, the IF EXISTS makes it a no-op on subsequent startups.
+    execute_ddl(
+        &client,
+        &base_url,
+        "DROP TABLE IF EXISTS candles_1m",
+        "drop legacy candles_1m table",
+    )
+    .await;
+
+    // Step 4: Create materialized views in dependency order.
     let mut created_count: u32 = 0;
     for def in VIEW_DEFS {
         let sql = build_view_sql(def);
