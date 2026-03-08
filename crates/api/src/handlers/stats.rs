@@ -124,6 +124,10 @@ mod tests {
         assert!(result.is_none());
     }
 
+    fn empty_snapshot() -> dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot {
+        std::sync::Arc::new(std::sync::RwLock::new(None))
+    }
+
     #[tokio::test]
     async fn test_get_stats_returns_unreachable_when_questdb_down() {
         use crate::state::SharedAppState;
@@ -155,6 +159,7 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
+            empty_snapshot(),
         );
         let result = get_stats(State(state)).await;
         assert!(!result.questdb_reachable);
@@ -519,6 +524,7 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
+            empty_snapshot(),
         );
         let result = get_stats(axum::extract::State(state)).await;
         assert!(result.questdb_reachable);

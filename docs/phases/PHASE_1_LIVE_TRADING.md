@@ -1305,13 +1305,13 @@ Response: Array of OHLCV candles with timestamps.
 - [x] NaN/Infinity guard on all price fields
 - [x] Latency measurement (metrics histograms)
 
-### Block 06: Candle Builder & Timeframes — PARTIAL
+### Block 06: Candle Builder & Timeframes — COMPLETE
 
 - [x] CandleAggregator: in-memory 1s OHLCV from live ticks
 - [x] Historical 1-minute candle fetch + QuestDB persistence
 - [x] Cross-verification of historical vs live candles
-- [ ] QuestDB materialized views for higher timeframes
-- [ ] IST alignment for all candle boundaries
+- [x] QuestDB materialized views for higher timeframes (18 views: 5s→1M)
+- [x] IST alignment for all candle boundaries (ALIGN TO CALENDAR WITH OFFSET '05:30')
 
 ### Block 07: Market Depth (20-Level & 200-Level) — COMPLETE
 
@@ -1325,7 +1325,7 @@ Response: Array of OHLCV candles with timestamps.
 - [x] Real-time change_pct calculation from ticks (TopMoversTracker)
 - [x] In-memory sorted rankings (top 20 gainers, losers, most active)
 - [x] Periodic snapshot computation (cold path, O(N log N))
-- [ ] API endpoint for current rankings
+- [x] API endpoint for current rankings (GET /api/top-movers)
 
 ### Block 09: Historical Data & Warmup — COMPLETE
 
@@ -1362,20 +1362,20 @@ Response: Array of OHLCV candles with timestamps.
 - [x] Instrument rebuild endpoint
 - [x] CORS middleware
 
-### Block 13: Observability Stack — PARTIAL
+### Block 13: Observability Stack — COMPLETE
 
 - [x] Prometheus metrics (tick latency, throughput, error rates)
 - [x] OpenTelemetry tracing layer
 - [x] Telegram alerting pipeline
-- [ ] Grafana dashboards
-- [ ] Loki log aggregation
+- [x] Grafana dashboards (system-overview, logs, traefik, trading-pipeline)
+- [x] Loki log aggregation (Alloy collector → Loki → Grafana)
 
-### Block 14: Risk Engine
+### Block 14: Risk Engine — COMPLETE
 
-- [ ] Max daily loss enforcement
-- [ ] Position size limits
-- [ ] P&L calculation
-- [ ] Auto-halt on risk breach
+- [x] Max daily loss enforcement (percentage-based threshold)
+- [x] Position size limits (per-instrument max lots)
+- [x] P&L calculation (realized from FIFO closes, unrealized tracking)
+- [x] Auto-halt on risk breach (manual halt/reset, daily reset)
 
 ### Block 15: Valkey Cache — COMPLETE
 

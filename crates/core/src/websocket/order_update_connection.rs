@@ -303,7 +303,8 @@ mod tests {
 
     #[test]
     fn test_reconnect_max_delay_greater_than_initial() {
-        const _: () = assert!(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS > ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+        const _: () =
+            assert!(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS > ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
     }
 
     #[test]

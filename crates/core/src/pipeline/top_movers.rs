@@ -9,10 +9,17 @@
 //! - O(N log N) snapshot computation every 5 seconds (cold path, ~2000 instruments)
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use tracing::debug;
 
 use dhan_live_trader_common::tick_types::ParsedTick;
+
+/// Shared handle for the latest top movers snapshot.
+///
+/// Written by the tick processor (cold path, every 5s).
+/// Read by the API handler (cold path, on request).
+pub type SharedTopMoversSnapshot = Arc<RwLock<Option<TopMoversSnapshot>>>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,7 +56,7 @@ struct SecurityState {
 // ---------------------------------------------------------------------------
 
 /// A single entry in the top movers snapshot.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct MoverEntry {
     /// Dhan security identifier.
     pub security_id: u32,
@@ -68,7 +75,7 @@ pub struct MoverEntry {
 // ---------------------------------------------------------------------------
 
 /// A point-in-time snapshot of top gainers, losers, and most active securities.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TopMoversSnapshot {
     /// Top N gainers sorted by change_pct descending.
     pub gainers: Vec<MoverEntry>,

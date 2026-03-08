@@ -906,6 +906,13 @@ pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 /// QuestDB table: 1-minute OHLCV candles from Dhan historical API.
 pub const QUESTDB_TABLE_CANDLES_1M: &str = "candles_1m";
 
+/// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
+pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
+
+/// IST offset for QuestDB ALIGN TO CALENDAR.
+/// QuestDB materialized views use this to align candle boundaries to IST (UTC+5:30).
+pub const QUESTDB_IST_ALIGN_OFFSET: &str = "05:30";
+
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants
 // ---------------------------------------------------------------------------

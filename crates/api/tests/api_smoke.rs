@@ -37,6 +37,7 @@ fn test_state() -> SharedAppState {
             build_window_start: "06:00:00".to_string(),
             build_window_end: "09:15:00".to_string(),
         },
+        std::sync::Arc::new(std::sync::RwLock::new(None)),
     )
 }
 

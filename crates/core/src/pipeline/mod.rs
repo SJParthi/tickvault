@@ -13,4 +13,4 @@ pub mod top_movers;
 
 pub use candle_aggregator::CandleAggregator;
 pub use tick_processor::run_tick_processor;
-pub use top_movers::TopMoversTracker;
+pub use top_movers::{SharedTopMoversSnapshot, TopMoversTracker};

@@ -235,12 +235,15 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 6: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!("setting up QuestDB tables (ticks + instruments + depth + previous_close + candles_1m)");
+    info!(
+        "setting up QuestDB tables (ticks + instruments + depth + previous_close + candles_1m + materialized views)"
+    );
 
     ensure_tick_table_dedup_keys(&config.questdb).await;
     ensure_depth_and_prev_close_tables(&config.questdb).await;
     ensure_instrument_tables(&config.questdb).await;
     ensure_candle_table_dedup_keys(&config.questdb).await;
+    dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb).await;
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(writer) => {
@@ -474,9 +477,13 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor
     // -----------------------------------------------------------------------
+    let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
+
     let processor_handle = if let Some(receiver) = frame_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
         let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
+        let snapshot_handle = Some(shared_movers.clone());
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -485,6 +492,7 @@ async fn main() -> Result<()> {
                 None,
                 candle_agg,
                 movers,
+                snapshot_handle,
             )
             .await;
         });
@@ -524,6 +532,7 @@ async fn main() -> Result<()> {
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
+        shared_movers,
     );
 
     let router = build_router(api_state);
