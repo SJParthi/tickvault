@@ -1,6 +1,6 @@
 //! QuestDB persistence for 1-minute OHLCV candles from Dhan historical API.
 //!
-//! Stores candles in a dedicated `candles_1m` table with DEDUP UPSERT KEYS
+//! Stores candles in a dedicated `historical_candles_1m` table with DEDUP UPSERT KEYS
 //! on `(ts, security_id)` to ensure idempotent re-ingestion.
 //!
 //! # Table Schema
@@ -148,11 +148,11 @@ impl CandlePersistenceWriter {
 // Table DDL + DEDUP Setup
 // ---------------------------------------------------------------------------
 
-/// SQL to create the `candles_1m` table with explicit schema.
+/// SQL to create the `historical_candles_1m` table with explicit schema.
 ///
 /// Idempotent — safe to call every startup.
 const CANDLES_1M_CREATE_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS candles_1m (\
+    CREATE TABLE IF NOT EXISTS historical_candles_1m (\
         segment SYMBOL,\
         security_id LONG,\
         open DOUBLE,\
@@ -197,21 +197,21 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     {
         Ok(response) => {
             if response.status().is_success() {
-                info!("candles_1m table ensured (CREATE TABLE IF NOT EXISTS)");
+                info!("historical_candles_1m table ensured (CREATE TABLE IF NOT EXISTS)");
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 warn!(
                     %status,
                     body = body.chars().take(200).collect::<String>(),
-                    "candles_1m table CREATE DDL returned non-success"
+                    "historical_candles_1m table CREATE DDL returned non-success"
                 );
             }
         }
         Err(err) => {
             warn!(
                 ?err,
-                "candles_1m table CREATE DDL request failed — table not pre-created"
+                "historical_candles_1m table CREATE DDL request failed — table not pre-created"
             );
             return;
         }
@@ -230,23 +230,23 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     {
         Ok(response) => {
             if response.status().is_success() {
-                debug!("DEDUP UPSERT KEYS enabled for candles_1m table");
+                debug!("DEDUP UPSERT KEYS enabled for historical_candles_1m table");
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 warn!(
                     %status,
                     body = body.chars().take(200).collect::<String>(),
-                    "candles_1m table DEDUP DDL returned non-success"
+                    "historical_candles_1m table DEDUP DDL returned non-success"
                 );
             }
         }
         Err(err) => {
-            warn!(?err, "candles_1m table DEDUP DDL request failed");
+            warn!(?err, "historical_candles_1m table DEDUP DDL request failed");
         }
     }
 
-    info!("candles_1m table setup complete (DDL + DEDUP UPSERT KEYS)");
+    info!("historical_candles_1m table setup complete (DDL + DEDUP UPSERT KEYS)");
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_candles_1m_ddl_contains_table_name() {
-        assert!(CANDLES_1M_CREATE_DDL.contains("candles_1m"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("historical_candles_1m"));
         assert!(CANDLES_1M_CREATE_DDL.contains("TIMESTAMP(ts)"));
         assert!(CANDLES_1M_CREATE_DDL.contains("PARTITION BY DAY"));
     }
