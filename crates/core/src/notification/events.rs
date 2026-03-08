@@ -108,6 +108,18 @@ pub enum NotificationEvent {
         instruments_with_gaps: usize,
     },
 
+    /// Public IP verification failed — static IP mismatch or detection failure.
+    IpVerificationFailed {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// Public IP verification succeeded at boot.
+    IpVerificationSuccess {
+        /// The verified public IP address.
+        verified_ip: String,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -186,6 +198,14 @@ impl NotificationEvent {
                     "<b>Candle verification FAILED</b>\nChecked: {instruments_checked}\nWith gaps: {instruments_with_gaps}"
                 )
             }
+            Self::IpVerificationFailed { reason } => {
+                format!(
+                    "<b>IP VERIFICATION FAILED</b>\n{reason}\n\nBoot blocked — no Dhan API calls will be made."
+                )
+            }
+            Self::IpVerificationSuccess { verified_ip } => {
+                format!("<b>IP verified</b> — {verified_ip}")
+            }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
             Self::Custom { message } => message.clone(),
@@ -199,6 +219,7 @@ impl NotificationEvent {
     /// - `Medium` / `Low` / `Info` → Telegram only
     pub fn severity(&self) -> Severity {
         match self {
+            Self::IpVerificationFailed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
@@ -210,6 +231,7 @@ impl NotificationEvent {
             Self::ShutdownInitiated => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::TokenRenewed => Severity::Low,
+            Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
@@ -476,6 +498,45 @@ mod tests {
     fn test_shutdown_complete_is_info() {
         let event = NotificationEvent::ShutdownComplete;
         assert_eq!(event.severity(), Severity::Info);
+    }
+
+    // -- IP Verification event tests --
+
+    #[test]
+    fn test_ip_verification_failed_message() {
+        let event = NotificationEvent::IpVerificationFailed {
+            reason: "IP mismatch — expected 203.0.XXX.XX, got 198.51.XXX.XX".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("IP VERIFICATION FAILED"));
+        assert!(msg.contains("IP mismatch"));
+        assert!(msg.contains("Boot blocked"));
+    }
+
+    #[test]
+    fn test_ip_verification_failed_is_critical() {
+        let event = NotificationEvent::IpVerificationFailed {
+            reason: "SSM unreachable".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_ip_verification_success_message() {
+        let event = NotificationEvent::IpVerificationSuccess {
+            verified_ip: "203.0.113.42".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("IP verified"));
+        assert!(msg.contains("203.0.113.42"));
+    }
+
+    #[test]
+    fn test_ip_verification_success_is_low() {
+        let event = NotificationEvent::IpVerificationSuccess {
+            verified_ip: "10.0.0.1".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Low);
     }
 
     #[test]

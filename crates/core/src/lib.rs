@@ -24,6 +24,7 @@
 pub mod auth;
 pub mod historical;
 pub mod instrument;
+pub mod network;
 pub mod notification;
 pub mod parser;
 pub mod pipeline;

@@ -445,6 +445,29 @@ pub const SSM_SNS_SERVICE: &str = "sns";
 pub const SNS_PHONE_NUMBER_SECRET: &str = "phone-number";
 
 // ---------------------------------------------------------------------------
+// Network / IP Verification — SSM Constants
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for network configuration.
+pub const SSM_NETWORK_SERVICE: &str = "network";
+
+/// SSM key for the expected static public IP (BSNL/ISP-assigned).
+/// Value must be a valid IPv4 address string (e.g., "203.0.113.42").
+pub const STATIC_IP_SECRET: &str = "static-ip";
+
+/// Primary URL for public IP detection (AWS-owned, plain text response).
+pub const PUBLIC_IP_CHECK_PRIMARY_URL: &str = "https://checkip.amazonaws.com";
+
+/// Fallback URL for public IP detection (plain text response).
+pub const PUBLIC_IP_CHECK_FALLBACK_URL: &str = "https://api.ipify.org";
+
+/// Timeout in seconds for public IP detection HTTP requests.
+pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum retry attempts for public IP detection (primary + fallback).
+pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
+
+// ---------------------------------------------------------------------------
 // Docker Container Naming
 // ---------------------------------------------------------------------------
 

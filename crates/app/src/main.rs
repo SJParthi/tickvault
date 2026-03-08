@@ -1,7 +1,7 @@
 //! Binary entry point for the dhan-live-trader application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Observability → Logging → Notification → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
+//! Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
 //!
 //! # Boot Sequence (optimized for fast restart)
 //!
@@ -12,16 +12,17 @@
 //! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
 //! 3. Initialize structured logging with OpenTelemetry layer
 //! 4. (parallel) Notification service + Docker infra check
-//! 5. Authenticate (token cache → SSM → TOTP → JWT)
-//! 6. (parallel) QuestDB table setup (5 DDL queries concurrent)
-//! 7. Build F&O universe + subscription plan
-//! 8. Build WebSocket connection pool
-//! 9. Spawn tick processing pipeline
-//! 10. Spawn background historical candle fetch (cold path)
-//! 11. Spawn order update WebSocket
-//! 12. Start API server
-//! 13. Spawn token renewal task
-//! 14. Await shutdown signal
+//! 5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)
+//! 6. Authenticate (token cache → SSM → TOTP → JWT)
+//! 7. (parallel) QuestDB table setup (5 DDL queries concurrent)
+//! 8. Build F&O universe + subscription plan
+//! 9. Build WebSocket connection pool
+//! 10. Spawn tick processing pipeline
+//! 11. Spawn background historical candle fetch (cold path)
+//! 12. Spawn order update WebSocket
+//! 13. Start API server
+//! 14. Spawn token renewal task
+//! 15. Await shutdown signal
 
 mod infra;
 mod observability;
@@ -50,6 +51,7 @@ use dhan_live_trader_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
     run_instrument_diagnostic,
 };
+use dhan_live_trader_core::network::ip_verifier;
 use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
 use dhan_live_trader_core::pipeline::run_tick_processor;
 use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
@@ -244,6 +246,28 @@ async fn main() -> Result<()> {
         ));
         let client_id = cache_result.client_id;
 
+        // --- IP verification + notification init (parallel, both needed before Dhan calls) ---
+        // Notification must be ready so IP failure can alert via Telegram.
+        // IP verification must pass before any WebSocket/REST call to Dhan.
+        let (fast_notifier, ip_result) = tokio::join!(
+            NotificationService::initialize(&config.notification),
+            ip_verifier::verify_public_ip(),
+        );
+        match ip_result {
+            Ok(result) => {
+                fast_notifier.notify(NotificationEvent::IpVerificationSuccess {
+                    verified_ip: result.verified_ip,
+                });
+            }
+            Err(err) => {
+                error!(error = %err, "FAST BOOT: IP verification failed — BLOCKING BOOT");
+                fast_notifier.notify(NotificationEvent::IpVerificationFailed {
+                    reason: err.to_string(),
+                });
+                return Ok(());
+            }
+        }
+
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
         let subscription_plan = load_instruments(&config).await;
 
@@ -286,19 +310,14 @@ async fn main() -> Result<()> {
         // All services start in parallel via tokio::join!.
         // =================================================================
 
-        // Background: QuestDB DDL + Notification + Infra + SSM validation
+        // Background: Docker infra + QuestDB DDL + SSM validation
+        // Notification already initialized above (needed for IP verification).
         // All run concurrently. None of them block tick processing.
-        let (notifier, _, deferred_token_manager) = tokio::join!(
-            // Notification + Docker infra
+        let notifier = fast_notifier;
+        let (_, deferred_token_manager) = tokio::join!(
+            // Docker infra + QuestDB DDL
             async {
-                let (notifier, _) = tokio::join!(
-                    NotificationService::initialize(&config.notification),
-                    infra::ensure_infra_running(&config.questdb),
-                );
-                notifier
-            },
-            // QuestDB DDL (idempotent — tables already exist from pre-crash)
-            async {
+                infra::ensure_infra_running(&config.questdb).await;
                 tokio::join!(
                     ensure_tick_table_dedup_keys(&config.questdb),
                     ensure_depth_and_prev_close_tables(&config.questdb),
@@ -326,10 +345,7 @@ async fn main() -> Result<()> {
                         &config.dhan,
                         &config.token,
                         &config.network,
-                        // Notification not ready yet — pass a temporary placeholder.
-                        // The deferred init only uses notifier for success/fail events,
-                        // which can be sent later via the real notifier.
-                        &NotificationService::initialize(&config.notification).await,
+                        &notifier,
                     ),
                 )
                 .await
@@ -443,6 +459,27 @@ async fn main() -> Result<()> {
         NotificationService::initialize(&config.notification),
         infra::ensure_infra_running(&config.questdb),
     );
+
+    // -----------------------------------------------------------------------
+    // Step 5.5: Verify public IP matches SSM static IP (BLOCKS BOOT on failure)
+    // -----------------------------------------------------------------------
+    // Must run AFTER notification (so Telegram alerts fire) and BEFORE auth
+    // (so no Dhan API call ever happens from a non-whitelisted IP).
+    info!("verifying public IP against SSM static IP");
+    match ip_verifier::verify_public_ip().await {
+        Ok(result) => {
+            notifier.notify(NotificationEvent::IpVerificationSuccess {
+                verified_ip: result.verified_ip,
+            });
+        }
+        Err(err) => {
+            error!(error = %err, "IP verification failed — BLOCKING BOOT");
+            notifier.notify(NotificationEvent::IpVerificationFailed {
+                reason: err.to_string(),
+            });
+            return Ok(());
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
