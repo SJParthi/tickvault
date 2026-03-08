@@ -160,8 +160,14 @@ pub async fn fetch_historical_candles(
     for instrument in registry.iter() {
         let security_id = instrument.security_id;
 
-        // Skip display indices — no candle data available
-        if instrument.category == SubscriptionCategory::DisplayIndex {
+        // Skip display indices and all derivatives (futures + options).
+        // Historical candles are only needed for indices and stock equities.
+        if matches!(
+            instrument.category,
+            SubscriptionCategory::DisplayIndex
+                | SubscriptionCategory::IndexDerivative
+                | SubscriptionCategory::StockDerivative
+        ) {
             instruments_skipped = instruments_skipped.saturating_add(1);
             continue;
         }
@@ -171,25 +177,14 @@ pub async fn fetch_historical_candles(
             continue;
         }
 
-        // Determine the Dhan API instrument type
-        let is_index = matches!(
-            instrument.category,
-            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::IndexDerivative
-        );
-
+        // Determine the Dhan API instrument type (only INDEX and EQUITY after skip above)
         let instrument_type = match instrument.category {
             SubscriptionCategory::MajorIndexValue => "INDEX",
             SubscriptionCategory::StockEquity => "EQUITY",
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => {
-                if instrument.option_type.is_some() {
-                    if is_index { "OPTIDX" } else { "OPTSTK" }
-                } else if is_index {
-                    "FUTIDX"
-                } else {
-                    "FUTSTK"
-                }
-            }
-            SubscriptionCategory::DisplayIndex => continue,
+            // Derivatives and display indices are already skipped above
+            SubscriptionCategory::IndexDerivative
+            | SubscriptionCategory::StockDerivative
+            | SubscriptionCategory::DisplayIndex => continue,
         };
 
         // Rate limiting delay between requests
