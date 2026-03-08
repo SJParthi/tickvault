@@ -1415,15 +1415,15 @@ The boot sequence determines implementation order:
 3. Block 03: WebSocket Connection       ✅ COMPLETE
 4. Block 04: Binary Parser              ✅ COMPLETE
 5. Block 05: Tick Pipeline              ✅ COMPLETE
-6. Block 06: Candle Builder             🔶 PARTIAL (1s aggregation done, materialized views pending)
+6. Block 06: Candle Builder             ✅ COMPLETE
 7. Block 07: Market Depth               ✅ COMPLETE
 8. Block 08: Top Gainers/Losers         ✅ COMPLETE
 9. Block 09: Historical Warmup          ✅ COMPLETE
 10. Block 10: Order Management          ⬜ PENDING
 11. Block 11: Order Update WebSocket    ✅ COMPLETE (OMS integration pending)
 12. Block 12: HTTP API Server           ✅ COMPLETE
-13. Block 13: Observability             🔶 PARTIAL (metrics + tracing done, dashboards pending)
-14. Block 14: Risk Engine               ⬜ PENDING
+13. Block 13: Observability             ✅ COMPLETE
+14. Block 14: Risk Engine               ✅ COMPLETE
 15. Block 15: Valkey Cache              ✅ COMPLETE
 ```
 
