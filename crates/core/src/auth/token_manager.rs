@@ -962,6 +962,7 @@ mod tests {
     async fn test_initialize_rejects_http_rest_api_base_url() {
         let dhan_config = DhanConfig {
             websocket_url: "wss://example.com".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
             rest_api_base_url: "http://api.dhan.co".to_string(),
             auth_base_url: "https://auth.dhan.co".to_string(),
             instrument_csv_url: "https://example.com/instruments.csv".to_string(),
@@ -1002,6 +1003,7 @@ mod tests {
     async fn test_initialize_rejects_http_auth_base_url() {
         let dhan_config = DhanConfig {
             websocket_url: "wss://example.com".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
             rest_api_base_url: "https://api.dhan.co".to_string(),
             auth_base_url: "http://auth.dhan.co".to_string(),
             instrument_csv_url: "https://example.com/instruments.csv".to_string(),
@@ -1386,6 +1388,7 @@ mod tests {
     async fn test_initialize_rejects_both_http_urls() {
         let dhan_config = DhanConfig {
             websocket_url: "wss://example.com".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
             rest_api_base_url: "http://api.dhan.co".to_string(),
             auth_base_url: "http://auth.dhan.co".to_string(),
             instrument_csv_url: "https://example.com/instruments.csv".to_string(),

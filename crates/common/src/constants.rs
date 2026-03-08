@@ -351,6 +351,19 @@ pub const DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE: usize = 8;
 /// Message code for order update WebSocket login request.
 pub const ORDER_UPDATE_LOGIN_MSG_CODE: u16 = 42;
 
+/// Read timeout for order update WebSocket (seconds).
+/// Order updates are infrequent — use longer timeout than market feed.
+pub const ORDER_UPDATE_READ_TIMEOUT_SECS: u64 = 120;
+
+/// Maximum reconnection attempts for order update WebSocket.
+pub const ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// Initial reconnect delay for order update WebSocket (milliseconds).
+pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+
+/// Maximum reconnect delay for order update WebSocket (milliseconds).
+pub const ORDER_UPDATE_RECONNECT_MAX_DELAY_MS: u64 = 60000;
+
 // ---------------------------------------------------------------------------
 // SEBI Compliance
 // ---------------------------------------------------------------------------
@@ -892,6 +905,13 @@ pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 
 /// QuestDB table: 1-minute OHLCV candles from Dhan historical API.
 pub const QUESTDB_TABLE_CANDLES_1M: &str = "candles_1m";
+
+/// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
+pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
+
+/// IST offset for QuestDB ALIGN TO CALENDAR.
+/// QuestDB materialized views use this to align candle boundaries to IST (UTC+5:30).
+pub const QUESTDB_IST_ALIGN_OFFSET: &str = "05:30";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants

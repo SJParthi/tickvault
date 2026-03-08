@@ -14,38 +14,8 @@ use dhan_live_trader_common::constants::{
 };
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 
+use super::read_helpers::{read_f32_le, read_u16_le, read_u32_le};
 use super::types::{PacketHeader, ParseError};
-
-/// Helper: reads a little-endian f32 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
-    f32::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-    ])
-}
-
-/// Helper: reads a little-endian u32 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-    ])
-}
-
-/// Helper: reads a little-endian u16 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([raw[offset], raw[offset + 1]])
-}
 
 /// Parses a Market Depth standalone packet into a `ParsedTick` and 5 depth levels.
 ///

@@ -2294,4 +2294,54 @@ mod tests {
         // Flushing empty buffer should not error
         writer.force_flush().unwrap();
     }
+
+    #[test]
+    fn test_midnight_timestamp_ilp_encoding() {
+        // Midnight IST = 18:30 UTC previous day. Ensure ILP encoding handles
+        // the partition boundary correctly (QuestDB partitions by HOUR).
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // 2026-03-08T00:00:00 IST = 2026-03-07T18:30:00 UTC = epoch 1772588400
+        let mut tick = make_test_tick(13, 24500.0);
+        tick.exchange_timestamp = 1772588400;
+        tick.received_at_nanos = 1_772_588_400_000_000_000;
+
+        writer.append_tick(&tick).unwrap();
+        writer.force_flush().unwrap();
+    }
+
+    #[test]
+    fn test_duplicate_security_id_timestamp_ilp_encoding() {
+        // Two ticks with same (security_id, exchange_timestamp) but different LTP.
+        // Both should be accepted by the ILP buffer — dedup is QuestDB's job
+        // via DEDUP UPSERT KEYS.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let mut tick1 = make_test_tick(42, 1500.0);
+        tick1.exchange_timestamp = 1772073900;
+        tick1.received_at_nanos = 1_772_073_900_000_000_000;
+
+        let mut tick2 = make_test_tick(42, 1505.0); // same security_id, different LTP
+        tick2.exchange_timestamp = 1772073900; // same timestamp
+        tick2.received_at_nanos = 1_772_073_900_100_000_000;
+
+        writer.append_tick(&tick1).unwrap();
+        writer.append_tick(&tick2).unwrap();
+        assert_eq!(writer.buffer.row_count(), 2);
+        writer.force_flush().unwrap();
+    }
 }

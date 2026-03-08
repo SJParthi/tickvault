@@ -58,6 +58,8 @@ pub struct TradingConfig {
 pub struct DhanConfig {
     /// WebSocket V2 binary feed URL.
     pub websocket_url: String,
+    /// Order update WebSocket URL (JSON-based, separate from binary feed).
+    pub order_update_websocket_url: String,
     /// REST API base URL (for trading, data, renewal).
     pub rest_api_base_url: String,
     /// Auth base URL (for token generation — separate from REST API).
@@ -568,6 +570,7 @@ mod tests {
             },
             dhan: DhanConfig {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),
+                order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
                 rest_api_base_url: "https://api.dhan.co/v2".to_string(),
                 auth_base_url: "https://auth.dhan.co".to_string(),
                 instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"

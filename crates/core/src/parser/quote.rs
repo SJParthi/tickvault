@@ -10,31 +10,8 @@ use dhan_live_trader_common::constants::{
 };
 use dhan_live_trader_common::tick_types::ParsedTick;
 
+use super::read_helpers::{read_f32_le, read_u32_le};
 use super::types::{PacketHeader, ParseError};
-
-/// Helper: reads a little-endian f32 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
-    f32::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-    ])
-}
-
-/// Helper: reads a little-endian u32 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-    ])
-}
 
 /// Parses a Quote packet into a `ParsedTick`.
 ///
@@ -387,6 +364,16 @@ mod tests {
         assert!(tick.day_close.is_nan());
         assert!(tick.day_high.is_nan());
         assert!(tick.day_low.is_nan());
+    }
+
+    #[test]
+    fn test_parse_quote_negative_ltp_parses_without_panic() {
+        let (buf, hdr) = make_quote_packet(
+            2, 13, -500.0, 1, 1772073900, 100.0, 1000, 500, 500, 99.0, 98.0, 101.0, 97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price < 0.0);
+        // Parser accepts negative LTP — tick_processor filters it downstream
     }
 
     #[test]

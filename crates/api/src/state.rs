@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot;
 
 /// Shared state available to all API handlers via axum's `State` extractor.
 #[derive(Clone)]
@@ -20,6 +21,8 @@ struct AppStateInner {
     instrument_config: InstrumentConfig,
     /// Concurrency guard: prevents concurrent instrument rebuilds.
     rebuild_in_progress: AtomicBool,
+    /// Shared top movers snapshot from the tick pipeline.
+    top_movers_snapshot: SharedTopMoversSnapshot,
 }
 
 impl SharedAppState {
@@ -28,6 +31,7 @@ impl SharedAppState {
         questdb_config: QuestDbConfig,
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
+        top_movers_snapshot: SharedTopMoversSnapshot,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
@@ -35,6 +39,7 @@ impl SharedAppState {
                 dhan_config,
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
+                top_movers_snapshot,
             }),
         }
     }
@@ -58,6 +63,11 @@ impl SharedAppState {
     pub fn rebuild_in_progress(&self) -> &AtomicBool {
         &self.inner.rebuild_in_progress
     }
+
+    /// Returns the shared top movers snapshot handle.
+    pub fn top_movers_snapshot(&self) -> &SharedTopMoversSnapshot {
+        &self.inner.top_movers_snapshot
+    }
 }
 
 #[cfg(test)]
@@ -68,6 +78,7 @@ mod tests {
     fn test_dhan_config() -> DhanConfig {
         DhanConfig {
             websocket_url: "wss://api-feed.dhan.co".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
             rest_api_base_url: "https://api.dhan.co/v2".to_string(),
             auth_base_url: "https://auth.dhan.co".to_string(),
             instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
@@ -90,6 +101,10 @@ mod tests {
         }
     }
 
+    fn empty_snapshot() -> SharedTopMoversSnapshot {
+        std::sync::Arc::new(std::sync::RwLock::new(None))
+    }
+
     #[test]
     fn test_shared_app_state_new_and_questdb_config() {
         let config = QuestDbConfig {
@@ -98,7 +113,12 @@ mod tests {
             pg_port: 8812,
             ilp_port: 9009,
         };
-        let state = SharedAppState::new(config, test_dhan_config(), test_instrument_config());
+        let state = SharedAppState::new(
+            config,
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+        );
         assert_eq!(state.questdb_config().host, "test-host");
         assert_eq!(state.questdb_config().ilp_port, 9009);
         assert_eq!(state.questdb_config().http_port, 9000);
@@ -112,7 +132,12 @@ mod tests {
             pg_port: 8812,
             ilp_port: 9009,
         };
-        let state1 = SharedAppState::new(config, test_dhan_config(), test_instrument_config());
+        let state1 = SharedAppState::new(
+            config,
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+        );
         let state2 = state1.clone();
         assert_eq!(state2.questdb_config().host, "clone-test");
     }

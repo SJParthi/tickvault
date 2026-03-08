@@ -21,6 +21,7 @@ fn test_state() -> SharedAppState {
         },
         DhanConfig {
             websocket_url: "wss://test".to_string(),
+            order_update_websocket_url: "wss://test".to_string(),
             rest_api_base_url: "https://test".to_string(),
             auth_base_url: "https://test".to_string(),
             instrument_csv_url: "https://test/csv".to_string(),
@@ -36,6 +37,7 @@ fn test_state() -> SharedAppState {
             build_window_start: "06:00:00".to_string(),
             build_window_end: "09:15:00".to_string(),
         },
+        std::sync::Arc::new(std::sync::RwLock::new(None)),
     )
 }
 

@@ -11,16 +11,17 @@
 //! # Modules
 //! - `indicator` — O(1) per-tick indicator engine (EMA, RSI, MACD, ATR, Bollinger, etc.)
 //! - `strategy` — FSM-based strategy evaluator with declarative conditions
+//! - `risk` — Risk engine: max daily loss, position limits, P&L tracking, auto-halt
 //!
 //! # Key Modules (to be built)
 //! - `order_management` — statig state machine for order lifecycle
-//! - `risk_manager` — Position sizing, drawdown limits, P&L tracking
 //! - `order_executor` — Dhan REST API order submission with governor rate limiting
 //!
 //! # Pipeline Position
 //! ParsedTick → **IndicatorEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
 
 pub mod indicator;
+pub mod risk;
 pub mod strategy;
 
 #[cfg(test)]
