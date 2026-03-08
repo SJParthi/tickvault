@@ -132,6 +132,60 @@ groups:
           summary: "No ticks received for 5 minutes"
           description: "Tick processing rate has been zero for 5 minutes during market hours."
 
+      - alert: HighHistoricalFetchErrors
+        expr: increase(dlt_historical_api_errors_total[10m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Historical candle fetch errors detected"
+          description: "{{ $value }} historical API errors in the last 10 minutes. Some instruments may have missing candle data."
+
+      - alert: HighWebSocketReconnectRate
+        expr: rate(dlt_websocket_reconnections_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent WebSocket reconnections"
+          description: "WebSocket reconnecting at {{ $value }}/sec. Network instability or Dhan server issues."
+
+      - alert: HighTraefik4xxRate
+        expr: sum(rate(traefik_entrypoint_requests_total{code=~"4.."}[5m])) / (sum(rate(traefik_entrypoint_requests_total[5m])) + 1e-10) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Traefik 4xx error rate above 10%"
+          description: "More than 10% of requests are returning 4xx client errors."
+
+      - alert: HighJunkTickRate
+        expr: rate(dlt_junk_ticks_filtered_total[5m]) > 10
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High junk tick rate detected"
+          description: "{{ $value }}/sec junk ticks filtered. Possible feed corruption or instrument mismatch."
+
+      - alert: HighCrossedMarketRate
+        expr: rate(dlt_crossed_market_total[5m]) > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Crossed market ticks detected"
+          description: "{{ $value }}/sec crossed-market conditions. Market data integrity may be degraded."
+
+      - alert: HighDedupFilterRate
+        expr: rate(dlt_dedup_filtered_total[5m]) / (rate(dlt_ticks_processed_total[5m]) + 1e-10) > 0.50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 50% ticks are duplicates"
+          description: "Dedup filter rate is {{ $value | humanizePercentage }}. Possible duplicate subscriptions or feed issue."
+
       # Phase 2 (OMS) — metrics not yet emitted, alert will be inert until then
       - alert: HighOrderRejectionRate
         expr: rate(dlt_orders_rejected_total[5m]) / (rate(dlt_orders_placed_total[5m]) + 1e-10) > 0.10

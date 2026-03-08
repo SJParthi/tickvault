@@ -90,6 +90,24 @@ pub enum NotificationEvent {
         manual_trigger_url: String,
     },
 
+    /// Historical candle fetch completed with failures.
+    HistoricalFetchFailed {
+        /// Number of instruments that succeeded.
+        instruments_fetched: usize,
+        /// Number of instruments that failed.
+        instruments_failed: usize,
+        /// Total candles ingested.
+        total_candles: usize,
+    },
+
+    /// Candle cross-verification found gaps in stored data.
+    CandleVerificationFailed {
+        /// Instruments checked.
+        instruments_checked: usize,
+        /// Instruments with gaps.
+        instruments_with_gaps: usize,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -151,6 +169,23 @@ impl NotificationEvent {
             } => {
                 format!("<b>Instruments FAILED</b>\n{reason}\n\nRetry: {manual_trigger_url}")
             }
+            Self::HistoricalFetchFailed {
+                instruments_fetched,
+                instruments_failed,
+                total_candles,
+            } => {
+                format!(
+                    "<b>Historical candle fetch — partial failure</b>\nFetched: {instruments_fetched}\nFailed: {instruments_failed}\nCandles: {total_candles}"
+                )
+            }
+            Self::CandleVerificationFailed {
+                instruments_checked,
+                instruments_with_gaps,
+            } => {
+                format!(
+                    "<b>Candle verification FAILED</b>\nChecked: {instruments_checked}\nWith gaps: {instruments_with_gaps}"
+                )
+            }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
             Self::Custom { message } => message.clone(),
@@ -168,6 +203,8 @@ impl NotificationEvent {
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
+            Self::HistoricalFetchFailed { .. } => Severity::High,
+            Self::CandleVerificationFailed { .. } => Severity::High,
             Self::Custom { .. } => Severity::High,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::ShutdownInitiated => Severity::Medium,
@@ -346,6 +383,51 @@ mod tests {
         assert!(msg.contains("Instruments FAILED"));
         assert!(msg.contains("HTTP 503"));
         assert!(msg.contains("/api/instruments/rebuild"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_message() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 9,
+            total_candles: 180000,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("partial failure"));
+        assert!(msg.contains("200"));
+        assert!(msg.contains("9"));
+        assert!(msg.contains("180000"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_is_high() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 9,
+            total_candles: 180000,
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_candle_verification_failed_message() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 209,
+            instruments_with_gaps: 3,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("verification FAILED"));
+        assert!(msg.contains("209"));
+        assert!(msg.contains("3"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_is_high() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 209,
+            instruments_with_gaps: 3,
+        };
+        assert_eq!(event.severity(), Severity::High);
     }
 
     // -- Severity tests --

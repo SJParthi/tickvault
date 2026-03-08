@@ -674,6 +674,15 @@ mod tests {
             connection_index: 2,
         });
         service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 9,
+            total_candles: 180000,
+        });
+        service.notify(NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 209,
+            instruments_with_gaps: 3,
+        });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
     }

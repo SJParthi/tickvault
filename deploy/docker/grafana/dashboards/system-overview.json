@@ -310,7 +310,10 @@
       "targets": [
         { "expr": "rate(dlt_parse_errors_total[5m])", "legendFormat": "parse errors", "refId": "A" },
         { "expr": "rate(dlt_storage_errors_total[5m])", "legendFormat": "storage errors", "refId": "B" },
-        { "expr": "rate(dlt_junk_ticks_filtered_total[5m])", "legendFormat": "junk filtered", "refId": "C" }
+        { "expr": "rate(dlt_junk_ticks_filtered_total[5m])", "legendFormat": "junk filtered", "refId": "C" },
+        { "expr": "rate(dlt_dedup_filtered_total[5m])", "legendFormat": "dedup filtered", "refId": "D" },
+        { "expr": "rate(dlt_crossed_market_total[5m])", "legendFormat": "crossed market", "refId": "E" },
+        { "expr": "rate(dlt_historical_api_errors_total[5m])", "legendFormat": "historical API errors", "refId": "F" }
       ]
     },
     {

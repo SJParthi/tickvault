@@ -391,6 +391,14 @@ async fn main() -> Result<()> {
                                 "historical candle fetch complete"
                             );
 
+                            if fetch_summary.instruments_failed > 0 {
+                                notifier.notify(NotificationEvent::HistoricalFetchFailed {
+                                    instruments_fetched: fetch_summary.instruments_fetched,
+                                    instruments_failed: fetch_summary.instruments_failed,
+                                    total_candles: fetch_summary.total_candles,
+                                });
+                            }
+
                             // Cross-verify candle integrity
                             let verify_report = verify_candle_integrity(&config.questdb).await;
                             if verify_report.passed {
@@ -406,6 +414,10 @@ async fn main() -> Result<()> {
                                     total_candles = verify_report.total_candles_in_db,
                                     "candle cross-verification: some instruments have gaps"
                                 );
+                                notifier.notify(NotificationEvent::CandleVerificationFailed {
+                                    instruments_checked: verify_report.instruments_checked,
+                                    instruments_with_gaps: verify_report.instruments_with_gaps,
+                                });
                             }
                         }
                         Err(err) => {
@@ -413,6 +425,11 @@ async fn main() -> Result<()> {
                                 ?err,
                                 "failed to fetch credentials for historical fetch — skipping"
                             );
+                            notifier.notify(NotificationEvent::Custom {
+                                message: format!(
+                                    "<b>Historical fetch SKIPPED</b>\nSSM credential fetch failed: {err}"
+                                ),
+                            });
                         }
                     }
                 }
@@ -421,6 +438,11 @@ async fn main() -> Result<()> {
                         ?err,
                         "QuestDB candle writer unavailable — skipping historical fetch"
                     );
+                    notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "<b>Historical fetch SKIPPED</b>\nQuestDB candle writer unavailable: {err}"
+                        ),
+                    });
                 }
             }
         } else {
