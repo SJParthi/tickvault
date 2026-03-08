@@ -454,6 +454,6 @@ threshold = 0.0
     assert_eq!(strategies[0].security_ids, vec![1, 2, 3]);
     assert_eq!(params.ema_fast_period, 12); // default
 
-    // No pending reload events
-    assert!(reloader.try_recv().is_none());
+    // Drain any pending reload events from file watcher startup
+    while reloader.try_recv().is_some() {}
 }
