@@ -1298,6 +1298,7 @@ dependencies = [
  "dhan-live-trader-common",
  "governor",
  "notify",
+ "reqwest",
  "serde",
  "serde_json",
  "statig",

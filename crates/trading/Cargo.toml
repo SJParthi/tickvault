@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 notify = { workspace = true }
 chrono = { workspace = true }
@@ -19,9 +20,9 @@ chrono-tz = { workspace = true }
 uuid = { workspace = true }
 governor = { workspace = true }
 statig = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "serde", "statig", "thiserror", "tokio", "tracing", "uuid"]

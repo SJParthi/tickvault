@@ -380,6 +380,16 @@ pub const SEBI_MAX_ORDERS_PER_SECOND: u32 = 10;
 pub const SEBI_AUDIT_RETENTION_YEARS: u32 = 5;
 
 // ---------------------------------------------------------------------------
+// OMS — Circuit Breaker
+// ---------------------------------------------------------------------------
+
+/// Consecutive API failures before the OMS circuit breaker opens.
+pub const OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+
+/// Seconds before the OMS circuit breaker transitions from Open to Half-Open.
+pub const OMS_CIRCUIT_BREAKER_RESET_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
 // ---------------------------------------------------------------------------
 
