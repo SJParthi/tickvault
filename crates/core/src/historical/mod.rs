@@ -8,7 +8,7 @@
 //! # API Details
 //! - Endpoint: POST `{rest_api_base_url}/charts/intraday`
 //! - Response: parallel arrays of open, high, low, close, volume, timestamp
-//! - Timestamps: standard UNIX epoch seconds (UTC, NOT IST-naive like WebSocket)
+//! - Timestamps: standard UNIX epoch seconds (UTC)
 //! - Limit: 90 days per request, 1-minute candle resolution
 //!
 //! # Trading Day

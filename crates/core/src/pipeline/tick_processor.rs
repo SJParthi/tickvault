@@ -17,7 +17,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 use dhan_live_trader_common::constants::{
-    DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
+    DEDUP_RING_BUFFER_POWER, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
 };
 use dhan_live_trader_common::tick_types::ParsedTick;
 
@@ -482,10 +482,11 @@ pub async fn run_tick_processor(
             // Sweep stale candles and persist completed 1s candles to QuestDB
             if let Some(ref mut agg) = candle_aggregator {
                 // Reuse received_at_nanos from line 179 instead of a second Utc::now() syscall.
-                // Convert nanoseconds → IST-naive epoch seconds for candle sweep comparison.
-                // received_at_nanos is UTC nanos; add IST offset to match Dhan's IST-naive convention.
-                let now_secs = ((received_at_nanos / 1_000_000_000)
-                    + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
+                // Dhan sends exchange_timestamp as UTC epoch seconds.
+                // received_at_nanos is UTC nanos — same timezone, direct comparison.
+                // APPROVED: i64→u32 truncation is safe: UTC epoch fits u32 until 2106
+                #[allow(clippy::cast_possible_truncation)]
+                let now_secs = (received_at_nanos / 1_000_000_000) as u32;
                 agg.sweep_stale(now_secs);
                 let completed = agg.completed_slice();
                 if !completed.is_empty() {

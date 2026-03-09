@@ -21,7 +21,7 @@ pub struct ParsedTick {
     pub last_traded_price: f32,
     /// Last trade quantity (from Quote/Full packets; 0 for Ticker).
     pub last_trade_quantity: u16,
-    /// Exchange timestamp as IST-naive epoch seconds (Dhan sends IST clock as if UTC).
+    /// Exchange timestamp as standard UTC epoch seconds from Dhan V2 API.
     pub exchange_timestamp: u32,
     /// Local receive timestamp in nanoseconds since Unix epoch (for latency measurement).
     pub received_at_nanos: i64,
@@ -127,7 +127,7 @@ pub struct DeepDepthLevel {
 /// A single 1-minute OHLCV candle from Dhan's historical intraday API.
 ///
 /// Used for cross-verification against live tick data and for backfill.
-/// Timestamps are UTC epoch seconds (converted from IST-naive by the fetcher).
+/// Timestamps are standard UTC epoch seconds from Dhan V2 REST API.
 #[derive(Debug, Clone, Copy)]
 pub struct HistoricalCandle {
     /// Candle open timestamp as UTC epoch seconds.
@@ -153,8 +153,8 @@ pub struct HistoricalCandle {
 /// Response from Dhan's intraday charts API.
 ///
 /// Each field is a parallel array — index N across all arrays forms one candle.
-/// Dhan V2 REST API returns timestamps as IST-naive epoch seconds — the IST
-/// clock time encoded as if UTC. Same convention as the WebSocket binary feed.
+/// Dhan V2 REST API returns timestamps as standard UTC epoch seconds.
+/// Confirmed by Dhan Python SDK's `utc_time()` using `datetime.utcfromtimestamp()`.
 ///
 /// Note: Dhan sometimes returns integer fields (volume, open_interest) as floats
 /// (e.g., `105600.0` instead of `105600`). The `deserialize_f64_as_i64_vec`
@@ -172,7 +172,7 @@ pub struct DhanIntradayResponse {
     /// Volume per candle (Dhan may return as int or float).
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub volume: Vec<i64>,
-    /// Timestamps as IST-naive epoch seconds from Dhan V2 REST API.
+    /// Timestamps as standard UTC epoch seconds from Dhan V2 REST API.
     /// Dhan may return as int or float.
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub timestamp: Vec<i64>,

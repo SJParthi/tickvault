@@ -380,13 +380,13 @@
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "exchange_time_ist" },
+            "matcher": { "id": "byName", "options": "exchange_time" },
             "properties": [
               { "id": "custom.width", "value": 200 }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "received_ist" },
+            "matcher": { "id": "byName", "options": "received_at" },
             "properties": [
               { "id": "custom.width", "value": 200 }
             ]
@@ -399,10 +399,10 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "exchange_time_ist" }]
+        "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
       },
       "title": "Latest Ticks — All Instruments",
-      "description": "Most recent ticks. Exchange time & received time shown in IST. Auto-refreshes every 5s.",
+      "description": "Most recent ticks. Timestamps auto-converted to IST by Grafana timezone. Auto-refreshes every 5s.",
       "type": "table",
       "targets": [
         {
@@ -410,7 +410,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  dateadd('s', 19800, ts) AS exchange_time_ist,\n  dateadd('s', 19800, received_at) AS received_ist\nFROM ticks\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 200;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  ts AS exchange_time,\n  received_at\nFROM ticks\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 200;",
           "refId": "A"
         }
       ]
@@ -453,7 +453,7 @@
             "properties": [{ "id": "decimals", "value": 2 }]
           },
           {
-            "matcher": { "id": "byName", "options": "candle_time_ist" },
+            "matcher": { "id": "byName", "options": "candle_time" },
             "properties": [
               { "id": "custom.width", "value": 200 }
             ]
@@ -472,10 +472,10 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "candle_time_ist" }]
+        "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Historical Candles 1m — All Instruments",
-      "description": "1-minute historical candles from Dhan REST API. Timestamps shown in IST.",
+      "description": "1-minute historical candles from Dhan REST API. UTC timestamps, IST display via Grafana timezone.",
       "type": "table",
       "targets": [
         {
@@ -483,7 +483,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM historical_candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  ts AS candle_time\nFROM historical_candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -526,7 +526,7 @@
             "properties": [{ "id": "decimals", "value": 2 }]
           },
           {
-            "matcher": { "id": "byName", "options": "candle_time_ist" },
+            "matcher": { "id": "byName", "options": "candle_time" },
             "properties": [
               { "id": "custom.width", "value": 200 }
             ]
@@ -545,10 +545,10 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "candle_time_ist" }]
+        "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Live 1-Minute Candles (from Materialized View)",
-      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. IST aligned.",
+      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. IST-aligned via OFFSET 05:30.",
       "type": "table",
       "targets": [
         {
@@ -556,7 +556,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  ts AS candle_time\nFROM candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -600,7 +600,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  dateadd('s', 19800, timestamp) AS loaded_ist\nFROM fno_underlyings\nORDER BY underlying_symbol;",
+          "rawSql": "SELECT\n  underlying_symbol,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  timestamp AS loaded_at\nFROM fno_underlyings\nORDER BY underlying_symbol;",
           "refId": "A"
         }
       ]
@@ -642,7 +642,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  dateadd('s', 19800, timestamp) AS loaded_ist\nFROM derivative_contracts\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
+          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  timestamp AS loaded_at\nFROM derivative_contracts\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
           "refId": "A"
         }
       ]
@@ -686,7 +686,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  symbol,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  dateadd('s', 19800, timestamp) AS loaded_ist\nFROM subscribed_indices\nORDER BY symbol;",
+          "rawSql": "SELECT\n  symbol,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  timestamp AS loaded_at\nFROM subscribed_indices\nORDER BY symbol;",
           "refId": "A"
         }
       ]
@@ -752,7 +752,7 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "depth_time_ist" }]
+        "sortBy": [{ "desc": true, "displayName": "depth_time" }]
       },
       "title": "Market Depth (Latest)",
       "description": "5-level bid/ask order book data. Bid in green, ask in red.",
@@ -763,7 +763,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  dateadd('s', 19800, ts) AS depth_time_ist\nFROM market_depth\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  ts AS depth_time\nFROM market_depth\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -812,7 +812,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  dateadd('s', 19800, ts) AS time_ist\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  ts AS time\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -850,7 +850,7 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "build_time_ist" }]
+        "sortBy": [{ "desc": true, "displayName": "build_time" }]
       },
       "title": "Instrument Build History",
       "description": "Daily instrument CSV parse stats — how many underlyings, derivatives, options were loaded.",
@@ -861,7 +861,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  csv_source,\n  csv_row_count,\n  parsed_row_count,\n  index_count,\n  equity_count,\n  underlying_count,\n  derivative_count,\n  option_chain_count,\n  build_duration_ms,\n  dateadd('s', 19800, timestamp) AS build_time_ist\nFROM instrument_build_metadata\nORDER BY timestamp DESC\nLIMIT 50;",
+          "rawSql": "SELECT\n  csv_source,\n  csv_row_count,\n  parsed_row_count,\n  index_count,\n  equity_count,\n  underlying_count,\n  derivative_count,\n  option_chain_count,\n  build_duration_ms,\n  timestamp AS build_time\nFROM instrument_build_metadata\nORDER BY timestamp DESC\nLIMIT 50;",
           "refId": "A"
         }
       ]
@@ -897,7 +897,7 @@
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "holiday_date_ist" },
+            "matcher": { "id": "byName", "options": "holiday_date" },
             "properties": [
               { "id": "custom.width", "value": 150 }
             ]
@@ -916,7 +916,7 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "holiday_date_ist" }]
+        "sortBy": [{ "desc": false, "displayName": "holiday_date" }]
       },
       "title": "NSE Holidays & Muhurat Trading Sessions (2026)",
       "description": "Complete NSE trading calendar loaded from config. Holidays (market closed) and Muhurat Trading sessions (special evening hours on Diwali). Source: NSE Circular NSE/CMTR/71775.",
@@ -927,7 +927,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  name,\n  holiday_type,\n  dateadd('s', 19800, ts) AS holiday_date_ist\nFROM nse_holidays\nORDER BY ts;",
+          "rawSql": "SELECT\n  name,\n  holiday_type,\n  ts AS holiday_date\nFROM nse_holidays\nORDER BY ts;",
           "refId": "A"
         }
       ]

@@ -90,7 +90,7 @@ pub struct CompletedCandle {
     pub security_id: u32,
     /// Binary exchange segment code.
     pub exchange_segment_code: u8,
-    /// Candle timestamp (second boundary, IST-naive epoch seconds from Dhan).
+    /// Candle timestamp (second boundary, UTC epoch seconds from Dhan).
     pub timestamp_secs: u32,
     /// Open price.
     pub open: f32,

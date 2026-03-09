@@ -26,7 +26,7 @@ use dhan_live_trader_common::constants::{
     CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+    QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
@@ -92,8 +92,8 @@ impl CandlePersistenceWriter {
 
     /// Appends a historical candle to the ILP buffer.
     ///
-    /// Expects `candle.timestamp_utc_secs` to be proper UTC (fetcher converts
-    /// from IST-naive before populating).
+    /// `candle.timestamp_utc_secs` is the raw UTC epoch from Dhan V2 API,
+    /// stored as-is without any offset manipulation.
     ///
     /// Auto-flushes if the buffer reaches `CANDLE_FLUSH_BATCH_SIZE`.
     ///
@@ -207,10 +207,9 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        // Dhan V2 sends exchange_timestamp as IST-naive epoch seconds.
-        // Subtract IST offset (5h30m = 19800s) to store as proper UTC,
-        // matching the tick persistence convention.
-        let utc_epoch_secs = i64::from(timestamp_secs).saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+        // Dhan V2 sends exchange_timestamp as standard UTC epoch seconds.
+        // Store as-is — no offset manipulation.
+        let utc_epoch_secs = i64::from(timestamp_secs);
         let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
 
         self.buffer
