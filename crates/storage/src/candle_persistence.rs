@@ -22,7 +22,9 @@ use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{CANDLE_FLUSH_BATCH_SIZE, QUESTDB_TABLE_CANDLES_1M};
+use dhan_live_trader_common::constants::{
+    CANDLE_FLUSH_BATCH_SIZE, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+};
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
 // ---------------------------------------------------------------------------
@@ -141,6 +143,118 @@ impl CandlePersistenceWriter {
     /// Returns the number of candles currently buffered (not yet flushed).
     pub fn pending_count(&self) -> usize {
         self.pending_count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live Candle Writer (candles_1s — feeds materialized views)
+// ---------------------------------------------------------------------------
+
+/// Batch size for live candle ILP flushes. Smaller than historical since
+/// live candles arrive in real-time and need lower latency.
+const LIVE_CANDLE_FLUSH_BATCH_SIZE: usize = 128;
+
+/// Batched writer for live 1-second candles to `candles_1s` via ILP.
+///
+/// Completed candles from `CandleAggregator` are written here, feeding
+/// QuestDB materialized views (candles_1m, 5m, 15m, etc.).
+pub struct LiveCandleWriter {
+    sender: Sender,
+    buffer: Buffer,
+    pending_count: usize,
+}
+
+impl LiveCandleWriter {
+    /// Creates a new live candle writer connected to QuestDB via ILP TCP.
+    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let sender = Sender::from_conf(&conf_string)
+            .context("failed to connect to QuestDB for live candles")?;
+        let buffer = sender.new_buffer();
+
+        Ok(Self {
+            sender,
+            buffer,
+            pending_count: 0,
+        })
+    }
+
+    /// Appends a completed 1-second candle to the ILP buffer.
+    ///
+    /// Auto-flushes when buffer reaches `LIVE_CANDLE_FLUSH_BATCH_SIZE`.
+    ///
+    /// # Performance
+    /// O(1) — single ILP row append + conditional flush.
+    #[allow(clippy::too_many_arguments)] // APPROVED: ILP row requires all OHLCV+meta columns
+    pub fn append_candle(
+        &mut self,
+        security_id: u32,
+        exchange_segment_code: u8,
+        timestamp_secs: u32,
+        open: f32,
+        high: f32,
+        low: f32,
+        close: f32,
+        volume: u32,
+        tick_count: u32,
+    ) -> Result<()> {
+        let ts_nanos = TimestampNanos::new(i64::from(timestamp_secs).saturating_mul(1_000_000_000));
+
+        self.buffer
+            .table(QUESTDB_TABLE_CANDLES_1S)
+            .context("table name")?
+            .symbol("segment", segment_code_to_str(exchange_segment_code))
+            .context("segment")?
+            .column_i64("security_id", i64::from(security_id))
+            .context("security_id")?
+            .column_f64("open", f64::from(open))
+            .context("open")?
+            .column_f64("high", f64::from(high))
+            .context("high")?
+            .column_f64("low", f64::from(low))
+            .context("low")?
+            .column_f64("close", f64::from(close))
+            .context("close")?
+            .column_i64("volume", i64::from(volume))
+            .context("volume")?
+            .column_i64("oi", 0) // OI not available per-second from ticks
+            .context("oi")?
+            .column_i64("tick_count", i64::from(tick_count))
+            .context("tick_count")?
+            .at(ts_nanos)
+            .context("designated timestamp")?;
+
+        self.pending_count = self.pending_count.saturating_add(1);
+
+        if self.pending_count >= LIVE_CANDLE_FLUSH_BATCH_SIZE {
+            self.force_flush()?;
+        }
+
+        Ok(())
+    }
+
+    /// Forces an immediate flush of all buffered candles to QuestDB.
+    pub fn force_flush(&mut self) -> Result<()> {
+        if self.pending_count == 0 {
+            return Ok(());
+        }
+
+        let count = self.pending_count;
+        self.sender
+            .flush(&mut self.buffer)
+            .context("flush live candles to QuestDB")?;
+        self.pending_count = 0;
+
+        debug!(flushed_rows = count, "live candle batch flushed to QuestDB");
+        Ok(())
+    }
+
+    /// Flushes if any candles are buffered.
+    pub fn flush_if_needed(&mut self) -> Result<()> {
+        if self.pending_count > 0 {
+            self.force_flush()?;
+        }
+        Ok(())
     }
 }
 

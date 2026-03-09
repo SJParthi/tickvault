@@ -355,6 +355,7 @@ async fn main() -> Result<()> {
                     None, // depth_writer — QuestDB reconnects in background
                     tick_broadcast_for_processor,
                     candle_agg,
+                    None, // live_candle_writer — QuestDB reconnects in background
                     movers,
                     snapshot_handle,
                 )
@@ -736,6 +737,22 @@ async fn main() -> Result<()> {
 
     let processor_handle = if let Some(receiver) = frame_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
+        let live_candle_writer =
+            match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(
+                &config.questdb,
+            ) {
+                Ok(w) => {
+                    info!("QuestDB live candle writer connected (candles_1s)");
+                    Some(w)
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "live candle writer unavailable — candles_1s will not be persisted"
+                    );
+                    None
+                }
+            };
         let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
         let snapshot_handle = Some(shared_movers.clone());
         let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
@@ -746,6 +763,7 @@ async fn main() -> Result<()> {
                 depth_writer,
                 tick_broadcast_for_processor,
                 candle_agg,
+                live_candle_writer,
                 movers,
                 snapshot_handle,
             )
