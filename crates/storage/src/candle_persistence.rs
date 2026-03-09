@@ -92,6 +92,9 @@ impl CandlePersistenceWriter {
 
     /// Appends a historical candle to the ILP buffer.
     ///
+    /// Expects `candle.timestamp_utc_secs` to be proper UTC (fetcher converts
+    /// from IST-naive before populating).
+    ///
     /// Auto-flushes if the buffer reaches `CANDLE_FLUSH_BATCH_SIZE`.
     ///
     /// # Performance

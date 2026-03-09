@@ -4,8 +4,9 @@
 //! instruments and persists to QuestDB via the `CandlePersistenceWriter`.
 //!
 //! # Timestamp Format
-//! Dhan V2 REST API returns standard UNIX epoch seconds (UTC).
-//! This differs from the WebSocket binary feed which sends IST-naive epochs.
+//! Dhan V2 REST API returns IST-naive epoch seconds — the IST clock time
+//! encoded as if UTC. This is the same convention as the WebSocket binary feed.
+//! We subtract the IST offset (5h30m = 19800s) to store as proper UTC.
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
@@ -27,6 +28,7 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS,
+    IST_UTC_OFFSET_SECONDS_I64,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{DhanIntradayResponse, HistoricalCandle};
@@ -95,7 +97,7 @@ pub struct CandleFetchSummary {
 ///
 /// # Returns
 /// Summary of fetch results (successes, failures, candle count).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // APPROVED: API fetch requires all config + writer params
 pub async fn fetch_historical_candles(
     registry: &InstrumentRegistry,
     dhan_config: &DhanConfig,
@@ -107,12 +109,11 @@ pub async fn fetch_historical_candles(
     let m_fetched = counter!("dlt_historical_candles_fetched_total");
     let m_api_errors = counter!("dlt_historical_api_errors_total");
 
+    #[allow(clippy::expect_used)] // APPROVED: compile-time constant 19800 is always valid
     // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800 = 5h30m),
     // always valid for east_opt(). The expect is unreachable but satisfies no-unwrap lint.
-    #[allow(clippy::expect_used)]
-    // APPROVED: compile-time constant 19800 is always valid for FixedOffset::east_opt
     let ist_offset =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid");
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time constant
 
     let now_ist = Utc::now().with_timezone(&ist_offset);
     let today = now_ist.date_naive();
@@ -331,11 +332,12 @@ pub async fn fetch_historical_candles(
                                     continue;
                                 }
 
-                                // Dhan V2 REST Charts Intraday API returns standard UNIX
-                                // epoch seconds (UTC). No timezone conversion needed.
-                                // NOTE: This differs from the WebSocket binary feed which
-                                // sends IST-naive epoch seconds requiring -5h30m adjustment.
-                                let utc_epoch = data.timestamp[i];
+                                // Dhan V2 REST Charts Intraday API returns IST-naive
+                                // epoch seconds — the IST clock time encoded as if UTC.
+                                // This is the SAME convention as the WebSocket binary feed.
+                                // Subtract IST offset (5h30m = 19800s) to get proper UTC.
+                                let utc_epoch =
+                                    data.timestamp[i].saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
 
                                 let oi_value = if i < data.open_interest.len() {
                                     data.open_interest[i]
@@ -472,5 +474,44 @@ mod tests {
         };
         assert_eq!(summary.instruments_fetched, 10);
         assert_eq!(summary.total_candles, 3750);
+    }
+
+    /// Verifies that IST-naive epoch seconds are correctly converted to UTC
+    /// by subtracting the IST offset (5h30m = 19800s).
+    ///
+    /// Market close candle at 15:29 IST on 2026-03-09:
+    /// - IST-naive epoch: 1773070140 (epoch for 2026-03-09T15:29:00 as-if-UTC)
+    /// - Correct UTC epoch: 1773070140 - 19800 = 1773050340 (2026-03-09T09:59:00 UTC)
+    /// - Display IST: 1773050340 + 19800 = 1773070140 → 2026-03-09T15:29:00 IST ✓
+    #[test]
+    fn test_ist_naive_to_utc_conversion_for_historical_candles() {
+        // IST-naive epoch for 2026-03-09 15:29:00 IST (encoded as-if UTC)
+        let ist_naive_epoch: i64 = 1_773_070_140;
+        let utc_epoch = ist_naive_epoch.saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+
+        // The correct UTC epoch should be 19800 seconds earlier
+        assert_eq!(utc_epoch, ist_naive_epoch - 19_800);
+        // Which equals 2026-03-09T09:59:00 UTC
+        assert_eq!(utc_epoch, 1_773_050_340);
+
+        // When Grafana adds IST offset for display: utc_epoch + 19800 = original IST time
+        let display_ist = utc_epoch + 19_800;
+        assert_eq!(display_ist, ist_naive_epoch);
+    }
+
+    /// Verifies that IST-naive conversion produces correct IST market hours
+    /// for a morning candle (09:15 IST = 03:45 UTC).
+    #[test]
+    fn test_ist_naive_to_utc_market_open_candle() {
+        // IST-naive epoch for 2026-03-09 09:15:00 IST (encoded as-if UTC)
+        let ist_naive_epoch: i64 = 1_773_047_700;
+        let utc_epoch = ist_naive_epoch.saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+
+        // 09:15 IST = 03:45 UTC
+        assert_eq!(utc_epoch, 1_773_027_900);
+
+        // Display: UTC + IST offset should show 09:15 IST
+        let display_ist = utc_epoch + 19_800;
+        assert_eq!(display_ist, ist_naive_epoch);
     }
 }

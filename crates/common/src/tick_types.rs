@@ -127,7 +127,7 @@ pub struct DeepDepthLevel {
 /// A single 1-minute OHLCV candle from Dhan's historical intraday API.
 ///
 /// Used for cross-verification against live tick data and for backfill.
-/// Timestamps are UTC epoch seconds (converted from IST by the fetcher).
+/// Timestamps are UTC epoch seconds (converted from IST-naive by the fetcher).
 #[derive(Debug, Clone, Copy)]
 pub struct HistoricalCandle {
     /// Candle open timestamp as UTC epoch seconds.
@@ -153,8 +153,8 @@ pub struct HistoricalCandle {
 /// Response from Dhan's intraday charts API.
 ///
 /// Each field is a parallel array — index N across all arrays forms one candle.
-/// Dhan V2 REST API returns timestamps as standard UNIX epoch seconds (UTC).
-/// NOTE: This differs from the WebSocket binary feed which sends IST-naive epochs.
+/// Dhan V2 REST API returns timestamps as IST-naive epoch seconds — the IST
+/// clock time encoded as if UTC. Same convention as the WebSocket binary feed.
 ///
 /// Note: Dhan sometimes returns integer fields (volume, open_interest) as floats
 /// (e.g., `105600.0` instead of `105600`). The `deserialize_f64_as_i64_vec`
@@ -172,7 +172,7 @@ pub struct DhanIntradayResponse {
     /// Volume per candle (Dhan may return as int or float).
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub volume: Vec<i64>,
-    /// Timestamps as UNIX epoch seconds (UTC) from Dhan V2 REST API.
+    /// Timestamps as IST-naive epoch seconds from Dhan V2 REST API.
     /// Dhan may return as int or float.
     #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
     pub timestamp: Vec<i64>,
