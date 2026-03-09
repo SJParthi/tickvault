@@ -28,7 +28,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader — Live market data explorer. Pick underlying, instrument, timeframe — charts load automatically. TradingView-style UX.",
+  "description": "dhan-live-trader — Live market data explorer. Pick index or equity, timeframe — candlestick charts load automatically. Historical candles for indices & equities only (no F&O derivatives).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -941,33 +941,15 @@
       {
         "current": {},
         "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT DISTINCT underlying_symbol FROM fno_underlyings ORDER BY underlying_symbol;",
-        "description": "Pick underlying (NIFTY, BANKNIFTY, etc.)",
-        "hide": 0,
-        "includeAll": false,
-        "label": "Underlying",
-        "multi": false,
-        "name": "underlying",
-        "options": [],
-        "query": "SELECT DISTINCT underlying_symbol FROM fno_underlyings ORDER BY underlying_symbol;",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {},
-        "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${underlying}' ORDER BY expiry_date, option_type, strike_price LIMIT 300;",
-        "description": "Pick contract — shows display name, resolves to security_id",
+        "definition": "SELECT DISTINCT symbol AS __text, security_id AS __value FROM subscribed_indices WHERE category = 'FnoUnderlying' UNION ALL SELECT DISTINCT underlying_symbol AS __text, price_feed_security_id AS __value FROM fno_underlyings WHERE kind = 'Stock' ORDER BY 1;",
+        "description": "Pick index or equity — only instruments with historical candle data (no F&O derivatives)",
         "hide": 0,
         "includeAll": false,
         "label": "Instrument",
         "multi": false,
         "name": "security_id",
         "options": [],
-        "query": "SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${underlying}' ORDER BY expiry_date, option_type, strike_price LIMIT 300;",
+        "query": "SELECT DISTINCT symbol AS __text, security_id AS __value FROM subscribed_indices WHERE category = 'FnoUnderlying' UNION ALL SELECT DISTINCT underlying_symbol AS __text, price_feed_security_id AS __value FROM fno_underlyings WHERE kind = 'Stock' ORDER BY 1;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
@@ -977,15 +959,15 @@
       {
         "current": {},
         "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT exchange_segment FROM derivative_contracts WHERE security_id = ${security_id} LIMIT 1;",
-        "description": "Auto-derived from selected instrument",
+        "definition": "SELECT DISTINCT segment FROM historical_candles_1m WHERE security_id = ${security_id} LIMIT 1;",
+        "description": "Auto-derived from selected instrument's historical candle data",
         "hide": 2,
         "includeAll": false,
         "label": "Segment",
         "multi": false,
         "name": "segment",
         "options": [],
-        "query": "SELECT exchange_segment FROM derivative_contracts WHERE security_id = ${security_id} LIMIT 1;",
+        "query": "SELECT DISTINCT segment FROM historical_candles_1m WHERE security_id = ${security_id} LIMIT 1;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
@@ -993,7 +975,7 @@
         "type": "query"
       },
       {
-        "current": { "selected": true, "text": "5m", "value": "5m" },
+        "current": { "selected": true, "text": "1m", "value": "1m" },
         "description": "Candlestick timeframe — 1m candles aggregated via QuestDB SAMPLE BY",
         "hide": 0,
         "includeAll": false,
@@ -1001,8 +983,8 @@
         "multi": false,
         "name": "timeframe",
         "options": [
-          { "selected": false, "text": "1m", "value": "1m" },
-          { "selected": true, "text": "5m", "value": "5m" },
+          { "selected": true, "text": "1m", "value": "1m" },
+          { "selected": false, "text": "5m", "value": "5m" },
           { "selected": false, "text": "15m", "value": "15m" },
           { "selected": false, "text": "30m", "value": "30m" },
           { "selected": false, "text": "1h", "value": "1h" },
@@ -1020,5 +1002,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 4
+  "version": 5
 }
