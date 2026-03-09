@@ -251,6 +251,8 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("total_buy_qty")?
         .column_i64("total_sell_qty", i64::from(tick.total_sell_quantity))
         .context("total_sell_qty")?
+        .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
+        .context("exchange_timestamp")?
         .column_ts("received_at", received_nanos)
         .context("received_at")?
         .at(ts_nanos)
@@ -271,8 +273,9 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
 /// - `security_id` as LONG (4-byte in Dhan, but LONG for QuestDB compat)
 /// - Price fields as DOUBLE (f64 from f32 parsed ticks)
 /// - Volume/quantity fields as LONG (cumulative, can exceed u32 for indices)
+/// - `exchange_timestamp` as LONG (raw Dhan u32 epoch seconds, preserved verbatim for audit)
 /// - `received_at` as TIMESTAMP (local clock for latency measurement)
-/// - `ts` as designated TIMESTAMP (exchange time, partition key)
+/// - `ts` as designated TIMESTAMP (exchange time converted to UTC, partition key)
 const TICKS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS ticks (\
         segment SYMBOL,\
@@ -288,6 +291,7 @@ const TICKS_CREATE_DDL: &str = "\
         last_trade_qty LONG,\
         total_buy_qty LONG,\
         total_sell_qty LONG,\
+        exchange_timestamp LONG,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
@@ -1076,6 +1080,7 @@ mod tests {
         assert!(content.contains("last_trade_qty"));
         assert!(content.contains("total_buy_qty"));
         assert!(content.contains("total_sell_qty"));
+        assert!(content.contains("exchange_timestamp"));
         assert!(content.contains("received_at"));
     }
 
@@ -1324,6 +1329,34 @@ mod tests {
         assert!(content.contains("received_at"));
     }
 
+    #[test]
+    fn test_build_tick_row_preserves_raw_exchange_timestamp() {
+        // The raw Dhan exchange_timestamp (IST-naive u32 epoch seconds) must
+        // be stored verbatim in the `exchange_timestamp` LONG column so the
+        // original data is never lost. The `ts` designated timestamp stores
+        // the UTC-converted value separately.
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let dhan_raw_epoch: u32 = 1_772_118_332; // IST 2026-02-27 09:25:32
+        let tick = ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 2,
+            last_traded_price: 24500.0,
+            exchange_timestamp: dhan_raw_epoch,
+            received_at_nanos: 1_772_098_532_000_000_000,
+            ..Default::default()
+        };
+
+        build_tick_row(&mut buffer, &tick).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // ILP integer format: field_name=1772118332i
+        let expected_ilp_value = format!("exchange_timestamp={}i", dhan_raw_epoch);
+        assert!(
+            content.contains(&expected_ilp_value),
+            "Raw exchange_timestamp not preserved verbatim in ILP buffer. Content: {content}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Coverage gap-fill: segment_code_to_str exhaustive tests
     // -----------------------------------------------------------------------
@@ -1362,6 +1395,7 @@ mod tests {
         assert!(TICKS_CREATE_DDL.contains("last_trade_qty LONG"));
         assert!(TICKS_CREATE_DDL.contains("total_buy_qty LONG"));
         assert!(TICKS_CREATE_DDL.contains("total_sell_qty LONG"));
+        assert!(TICKS_CREATE_DDL.contains("exchange_timestamp LONG"));
         assert!(TICKS_CREATE_DDL.contains("received_at TIMESTAMP"));
         assert!(TICKS_CREATE_DDL.contains("ts TIMESTAMP"));
     }
