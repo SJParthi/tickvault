@@ -29,3 +29,6 @@ pub mod notification;
 pub mod parser;
 pub mod pipeline;
 pub mod websocket;
+
+#[cfg(test)]
+pub mod test_support;

@@ -1516,4 +1516,20 @@ mod tests {
         let addr: Result<SocketAddr, _> = "not_a_socket".parse();
         assert!(addr.is_err(), "invalid address must fail");
     }
+
+    #[test]
+    fn off_hours_stagger_is_less_than_market_hours() {
+        // Off-hours stagger must be strictly less than the default 10s market-hours stagger.
+        // This test prevents accidental regressions where off-hours boot slows down.
+        const {
+            assert!(
+                OFF_HOURS_CONNECTION_STAGGER_MS > 0,
+                // "off-hours stagger must not be zero (still respectful to Dhan servers)"
+            );
+            assert!(
+                OFF_HOURS_CONNECTION_STAGGER_MS <= 2000,
+                // "off-hours stagger should not exceed 2s to avoid unnecessary boot delay"
+            );
+        }
+    }
 }

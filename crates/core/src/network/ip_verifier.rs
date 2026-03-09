@@ -352,7 +352,15 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_expected_ip_fails_without_real_ssm() {
         let result = fetch_expected_ip_from_ssm().await;
-        assert!(result.is_err(), "must fail without real SSM connectivity");
+        if crate::test_support::has_aws_credentials() {
+            // Dev machine with real AWS credentials — SSM is reachable.
+            assert!(
+                result.is_ok(),
+                "with real AWS credentials, SSM IP fetch should succeed"
+            );
+        } else {
+            assert!(result.is_err(), "must fail without real SSM connectivity");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -362,10 +370,18 @@ mod tests {
     #[tokio::test]
     async fn test_verify_public_ip_fails_without_real_ssm() {
         let result = verify_public_ip().await;
-        assert!(
-            result.is_err(),
-            "verify_public_ip must fail without real SSM"
-        );
+        if crate::test_support::has_aws_credentials() {
+            // Dev machine with real AWS credentials — SSM + public IP check both succeed.
+            assert!(
+                result.is_ok(),
+                "with real AWS credentials, IP verification should succeed"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "verify_public_ip must fail without real SSM"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

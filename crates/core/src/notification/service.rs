@@ -699,10 +699,18 @@ mod tests {
             sns_enabled: false,
         };
         let service = NotificationService::initialize(&config).await;
-        assert!(
-            !service.is_active(),
-            "without real SSM, service should be in no-op mode"
-        );
+        if crate::test_support::has_aws_credentials() {
+            // Dev machine with real AWS credentials — Telegram creds fetched from SSM.
+            assert!(
+                service.is_active(),
+                "with real AWS credentials, notification service should be active"
+            );
+        } else {
+            assert!(
+                !service.is_active(),
+                "without real SSM, service should be in no-op mode"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

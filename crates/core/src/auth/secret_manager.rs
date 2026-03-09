@@ -553,10 +553,20 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_dhan_credentials_returns_error_without_real_ssm() {
         let result = fetch_dhan_credentials().await;
-        assert!(
-            result.is_err(),
-            "fetch_dhan_credentials must fail without real SSM"
-        );
+        if crate::test_support::has_aws_credentials() {
+            // Dev machine with real AWS credentials — SSM is reachable,
+            // so fetch_dhan_credentials succeeds. Validate the happy path.
+            assert!(
+                result.is_ok(),
+                "with real AWS credentials, fetch should succeed"
+            );
+        } else {
+            // CI or machine without AWS credentials — SSM is unreachable.
+            assert!(
+                result.is_err(),
+                "fetch_dhan_credentials must fail without real SSM"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
