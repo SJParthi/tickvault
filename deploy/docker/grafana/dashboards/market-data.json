@@ -28,7 +28,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader — Live market data explorer. Pick index or equity, timeframe — candlestick charts load automatically. Historical candles for indices & equities only (no F&O derivatives).",
+  "description": "dhan-live-trader — Live market data explorer. Pick underlying (index or equity), then contract (spot or derivative) — candlestick charts load automatically.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -249,7 +249,7 @@
         "colors": { "up": "green", "down": "red", "flat": "gray" },
         "includeAllFields": true
       },
-      "title": "Historical — ${security_id:text}  [${timeframe}]",
+      "title": "Historical — ${contract:text}  [${timeframe}]",
       "type": "candlestick",
       "targets": [
         {
@@ -257,7 +257,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM historical_candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nSAMPLE BY ${timeframe}\nORDER BY ts;",
+          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM historical_candles_1m\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nSAMPLE BY ${timeframe}\nORDER BY ts;",
           "refId": "OHLCV"
         },
         {
@@ -265,7 +265,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM historical_candles_1m\n  WHERE security_id = ${security_id}\n    AND segment = '${segment}'\n    AND $__timeFilter(ts)\n  SAMPLE BY ${timeframe}\n  ORDER BY ts\n);",
+          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM historical_candles_1m\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND $__timeFilter(ts)\n  SAMPLE BY ${timeframe}\n  ORDER BY ts\n);",
           "refId": "SMA",
           "hide": false
         }
@@ -321,7 +321,7 @@
         "colors": { "up": "green", "down": "red", "flat": "gray" },
         "includeAllFields": true
       },
-      "title": "Live (Ticks) — ${security_id:text}  [${timeframe}]",
+      "title": "Live (Ticks) — ${contract:text}  [${timeframe}]",
       "type": "candlestick",
       "targets": [
         {
@@ -329,7 +329,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM candles_1m\nWHERE security_id = ${security_id}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nSAMPLE BY ${timeframe}\nORDER BY ts;",
+          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM candles_1m\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND $__timeFilter(ts)\nSAMPLE BY ${timeframe}\nORDER BY ts;",
           "refId": "OHLCV"
         },
         {
@@ -337,7 +337,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM candles_1m\n  WHERE security_id = ${security_id}\n    AND segment = '${segment}'\n    AND $__timeFilter(ts)\n  SAMPLE BY ${timeframe}\n  ORDER BY ts\n);",
+          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM candles_1m\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND $__timeFilter(ts)\n  SAMPLE BY ${timeframe}\n  ORDER BY ts\n);",
           "refId": "SMA",
           "hide": false
         }
@@ -942,10 +942,10 @@
         "current": { "selected": true, "text": "NIFTY", "value": "13" },
         "datasource": { "type": "postgres", "uid": "questdb" },
         "definition": "SELECT DISTINCT symbol AS __text, security_id AS __value FROM subscribed_indices WHERE category = 'FnoUnderlying' UNION ALL SELECT DISTINCT underlying_symbol AS __text, price_feed_security_id AS __value FROM fno_underlyings WHERE kind = 'Stock' ORDER BY 1;",
-        "description": "Pick index or equity — only instruments with historical candle data (no F&O derivatives)",
+        "description": "Pick index or equity underlying — derivatives shown in Contract dropdown",
         "hide": 0,
         "includeAll": false,
-        "label": "Instrument",
+        "label": "Underlying",
         "multi": false,
         "name": "security_id",
         "options": [],
@@ -957,17 +957,35 @@
         "type": "query"
       },
       {
+        "current": { "selected": true, "text": "NIFTY (Spot)", "value": "13" },
+        "datasource": { "type": "postgres", "uid": "questdb" },
+        "definition": "SELECT '${security_id:text} (Spot)' AS __text, ${security_id} AS __value UNION ALL SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${security_id:text}' ORDER BY 1;",
+        "description": "Spot/Index or derivative contract for the selected underlying",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Contract",
+        "multi": false,
+        "name": "contract",
+        "options": [],
+        "query": "SELECT '${security_id:text} (Spot)' AS __text, ${security_id} AS __value UNION ALL SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${security_id:text}' ORDER BY 1;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
         "current": { "selected": true, "text": "IDX_I", "value": "IDX_I" },
         "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT DISTINCT segment FROM historical_candles_1m WHERE security_id = ${security_id} LIMIT 1;",
-        "description": "Auto-derived from selected instrument's historical candle data",
+        "definition": "SELECT 'IDX_I' AS segment FROM subscribed_indices WHERE security_id = ${contract} AND symbol = '${security_id:text}' UNION ALL SELECT price_feed_segment AS segment FROM fno_underlyings WHERE price_feed_security_id = ${contract} AND underlying_symbol = '${security_id:text}' UNION ALL SELECT exchange_segment AS segment FROM derivative_contracts WHERE security_id = ${contract} AND underlying_symbol = '${security_id:text}';",
+        "description": "Auto-derived exchange segment for the selected contract",
         "hide": 2,
         "includeAll": false,
         "label": "Segment",
         "multi": false,
         "name": "segment",
         "options": [],
-        "query": "SELECT DISTINCT segment FROM historical_candles_1m WHERE security_id = ${security_id} LIMIT 1;",
+        "query": "SELECT 'IDX_I' AS segment FROM subscribed_indices WHERE security_id = ${contract} AND symbol = '${security_id:text}' UNION ALL SELECT price_feed_segment AS segment FROM fno_underlyings WHERE price_feed_security_id = ${contract} AND underlying_symbol = '${security_id:text}' UNION ALL SELECT exchange_segment AS segment FROM derivative_contracts WHERE security_id = ${contract} AND underlying_symbol = '${security_id:text}';",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
