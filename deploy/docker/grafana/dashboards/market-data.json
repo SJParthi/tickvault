@@ -402,7 +402,7 @@
         "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
       },
       "title": "Latest Ticks — All Instruments",
-      "description": "Most recent ticks. Timestamps auto-converted to IST by Grafana timezone. Auto-refreshes every 5s.",
+      "description": "Most recent ticks. Dhan sends IST epoch seconds stored as-is; Grafana UTC mode displays them correctly. Auto-refreshes every 5s.",
       "type": "table",
       "targets": [
         {
@@ -475,7 +475,7 @@
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Historical Candles 1m — All Instruments",
-      "description": "1-minute historical candles from Dhan REST API. UTC timestamps, IST display via Grafana timezone.",
+      "description": "1-minute historical candles from Dhan REST API. IST epoch seconds stored as-is; Grafana UTC mode displays correctly.",
       "type": "table",
       "targets": [
         {
@@ -1017,7 +1017,7 @@
   },
   "time": { "from": "now-3d", "to": "now" },
   "timepicker": {},
-  "timezone": "Asia/Kolkata",
+  "timezone": "utc",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
   "version": 6

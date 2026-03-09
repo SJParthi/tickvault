@@ -4,10 +4,10 @@
 //! instruments and persists to QuestDB via the `CandlePersistenceWriter`.
 //!
 //! # Timestamp Format
-//! Dhan V2 REST API returns standard UTC epoch seconds (Unix time).
-//! Confirmed by Dhan Python SDK's `utc_time()` using `datetime.utcfromtimestamp()`.
-//! Timestamps are stored as-is in QuestDB; Grafana `timezone: Asia/Kolkata`
-//! handles UTC→IST display conversion.
+//! Dhan V2 REST API returns IST epoch seconds — the epoch value represents
+//! IST wall-clock time, NOT UTC. Timestamps are stored as-is in QuestDB
+//! (no conversion). Grafana dashboard uses `timezone: utc` to display them
+//! correctly without adding a +5:30 offset.
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
@@ -332,8 +332,8 @@ pub async fn fetch_historical_candles(
                                     continue;
                                 }
 
-                                // Dhan V2 REST API returns standard UTC epoch seconds.
-                                // Store as-is; Grafana handles UTC→IST display.
+                                // Dhan V2 REST API returns IST epoch seconds.
+                                // Store as-is — no conversion needed.
                                 let utc_epoch = data.timestamp[i];
 
                                 let oi_value = if i < data.open_interest.len() {
@@ -473,59 +473,58 @@ mod tests {
         assert_eq!(summary.total_candles, 3750);
     }
 
-    /// Verifies Dhan REST API returns standard UTC epoch seconds.
+    /// Verifies Dhan REST API returns IST epoch seconds.
     ///
     /// Market close candle at 15:29 IST on 2026-03-09:
-    /// - UTC epoch: 1773050340 (2026-03-09T09:59:00 UTC = 15:29:00 IST)
-    /// - Stored as-is in QuestDB; Grafana timezone Asia/Kolkata shows IST.
+    /// - IST epoch decodes directly to 15:29 (no +5:30 conversion needed).
+    /// - Stored as-is in QuestDB; Grafana `timezone: utc` shows correctly.
     #[test]
-    fn test_dhan_rest_api_returns_utc_epoch_market_close() {
-        // 2026-03-09 00:00:00 UTC = 1773014400
-        // 09:59:00 UTC = 35940s from midnight
-        let utc_epoch: i64 = 1_773_014_400 + 35_940; // 1_773_050_340
-        assert_eq!(utc_epoch, 1_773_050_340);
+    fn test_dhan_rest_api_returns_ist_epoch_market_close() {
+        // IST epoch for 2026-03-09 15:29:00 IST
+        let ist_epoch: i64 = 1_773_014_400 + 15 * 3600 + 29 * 60; // 1_773_070_140
+        assert_eq!(ist_epoch, 1_773_070_140);
 
-        // This is 15:29 IST (09:59 UTC + 5h30m)
-        let ist_seconds_from_midnight = (utc_epoch % 86_400) + 19_800;
-        let ist_hour = ist_seconds_from_midnight / 3600;
-        let ist_minute = (ist_seconds_from_midnight % 3600) / 60;
-        assert_eq!(ist_hour, 15, "IST hour must be 15");
-        assert_eq!(ist_minute, 29, "IST minute must be 29");
+        // IST epoch decodes directly — no +5:30 needed
+        let secs_from_midnight = ist_epoch % 86_400;
+        let hour = secs_from_midnight / 3600;
+        let minute = (secs_from_midnight % 3600) / 60;
+        assert_eq!(hour, 15, "IST hour must be 15");
+        assert_eq!(minute, 29, "IST minute must be 29");
     }
 
-    /// Verifies UTC epoch for market open candle (09:15 IST = 03:45 UTC).
+    /// Verifies IST epoch for market open candle (09:15 IST).
     #[test]
-    fn test_dhan_rest_api_returns_utc_epoch_market_open() {
-        // 2026-03-09 03:45:00 UTC = 09:15:00 IST
-        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 45 * 60; // 1_773_027_900
-        assert_eq!(utc_epoch, 1_773_027_900);
+    fn test_dhan_rest_api_returns_ist_epoch_market_open() {
+        // IST epoch for 2026-03-09 09:15:00 IST
+        let ist_epoch: i64 = 1_773_014_400 + 9 * 3600 + 15 * 60; // 1_773_047_700
+        assert_eq!(ist_epoch, 1_773_047_700);
 
-        let ist_seconds_from_midnight = (utc_epoch % 86_400) + 19_800;
-        let ist_hour = ist_seconds_from_midnight / 3600;
-        let ist_minute = (ist_seconds_from_midnight % 3600) / 60;
-        assert_eq!(ist_hour, 9, "IST hour must be 9");
-        assert_eq!(ist_minute, 15, "IST minute must be 15");
+        let secs_from_midnight = ist_epoch % 86_400;
+        let hour = secs_from_midnight / 3600;
+        let minute = (secs_from_midnight % 3600) / 60;
+        assert_eq!(hour, 9, "IST hour must be 9");
+        assert_eq!(minute, 15, "IST minute must be 15");
     }
 
-    /// Verifies UTC epoch for mid-session candle (12:00 IST = 06:30 UTC).
+    /// Verifies IST epoch for mid-session candle (12:00 IST).
     #[test]
-    fn test_dhan_rest_api_returns_utc_epoch_mid_session() {
-        // 2026-03-09 06:30:00 UTC = 12:00:00 IST
-        let utc_epoch: i64 = 1_773_014_400 + 6 * 3600 + 30 * 60; // 1_773_037_800
-        assert_eq!(utc_epoch, 1_773_037_800);
+    fn test_dhan_rest_api_returns_ist_epoch_mid_session() {
+        // IST epoch for 2026-03-09 12:00:00 IST
+        let ist_epoch: i64 = 1_773_014_400 + 12 * 3600; // 1_773_057_600
+        assert_eq!(ist_epoch, 1_773_057_600);
 
-        let ist_seconds_from_midnight = (utc_epoch % 86_400) + 19_800;
-        let ist_hour = ist_seconds_from_midnight / 3600;
-        let ist_minute = (ist_seconds_from_midnight % 3600) / 60;
-        assert_eq!(ist_hour, 12, "IST hour must be 12");
-        assert_eq!(ist_minute, 0, "IST minute must be 0");
+        let secs_from_midnight = ist_epoch % 86_400;
+        let hour = secs_from_midnight / 3600;
+        let minute = (secs_from_midnight % 3600) / 60;
+        assert_eq!(hour, 12, "IST hour must be 12");
+        assert_eq!(minute, 0, "IST minute must be 0");
     }
 
-    /// Verifies the store-as-is approach: UTC epoch stored directly in
+    /// Verifies the store-as-is approach: IST epoch stored directly in
     /// HistoricalCandle without any offset manipulation.
     #[test]
-    fn test_historical_candle_stores_utc_epoch_as_is() {
-        let dhan_epoch: i64 = 1_773_050_340; // 2026-03-09T09:59:00 UTC = 15:29 IST
+    fn test_historical_candle_stores_ist_epoch_as_is() {
+        let dhan_epoch: i64 = 1_773_070_140; // 15:29 IST on 2026-03-09
         let candle = HistoricalCandle {
             timestamp_utc_secs: dhan_epoch, // Stored as-is, no manipulation
             security_id: 42,
@@ -537,9 +536,8 @@ mod tests {
             volume: 1000,
             open_interest: 0,
         };
-        // Timestamp stored is exactly what Dhan returned
+        // Timestamp stored is exactly what Dhan returned — raw IST epoch
         assert_eq!(candle.timestamp_utc_secs, dhan_epoch);
-        // No subtraction, no addition — raw UTC
-        assert_eq!(candle.timestamp_utc_secs, 1_773_050_340);
+        assert_eq!(candle.timestamp_utc_secs, 1_773_070_140);
     }
 }

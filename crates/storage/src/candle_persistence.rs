@@ -4,7 +4,7 @@
 //! on `(ts, security_id)` to ensure idempotent re-ingestion.
 //!
 //! # Table Schema
-//! - `ts` TIMESTAMP (designated) — candle open time in UTC
+//! - `ts` TIMESTAMP (designated) — candle open time (IST epoch, stored as-is)
 //! - `security_id` LONG — Dhan security identifier
 //! - `segment` SYMBOL — exchange segment (NSE_FNO, NSE_EQ, etc.)
 //! - OHLCV + OI as DOUBLE/LONG columns
@@ -92,8 +92,8 @@ impl CandlePersistenceWriter {
 
     /// Appends a historical candle to the ILP buffer.
     ///
-    /// `candle.timestamp_utc_secs` is the raw UTC epoch from Dhan V2 API,
-    /// stored as-is without any offset manipulation.
+    /// `candle.timestamp_utc_secs` is IST epoch seconds from Dhan V2 API,
+    /// stored as-is without any conversion.
     ///
     /// Auto-flushes if the buffer reaches `CANDLE_FLUSH_BATCH_SIZE`.
     ///
@@ -207,8 +207,8 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        // Dhan V2 sends exchange_timestamp as standard UTC epoch seconds.
-        // Store as-is — no offset manipulation.
+        // Dhan V2 sends exchange_timestamp as IST epoch seconds.
+        // Store as-is — no conversion needed.
         let utc_epoch_secs = i64::from(timestamp_secs);
         let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
 

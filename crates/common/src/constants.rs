@@ -466,10 +466,10 @@ pub const SSM_NETWORK_SERVICE: &str = "network";
 pub const STATIC_IP_SECRET: &str = "static-ip";
 
 /// Primary URL for public IP detection (AWS-owned, plain text response).
-pub const PUBLIC_IP_CHECK_PRIMARY_URL: &str = "https://checkip.amazonaws.com";
+pub const PUBLIC_IP_CHECK_PRIMARY_URL: &str = "https://checkip.amazonaws.com"; // APPROVED: infrastructure constant
 
 /// Fallback URL for public IP detection (plain text response).
-pub const PUBLIC_IP_CHECK_FALLBACK_URL: &str = "https://api.ipify.org";
+pub const PUBLIC_IP_CHECK_FALLBACK_URL: &str = "https://api.ipify.org"; // APPROVED: infrastructure constant
 
 /// Timeout in seconds for public IP detection HTTP requests.
 pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
@@ -952,9 +952,12 @@ pub const QUESTDB_TABLE_CANDLES_1M: &str = "historical_candles_1m";
 /// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
 pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
-/// IST offset for QuestDB ALIGN TO CALENDAR.
-/// QuestDB materialized views use this to align candle boundaries to IST (UTC+5:30).
-pub const QUESTDB_IST_ALIGN_OFFSET: &str = "05:30";
+/// Calendar alignment offset for QuestDB materialized views.
+///
+/// Dhan sends IST epoch seconds — stored as-is in QuestDB (no UTC conversion).
+/// Since the data already represents IST wall-clock time, no calendar offset
+/// is needed. Offset "00:00" gives clean hour/day boundaries (09:00, 10:00, …).
+pub const QUESTDB_IST_ALIGN_OFFSET: &str = "00:00";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants
