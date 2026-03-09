@@ -248,13 +248,28 @@ jobs:
       - name: Benchmark budget gate (latency budgets + regression check)
         run: bash scripts/bench-gate.sh
 
-      - name: DHAT zero-allocation check (if dhat tests exist)
+      - name: DHAT zero-allocation check (HARD FAIL for hot-path crates)
         run: |
-          DHAT_TESTS=$(grep -r 'dhat' crates/ --include='*.rs' -l 2>/dev/null | head -1)
-          if [ -n "$DHAT_TESTS" ]; then
+          # Hot-path crates MUST have DHAT tests once they exist — no silent skip
+          HOT_CRATES="core trading"
+          DHAT_MISSING=""
+          DHAT_FOUND=false
+
+          for crate in $HOT_CRATES; do
+            if grep -r 'dhat' "crates/$crate/" --include='*.rs' -q 2>/dev/null; then
+              DHAT_FOUND=true
+            else
+              DHAT_MISSING="$DHAT_MISSING $crate"
+            fi
+          done
+
+          if [ "$DHAT_FOUND" = "true" ]; then
+            echo "Running DHAT tests (HARD FAIL — zero allocations on hot path)"
             cargo test --workspace -- --test-threads=1 dhat
-          else
-            echo "No DHAT tests found — skipping."
+          fi
+
+          if [ -n "$DHAT_MISSING" ]; then
+            echo "::warning::DHAT tests missing for hot-path crates:$DHAT_MISSING — add dhat assertions before production"
           fi
 
       # ---- Coverage ----
