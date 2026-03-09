@@ -48,6 +48,7 @@ use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
 use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
 use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
+use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
 use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
 use dhan_live_trader_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
@@ -695,9 +696,12 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 7: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
-    // In slow boot, Docker is already running so instrument persistence succeeds
-    // on first attempt. The universe is not needed for re-persistence here.
-    let (subscription_plan, _slow_boot_universe) = load_instruments(&config).await;
+    // In slow boot, Docker is already running. FreshBuild persists internally,
+    // but CachedPlan (within build window) needs explicit persistence here.
+    let (subscription_plan, slow_boot_universe) = load_instruments(&config).await;
+    if let Some(ref universe) = slow_boot_universe {
+        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+    }
 
     // -----------------------------------------------------------------------
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
@@ -916,7 +920,28 @@ async fn load_instruments(
                 feed_mode = %plan.summary.feed_mode,
                 "subscription plan ready (zero-copy rkyv cache)"
             );
-            (Some(plan), None)
+            // Load owned universe from rkyv cache for QuestDB persistence.
+            // Zero-copy MappedUniverse built the plan; persist_instrument_snapshot
+            // needs owned FnoUniverse. One-time ~5-15ms startup cost, not hot path.
+            let universe = match read_binary_cache(&config.instrument.csv_cache_directory) {
+                Ok(Some(u)) => {
+                    info!(
+                        underlyings = u.underlyings.len(),
+                        derivatives = u.derivative_contracts.len(),
+                        "owned universe loaded from rkyv cache for QuestDB persistence"
+                    );
+                    Some(u)
+                }
+                Ok(None) => {
+                    warn!("rkyv cache not found for persistence — instrument tables will be empty");
+                    None
+                }
+                Err(err) => {
+                    warn!(%err, "rkyv cache read failed for persistence — instrument tables will be empty");
+                    None
+                }
+            };
+            (Some(plan), universe)
         }
         Ok(InstrumentLoadResult::Unavailable) => {
             info!("instruments: no cache available during market hours");
