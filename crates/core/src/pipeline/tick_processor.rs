@@ -487,10 +487,10 @@ pub async fn run_tick_processor(
                 let now_secs = ((received_at_nanos / 1_000_000_000)
                     + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
                 agg.sweep_stale(now_secs);
-                let completed = agg.drain_completed();
+                let completed = agg.completed_slice();
                 if !completed.is_empty() {
                     if let Some(ref mut cw) = live_candle_writer {
-                        for c in &completed {
+                        for c in completed {
                             if let Err(err) = cw.append_candle(
                                 c.security_id,
                                 c.exchange_segment_code,
@@ -509,6 +509,7 @@ pub async fn run_tick_processor(
                     }
                     trace!(count = completed.len(), "flushed completed 1s candles");
                 }
+                agg.clear_completed();
             }
             // Periodic live candle flush
             if let Some(ref mut cw) = live_candle_writer
@@ -549,9 +550,9 @@ pub async fn run_tick_processor(
     // Flush remaining candles and persist to QuestDB
     if let Some(ref mut agg) = candle_aggregator {
         agg.flush_all();
-        let remaining = agg.drain_completed();
+        let final_count = agg.completed_slice().len();
         if let Some(ref mut cw) = live_candle_writer {
-            for c in &remaining {
+            for c in agg.completed_slice() {
                 let _ = cw.append_candle(
                     c.security_id,
                     c.exchange_segment_code,
@@ -568,9 +569,10 @@ pub async fn run_tick_processor(
                 error!(?err, "final live candle flush failed");
             }
         }
+        agg.clear_completed();
         info!(
             total_completed = agg.total_completed(),
-            final_flush = remaining.len(),
+            final_flush = final_count,
             "candle aggregator stopped"
         );
     }

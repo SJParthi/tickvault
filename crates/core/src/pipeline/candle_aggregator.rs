@@ -223,9 +223,20 @@ impl CandleAggregator {
         self.candles.clear();
     }
 
-    /// Drains and returns completed candles. Caller is responsible for persisting them.
-    pub fn drain_completed(&mut self) -> Vec<CompletedCandle> {
-        std::mem::take(&mut self.completed)
+    /// Returns a slice of completed candles ready for persistence.
+    ///
+    /// Call [`clear_completed()`](Self::clear_completed) after processing to free the buffer
+    /// while preserving its pre-allocated capacity (avoids reallocation on the next cycle).
+    pub fn completed_slice(&self) -> &[CompletedCandle] {
+        &self.completed
+    }
+
+    /// Clears the completed buffer, preserving pre-allocated capacity.
+    ///
+    /// Unlike `std::mem::take` (which replaces with a zero-capacity Vec and discards the
+    /// pre-allocated buffer), `clear()` keeps the existing allocation for reuse.
+    pub fn clear_completed(&mut self) {
+        self.completed.clear();
     }
 
     /// Returns the number of active (in-progress) candles.
@@ -236,6 +247,16 @@ impl CandleAggregator {
     /// Returns the total number of candles completed since startup.
     pub fn total_completed(&self) -> u64 {
         self.total_completed
+    }
+
+    /// Drains and returns completed candles (test-only convenience).
+    ///
+    /// Uses `std::mem::take` which discards the pre-allocated capacity.
+    /// Production code must use [`completed_slice()`](Self::completed_slice) +
+    /// [`clear_completed()`](Self::clear_completed) to preserve capacity.
+    #[cfg(test)]
+    pub fn drain_completed(&mut self) -> Vec<CompletedCandle> {
+        std::mem::take(&mut self.completed)
     }
 }
 

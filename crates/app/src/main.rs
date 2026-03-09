@@ -1299,8 +1299,7 @@ async fn run_candle_persistence_consumer(
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 // Shutdown: flush remaining candles
                 aggregator.flush_all();
-                let remaining = aggregator.drain_completed();
-                for c in &remaining {
+                for c in aggregator.completed_slice() {
                     let _ = candle_writer.append_candle(
                         c.security_id,
                         c.exchange_segment_code,
@@ -1313,6 +1312,7 @@ async fn run_candle_persistence_consumer(
                         c.tick_count,
                     );
                 }
+                aggregator.clear_completed();
                 let _ = candle_writer.force_flush();
                 info!(
                     candles_persisted,
@@ -1330,9 +1330,9 @@ async fn run_candle_persistence_consumer(
         if last_sweep.elapsed() >= sweep_interval {
             let now_secs = chrono::Utc::now().timestamp() as u32;
             aggregator.sweep_stale(now_secs);
-            let completed = aggregator.drain_completed();
+            let completed = aggregator.completed_slice();
 
-            for c in &completed {
+            for c in completed {
                 if let Err(err) = candle_writer.append_candle(
                     c.security_id,
                     c.exchange_segment_code,
@@ -1350,6 +1350,7 @@ async fn run_candle_persistence_consumer(
             }
 
             candles_persisted = candles_persisted.saturating_add(completed.len() as u64);
+            aggregator.clear_completed();
 
             if let Err(err) = candle_writer.flush_if_needed() {
                 warn!(?err, "cold-path candle flush failed");

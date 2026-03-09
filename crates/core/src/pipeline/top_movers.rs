@@ -223,6 +223,7 @@ impl TopMoversTracker {
             "top movers snapshot computed"
         );
 
+        // O(1) EXEMPT: cold path (every 5s). Clone copies ~1KB (3 × 20 Copy entries).
         self.latest_snapshot = Some(snapshot.clone());
         snapshot
     }
