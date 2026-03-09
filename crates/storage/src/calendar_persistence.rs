@@ -180,18 +180,15 @@ fn persist_inner(calendar: &TradingCalendar, questdb_config: &QuestDbConfig) -> 
             "Holiday"
         };
 
-        // Convert date to midnight IST → UTC timestamp in nanoseconds.
-        // IST midnight = UTC previous day 18:30:00.
-        let midnight_ist_epoch_secs = entry
+        // Store holiday date as IST midnight directly (IST-as-UTC convention).
+        // QuestDB will display 2026-03-09T00:00:00Z for an IST date of 2026-03-09.
+        let midnight_epoch_secs = entry
             .date
             .and_hms_opt(0, 0, 0)
-            .map(|dt| {
-                dt.and_utc().timestamp()
-                    - i64::from(dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS)
-            })
+            .map(|dt| dt.and_utc().timestamp())
             .context("failed to compute timestamp for holiday")?;
 
-        let ts_nanos = TimestampNanos::new(midnight_ist_epoch_secs * 1_000_000_000);
+        let ts_nanos = TimestampNanos::new(midnight_epoch_secs * 1_000_000_000);
 
         buffer
             .table(QUESTDB_TABLE_NSE_HOLIDAYS)

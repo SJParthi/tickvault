@@ -28,8 +28,9 @@ use dhan_live_trader_common::constants::{
     DEPTH_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS,
-    TICK_FLUSH_BATCH_SIZE, TICK_FLUSH_INTERVAL_MS,
+    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_MARKET_DEPTH,
+    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE,
+    TICK_FLUSH_INTERVAL_MS,
 };
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 
@@ -208,17 +209,20 @@ fn f32_to_f64_clean(v: f32) -> f64 {
 
 /// Writes a single tick row into the ILP buffer (no flush).
 ///
-/// Dhan V2 WebSocket sends `exchange_timestamp` as standard UTC epoch seconds.
-/// Stored as-is in QuestDB; Grafana `timezone: Asia/Kolkata` converts to IST.
+/// Dhan V2 WebSocket sends `exchange_timestamp` as UTC epoch seconds.
+/// We add `IST_UTC_OFFSET_SECONDS_I64` so QuestDB displays IST wall-clock
+/// time directly. The raw `exchange_timestamp` LONG column is preserved
+/// verbatim for audit.
 ///
 /// Price fields use `f32_to_f64_clean` to preserve the original Dhan f32
 /// precision without f32→f64 widening artifacts.
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
-    // Dhan V2 WebSocket sends exchange_timestamp as UTC epoch seconds.
-    // Store as-is — no conversion needed.
-    let utc_epoch_secs = i64::from(tick.exchange_timestamp);
-    let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
-    let received_nanos = TimestampNanos::new(tick.received_at_nanos);
+    // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
+    let ist_epoch_secs =
+        i64::from(tick.exchange_timestamp).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+    let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+    let received_nanos =
+        TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     buffer
         .table(QUESTDB_TABLE_TICKS)
@@ -272,8 +276,8 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
 /// - Price fields as DOUBLE (f64 from f32 parsed ticks)
 /// - Volume/quantity fields as LONG (cumulative, can exceed u32 for indices)
 /// - `exchange_timestamp` as LONG (raw Dhan UTC epoch seconds, preserved verbatim for audit)
-/// - `received_at` as TIMESTAMP (local UTC clock for latency measurement)
-/// - `ts` as designated TIMESTAMP (UTC epoch from Dhan, stored as-is)
+/// - `received_at` as TIMESTAMP (system clock, IST-adjusted for consistency)
+/// - `ts` as designated TIMESTAMP (Dhan UTC epoch + IST offset, IST-as-UTC convention)
 const TICKS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS ticks (\
         segment SYMBOL,\
@@ -484,7 +488,9 @@ fn build_depth_rows(
     received_at_nanos: i64,
     depth: &[MarketDepthLevel; 5],
 ) -> Result<()> {
-    let received_nanos = TimestampNanos::new(received_at_nanos);
+    // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
+    let received_nanos =
+        TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     for (i, level) in depth.iter().enumerate() {
         // APPROVED: depth is [_; 5], so i is 0..4 — always fits i64
@@ -528,7 +534,7 @@ fn build_depth_rows(
 ///
 /// Called once per security when a code 6 packet arrives (typically at session start).
 /// Uses `received_at` as designated timestamp since Dhan doesn't send a timestamp
-/// in this packet type.
+/// in this packet type. Shifted to IST-as-UTC for consistency with all other tables.
 ///
 /// Price field uses `f32_to_f64_clean` to preserve Dhan f32 precision.
 pub fn build_previous_close_row(
@@ -539,7 +545,9 @@ pub fn build_previous_close_row(
     previous_oi: u32,
     received_at_nanos: i64,
 ) -> Result<()> {
-    let received_nanos = TimestampNanos::new(received_at_nanos);
+    // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
+    let received_nanos =
+        TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     buffer
         .table(QUESTDB_TABLE_PREVIOUS_CLOSE)
@@ -1021,24 +1029,25 @@ mod tests {
     }
 
     #[test]
-    fn test_utc_epoch_stored_as_is_in_ts_nanos() {
+    fn test_utc_epoch_converted_to_ist_in_ts_nanos() {
         // Dhan sends exchange_timestamp as UTC epoch seconds.
         // Example: epoch 1740556500 = 07:55 UTC = 13:25 IST.
-        // Stored directly — no offset manipulation.
+        // We add IST_UTC_OFFSET_SECONDS_I64 so QuestDB shows IST wall-clock time.
         let dhan_epoch: u32 = 1_740_556_500;
 
         let epoch_secs = i64::from(dhan_epoch);
-        let ts_nanos = TimestampNanos::new(epoch_secs * 1_000_000_000);
+        let ist_epoch_secs = epoch_secs + IST_UTC_OFFSET_SECONDS_I64;
+        let ts_nanos = TimestampNanos::new(ist_epoch_secs * 1_000_000_000);
         assert_eq!(
-            epoch_secs * 1_000_000_000,
+            ist_epoch_secs * 1_000_000_000,
             ts_nanos.as_i64(),
-            "ts_nanos should be UTC epoch nanoseconds stored as-is"
+            "ts_nanos should be IST-as-UTC epoch nanoseconds"
         );
 
-        // UTC epoch — add IST offset (19800s) to get IST time
-        let ist_secs = (epoch_secs + IST_UTC_OFFSET_SECONDS_I64) % 86_400;
-        let hour = ist_secs / 3600;
-        let minute = (ist_secs % 3600) / 60;
+        // Verify the IST-as-UTC timestamp shows 13:25 IST in QuestDB.
+        let ist_time_of_day = ist_epoch_secs % 86_400;
+        let hour = ist_time_of_day / 3600;
+        let minute = (ist_time_of_day % 3600) / 60;
         assert_eq!(hour, 13, "IST hour must be 13");
         assert_eq!(minute, 25, "IST minute must be 25");
     }
@@ -1289,8 +1298,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tick_row_utc_epoch_stored_as_is() {
-        // Verify the UTC epoch is stored without any offset manipulation.
+    fn test_build_tick_row_stores_ist_adjusted_epoch() {
+        // Verify UTC epoch is shifted by IST offset before storage.
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
             security_id: 13,
@@ -1304,16 +1313,17 @@ mod tests {
 
         build_tick_row(&mut buffer, &tick).unwrap();
 
-        // Verify row was written with raw UTC epoch as designated timestamp.
+        // Verify row was written with IST-adjusted epoch as designated timestamp.
         assert_eq!(buffer.row_count(), 1);
         assert!(!buffer.is_empty());
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
-        // ILP designated timestamp = raw UTC epoch in nanoseconds
-        let expected_ts = format!("{}\n", 1_740_556_500_i64 * 1_000_000_000);
+        // ILP designated timestamp = (UTC epoch + IST offset) in nanoseconds
+        let ist_epoch = (1_740_556_500_i64 + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+        let expected_ts = format!("{ist_epoch}\n");
         assert!(
             content.ends_with(&expected_ts),
-            "ILP timestamp must be raw UTC epoch nanos. Content: {content}"
+            "ILP timestamp must be IST-adjusted epoch nanos. Content: {content}"
         );
     }
 
@@ -1338,11 +1348,11 @@ mod tests {
 
     #[test]
     fn test_build_tick_row_preserves_raw_exchange_timestamp() {
-        // The raw Dhan exchange_timestamp (IST epoch seconds) is stored
-        // verbatim as both the `exchange_timestamp` LONG column and the
-        // `ts` designated timestamp (in nanoseconds).
+        // The raw Dhan exchange_timestamp (UTC epoch seconds) is stored
+        // verbatim in the `exchange_timestamp` LONG column for audit.
+        // The designated `ts` uses IST-adjusted epoch (UTC + 19800s).
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        let dhan_raw_epoch: u32 = 1_740_556_500; // IST epoch representing 07:55 IST
+        let dhan_raw_epoch: u32 = 1_740_556_500; // UTC epoch for 07:55 UTC (13:25 IST)
         let tick = ParsedTick {
             security_id: 13,
             exchange_segment_code: 2,
@@ -2466,11 +2476,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dhan_epoch_build_tick_row_stores_utc_as_is() {
+    fn test_dhan_epoch_build_tick_row_stores_ist_adjusted() {
         // End-to-end: build_tick_row with a tick at 10:30:00 IST (05:00 UTC)
-        // and verify the designated timestamp is the raw UTC epoch nanos.
+        // and verify the designated timestamp is IST-adjusted epoch nanos.
         let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(10, 30, 0);
-        let expected_ts_nanos = i64::from(dhan_epoch) * 1_000_000_000;
+        // IST-as-UTC: raw UTC epoch + 19800s offset
+        let ist_ts_nanos = (i64::from(dhan_epoch) + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
@@ -2478,18 +2489,18 @@ mod tests {
             exchange_segment_code: EXCHANGE_SEGMENT_NSE_EQ,
             last_traded_price: 2350.50,
             exchange_timestamp: dhan_epoch,
-            received_at_nanos: expected_ts_nanos + 500_000, // ~0.5ms latency
+            received_at_nanos: i64::from(dhan_epoch) * 1_000_000_000 + 500_000, // ~0.5ms latency
             ..Default::default()
         };
 
         build_tick_row(&mut buffer, &tick).unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
-        // ILP designated timestamp (last value before newline) = raw UTC epoch nanos.
-        let expected_ts_str = format!("{expected_ts_nanos}\n");
+        // ILP designated timestamp (last value before newline) = IST-adjusted epoch nanos.
+        let expected_ts_str = format!("{ist_ts_nanos}\n");
         assert!(
             content.ends_with(&expected_ts_str),
-            "ILP designated timestamp must be raw UTC epoch nanos.\nExpected suffix: {expected_ts_str}\nActual: {content}"
+            "ILP designated timestamp must be IST-adjusted epoch nanos.\nExpected suffix: {expected_ts_str}\nActual: {content}"
         );
     }
 

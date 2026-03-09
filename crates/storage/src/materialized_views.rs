@@ -199,7 +199,7 @@ const VIEW_DEFS: &[ViewDef] = &[
 
 /// Builds the CREATE MATERIALIZED VIEW SQL for a given view definition.
 ///
-/// Data is standard UTC epoch — offset '05:30' aligns boundaries to IST.
+/// Data is stored as IST-as-UTC — offset '00:00' since midnight "UTC" IS midnight IST.
 fn build_view_sql(def: &ViewDef) -> String {
     let tick_count_select = if def.has_tick_count {
         ", sum(tick_count) AS tick_count"
@@ -355,10 +355,10 @@ mod tests {
 
     #[test]
     fn build_view_sql_includes_ist_offset() {
-        // UTC data needs '05:30' offset so candle boundaries align to IST.
+        // IST-as-UTC data: offset '00:00' since midnight "UTC" IS midnight IST.
         let def = &VIEW_DEFS[0]; // candles_5s
         let sql = build_view_sql(def);
-        assert!(sql.contains("ALIGN TO CALENDAR WITH OFFSET '05:30'"));
+        assert!(sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:00'"));
         assert!(sql.contains("SAMPLE BY 5s"));
         assert!(sql.contains("FROM candles_1s"));
         assert!(sql.contains("candles_5s"));

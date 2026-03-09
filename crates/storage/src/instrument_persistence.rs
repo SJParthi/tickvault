@@ -24,9 +24,8 @@
 //!
 //! - `expiry_date` is stored as a STRING in `YYYY-MM-DD` format, not a TIMESTAMP.
 //! - Futures have `option_type = ''` (empty string, not NULL) and `strike_price = 0.0`.
-//! - The designated timestamp (`timestamp` column) is IST midnight stored as UTC.
-//!   QuestDB displays it in UTC (e.g., `2026-02-24T18:30:00Z` = `2026-02-25 00:00:00 IST`).
-//!   Grafana dashboards should set timezone to IST for correct display.
+//! - The designated timestamp (`timestamp` column) uses IST-as-UTC convention:
+//!   midnight IST stored directly (e.g., `2026-02-25T00:00:00Z` = midnight IST Feb 25).
 
 use std::time::Duration;
 
@@ -409,18 +408,19 @@ fn build_snapshot_timestamp() -> Result<TimestampNanos> {
     naive_date_to_timestamp_nanos(today_ist)
 }
 
-/// Converts a `NaiveDate` to `TimestampNanos` at midnight IST.
+/// Converts a `NaiveDate` to `TimestampNanos` at midnight (IST-as-UTC convention).
+///
+/// Stores midnight of the IST date directly so QuestDB displays
+/// `2026-03-09T00:00:00Z` for IST date 2026-03-09. No timezone shifting.
 fn naive_date_to_timestamp_nanos(date: NaiveDate) -> Result<TimestampNanos> {
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
     let midnight = date
         .and_hms_opt(0, 0, 0)
         .context("failed to construct midnight time")?;
-    let ist_datetime = midnight
-        .and_local_timezone(ist)
-        .single()
-        .context("ambiguous or invalid IST timezone conversion")?;
-    TimestampNanos::from_datetime(ist_datetime).context("failed to convert IST date to ILP nanos")
+    let epoch_nanos = midnight
+        .and_utc()
+        .timestamp_nanos_opt()
+        .context("timestamp nanos overflow")?;
+    Ok(TimestampNanos::new(epoch_nanos))
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,17 +1329,14 @@ mod tests {
 
     #[test]
     fn test_naive_date_to_timestamp_nanos_epoch_date() {
-        // 1970-01-01 midnight IST = 1969-12-31 18:30:00 UTC.
-        // IST is UTC+5:30, so midnight IST is 5h30m BEFORE midnight UTC.
-        // That means the nanos value should be negative: -(5*3600 + 30*60) * 1_000_000_000.
+        // IST-as-UTC convention: 1970-01-01 midnight is stored as epoch 0.
         let epoch_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date");
         let ts = naive_date_to_timestamp_nanos(epoch_date).expect("valid timestamp");
 
-        let expected_nanos: i64 = -((5 * 3600 + 30 * 60) as i64) * 1_000_000_000;
         assert_eq!(
             ts.as_i64(),
-            expected_nanos,
-            "1970-01-01 midnight IST should be -19800 seconds in nanos (UTC offset)"
+            0,
+            "1970-01-01 midnight IST-as-UTC should be epoch 0"
         );
     }
 
@@ -1350,7 +1347,7 @@ mod tests {
         let ts =
             naive_date_to_timestamp_nanos(far_future).expect("far future date must not overflow");
 
-        // 2099-12-31 midnight IST = 2099-12-30 18:30:00 UTC.
+        // IST-as-UTC: 2099-12-31T00:00:00Z (midnight of the date).
         // Must be well past 2020 epoch.
         assert!(
             ts.as_i64() > 1_577_836_800_000_000_000,
@@ -1935,22 +1932,16 @@ mod tests {
 
     #[test]
     fn test_build_snapshot_timestamp_is_at_ist_midnight() {
-        // The snapshot timestamp should be at IST midnight (00:00:00 IST),
-        // which means the nanos value modulo a full day minus IST offset
-        // should equal zero.
+        // IST-as-UTC convention: snapshot timestamp is midnight of the IST date.
+        // The nanos value should be exactly divisible by nanos_per_day (no offset).
         let ts = build_snapshot_timestamp().unwrap();
         let nanos = ts.as_i64();
 
-        // IST midnight = some UTC time. The nanosecond value of IST midnight
-        // is always an exact multiple of (nanos_per_second * seconds_in_day) minus IST offset.
-        // More precisely: nanos + IST_offset_nanos should be divisible by nanos_per_day.
-        let ist_offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
         let nanos_per_day: i64 = 86_400 * 1_000_000_000;
-        let adjusted = nanos + ist_offset_nanos;
         assert_eq!(
-            adjusted % nanos_per_day,
+            nanos % nanos_per_day,
             0,
-            "snapshot timestamp must be IST midnight (remainder should be zero)"
+            "snapshot timestamp must be at midnight (IST-as-UTC convention)"
         );
     }
 
@@ -1960,17 +1951,15 @@ mod tests {
 
     #[test]
     fn test_naive_date_to_timestamp_nanos_known_date_exact_value() {
-        // 2026-03-01 midnight IST = 2026-02-28 18:30:00 UTC.
-        // 2026-02-28 18:30:00 UTC = epoch + some known nanos.
+        // IST-as-UTC: 2026-03-01 midnight stored as 2026-03-01T00:00:00Z.
         let date = NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid date");
         let ts = naive_date_to_timestamp_nanos(date).unwrap();
 
-        // 2026-03-01T00:00:00+05:30 = 2026-02-28T18:30:00Z
-        // Calculate manually: days from epoch to 2026-02-28 = 20,512 days
-        // 20512 * 86400 = 1,772,236,800 seconds to start of 2026-02-28 UTC
-        // + 18h30m = 66600 seconds = 1,772,303,400 seconds total
-        // = 1,772,303,400,000,000,000 nanos
-        let expected_nanos: i64 = 1_772_303_400_000_000_000;
+        // 2026-03-01T00:00:00Z
+        // Days from epoch to 2026-03-01 = 20,513 days
+        // 20513 * 86400 = 1,772,323,200 seconds
+        // = 1,772,323,200,000,000,000 nanos
+        let expected_nanos: i64 = 1_772_323_200_000_000_000;
         assert_eq!(ts.as_i64(), expected_nanos);
     }
 

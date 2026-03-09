@@ -4,7 +4,7 @@
 //! on `(ts, security_id)` to ensure idempotent re-ingestion.
 //!
 //! # Table Schema
-//! - `ts` TIMESTAMP (designated) — candle open time (UTC epoch from Dhan)
+//! - `ts` TIMESTAMP (designated) — candle open time (IST-as-UTC: UTC epoch + 19800s)
 //! - `security_id` LONG — Dhan security identifier
 //! - `segment` SYMBOL — exchange segment (NSE_FNO, NSE_EQ, etc.)
 //! - OHLCV + OI as DOUBLE/LONG columns
@@ -26,7 +26,7 @@ use dhan_live_trader_common::constants::{
     CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
@@ -92,15 +92,20 @@ impl CandlePersistenceWriter {
 
     /// Appends a historical candle to the ILP buffer.
     ///
-    /// `candle.timestamp_utc_secs` is UTC epoch seconds from Dhan V2 API,
-    /// stored as-is without any conversion.
+    /// Converts `candle.timestamp_utc_secs` (UTC epoch from Dhan V2 API) to
+    /// IST-as-UTC by adding `IST_UTC_OFFSET_SECONDS_I64`, so QuestDB displays
+    /// IST wall-clock time directly (e.g., 09:15 instead of 03:45).
     ///
     /// Auto-flushes if the buffer reaches `CANDLE_FLUSH_BATCH_SIZE`.
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
     pub fn append_candle(&mut self, candle: &HistoricalCandle) -> Result<()> {
-        let ts_nanos = TimestampNanos::new(candle.timestamp_utc_secs.saturating_mul(1_000_000_000));
+        // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
+        let ist_epoch_secs = candle
+            .timestamp_utc_secs
+            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1M)
@@ -207,10 +212,9 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        // Dhan V2 sends exchange_timestamp as UTC epoch seconds.
-        // Store as-is — no conversion needed.
-        let utc_epoch_secs = i64::from(timestamp_secs);
-        let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
+        // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
+        let ist_epoch_secs = i64::from(timestamp_secs).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1S)

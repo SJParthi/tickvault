@@ -954,11 +954,10 @@ pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
 /// Calendar alignment offset for QuestDB materialized views.
 ///
-/// Dhan V2 sends standard UTC epoch seconds stored in QuestDB as UTC.
-/// IST = UTC + 5:30, so daily/hourly boundaries must be offset by "05:30"
-/// to align candle boundaries to IST wall-clock time (e.g., daily candle
-/// starts at 00:00 IST = 18:30 UTC previous day).
-pub const QUESTDB_IST_ALIGN_OFFSET: &str = "05:30";
+/// All timestamps are stored as IST-as-UTC (UTC epoch + 19800s), so QuestDB
+/// displays IST wall-clock time directly. No offset needed — midnight "UTC"
+/// in our convention IS midnight IST.
+pub const QUESTDB_IST_ALIGN_OFFSET: &str = "00:00";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants
@@ -989,6 +988,10 @@ pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 
 /// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for tick timestamp conversion.
 pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
+
+/// IST offset from UTC in nanoseconds (5h 30m = 19,800,000,000,000 ns).
+/// Used for converting `received_at_nanos` (system clock UTC) to IST-as-UTC.
+pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
