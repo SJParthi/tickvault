@@ -15,6 +15,15 @@ fi
 
 HOOKS_DIR="$(dirname "$0")"
 
+# SAFETY: Block compound commands that chain gated operations.
+# e.g., "git commit -m msg && git push" would only gate the first operation.
+# Each gated command must be a separate tool call.
+if echo "$COMMAND" | grep -qE '(&&|\|\||;)\s*(git (commit|push)|gh pr (create|merge))'; then
+  echo "BLOCKED: Compound command detected with gated operations." >&2
+  echo "Each git commit, git push, gh pr create, gh pr merge must be a separate command." >&2
+  exit 2
+fi
+
 # Route to the correct gate based on command content.
 # Only ONE gate runs per command — no wasted work.
 if echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then

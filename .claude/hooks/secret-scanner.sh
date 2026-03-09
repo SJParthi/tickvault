@@ -28,8 +28,8 @@ scan_secret() {
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
 
-    # Skip binary files, lock files, scanners, and CI scanner workflows
-    if echo "$file" | grep -qE '\.(sh|md|lock)$'; then
+    # Skip binary files and lock files
+    if echo "$file" | grep -qE '\.(lock|png|jpg|gif|ico|woff|woff2|ttf|eot)$'; then
       continue
     fi
 
@@ -38,8 +38,16 @@ scan_secret() {
       continue
     fi
 
-    # Only scan relevant file types for secrets
-    if ! echo "$file" | grep -qE '\.(rs|toml|json|yml|yaml|cfg|conf|ini|properties)$'; then
+    # Skip this scanner itself (contains secret patterns as detection rules)
+    if echo "$file" | grep -qE 'secret-scanner\.sh$'; then
+      continue
+    fi
+
+    # Only scan relevant file types for secrets (including .sh and extensionless like Dockerfile)
+    local basename_file
+    basename_file=$(basename "$file")
+    if ! echo "$file" | grep -qE '\.(rs|toml|json|yml|yaml|cfg|conf|ini|properties|sh|env|txt)$' && \
+       ! echo "$basename_file" | grep -qiE '^(Dockerfile|Makefile|Justfile|Procfile)$'; then
       continue
     fi
 

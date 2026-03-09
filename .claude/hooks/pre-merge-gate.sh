@@ -31,7 +31,7 @@ fi
 
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 if [ -z "$CWD" ]; then CWD="."; fi
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "  FAIL: Cannot cd to $CWD" >&2; exit 2; }
 
 FAILED=0
 
@@ -96,11 +96,14 @@ if [ -n "$REPO_FLAG" ]; then
   GH_ARGS="$GH_ARGS --repo $REPO_FLAG"
 fi
 
-# Get check results
-CHECKS_OUTPUT=$(gh pr checks $GH_ARGS 2>&1)
+# Get check results (timeout 30s — API call should be fast)
+CHECKS_OUTPUT=$(timeout 30 gh pr checks $GH_ARGS 2>&1)
 CHECKS_EXIT=$?
 
-if [ "$CHECKS_EXIT" -ne 0 ]; then
+if [ "$CHECKS_EXIT" -eq 124 ]; then
+  echo "  FAIL: gh pr checks timed out (30s) — blocking merge" >&2
+  FAILED=1
+elif [ "$CHECKS_EXIT" -ne 0 ]; then
   # gh pr checks exits non-zero if any check is not passing
   # Parse output to find failures
   FAILED_CHECKS=$(echo "$CHECKS_OUTPUT" | grep -E 'fail|pending' | head -10)
@@ -111,10 +114,12 @@ if [ "$CHECKS_EXIT" -ne 0 ]; then
     done
     FAILED=1
   else
-    # gh pr checks might fail for other reasons (no PR, auth issues)
-    echo "  WARN: Could not verify CI status:" >&2
+    # gh pr checks failed for other reasons (no PR, auth issues, network)
+    # For a trading system: unknown CI status = BLOCK, not proceed
+    echo "  FAIL: Could not verify CI status (network/auth/no PR):" >&2
     echo "  $CHECKS_OUTPUT" | head -5 >&2
-    echo "  Proceeding with caution — CI status unknown." >&2
+    echo "  CI verification is mandatory. Fix the issue and retry." >&2
+    FAILED=1
   fi
 else
   echo "  PASS: All CI checks passed" >&2

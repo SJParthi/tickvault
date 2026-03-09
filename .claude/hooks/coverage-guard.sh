@@ -21,11 +21,16 @@ if ! command -v cargo-llvm-cov > /dev/null 2>&1; then
   exit 0
 fi
 
-# Get current workspace coverage percentage
-COV_JSON=$(cargo llvm-cov --workspace --json 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$COV_JSON" ]; then
-  echo "  SKIP: cargo llvm-cov failed — coverage guard skipped" >&2
-  exit 0
+# Get current workspace coverage percentage (timeout 150s — compilation + test run)
+COV_JSON=$(timeout 150 cargo llvm-cov --workspace --json 2>/dev/null)
+COV_RESULT=$?
+if [ "$COV_RESULT" -eq 124 ]; then
+  echo "  FAIL: cargo llvm-cov timed out (150s) — blocking" >&2
+  exit 2
+fi
+if [ "$COV_RESULT" -ne 0 ] || [ -z "$COV_JSON" ]; then
+  echo "  FAIL: cargo llvm-cov failed (exit $COV_RESULT) — blocking" >&2
+  exit 2
 fi
 
 CURRENT_PCT=$(echo "$COV_JSON" | python3 -c "
@@ -41,8 +46,8 @@ else:
 " 2>/dev/null)
 
 if [ -z "$CURRENT_PCT" ]; then
-  echo "  SKIP: Could not parse coverage — guard skipped" >&2
-  exit 0
+  echo "  FAIL: Could not parse coverage output — blocking" >&2
+  exit 2
 fi
 
 if [ ! -f "$BASELINE_FILE" ]; then

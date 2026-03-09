@@ -34,7 +34,7 @@ if [ -z "$CWD" ]; then
   CWD="."
 fi
 
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "  FAIL: Cannot cd to $CWD" >&2; exit 2; }
 
 # Signal to auto-save-remote that a user push is in progress
 PUSH_LOCK="$CWD/.claude/hooks/.push-in-progress"
@@ -88,7 +88,8 @@ else
   FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
   if [ "$FMT_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo fmt timed out (60s)" >&2
+    echo "  FAIL: cargo fmt timed out (60s) — blocking push" >&2
+    FAILED=1
   elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: Code not formatted:" >&2
     echo "$FMT_OUT" | tail -10 >&2
@@ -102,7 +103,8 @@ else
   CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
   CLIPPY_EXIT=$?
   if [ "$CLIPPY_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo clippy timed out (120s)" >&2
+    echo "  FAIL: cargo clippy timed out (120s) — blocking push" >&2
+    FAILED=1
   elif [ "$CLIPPY_EXIT" -ne 0 ]; then
     echo "  FAIL: clippy warnings found:" >&2
     echo "$CLIPPY_OUT" | tail -20 >&2
@@ -116,7 +118,8 @@ else
   TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
   TEST_EXIT=$?
   if [ "$TEST_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo test timed out (120s)" >&2
+    echo "  FAIL: cargo test timed out (120s) — blocking push" >&2
+    FAILED=1
   elif [ "$TEST_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo test failed:" >&2
     echo "$TEST_OUT" | tail -20 >&2
@@ -160,7 +163,8 @@ if command -v cargo-audit > /dev/null 2>&1; then
   AUDIT_OUT=$(timeout 30 cargo audit --deny yanked 2>&1)
   AUDIT_EXIT=$?
   if [ "$AUDIT_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo audit timed out (30s)" >&2
+    echo "  FAIL: cargo audit timed out (30s) — blocking push" >&2
+    FAILED=1
   elif echo "$AUDIT_OUT" | grep -q "couldn't fetch advisory database"; then
     echo "  SKIP: Cannot reach advisory database (network issue)" >&2
   elif [ "$AUDIT_EXIT" -ne 0 ]; then
@@ -180,7 +184,8 @@ if command -v cargo-deny > /dev/null 2>&1; then
   DENY_OUTPUT=$(timeout 30 cargo deny check 2>&1)
   DENY_EXIT=$?
   if [ "$DENY_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo deny timed out (30s)" >&2
+    echo "  FAIL: cargo deny timed out (30s) — blocking push" >&2
+    FAILED=1
   elif [ "$DENY_EXIT" -ne 0 ]; then
     if echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect'; then
       echo "  SKIP: cargo deny cannot reach advisory DB (network/proxy). CI will enforce." >&2
@@ -199,8 +204,16 @@ fi
 echo "  [8/8] Coverage ratchet guard..." >&2
 if [ -x "$HOOKS_DIR/coverage-guard.sh" ]; then
   if command -v cargo-llvm-cov > /dev/null 2>&1; then
-    if ! "$HOOKS_DIR/coverage-guard.sh" "$CWD" 2>&1; then
+    COV_OUT=$(timeout 180 "$HOOKS_DIR/coverage-guard.sh" "$CWD" 2>&1)
+    COV_EXIT=$?
+    if [ "$COV_EXIT" -eq 124 ]; then
+      echo "  FAIL: Coverage guard timed out (180s) — blocking push" >&2
       FAILED=1
+    elif [ "$COV_EXIT" -ne 0 ]; then
+      echo "$COV_OUT" >&2
+      FAILED=1
+    else
+      echo "$COV_OUT" >&2
     fi
   else
     echo "  SKIP: cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)" >&2

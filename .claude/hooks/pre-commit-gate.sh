@@ -31,7 +31,7 @@ if [ -z "$CWD" ]; then
   CWD="."
 fi
 
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "  FAIL: Cannot cd to $CWD" >&2; exit 2; }
 
 # Check if any .rs files are staged
 RS_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\.rs$' || true)
@@ -58,7 +58,8 @@ if [ -n "$RS_STAGED" ]; then
   FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
   if [ "$FMT_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo fmt timed out (60s)" >&2
+    echo "  FAIL: cargo fmt timed out (60s) — treating as failure" >&2
+    FAILED=1
   elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo fmt check failed:" >&2
     echo "$FMT_OUT" | tail -20 >&2
@@ -70,13 +71,25 @@ if [ -n "$RS_STAGED" ]; then
 
   # Gate 2: Banned pattern scanner
   echo "  [2/7] Banned pattern scan..." >&2
-  if ! echo "$RS_STAGED" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$RS_STAGED" 2>&1; then
+  SCAN_OUT=$(timeout 30 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$RS_STAGED" 2>&1)
+  SCAN_EXIT=$?
+  if [ "$SCAN_EXIT" -eq 124 ]; then
+    echo "  FAIL: Banned pattern scanner timed out (30s)" >&2
+    FAILED=1
+  elif [ "$SCAN_EXIT" -ne 0 ]; then
+    echo "$SCAN_OUT" >&2
     FAILED=1
   fi
 
   # Gate 3: O(1) latency & dedup scanner
   echo "  [3/7] O(1) latency & dedup scan..." >&2
-  if ! echo "$RS_STAGED" | "$HOOKS_DIR/dedup-latency-scanner.sh" "$CWD" "$RS_STAGED" 2>&1; then
+  DEDUP_OUT=$(timeout 30 "$HOOKS_DIR/dedup-latency-scanner.sh" "$CWD" "$RS_STAGED" 2>&1)
+  DEDUP_EXIT=$?
+  if [ "$DEDUP_EXIT" -eq 124 ]; then
+    echo "  FAIL: O(1) latency scanner timed out (30s)" >&2
+    FAILED=1
+  elif [ "$DEDUP_EXIT" -ne 0 ]; then
+    echo "$DEDUP_OUT" >&2
     FAILED=1
   fi
 
@@ -89,7 +102,13 @@ fi
 # GATE 4: Secret scanner (runs on ALL staged files, not just .rs)
 # ─────────────────────────────────────────────
 echo "  [4/7] Secret scan..." >&2
-if ! echo "$ALL_STAGED" | "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1; then
+SECRET_OUT=$(timeout 30 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1)
+SECRET_EXIT=$?
+if [ "$SECRET_EXIT" -eq 124 ]; then
+  echo "  FAIL: Secret scanner timed out (30s)" >&2
+  FAILED=1
+elif [ "$SECRET_EXIT" -ne 0 ]; then
+  echo "$SECRET_OUT" >&2
   FAILED=1
 fi
 
@@ -165,7 +184,7 @@ if command -v typos > /dev/null 2>&1; then
     while IFS= read -r tf; do
       [ -z "$tf" ] && continue
       [ ! -f "$tf" ] && continue
-      RESULT=$(typos "$tf" 2>&1 || true)
+      RESULT=$(timeout 10 typos "$tf" 2>&1 || true)
       if [ -n "$RESULT" ]; then
         TYPOS_OUT="${TYPOS_OUT}${RESULT}\n"
         TYPOS_FAIL=1
