@@ -1299,6 +1299,7 @@ dependencies = [
  "governor",
  "notify",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
