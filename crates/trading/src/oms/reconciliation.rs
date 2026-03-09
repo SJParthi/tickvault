@@ -154,6 +154,12 @@ mod tests {
             update_time: String::new(),
             rejection_reason: String::new(),
             tag: String::new(),
+            oms_error_code: String::new(),
+            oms_error_description: String::new(),
+            trading_symbol: String::new(),
+            drv_expiry_date: String::new(),
+            drv_option_type: String::new(),
+            drv_strike_price: 0.0,
         }
     }
 

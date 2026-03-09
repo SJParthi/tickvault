@@ -1,4 +1,4 @@
-//! Circuit breaker for the Dhan REST API using the failsafe crate.
+//! Circuit breaker for the Dhan REST API using atomic counters.
 //!
 //! Protects order submission from cascading failures when the Dhan API
 //! is unreachable or returning errors.

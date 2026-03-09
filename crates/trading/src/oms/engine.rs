@@ -230,6 +230,7 @@ impl OrderManagementSystem {
             dhan_client_id: self.client_id.clone(),
             order_id: order_id.to_owned(),
             order_type: request.order_type.as_str().to_owned(),
+            leg_name: String::new(),
             quantity: request.quantity,
             price: request.price,
             trigger_price: request.trigger_price,
@@ -497,8 +498,11 @@ mod tests {
     }
 
     fn make_oms_with_order(order_id: &str, status: OrderStatus) -> OrderManagementSystem {
-        let api_client =
-            OrderApiClient::new(reqwest::Client::new(), "https://api.dhan.co/v2".to_owned());
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
         let rate_limiter = OrderRateLimiter::new(10);
         let mut oms = OrderManagementSystem::new(
             api_client,
@@ -578,8 +582,11 @@ mod tests {
 
     #[test]
     fn new_oms_is_empty() {
-        let api_client =
-            OrderApiClient::new(reqwest::Client::new(), "https://api.dhan.co/v2".to_owned());
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
         let oms = OrderManagementSystem::new(
             api_client,
             OrderRateLimiter::new(10),

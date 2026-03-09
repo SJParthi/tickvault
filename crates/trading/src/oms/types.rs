@@ -17,7 +17,7 @@ use dhan_live_trader_common::order_types::{
 ///
 /// One `ManagedOrder` per order placed through the system. Updated by
 /// WebSocket order updates and REST reconciliation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ManagedOrder {
     /// Dhan order ID (returned from place response).
     pub order_id: String,
@@ -158,6 +158,8 @@ pub struct DhanModifyOrderRequest {
     pub dhan_client_id: String,
     pub order_id: String,
     pub order_type: String,
+    /// Leg name — empty string for regular orders, required by Dhan API.
+    pub leg_name: String,
     pub quantity: i64,
     pub price: f64,
     pub trigger_price: f64,
@@ -215,6 +217,24 @@ pub struct DhanOrderResponse {
     pub rejection_reason: String,
     #[serde(default)]
     pub tag: String,
+    /// Dhan OMS error code (e.g., "DH-906" for rejection diagnostics).
+    #[serde(default)]
+    pub oms_error_code: String,
+    /// Dhan OMS error description (human-readable rejection reason).
+    #[serde(default)]
+    pub oms_error_description: String,
+    /// Trading symbol (e.g., "NIFTY-Mar2026-24500-CE").
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Derivative expiry date.
+    #[serde(default)]
+    pub drv_expiry_date: String,
+    /// Derivative option type ("CALL", "PUT").
+    #[serde(default)]
+    pub drv_option_type: String,
+    /// Derivative strike price.
+    #[serde(default)]
+    pub drv_strike_price: f64,
 }
 
 /// Dhan REST API positions response.
@@ -245,6 +265,24 @@ pub struct DhanPositionResponse {
     pub realized_profit: f64,
     #[serde(default)]
     pub unrealized_profit: f64,
+    /// Trading symbol (e.g., "NIFTY-Mar2026-24500-CE").
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Cost price.
+    #[serde(default)]
+    pub cost_price: f64,
+    /// Lot multiplier.
+    #[serde(default)]
+    pub multiplier: i64,
+    /// Derivative expiry date.
+    #[serde(default)]
+    pub drv_expiry_date: String,
+    /// Derivative option type ("CALL", "PUT").
+    #[serde(default)]
+    pub drv_option_type: String,
+    /// Derivative strike price.
+    #[serde(default)]
+    pub drv_strike_price: f64,
 }
 
 // ---------------------------------------------------------------------------
