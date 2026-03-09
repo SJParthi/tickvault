@@ -12,7 +12,7 @@
 //! - Failure threshold: consecutive failures before opening
 //! - Reset timeout: time before transitioning from Open to Half-Open
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -55,6 +55,8 @@ pub struct OrderCircuitBreaker {
     opened_at_secs: AtomicU64,
     /// Duration before transitioning from Open to Half-Open.
     reset_timeout: Duration,
+    /// Gate for Half-Open: only one probe request allowed.
+    half_open_probe_sent: AtomicBool,
 }
 
 impl Default for OrderCircuitBreaker {
@@ -71,6 +73,7 @@ impl OrderCircuitBreaker {
             failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
             opened_at_secs: AtomicU64::new(0),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
         }
     }
 
@@ -83,7 +86,21 @@ impl OrderCircuitBreaker {
     /// `OmsError::CircuitBreakerOpen` if the circuit is open.
     pub fn check(&self) -> Result<(), OmsError> {
         match self.state() {
-            CircuitState::Closed | CircuitState::HalfOpen => Ok(()),
+            CircuitState::Closed => Ok(()),
+            CircuitState::HalfOpen => {
+                // Only allow one probe request in HalfOpen state.
+                if self
+                    .half_open_probe_sent
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    info!("circuit breaker HALF-OPEN — allowing one probe request");
+                    Ok(())
+                } else {
+                    warn!("circuit breaker HALF-OPEN — probe already in flight, rejecting");
+                    Err(OmsError::CircuitBreakerOpen)
+                }
+            }
             CircuitState::Open => {
                 warn!("circuit breaker OPEN — Dhan API temporarily unavailable");
                 Err(OmsError::CircuitBreakerOpen)
@@ -98,6 +115,7 @@ impl OrderCircuitBreaker {
             info!("circuit breaker CLOSED — Dhan API recovered");
         }
         self.opened_at_secs.store(0, Ordering::Relaxed);
+        self.half_open_probe_sent.store(false, Ordering::Relaxed);
     }
 
     /// Records a failed API call — increments the failure counter.
@@ -109,14 +127,21 @@ impl OrderCircuitBreaker {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
 
-        if new_count >= self.failure_threshold && self.opened_at_secs.load(Ordering::Relaxed) == 0 {
+        if new_count >= self.failure_threshold {
             let now_secs = now_epoch_secs();
-            self.opened_at_secs.store(now_secs, Ordering::Relaxed);
-            warn!(
-                failures = new_count,
-                threshold = self.failure_threshold,
-                "circuit breaker OPEN — Dhan API failures exceeded threshold"
-            );
+            // Atomically set opened_at only if not already set (avoids TOCTOU race).
+            if self
+                .opened_at_secs
+                .compare_exchange(0, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.half_open_probe_sent.store(false, Ordering::Relaxed);
+                warn!(
+                    failures = new_count,
+                    threshold = self.failure_threshold,
+                    "circuit breaker OPEN — Dhan API failures exceeded threshold"
+                );
+            }
         }
     }
 
@@ -144,6 +169,7 @@ impl OrderCircuitBreaker {
     pub fn reset(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.opened_at_secs.store(0, Ordering::Relaxed);
+        self.half_open_probe_sent.store(false, Ordering::Relaxed);
         info!("circuit breaker manually reset to CLOSED");
     }
 }
