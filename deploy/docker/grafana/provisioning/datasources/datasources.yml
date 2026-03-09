@@ -59,6 +59,7 @@ datasources:
       password: $DLT_QUESTDB_PG_PASSWORD
     editable: false
     jsonData:
+      database: qdb
       sslmode: disable
       maxOpenConns: 5
       maxIdleConns: 2

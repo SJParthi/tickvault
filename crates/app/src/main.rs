@@ -41,6 +41,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use dhan_live_trader_common::config::ApplicationConfig;
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
+use dhan_live_trader_common::instrument_types::FnoUniverse;
 use dhan_live_trader_common::trading_calendar::TradingCalendar;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
@@ -63,7 +64,9 @@ use dhan_live_trader_storage::calendar_persistence;
 use dhan_live_trader_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
-use dhan_live_trader_storage::instrument_persistence::ensure_instrument_tables;
+use dhan_live_trader_storage::instrument_persistence::{
+    ensure_instrument_tables, persist_instrument_snapshot,
+};
 use dhan_live_trader_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
     ensure_tick_table_dedup_keys,
@@ -78,6 +81,13 @@ use dhan_live_trader_api::state::SharedAppState;
 
 /// Base config file path (relative to working directory).
 const CONFIG_BASE_PATH: &str = "config/base.toml";
+
+/// Log file path for Alloy/Loki consumption.
+///
+/// When running via `cargo run` (dev mode), this file allows Alloy
+/// to ingest app logs into Loki without requiring a Docker container.
+/// The file is created at startup; Alloy watches it and pushes to Loki.
+const APP_LOG_FILE_PATH: &str = "data/logs/app.log";
 
 /// Local override config file path (git-ignored, optional).
 /// Overrides Docker hostnames with localhost for `cargo run` on host.
@@ -153,9 +163,28 @@ async fn main() -> Result<()> {
             Box::new(fmt_layer)
         };
 
+    // File-based JSON log layer for Alloy → Loki ingestion.
+    // Enables Grafana log dashboards to work even in dev mode (cargo run).
+    // Alloy watches this file and pushes logs to Loki automatically.
+    let file_log_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+        match create_log_file_writer() {
+            Some(file) => {
+                let file_fmt = tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_file(false)
+                    .with_line_number(false)
+                    .json()
+                    .with_writer(std::sync::Mutex::new(file));
+                Some(Box::new(file_fmt))
+            }
+            None => None,
+        };
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_boxed)
+        .with(file_log_layer)
         .with(otel_layer)
         .init();
 
@@ -270,7 +299,7 @@ async fn main() -> Result<()> {
         }
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
-        let subscription_plan = load_instruments(&config).await;
+        let (subscription_plan, fresh_universe) = load_instruments(&config).await;
 
         // --- WebSocket connect: THE ONLY BLOCKING STEP (~400ms) ---
         let (frame_receiver, ws_handles) =
@@ -337,6 +366,14 @@ async fn main() -> Result<()> {
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
                 let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
+
+                // Re-persist instrument data if fresh build happened before Docker started.
+                // The initial persistence inside load_or_build_instruments fails when QuestDB
+                // is not running yet. Now that Docker is up and tables exist, retry.
+                if let Some(ref universe) = fresh_universe {
+                    let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+                }
+
                 info!("QuestDB DDL complete (background)");
             },
             // SSM validation + TokenManager for renewal
@@ -379,6 +416,20 @@ async fn main() -> Result<()> {
                 None
             }
         };
+
+        // --- Background: Tick persistence (cold path — subscribes to broadcast) ---
+        // The tick processor was started with None writers (fast boot, QuestDB wasn't
+        // ready). Now QuestDB is available. Spawn a separate cold-path consumer that
+        // subscribes to the tick broadcast and persists to QuestDB. This never touches
+        // the hot-path tick processor loop — zero allocation impact.
+        {
+            let tick_persistence_rx = fast_tick_broadcast_sender.subscribe();
+            let questdb_cfg = config.questdb.clone();
+            tokio::spawn(async move {
+                run_tick_persistence_consumer(tick_persistence_rx, questdb_cfg).await;
+            });
+            info!("background tick persistence consumer started (cold path)");
+        }
 
         // --- Background: Order update WebSocket ---
         let (order_update_sender, _order_update_receiver) = tokio::sync::broadcast::channel::<
@@ -611,7 +662,9 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 7: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
-    let subscription_plan: Option<SubscriptionPlan> = load_instruments(&config).await;
+    // In slow boot, Docker is already running so instrument persistence succeeds
+    // on first attempt. The universe is not needed for re-persistence here.
+    let (subscription_plan, _slow_boot_universe) = load_instruments(&config).await;
 
     // -----------------------------------------------------------------------
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
@@ -788,7 +841,13 @@ async fn main() -> Result<()> {
 // Helper: Load instruments (shared by fast and slow boot paths)
 // ---------------------------------------------------------------------------
 
-async fn load_instruments(config: &ApplicationConfig) -> Option<SubscriptionPlan> {
+/// Loads instruments and returns (plan, optional universe for re-persistence).
+///
+/// The `FnoUniverse` is returned on fresh builds so the caller can re-persist
+/// instrument data to QuestDB after Docker infra starts (fast boot path).
+async fn load_instruments(
+    config: &ApplicationConfig,
+) -> (Option<SubscriptionPlan>, Option<FnoUniverse>) {
     info!("checking instrument build eligibility");
 
     match load_or_build_instruments(
@@ -805,7 +864,7 @@ async fn load_instruments(config: &ApplicationConfig) -> Option<SubscriptionPlan
                 Some(tz) => tz,
                 None => {
                     error!("invalid IST offset constant");
-                    return None;
+                    return (None, None);
                 }
             };
             let today = Utc::now().with_timezone(&ist).date_naive();
@@ -816,7 +875,7 @@ async fn load_instruments(config: &ApplicationConfig) -> Option<SubscriptionPlan
                 feed_mode = %plan.summary.feed_mode,
                 "subscription plan ready (fresh build)"
             );
-            Some(plan)
+            (Some(plan), Some(universe))
         }
         Ok(InstrumentLoadResult::CachedPlan(plan)) => {
             info!(
@@ -824,17 +883,48 @@ async fn load_instruments(config: &ApplicationConfig) -> Option<SubscriptionPlan
                 feed_mode = %plan.summary.feed_mode,
                 "subscription plan ready (zero-copy rkyv cache)"
             );
-            Some(plan)
+            (Some(plan), None)
         }
         Ok(InstrumentLoadResult::Unavailable) => {
             info!("instruments: no cache available during market hours");
-            None
+            (None, None)
         }
         Err(err) => {
             warn!(
                 error = %err,
                 "instrument build failed — no instruments to subscribe"
             );
+            (None, None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Create log file writer for Alloy → Loki ingestion
+// ---------------------------------------------------------------------------
+
+/// Opens (or creates) the app log file for Alloy consumption.
+///
+/// Creates `data/logs/` directory if needed. Returns `None` if the file
+/// cannot be created (best-effort — logging to stdout always works).
+fn create_log_file_writer() -> Option<std::fs::File> {
+    let log_dir = std::path::Path::new(APP_LOG_FILE_PATH)
+        .parent()
+        .unwrap_or(std::path::Path::new("data/logs"));
+
+    if let Err(err) = std::fs::create_dir_all(log_dir) {
+        eprintln!("warning: cannot create log directory {log_dir:?}: {err}");
+        return None;
+    }
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(APP_LOG_FILE_PATH)
+    {
+        Ok(file) => Some(file),
+        Err(err) => {
+            eprintln!("warning: cannot open log file {APP_LOG_FILE_PATH}: {err}");
             None
         }
     }
@@ -995,6 +1085,75 @@ fn spawn_historical_candle_fetch(
     });
 
     info!("background historical candle fetch spawned (non-blocking)");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Cold-path tick persistence consumer (fast boot only)
+// ---------------------------------------------------------------------------
+
+/// Subscribes to the tick broadcast and writes ticks to QuestDB.
+///
+/// Used in fast boot where the tick processor starts with `None` writers
+/// (QuestDB isn't ready yet). This consumer starts after QuestDB DDL
+/// completes and persists ticks on the cold path — zero impact on the
+/// hot-path tick processor.
+///
+/// Depth persistence is handled by the tick processor in slow boot only.
+/// In fast boot, depth data is not persisted until the next full restart
+/// (depth requires raw frame fields which the broadcast doesn't carry).
+async fn run_tick_persistence_consumer(
+    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
+    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+) {
+    let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
+        Ok(writer) => {
+            info!("cold-path tick persistence writer connected to QuestDB");
+            writer
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "cold-path tick persistence writer unavailable — ticks will NOT be persisted"
+            );
+            return;
+        }
+    };
+
+    let mut ticks_persisted: u64 = 0;
+    let flush_interval = std::time::Duration::from_millis(100);
+    let mut last_flush = std::time::Instant::now();
+
+    loop {
+        match tick_rx.recv().await {
+            Ok(tick) => {
+                if let Err(err) = tick_writer.append_tick(&tick) {
+                    warn!(?err, "cold-path tick persistence write failed");
+                }
+
+                ticks_persisted = ticks_persisted.saturating_add(1);
+
+                // Periodic flush (every 100ms) to keep data flowing to QuestDB.
+                if last_flush.elapsed() >= flush_interval {
+                    let _ = tick_writer.flush_if_needed();
+                    last_flush = std::time::Instant::now();
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "cold-path tick persistence lagged — some ticks not persisted"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                info!(
+                    ticks_persisted,
+                    "cold-path tick persistence consumer shutting down (broadcast closed)"
+                );
+                let _ = tick_writer.flush_if_needed();
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
