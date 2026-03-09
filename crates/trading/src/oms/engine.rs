@@ -157,7 +157,11 @@ impl OrderManagementSystem {
 
         let now_us = now_epoch_us();
 
-        // Step 7: Create ManagedOrder in Transit state
+        // Step 7: Create ManagedOrder with status from Dhan response.
+        // Dhan can return TRADED or REJECTED immediately; default to Transit if unparseable.
+        let initial_status =
+            parse_order_status(&response.order_status).unwrap_or(OrderStatus::Transit);
+
         let order = ManagedOrder {
             order_id: response.order_id.clone(),
             correlation_id: correlation_id.clone(),
@@ -169,7 +173,7 @@ impl OrderManagementSystem {
             quantity: request.quantity,
             price: request.price,
             trigger_price: request.trigger_price,
-            status: OrderStatus::Transit,
+            status: initial_status,
             traded_qty: 0,
             avg_traded_price: 0.0,
             lot_size: request.lot_size,
@@ -301,6 +305,13 @@ impl OrderManagementSystem {
             }
         }
 
+        // Mark for reconciliation — cancel is async; WebSocket will confirm,
+        // but if WS is down we need REST reconciliation to pick it up.
+        if let Some(order) = self.orders.get_mut(order_id) {
+            order.needs_reconciliation = true;
+            order.updated_at_us = now_epoch_us();
+        }
+
         info!(order_id = %order_id, "order cancel request sent");
         Ok(())
     }
@@ -410,10 +421,12 @@ impl OrderManagementSystem {
 
         let (report, updates) = reconcile_orders(&self.orders, &dhan_orders);
 
-        // Apply corrections
-        for (order_id, new_status) in updates {
-            if let Some(order) = self.orders.get_mut(&order_id) {
-                order.status = new_status;
+        // Apply corrections (status + fill data)
+        for update in updates {
+            if let Some(order) = self.orders.get_mut(&update.order_id) {
+                order.status = update.status;
+                order.traded_qty = update.traded_qty;
+                order.avg_traded_price = update.avg_traded_price;
                 order.needs_reconciliation = false;
                 order.updated_at_us = now_epoch_us();
             }
@@ -486,14 +499,6 @@ mod tests {
     impl TokenProvider for TestTokenProvider {
         fn get_access_token(&self) -> Result<String, OmsError> {
             Ok("test-token".to_owned())
-        }
-    }
-
-    /// Test token provider that always fails.
-    struct FailingTokenProvider;
-    impl TokenProvider for FailingTokenProvider {
-        fn get_access_token(&self) -> Result<String, OmsError> {
-            Err(OmsError::NoToken)
         }
     }
 

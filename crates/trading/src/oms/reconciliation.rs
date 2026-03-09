@@ -16,6 +16,17 @@ use dhan_live_trader_common::order_types::OrderStatus;
 use super::state_machine::parse_order_status;
 use super::types::{DhanOrderResponse, ManagedOrder, ReconciliationReport};
 
+/// A single correction to apply from reconciliation.
+///
+/// Carries status and fill data so the engine can sync everything in one pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconciliationUpdate {
+    pub order_id: String,
+    pub status: OrderStatus,
+    pub traded_qty: i64,
+    pub avg_traded_price: f64,
+}
+
 /// Reconciles OMS order state against orders fetched from the Dhan REST API.
 ///
 /// # Arguments
@@ -24,16 +35,16 @@ use super::types::{DhanOrderResponse, ManagedOrder, ReconciliationReport};
 ///
 /// # Returns
 /// A `ReconciliationReport` with mismatch details, plus a list of
-/// state updates to apply (order_id, new_status).
+/// corrections to apply (status + fill data).
 ///
 /// # Side Effects
 /// Logs ERROR for each mismatch (triggers Telegram alert via tracing).
 pub fn reconcile_orders(
     oms_orders: &HashMap<String, ManagedOrder>,
     dhan_orders: &[DhanOrderResponse],
-) -> (ReconciliationReport, Vec<(String, OrderStatus)>) {
+) -> (ReconciliationReport, Vec<ReconciliationUpdate>) {
     let mut report = ReconciliationReport::default();
-    let mut updates: Vec<(String, OrderStatus)> = Vec::new();
+    let mut updates: Vec<ReconciliationUpdate> = Vec::new();
 
     for dhan_order in dhan_orders {
         let dhan_status = match parse_order_status(&dhan_order.order_status) {
@@ -52,7 +63,12 @@ pub fn reconcile_orders(
 
         match oms_orders.get(&dhan_order.order_id) {
             Some(oms_order) => {
-                if oms_order.status != dhan_status {
+                let status_mismatch = oms_order.status != dhan_status;
+                let fill_mismatch = oms_order.traded_qty != dhan_order.traded_quantity
+                    || (oms_order.avg_traded_price - dhan_order.average_trade_price).abs()
+                        > f64::EPSILON;
+
+                if status_mismatch {
                     error!(
                         order_id = %dhan_order.order_id,
                         oms_status = %oms_order.status.as_str(),
@@ -63,7 +79,15 @@ pub fn reconcile_orders(
                     report
                         .mismatched_order_ids
                         .push(dhan_order.order_id.clone());
-                    updates.push((dhan_order.order_id.clone(), dhan_status));
+                }
+
+                if status_mismatch || fill_mismatch {
+                    updates.push(ReconciliationUpdate {
+                        order_id: dhan_order.order_id.clone(),
+                        status: dhan_status,
+                        traded_qty: dhan_order.traded_quantity,
+                        avg_traded_price: dhan_order.average_trade_price,
+                    });
                 }
             }
             None => {
@@ -198,7 +222,8 @@ mod tests {
         assert_eq!(report.mismatches_found, 1);
         assert_eq!(report.mismatched_order_ids, vec!["1"]);
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0], ("1".to_owned(), OrderStatus::Traded));
+        assert_eq!(updates[0].order_id, "1");
+        assert_eq!(updates[0].status, OrderStatus::Traded);
     }
 
     #[test]
@@ -224,6 +249,26 @@ mod tests {
         let (report, updates) = reconcile_orders(&oms, &dhan);
         assert_eq!(report.total_checked, 0); // skipped, not counted
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn fill_data_mismatch_generates_update() {
+        let mut oms = HashMap::new();
+        let mut order = make_managed_order("1", OrderStatus::Traded);
+        order.traded_qty = 25; // OMS thinks 25 filled
+        order.avg_traded_price = 100.0;
+        oms.insert("1".to_owned(), order);
+
+        let mut dhan = make_dhan_order("1", "TRADED");
+        dhan.traded_quantity = 50; // Dhan says 50 filled
+        dhan.average_trade_price = 102.5;
+        let dhan = vec![dhan];
+
+        let (report, updates) = reconcile_orders(&oms, &dhan);
+        assert_eq!(report.mismatches_found, 0); // status matches
+        assert_eq!(updates.len(), 1); // fill data mismatch triggers update
+        assert_eq!(updates[0].traded_qty, 50);
+        assert!((updates[0].avg_traded_price - 102.5).abs() < f64::EPSILON);
     }
 
     #[test]

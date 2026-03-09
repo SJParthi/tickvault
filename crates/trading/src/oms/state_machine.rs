@@ -6,14 +6,16 @@
 //!
 //! # Valid Transitions (from Phase 1 spec §10)
 //! ```text
-//! Transit  → Pending     (reached exchange)
-//! Transit  → Rejected    (exchange rejected immediately)
-//! Pending  → Confirmed   (exchange accepted)
-//! Confirmed → Traded     (fully filled)
-//! Confirmed → Cancelled  (user cancelled)
-//! Confirmed → Expired    (end of validity)
-//! Pending  → Traded      (immediate fill, skips Confirmed)
-//! Pending  → Cancelled   (cancelled before confirmation)
+//! Transit   → Pending     (reached exchange)
+//! Transit   → Rejected    (exchange rejected immediately)
+//! Pending   → Confirmed   (exchange accepted)
+//! Pending   → Traded      (immediate fill, skips Confirmed)
+//! Pending   → Cancelled   (cancelled before confirmation)
+//! Pending   → Rejected    (exchange rejected after pending)
+//! Pending   → Expired     (order expired while pending)
+//! Confirmed → Traded      (fully filled)
+//! Confirmed → Cancelled   (user cancelled)
+//! Confirmed → Expired     (end of validity)
 //! ```
 
 use dhan_live_trader_common::order_types::OrderStatus;
@@ -31,10 +33,12 @@ pub fn is_valid_transition(from: OrderStatus, to: OrderStatus) -> bool {
         // Transit can go to Pending or Rejected
         (OrderStatus::Transit, OrderStatus::Pending)
             | (OrderStatus::Transit, OrderStatus::Rejected)
-            // Pending can go to Confirmed, Traded, or Cancelled
+            // Pending can go to Confirmed, Traded, Cancelled, Rejected, or Expired
             | (OrderStatus::Pending, OrderStatus::Confirmed)
             | (OrderStatus::Pending, OrderStatus::Traded)
             | (OrderStatus::Pending, OrderStatus::Cancelled)
+            | (OrderStatus::Pending, OrderStatus::Rejected)
+            | (OrderStatus::Pending, OrderStatus::Expired)
             // Confirmed can go to Traded, Cancelled, or Expired
             | (OrderStatus::Confirmed, OrderStatus::Traded)
             | (OrderStatus::Confirmed, OrderStatus::Cancelled)
@@ -108,6 +112,22 @@ mod tests {
         assert!(is_valid_transition(
             OrderStatus::Pending,
             OrderStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn pending_to_rejected_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Pending,
+            OrderStatus::Rejected
+        ));
+    }
+
+    #[test]
+    fn pending_to_expired_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Pending,
+            OrderStatus::Expired
         ));
     }
 
