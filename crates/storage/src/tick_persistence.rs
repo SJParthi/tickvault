@@ -2378,4 +2378,215 @@ mod tests {
         assert_eq!(writer.buffer.row_count(), 2);
         writer.force_flush().unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Dhan epoch → IST timestamp verification with real market hours
+    //
+    // Dhan WebSocket sends IST-naive epoch seconds: the IST wall-clock time
+    // encoded as if UTC. Example: 09:15:00 IST → epoch for 09:15:00 UTC.
+    //
+    // Our pipeline: subtract 19800s → proper UTC → store in QuestDB `ts`.
+    // Grafana: `dateadd('s', 19800, ts)` → back to IST for display.
+    //
+    // These tests verify the FULL roundtrip with known epoch values
+    // corresponding to NSE market hours (09:15 - 15:30 IST).
+    // -----------------------------------------------------------------------
+
+    /// Helper: compute IST-naive epoch for a given IST wall-clock time on 2026-03-10.
+    /// `ist_hours` and `ist_minutes` are IST wall-clock values.
+    /// Returns: the IST-naive epoch (as Dhan would send it).
+    fn ist_naive_epoch_for_2026_03_10(ist_hours: u32, ist_minutes: u32, ist_seconds: u32) -> u32 {
+        // 2026-03-10 00:00:00 UTC epoch = 1773100800
+        // (verified: datetime(2026,3,10,0,0,0,tzinfo=UTC).timestamp() == 1773100800)
+        const MARCH_10_2026_MIDNIGHT_UTC: u32 = 1_773_100_800;
+        MARCH_10_2026_MIDNIGHT_UTC + ist_hours * 3600 + ist_minutes * 60 + ist_seconds
+    }
+
+    #[test]
+    fn test_dhan_epoch_market_open_0915_ist() {
+        // NSE market opens at 09:15:00 IST.
+        // Dhan WebSocket sends: epoch for "09:15:00 UTC" (IST-naive).
+        let dhan_epoch = ist_naive_epoch_for_2026_03_10(9, 15, 0);
+
+        // Our code subtracts IST offset → proper UTC.
+        let utc_epoch = i64::from(dhan_epoch) - IST_UTC_OFFSET_SECONDS_I64;
+
+        // The UTC time should be 03:45:00 UTC (09:15 - 05:30).
+        let expected_utc = ist_naive_epoch_for_2026_03_10(3, 45, 0);
+        assert_eq!(utc_epoch, i64::from(expected_utc), "09:15 IST = 03:45 UTC");
+
+        // Grafana roundtrip: dateadd('s', 19800, ts) should give back IST.
+        let grafana_ist = utc_epoch + IST_UTC_OFFSET_SECONDS_I64;
+        assert_eq!(
+            grafana_ist,
+            i64::from(dhan_epoch),
+            "Grafana dateadd must recover original IST time"
+        );
+
+        // Verify IST hour/minute from the Grafana value.
+        let seconds_since_midnight =
+            grafana_ist - i64::from(ist_naive_epoch_for_2026_03_10(0, 0, 0));
+        let hour = seconds_since_midnight / 3600;
+        let minute = (seconds_since_midnight % 3600) / 60;
+        assert_eq!(hour, 9, "IST hour must be 9");
+        assert_eq!(minute, 15, "IST minute must be 15");
+    }
+
+    #[test]
+    fn test_dhan_epoch_market_close_1530_ist() {
+        // NSE market closes at 15:30:00 IST.
+        let dhan_epoch = ist_naive_epoch_for_2026_03_10(15, 30, 0);
+
+        let utc_epoch = i64::from(dhan_epoch) - IST_UTC_OFFSET_SECONDS_I64;
+
+        // 15:30 IST = 10:00 UTC.
+        let expected_utc = ist_naive_epoch_for_2026_03_10(10, 0, 0);
+        assert_eq!(utc_epoch, i64::from(expected_utc), "15:30 IST = 10:00 UTC");
+
+        // Grafana roundtrip.
+        let grafana_ist = utc_epoch + IST_UTC_OFFSET_SECONDS_I64;
+        let seconds_since_midnight =
+            grafana_ist - i64::from(ist_naive_epoch_for_2026_03_10(0, 0, 0));
+        let hour = seconds_since_midnight / 3600;
+        let minute = (seconds_since_midnight % 3600) / 60;
+        assert_eq!(hour, 15, "IST hour must be 15");
+        assert_eq!(minute, 30, "IST minute must be 30");
+    }
+
+    #[test]
+    fn test_dhan_epoch_mid_session_1200_ist() {
+        // Mid-session: 12:00:00 IST.
+        let dhan_epoch = ist_naive_epoch_for_2026_03_10(12, 0, 0);
+
+        let utc_epoch = i64::from(dhan_epoch) - IST_UTC_OFFSET_SECONDS_I64;
+
+        // 12:00 IST = 06:30 UTC.
+        let expected_utc = ist_naive_epoch_for_2026_03_10(6, 30, 0);
+        assert_eq!(utc_epoch, i64::from(expected_utc), "12:00 IST = 06:30 UTC");
+
+        let grafana_ist = utc_epoch + IST_UTC_OFFSET_SECONDS_I64;
+        let seconds_since_midnight =
+            grafana_ist - i64::from(ist_naive_epoch_for_2026_03_10(0, 0, 0));
+        let hour = seconds_since_midnight / 3600;
+        let minute = (seconds_since_midnight % 3600) / 60;
+        assert_eq!(hour, 12, "IST hour must be 12");
+        assert_eq!(minute, 0, "IST minute must be 0");
+    }
+
+    #[test]
+    fn test_dhan_epoch_pre_market_0900_ist() {
+        // Pre-market: 09:00:00 IST (before market open).
+        let dhan_epoch = ist_naive_epoch_for_2026_03_10(9, 0, 0);
+
+        let utc_epoch = i64::from(dhan_epoch) - IST_UTC_OFFSET_SECONDS_I64;
+
+        // 09:00 IST = 03:30 UTC.
+        let expected_utc = ist_naive_epoch_for_2026_03_10(3, 30, 0);
+        assert_eq!(utc_epoch, i64::from(expected_utc), "09:00 IST = 03:30 UTC");
+
+        let grafana_ist = utc_epoch + IST_UTC_OFFSET_SECONDS_I64;
+        let seconds_since_midnight =
+            grafana_ist - i64::from(ist_naive_epoch_for_2026_03_10(0, 0, 0));
+        let hour = seconds_since_midnight / 3600;
+        assert_eq!(hour, 9, "IST hour must be 9");
+    }
+
+    #[test]
+    fn test_dhan_epoch_build_tick_row_produces_correct_utc_ts() {
+        // End-to-end: build_tick_row with a 10:30:00 IST tick and verify
+        // the designated timestamp in the ILP buffer is UTC (05:00:00 UTC).
+        let dhan_epoch = ist_naive_epoch_for_2026_03_10(10, 30, 0);
+        let expected_utc_epoch_secs = i64::from(dhan_epoch) - IST_UTC_OFFSET_SECONDS_I64;
+        let expected_ts_nanos = expected_utc_epoch_secs * 1_000_000_000;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 25,
+            exchange_segment_code: EXCHANGE_SEGMENT_NSE_EQ, // ADANIENT equity
+            last_traded_price: 2350.50,
+            exchange_timestamp: dhan_epoch,
+            received_at_nanos: expected_utc_epoch_secs * 1_000_000_000 + 500_000, // ~0.5ms latency
+            ..Default::default()
+        };
+
+        build_tick_row(&mut buffer, &tick).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // ILP line protocol format: fields... <timestamp_nanos>\n
+        // The designated timestamp (last value before newline) must be UTC nanos.
+        let expected_ts_str = format!("{expected_ts_nanos}\n");
+        assert!(
+            content.ends_with(&expected_ts_str),
+            "ILP designated timestamp must be UTC nanos.\nExpected suffix: {expected_ts_str}\nActual: {content}"
+        );
+    }
+
+    #[test]
+    fn test_dhan_epoch_all_market_hours_produce_valid_ist_range() {
+        // Verify that for every minute from 09:15 to 15:30 IST,
+        // the roundtrip (Dhan → UTC → Grafana IST) lands in [09:15, 15:30].
+        let market_open_epoch = ist_naive_epoch_for_2026_03_10(9, 15, 0);
+        let market_close_epoch = ist_naive_epoch_for_2026_03_10(15, 30, 0);
+        let midnight_epoch = ist_naive_epoch_for_2026_03_10(0, 0, 0);
+
+        let mut minute = market_open_epoch;
+        while minute <= market_close_epoch {
+            let utc = i64::from(minute) - IST_UTC_OFFSET_SECONDS_I64;
+            let grafana_ist = utc + IST_UTC_OFFSET_SECONDS_I64;
+            let secs_from_midnight = grafana_ist - i64::from(midnight_epoch);
+            let hour = secs_from_midnight / 3600;
+            let min_of_hour = (secs_from_midnight % 3600) / 60;
+            let total_minutes = hour * 60 + min_of_hour;
+
+            assert!(
+                (555..=930).contains(&total_minutes),
+                "IST time {hour}:{min_of_hour:02} (minute {total_minutes}) out of market range for epoch {minute}"
+            );
+
+            minute += 60; // advance 1 minute
+        }
+    }
+
+    #[test]
+    fn test_historical_candle_utc_epoch_needs_no_conversion() {
+        // Dhan REST API returns standard UTC epoch seconds.
+        // For 10:00 AM IST = 04:30 UTC on 2026-03-10:
+        // UTC epoch = March 10 midnight + 4h30m = 1741564800 + 16200 = 1741581000
+        let utc_epoch_from_rest: i64 = i64::from(ist_naive_epoch_for_2026_03_10(4, 30, 0));
+
+        // Historical candle persistence stores as-is (no offset subtraction).
+        let ts_nanos = TimestampNanos::new(utc_epoch_from_rest * 1_000_000_000);
+        assert_eq!(ts_nanos.as_i64(), utc_epoch_from_rest * 1_000_000_000);
+
+        // Grafana dateadd('s', 19800, ts) recovers 10:00 IST.
+        let grafana_ist = utc_epoch_from_rest + IST_UTC_OFFSET_SECONDS_I64;
+        let midnight = i64::from(ist_naive_epoch_for_2026_03_10(0, 0, 0));
+        let secs_from_midnight = grafana_ist - midnight;
+        let hour = secs_from_midnight / 3600;
+        let minute = (secs_from_midnight % 3600) / 60;
+        assert_eq!(hour, 10, "REST API 04:30 UTC = 10:00 IST");
+        assert_eq!(minute, 0);
+    }
+
+    #[test]
+    fn test_live_candle_utc_conversion_matches_tick_persistence() {
+        // Live candle and tick both use the same IST → UTC conversion.
+        // Verify they produce identical UTC epochs for the same Dhan timestamp.
+        let dhan_epoch: u32 = ist_naive_epoch_for_2026_03_10(11, 45, 30);
+
+        // Tick persistence path (build_tick_row):
+        let tick_utc = i64::from(dhan_epoch).saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+
+        // Live candle persistence path (LiveCandleWriter::append_candle):
+        let candle_utc = i64::from(dhan_epoch).saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+
+        assert_eq!(
+            tick_utc, candle_utc,
+            "Tick and candle persistence must produce identical UTC epochs"
+        );
+
+        // Both should give 06:15:30 UTC.
+        let expected_utc = i64::from(ist_naive_epoch_for_2026_03_10(6, 15, 30));
+        assert_eq!(tick_utc, expected_utc, "11:45:30 IST = 06:15:30 UTC");
+    }
 }

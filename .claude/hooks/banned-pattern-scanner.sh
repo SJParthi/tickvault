@@ -27,20 +27,26 @@ extract_prod_code() {
   awk '
     BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
     # Skip #[cfg(test)] and #[test] blocks (brace-depth tracking)
-    /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
-    /^[[:space:]]*#\[test\]/ { skip=1; next }
+    # Only trigger when NOT already inside a skip block to prevent
+    # nested #[test] attributes from resetting the outer module depth.
+    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; next }
+    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; next }
+    # Inside a skip block that has entered braces — track depth
+    skip==1 && depth > 0 {
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) { skip=0; depth=0 }
+      next
+    }
+    # Inside a skip block, first line with opening brace — start depth tracking
     skip==1 && /\{/ {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
       if (depth <= 0) { skip=0; depth=0 }
       next
     }
-    skip==1 {
-      depth += gsub(/\{/, "{")
-      depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
-      next
-    }
+    # Inside a skip block, no braces yet (attribute lines like #[allow()])
+    skip==1 { next }
     # Block-level exemptions: O(1) EXEMPT: begin ... O(1) EXEMPT: end
     /O\(1\) EXEMPT: begin/ { exempt=1; next }
     /O\(1\) EXEMPT: end/ { exempt=0; next }

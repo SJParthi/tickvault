@@ -243,11 +243,11 @@
       "gridPos": { "h": 16, "w": 24, "x": 0, "y": 6 },
       "id": 11,
       "options": {
-        "mode": 2,
+        "mode": "candles+volume",
         "candleStyle": "candles",
         "colorStrategy": "open-close",
         "colors": { "up": "green", "down": "red", "flat": "gray" },
-        "includeAllFields": true
+        "includeAllFields": false
       },
       "title": "Historical — ${contract:text}  [${timeframe}]",
       "type": "candlestick",
@@ -255,7 +255,7 @@
         {
           "datasource": { "type": "postgres", "uid": "questdb" },
           "editorMode": "code",
-          "format": "table",
+          "format": "time_series",
           "rawQuery": true,
           "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles_1m\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
           "refId": "OHLCV"
@@ -263,11 +263,11 @@
         {
           "datasource": { "type": "postgres", "uid": "questdb" },
           "editorMode": "code",
-          "format": "table",
+          "format": "time_series",
           "rawQuery": true,
           "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM historical_candles_1m\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
           "refId": "SMA",
-          "hide": false
+          "hide": true
         }
       ]
     },
@@ -315,11 +315,11 @@
       "gridPos": { "h": 16, "w": 24, "x": 0, "y": 22 },
       "id": 12,
       "options": {
-        "mode": 2,
+        "mode": "candles+volume",
         "candleStyle": "candles",
         "colorStrategy": "open-close",
         "colors": { "up": "green", "down": "red", "flat": "gray" },
-        "includeAllFields": true
+        "includeAllFields": false
       },
       "title": "Live (Ticks) — ${contract:text}  [${timeframe}]",
       "type": "candlestick",
@@ -327,7 +327,7 @@
         {
           "datasource": { "type": "postgres", "uid": "questdb" },
           "editorMode": "code",
-          "format": "table",
+          "format": "time_series",
           "rawQuery": true,
           "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM candles_${timeframe}\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
           "refId": "OHLCV"
@@ -335,11 +335,11 @@
         {
           "datasource": { "type": "postgres", "uid": "questdb" },
           "editorMode": "code",
-          "format": "table",
+          "format": "time_series",
           "rawQuery": true,
           "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM candles_${timeframe}\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
           "refId": "SMA",
-          "hide": false
+          "hide": true
         }
       ]
     },
@@ -410,7 +410,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  dateadd('s', 19800, ts) AS exchange_time_ist,\n  dateadd('s', 19800, received_at) AS received_ist\nFROM ticks\nORDER BY ts DESC\nLIMIT 200;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  dateadd('s', 19800, ts) AS exchange_time_ist,\n  dateadd('s', 19800, received_at) AS received_ist\nFROM ticks\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 200;",
           "refId": "A"
         }
       ]
@@ -483,7 +483,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM historical_candles_1m\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM historical_candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -556,7 +556,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM candles_1m\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  dateadd('s', 19800, ts) AS candle_time_ist\nFROM candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -763,7 +763,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  dateadd('s', 19800, ts) AS depth_time_ist\nFROM market_depth\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  dateadd('s', 19800, ts) AS depth_time_ist\nFROM market_depth\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -1020,5 +1020,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 5
+  "version": 6
 }
