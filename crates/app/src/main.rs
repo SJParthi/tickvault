@@ -89,6 +89,13 @@ const CONFIG_BASE_PATH: &str = "config/base.toml";
 /// The file is created at startup; Alloy watches it and pushes to Loki.
 const APP_LOG_FILE_PATH: &str = "data/logs/app.log";
 
+/// Fast boot window start (IST). Starts 15 min before NSE pre-open (09:00)
+/// to cover crash recovery during the pre-open session.
+const FAST_BOOT_WINDOW_START: &str = "09:00:00";
+
+/// Fast boot window end (IST). NSE regular session closes at 15:30.
+const FAST_BOOT_WINDOW_END: &str = "15:30:00";
+
 /// Local override config file path (git-ignored, optional).
 /// Overrides Docker hostnames with localhost for `cargo run` on host.
 const CONFIG_LOCAL_PATH: &str = "config/local.toml";
@@ -247,14 +254,32 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Two-Phase Boot: try fast path first (cache hit → ticks in ~400ms),
-    // fall back to full sequential boot on cache miss.
+    // Two-Phase Boot: fast path ONLY during market hours on trading days.
+    // Outside market hours or non-trading days → always slow boot.
     // -----------------------------------------------------------------------
     let fast_cache = token_cache::load_token_cache_fast();
+    let is_market_hours = trading_calendar.is_trading_day_today()
+        && dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
+            FAST_BOOT_WINDOW_START,
+            FAST_BOOT_WINDOW_END,
+        );
 
-    if let Some(cache_result) = fast_cache {
+    if !is_market_hours && fast_cache.is_some() {
+        info!("token cache exists but outside market hours / non-trading day — using slow boot");
+    }
+
+    if let Some(cache_result) = fast_cache.filter(|_| is_market_hours) {
         // =================================================================
-        // FAST BOOT PATH (crash restart with valid cache)
+        // FAST BOOT PATH (market-hours crash restart with valid cache)
+        //
+        // ONLY activates when ALL conditions are met:
+        //   1. Valid token cache exists (crash recovery scenario)
+        //   2. Today is an NSE trading day (not weekend/holiday)
+        //   3. Current IST time is 09:00–15:30 (NSE session window)
+        //
+        // Outside this window (e.g., 8 AM pre-market, weekends, holidays),
+        // the slow boot path runs — downloads fresh instruments, starts
+        // Docker first, creates persistence writers properly.
         //
         // Critical path (ONLY WebSocket blocks):
         //   Config → Logging → Cache (2ms) → Instruments (0.5ms) →
@@ -528,10 +553,18 @@ async fn main() -> Result<()> {
     }
 
     // =====================================================================
-    // SLOW BOOT PATH (normal start / no cache)
-    // Original sequential boot — unchanged behavior.
+    // SLOW BOOT PATH (normal start / pre-market / no cache)
+    // Sequential boot: Docker first → instruments → auth → WebSocket.
     // =====================================================================
-    info!("standard boot — no valid token cache, full auth sequence");
+    if !is_market_hours {
+        info!(
+            build_window_start = %config.instrument.build_window_start,
+            build_window_end = %config.instrument.build_window_end,
+            "standard boot — outside market hours, full sequential setup"
+        );
+    } else {
+        info!("standard boot — no valid token cache, full auth sequence");
+    }
 
     // -----------------------------------------------------------------------
     // Steps 4+5: Notification + Docker infra (parallel — independent of each other)
