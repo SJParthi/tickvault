@@ -1015,7 +1015,7 @@
       }
     ]
   },
-  "time": { "from": "now-1h", "to": "now" },
+  "time": { "from": "now-6h", "to": "now" },
   "timepicker": {},
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",

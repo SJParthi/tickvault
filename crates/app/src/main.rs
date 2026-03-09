@@ -458,6 +458,21 @@ async fn main() -> Result<()> {
             info!("background tick persistence consumer started (cold path)");
         }
 
+        // --- Background: Candle persistence (cold path — aggregates ticks → candles_1s) ---
+        // In fast boot, live_candle_writer is None so the hot-path CandleAggregator
+        // produces candles but can't persist them. This cold-path consumer runs its
+        // own CandleAggregator, subscribes to the tick broadcast, and writes completed
+        // 1-second candles to QuestDB `candles_1s`. Materialized views (1m, 5m, etc.)
+        // automatically aggregate from candles_1s.
+        {
+            let candle_persistence_rx = fast_tick_broadcast_sender.subscribe();
+            let questdb_cfg = config.questdb.clone();
+            tokio::spawn(async move {
+                run_candle_persistence_consumer(candle_persistence_rx, questdb_cfg).await;
+            });
+            info!("background candle persistence consumer started (cold path)");
+        }
+
         // --- Background: Order update WebSocket ---
         let (order_update_sender, _order_update_receiver) = tokio::sync::broadcast::channel::<
             dhan_live_trader_common::order_types::OrderUpdate,
@@ -1228,6 +1243,118 @@ async fn run_tick_persistence_consumer(
                 let _ = tick_writer.flush_if_needed();
                 return;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Cold-path candle persistence consumer (fast boot only)
+// ---------------------------------------------------------------------------
+
+/// Subscribes to the tick broadcast, aggregates ticks into 1-second candles,
+/// and persists them to QuestDB `candles_1s` via ILP.
+///
+/// This is the cold-path equivalent of the hot-path CandleAggregator + LiveCandleWriter
+/// that runs inside `run_tick_processor`. In fast boot mode, the tick processor starts
+/// with `live_candle_writer = None` (QuestDB not ready), so candles are aggregated
+/// but not persisted. This consumer fills that gap once QuestDB is available.
+///
+/// Materialized views (candles_1m, 5m, 15m, etc.) automatically aggregate from candles_1s.
+async fn run_candle_persistence_consumer(
+    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
+    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+) {
+    let mut candle_writer =
+        match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(&questdb_config) {
+            Ok(writer) => {
+                info!("cold-path live candle writer connected to QuestDB (candles_1s)");
+                writer
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "cold-path live candle writer unavailable — candles_1s will NOT be persisted"
+                );
+                return;
+            }
+        };
+
+    let mut aggregator = dhan_live_trader_core::pipeline::CandleAggregator::new();
+    let sweep_interval = std::time::Duration::from_millis(100);
+    let mut last_sweep = std::time::Instant::now();
+    let mut candles_persisted: u64 = 0;
+
+    loop {
+        // Use timeout so stale candles are swept even during quiet periods.
+        match tokio::time::timeout(sweep_interval, tick_rx.recv()).await {
+            Ok(Ok(tick)) => {
+                aggregator.update(&tick);
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                warn!(
+                    skipped,
+                    "cold-path candle consumer lagged — some ticks not aggregated into candles"
+                );
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                // Shutdown: flush remaining candles
+                aggregator.flush_all();
+                let remaining = aggregator.drain_completed();
+                for c in &remaining {
+                    let _ = candle_writer.append_candle(
+                        c.security_id,
+                        c.exchange_segment_code,
+                        c.timestamp_secs,
+                        c.open,
+                        c.high,
+                        c.low,
+                        c.close,
+                        c.volume,
+                        c.tick_count,
+                    );
+                }
+                let _ = candle_writer.force_flush();
+                info!(
+                    candles_persisted,
+                    total_completed = aggregator.total_completed(),
+                    "cold-path candle persistence consumer shutting down (broadcast closed)"
+                );
+                return;
+            }
+            Err(_timeout) => {
+                // No tick received within sweep_interval — just sweep below
+            }
+        }
+
+        // Periodic sweep: emit stale candles and flush to QuestDB
+        if last_sweep.elapsed() >= sweep_interval {
+            let now_secs = chrono::Utc::now().timestamp() as u32;
+            aggregator.sweep_stale(now_secs);
+            let completed = aggregator.drain_completed();
+
+            for c in &completed {
+                if let Err(err) = candle_writer.append_candle(
+                    c.security_id,
+                    c.exchange_segment_code,
+                    c.timestamp_secs,
+                    c.open,
+                    c.high,
+                    c.low,
+                    c.close,
+                    c.volume,
+                    c.tick_count,
+                ) {
+                    warn!(?err, "cold-path candle write failed");
+                    break;
+                }
+            }
+
+            candles_persisted = candles_persisted.saturating_add(completed.len() as u64);
+
+            if let Err(err) = candle_writer.flush_if_needed() {
+                warn!(?err, "cold-path candle flush failed");
+            }
+            last_sweep = std::time::Instant::now();
         }
     }
 }
