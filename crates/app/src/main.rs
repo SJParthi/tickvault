@@ -97,6 +97,14 @@ const FAST_BOOT_WINDOW_START: &str = "09:00:00";
 /// Fast boot window end (IST). NSE regular session closes at 15:30.
 const FAST_BOOT_WINDOW_END: &str = "15:30:00";
 
+/// Reduced WebSocket connection stagger for off-market-hours boot (milliseconds).
+///
+/// Dhan docs impose no rate limit on WebSocket connection establishment.
+/// During market hours we use the full 10s stagger (config) as a defensive
+/// measure against server load. Outside market hours, 1s is sufficient —
+/// avoids the unnecessary 40s boot delay while remaining respectful.
+const OFF_HOURS_CONNECTION_STAGGER_MS: u64 = 1000;
+
 /// Local override config file path (git-ignored, optional).
 /// Overrides Docker hostnames with localhost for `cargo run` on host.
 const CONFIG_LOCAL_PATH: &str = "config/local.toml";
@@ -329,7 +337,8 @@ async fn main() -> Result<()> {
 
         // --- WebSocket connect: THE ONLY BLOCKING STEP (~400ms) ---
         let (frame_receiver, ws_handles) =
-            build_websocket_pool(&token_handle, &client_id, &subscription_plan, &config).await;
+            build_websocket_pool(&token_handle, &client_id, &subscription_plan, &config, true)
+                .await;
 
         // --- Tick processor: TICKS FLOWING (in-memory, no persistence yet) ---
         let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
@@ -733,7 +742,14 @@ async fn main() -> Result<()> {
             credentials.client_id.expose_secret().to_string()
         };
 
-        build_websocket_pool(&token_handle, &ws_client_id, &subscription_plan, &config).await
+        build_websocket_pool(
+            &token_handle,
+            &ws_client_id,
+            &subscription_plan,
+            &config,
+            is_market_hours,
+        )
+        .await
     } else {
         warn!("WebSocket pool skipped — running in offline mode");
         (None, Vec::new())
@@ -1030,6 +1046,7 @@ async fn build_websocket_pool(
     client_id: &str,
     subscription_plan: &Option<SubscriptionPlan>,
     config: &ApplicationConfig,
+    is_market_hours: bool,
 ) -> (
     Option<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
     Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
@@ -1040,6 +1057,20 @@ async fn build_websocket_pool(
             warn!("WebSocket pool skipped — no subscription plan");
             return (None, Vec::new());
         }
+    };
+
+    // Outside market hours, use reduced stagger to avoid unnecessary boot delay.
+    let ws_config = if is_market_hours {
+        config.websocket.clone()
+    } else {
+        let mut cfg = config.websocket.clone();
+        info!(
+            market_hours_stagger_ms = cfg.connection_stagger_ms,
+            off_hours_stagger_ms = OFF_HOURS_CONNECTION_STAGGER_MS,
+            "using reduced WebSocket stagger (off-market-hours boot)"
+        );
+        cfg.connection_stagger_ms = OFF_HOURS_CONNECTION_STAGGER_MS;
+        cfg
     };
 
     info!("building WebSocket connection pool");
@@ -1057,7 +1088,7 @@ async fn build_websocket_pool(
         token_handle.clone(),
         client_id.to_string(),
         config.dhan.clone(),
-        config.websocket.clone(),
+        ws_config,
         instruments,
         feed_mode,
     ) {

@@ -42,6 +42,12 @@ const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 /// Grafana dashboard URL — auto-opened in browser after infrastructure starts.
 const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
+/// Grafana host for TCP reachability probe.
+const GRAFANA_HOST: &str = "127.0.0.1";
+
+/// Grafana HTTP port for TCP reachability probe.
+const GRAFANA_PORT: u16 = 3000;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -62,6 +68,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             port = questdb_config.http_port,
             "infrastructure already running (QuestDB reachable)"
         );
+        // Infrastructure already running — still auto-open Grafana dashboard.
+        open_grafana_if_reachable().await;
         return;
     }
 
@@ -147,10 +155,22 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 
     // Wait for QuestDB and Grafana to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
-    wait_for_service_healthy("Grafana", "127.0.0.1", 3000).await;
+    wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
 
     // Auto-open Grafana dashboards in the default browser.
-    open_in_browser(GRAFANA_DASHBOARD_URL).await;
+    open_grafana_if_reachable().await;
+}
+
+/// Opens the Grafana dashboard in the default browser if Grafana is reachable.
+///
+/// Best-effort: if Grafana is not running or the browser cannot be launched,
+/// logs a warning and returns — does not block boot.
+async fn open_grafana_if_reachable() {
+    if is_service_reachable(GRAFANA_HOST, GRAFANA_PORT) {
+        open_in_browser(GRAFANA_DASHBOARD_URL).await;
+    } else {
+        debug!("Grafana not reachable — skipping browser auto-open");
+    }
 }
 
 // ---------------------------------------------------------------------------
