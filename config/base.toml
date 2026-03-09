@@ -138,6 +138,11 @@ token_validity_hours = 24
 max_daily_loss_percent = 2.0
 max_position_size_lots = 50
 
+[strategy]
+config_path = "config/strategies.toml"
+capital = 1000000.0
+dry_run = true  # SAFETY: never place real orders — paper trading only
+
 [logging]
 level = "info"
 format = "json"

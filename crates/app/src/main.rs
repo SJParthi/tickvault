@@ -26,6 +26,7 @@
 
 mod infra;
 mod observability;
+mod trading_pipeline;
 
 use std::net::SocketAddr;
 
@@ -279,10 +280,16 @@ async fn main() -> Result<()> {
         let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
             std::sync::Arc::new(std::sync::RwLock::new(None));
 
+        // Tick broadcast for trading pipeline (cold path consumer).
+        let (fast_tick_broadcast_sender, _fast_tick_broadcast_rx) = tokio::sync::broadcast::channel::<
+            dhan_live_trader_common::tick_types::ParsedTick,
+        >(1024);
+
         let processor_handle = if let Some(receiver) = frame_receiver {
             let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
             let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
             let snapshot_handle = Some(shared_movers.clone());
+            let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
             // Start with None writers — ticks are processed in-memory for trading.
             // QuestDB persistence reconnects in background (tables already exist
             // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
@@ -291,7 +298,7 @@ async fn main() -> Result<()> {
                     receiver,
                     None, // tick_writer — QuestDB reconnects in background
                     None, // depth_writer — QuestDB reconnects in background
-                    None,
+                    tick_broadcast_for_processor,
                     candle_agg,
                     movers,
                     snapshot_handle,
@@ -390,6 +397,29 @@ async fn main() -> Result<()> {
         };
         info!("order update WebSocket started (background)");
 
+        // --- Background: Trading pipeline (paper trading) ---
+        let trading_handle = {
+            let tick_rx = fast_tick_broadcast_sender.subscribe();
+            let order_rx = order_update_sender.subscribe();
+
+            match trading_pipeline::init_trading_pipeline(&config, &token_handle, &client_id) {
+                Some((pipeline_config, hot_reloader)) => {
+                    let handle = trading_pipeline::spawn_trading_pipeline(
+                        pipeline_config,
+                        tick_rx,
+                        order_rx,
+                        hot_reloader,
+                    );
+                    info!("trading pipeline started (paper trading, fast boot)");
+                    Some(handle)
+                }
+                None => {
+                    info!("trading pipeline disabled — no strategy config (fast boot)");
+                    None
+                }
+            }
+        };
+
         // --- Background: API server ---
         let api_state = SharedAppState::new(
             config.questdb.clone(),
@@ -437,6 +467,7 @@ async fn main() -> Result<()> {
             renewal_handle,
             Some(order_update_handle),
             Some(api_handle),
+            trading_handle,
             otel_provider,
             &notifier,
             &config,
@@ -603,28 +634,34 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 9: Spawn tick processor
+    // Step 9: Spawn tick processor (with tick broadcast for trading pipeline)
     // -----------------------------------------------------------------------
     let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
         std::sync::Arc::new(std::sync::RwLock::new(None));
+
+    // Tick broadcast: fan-out parsed ticks to the trading pipeline (cold path consumer).
+    // Capacity 1024: trading pipeline is allowed to lag — it only needs latest price.
+    let (tick_broadcast_sender, _tick_broadcast_default_rx) =
+        tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(1024);
 
     let processor_handle = if let Some(receiver) = frame_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
         let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
         let snapshot_handle = Some(shared_movers.clone());
+        let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
                 tick_writer,
                 depth_writer,
-                None,
+                tick_broadcast_for_processor,
                 candle_agg,
                 movers,
                 snapshot_handle,
             )
             .await;
         });
-        info!("tick processor started (with candle aggregation + top movers)");
+        info!("tick processor started (with candle aggregation + top movers + trading broadcast)");
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
@@ -658,6 +695,42 @@ async fn main() -> Result<()> {
         })
     };
     info!("order update WebSocket started");
+
+    // -----------------------------------------------------------------------
+    // Step 10.5: Spawn trading pipeline (indicators → strategies → OMS)
+    // -----------------------------------------------------------------------
+    let trading_handle = {
+        let ws_client_id_for_trading = {
+            let credentials = secret_manager::fetch_dhan_credentials()
+                .await
+                .context("failed to fetch Dhan client ID for trading pipeline")?;
+            credentials.client_id.expose_secret().to_string()
+        };
+
+        let tick_rx = tick_broadcast_sender.subscribe();
+        let order_rx = order_update_sender.subscribe();
+
+        match trading_pipeline::init_trading_pipeline(
+            &config,
+            &token_manager.token_handle(),
+            &ws_client_id_for_trading,
+        ) {
+            Some((pipeline_config, hot_reloader)) => {
+                let handle = trading_pipeline::spawn_trading_pipeline(
+                    pipeline_config,
+                    tick_rx,
+                    order_rx,
+                    hot_reloader,
+                );
+                info!("trading pipeline started (paper trading)");
+                Some(handle)
+            }
+            None => {
+                info!("trading pipeline disabled — no strategy config");
+                None
+            }
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
@@ -702,6 +775,7 @@ async fn main() -> Result<()> {
         Some(renewal_handle),
         Some(order_update_handle),
         Some(api_handle),
+        trading_handle,
         otel_provider,
         &notifier,
         &config,
@@ -934,6 +1008,7 @@ async fn run_shutdown_fast(
     renewal_handle: Option<tokio::task::JoinHandle<()>>,
     order_update_handle: Option<tokio::task::JoinHandle<()>>,
     api_handle: Option<tokio::task::JoinHandle<()>>,
+    trading_handle: Option<tokio::task::JoinHandle<()>>,
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     notifier: &std::sync::Arc<NotificationService>,
     config: &ApplicationConfig,
@@ -997,12 +1072,17 @@ async fn run_shutdown_fast(
         }
     }
 
-    // 5. Stop API server.
+    // 5. Stop trading pipeline.
+    if let Some(handle) = trading_handle {
+        handle.abort();
+    }
+
+    // 6. Stop API server.
     if let Some(handle) = api_handle {
         handle.abort();
     }
 
-    // 6. Flush OpenTelemetry.
+    // 7. Flush OpenTelemetry.
     drop(otel_provider);
     drop(shared_movers);
 

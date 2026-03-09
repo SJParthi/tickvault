@@ -33,6 +33,45 @@ pub struct ApplicationConfig {
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub historical: HistoricalDataConfig,
+    #[serde(default)]
+    pub strategy: StrategyConfig,
+}
+
+/// Strategy and paper-trading configuration.
+#[derive(Debug, Deserialize)]
+pub struct StrategyConfig {
+    /// Path to the strategy TOML config file (relative to working directory).
+    #[serde(default = "default_strategy_config_path")]
+    pub config_path: String,
+    /// Trading capital in rupees (for risk engine daily loss calculation).
+    #[serde(default = "default_capital")]
+    pub capital: f64,
+    /// Dry-run mode: when true, NO real orders are placed. All orders are simulated.
+    /// DEFAULT: true. This is a developer-only tool.
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            config_path: default_strategy_config_path(),
+            capital: default_capital(),
+            dry_run: default_dry_run(),
+        }
+    }
+}
+
+fn default_strategy_config_path() -> String {
+    "config/strategies.toml".to_string()
+}
+
+const fn default_capital() -> f64 {
+    1_000_000.0
+}
+
+const fn default_dry_run() -> bool {
+    true
 }
 
 /// Trading session timing configuration.
@@ -676,6 +715,7 @@ mod tests {
             notification: NotificationConfig::default(),
             observability: ObservabilityConfig::default(),
             historical: HistoricalDataConfig::default(),
+            strategy: StrategyConfig::default(),
         }
     }
 

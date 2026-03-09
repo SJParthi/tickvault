@@ -49,6 +49,12 @@ pub trait TokenProvider: Send + Sync {
 /// Central order management system composing all OMS sub-components.
 ///
 /// Manages the full order lifecycle: place → track → update → reconcile.
+///
+/// # Safety: Dry-Run Mode (default)
+/// When `dry_run` is `true` (the default), **no HTTP calls are ever made**.
+/// All order operations are simulated locally — place returns a fake order ID,
+/// modify/cancel update local state only, reconcile is a no-op.
+/// This ensures the system NEVER touches real money during development.
 pub struct OrderManagementSystem {
     /// Order state keyed by Dhan order ID.
     orders: HashMap<String, ManagedOrder>,
@@ -68,13 +74,21 @@ pub struct OrderManagementSystem {
     total_placed: u64,
     /// Total order updates processed.
     total_updates: u64,
+    /// Dry-run mode: when true, NO HTTP calls are made. All orders are simulated.
+    /// DEFAULT: true. Must be explicitly set to false for live trading.
+    dry_run: bool,
+    /// Counter for generating sequential paper order IDs.
+    paper_order_counter: u64,
 }
 
 impl OrderManagementSystem {
-    /// Creates a new OMS with the given components.
+    /// Creates a new OMS in **dry-run mode** (default).
+    ///
+    /// In dry-run mode, no HTTP calls are ever made to Dhan. All orders
+    /// are simulated locally with fake order IDs (PAPER-xxx).
     ///
     /// # Arguments
-    /// * `api_client` — Dhan REST API client.
+    /// * `api_client` — Dhan REST API client (unused in dry-run).
     /// * `rate_limiter` — SEBI-compliant rate limiter.
     /// * `token_provider` — Callback for getting the current access token.
     /// * `client_id` — Dhan client ID.
@@ -94,7 +108,14 @@ impl OrderManagementSystem {
             client_id,
             total_placed: 0,
             total_updates: 0,
+            dry_run: true,
+            paper_order_counter: 0,
         }
+    }
+
+    /// Returns whether the OMS is in dry-run (paper trading) mode.
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
     }
 
     /// Places a new order through the OMS pipeline.
@@ -112,19 +133,64 @@ impl OrderManagementSystem {
     /// - `OmsError::DhanApiError` — Dhan returned an error
     /// - `OmsError::DhanRateLimited` — HTTP 429 from Dhan
     pub async fn place_order(&mut self, request: PlaceOrderRequest) -> Result<String, OmsError> {
-        // Step 1: Rate limiter check
+        // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
         self.rate_limiter.check()?;
 
         // Step 2: Circuit breaker check
         self.circuit_breaker.check()?;
 
-        // Step 3: Get access token
+        // Step 3: Generate correlation ID
+        let correlation_id = self.correlations.generate_id();
+        let now_us = now_epoch_us();
+
+        // ---- DRY-RUN: simulate order without any HTTP call ----
+        if self.dry_run {
+            self.paper_order_counter = self.paper_order_counter.saturating_add(1);
+            let paper_order_id = format!("PAPER-{}", self.paper_order_counter);
+
+            let order = ManagedOrder {
+                order_id: paper_order_id.clone(),
+                correlation_id: correlation_id.clone(),
+                security_id: request.security_id,
+                transaction_type: request.transaction_type,
+                order_type: request.order_type,
+                product_type: request.product_type,
+                validity: request.validity,
+                quantity: request.quantity,
+                price: request.price,
+                trigger_price: request.trigger_price,
+                status: OrderStatus::Confirmed,
+                traded_qty: 0,
+                avg_traded_price: 0.0,
+                lot_size: request.lot_size,
+                created_at_us: now_us,
+                updated_at_us: now_us,
+                needs_reconciliation: false,
+            };
+
+            self.correlations
+                .track(correlation_id, paper_order_id.clone());
+            self.orders.insert(paper_order_id.clone(), order);
+            self.total_placed = self.total_placed.saturating_add(1);
+
+            info!(
+                order_id = %paper_order_id,
+                security_id = request.security_id,
+                transaction_type = %request.transaction_type.as_str(),
+                quantity = request.quantity,
+                price = request.price,
+                "PAPER TRADE: order simulated (no HTTP call)"
+            );
+
+            return Ok(paper_order_id);
+        }
+
+        // ---- LIVE MODE: actual Dhan REST API call ----
+
+        // Step 3b: Get access token (only in live mode)
         let access_token = self.token_provider.get_access_token()?;
 
-        // Step 4: Generate correlation ID
-        let correlation_id = self.correlations.generate_id();
-
-        // Step 5: Build Dhan REST request
+        // Step 4: Build Dhan REST request
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
@@ -141,7 +207,7 @@ impl OrderManagementSystem {
             correlation_id: correlation_id.clone(),
         };
 
-        // Step 6: Call Dhan REST API
+        // Step 5: Call Dhan REST API
         let response = match self
             .api_client
             .place_order(access_token.expose_secret(), &dhan_request)
@@ -157,9 +223,7 @@ impl OrderManagementSystem {
             }
         };
 
-        let now_us = now_epoch_us();
-
-        // Step 7: Create ManagedOrder with status from Dhan response.
+        // Step 6: Create ManagedOrder with status from Dhan response.
         // Dhan can return TRADED or REJECTED immediately; default to Transit if unparseable.
         let initial_status =
             parse_order_status(&response.order_status).unwrap_or(OrderStatus::Transit);
@@ -184,7 +248,7 @@ impl OrderManagementSystem {
             needs_reconciliation: false,
         };
 
-        // Step 8: Track in state
+        // Step 7: Track in state
         self.correlations
             .track(correlation_id, response.order_id.clone());
         self.orders.insert(response.order_id.clone(), order);
@@ -230,6 +294,22 @@ impl OrderManagementSystem {
 
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
+
+        // ---- DRY-RUN: update local state only, no HTTP ----
+        if self.dry_run {
+            if let Some(order) = self.orders.get_mut(order_id) {
+                order.order_type = request.order_type;
+                order.quantity = request.quantity;
+                order.price = request.price;
+                order.trigger_price = request.trigger_price;
+                order.validity = request.validity;
+                order.updated_at_us = now_epoch_us();
+            }
+            info!(order_id = %order_id, "PAPER TRADE: order modify simulated (no HTTP call)");
+            return Ok(());
+        }
+
+        // ---- LIVE MODE ----
         let access_token = self.token_provider.get_access_token()?;
 
         let dhan_request = DhanModifyOrderRequest {
@@ -295,6 +375,18 @@ impl OrderManagementSystem {
 
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
+
+        // ---- DRY-RUN: simulate cancel locally ----
+        if self.dry_run {
+            if let Some(order) = self.orders.get_mut(order_id) {
+                order.status = OrderStatus::Cancelled;
+                order.updated_at_us = now_epoch_us();
+            }
+            info!(order_id = %order_id, "PAPER TRADE: order cancel simulated (no HTTP call)");
+            return Ok(());
+        }
+
+        // ---- LIVE MODE ----
         let access_token = self.token_provider.get_access_token()?;
 
         match self
@@ -436,6 +528,12 @@ impl OrderManagementSystem {
     /// Fetches all today's orders and compares with OMS state.
     /// Mismatches are logged at ERROR level and corrected in local state.
     pub async fn reconcile(&mut self) -> Result<ReconciliationReport, OmsError> {
+        // DRY-RUN: no server state to reconcile against.
+        if self.dry_run {
+            info!("PAPER TRADE: reconciliation skipped (dry-run mode)");
+            return Ok(ReconciliationReport::default());
+        }
+
         let access_token = self.token_provider.get_access_token()?;
         let dhan_orders = self
             .api_client
@@ -489,8 +587,9 @@ impl OrderManagementSystem {
         self.correlations.clear();
         self.total_placed = 0;
         self.total_updates = 0;
+        self.paper_order_counter = 0;
         self.circuit_breaker.reset();
-        info!("OMS daily state reset");
+        info!(dry_run = self.dry_run, "OMS daily state reset");
     }
 }
 
