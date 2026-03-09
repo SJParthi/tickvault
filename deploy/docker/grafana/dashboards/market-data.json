@@ -939,7 +939,7 @@
   "templating": {
     "list": [
       {
-        "current": {},
+        "current": { "selected": true, "text": "NIFTY", "value": "13" },
         "datasource": { "type": "postgres", "uid": "questdb" },
         "definition": "SELECT DISTINCT symbol AS __text, security_id AS __value FROM subscribed_indices WHERE category = 'FnoUnderlying' UNION ALL SELECT DISTINCT underlying_symbol AS __text, price_feed_security_id AS __value FROM fno_underlyings WHERE kind = 'Stock' ORDER BY 1;",
         "description": "Pick index or equity — only instruments with historical candle data (no F&O derivatives)",
@@ -957,7 +957,7 @@
         "type": "query"
       },
       {
-        "current": {},
+        "current": { "selected": true, "text": "IDX_I", "value": "IDX_I" },
         "datasource": { "type": "postgres", "uid": "questdb" },
         "definition": "SELECT DISTINCT segment FROM historical_candles_1m WHERE security_id = ${security_id} LIMIT 1;",
         "description": "Auto-derived from selected instrument's historical candle data",
