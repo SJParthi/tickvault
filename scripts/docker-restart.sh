@@ -4,6 +4,8 @@
 # =============================================================================
 # Full restart: down → build → up. Use from IntelliJ run configuration.
 # Preserves volumes (data survives restart). Use docker-down.sh -v for full wipe.
+#
+# Fetches credentials from AWS SSM on every run — zero secrets on disk.
 # =============================================================================
 
 set -euo pipefail
@@ -17,18 +19,43 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${PROJECT_ROOT}/deploy/docker/docker-compose.yml"
 
-# Source SSM env vars (bootstrap must have run at least once)
-if [ -f "${PROJECT_ROOT}/data/.env.ssm" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "${PROJECT_ROOT}/data/.env.ssm"
-    set +a
-else
-    # Fallback: try bootstrap.sh if env file doesn't exist
-    echo -e "${RED}data/.env.ssm not found — run scripts/bootstrap.sh first${NC}"
+# ---------------------------------------------------------------------------
+# Fetch credentials from AWS SSM (zero secrets on disk)
+# ---------------------------------------------------------------------------
+REGION="ap-south-1"
+SSM_ENV="${ENVIRONMENT:-dev}"
+
+fetch_ssm_secret() {
+    local name="$1"
+    aws ssm get-parameter \
+        --region "${REGION}" \
+        --name "${name}" \
+        --with-decryption \
+        --output text \
+        --query "Parameter.Value" \
+        --no-cli-pager 2>/dev/null
+}
+
+if ! command -v aws > /dev/null 2>&1; then
+    echo -e "${RED}AWS CLI not found! Install: pip3 install awscli${NC}"
     exit 1
 fi
 
+if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
+    echo -e "${RED}AWS credentials not configured! Run: aws configure --region ${REGION}${NC}"
+    exit 1
+fi
+
+echo -e "${CYAN}Fetching credentials from AWS SSM...${NC}"
+export DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
+export DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
+export DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
+export DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
+export DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token")
+export DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id")
+echo -e "  ${GREEN}Done${NC}"
+
+echo ""
 echo -e "${CYAN}[1/3] Stopping all dlt-* containers...${NC}"
 docker compose -f "${COMPOSE_FILE}" down --remove-orphans
 echo -e "${GREEN}  Done${NC}"
