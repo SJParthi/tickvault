@@ -402,7 +402,7 @@
         "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
       },
       "title": "Latest Ticks — All Instruments",
-      "description": "Most recent ticks. Dhan V2 sends standard UTC epoch seconds; Grafana Asia/Kolkata timezone converts to IST for display. Auto-refreshes every 5s.",
+      "description": "Most recent ticks. Timestamps stored as IST-as-UTC; Grafana UTC timezone displays IST wall-clock directly. Auto-refreshes every 5s.",
       "type": "table",
       "targets": [
         {
@@ -475,7 +475,7 @@
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Historical Candles 1m — All Instruments",
-      "description": "1-minute historical candles from Dhan REST API. Standard UTC epoch seconds; Grafana Asia/Kolkata timezone converts to IST for display.",
+      "description": "1-minute historical candles from Dhan REST API. Timestamps stored as IST-as-UTC; Grafana UTC timezone displays IST wall-clock directly.",
       "type": "table",
       "targets": [
         {
@@ -548,7 +548,7 @@
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Live 1-Minute Candles (from Materialized View)",
-      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. IST-aligned via OFFSET 05:30.",
+      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. IST-as-UTC — no offset needed.",
       "type": "table",
       "targets": [
         {
@@ -1017,7 +1017,7 @@
   },
   "time": { "from": "now-3d", "to": "now" },
   "timepicker": {},
-  "timezone": "Asia/Kolkata",
+  "timezone": "utc",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
   "version": 6
