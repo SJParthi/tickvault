@@ -201,7 +201,7 @@
     },
     {
       "datasource": { "type": "postgres", "uid": "questdb" },
-      "description": "Historical OHLCV candlestick chart from Dhan REST API. Pick Underlying → Instrument → Timeframe from dropdowns above. 1m candles aggregated via SAMPLE BY into selected timeframe. SMA 20 overlay.",
+      "description": "Historical OHLCV candlestick chart from Dhan REST API. Pick Underlying → Instrument from dropdowns above. 1m candles queried directly. SMA 20 overlay.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -257,7 +257,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  first(open) AS open,\n  max(high) AS high,\n  min(low) AS low,\n  last(close) AS close,\n  sum(volume) AS volume\nFROM historical_candles_1m\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nSAMPLE BY ${timeframe}\nALIGN TO CALENDAR WITH OFFSET '05:30'\nORDER BY ts;",
+          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles_1m\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
           "refId": "OHLCV"
         },
         {
@@ -265,7 +265,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    last(close) AS close\n  FROM historical_candles_1m\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  SAMPLE BY ${timeframe}\n  ALIGN TO CALENDAR WITH OFFSET '05:30'\n  ORDER BY ts\n);",
+          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM historical_candles_1m\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
           "refId": "SMA",
           "hide": false
         }
