@@ -358,6 +358,8 @@ pub struct ReconciliationReport {
     pub mismatches_found: u32,
     /// Number of orders found on Dhan but missing from OMS.
     pub missing_from_oms: u32,
+    /// Number of non-terminal OMS orders not found on Dhan (ghost orders).
+    pub missing_from_dhan: u32,
     /// Order IDs that had mismatches.
     pub mismatched_order_ids: Vec<String>,
 }
@@ -456,6 +458,7 @@ mod tests {
         assert_eq!(report.total_checked, 0);
         assert_eq!(report.mismatches_found, 0);
         assert_eq!(report.missing_from_oms, 0);
+        assert_eq!(report.missing_from_dhan, 0);
         assert!(report.mismatched_order_ids.is_empty());
     }
 

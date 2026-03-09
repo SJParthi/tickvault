@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::order_types::{OrderStatus, OrderUpdate};
@@ -35,9 +36,10 @@ use super::types::{
 ///
 /// Implemented at the binary level where `TokenHandle` (core crate) is available.
 /// Uses dynamic dispatch (cold path — orders are infrequent).
+/// Returns `SecretString` to ensure zeroize-on-drop for the access token.
 pub trait TokenProvider: Send + Sync {
     /// Returns the current valid access token, or an error.
-    fn get_access_token(&self) -> Result<String, OmsError>;
+    fn get_access_token(&self) -> Result<SecretString, OmsError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +144,7 @@ impl OrderManagementSystem {
         // Step 6: Call Dhan REST API
         let response = match self
             .api_client
-            .place_order(&access_token, &dhan_request)
+            .place_order(access_token.expose_secret(), &dhan_request)
             .await
         {
             Ok(resp) => {
@@ -244,7 +246,7 @@ impl OrderManagementSystem {
 
         match self
             .api_client
-            .modify_order(&access_token, order_id, &dhan_request)
+            .modify_order(access_token.expose_secret(), order_id, &dhan_request)
             .await
         {
             Ok(()) => {
@@ -295,7 +297,11 @@ impl OrderManagementSystem {
         self.circuit_breaker.check()?;
         let access_token = self.token_provider.get_access_token()?;
 
-        match self.api_client.cancel_order(&access_token, order_id).await {
+        match self
+            .api_client
+            .cancel_order(access_token.expose_secret(), order_id)
+            .await
+        {
             Ok(()) => {
                 self.circuit_breaker.record_success();
             }
@@ -350,6 +356,20 @@ impl OrderManagementSystem {
                 return Ok(());
             }
         };
+
+        // If the update came via correlation_id with a different order_no,
+        // re-index so future updates (which may lack correlation_id) can find it.
+        if update.order_no != order_id
+            && !update.order_no.is_empty()
+            && let Some(order) = self.orders.get(&order_id).cloned()
+        {
+            self.orders.insert(update.order_no.clone(), order);
+            debug!(
+                old_order_id = %order_id,
+                new_order_no = %update.order_no,
+                "re-indexed order under new order_no from WebSocket"
+            );
+        }
 
         let new_status = match parse_order_status(&update.status) {
             Some(status) => status,
@@ -417,7 +437,10 @@ impl OrderManagementSystem {
     /// Mismatches are logged at ERROR level and corrected in local state.
     pub async fn reconcile(&mut self) -> Result<ReconciliationReport, OmsError> {
         let access_token = self.token_provider.get_access_token()?;
-        let dhan_orders = self.api_client.get_all_orders(&access_token).await?;
+        let dhan_orders = self
+            .api_client
+            .get_all_orders(access_token.expose_secret())
+            .await?;
 
         let (report, updates) = reconcile_orders(&self.orders, &dhan_orders);
 
@@ -497,8 +520,8 @@ mod tests {
     /// Test token provider that always returns a fixed token.
     struct TestTokenProvider;
     impl TokenProvider for TestTokenProvider {
-        fn get_access_token(&self) -> Result<String, OmsError> {
-            Ok("test-token".to_owned())
+        fn get_access_token(&self) -> Result<SecretString, OmsError> {
+            Ok(SecretString::from("test-token"))
         }
     }
 

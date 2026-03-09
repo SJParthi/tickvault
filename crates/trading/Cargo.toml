@@ -20,8 +20,9 @@ chrono-tz = { workspace = true }
 uuid = { workspace = true }
 governor = { workspace = true }
 reqwest = { workspace = true }
+secrecy = { workspace = true }
 
 [dev-dependencies]
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "serde", "thiserror", "tokio", "tracing", "uuid"]
+ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]

@@ -103,11 +103,28 @@ pub fn reconcile_orders(
         }
     }
 
-    if report.mismatches_found > 0 {
+    // Reverse check: find non-terminal OMS orders not present in Dhan's response.
+    // These are "ghost orders" — OMS thinks they exist, but Dhan doesn't.
+    let dhan_order_ids: std::collections::HashSet<&str> =
+        dhan_orders.iter().map(|o| o.order_id.as_str()).collect();
+
+    for (order_id, oms_order) in oms_orders {
+        if !oms_order.is_terminal() && !dhan_order_ids.contains(order_id.as_str()) {
+            warn!(
+                order_id = %order_id,
+                oms_status = %oms_order.status.as_str(),
+                "GHOST ORDER — OMS has non-terminal order not found on Dhan"
+            );
+            report.missing_from_dhan = report.missing_from_dhan.saturating_add(1);
+        }
+    }
+
+    if report.mismatches_found > 0 || report.missing_from_dhan > 0 {
         error!(
             mismatches = report.mismatches_found,
+            missing_from_dhan = report.missing_from_dhan,
             total_checked = report.total_checked,
-            "RECONCILIATION COMPLETE — mismatches found (see above for details)"
+            "RECONCILIATION COMPLETE — issues found (see above for details)"
         );
     } else {
         info!(
@@ -272,6 +289,25 @@ mod tests {
     }
 
     #[test]
+    fn ghost_order_detected() {
+        let mut oms = HashMap::new();
+        // Non-terminal order in OMS but not in Dhan response = ghost
+        oms.insert(
+            "ghost-1".to_owned(),
+            make_managed_order("ghost-1", OrderStatus::Confirmed),
+        );
+        // Terminal order in OMS but not in Dhan response = OK (already done)
+        oms.insert(
+            "done-1".to_owned(),
+            make_managed_order("done-1", OrderStatus::Traded),
+        );
+        let dhan: Vec<DhanOrderResponse> = vec![];
+
+        let (report, _updates) = reconcile_orders(&oms, &dhan);
+        assert_eq!(report.missing_from_dhan, 1); // only the non-terminal one
+    }
+
+    #[test]
     fn multiple_orders_mixed() {
         let mut oms = HashMap::new();
         oms.insert(
@@ -290,6 +326,7 @@ mod tests {
         assert_eq!(report.total_checked, 3);
         assert_eq!(report.mismatches_found, 1);
         assert_eq!(report.missing_from_oms, 1);
+        assert_eq!(report.missing_from_dhan, 0); // both OMS orders appear in Dhan
         assert_eq!(updates.len(), 1);
     }
 }
