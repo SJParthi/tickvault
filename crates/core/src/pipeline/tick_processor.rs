@@ -481,10 +481,11 @@ pub async fn run_tick_processor(
 
             // Sweep stale candles and persist completed 1s candles to QuestDB
             if let Some(ref mut agg) = candle_aggregator {
-                // Candle timestamps are IST-naive epoch seconds (Dhan convention),
-                // so compare against IST-naive "now" to detect stale candles correctly.
-                let now_secs =
-                    (chrono::Utc::now().timestamp() + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
+                // Reuse received_at_nanos from line 179 instead of a second Utc::now() syscall.
+                // Convert nanoseconds → IST-naive epoch seconds for candle sweep comparison.
+                // received_at_nanos is UTC nanos; add IST offset to match Dhan's IST-naive convention.
+                let now_secs = ((received_at_nanos / 1_000_000_000)
+                    + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
                 agg.sweep_stale(now_secs);
                 let completed = agg.drain_completed();
                 if !completed.is_empty() {
