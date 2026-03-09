@@ -21,7 +21,7 @@ pub struct ParsedTick {
     pub last_traded_price: f32,
     /// Last trade quantity (from Quote/Full packets; 0 for Ticker).
     pub last_trade_quantity: u16,
-    /// Exchange timestamp as epoch seconds (UTC).
+    /// Exchange timestamp as IST-naive epoch seconds (Dhan sends IST clock as if UTC).
     pub exchange_timestamp: u32,
     /// Local receive timestamp in nanoseconds since Unix epoch (for latency measurement).
     pub received_at_nanos: i64,

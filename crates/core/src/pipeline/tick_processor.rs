@@ -17,7 +17,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 use dhan_live_trader_common::constants::{
-    DEDUP_RING_BUFFER_POWER, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
+    DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
 };
 use dhan_live_trader_common::tick_types::ParsedTick;
 
@@ -481,7 +481,10 @@ pub async fn run_tick_processor(
 
             // Sweep stale candles and persist completed 1s candles to QuestDB
             if let Some(ref mut agg) = candle_aggregator {
-                let now_secs = chrono::Utc::now().timestamp() as u32;
+                // Candle timestamps are IST-naive epoch seconds (Dhan convention),
+                // so compare against IST-naive "now" to detect stale candles correctly.
+                let now_secs =
+                    (chrono::Utc::now().timestamp() + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
                 agg.sweep_stale(now_secs);
                 let completed = agg.drain_completed();
                 if !completed.is_empty() {
