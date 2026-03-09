@@ -23,7 +23,10 @@ use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    CANDLE_FLUSH_BATCH_SIZE, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+    CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
+    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
+    EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
+    QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
@@ -37,17 +40,20 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// DEDUP UPSERT KEY column for the candles table.
 const DEDUP_KEY_CANDLES: &str = "security_id";
 
-/// Maps binary exchange_segment_code to string for ILP SYMBOL column.
+/// Maps the binary exchange_segment_code to a human-readable symbol name.
+///
+/// Uses the same mapping as the Dhan Python SDK.
+/// Note: code 6 is unused/skipped in Dhan's protocol.
 fn segment_code_to_str(code: u8) -> &'static str {
     match code {
-        0 => "IDX_I",
-        1 => "NSE_EQ",
-        2 => "NSE_FNO",
-        3 => "NSE_CURRENCY",
-        4 => "BSE_EQ",
-        5 => "MCX_COMM",
-        6 => "BSE_CURRENCY",
-        7 => "BSE_FNO",
+        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
+        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
+        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
+        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
+        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
+        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
+        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
+        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
         _ => "UNKNOWN",
     }
 }
@@ -372,13 +378,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_segment_code_to_str_nse_fno() {
-        assert_eq!(segment_code_to_str(2), "NSE_FNO");
+    fn test_segment_code_to_str_all_valid_codes() {
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_IDX_I), "IDX_I");
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ), "NSE_EQ");
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_NSE_FNO), "NSE_FNO");
+        assert_eq!(
+            segment_code_to_str(EXCHANGE_SEGMENT_NSE_CURRENCY),
+            "NSE_CURRENCY"
+        );
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_BSE_EQ), "BSE_EQ");
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_MCX_COMM), "MCX_COMM");
+        assert_eq!(
+            segment_code_to_str(EXCHANGE_SEGMENT_BSE_CURRENCY),
+            "BSE_CURRENCY"
+        );
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_BSE_FNO), "BSE_FNO");
     }
 
     #[test]
     fn test_segment_code_to_str_unknown() {
         assert_eq!(segment_code_to_str(255), "UNKNOWN");
+        // Code 6 is unused in Dhan protocol — must map to UNKNOWN
+        assert_eq!(segment_code_to_str(6), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_segment_code_bse_fno_is_8_not_7() {
+        // Regression: BSE_FNO is code 8, not 7. Code 6 is skipped in Dhan protocol.
+        assert_eq!(EXCHANGE_SEGMENT_BSE_FNO, 8);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_CURRENCY, 7);
+        assert_eq!(segment_code_to_str(8), "BSE_FNO");
+        assert_eq!(segment_code_to_str(7), "BSE_CURRENCY");
     }
 
     #[test]
