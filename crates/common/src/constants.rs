@@ -954,10 +954,11 @@ pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
 /// Calendar alignment offset for QuestDB materialized views.
 ///
-/// Dhan sends IST epoch seconds — stored as-is in QuestDB (no UTC conversion).
-/// Since the data already represents IST wall-clock time, no calendar offset
-/// is needed. Offset "00:00" gives clean hour/day boundaries (09:00, 10:00, …).
-pub const QUESTDB_IST_ALIGN_OFFSET: &str = "00:00";
+/// Dhan V2 sends standard UTC epoch seconds stored in QuestDB as UTC.
+/// IST = UTC + 5:30, so daily/hourly boundaries must be offset by "05:30"
+/// to align candle boundaries to IST wall-clock time (e.g., daily candle
+/// starts at 00:00 IST = 18:30 UTC previous day).
+pub const QUESTDB_IST_ALIGN_OFFSET: &str = "05:30";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants

@@ -1,9 +1,9 @@
 //! QuestDB materialized views for multi-timeframe candle aggregation.
 //!
 //! Creates the `candles_1s` base table and 18 materialized views covering
-//! timeframes from 5 seconds to 1 month. Dhan timestamps are IST epoch
-//! seconds stored as-is — no UTC conversion. Views use `OFFSET '00:00'`
-//! since the data already represents IST wall-clock time.
+//! timeframes from 5 seconds to 1 month. Dhan V2 sends standard UTC epoch
+//! seconds. Views use `OFFSET '05:30'` so candle boundaries align to IST
+//! wall-clock time (IST = UTC + 5:30).
 //!
 //! Timeframes 20-21 (3 months, 1 year) are computed in Rust from monthly data.
 //!
@@ -199,7 +199,7 @@ const VIEW_DEFS: &[ViewDef] = &[
 
 /// Builds the CREATE MATERIALIZED VIEW SQL for a given view definition.
 ///
-/// Data is IST epoch — no offset needed since boundaries already align to IST.
+/// Data is standard UTC epoch — offset '05:30' aligns boundaries to IST.
 fn build_view_sql(def: &ViewDef) -> String {
     let tick_count_select = if def.has_tick_count {
         ", sum(tick_count) AS tick_count"
@@ -354,11 +354,11 @@ mod tests {
     }
 
     #[test]
-    fn build_view_sql_includes_zero_offset() {
-        // IST epoch data needs no calendar offset — boundaries already align to IST.
+    fn build_view_sql_includes_ist_offset() {
+        // UTC data needs '05:30' offset so candle boundaries align to IST.
         let def = &VIEW_DEFS[0]; // candles_5s
         let sql = build_view_sql(def);
-        assert!(sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:00'"));
+        assert!(sql.contains("ALIGN TO CALENDAR WITH OFFSET '05:30'"));
         assert!(sql.contains("SAMPLE BY 5s"));
         assert!(sql.contains("FROM candles_1s"));
         assert!(sql.contains("candles_5s"));
