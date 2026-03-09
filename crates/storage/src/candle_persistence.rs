@@ -26,7 +26,7 @@ use dhan_live_trader_common::constants::{
     CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
@@ -204,7 +204,11 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        let ts_nanos = TimestampNanos::new(i64::from(timestamp_secs).saturating_mul(1_000_000_000));
+        // Dhan V2 sends exchange_timestamp as IST-naive epoch seconds.
+        // Subtract IST offset (5h30m = 19800s) to store as proper UTC,
+        // matching the tick persistence convention.
+        let utc_epoch_secs = i64::from(timestamp_secs).saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+        let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1S)
