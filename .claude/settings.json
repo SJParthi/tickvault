@@ -90,15 +90,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "FILE=$(cat | jq -r '.tool_input.file_path // empty'); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.rs$'; then rustfmt \"$FILE\" 2>/dev/null || true; fi"
-          }
-        ]
-      },
-      {
         "matcher": "Bash",
         "hooks": [
           {
@@ -119,16 +110,7 @@
         ]
       }
     ],
-    "SubagentStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo 'SUBAGENT: Rust 2024 O(1) trading system. Principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned.'"
-          }
-        ]
-      }
-    ],
+    "SubagentStart": [],
     "PreCompact": [
       {
         "hooks": [

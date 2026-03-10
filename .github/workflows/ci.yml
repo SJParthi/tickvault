@@ -11,8 +11,8 @@
 #
 # Jobs:
 #   1. Build & Verify — compile + fmt + clippy + docs + typos + machete + test
-#   2. Security & Audit — cargo deny + cargo audit (parallel after Job 1)
-#   3. Coverage & Perf — llvm-cov + bench + DHAT (push to main only)
+#   2. Security & Audit — cargo deny + cargo audit (PARALLEL with Job 1 — no build needed)
+#   3. Coverage & Perf — llvm-cov + bench + DHAT (push to main only, after Job 1)
 #   + Commit Lint (PR only, lightweight, parallel)
 #
 # Checks preserved (all 14):
@@ -193,10 +193,9 @@ jobs:
           path: /tmp/test-output.txt
           retention-days: 7
 
-  # ---- Job 2: Security & Audit (parallel after build-and-verify) ----
+  # ---- Job 2: Security & Audit (parallel — no build artifacts needed) ----
   security-and-audit:
     name: "Security & Audit"
-    needs: build-and-verify
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10

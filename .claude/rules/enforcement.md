@@ -8,7 +8,9 @@ paths:
 
 ## Active Hooks (simplified until AWS deployment)
 - **PreToolUse (Edit|Write):** block-env-files.sh — prevents .env file creation
-- **PostToolUse (Edit|Write):** rustfmt auto-format on .rs files
+- **PostToolUse (Edit|Write):** REMOVED — pre-commit gate enforces fmt; no per-edit rustfmt
+- **SubagentStart:** REMOVED — principles already in CLAUDE.md context
+- **Pre-push (7 fast gates):** fmt, banned patterns, secrets, test-count ratchet, data integrity, pub fn test, financial test (CI handles clippy/test/audit/deny/coverage/loom)
 - **Pre-PR (5 gates):** branch check, naming, clean tree, quality state, commit format
 - **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage)
 
@@ -51,14 +53,14 @@ Background daemon (`auto-save-remote.sh`) launched at SessionStart via `session-
 
 - **Namespace:** `refs/auto-save/<branch-safe>-<session-id>/latest` + timestamped refs
 - **Mechanism:** git plumbing (`commit-tree`, `write-tree`, `update-ref`) — zero disruption to working tree/index/HEAD
-- **Push frequency:** Every 6 min (3rd snapshot cycle) + on daemon exit
+- **Push frequency:** Every 15 min (3rd snapshot cycle at 5-min intervals) + on daemon exit
 - **Retention:** Latest ref (always) + last 3 timestamped refs (pruned beyond)
 - **Cleanup:** Pre-push gate deletes auto-save refs on successful quality-gated push
 - **Hook bypass:** Runs as background process (nohup), NOT through Claude Code tool pipeline — hooks don't fire by design
 - **Recovery:** `.claude/hooks/recover-wip.sh` (list/diff/apply/restore/clean)
 - **Orphan detection:** `session-sanity.sh` checks for remote auto-save refs on session start, warns if found
 
-Worst-case data loss: ≤6 minutes (machine SIGKILL with no trap).
+Worst-case data loss: ≤15 minutes (machine SIGKILL with no trap). Local stash layer (auto-save-watchdog.sh) still covers 2-minute intervals.
 
 ### Session Collision Detection
 - **At startup:** `session-sanity.sh` fetches remote `refs/auto-save/*`, compares branch names, warns if another session is active on same branch with file overlap

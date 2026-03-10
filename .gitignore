@@ -63,6 +63,7 @@ fuzz/target/
 .claude/hooks/.coverage-baseline
 .claude/hooks/.untested-pubfn-baseline
 .claude/hooks/.financial-test-baseline
+.claude/hooks/.last-session-check
 quality/.binary-size-baseline
 
 # ---- Auto-save watchdog (runtime state) ----
@@ -75,6 +76,8 @@ quality/.binary-size-baseline
 .claude/hooks/.auto-save-index
 .claude/hooks/.conflict-warning
 .claude/hooks/.collision-detected
+.claude/hooks/.session-network.log
+.claude/hooks/.push-in-progress
 
 # ---- Temporary files ----
 *.tmp

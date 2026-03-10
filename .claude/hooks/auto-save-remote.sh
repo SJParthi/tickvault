@@ -22,9 +22,9 @@ CWD="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 cd "$CWD" || exit 1
 
 # ── Config ──────────────────────────────────────────────────────
-INTERVAL_SECONDS=120          # Snapshot every 2 minutes
+INTERVAL_SECONDS=300          # Snapshot every 5 minutes (was 2 — reduces git contention)
 MIN_CHANGED_FILES=1           # Minimum dirty files to trigger
-PUSH_EVERY_NTH=3              # Push every Nth snapshot (~6 min)
+PUSH_EVERY_NTH=3              # Push every Nth snapshot (~15 min)
 MAX_TIMESTAMPED=3             # Keep only latest N timestamped refs
 PID_FILE="$CWD/.claude/hooks/.remote-watchdog.pid"
 LOG_FILE="$CWD/.claude/hooks/.remote-watchdog.log"
