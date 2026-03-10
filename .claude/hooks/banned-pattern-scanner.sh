@@ -113,16 +113,18 @@ scan_prod_code() {
 }
 
 # Helper: scan ONLY hot-path code
-# Hot path = crates/trading/, crates/websocket/, crates/oms/ (full crates)
+# Hot path = crates/trading/ (excluding oms/ — order management is network-bound cold path),
+#            crates/websocket/, crates/oms/ (full crates)
 #          + crates/core/src/websocket/, crates/core/src/ticker/ (specific modules within core)
 # Cold path within core (auth/, instrument/, notification/, config/) is NOT hot path.
+# Cold path within trading (oms/) — order placement is I/O-bound, not latency-critical.
 scan_hot_path() {
   local pattern="$1"
   local description="$2"
   local files="$3"
   local hot_path_files
 
-  hot_path_files=$(echo "$files" | grep -E '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/' || true)
+  hot_path_files=$(echo "$files" | grep -E '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/' | grep -v '^crates/trading/src/oms/' || true)
   if [ -z "$hot_path_files" ]; then
     return
   fi

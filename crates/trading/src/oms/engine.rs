@@ -224,7 +224,7 @@ impl OrderManagementSystem {
         };
 
         // Step 6: Create ManagedOrder with status from Dhan response.
-        // Dhan can return TRADED or REJECTED immediately; default to Transit if unparseable.
+        // Dhan can return TRADED or REJECTED immediately; default to Transit if unparsable.
         let initial_status =
             parse_order_status(&response.order_status).unwrap_or(OrderStatus::Transit);
 
