@@ -88,13 +88,13 @@ async fn execute_query(sql: &str) -> QuestDbResponse {
     );
 
     // Check for QuestDB error envelope
-    if let Ok(error_resp) = serde_json::from_str::<QuestDbError>(&body) {
-        if !error_resp.error.is_empty() {
-            panic!(
-                "QuestDB SQL error at position {}: {}\nQuery: {sql}",
-                error_resp.position, error_resp.error
-            );
-        }
+    if let Ok(error_resp) = serde_json::from_str::<QuestDbError>(&body)
+        && !error_resp.error.is_empty()
+    {
+        panic!(
+            "QuestDB SQL error at position {}: {}\nQuery: {sql}",
+            error_resp.position, error_resp.error
+        );
     }
 
     serde_json::from_str::<QuestDbResponse>(&body)
