@@ -1,56 +1,259 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Pre-Push Hook
+# dhan-live-trader — Pre-Push Hook (Comprehensive)
 # =============================================================================
-# Runs before every push. Blocks push if any check fails.
-# Checks: compilation, tests, security audit.
-# Heavier than pre-commit — ensures nothing broken reaches GitHub.
+# Final safety net before code leaves the machine. Blocks push on failure.
+# Calls .claude/hooks/ scanners for banned patterns, test count guard.
+#
+# DEDUP: If pre-commit gate passed for same HEAD within 5 min,
+# gates 1-5 are SKIPPED. Only push-only gates run.
+#
+# Gate order:
+#   1. cargo fmt --check          [skippable if commit-verified]
+#   2. cargo clippy -D warnings   [skippable if commit-verified]
+#   3. cargo test (full workspace) [skippable if commit-verified]
+#   4. Banned pattern scan (full)  [skippable if commit-verified]
+#   5. Test count guard            [skippable if commit-verified]
+#   6. cargo audit (CVEs + yanked)
+#   7. cargo deny check (license + advisory)
+#   8. Coverage ratchet guard
+#   9. Loom concurrency tests
+#
 # Install: git config core.hooksPath scripts/git-hooks
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+PROJECT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"
+CLAUDE_HOOKS="$PROJECT_DIR/.claude/hooks"
 
-echo "=== Pre-push checks ==="
+cd "$PROJECT_DIR" || { echo "  FAIL: Cannot cd to $PROJECT_DIR" >&2; exit 1; }
 
-# --- Stage 1: Compile ---
-echo -n "  Compiling workspace... "
-if cargo check --workspace > /dev/null 2>&1; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FAILED${NC}"
-    echo ""
-    echo "  Compilation failed. Fix errors before pushing."
-    echo ""
-    exit 1
+# Check if any .rs files exist
+RS_EXISTS=$(find crates -name '*.rs' 2>/dev/null | head -1)
+if [ -z "$RS_EXISTS" ]; then
+  exit 0
 fi
 
-# --- Stage 2: Tests ---
-echo -n "  Running tests... "
-if cargo test --workspace > /dev/null 2>&1; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FAILED${NC}"
-    echo ""
-    echo "  Tests failed. Fix failing tests before pushing."
-    echo ""
-    exit 1
+FAILED=0
+
+# ─────────────────────────────────────────────
+# DEDUP CHECK: Did pre-commit gate already pass for this HEAD?
+# ─────────────────────────────────────────────
+STATE_FILE="$CLAUDE_HOOKS/.last-quality-pass"
+HEAD_CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+HEAD_PARENT=$(git rev-parse HEAD~1 2>/dev/null || echo "unknown")
+COMMIT_VERIFIED=false
+AGE=0
+
+if [ -f "$STATE_FILE" ]; then
+  SAVED_HASH=$(awk '{print $1}' "$STATE_FILE")
+  SAVED_TIME=$(awk '{print $2}' "$STATE_FILE")
+  NOW=$(date +%s)
+  AGE=$(( NOW - SAVED_TIME ))
+
+  if { [ "$SAVED_HASH" = "$HEAD_CURRENT" ] || [ "$SAVED_HASH" = "$HEAD_PARENT" ]; } && [ "$AGE" -lt 300 ]; then
+    COMMIT_VERIFIED=true
+  fi
 fi
 
-# --- Stage 3: Security Audit (if cargo-audit is installed) ---
-echo -n "  Security audit... "
-if command -v cargo-audit > /dev/null 2>&1; then
-    if cargo audit > /dev/null 2>&1; then
-        echo -e "${GREEN}OK${NC}"
+if [ "$COMMIT_VERIFIED" = "true" ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  PRE-PUSH (FAST — commit-verified ${AGE}s ago) ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+  echo "  [1-5/9] SKIP: Already verified by pre-commit gate" >&2
+else
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║        PRE-PUSH SAFETY NET (9 Gates)          ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+
+  # Gate 1: cargo fmt
+  echo "  [1/9] cargo fmt --check..." >&2
+  FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
+  FMT_EXIT=$?
+  if [ "$FMT_EXIT" -eq 124 ]; then
+    echo "  FAIL: cargo fmt timed out (60s)" >&2
+    FAILED=1
+  elif [ "$FMT_EXIT" -ne 0 ]; then
+    echo "  FAIL: Code not formatted:" >&2
+    echo "$FMT_OUT" | tail -10 >&2
+    FAILED=1
+  else
+    echo "  PASS: cargo fmt" >&2
+  fi
+
+  # Gate 2: cargo clippy
+  echo "  [2/9] cargo clippy..." >&2
+  CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+  CLIPPY_EXIT=$?
+  if [ "$CLIPPY_EXIT" -eq 124 ]; then
+    echo "  FAIL: cargo clippy timed out (120s)" >&2
+    FAILED=1
+  elif [ "$CLIPPY_EXIT" -ne 0 ]; then
+    echo "  FAIL: clippy warnings found:" >&2
+    echo "$CLIPPY_OUT" | tail -20 >&2
+    FAILED=1
+  else
+    echo "  PASS: cargo clippy (zero warnings)" >&2
+  fi
+
+  # Gate 3: cargo test
+  echo "  [3/9] cargo test..." >&2
+  TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
+  TEST_EXIT=$?
+  if [ "$TEST_EXIT" -eq 124 ]; then
+    echo "  FAIL: cargo test timed out (120s)" >&2
+    FAILED=1
+  elif [ "$TEST_EXIT" -ne 0 ]; then
+    echo "  FAIL: cargo test failed:" >&2
+    echo "$TEST_OUT" | tail -20 >&2
+    FAILED=1
+  else
+    echo "  PASS: cargo test" >&2
+  fi
+
+  # Gate 4: Banned pattern scan (full workspace)
+  echo "  [4/9] Banned pattern scan (full workspace)..." >&2
+  ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
+  if [ -n "$ALL_RS" ] && [ -x "$CLAUDE_HOOKS/banned-pattern-scanner.sh" ]; then
+    if ! timeout 60 "$CLAUDE_HOOKS/banned-pattern-scanner.sh" "$PROJECT_DIR" "$ALL_RS" > /dev/null 2>&1; then
+      echo "  FAIL: Banned patterns in workspace" >&2
+      FAILED=1
     else
-        echo -e "${YELLOW}WARNINGS${NC} (check cargo audit output)"
+      echo "  PASS: Banned pattern scan" >&2
     fi
-else
-    echo -e "${YELLOW}SKIPPED${NC} (cargo-audit not installed — run bootstrap.sh)"
+  else
+    echo "  SKIP: Scanner not available" >&2
+  fi
+
+  # Gate 5: Test count guard
+  echo "  [5/9] Test count guard..." >&2
+  if [ -x "$CLAUDE_HOOKS/test-count-guard.sh" ]; then
+    if ! timeout 30 "$CLAUDE_HOOKS/test-count-guard.sh" "$PROJECT_DIR" 2>&1; then
+      FAILED=1
+    fi
+  else
+    echo "  SKIP: test-count-guard.sh not found" >&2
+  fi
 fi
 
-echo -e "=== All pre-push checks ${GREEN}PASSED${NC} ==="
+# ─────────────────────────────────────────────
+# Gates 6-9: Push-only gates (always run)
+# ─────────────────────────────────────────────
+
+# Gate 6: cargo audit
+echo "  [6/9] cargo audit (CVEs + yanked)..." >&2
+if command -v cargo-audit > /dev/null 2>&1; then
+  AUDIT_OUT=$(timeout 30 cargo audit --deny yanked 2>&1)
+  AUDIT_EXIT=$?
+  if [ "$AUDIT_EXIT" -eq 124 ]; then
+    echo "  FAIL: cargo audit timed out (30s)" >&2
+    FAILED=1
+  elif echo "$AUDIT_OUT" | grep -q "couldn't fetch advisory database"; then
+    echo "  SKIP: Cannot reach advisory database (network)" >&2
+  elif [ "$AUDIT_EXIT" -ne 0 ]; then
+    echo "  FAIL: cargo audit found issues:" >&2
+    echo "$AUDIT_OUT" | tail -15 >&2
+    FAILED=1
+  else
+    echo "  PASS: cargo audit" >&2
+  fi
+else
+  echo "  SKIP: cargo-audit not installed" >&2
+fi
+
+# Gate 7: cargo deny
+echo "  [7/9] cargo deny..." >&2
+if command -v cargo-deny > /dev/null 2>&1; then
+  DENY_OUTPUT=$(timeout 30 cargo deny check 2>&1)
+  DENY_EXIT=$?
+  if [ "$DENY_EXIT" -eq 124 ]; then
+    echo "  FAIL: cargo deny timed out (30s)" >&2
+    FAILED=1
+  elif [ "$DENY_EXIT" -ne 0 ]; then
+    if echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect'; then
+      echo "  SKIP: cargo deny cannot reach advisory DB (network). CI will enforce." >&2
+    else
+      echo "  FAIL: cargo deny found issues" >&2
+      FAILED=1
+    fi
+  else
+    echo "  PASS: cargo deny" >&2
+  fi
+else
+  echo "  SKIP: cargo-deny not installed" >&2
+fi
+
+# Gate 8: Coverage ratchet guard
+echo "  [8/9] Coverage ratchet guard..." >&2
+if [ -x "$CLAUDE_HOOKS/coverage-guard.sh" ]; then
+  if command -v cargo-llvm-cov > /dev/null 2>&1; then
+    COV_OUT=$(timeout 180 "$CLAUDE_HOOKS/coverage-guard.sh" "$PROJECT_DIR" 2>&1)
+    COV_EXIT=$?
+    if [ "$COV_EXIT" -eq 124 ]; then
+      echo "  FAIL: Coverage guard timed out (180s)" >&2
+      FAILED=1
+    elif [ "$COV_EXIT" -ne 0 ]; then
+      echo "$COV_OUT" >&2
+      FAILED=1
+    else
+      echo "$COV_OUT" >&2
+    fi
+  else
+    echo "  SKIP: cargo-llvm-cov not installed" >&2
+  fi
+else
+  echo "  SKIP: coverage-guard.sh not found" >&2
+fi
+
+# Gate 9: Loom concurrency tests
+echo "  [9/9] Loom concurrency tests (hot-path crates)..." >&2
+HOT_CRATES="core trading"
+LOOM_FOUND=false
+for crate in $HOT_CRATES; do
+  if grep -r 'loom' "crates/$crate/" --include='*.rs' -q 2>/dev/null; then
+    LOOM_FOUND=true
+    echo "  Running loom tests for crates/$crate..." >&2
+    LOOM_OUT=$(timeout 300 env RUSTFLAGS="--cfg loom" cargo test -p "dhan-$crate" --lib 2>&1)
+    LOOM_EXIT=$?
+    if [ "$LOOM_EXIT" -eq 124 ]; then
+      echo "  FAIL: Loom tests timed out (300s) for $crate" >&2
+      FAILED=1
+    elif [ "$LOOM_EXIT" -ne 0 ]; then
+      echo "  FAIL: Loom tests failed for $crate:" >&2
+      echo "$LOOM_OUT" | tail -20 >&2
+      FAILED=1
+    else
+      echo "  PASS: Loom tests for $crate" >&2
+    fi
+  fi
+done
+if [ "$LOOM_FOUND" = "false" ]; then
+  echo "  SKIP: No loom tests in hot-path crates yet" >&2
+fi
+
+# ─────────────────────────────────────────────
+# FINAL VERDICT
+# ─────────────────────────────────────────────
+echo "" >&2
+if [ "$FAILED" -ne 0 ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  PUSH BLOCKED — Fix issues above             ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+  exit 1
+fi
+
+# Update state file
+TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
+echo "$HEAD_CURRENT $(date +%s) $TEST_COUNT" > "$CLAUDE_HOOKS/.last-quality-pass"
+
+if [ "$COMMIT_VERIFIED" = "true" ]; then
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  PUSH ALLOWED (fast path — 4 gates only)     ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+else
+  echo "╔══════════════════════════════════════════════╗" >&2
+  echo "║  ALL 9 GATES PASSED — Push allowed            ║" >&2
+  echo "╚══════════════════════════════════════════════╝" >&2
+fi
+exit 0

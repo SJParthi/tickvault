@@ -6,40 +6,41 @@
 #   <type>(<scope>): <description>
 #
 # Valid types: feat, fix, refactor, test, docs, chore, perf, security
+# Optional [Phase N] prefix allowed.
 # Install: git config core.hooksPath scripts/git-hooks
 # =============================================================================
 
 set -euo pipefail
 
 COMMIT_MSG_FILE="$1"
-COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+FIRST_LINE=$(head -1 "$COMMIT_MSG_FILE")
 
 # Allow merge commits and revert commits
-if echo "$COMMIT_MSG" | grep -qE "^(Merge|Revert) "; then
+if echo "$FIRST_LINE" | grep -qE "^(Merge|Revert) "; then
     exit 0
 fi
 
 # Conventional commit pattern: type(scope): description
 # Also allows type: description (without scope) for simple commits
 # Optional [Phase N] prefix per CLAUDE.md convention
-PATTERN="^(\[Phase [0-9]+\] )?(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_-]+\))?: .+"
+PATTERN="^(\[Phase [0-9]+\] )?(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+"
 
-if ! echo "$COMMIT_MSG" | head -1 | grep -qE "$PATTERN"; then
-    echo ""
-    echo "  ERROR: Commit message does not follow conventional format."
-    echo ""
-    echo "  Expected: <type>(<scope>): <description>"
-    echo ""
-    echo "  Valid types: feat, fix, refactor, test, docs, chore, perf, security"
-    echo ""
-    echo "  Examples:"
-    echo "    feat(websocket): implement Dhan V2 binary frame parser"
-    echo "    fix(oms): handle partial fill state transition correctly"
-    echo "    test(binary-parser): add fuzz tests for malformed packets"
-    echo "    chore(deps): pin tokio to version from Tech Stack Bible V6"
-    echo "    docs: update README with bootstrap instructions"
-    echo ""
-    echo "  Your message: $(head -1 "$COMMIT_MSG_FILE")"
-    echo ""
+if ! echo "$FIRST_LINE" | head -1 | grep -qE "$PATTERN"; then
+    echo "" >&2
+    echo "╔══════════════════════════════════════════════╗" >&2
+    echo "║  COMMIT BLOCKED — Bad commit message format   ║" >&2
+    echo "╚══════════════════════════════════════════════╝" >&2
+    echo "" >&2
+    echo "  Expected: <type>(<scope>): <description>" >&2
+    echo "  Types:    feat, fix, refactor, test, docs, chore, perf, security" >&2
+    echo "" >&2
+    echo "  Examples:" >&2
+    echo "    feat(websocket): implement Dhan V2 binary frame parser" >&2
+    echo "    fix(oms): handle partial fill state transition correctly" >&2
+    echo "    test(binary-parser): add fuzz tests for malformed packets" >&2
+    echo "    chore(deps): pin tokio to version from Tech Stack Bible V6" >&2
+    echo "" >&2
+    echo "  Your message: $FIRST_LINE" >&2
+    echo "" >&2
     exit 1
 fi
