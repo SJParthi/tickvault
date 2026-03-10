@@ -37,11 +37,16 @@ scan_pattern() {
     fi
 
     # If hot-path only, filter to actual hot-path code:
-    # Full crates: trading/, websocket/, oms/
+    # Full crates: trading/ (excl. oms/), websocket/, oms/
     # Core submodules: core/src/websocket/, core/src/ticker/
     # NOT: core/src/auth/, core/src/instrument/, core/src/notification/ (cold path)
+    # NOT: trading/src/oms/ (order management is network-bound cold path)
     if [ "$is_hot_path" = "true" ]; then
       if ! echo "$file" | grep -qE '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/'; then
+        continue
+      fi
+      # OMS is order management — I/O-bound, not latency-critical
+      if echo "$file" | grep -qE '^crates/trading/src/oms/'; then
         continue
       fi
     fi

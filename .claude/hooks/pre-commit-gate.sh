@@ -6,11 +6,12 @@
 # FAST gates only (< 5s total):
 #   1. cargo fmt --check
 #   2. Banned pattern scanner
-#   3. O(1) latency & dedup scanner
-#   4. Secret scanner
-#   5. Cargo.toml version pinning
-#   6. Commit message format
-#   7. Typos check
+#   3. Data integrity guard (price precision)
+#   4. O(1) latency & dedup scanner
+#   5. Secret scanner
+#   6. Cargo.toml version pinning
+#   7. Commit message format
+#   8. Typos check
 #
 # Heavy gates (clippy, test, audit, deny) run on PUSH only.
 # ALL gates must pass. One failure = commit blocked.
@@ -31,7 +32,7 @@ if [ -z "$CWD" ]; then
   CWD="."
 fi
 
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "  FAIL: Cannot cd to $CWD" >&2; exit 2; }
 
 # Check if any .rs files are staged
 RS_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\.rs$' || true)
@@ -46,7 +47,7 @@ HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║      PRE-COMMIT FAST GATE (7 Gates)          ║" >&2
+echo "║      PRE-COMMIT FAST GATE (8 Gates)          ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
 # ─────────────────────────────────────────────
@@ -54,11 +55,12 @@ echo "╚═══════════════════════�
 # ─────────────────────────────────────────────
 if [ -n "$RS_STAGED" ]; then
 
-  echo "  [1/7] cargo fmt --check..." >&2
+  echo "  [1/8] cargo fmt --check..." >&2
   FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
   if [ "$FMT_EXIT" -eq 124 ]; then
-    echo "  SKIP: cargo fmt timed out (60s)" >&2
+    echo "  FAIL: cargo fmt timed out (60s) — treating as failure" >&2
+    FAILED=1
   elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo fmt check failed:" >&2
     echo "$FMT_OUT" | tail -20 >&2
@@ -69,36 +71,66 @@ if [ -n "$RS_STAGED" ]; then
   fi
 
   # Gate 2: Banned pattern scanner
-  echo "  [2/7] Banned pattern scan..." >&2
-  if ! echo "$RS_STAGED" | "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$RS_STAGED" 2>&1; then
+  echo "  [2/8] Banned pattern scan..." >&2
+  SCAN_OUT=$(timeout 30 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$RS_STAGED" 2>&1)
+  SCAN_EXIT=$?
+  if [ "$SCAN_EXIT" -eq 124 ]; then
+    echo "  FAIL: Banned pattern scanner timed out (30s)" >&2
+    FAILED=1
+  elif [ "$SCAN_EXIT" -ne 0 ]; then
+    echo "$SCAN_OUT" >&2
     FAILED=1
   fi
 
-  # Gate 3: O(1) latency & dedup scanner
-  echo "  [3/7] O(1) latency & dedup scan..." >&2
-  if ! echo "$RS_STAGED" | "$HOOKS_DIR/dedup-latency-scanner.sh" "$CWD" "$RS_STAGED" 2>&1; then
+  # Gate 3: Data integrity guard (price precision preservation)
+  echo "  [3/8] Data integrity guard..." >&2
+  INTEGRITY_OUT=$(timeout 30 "$HOOKS_DIR/data-integrity-guard.sh" "$CWD" "$RS_STAGED" 2>&1)
+  INTEGRITY_EXIT=$?
+  if [ "$INTEGRITY_EXIT" -eq 124 ]; then
+    echo "  FAIL: Data integrity guard timed out (30s)" >&2
+    FAILED=1
+  elif [ "$INTEGRITY_EXIT" -ne 0 ]; then
+    echo "$INTEGRITY_OUT" >&2
+    FAILED=1
+  fi
+
+  # Gate 4: O(1) latency & dedup scanner
+  echo "  [4/8] O(1) latency & dedup scan..." >&2
+  DEDUP_OUT=$(timeout 30 "$HOOKS_DIR/dedup-latency-scanner.sh" "$CWD" "$RS_STAGED" 2>&1)
+  DEDUP_EXIT=$?
+  if [ "$DEDUP_EXIT" -eq 124 ]; then
+    echo "  FAIL: O(1) latency scanner timed out (30s)" >&2
+    FAILED=1
+  elif [ "$DEDUP_EXIT" -ne 0 ]; then
+    echo "$DEDUP_OUT" >&2
     FAILED=1
   fi
 
 else
-  echo "  [1/7] No .rs files staged — skipping fmt" >&2
-  echo "  [2-3/7] No .rs files staged — skipping Rust scanners" >&2
+  echo "  [1/8] No .rs files staged — skipping fmt" >&2
+  echo "  [2-4/8] No .rs files staged — skipping Rust scanners" >&2
 fi
 
 # ─────────────────────────────────────────────
-# GATE 4: Secret scanner (runs on ALL staged files, not just .rs)
+# GATE 5: Secret scanner (runs on ALL staged files, not just .rs)
 # ─────────────────────────────────────────────
-echo "  [4/7] Secret scan..." >&2
-if ! echo "$ALL_STAGED" | "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1; then
+echo "  [5/8] Secret scan..." >&2
+SECRET_OUT=$(timeout 30 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1)
+SECRET_EXIT=$?
+if [ "$SECRET_EXIT" -eq 124 ]; then
+  echo "  FAIL: Secret scanner timed out (30s)" >&2
+  FAILED=1
+elif [ "$SECRET_EXIT" -ne 0 ]; then
+  echo "$SECRET_OUT" >&2
   FAILED=1
 fi
 
 # ─────────────────────────────────────────────
-# GATE 5: Cargo.toml version pinning (no ^, ~, *, >= in deps)
+# GATE 6: Cargo.toml version pinning (no ^, ~, *, >= in deps)
 # ─────────────────────────────────────────────
 TOML_STAGED=$(echo "$ALL_STAGED" | grep 'Cargo\.toml$' || true)
 if [ -n "$TOML_STAGED" ]; then
-  echo "  [5/7] Cargo.toml version pinning check..." >&2
+  echo "  [6/8] Cargo.toml version pinning check..." >&2
   TOML_VIOLATIONS=0
   while IFS= read -r toml_file; do
     [ -z "$toml_file" ] && continue
@@ -121,13 +153,13 @@ if [ -n "$TOML_STAGED" ]; then
     echo "  PASS: Cargo.toml versions pinned" >&2
   fi
 else
-  echo "  [5/7] No Cargo.toml staged — skipping version pin check" >&2
+  echo "  [6/8] No Cargo.toml staged — skipping version pin check" >&2
 fi
 
 # ─────────────────────────────────────────────
-# GATE 6: Commit message format (conventional commits)
+# GATE 7: Commit message format (conventional commits)
 # ─────────────────────────────────────────────
-echo "  [6/7] Commit message format..." >&2
+echo "  [7/8] Commit message format..." >&2
 # Extract -m "message" from the git commit command (macOS-compatible, no grep -P)
 COMMIT_MSG=$(echo "$COMMAND" | sed -n "s/.*-m [\"'][^\"']*[\"'].*/&/p" 2>/dev/null | sed "s/.*-m [\"']//" | sed "s/[\"'].*//" | head -1 || true)
 if [ -z "$COMMIT_MSG" ]; then
@@ -153,9 +185,9 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# GATE 7: Typos check (staged files)
+# GATE 8: Typos check (staged files)
 # ─────────────────────────────────────────────
-echo "  [7/7] Typos check..." >&2
+echo "  [8/8] Typos check..." >&2
 if command -v typos > /dev/null 2>&1; then
   # Check only staged files to keep it fast
   TYPO_FILES=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -E '\.(rs|toml|md|yml|yaml|sh)$' || true)
@@ -165,7 +197,7 @@ if command -v typos > /dev/null 2>&1; then
     while IFS= read -r tf; do
       [ -z "$tf" ] && continue
       [ ! -f "$tf" ] && continue
-      RESULT=$(typos "$tf" 2>&1 || true)
+      RESULT=$(timeout 10 typos "$tf" 2>&1 || true)
       if [ -n "$RESULT" ]; then
         TYPOS_OUT="${TYPOS_OUT}${RESULT}\n"
         TYPOS_FAIL=1
@@ -202,6 +234,6 @@ TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | 
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  ALL 7 GATES PASSED — Commit allowed           ║" >&2
+echo "║  ALL 8 GATES PASSED — Commit allowed           ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

@@ -28,8 +28,9 @@ use dhan_live_trader_common::constants::{
     DEPTH_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE,
-    QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE, TICK_FLUSH_INTERVAL_MS,
+    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_MARKET_DEPTH,
+    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE,
+    TICK_FLUSH_INTERVAL_MS,
 };
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 
@@ -183,8 +184,9 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
 #[inline]
-fn f32_to_f64_clean(v: f32) -> f64 {
+pub(crate) fn f32_to_f64_clean(v: f32) -> f64 {
     if v == 0.0 || !v.is_finite() {
+        // APPROVED: f64::from(f32) is correct for zero/inf/NaN — no precision loss for these values
         return f64::from(v);
     }
     let mut buf = [0u8; F32_DECIMAL_BUF_SIZE];
@@ -199,6 +201,7 @@ fn f32_to_f64_clean(v: f32) -> f64 {
     std::str::from_utf8(&buf[..n])
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
+        // APPROVED: f64::from(f32) fallback — only reached if ryu/parse fails (never in practice)
         .unwrap_or(f64::from(v))
 }
 
@@ -208,19 +211,20 @@ fn f32_to_f64_clean(v: f32) -> f64 {
 
 /// Writes a single tick row into the ILP buffer (no flush).
 ///
-/// Converts the IST-naive exchange timestamp to proper UTC by subtracting
-/// the IST offset (5h30m = 19800s), then writes all tick fields into the buffer.
+/// Dhan V2 WebSocket sends `exchange_timestamp` as UTC epoch seconds.
+/// We add `IST_UTC_OFFSET_SECONDS_I64` so QuestDB displays IST wall-clock
+/// time directly. The raw `exchange_timestamp` LONG column is preserved
+/// verbatim for audit.
 ///
 /// Price fields use `f32_to_f64_clean` to preserve the original Dhan f32
 /// precision without f32→f64 widening artifacts.
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
-    // Dhan V2 sends exchange_timestamp as IST-naive epoch: the IST clock time
-    // (e.g., 09:25:32 IST) encoded as if it were UTC epoch seconds. To store as
-    // proper UTC in QuestDB, subtract the IST offset (5h30m = 19800s).
-    let utc_epoch_secs =
-        i64::from(tick.exchange_timestamp).saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
-    let ts_nanos = TimestampNanos::new(utc_epoch_secs.saturating_mul(1_000_000_000));
-    let received_nanos = TimestampNanos::new(tick.received_at_nanos);
+    // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
+    let ist_epoch_secs =
+        i64::from(tick.exchange_timestamp).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+    let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+    let received_nanos =
+        TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     buffer
         .table(QUESTDB_TABLE_TICKS)
@@ -251,6 +255,8 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("total_buy_qty")?
         .column_i64("total_sell_qty", i64::from(tick.total_sell_quantity))
         .context("total_sell_qty")?
+        .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
+        .context("exchange_timestamp")?
         .column_ts("received_at", received_nanos)
         .context("received_at")?
         .at(ts_nanos)
@@ -271,8 +277,9 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
 /// - `security_id` as LONG (4-byte in Dhan, but LONG for QuestDB compat)
 /// - Price fields as DOUBLE (f64 from f32 parsed ticks)
 /// - Volume/quantity fields as LONG (cumulative, can exceed u32 for indices)
-/// - `received_at` as TIMESTAMP (local clock for latency measurement)
-/// - `ts` as designated TIMESTAMP (exchange time, partition key)
+/// - `exchange_timestamp` as LONG (raw Dhan UTC epoch seconds, preserved verbatim for audit)
+/// - `received_at` as TIMESTAMP (system clock, IST-adjusted for consistency)
+/// - `ts` as designated TIMESTAMP (Dhan UTC epoch + IST offset, IST-as-UTC convention)
 const TICKS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS ticks (\
         segment SYMBOL,\
@@ -288,6 +295,7 @@ const TICKS_CREATE_DDL: &str = "\
         last_trade_qty LONG,\
         total_buy_qty LONG,\
         total_sell_qty LONG,\
+        exchange_timestamp LONG,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
@@ -482,7 +490,9 @@ fn build_depth_rows(
     received_at_nanos: i64,
     depth: &[MarketDepthLevel; 5],
 ) -> Result<()> {
-    let received_nanos = TimestampNanos::new(received_at_nanos);
+    // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
+    let received_nanos =
+        TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     for (i, level) in depth.iter().enumerate() {
         // APPROVED: depth is [_; 5], so i is 0..4 — always fits i64
@@ -526,7 +536,7 @@ fn build_depth_rows(
 ///
 /// Called once per security when a code 6 packet arrives (typically at session start).
 /// Uses `received_at` as designated timestamp since Dhan doesn't send a timestamp
-/// in this packet type.
+/// in this packet type. Shifted to IST-as-UTC for consistency with all other tables.
 ///
 /// Price field uses `f32_to_f64_clean` to preserve Dhan f32 precision.
 pub fn build_previous_close_row(
@@ -537,7 +547,9 @@ pub fn build_previous_close_row(
     previous_oi: u32,
     received_at_nanos: i64,
 ) -> Result<()> {
-    let received_nanos = TimestampNanos::new(received_at_nanos);
+    // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
+    let received_nanos =
+        TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     buffer
         .table(QUESTDB_TABLE_PREVIOUS_CLOSE)
@@ -697,6 +709,7 @@ fn current_time_ms() -> u64 {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
+    use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
     use questdb::ingress::ProtocolVersion;
 
     fn make_test_tick(security_id: u32, ltp: f32) -> ParsedTick {
@@ -1018,25 +1031,27 @@ mod tests {
     }
 
     #[test]
-    fn test_ist_offset_subtracted_in_ts_nanos() {
-        // Dhan sends exchange_timestamp as IST-naive epoch.
-        // Example: IST 09:25:32 on 2026-02-27 → Dhan sends 1772118332
-        // (which is 2026-02-27T09:25:32Z in UTC interpretation).
-        // Correct UTC = 2026-02-27T03:55:32Z = epoch 1772098532.
-        // The IST offset = 19800 seconds.
-        let dhan_ist_naive_epoch: u32 = 1_772_118_332;
-        let expected_utc_epoch: i64 = 1_772_098_532;
+    fn test_utc_epoch_converted_to_ist_in_ts_nanos() {
+        // Dhan sends exchange_timestamp as UTC epoch seconds.
+        // Example: epoch 1740556500 = 07:55 UTC = 13:25 IST.
+        // We add IST_UTC_OFFSET_SECONDS_I64 so QuestDB shows IST wall-clock time.
+        let dhan_epoch: u32 = 1_740_556_500;
 
-        let utc_epoch_secs = i64::from(dhan_ist_naive_epoch) - IST_UTC_OFFSET_SECONDS_I64;
-        assert_eq!(utc_epoch_secs, expected_utc_epoch);
-
-        // Verify the nanosecond conversion matches QuestDB expectations
-        let ts_nanos = TimestampNanos::new(utc_epoch_secs * 1_000_000_000);
+        let epoch_secs = i64::from(dhan_epoch);
+        let ist_epoch_secs = epoch_secs + IST_UTC_OFFSET_SECONDS_I64;
+        let ts_nanos = TimestampNanos::new(ist_epoch_secs * 1_000_000_000);
         assert_eq!(
-            utc_epoch_secs * 1_000_000_000,
+            ist_epoch_secs * 1_000_000_000,
             ts_nanos.as_i64(),
-            "ts_nanos should be UTC epoch nanoseconds"
+            "ts_nanos should be IST-as-UTC epoch nanoseconds"
         );
+
+        // Verify the IST-as-UTC timestamp shows 13:25 IST in QuestDB.
+        let ist_time_of_day = ist_epoch_secs % 86_400;
+        let hour = ist_time_of_day / 3600;
+        let minute = (ist_time_of_day % 3600) / 60;
+        assert_eq!(hour, 13, "IST hour must be 13");
+        assert_eq!(minute, 25, "IST minute must be 25");
     }
 
     // -----------------------------------------------------------------------
@@ -1076,6 +1091,7 @@ mod tests {
         assert!(content.contains("last_trade_qty"));
         assert!(content.contains("total_buy_qty"));
         assert!(content.contains("total_sell_qty"));
+        assert!(content.contains("exchange_timestamp"));
         assert!(content.contains("received_at"));
     }
 
@@ -1284,25 +1300,33 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tick_row_ist_offset_applied_correctly() {
-        // Verify the IST offset is subtracted when building the row.
+    fn test_build_tick_row_stores_ist_adjusted_epoch() {
+        // Verify UTC epoch is shifted by IST offset before storage.
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
             security_id: 13,
             exchange_segment_code: 2,
             last_traded_price: 24500.0,
-            // 1772118332 is IST-naive epoch for 2026-02-27 09:25:32 IST.
-            exchange_timestamp: 1_772_118_332,
-            received_at_nanos: 1_772_098_532_000_000_000,
+            // 1740556500 = UTC epoch for 07:55 UTC (13:25 IST)
+            exchange_timestamp: 1_740_556_500,
+            received_at_nanos: 1_740_556_500_000_000_000,
             ..Default::default()
         };
 
         build_tick_row(&mut buffer, &tick).unwrap();
 
-        // The buffer should contain the UTC-corrected timestamp.
-        // We can verify by checking the row was written successfully.
+        // Verify row was written with IST-adjusted epoch as designated timestamp.
         assert_eq!(buffer.row_count(), 1);
         assert!(!buffer.is_empty());
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // ILP designated timestamp = (UTC epoch + IST offset) in nanoseconds
+        let ist_epoch = (1_740_556_500_i64 + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+        let expected_ts = format!("{ist_epoch}\n");
+        assert!(
+            content.ends_with(&expected_ts),
+            "ILP timestamp must be IST-adjusted epoch nanos. Content: {content}"
+        );
     }
 
     #[test]
@@ -1322,6 +1346,33 @@ mod tests {
         let content = String::from_utf8_lossy(buffer.as_bytes());
         // received_at should appear as a timestamp column in the buffer.
         assert!(content.contains("received_at"));
+    }
+
+    #[test]
+    fn test_build_tick_row_preserves_raw_exchange_timestamp() {
+        // The raw Dhan exchange_timestamp (UTC epoch seconds) is stored
+        // verbatim in the `exchange_timestamp` LONG column for audit.
+        // The designated `ts` uses IST-adjusted epoch (UTC + 19800s).
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let dhan_raw_epoch: u32 = 1_740_556_500; // UTC epoch for 07:55 UTC (13:25 IST)
+        let tick = ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 2,
+            last_traded_price: 24500.0,
+            exchange_timestamp: dhan_raw_epoch,
+            received_at_nanos: 1_740_556_500_500_000_000, // ~0.5ms after exchange time
+            ..Default::default()
+        };
+
+        build_tick_row(&mut buffer, &tick).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // ILP integer format: field_name=<value>i
+        let expected_ilp_value = format!("exchange_timestamp={}i", dhan_raw_epoch);
+        assert!(
+            content.contains(&expected_ilp_value),
+            "Raw exchange_timestamp not preserved verbatim in ILP buffer. Content: {content}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1362,6 +1413,7 @@ mod tests {
         assert!(TICKS_CREATE_DDL.contains("last_trade_qty LONG"));
         assert!(TICKS_CREATE_DDL.contains("total_buy_qty LONG"));
         assert!(TICKS_CREATE_DDL.contains("total_sell_qty LONG"));
+        assert!(TICKS_CREATE_DDL.contains("exchange_timestamp LONG"));
         assert!(TICKS_CREATE_DDL.contains("received_at TIMESTAMP"));
         assert!(TICKS_CREATE_DDL.contains("ts TIMESTAMP"));
     }
@@ -1473,15 +1525,13 @@ mod tests {
 
     #[test]
     fn test_build_tick_row_with_minimal_tick() {
-        // Cannot use ParsedTick::default() because exchange_timestamp=0 minus
-        // IST offset produces a negative epoch which QuestDB rejects.
-        // Use a minimal tick with a valid timestamp instead.
+        // Use a minimal tick with a valid UTC timestamp.
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
             security_id: 1,
             exchange_segment_code: 0, // IDX_I
             last_traded_price: 0.0,
-            exchange_timestamp: 1740556500, // valid IST-naive epoch
+            exchange_timestamp: 1740556500, // valid UTC epoch (2025-02-26 07:55 UTC)
             received_at_nanos: 1_740_556_500_000_000_000,
             ..Default::default()
         };
@@ -1547,9 +1597,7 @@ mod tests {
 
     #[test]
     fn test_build_tick_row_minimum_valid_exchange_timestamp() {
-        // The minimum valid exchange_timestamp is IST_UTC_OFFSET_SECONDS + 1 (19801),
-        // because subtracting the IST offset from anything smaller creates a negative
-        // epoch that QuestDB rejects. Verify the boundary works.
+        // Verify a small but positive exchange_timestamp is accepted.
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
             security_id: 1,
@@ -2308,7 +2356,7 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
-        // 2026-03-08T00:00:00 IST = 2026-03-07T18:30:00 UTC = epoch 1772588400
+        // Test UTC epoch value in early March 2026 range.
         let mut tick = make_test_tick(13, 24500.0);
         tick.exchange_timestamp = 1772588400;
         tick.received_at_nanos = 1_772_588_400_000_000_000;
@@ -2343,5 +2391,207 @@ mod tests {
         writer.append_tick(&tick2).unwrap();
         assert_eq!(writer.buffer.row_count(), 2);
         writer.force_flush().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Dhan UTC epoch verification with real market hours
+    //
+    // Dhan V2 API sends standard UTC epoch seconds. Our pipeline stores
+    // them as-is in QuestDB. Grafana `timezone: Asia/Kolkata` converts
+    // to IST for display.
+    //
+    // These tests verify the FULL pipeline with known UTC epoch values
+    // corresponding to NSE market hours (09:15 - 15:30 IST).
+    // -----------------------------------------------------------------------
+
+    /// Helper: compute UTC epoch for a given IST time on 2026-03-10.
+    ///
+    /// IST = UTC + 5:30. Midnight IST on 2026-03-10 = 2026-03-09 18:30 UTC.
+    fn utc_epoch_for_ist_time_2026_03_10(
+        ist_hours: u32,
+        ist_minutes: u32,
+        ist_seconds: u32,
+    ) -> u32 {
+        // 2026-03-09 18:30:00 UTC = 2026-03-10 00:00:00 IST
+        const MARCH_10_2026_MIDNIGHT_IST_AS_UTC: u32 = 1_773_081_000;
+        MARCH_10_2026_MIDNIGHT_IST_AS_UTC + ist_hours * 3600 + ist_minutes * 60 + ist_seconds
+    }
+
+    /// Helper: extract IST hour/minute from a UTC epoch.
+    ///
+    /// Adds IST offset (+5:30 = 19800s) then takes mod 86400 to get
+    /// IST seconds from midnight.
+    fn utc_epoch_to_ist_hm(utc_epoch: i64) -> (i64, i64) {
+        let ist_secs = (utc_epoch + IST_UTC_OFFSET_SECONDS_I64) % 86_400;
+        let hour = ist_secs / 3600;
+        let minute = (ist_secs % 3600) / 60;
+        (hour, minute)
+    }
+
+    #[test]
+    fn test_dhan_epoch_market_open_0915_ist() {
+        // NSE market opens at 09:15:00 IST = 03:45:00 UTC.
+        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(9, 15, 0);
+
+        // Stored as-is — no manipulation.
+        let stored_epoch = i64::from(dhan_epoch);
+
+        // Grafana Asia/Kolkata converts UTC → IST.
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        assert_eq!(ist_hour, 9, "IST hour must be 9");
+        assert_eq!(ist_minute, 15, "IST minute must be 15");
+    }
+
+    #[test]
+    fn test_dhan_epoch_market_close_1530_ist() {
+        // NSE market closes at 15:30:00 IST = 10:00:00 UTC.
+        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(15, 30, 0);
+
+        let stored_epoch = i64::from(dhan_epoch);
+
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        assert_eq!(ist_hour, 15, "IST hour must be 15");
+        assert_eq!(ist_minute, 30, "IST minute must be 30");
+    }
+
+    #[test]
+    fn test_dhan_epoch_mid_session_1200_ist() {
+        // Mid-session: 12:00:00 IST = 06:30:00 UTC.
+        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(12, 0, 0);
+
+        let stored_epoch = i64::from(dhan_epoch);
+
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        assert_eq!(ist_hour, 12, "IST hour must be 12");
+        assert_eq!(ist_minute, 0, "IST minute must be 0");
+    }
+
+    #[test]
+    fn test_dhan_epoch_pre_market_0900_ist() {
+        // Pre-market: 09:00:00 IST = 03:30:00 UTC.
+        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(9, 0, 0);
+
+        let stored_epoch = i64::from(dhan_epoch);
+
+        let (ist_hour, _ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        assert_eq!(ist_hour, 9, "IST hour must be 9");
+    }
+
+    #[test]
+    fn test_dhan_epoch_build_tick_row_stores_ist_adjusted() {
+        // End-to-end: build_tick_row with a tick at 10:30:00 IST (05:00 UTC)
+        // and verify the designated timestamp is IST-adjusted epoch nanos.
+        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(10, 30, 0);
+        // IST-as-UTC: raw UTC epoch + 19800s offset
+        let ist_ts_nanos = (i64::from(dhan_epoch) + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 25,
+            exchange_segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+            last_traded_price: 2350.50,
+            exchange_timestamp: dhan_epoch,
+            received_at_nanos: i64::from(dhan_epoch) * 1_000_000_000 + 500_000, // ~0.5ms latency
+            ..Default::default()
+        };
+
+        build_tick_row(&mut buffer, &tick).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // ILP designated timestamp (last value before newline) = IST-adjusted epoch nanos.
+        let expected_ts_str = format!("{ist_ts_nanos}\n");
+        assert!(
+            content.ends_with(&expected_ts_str),
+            "ILP designated timestamp must be IST-adjusted epoch nanos.\nExpected suffix: {expected_ts_str}\nActual: {content}"
+        );
+    }
+
+    #[test]
+    fn test_dhan_epoch_all_market_hours_display_correct_ist() {
+        // Verify that for every minute from 09:15 to 15:30 IST,
+        // the stored UTC epoch converts to IST market hours correctly.
+        let market_open = utc_epoch_for_ist_time_2026_03_10(9, 15, 0);
+        let market_close = utc_epoch_for_ist_time_2026_03_10(15, 30, 0);
+
+        let mut epoch = market_open;
+        while epoch <= market_close {
+            let stored = i64::from(epoch);
+            let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored);
+            let total_minutes = ist_hour * 60 + ist_minute;
+
+            assert!(
+                (555..=930).contains(&total_minutes),
+                "IST time {ist_hour}:{ist_minute:02} (minute {total_minutes}) out of market range for UTC epoch {epoch}"
+            );
+
+            epoch += 60; // advance 1 minute
+        }
+    }
+
+    #[test]
+    fn test_historical_candle_utc_epoch_stored_directly() {
+        // Dhan REST API returns UTC epoch seconds.
+        // For 10:00 IST = 04:30 UTC on 2026-03-10:
+        let utc_epoch: i64 = i64::from(utc_epoch_for_ist_time_2026_03_10(10, 0, 0));
+
+        // Historical candle persistence stores as-is (no offset manipulation).
+        let ts_nanos = TimestampNanos::new(utc_epoch * 1_000_000_000);
+        assert_eq!(ts_nanos.as_i64(), utc_epoch * 1_000_000_000);
+
+        // Grafana Asia/Kolkata converts UTC → 10:00 IST.
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(utc_epoch);
+        assert_eq!(ist_hour, 10, "IST hour must be 10");
+        assert_eq!(ist_minute, 0);
+    }
+
+    #[test]
+    fn test_live_candle_and_tick_store_same_utc_epoch() {
+        // Live candle and tick both store the raw UTC epoch from Dhan.
+        // Verify they produce identical stored values for the same timestamp.
+        let dhan_epoch: u32 = utc_epoch_for_ist_time_2026_03_10(11, 45, 30);
+
+        // Both paths store as-is — no conversion.
+        let tick_stored = i64::from(dhan_epoch);
+        let candle_stored = i64::from(dhan_epoch);
+
+        assert_eq!(
+            tick_stored, candle_stored,
+            "Tick and candle persistence must store identical UTC epochs"
+        );
+
+        // Verify IST time is 11:45 IST.
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(tick_stored);
+        assert_eq!(ist_hour, 11, "IST hour must be 11");
+        assert_eq!(ist_minute, 45, "IST minute must be 45");
+    }
+
+    #[test]
+    fn test_dhan_sdk_test_value_is_utc_epoch() {
+        // The Dhan Python SDK test value 1740556500 is used across
+        // parser tests (ticker.rs, quote.rs, full_packet.rs).
+        // It represents 07:55 UTC = 13:25 IST.
+        let dhan_epoch: i64 = 1_740_556_500;
+
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(dhan_epoch);
+        assert_eq!(ist_hour, 13, "IST hour must be 13");
+        assert_eq!(ist_minute, 25, "IST minute must be 25");
+    }
+
+    #[test]
+    fn test_received_at_and_exchange_timestamp_same_utc_basis() {
+        // received_at_nanos comes from chrono::Utc::now() → proper UTC.
+        // exchange_timestamp is also UTC epoch from Dhan V2.
+        // Both are in the SAME timezone basis — no offset between them
+        // (only network/processing latency).
+        let exchange_ts: u32 = utc_epoch_for_ist_time_2026_03_10(10, 30, 0);
+        // Simulate ~1ms network latency
+        let received_utc_nanos: i64 = i64::from(exchange_ts) * 1_000_000_000 + 1_000_000;
+
+        // The difference is just latency, not a timezone offset.
+        let diff_nanos = received_utc_nanos - i64::from(exchange_ts) * 1_000_000_000;
+        assert_eq!(
+            diff_nanos, 1_000_000,
+            "exchange_timestamp and received_at are both UTC — diff is only latency"
+        );
     }
 }

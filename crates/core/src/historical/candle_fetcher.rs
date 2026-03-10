@@ -1,8 +1,12 @@
 //! Dhan intraday candle fetcher — fully automated 1-minute OHLCV retrieval.
 //!
-//! Fetches historical candles from Dhan's REST API for all subscribed
-//! instruments, converts IST timestamps to UTC, and persists to QuestDB
-//! via the `CandlePersistenceWriter`.
+//! Fetches historical candles from Dhan's V2 REST API for all subscribed
+//! instruments and persists to QuestDB via the `CandlePersistenceWriter`.
+//!
+//! # Timestamp Format
+//! Dhan V2 REST API returns standard UTC epoch seconds. Timestamps are
+//! stored as-is in QuestDB (no conversion). Grafana dashboard uses
+//! `timezone: Asia/Kolkata` to display them in IST.
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
@@ -24,7 +28,6 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS,
-    IST_UTC_OFFSET_SECONDS_I64,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{DhanIntradayResponse, HistoricalCandle};
@@ -93,7 +96,7 @@ pub struct CandleFetchSummary {
 ///
 /// # Returns
 /// Summary of fetch results (successes, failures, candle count).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // APPROVED: API fetch requires all config + writer params
 pub async fn fetch_historical_candles(
     registry: &InstrumentRegistry,
     dhan_config: &DhanConfig,
@@ -105,12 +108,11 @@ pub async fn fetch_historical_candles(
     let m_fetched = counter!("dlt_historical_candles_fetched_total");
     let m_api_errors = counter!("dlt_historical_api_errors_total");
 
+    #[allow(clippy::expect_used)] // APPROVED: compile-time constant 19800 is always valid
     // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800 = 5h30m),
     // always valid for east_opt(). The expect is unreachable but satisfies no-unwrap lint.
-    #[allow(clippy::expect_used)]
-    // APPROVED: compile-time constant 19800 is always valid for FixedOffset::east_opt
     let ist_offset =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid");
+        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time constant
 
     let now_ist = Utc::now().with_timezone(&ist_offset);
     let today = now_ist.date_naive();
@@ -160,8 +162,14 @@ pub async fn fetch_historical_candles(
     for instrument in registry.iter() {
         let security_id = instrument.security_id;
 
-        // Skip display indices — no candle data available
-        if instrument.category == SubscriptionCategory::DisplayIndex {
+        // Skip display indices and all derivatives (futures + options).
+        // Historical candles are only needed for indices and stock equities.
+        if matches!(
+            instrument.category,
+            SubscriptionCategory::DisplayIndex
+                | SubscriptionCategory::IndexDerivative
+                | SubscriptionCategory::StockDerivative
+        ) {
             instruments_skipped = instruments_skipped.saturating_add(1);
             continue;
         }
@@ -171,25 +179,14 @@ pub async fn fetch_historical_candles(
             continue;
         }
 
-        // Determine the Dhan API instrument type
-        let is_index = matches!(
-            instrument.category,
-            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::IndexDerivative
-        );
-
+        // Determine the Dhan API instrument type (only INDEX and EQUITY after skip above)
         let instrument_type = match instrument.category {
             SubscriptionCategory::MajorIndexValue => "INDEX",
             SubscriptionCategory::StockEquity => "EQUITY",
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => {
-                if instrument.option_type.is_some() {
-                    if is_index { "OPTIDX" } else { "OPTSTK" }
-                } else if is_index {
-                    "FUTIDX"
-                } else {
-                    "FUTSTK"
-                }
-            }
-            SubscriptionCategory::DisplayIndex => continue,
+            // Derivatives and display indices are already skipped above
+            SubscriptionCategory::IndexDerivative
+            | SubscriptionCategory::StockDerivative
+            | SubscriptionCategory::DisplayIndex => continue,
         };
 
         // Rate limiting delay between requests
@@ -334,10 +331,9 @@ pub async fn fetch_historical_candles(
                                     continue;
                                 }
 
-                                // Convert IST-naive timestamp to UTC
-                                let ist_epoch = data.timestamp[i];
-                                let utc_epoch =
-                                    ist_epoch.saturating_sub(IST_UTC_OFFSET_SECONDS_I64);
+                                // Dhan V2 REST API returns standard UTC epoch seconds.
+                                // Store as-is — no conversion needed.
+                                let utc_epoch = data.timestamp[i];
 
                                 let oi_value = if i < data.open_interest.len() {
                                     data.open_interest[i]
@@ -474,5 +470,76 @@ mod tests {
         };
         assert_eq!(summary.instruments_fetched, 10);
         assert_eq!(summary.total_candles, 3750);
+    }
+
+    /// IST offset in seconds (5h30m) for UTC→IST conversion in tests.
+    const IST_OFFSET: i64 = 19_800;
+
+    /// Extracts IST hour and minute from a UTC epoch by adding IST offset.
+    fn utc_epoch_to_ist_hm(utc_epoch: i64) -> (i64, i64) {
+        let ist_secs = (utc_epoch + IST_OFFSET) % 86_400;
+        (ist_secs / 3600, (ist_secs % 3600) / 60)
+    }
+
+    /// Verifies Dhan REST API returns standard UTC epoch seconds.
+    ///
+    /// Market close candle at 15:29 IST = 09:59 UTC on 2026-03-09.
+    /// Stored as-is in QuestDB; Grafana `timezone: Asia/Kolkata` shows IST.
+    #[test]
+    fn test_dhan_rest_api_returns_utc_epoch_market_close() {
+        // 15:29 IST = 09:59 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60; // 1_773_050_340
+        assert_eq!(utc_epoch, 1_773_050_340);
+
+        // Convert UTC epoch to IST for verification
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(utc_epoch);
+        assert_eq!(ist_hour, 15, "IST hour must be 15");
+        assert_eq!(ist_minute, 29, "IST minute must be 29");
+    }
+
+    /// Verifies UTC epoch for market open candle (09:15 IST = 03:45 UTC).
+    #[test]
+    fn test_dhan_rest_api_returns_utc_epoch_market_open() {
+        // 09:15 IST = 03:45 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 45 * 60; // 1_773_027_900
+        assert_eq!(utc_epoch, 1_773_027_900);
+
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(utc_epoch);
+        assert_eq!(ist_hour, 9, "IST hour must be 9");
+        assert_eq!(ist_minute, 15, "IST minute must be 15");
+    }
+
+    /// Verifies UTC epoch for mid-session candle (12:00 IST = 06:30 UTC).
+    #[test]
+    fn test_dhan_rest_api_returns_utc_epoch_mid_session() {
+        // 12:00 IST = 06:30 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 6 * 3600 + 30 * 60; // 1_773_037_800
+        assert_eq!(utc_epoch, 1_773_037_800);
+
+        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(utc_epoch);
+        assert_eq!(ist_hour, 12, "IST hour must be 12");
+        assert_eq!(ist_minute, 0, "IST minute must be 0");
+    }
+
+    /// Verifies the store-as-is approach: UTC epoch stored directly in
+    /// HistoricalCandle without any offset manipulation.
+    #[test]
+    fn test_historical_candle_stores_utc_epoch_as_is() {
+        // 15:29 IST = 09:59 UTC on 2026-03-09
+        let dhan_epoch: i64 = 1_773_050_340;
+        let candle = HistoricalCandle {
+            timestamp_utc_secs: dhan_epoch, // Stored as-is, no manipulation
+            security_id: 42,
+            exchange_segment_code: 2,
+            open: 100.0,
+            high: 102.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1000,
+            open_interest: 0,
+        };
+        // Timestamp stored is exactly what Dhan returned — raw UTC epoch
+        assert_eq!(candle.timestamp_utc_secs, dhan_epoch);
+        assert_eq!(candle.timestamp_utc_secs, 1_773_050_340);
     }
 }

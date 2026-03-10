@@ -108,6 +108,7 @@ pub struct SubscribedInstrument {
 ///
 /// Built once at startup, shared via `Arc<InstrumentRegistry>` across the pipeline.
 /// Every tick from the WebSocket can be enriched in O(1) by looking up `security_id`.
+#[derive(Clone)]
 pub struct InstrumentRegistry {
     /// O(1) lookup: security_id → instrument metadata.
     instruments: HashMap<SecurityId, SubscribedInstrument>,

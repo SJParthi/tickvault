@@ -27,11 +27,26 @@ const INFRA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wait time for Docker services to become healthy.
 const INFRA_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum wait time for Docker daemon to start after launching Docker Desktop.
+const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Path to docker-compose file relative to project root.
 const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
+
+/// macOS Docker Desktop application name for `open -a`.
+const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
+
+/// Grafana dashboard URL — auto-opened in browser after infrastructure starts.
+const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
+
+/// Grafana host for TCP reachability probe.
+const GRAFANA_HOST: &str = "127.0.0.1";
+
+/// Grafana HTTP port for TCP reachability probe.
+const GRAFANA_PORT: u16 = 3000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -53,10 +68,18 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             port = questdb_config.http_port,
             "infrastructure already running (QuestDB reachable)"
         );
+        // Infrastructure already running — still auto-open Grafana dashboard.
+        open_grafana_if_reachable().await;
         return;
     }
 
     info!("infrastructure not running — auto-starting Docker services");
+
+    // Ensure Docker daemon is running (launches Docker Desktop on macOS if needed).
+    if !ensure_docker_daemon_running().await {
+        warn!("Docker daemon is not available — cannot auto-start infrastructure");
+        return;
+    }
 
     // Fetch infra credentials from SSM concurrently.
     let (questdb_creds, grafana_creds, telegram_creds) = match tokio::join!(
@@ -130,13 +153,148 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Wait for QuestDB to become healthy.
+    // Wait for QuestDB and Grafana to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
+    wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
+
+    // Auto-open Grafana dashboards in the default browser.
+    open_grafana_if_reachable().await;
+}
+
+/// Opens the Grafana dashboard in the default browser if Grafana is reachable.
+///
+/// Best-effort: if Grafana is not running or the browser cannot be launched,
+/// logs a warning and returns — does not block boot.
+async fn open_grafana_if_reachable() {
+    if is_service_reachable(GRAFANA_HOST, GRAFANA_PORT) {
+        open_in_browser(GRAFANA_DASHBOARD_URL).await;
+    } else {
+        debug!("Grafana not reachable — skipping browser auto-open");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+/// Checks if the Docker daemon is responding to `docker info`.
+async fn is_docker_daemon_running() -> bool {
+    use tokio::process::Command;
+
+    match Command::new("docker")
+        .args(["info"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Ensures the Docker daemon is running. On macOS, launches Docker Desktop
+/// if the daemon is not responding and waits for it to become ready.
+///
+/// Returns `true` if the daemon is available, `false` if it could not be started.
+async fn ensure_docker_daemon_running() -> bool {
+    if is_docker_daemon_running().await {
+        debug!("Docker daemon is already running");
+        return true;
+    }
+
+    info!("Docker daemon not running — attempting to launch Docker Desktop");
+
+    // On macOS, launch Docker Desktop via `open -a Docker`.
+    // On Linux, Docker is typically a systemd service (always running).
+    if !cfg!(target_os = "macos") {
+        warn!("Docker daemon not running and auto-launch is only supported on macOS");
+        return false;
+    }
+
+    {
+        use tokio::process::Command;
+
+        let launch_result = Command::new("open")
+            .args(["-a", DOCKER_DESKTOP_APP_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+
+        match launch_result {
+            Ok(status) if status.success() => {
+                info!("Docker Desktop launch command sent — waiting for daemon to start");
+            }
+            Ok(status) => {
+                warn!(
+                    exit_code = ?status.code(),
+                    "failed to launch Docker Desktop — is it installed?"
+                );
+                return false;
+            }
+            Err(err) => {
+                warn!(?err, "failed to execute `open -a Docker`");
+                return false;
+            }
+        }
+    }
+
+    // Poll until Docker daemon is ready or timeout expires.
+    let start = std::time::Instant::now();
+    while start.elapsed() < DOCKER_DAEMON_TIMEOUT {
+        if is_docker_daemon_running().await {
+            info!(
+                elapsed_secs = start.elapsed().as_secs(),
+                "Docker daemon is now running"
+            );
+            return true;
+        }
+        debug!(
+            elapsed_secs = start.elapsed().as_secs(),
+            "waiting for Docker daemon to start"
+        );
+        tokio::time::sleep(INFRA_HEALTH_POLL_INTERVAL).await;
+    }
+
+    warn!(
+        timeout_secs = DOCKER_DAEMON_TIMEOUT.as_secs(),
+        "Docker daemon did not start within timeout"
+    );
+    false
+}
+
+/// Opens a URL in the default browser.
+///
+/// Uses `open` on macOS, `xdg-open` on Linux. Best-effort — logs a warning
+/// if the browser cannot be launched.
+async fn open_in_browser(url: &str) {
+    use tokio::process::Command;
+
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    match Command::new(program)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) if status.success() => {
+            info!(url, "opened dashboard in browser");
+        }
+        Ok(status) => {
+            warn!(url, exit_code = ?status.code(), "failed to open browser");
+        }
+        Err(err) => {
+            warn!(url, ?err, "failed to launch browser command");
+        }
+    }
+}
 
 /// TCP probe — returns true if a TCP connection can be established.
 fn is_service_reachable(host: &str, port: u16) -> bool {
@@ -246,5 +404,16 @@ mod tests {
     #[test]
     fn test_health_poll_interval_less_than_timeout() {
         assert!(INFRA_HEALTH_POLL_INTERVAL < INFRA_HEALTH_TIMEOUT);
+    }
+
+    #[test]
+    fn test_docker_daemon_timeout_is_reasonable() {
+        assert!(DOCKER_DAEMON_TIMEOUT.as_secs() >= 30);
+        assert!(DOCKER_DAEMON_TIMEOUT.as_secs() <= 180);
+    }
+
+    #[test]
+    fn test_docker_desktop_app_name_is_not_empty() {
+        assert!(!DOCKER_DESKTOP_APP_NAME.is_empty());
     }
 }

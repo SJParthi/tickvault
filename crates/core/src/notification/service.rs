@@ -674,6 +674,15 @@ mod tests {
             connection_index: 2,
         });
         service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 9,
+            total_candles: 180000,
+        });
+        service.notify(NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 209,
+            instruments_with_gaps: 3,
+        });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -690,10 +699,18 @@ mod tests {
             sns_enabled: false,
         };
         let service = NotificationService::initialize(&config).await;
-        assert!(
-            !service.is_active(),
-            "without real SSM, service should be in no-op mode"
-        );
+        if crate::test_support::has_aws_credentials() {
+            // Dev machine with real AWS credentials — Telegram creds fetched from SSM.
+            assert!(
+                service.is_active(),
+                "with real AWS credentials, notification service should be active"
+            );
+        } else {
+            assert!(
+                !service.is_active(),
+                "without real SSM, service should be in no-op mode"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

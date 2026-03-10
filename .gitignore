@@ -61,6 +61,8 @@ fuzz/target/
 .claude/hooks/.last-quality-pass
 .claude/hooks/.test-count-baseline
 .claude/hooks/.coverage-baseline
+.claude/hooks/.untested-pubfn-baseline
+.claude/hooks/.financial-test-baseline
 quality/.binary-size-baseline
 
 # ---- Auto-save watchdog (runtime state) ----

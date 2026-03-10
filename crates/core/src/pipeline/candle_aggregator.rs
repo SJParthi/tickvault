@@ -30,7 +30,7 @@ const STALE_CANDLE_THRESHOLD_SECS: u32 = 5;
 
 /// A single in-memory 1-second candle being accumulated from live ticks.
 ///
-/// 32 bytes — fits in half a cache line. Copy for zero-allocation hot path.
+/// 36 bytes — fits in a cache line. Copy for zero-allocation hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct LiveCandle {
     /// Candle timestamp (exchange_timestamp truncated to second boundary).
@@ -45,6 +45,8 @@ pub struct LiveCandle {
     pub close: f32,
     /// Cumulative volume snapshot from latest tick (NOT incremental).
     pub volume: u32,
+    /// Number of ticks aggregated into this candle.
+    pub tick_count: u32,
 }
 
 impl LiveCandle {
@@ -58,6 +60,7 @@ impl LiveCandle {
             low: tick.last_traded_price,
             close: tick.last_traded_price,
             volume: tick.volume,
+            tick_count: 1,
         }
     }
 
@@ -72,6 +75,7 @@ impl LiveCandle {
         }
         self.close = tick.last_traded_price;
         self.volume = tick.volume; // Snapshot, not incremental
+        self.tick_count = self.tick_count.saturating_add(1);
     }
 }
 
@@ -86,7 +90,7 @@ pub struct CompletedCandle {
     pub security_id: u32,
     /// Binary exchange segment code.
     pub exchange_segment_code: u8,
-    /// Candle timestamp (second boundary, UTC epoch seconds).
+    /// Candle timestamp (second boundary, UTC epoch seconds from Dhan).
     pub timestamp_secs: u32,
     /// Open price.
     pub open: f32,
@@ -98,6 +102,8 @@ pub struct CompletedCandle {
     pub close: f32,
     /// Volume snapshot.
     pub volume: u32,
+    /// Number of ticks aggregated into this candle.
+    pub tick_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +165,7 @@ impl CandleAggregator {
                     low: candle.low,
                     close: candle.close,
                     volume: candle.volume,
+                    tick_count: candle.tick_count,
                 });
                 self.total_completed = self.total_completed.saturating_add(1);
                 *candle = LiveCandle::from_tick(tick);
@@ -187,6 +194,7 @@ impl CandleAggregator {
                     low: candle.low,
                     close: candle.close,
                     volume: candle.volume,
+                    tick_count: candle.tick_count,
                 });
                 self.total_completed = self.total_completed.saturating_add(1);
                 false // Remove from map
@@ -208,15 +216,27 @@ impl CandleAggregator {
                 low: candle.low,
                 close: candle.close,
                 volume: candle.volume,
+                tick_count: candle.tick_count,
             });
             self.total_completed = self.total_completed.saturating_add(1);
         }
         self.candles.clear();
     }
 
-    /// Drains and returns completed candles. Caller is responsible for persisting them.
-    pub fn drain_completed(&mut self) -> Vec<CompletedCandle> {
-        std::mem::take(&mut self.completed)
+    /// Returns a slice of completed candles ready for persistence.
+    ///
+    /// Call [`clear_completed()`](Self::clear_completed) after processing to free the buffer
+    /// while preserving its pre-allocated capacity (avoids reallocation on the next cycle).
+    pub fn completed_slice(&self) -> &[CompletedCandle] {
+        &self.completed
+    }
+
+    /// Clears the completed buffer, preserving pre-allocated capacity.
+    ///
+    /// Unlike `std::mem::take` (which replaces with a zero-capacity Vec and discards the
+    /// pre-allocated buffer), `clear()` keeps the existing allocation for reuse.
+    pub fn clear_completed(&mut self) {
+        self.completed.clear();
     }
 
     /// Returns the number of active (in-progress) candles.
@@ -227,6 +247,16 @@ impl CandleAggregator {
     /// Returns the total number of candles completed since startup.
     pub fn total_completed(&self) -> u64 {
         self.total_completed
+    }
+
+    /// Drains and returns completed candles (test-only convenience).
+    ///
+    /// Uses `std::mem::take` which discards the pre-allocated capacity.
+    /// Production code must use [`completed_slice()`](Self::completed_slice) +
+    /// [`clear_completed()`](Self::clear_completed) to preserve capacity.
+    #[cfg(test)]
+    pub fn drain_completed(&mut self) -> Vec<CompletedCandle> {
+        std::mem::take(&mut self.completed)
     }
 }
 
@@ -372,8 +402,8 @@ mod tests {
     #[test]
     fn live_candle_size_is_compact() {
         assert!(
-            std::mem::size_of::<LiveCandle>() <= 32,
-            "LiveCandle must fit in half a cache line (32 bytes)"
+            std::mem::size_of::<LiveCandle>() <= 36,
+            "LiveCandle must fit in a cache line"
         );
     }
 
@@ -462,6 +492,7 @@ mod tests {
             low: 95.0,
             close: 105.0,
             volume: 500,
+            tick_count: 10,
         };
         let copy = c; // Copy
         assert_eq!(c.security_id, copy.security_id);

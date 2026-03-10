@@ -380,6 +380,16 @@ pub const SEBI_MAX_ORDERS_PER_SECOND: u32 = 10;
 pub const SEBI_AUDIT_RETENTION_YEARS: u32 = 5;
 
 // ---------------------------------------------------------------------------
+// OMS — Circuit Breaker
+// ---------------------------------------------------------------------------
+
+/// Consecutive API failures before the OMS circuit breaker opens.
+pub const OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+
+/// Seconds before the OMS circuit breaker transitions from Open to Half-Open.
+pub const OMS_CIRCUIT_BREAKER_RESET_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
 // ---------------------------------------------------------------------------
 
@@ -443,6 +453,29 @@ pub const SSM_SNS_SERVICE: &str = "sns";
 /// SSM key for the phone number to send SNS SMS alerts to.
 /// Value must be in E.164 format: `+<country_code><number>` (e.g., "+919876543210").
 pub const SNS_PHONE_NUMBER_SECRET: &str = "phone-number";
+
+// ---------------------------------------------------------------------------
+// Network / IP Verification — SSM Constants
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for network configuration.
+pub const SSM_NETWORK_SERVICE: &str = "network";
+
+/// SSM key for the expected static public IP (BSNL/ISP-assigned).
+/// Value must be a valid IPv4 address string (e.g., "203.0.113.42").
+pub const STATIC_IP_SECRET: &str = "static-ip";
+
+/// Primary URL for public IP detection (AWS-owned, plain text response).
+pub const PUBLIC_IP_CHECK_PRIMARY_URL: &str = "https://checkip.amazonaws.com"; // APPROVED: infrastructure constant
+
+/// Fallback URL for public IP detection (plain text response).
+pub const PUBLIC_IP_CHECK_FALLBACK_URL: &str = "https://api.ipify.org"; // APPROVED: infrastructure constant
+
+/// Timeout in seconds for public IP detection HTTP requests.
+pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum retry attempts for public IP detection (primary + fallback).
+pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Docker Container Naming
@@ -671,6 +704,9 @@ pub const QUESTDB_TABLE_DERIVATIVE_CONTRACTS: &str = "derivative_contracts";
 
 /// QuestDB table: daily subscribed index snapshots (8 F&O + 23 Display = 31).
 pub const QUESTDB_TABLE_SUBSCRIBED_INDICES: &str = "subscribed_indices";
+
+/// QuestDB table: NSE trading calendar (holidays + Muhurat sessions).
+pub const QUESTDB_TABLE_NSE_HOLIDAYS: &str = "nse_holidays";
 
 // ---------------------------------------------------------------------------
 // QuestDB ILP — Ingestion Configuration
@@ -916,9 +952,12 @@ pub const QUESTDB_TABLE_CANDLES_1M: &str = "historical_candles_1m";
 /// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
 pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
-/// IST offset for QuestDB ALIGN TO CALENDAR.
-/// QuestDB materialized views use this to align candle boundaries to IST (UTC+5:30).
-pub const QUESTDB_IST_ALIGN_OFFSET: &str = "05:30";
+/// Calendar alignment offset for QuestDB materialized views.
+///
+/// All timestamps are stored as IST-as-UTC (UTC epoch + 19800s), so QuestDB
+/// displays IST wall-clock time directly. No offset needed — midnight "UTC"
+/// in our convention IS midnight IST.
+pub const QUESTDB_IST_ALIGN_OFFSET: &str = "00:00";
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Processing Constants
@@ -949,6 +988,10 @@ pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 
 /// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for tick timestamp conversion.
 pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
+
+/// IST offset from UTC in nanoseconds (5h 30m = 19,800,000,000,000 ns).
+/// Used for converting `received_at_nanos` (system clock UTC) to IST-as-UTC.
+pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
@@ -1021,6 +1064,23 @@ pub const MAX_STRATEGY_INSTANCES: usize = 256;
 // ---------------------------------------------------------------------------
 // Frontend — Tick Broadcast Channel
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Token Cache — Fast Restart
+// ---------------------------------------------------------------------------
+
+/// File path for the cached JWT token (inside Docker container).
+///
+/// `/tmp` is ephemeral on container restart but survives process crashes
+/// within the same container — exactly the right lifetime for crash recovery.
+/// Security: file permissions 0600, container isolation, 24h TTL token.
+pub const TOKEN_CACHE_FILE_PATH: &str = "/tmp/dlt-token-cache";
+
+/// Minimum remaining token validity (hours) to accept a cached token.
+///
+/// If the cached token expires in less than this, a full re-auth is performed.
+/// 1 hour gives the renewal loop time to refresh before expiry.
+pub const TOKEN_CACHE_MIN_REMAINING_HOURS: i64 = 1;
 
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions

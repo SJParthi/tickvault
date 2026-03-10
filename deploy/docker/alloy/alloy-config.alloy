@@ -2,8 +2,11 @@
 // dhan-live-trader — Grafana Alloy Configuration
 // =============================================================================
 // Replaces Promtail (which is BANNED). Collects Docker container logs and
-// forwards them to Loki.
+// forwards them to Loki. Also watches the host app log file for dev mode
+// (cargo run) where the Rust app is not in a Docker container.
 // =============================================================================
+
+// ---- Docker container log collection (production + infra services) ----
 
 // Discover Docker containers
 discovery.docker "containers" {
@@ -41,7 +44,23 @@ loki.source.docker "dlt_logs" {
   forward_to = [loki.write.default.receiver]
 }
 
-// Write logs to Loki
+// ---- Host app log file (dev mode: cargo run writes JSON to data/logs/app.log) ----
+
+// The Rust app writes structured JSON logs to data/logs/app.log.
+// This file is mounted into the Alloy container at /var/log/dlt-app/app.log.
+// Labels match the Docker container convention so Grafana dashboards work
+// identically in both dev (cargo run) and production (Docker) modes.
+local.file_match "app_logs" {
+  path_targets = [{"__path__" = "/var/log/dlt-app/app.log"}]
+}
+
+loki.source.file "app_logs" {
+  targets    = local.file_match.app_logs.targets
+  labels     = { "job" = "dlt-docker", "container" = "dlt-app", "service" = "dlt-app" }
+  forward_to = [loki.write.default.receiver]
+}
+
+// ---- Write all logs to Loki ----
 loki.write "default" {
   endpoint {
     url = "http://dlt-loki:3100/loki/api/v1/push"

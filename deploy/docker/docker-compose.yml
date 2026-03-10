@@ -160,6 +160,10 @@ services:
     volumes:
       - ./alloy/alloy-config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host app log file: the Rust app writes JSON logs to data/logs/app.log
+      # when running via `cargo run` (dev mode). Alloy watches this file and
+      # pushes to Loki — enables Grafana log dashboards without Docker container.
+      - ../../data/logs:/var/log/dlt-app:ro
     command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
     depends_on:
       dlt-loki:

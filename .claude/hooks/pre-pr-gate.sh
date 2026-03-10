@@ -33,7 +33,7 @@ fi
 
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 if [ -z "$CWD" ]; then CWD="."; fi
-cd "$CWD" || exit 0
+cd "$CWD" || { echo "  FAIL: Cannot cd to $CWD" >&2; exit 2; }
 
 HOOKS_DIR="$(dirname "$0")"
 STATE_FILE="$HOOKS_DIR/.last-quality-pass"
@@ -123,7 +123,8 @@ if [ "$QUALITY_FRESH" = "false" ]; then
     FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
     FMT_EXIT=$?
     if [ "$FMT_EXIT" -eq 124 ]; then
-      echo "  SKIP: cargo fmt timed out (60s)" >&2
+      echo "  FAIL: cargo fmt timed out (60s) — blocking PR" >&2
+      FAILED=1
     elif [ "$FMT_EXIT" -ne 0 ]; then
       echo "  FAIL: cargo fmt:" >&2
       echo "$FMT_OUT" | tail -10 >&2
@@ -137,7 +138,8 @@ if [ "$QUALITY_FRESH" = "false" ]; then
     CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
     CLIPPY_EXIT=$?
     if [ "$CLIPPY_EXIT" -eq 124 ]; then
-      echo "  SKIP: cargo clippy timed out (120s)" >&2
+      echo "  FAIL: cargo clippy timed out (120s) — blocking PR" >&2
+      FAILED=1
     elif [ "$CLIPPY_EXIT" -ne 0 ]; then
       echo "  FAIL: cargo clippy:" >&2
       echo "$CLIPPY_OUT" | tail -20 >&2
@@ -151,7 +153,8 @@ if [ "$QUALITY_FRESH" = "false" ]; then
     TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
     TEST_EXIT=$?
     if [ "$TEST_EXIT" -eq 124 ]; then
-      echo "  SKIP: cargo test timed out (120s)" >&2
+      echo "  FAIL: cargo test timed out (120s) — blocking PR" >&2
+      FAILED=1
     elif [ "$TEST_EXIT" -ne 0 ]; then
       echo "  FAIL: cargo test:" >&2
       echo "$TEST_OUT" | tail -20 >&2

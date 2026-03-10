@@ -28,6 +28,7 @@ use dhan_live_trader_common::error::ApplicationError;
 use dhan_live_trader_common::sanitize::redact_url_params;
 
 use super::secret_manager;
+use super::token_cache;
 use super::totp_generator::generate_totp_code;
 use super::types::{DhanCredentials, DhanGenerateTokenResponse, TokenState};
 use crate::notification::events::NotificationEvent;
@@ -158,6 +159,21 @@ impl TokenManager {
             notifier: Arc::clone(notifier),
         });
 
+        // Fast path: try loading a cached token from a previous run.
+        // This skips the Dhan HTTP auth call (~500ms-2s), saving significant
+        // boot time on crash recovery. SSM credentials are still fetched above
+        // (needed for the renewal loop).
+        if let Some(cached_token) = token_cache::load_token_cache(&manager.credentials.client_id) {
+            manager.token.store(Arc::new(Some(cached_token)));
+            info!(
+                expires_at = %manager.current_expiry_display(),
+                "using cached token — skipped Dhan auth HTTP call"
+            );
+            notifier.notify(NotificationEvent::AuthenticationSuccess);
+            return Ok(manager);
+        }
+
+        // Slow path: full auth via Dhan API.
         // Infinite retry for transient errors, fail fast for permanent errors.
         // TOTP errors get limited retries (window boundary timing can cause
         // valid secrets to produce rejected codes).
@@ -278,6 +294,105 @@ impl TokenManager {
         }
     }
 
+    /// Creates a `TokenManager` using a pre-existing `TokenHandle`.
+    ///
+    /// Called during two-phase boot: the fast path has already loaded a
+    /// cached token into `token_handle` and connected WebSocket. This method
+    /// fetches SSM credentials and validates the cached token belongs to
+    /// the correct account. If the client_id doesn't match, it re-authenticates.
+    ///
+    /// # Arguments
+    /// * `token_handle` — Pre-existing handle already populated with a cached token.
+    /// * `cached_client_id` — Client ID from the token cache (for validation).
+    #[instrument(skip_all)]
+    pub async fn initialize_deferred(
+        token_handle: TokenHandle,
+        cached_client_id: &str,
+        dhan_config: &DhanConfig,
+        token_config: &TokenConfig,
+        network_config: &NetworkConfig,
+        notifier: &Arc<NotificationService>,
+    ) -> Result<Arc<Self>, ApplicationError> {
+        info!("deferred auth: fetching SSM credentials for validation + renewal");
+
+        // Validate HTTPS scheme
+        if !dhan_config.rest_api_base_url.starts_with("https://") {
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "rest_api_base_url must use HTTPS, got: {}",
+                    dhan_config.rest_api_base_url
+                ),
+            });
+        }
+        if !dhan_config.auth_base_url.starts_with("https://") {
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "auth_base_url must use HTTPS, got: {}",
+                    dhan_config.auth_base_url
+                ),
+            });
+        }
+
+        // SSM credential fetch with retry (3 attempts, exponential backoff).
+        let credentials = {
+            let mut attempt = 0u32;
+            loop {
+                attempt = attempt.saturating_add(1);
+                match secret_manager::fetch_dhan_credentials().await {
+                    Ok(creds) => break creds,
+                    Err(err) if attempt >= 3 => return Err(err),
+                    Err(err) => {
+                        warn!(
+                            attempt,
+                            error = %err,
+                            "deferred auth: SSM credential fetch failed, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(u64::from(2u32.pow(attempt)))).await;
+                    }
+                }
+            }
+        };
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(network_config.request_timeout_ms))
+            .build()
+            .map_err(|err| ApplicationError::AuthenticationFailed {
+                reason: format!("HTTP client creation failed: {err}"),
+            })?;
+
+        let manager = Arc::new(Self {
+            token: token_handle,
+            credentials,
+            rest_api_base_url: dhan_config.rest_api_base_url.clone(),
+            auth_base_url: dhan_config.auth_base_url.clone(),
+            http_client,
+            token_config: token_config.clone(),
+            network_config: network_config.clone(),
+            notifier: Arc::clone(notifier),
+        });
+
+        // Validate cached client_id against SSM. If they differ, the cache was
+        // for a different account — do full re-auth to get a valid token.
+        let ssm_client_id = manager.credentials.client_id.expose_secret();
+        if cached_client_id != ssm_client_id {
+            warn!("deferred auth: cached client_id mismatch — re-authenticating");
+            token_cache::delete_cache_file();
+            manager.acquire_token().await.map_err(|err| {
+                error!(error = %err, "deferred auth: re-authentication failed");
+                err
+            })?;
+            info!(
+                expires_at = %manager.current_expiry_display(),
+                "deferred auth: re-authentication successful after client_id mismatch"
+            );
+        } else {
+            info!("deferred auth: cached token validated against SSM credentials");
+        }
+
+        notifier.notify(NotificationEvent::AuthenticationSuccess);
+        Ok(manager)
+    }
+
     /// Returns a `TokenHandle` for O(1) atomic token reads.
     ///
     /// Downstream consumers (WebSocket, REST) call this once at setup,
@@ -376,6 +491,9 @@ impl TokenManager {
         let token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(token_state)));
 
+        // Cache for fast restart on crash recovery
+        self.save_current_token_to_cache();
+
         Ok(())
     }
 
@@ -445,6 +563,9 @@ impl TokenManager {
 
         let new_token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(new_token_state)));
+
+        // Update cache for fast restart
+        self.save_current_token_to_cache();
 
         Ok(())
     }
@@ -579,6 +700,14 @@ impl TokenManager {
         match guard.as_ref().as_ref() {
             Some(state) => state.time_until_refresh(self.token_config.refresh_before_expiry_hours),
             None => Duration::ZERO, // No token — refresh immediately
+        }
+    }
+
+    /// Saves the current token to the disk cache for fast crash recovery.
+    fn save_current_token_to_cache(&self) {
+        let guard = self.token.load();
+        if let Some(token_state) = guard.as_ref().as_ref() {
+            token_cache::save_token_cache(token_state, &self.credentials.client_id);
         }
     }
 

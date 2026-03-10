@@ -32,10 +32,12 @@
 //! ```
 
 pub mod secret_manager;
+pub mod token_cache;
 pub mod token_manager;
 pub mod totp_generator;
 pub mod types;
 
+pub use token_cache::FastCacheResult;
 pub use token_manager::{TokenHandle, TokenManager};
 pub use types::{
     DhanCredentials, GrafanaCredentials, QuestDbCredentials, TelegramCredentials, TokenState,

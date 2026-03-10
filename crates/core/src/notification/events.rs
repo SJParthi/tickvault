@@ -90,6 +90,36 @@ pub enum NotificationEvent {
         manual_trigger_url: String,
     },
 
+    /// Historical candle fetch completed with failures.
+    HistoricalFetchFailed {
+        /// Number of instruments that succeeded.
+        instruments_fetched: usize,
+        /// Number of instruments that failed.
+        instruments_failed: usize,
+        /// Total candles ingested.
+        total_candles: usize,
+    },
+
+    /// Candle cross-verification found gaps in stored data.
+    CandleVerificationFailed {
+        /// Instruments checked.
+        instruments_checked: usize,
+        /// Instruments with gaps.
+        instruments_with_gaps: usize,
+    },
+
+    /// Public IP verification failed — static IP mismatch or detection failure.
+    IpVerificationFailed {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// Public IP verification succeeded at boot.
+    IpVerificationSuccess {
+        /// The verified public IP address.
+        verified_ip: String,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -151,6 +181,31 @@ impl NotificationEvent {
             } => {
                 format!("<b>Instruments FAILED</b>\n{reason}\n\nRetry: {manual_trigger_url}")
             }
+            Self::HistoricalFetchFailed {
+                instruments_fetched,
+                instruments_failed,
+                total_candles,
+            } => {
+                format!(
+                    "<b>Historical candle fetch — partial failure</b>\nFetched: {instruments_fetched}\nFailed: {instruments_failed}\nCandles: {total_candles}"
+                )
+            }
+            Self::CandleVerificationFailed {
+                instruments_checked,
+                instruments_with_gaps,
+            } => {
+                format!(
+                    "<b>Candle verification FAILED</b>\nChecked: {instruments_checked}\nWith gaps: {instruments_with_gaps}"
+                )
+            }
+            Self::IpVerificationFailed { reason } => {
+                format!(
+                    "<b>IP VERIFICATION FAILED</b>\n{reason}\n\nBoot blocked — no Dhan API calls will be made."
+                )
+            }
+            Self::IpVerificationSuccess { verified_ip } => {
+                format!("<b>IP verified</b> — {verified_ip}")
+            }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
             Self::Custom { message } => message.clone(),
@@ -164,15 +219,19 @@ impl NotificationEvent {
     /// - `Medium` / `Low` / `Info` → Telegram only
     pub fn severity(&self) -> Severity {
         match self {
+            Self::IpVerificationFailed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
+            Self::HistoricalFetchFailed { .. } => Severity::High,
+            Self::CandleVerificationFailed { .. } => Severity::High,
             Self::Custom { .. } => Severity::High,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::ShutdownInitiated => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::TokenRenewed => Severity::Low,
+            Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
@@ -348,6 +407,51 @@ mod tests {
         assert!(msg.contains("/api/instruments/rebuild"));
     }
 
+    #[test]
+    fn test_historical_fetch_failed_message() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 9,
+            total_candles: 180000,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("partial failure"));
+        assert!(msg.contains("200"));
+        assert!(msg.contains("9"));
+        assert!(msg.contains("180000"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_is_high() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 9,
+            total_candles: 180000,
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_candle_verification_failed_message() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 209,
+            instruments_with_gaps: 3,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("verification FAILED"));
+        assert!(msg.contains("209"));
+        assert!(msg.contains("3"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_is_high() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 209,
+            instruments_with_gaps: 3,
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
     // -- Severity tests --
 
     #[test]
@@ -394,6 +498,45 @@ mod tests {
     fn test_shutdown_complete_is_info() {
         let event = NotificationEvent::ShutdownComplete;
         assert_eq!(event.severity(), Severity::Info);
+    }
+
+    // -- IP Verification event tests --
+
+    #[test]
+    fn test_ip_verification_failed_message() {
+        let event = NotificationEvent::IpVerificationFailed {
+            reason: "IP mismatch — expected 203.0.XXX.XX, got 198.51.XXX.XX".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("IP VERIFICATION FAILED"));
+        assert!(msg.contains("IP mismatch"));
+        assert!(msg.contains("Boot blocked"));
+    }
+
+    #[test]
+    fn test_ip_verification_failed_is_critical() {
+        let event = NotificationEvent::IpVerificationFailed {
+            reason: "SSM unreachable".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_ip_verification_success_message() {
+        let event = NotificationEvent::IpVerificationSuccess {
+            verified_ip: "203.0.113.42".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("IP verified"));
+        assert!(msg.contains("203.0.113.42"));
+    }
+
+    #[test]
+    fn test_ip_verification_success_is_low() {
+        let event = NotificationEvent::IpVerificationSuccess {
+            verified_ip: "10.0.0.1".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Low);
     }
 
     #[test]

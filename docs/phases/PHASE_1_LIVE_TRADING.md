@@ -375,12 +375,12 @@ SDK format: `<BHBIfI>`
 ```
 Bytes 0-7:   Header (response_code=2, length, segment, security_id)
 Bytes 8-11:  LTP (f32, Little Endian) — direct price in rupees, NO division
-Bytes 12-15: LTT (u32, Little Endian) — last trade time (epoch seconds, IST-naive)
+Bytes 12-15: LTT (u32, Little Endian) — last trade time (UTC epoch seconds)
 ```
 
 **Price decoding for Ticker:**
 - LTP: Read f32 at offset 8 — value IS the price in rupees (no /100)
-- LTT: Read u32 at offset 12 — IST-naive epoch seconds
+- LTT: Read u32 at offset 12 — UTC epoch seconds
 
 ### Response Code 4 — Quote Packet (50 bytes total)
 

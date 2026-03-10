@@ -17,6 +17,7 @@
 //! # Boot Sequence Position
 //! OMS -> **QuestDB -> Valkey** -> HTTP API
 
+pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod instrument_persistence;
 pub mod materialized_views;

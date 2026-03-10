@@ -27,20 +27,26 @@ extract_prod_code() {
   awk '
     BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
     # Skip #[cfg(test)] and #[test] blocks (brace-depth tracking)
-    /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; next }
-    /^[[:space:]]*#\[test\]/ { skip=1; next }
+    # Only trigger when NOT already inside a skip block to prevent
+    # nested #[test] attributes from resetting the outer module depth.
+    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; next }
+    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; next }
+    # Inside a skip block that has entered braces — track depth
+    skip==1 && depth > 0 {
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) { skip=0; depth=0 }
+      next
+    }
+    # Inside a skip block, first line with opening brace — start depth tracking
     skip==1 && /\{/ {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
       if (depth <= 0) { skip=0; depth=0 }
       next
     }
-    skip==1 {
-      depth += gsub(/\{/, "{")
-      depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
-      next
-    }
+    # Inside a skip block, no braces yet (attribute lines like #[allow()])
+    skip==1 { next }
     # Block-level exemptions: O(1) EXEMPT: begin ... O(1) EXEMPT: end
     /O\(1\) EXEMPT: begin/ { exempt=1; next }
     /O\(1\) EXEMPT: end/ { exempt=0; next }
@@ -107,16 +113,18 @@ scan_prod_code() {
 }
 
 # Helper: scan ONLY hot-path code
-# Hot path = crates/trading/, crates/websocket/, crates/oms/ (full crates)
+# Hot path = crates/trading/ (excluding oms/ — order management is network-bound cold path),
+#            crates/websocket/, crates/oms/ (full crates)
 #          + crates/core/src/websocket/, crates/core/src/ticker/ (specific modules within core)
 # Cold path within core (auth/, instrument/, notification/, config/) is NOT hot path.
+# Cold path within trading (oms/) — order placement is I/O-bound, not latency-critical.
 scan_hot_path() {
   local pattern="$1"
   local description="$2"
   local files="$3"
   local hot_path_files
 
-  hot_path_files=$(echo "$files" | grep -E '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/' || true)
+  hot_path_files=$(echo "$files" | grep -E '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/' | grep -v '^crates/trading/src/oms/' || true)
   if [ -z "$hot_path_files" ]; then
     return
   fi
@@ -191,6 +199,28 @@ scan_hot_path 'dyn ' 'dyn Trait on hot path — use enum_dispatch' "$STAGED_FILE
 
 # HashMap::new() without capacity on hot path
 scan_hot_path 'HashMap::new()' 'HashMap::new() on hot path — use with_capacity()' "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
+# CATEGORY 2b: Storage crate — price precision
+# ─────────────────────────────────────────────
+
+# f64::from() on f32 prices in storage crate — must use f32_to_f64_clean()
+# Raw f64::from(f32) widens IEEE 754 bit pattern, causing 10.20 → 10.19999980926514
+scan_storage_precision() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local storage_files
+
+  storage_files=$(echo "$files" | grep -E '^crates/storage/' || true)
+  if [ -z "$storage_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$description" "$storage_files"
+}
+
+scan_storage_precision 'f64::from(' 'f64::from(f32) in storage — use f32_to_f64_clean() to preserve Dhan price precision' "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
 # CATEGORY 3: Hardcoded values (all prod code)

@@ -174,6 +174,146 @@ groups:
         labels:
           severity: critical
 
+      - uid: dlt-no-ticks
+        title: "No Ticks Received"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(dlt_ticks_processed_total[5m]) == 0"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "No ticks received for 5 minutes"
+          description: "Tick processing rate has been zero for 5+ minutes. Market data feed may be dead."
+        labels:
+          severity: critical
+
+      - uid: dlt-high-parse-errors
+        title: "High Parse Error Rate"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(dlt_parse_errors_total[5m]) > 1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 3m
+        annotations:
+          summary: "Parse error rate above 1/sec"
+          description: "Binary frame parse errors are sustained above 1/sec. Feed data may be corrupted."
+        labels:
+          severity: warning
+
+      - uid: dlt-high-storage-errors
+        title: "High Storage Error Rate"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(dlt_storage_errors_total[5m]) > 0.1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 3m
+        annotations:
+          summary: "QuestDB storage errors detected"
+          description: "Tick persistence is failing. Check QuestDB connectivity and disk space."
+        labels:
+          severity: warning
+
+      - uid: dlt-high-reconnect-rate
+        title: "Frequent WebSocket Reconnections"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(dlt_websocket_reconnections_total[5m]) > 0.1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "WebSocket reconnecting frequently"
+          description: "WebSocket connections are reconnecting at a high rate. Network or Dhan server instability."
+        labels:
+          severity: warning
+
       - uid: dlt-websocket-disconnect
         title: "WebSocket Disconnected"
         condition: C

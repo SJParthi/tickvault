@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Full Quality Gates (All 6 CI Stages)
+# dhan-live-trader — Full Quality Gates (All 7 CI Stages)
 # =============================================================================
-# Runs the same 6 stages that CI runs on GitHub Actions.
+# Runs the same stages that CI runs on GitHub Actions, plus local-only checks.
 # If this passes locally, it will pass in CI.
 #
 # Usage: ./scripts/quality-full.sh
@@ -14,6 +14,7 @@
 #   4. Security    — cargo audit + cargo deny check
 #   5. Performance — cargo bench --workspace (if benchmarks exist)
 #   6. Coverage    — cargo llvm-cov --workspace (99% threshold)
+#   7. Flakiness   — run tests 3x to detect intermittent failures (local only)
 # =============================================================================
 
 set -euo pipefail
@@ -44,7 +45,7 @@ run_stage() {
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   Full Quality Gates — 6 Stages                ║${NC}"
+echo -e "${CYAN}║   Full Quality Gates — 7 Stages                ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -102,6 +103,24 @@ if command -v cargo-llvm-cov > /dev/null 2>&1; then
 else
     echo -e "${CYAN}[Stage 6/6]${NC} Coverage"
     echo -e "  ${YELLOW}SKIPPED${NC} — cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)"
+    echo ""
+fi
+
+# Stage 7: Flakiness detection (local only — zero CI cost)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$SCRIPT_DIR/flaky-detect.sh" ]; then
+    echo -e "${CYAN}[Stage 7/7]${NC} Flakiness Detection (3 runs)"
+    echo -n "  Running: ./scripts/flaky-detect.sh 3 ... "
+    if "$SCRIPT_DIR/flaky-detect.sh" 3 > /dev/null 2>&1; then
+        echo -e "${GREEN}PASSED${NC}"
+    else
+        echo -e "${RED}FAILED${NC}"
+        FAILED=1
+    fi
+    echo ""
+else
+    echo -e "${CYAN}[Stage 7/7]${NC} Flakiness Detection"
+    echo -e "  ${YELLOW}SKIPPED${NC} — scripts/flaky-detect.sh not found"
     echo ""
 fi
 

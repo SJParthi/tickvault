@@ -14,6 +14,80 @@ data_collection_end = "16:00:00"
 timezone = "Asia/Kolkata"
 max_orders_per_second = 10
 
+# ---------------------------------------------------------------------------
+# NSE Trading Holidays — Official NSE Circular NSE/CMTR/71775
+# ---------------------------------------------------------------------------
+# Update annually when NSE publishes the next calendar year's circular.
+# Format: { date = "YYYY-MM-DD", name = "..." }
+# Weekends are excluded automatically — only list weekday holidays.
+
+[[trading.nse_holidays]]
+date = "2026-01-26"
+name = "Republic Day"
+
+[[trading.nse_holidays]]
+date = "2026-03-03"
+name = "Holi"
+
+[[trading.nse_holidays]]
+date = "2026-03-26"
+name = "Shri Ram Navami"
+
+[[trading.nse_holidays]]
+date = "2026-03-31"
+name = "Shri Mahavir Jayanti"
+
+[[trading.nse_holidays]]
+date = "2026-04-03"
+name = "Good Friday"
+
+[[trading.nse_holidays]]
+date = "2026-04-14"
+name = "Dr. Baba Saheb Ambedkar Jayanti"
+
+[[trading.nse_holidays]]
+date = "2026-05-01"
+name = "Maharashtra Day"
+
+[[trading.nse_holidays]]
+date = "2026-05-28"
+name = "Bakri Eid (Eid ul-Adha)"
+
+[[trading.nse_holidays]]
+date = "2026-06-26"
+name = "Muharram"
+
+[[trading.nse_holidays]]
+date = "2026-09-14"
+name = "Ganesh Chaturthi"
+
+[[trading.nse_holidays]]
+date = "2026-10-02"
+name = "Mahatma Gandhi Jayanti"
+
+[[trading.nse_holidays]]
+date = "2026-10-20"
+name = "Dussehra"
+
+[[trading.nse_holidays]]
+date = "2026-11-10"
+name = "Diwali Balipratipada"
+
+[[trading.nse_holidays]]
+date = "2026-11-24"
+name = "Prakash Gurpurb Sri Guru Nanak Dev"
+
+[[trading.nse_holidays]]
+date = "2026-12-25"
+name = "Christmas"
+
+# Special trading sessions (market normally closed but opens for limited hours).
+# Muhurat Trading: ~1 hour evening session on Diwali.
+
+[[trading.muhurat_trading_dates]]
+date = "2026-11-08"
+name = "Diwali 2026 (Sunday — special session)"
+
 [dhan]
 websocket_url = "wss://api-feed.dhan.co"
 order_update_websocket_url = "wss://api-order-update.dhan.co"
@@ -63,6 +137,11 @@ token_validity_hours = 24
 [risk]
 max_daily_loss_percent = 2.0
 max_position_size_lots = 50
+
+[strategy]
+config_path = "config/strategies.toml"
+capital = 1000000.0
+dry_run = true  # SAFETY: never place real orders — paper trading only
 
 [logging]
 level = "info"

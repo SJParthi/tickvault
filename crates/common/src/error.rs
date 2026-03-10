@@ -64,6 +64,10 @@ pub enum ApplicationError {
     /// Telegram notification send failed (non-fatal — logged as warn only).
     #[error("notification send failed: {reason}")]
     NotificationSendFailed { reason: String },
+
+    /// Public IP verification failed — static IP mismatch or detection failure.
+    #[error("IP verification failed: {reason}")]
+    IpVerificationFailed { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +178,16 @@ mod tests {
     fn test_auth_circuit_breaker_display() {
         let err = ApplicationError::AuthCircuitBreakerTripped { failures: 5 };
         assert!(err.to_string().contains("5"));
+    }
+
+    #[test]
+    fn test_ip_verification_failed_display() {
+        let err = ApplicationError::IpVerificationFailed {
+            reason: "IP mismatch".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("IP verification failed"));
+        assert!(msg.contains("IP mismatch"));
     }
 
     #[test]

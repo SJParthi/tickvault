@@ -8,6 +8,7 @@ use chrono::NaiveTime;
 use serde::Deserialize;
 
 use crate::constants::SEBI_MAX_ORDERS_PER_SECOND;
+use crate::trading_calendar::TradingCalendar;
 
 /// Root application configuration.
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,45 @@ pub struct ApplicationConfig {
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub historical: HistoricalDataConfig,
+    #[serde(default)]
+    pub strategy: StrategyConfig,
+}
+
+/// Strategy and paper-trading configuration.
+#[derive(Debug, Deserialize)]
+pub struct StrategyConfig {
+    /// Path to the strategy TOML config file (relative to working directory).
+    #[serde(default = "default_strategy_config_path")]
+    pub config_path: String,
+    /// Trading capital in rupees (for risk engine daily loss calculation).
+    #[serde(default = "default_capital")]
+    pub capital: f64,
+    /// Dry-run mode: when true, NO real orders are placed. All orders are simulated.
+    /// DEFAULT: true. This is a developer-only tool.
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            config_path: default_strategy_config_path(),
+            capital: default_capital(),
+            dry_run: default_dry_run(),
+        }
+    }
+}
+
+fn default_strategy_config_path() -> String {
+    "config/strategies.toml".to_string()
+}
+
+const fn default_capital() -> f64 {
+    1_000_000.0
+}
+
+const fn default_dry_run() -> bool {
+    true
 }
 
 /// Trading session timing configuration.
@@ -51,6 +91,22 @@ pub struct TradingConfig {
     pub timezone: String,
     /// Maximum orders per second (SEBI limit).
     pub max_orders_per_second: u32,
+    /// NSE trading holidays with names for display.
+    /// Source: official NSE circular (update annually).
+    #[serde(default)]
+    pub nse_holidays: Vec<NseHolidayEntry>,
+    /// Muhurat Trading dates — special sessions on otherwise closed days.
+    #[serde(default)]
+    pub muhurat_trading_dates: Vec<NseHolidayEntry>,
+}
+
+/// A single NSE holiday or Muhurat trading date with display name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NseHolidayEntry {
+    /// Date in YYYY-MM-DD format (IST).
+    pub date: String,
+    /// Human-readable holiday name for display.
+    pub name: String,
 }
 
 /// Dhan API and WebSocket connection configuration.
@@ -526,6 +582,11 @@ impl ApplicationConfig {
             bail!("notification.send_timeout_ms must be > 0");
         }
 
+        // Trading calendar: validate all holiday date strings parse correctly
+        // and none fall on weekends. This also constructs the calendar to verify
+        // internal consistency.
+        TradingCalendar::from_config(&self.trading)?;
+
         // Historical: validate if enabled.
         if self.historical.enabled {
             if self.historical.lookback_days == 0
@@ -567,6 +628,20 @@ mod tests {
                 data_collection_end: "16:00:00".to_string(),
                 timezone: "Asia/Kolkata".to_string(),
                 max_orders_per_second: 10,
+                nse_holidays: vec![
+                    NseHolidayEntry {
+                        date: "2026-01-26".to_string(),
+                        name: "Republic Day".to_string(),
+                    },
+                    NseHolidayEntry {
+                        date: "2026-03-03".to_string(),
+                        name: "Holi".to_string(),
+                    },
+                ],
+                muhurat_trading_dates: vec![NseHolidayEntry {
+                    date: "2026-11-08".to_string(),
+                    name: "Diwali 2026".to_string(),
+                }],
             },
             dhan: DhanConfig {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),
@@ -640,6 +715,7 @@ mod tests {
             notification: NotificationConfig::default(),
             observability: ObservabilityConfig::default(),
             historical: HistoricalDataConfig::default(),
+            strategy: StrategyConfig::default(),
         }
     }
 

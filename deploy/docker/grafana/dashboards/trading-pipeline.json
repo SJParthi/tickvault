@@ -136,7 +136,9 @@
         "overrides": [
           { "matcher": { "id": "byName", "options": "junk filtered/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
           { "matcher": { "id": "byName", "options": "parse errors/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "storage errors/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "dark-red", "mode": "fixed" } }] }
+          { "matcher": { "id": "byName", "options": "storage errors/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "dark-red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "dedup filtered/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "crossed market/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] }
         ]
       },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
@@ -147,7 +149,9 @@
       "targets": [
         { "expr": "rate(dlt_junk_ticks_filtered_total[1m])", "legendFormat": "junk filtered/s", "refId": "A" },
         { "expr": "rate(dlt_parse_errors_total[1m])", "legendFormat": "parse errors/s", "refId": "B" },
-        { "expr": "rate(dlt_storage_errors_total[1m])", "legendFormat": "storage errors/s", "refId": "C" }
+        { "expr": "rate(dlt_storage_errors_total[1m])", "legendFormat": "storage errors/s", "refId": "C" },
+        { "expr": "rate(dlt_dedup_filtered_total[1m])", "legendFormat": "dedup filtered/s", "refId": "D" },
+        { "expr": "rate(dlt_crossed_market_total[1m])", "legendFormat": "crossed market/s", "refId": "E" }
       ]
     },
     {
@@ -262,7 +266,81 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "id": 110,
+      "title": "Historical Candles & Data Integrity",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "green", "mode": "fixed" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 28 },
+      "id": 20,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Historical Candles Fetched",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_historical_candles_fetched_total", "legendFormat": "", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "red", "mode": "fixed" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 28 },
+      "id": 21,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Historical API Errors",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_historical_api_errors_total", "legendFormat": "", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "yellow", "mode": "fixed" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 28 },
+      "id": 22,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Dedup Filtered Total",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_dedup_filtered_total", "legendFormat": "", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "purple", "mode": "fixed" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "purple", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 28 },
+      "id": 23,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Crossed Market Events",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_crossed_market_total", "legendFormat": "", "refId": "A" }]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
       "id": 103,
       "title": "Order Flow",
       "type": "row"

@@ -4,7 +4,7 @@
 //! on `(ts, security_id)` to ensure idempotent re-ingestion.
 //!
 //! # Table Schema
-//! - `ts` TIMESTAMP (designated) — candle open time in UTC
+//! - `ts` TIMESTAMP (designated) — candle open time (IST-as-UTC: UTC epoch + 19800s)
 //! - `security_id` LONG — Dhan security identifier
 //! - `segment` SYMBOL — exchange segment (NSE_FNO, NSE_EQ, etc.)
 //! - OHLCV + OI as DOUBLE/LONG columns
@@ -22,8 +22,15 @@ use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{CANDLE_FLUSH_BATCH_SIZE, QUESTDB_TABLE_CANDLES_1M};
+use dhan_live_trader_common::constants::{
+    CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
+    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
+    EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
+    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+};
 use dhan_live_trader_common::tick_types::HistoricalCandle;
+
+use crate::tick_persistence::f32_to_f64_clean;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,17 +42,20 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// DEDUP UPSERT KEY column for the candles table.
 const DEDUP_KEY_CANDLES: &str = "security_id";
 
-/// Maps binary exchange_segment_code to string for ILP SYMBOL column.
+/// Maps the binary exchange_segment_code to a human-readable symbol name.
+///
+/// Uses the same mapping as the Dhan Python SDK.
+/// Note: code 6 is unused/skipped in Dhan's protocol.
 fn segment_code_to_str(code: u8) -> &'static str {
     match code {
-        0 => "IDX_I",
-        1 => "NSE_EQ",
-        2 => "NSE_FNO",
-        3 => "NSE_CURRENCY",
-        4 => "BSE_EQ",
-        5 => "MCX_COMM",
-        6 => "BSE_CURRENCY",
-        7 => "BSE_FNO",
+        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
+        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
+        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
+        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
+        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
+        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
+        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
+        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
         _ => "UNKNOWN",
     }
 }
@@ -84,12 +94,20 @@ impl CandlePersistenceWriter {
 
     /// Appends a historical candle to the ILP buffer.
     ///
+    /// Converts `candle.timestamp_utc_secs` (UTC epoch from Dhan V2 API) to
+    /// IST-as-UTC by adding `IST_UTC_OFFSET_SECONDS_I64`, so QuestDB displays
+    /// IST wall-clock time directly (e.g., 09:15 instead of 03:45).
+    ///
     /// Auto-flushes if the buffer reaches `CANDLE_FLUSH_BATCH_SIZE`.
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
     pub fn append_candle(&mut self, candle: &HistoricalCandle) -> Result<()> {
-        let ts_nanos = TimestampNanos::new(candle.timestamp_utc_secs.saturating_mul(1_000_000_000));
+        // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
+        let ist_epoch_secs = candle
+            .timestamp_utc_secs
+            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1M)
@@ -141,6 +159,120 @@ impl CandlePersistenceWriter {
     /// Returns the number of candles currently buffered (not yet flushed).
     pub fn pending_count(&self) -> usize {
         self.pending_count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live Candle Writer (candles_1s — feeds materialized views)
+// ---------------------------------------------------------------------------
+
+/// Batch size for live candle ILP flushes. Smaller than historical since
+/// live candles arrive in real-time and need lower latency.
+const LIVE_CANDLE_FLUSH_BATCH_SIZE: usize = 128;
+
+/// Batched writer for live 1-second candles to `candles_1s` via ILP.
+///
+/// Completed candles from `CandleAggregator` are written here, feeding
+/// QuestDB materialized views (candles_1m, 5m, 15m, etc.).
+pub struct LiveCandleWriter {
+    sender: Sender,
+    buffer: Buffer,
+    pending_count: usize,
+}
+
+impl LiveCandleWriter {
+    /// Creates a new live candle writer connected to QuestDB via ILP TCP.
+    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let sender = Sender::from_conf(&conf_string)
+            .context("failed to connect to QuestDB for live candles")?;
+        let buffer = sender.new_buffer();
+
+        Ok(Self {
+            sender,
+            buffer,
+            pending_count: 0,
+        })
+    }
+
+    /// Appends a completed 1-second candle to the ILP buffer.
+    ///
+    /// Auto-flushes when buffer reaches `LIVE_CANDLE_FLUSH_BATCH_SIZE`.
+    ///
+    /// # Performance
+    /// O(1) — single ILP row append + conditional flush.
+    #[allow(clippy::too_many_arguments)] // APPROVED: ILP row requires all OHLCV+meta columns
+    pub fn append_candle(
+        &mut self,
+        security_id: u32,
+        exchange_segment_code: u8,
+        timestamp_secs: u32,
+        open: f32,
+        high: f32,
+        low: f32,
+        close: f32,
+        volume: u32,
+        tick_count: u32,
+    ) -> Result<()> {
+        // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
+        let ist_epoch_secs = i64::from(timestamp_secs).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+
+        self.buffer
+            .table(QUESTDB_TABLE_CANDLES_1S)
+            .context("table name")?
+            .symbol("segment", segment_code_to_str(exchange_segment_code))
+            .context("segment")?
+            .column_i64("security_id", i64::from(security_id))
+            .context("security_id")?
+            .column_f64("open", f32_to_f64_clean(open))
+            .context("open")?
+            .column_f64("high", f32_to_f64_clean(high))
+            .context("high")?
+            .column_f64("low", f32_to_f64_clean(low))
+            .context("low")?
+            .column_f64("close", f32_to_f64_clean(close))
+            .context("close")?
+            .column_i64("volume", i64::from(volume))
+            .context("volume")?
+            .column_i64("oi", 0) // OI not available per-second from ticks
+            .context("oi")?
+            .column_i64("tick_count", i64::from(tick_count))
+            .context("tick_count")?
+            .at(ts_nanos)
+            .context("designated timestamp")?;
+
+        self.pending_count = self.pending_count.saturating_add(1);
+
+        if self.pending_count >= LIVE_CANDLE_FLUSH_BATCH_SIZE {
+            self.force_flush()?;
+        }
+
+        Ok(())
+    }
+
+    /// Forces an immediate flush of all buffered candles to QuestDB.
+    pub fn force_flush(&mut self) -> Result<()> {
+        if self.pending_count == 0 {
+            return Ok(());
+        }
+
+        let count = self.pending_count;
+        self.sender
+            .flush(&mut self.buffer)
+            .context("flush live candles to QuestDB")?;
+        self.pending_count = 0;
+
+        debug!(flushed_rows = count, "live candle batch flushed to QuestDB");
+        Ok(())
+    }
+
+    /// Flushes if any candles are buffered.
+    pub fn flush_if_needed(&mut self) -> Result<()> {
+        if self.pending_count > 0 {
+            self.force_flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -258,13 +390,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_segment_code_to_str_nse_fno() {
-        assert_eq!(segment_code_to_str(2), "NSE_FNO");
+    fn test_segment_code_to_str_all_valid_codes() {
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_IDX_I), "IDX_I");
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ), "NSE_EQ");
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_NSE_FNO), "NSE_FNO");
+        assert_eq!(
+            segment_code_to_str(EXCHANGE_SEGMENT_NSE_CURRENCY),
+            "NSE_CURRENCY"
+        );
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_BSE_EQ), "BSE_EQ");
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_MCX_COMM), "MCX_COMM");
+        assert_eq!(
+            segment_code_to_str(EXCHANGE_SEGMENT_BSE_CURRENCY),
+            "BSE_CURRENCY"
+        );
+        assert_eq!(segment_code_to_str(EXCHANGE_SEGMENT_BSE_FNO), "BSE_FNO");
     }
 
     #[test]
     fn test_segment_code_to_str_unknown() {
         assert_eq!(segment_code_to_str(255), "UNKNOWN");
+        // Code 6 is unused in Dhan protocol — must map to UNKNOWN
+        assert_eq!(segment_code_to_str(6), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_segment_code_bse_fno_is_8_not_7() {
+        // Regression: BSE_FNO is code 8, not 7. Code 6 is skipped in Dhan protocol.
+        assert_eq!(EXCHANGE_SEGMENT_BSE_FNO, 8);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_CURRENCY, 7);
+        assert_eq!(segment_code_to_str(8), "BSE_FNO");
+        assert_eq!(segment_code_to_str(7), "BSE_CURRENCY");
     }
 
     #[test]
