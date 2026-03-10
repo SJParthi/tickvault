@@ -50,6 +50,7 @@ zeroize = "zeroize"
 ist = "ist"
 ine = "ine"
 ot = "ot"
+thr = "thr"
 
 [files]
 extend-exclude = [

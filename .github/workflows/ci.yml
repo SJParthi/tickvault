@@ -223,7 +223,14 @@ jobs:
           tool: cargo-audit
 
       - name: Audit (yanked crates — hard block)
-        run: cargo audit --deny yanked
+        run: |
+          cargo audit --deny yanked 2>&1 | tee /tmp/audit-yanked.txt
+          AUDIT_EXIT=${PIPESTATUS[0]}
+          if [ "$AUDIT_EXIT" -ne 0 ]; then
+            echo "::error::cargo audit failed — see output above"
+            cat /tmp/audit-yanked.txt
+            exit "$AUDIT_EXIT"
+          fi
 
       - name: Audit advisories (warn only — CVEs already checked by cargo deny)
         run: |
