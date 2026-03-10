@@ -184,8 +184,9 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
 #[inline]
-fn f32_to_f64_clean(v: f32) -> f64 {
+pub(crate) fn f32_to_f64_clean(v: f32) -> f64 {
     if v == 0.0 || !v.is_finite() {
+        // APPROVED: f64::from(f32) is correct for zero/inf/NaN — no precision loss for these values
         return f64::from(v);
     }
     let mut buf = [0u8; F32_DECIMAL_BUF_SIZE];
@@ -200,6 +201,7 @@ fn f32_to_f64_clean(v: f32) -> f64 {
     std::str::from_utf8(&buf[..n])
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
+        // APPROVED: f64::from(f32) fallback — only reached if ryu/parse fails (never in practice)
         .unwrap_or(f64::from(v))
 }
 

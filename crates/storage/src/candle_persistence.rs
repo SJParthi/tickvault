@@ -30,6 +30,8 @@ use dhan_live_trader_common::constants::{
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
+use crate::tick_persistence::f32_to_f64_clean;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -223,13 +225,13 @@ impl LiveCandleWriter {
             .context("segment")?
             .column_i64("security_id", i64::from(security_id))
             .context("security_id")?
-            .column_f64("open", f64::from(open))
+            .column_f64("open", f32_to_f64_clean(open))
             .context("open")?
-            .column_f64("high", f64::from(high))
+            .column_f64("high", f32_to_f64_clean(high))
             .context("high")?
-            .column_f64("low", f64::from(low))
+            .column_f64("low", f32_to_f64_clean(low))
             .context("low")?
-            .column_f64("close", f64::from(close))
+            .column_f64("close", f32_to_f64_clean(close))
             .context("close")?
             .column_i64("volume", i64::from(volume))
             .context("volume")?

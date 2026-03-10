@@ -199,6 +199,28 @@ scan_hot_path 'dyn ' 'dyn Trait on hot path — use enum_dispatch' "$STAGED_FILE
 scan_hot_path 'HashMap::new()' 'HashMap::new() on hot path — use with_capacity()' "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 2b: Storage crate — price precision
+# ─────────────────────────────────────────────
+
+# f64::from() on f32 prices in storage crate — must use f32_to_f64_clean()
+# Raw f64::from(f32) widens IEEE 754 bit pattern, causing 10.20 → 10.19999980926514
+scan_storage_precision() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local storage_files
+
+  storage_files=$(echo "$files" | grep -E '^crates/storage/' || true)
+  if [ -z "$storage_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$description" "$storage_files"
+}
+
+scan_storage_precision 'f64::from(' 'f64::from(f32) in storage — use f32_to_f64_clean() to preserve Dhan price precision' "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # CATEGORY 3: Hardcoded values (all prod code)
 # ─────────────────────────────────────────────
 
