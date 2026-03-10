@@ -23,6 +23,24 @@ paths:
 - Manual override only: `echo <count> > .claude/hooks/.test-count-baseline`
 - Gitignored (local machine state)
 
+## Untested Pub Fn Baseline (.untested-pubfn-baseline)
+- Ratchet mechanism — count can only go DOWN
+- Every new pub fn must have a matching #[test] or "// TEST-EXEMPT: <reason>"
+- Manual override: `echo <count> > .claude/hooks/.untested-pubfn-baseline`
+- Gitignored (local machine state)
+
+## Financial Test Baseline (.financial-test-baseline)
+- Ratchet mechanism — count can only go DOWN
+- Financial functions (price/order/position) must have boundary/property tests
+- Manual override: `echo <count> > .claude/hooks/.financial-test-baseline`
+- Gitignored (local machine state)
+
+## Data Integrity Guard
+- Blocks f64::from(f32), `as f64` on prices, .round()/.floor()/.ceil() on prices
+- Scope: crates/storage/, crates/core/src/pipeline/
+- Exempt: "// DATA-INTEGRITY-EXEMPT: <reason>" or "// APPROVED:" on preceding line
+- Runs at commit (staged files) and push (full workspace)
+
 ## Exit Codes
 - 0 = PASS (allow the action)
 - 2 = BLOCK (prevent the action, show errors on stderr)

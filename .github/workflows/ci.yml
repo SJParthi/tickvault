@@ -165,6 +165,22 @@ jobs:
             echo "::warning::Unused dependencies found — cleanup when crate code is complete"
           fi
 
+      # ---- Stage 2b: Data Integrity ----
+      - name: Data integrity guard (price precision preservation)
+        run: |
+          chmod +x .claude/hooks/data-integrity-guard.sh
+          .claude/hooks/data-integrity-guard.sh .
+
+      - name: Pub fn test guard (every public function has a test)
+        run: |
+          chmod +x .claude/hooks/pub-fn-test-guard.sh
+          .claude/hooks/pub-fn-test-guard.sh . all
+
+      - name: Financial test guard (price/money functions need boundary tests)
+        run: |
+          chmod +x .claude/hooks/financial-test-guard.sh
+          .claude/hooks/financial-test-guard.sh .
+
       # ---- Stage 3: Test ----
       - name: Run tests
         run: cargo test --workspace 2>&1 | tee /tmp/test-output.txt
