@@ -12,7 +12,7 @@ paths:
 - **SubagentStart:** REMOVED — principles already in CLAUDE.md context
 - **Pre-push (7 fast gates):** fmt, banned patterns, secrets, test-count ratchet, data integrity, pub fn test, financial test (CI handles clippy/test/audit/deny/coverage/loom)
 - **Pre-PR (5 gates):** branch check, naming, clean tree, quality state, commit format
-- **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage)
+- **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage). Smart skip: heavy Rust steps (build/clippy/test) skipped when only config/scripts change.
 
 ## State File (.last-quality-pass)
 - Written by pre-PR quality check on success
