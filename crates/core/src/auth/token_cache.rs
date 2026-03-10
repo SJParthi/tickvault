@@ -332,6 +332,13 @@ fn hash_client_id(client_id: &SecretString) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// All tests that read/write `/tmp/dlt-token-cache` must hold this lock.
+    /// Cargo runs tests in the same binary in parallel threads; without
+    /// serialization, one test's `save` can be overwritten by another before
+    /// the matching `load`, causing spurious failures.
+    static CACHE_FILE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_hash_client_id_deterministic() {
@@ -349,21 +356,22 @@ mod tests {
 
     #[test]
     fn test_load_token_cache_missing_file() {
-        // No cache file exists at the default path (test runs in clean env)
-        // This should return None gracefully
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
         let id = SecretString::from("test-client".to_string());
-        // Note: this test may find a cache file if run after save tests,
-        // but in CI the /tmp is clean. We test the "file not found" path.
         let result = load_token_cache(&id);
-        // Either None (no file) or Some (leftover from another test) — both valid
-        assert!(result.is_none() || result.is_some());
+        assert!(result.is_none(), "missing file should return None");
     }
 
     #[test]
     fn test_save_and_load_roundtrip() {
         use chrono::{Duration, Utc};
 
-        // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
+
         #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
             .expect("IST offset 19800s is always valid"); // APPROVED: test code
@@ -377,25 +385,24 @@ mod tests {
 
         let client_id = SecretString::from("roundtrip-test-client".to_string());
 
-        // Save
         save_token_cache(&token, &client_id);
 
-        // Load — in parallel test execution, another test may delete or
-        // overwrite the cache file between save and load. We validate
-        // correctness when the file is still ours.
-        if let Some(loaded) = load_token_cache(&client_id) {
-            assert_eq!(loaded.access_token().expose_secret(), "test-jwt-for-cache");
-            assert!(loaded.is_valid());
-        }
-        // If None, a concurrent test deleted the file — acceptable.
+        let loaded = load_token_cache(&client_id);
+        assert!(loaded.is_some(), "roundtrip should return Some");
+        let loaded = loaded.unwrap(); // APPROVED: test code — just asserted Some
+        assert_eq!(loaded.access_token().expose_secret(), "test-jwt-for-cache");
+        assert!(loaded.is_valid());
 
-        // Cleanup
         delete_cache_file();
     }
 
     #[test]
     fn test_load_rejects_wrong_client_id() {
         use chrono::{Duration, Utc};
+
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
 
         #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
@@ -413,7 +420,6 @@ mod tests {
 
         save_token_cache(&token, &client_a);
 
-        // Loading with a different client_id should fail
         let loaded = load_token_cache(&client_b);
         assert!(loaded.is_none(), "wrong client_id should reject cache");
 
@@ -423,6 +429,10 @@ mod tests {
     #[test]
     fn test_load_rejects_expired_token() {
         use chrono::{Duration, Utc};
+
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
 
         #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
@@ -447,6 +457,10 @@ mod tests {
     #[test]
     fn test_load_rejects_nearly_expired_token() {
         use chrono::{Duration, Utc};
+
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
 
         #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
@@ -474,7 +488,10 @@ mod tests {
 
     #[test]
     fn test_corrupt_cache_file_returns_none() {
-        // Write garbage to the cache file
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
+
         std::fs::write(TOKEN_CACHE_FILE_PATH, "not valid json {{{").ok();
 
         let client_id = SecretString::from("corrupt-test".to_string());
@@ -515,6 +532,10 @@ mod tests {
         use chrono::{Duration, Utc};
 
         #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
+
+        #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
             .expect("IST offset 19800s is always valid"); // APPROVED: test code
         let now_ist = Utc::now().with_timezone(&ist);
@@ -528,22 +549,21 @@ mod tests {
         let client_id = SecretString::from("fast-client-123".to_string());
         save_token_cache(&token, &client_id);
 
-        // load_token_cache_fast should return Some (token + client_id).
-        // In parallel test execution another test may overwrite the file
-        // between our save and load, so we only assert the result is valid
-        // if present. The critical functional test is that Some → valid data.
-        if let Some(fast) = load_token_cache_fast() {
-            assert!(!fast.client_id.is_empty(), "client_id must not be empty");
-            assert!(fast.token.is_valid(), "token must be valid");
-        }
-        // If None, another test deleted/overwrote the file — acceptable in parallel.
+        let fast = load_token_cache_fast();
+        assert!(fast.is_some(), "fast roundtrip should return Some");
+        let fast = fast.unwrap(); // APPROVED: test code — just asserted Some
+        assert!(!fast.client_id.is_empty(), "client_id must not be empty");
+        assert!(fast.token.is_valid(), "token must be valid");
 
         delete_cache_file();
     }
 
     #[test]
     fn test_load_token_cache_fast_missing_file() {
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
+
         let result = load_token_cache_fast();
         assert!(
             result.is_none(),
@@ -554,6 +574,10 @@ mod tests {
     #[test]
     fn test_load_token_cache_fast_old_format_without_client_id() {
         use chrono::{Duration, Utc};
+
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
 
         #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
@@ -581,6 +605,10 @@ mod tests {
     #[test]
     fn test_load_token_cache_fast_expired_token() {
         use chrono::{Duration, Utc};
+
+        #[allow(clippy::expect_used)]
+        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        delete_cache_file();
 
         #[allow(clippy::expect_used)]
         let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
