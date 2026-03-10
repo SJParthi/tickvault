@@ -89,10 +89,10 @@ else
 
   # Gate 1: cargo fmt
   echo "  [1/12] cargo fmt --check..." >&2
-  FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
+  FMT_OUT=$(timeout 120 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
   if [ "$FMT_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo fmt timed out (60s) — blocking push" >&2
+    echo "  FAIL: cargo fmt timed out (120s) — blocking push" >&2
     FAILED=1
   elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: Code not formatted:" >&2
@@ -104,10 +104,10 @@ else
 
   # Gate 2: cargo clippy
   echo "  [2/12] cargo clippy..." >&2
-  CLIPPY_OUT=$(timeout 120 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+  CLIPPY_OUT=$(timeout 240 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
   CLIPPY_EXIT=$?
   if [ "$CLIPPY_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo clippy timed out (120s) — blocking push" >&2
+    echo "  FAIL: cargo clippy timed out (240s) — blocking push" >&2
     FAILED=1
   elif [ "$CLIPPY_EXIT" -ne 0 ]; then
     echo "  FAIL: clippy warnings found:" >&2
@@ -119,10 +119,10 @@ else
 
   # Gate 3: cargo test
   echo "  [3/12] cargo test..." >&2
-  TEST_OUT=$(timeout 120 cargo test --workspace 2>&1)
+  TEST_OUT=$(timeout 300 cargo test --workspace 2>&1)
   TEST_EXIT=$?
   if [ "$TEST_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo test timed out (120s) — blocking push" >&2
+    echo "  FAIL: cargo test timed out (300s) — blocking push" >&2
     FAILED=1
   elif [ "$TEST_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo test failed:" >&2

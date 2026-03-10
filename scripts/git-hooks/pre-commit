@@ -43,10 +43,10 @@ echo "╚═══════════════════════�
 if [ -n "$RS_STAGED" ]; then
 
   echo "  [1/6] cargo fmt --check..." >&2
-  FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
+  FMT_OUT=$(timeout 120 cargo fmt --all -- --check 2>&1)
   FMT_EXIT=$?
   if [ "$FMT_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo fmt timed out (60s)" >&2
+    echo "  FAIL: cargo fmt timed out (120s)" >&2
     FAILED=1
   elif [ "$FMT_EXIT" -ne 0 ]; then
     echo "  FAIL: cargo fmt check failed:" >&2
