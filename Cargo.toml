@@ -50,7 +50,7 @@ opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32.1"
 
 # ---- Section 6: Trading Domain — Auth ----
