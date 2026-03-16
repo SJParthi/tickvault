@@ -55,9 +55,6 @@ pub struct PositionInfo {
     pub avg_entry_price: f64,
     /// Realized P&L from closed trades (in rupees).
     pub realized_pnl: f64,
-    /// Contract lot size (e.g., 25 for NIFTY options). Stored from the most
-    /// recent `record_fill` call for unrealized P&L computation.
-    pub lot_size: u32,
 }
 
 // ---------------------------------------------------------------------------

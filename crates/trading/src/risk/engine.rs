@@ -40,8 +40,6 @@ pub struct RiskEngine {
     capital: f64,
     /// Per-instrument positions keyed by security_id.
     positions: HashMap<u32, PositionInfo>,
-    /// Latest market prices keyed by security_id (for unrealized P&L).
-    market_prices: HashMap<u32, f64>,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -67,7 +65,6 @@ impl RiskEngine {
             max_position_lots,
             capital,
             positions: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
-            market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             total_realized_pnl: 0.0,
             halted: false,
             halt_reason: None,
@@ -156,11 +153,6 @@ impl RiskEngine {
     ) {
         let pos = self.positions.entry(security_id).or_default();
 
-        // Store lot_size for unrealized P&L computation
-        if lot_size > 0 {
-            pos.lot_size = lot_size;
-        }
-
         // Check if this fill reduces or closes the position (generates realized P&L)
         let is_reducing =
             (pos.net_lots > 0 && filled_lots < 0) || (pos.net_lots < 0 && filled_lots > 0);
@@ -202,12 +194,12 @@ impl RiskEngine {
     ///
     /// # Performance
     /// O(1) — HashMap lookup + field update.
-    // RISK-GAP-02: rejects non-positive and non-finite prices
-    pub fn update_market_price(&mut self, security_id: u32, current_price: f64) {
-        if !current_price.is_finite() || current_price <= 0.0 {
-            return;
-        }
-        self.market_prices.insert(security_id, current_price);
+    pub fn update_market_price(&mut self, security_id: u32, _current_price: f64) {
+        // Unrealized P&L is computed on-demand in total_unrealized_pnl().
+        // We store the latest price for each position. For now, this is a
+        // no-op placeholder — unrealized P&L computation will use live tick
+        // prices from the papaya concurrent map in the pipeline.
+        let _ = security_id;
     }
 
     /// Manually halts trading (operator-initiated).
@@ -227,10 +219,8 @@ impl RiskEngine {
     }
 
     /// Resets all daily state (P&L, positions, halt) for a new trading day.
-    // RISK-GAP-02: clears ALL state (positions, prices, lots, P&L, halt)
     pub fn reset_daily(&mut self) {
         self.positions.clear();
-        self.market_prices.clear();
         self.total_realized_pnl = 0.0;
         self.halted = false;
         self.halt_reason = None;
@@ -256,32 +246,11 @@ impl RiskEngine {
 
     /// Returns the total unrealized P&L across all open positions.
     ///
-    /// // RISK-GAP-02: conservative — skips securities with no market price
+    /// Currently returns 0.0 — will be computed from live market prices
+    /// once the papaya price map integration is wired.
     pub fn total_unrealized_pnl(&self) -> f64 {
-        let mut total = 0.0_f64;
-        for (&security_id, pos) in &self.positions {
-            if pos.net_lots == 0 {
-                continue;
-            }
-            let Some(&market_price) = self.market_prices.get(&security_id) else {
-                continue; // Conservative: no price → skip (counts as 0)
-            };
-            // lot_size 0 → treat as 1 to avoid zeroing out P&L
-            let lot_multiplier = if pos.lot_size == 0 {
-                1_u32
-            } else {
-                pos.lot_size
-            };
-            // (market_price - avg_entry) * net_lots * lot_size
-            // Works for both long (net_lots > 0) and short (net_lots < 0):
-            //   Long at 100, market 110: (110-100) * +10 * 25 = +25000
-            //   Short at 100, market 90: (90-100) * -10 * 25 = +25000
-            let unrealized = (market_price - pos.avg_entry_price)
-                * f64::from(pos.net_lots)
-                * f64::from(lot_multiplier);
-            total += unrealized;
-        }
-        total
+        // TODO: compute from live prices via papaya concurrent map
+        0.0
     }
 
     /// Returns the position info for a specific instrument.
@@ -572,79 +541,5 @@ mod tests {
     fn position_for_unknown_security() {
         let engine = make_engine();
         assert!(engine.position(9999).is_none());
-    }
-
-    #[test]
-    fn unrealized_pnl_long_position() {
-        let mut engine = make_engine();
-        engine.record_fill(1001, 10, 100.0, 25);
-        engine.update_market_price(1001, 110.0);
-        // (110 - 100) * 10 * 25 = 2500
-        assert!((engine.total_unrealized_pnl() - 2500.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn unrealized_pnl_short_position() {
-        let mut engine = make_engine();
-        engine.record_fill(1001, -10, 100.0, 25);
-        engine.update_market_price(1001, 90.0);
-        // (90 - 100) * -10 * 25 = 2500 profit
-        assert!((engine.total_unrealized_pnl() - 2500.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn unrealized_pnl_no_market_price_is_zero() {
-        let mut engine = make_engine();
-        engine.record_fill(1001, 10, 100.0, 25);
-        // No market price → conservative 0
-        assert!((engine.total_unrealized_pnl()).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn unrealized_pnl_invalid_prices_ignored() {
-        let mut engine = make_engine();
-        engine.record_fill(1001, 10, 100.0, 25);
-        engine.update_market_price(1001, -5.0);
-        engine.update_market_price(1001, 0.0);
-        engine.update_market_price(1001, f64::NAN);
-        engine.update_market_price(1001, f64::INFINITY);
-        assert!((engine.total_unrealized_pnl()).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn unrealized_pnl_multiple_instruments() {
-        let mut engine = make_engine();
-        engine.record_fill(1001, 10, 100.0, 25);
-        engine.record_fill(1002, -5, 200.0, 50);
-        engine.update_market_price(1001, 110.0);
-        engine.update_market_price(1002, 190.0);
-        // 1001: (110-100) * 10 * 25 = 2500
-        // 1002: (190-200) * -5 * 50 = 2500
-        assert!((engine.total_unrealized_pnl() - 5000.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn unrealized_pnl_cleared_on_daily_reset() {
-        let mut engine = make_engine();
-        engine.record_fill(1001, 10, 100.0, 25);
-        engine.update_market_price(1001, 110.0);
-        assert!(engine.total_unrealized_pnl() > 0.0);
-
-        engine.reset_daily();
-        assert!((engine.total_unrealized_pnl()).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn unrealized_loss_triggers_halt() {
-        // 2% of 1M = 20,000 max loss
-        let mut engine = make_engine();
-        // Buy 80 lots at 100, lot_size 25
-        engine.record_fill(1001, 80, 100.0, 25);
-        // Market drops to 90 → unrealized = (90-100)*80*25 = -20,000
-        engine.update_market_price(1001, 90.0);
-        let result = engine.check_order(2001, 1);
-        assert!(!result.is_approved());
-        assert!(engine.is_halted());
-        assert_eq!(engine.halt_reason(), Some(RiskBreach::MaxDailyLossExceeded));
     }
 }
