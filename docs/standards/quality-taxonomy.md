@@ -581,7 +581,7 @@ services:
 - [ ] All TODOs/FIXMEs resolved in production code
 - [ ] Health check passes (POST /health)
 - [ ] Smoke test passes (1 tick end-to-end)
-- [ ] Release checklist complete (`docs/templates/release_checklist.md`)
+- [ ] Release checklist complete (`docs/templates/release-checklist.md`)
 - [ ] Parthiban approves
 
 ---

@@ -69,8 +69,8 @@ CI enforces checks on PRs to main. All must pass.
 ## Key References
 
 - [CLAUDE.md](CLAUDE.md) — project rules and conventions
-- [docs/tech_stack_bible_v6.md](docs/tech_stack_bible_v6.md) — approved dependencies and versions
-- [docs/phases/PHASE_1_LIVE_TRADING.md](docs/phases/PHASE_1_LIVE_TRADING.md) — current phase
+- [docs/architecture/tech-stack-bible.md](docs/architecture/tech-stack-bible.md) — approved dependencies and versions
+- [docs/phases/phase-1-live-trading.md](docs/phases/phase-1-live-trading.md) — current phase
 
 ## Owner
 

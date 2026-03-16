@@ -65,7 +65,7 @@ All CI green + Docker image builds (<50MB binary) + health checks pass + smoke t
 
 ## Gate 5b: Release Checklist
 
-Full checklist: `docs/templates/release_checklist.md` (read ONLY at release time).
+Full checklist: `docs/templates/release-checklist.md` (read ONLY at release time).
 
 ## Gate 6: Runtime Monitoring — Post-Deployment
 

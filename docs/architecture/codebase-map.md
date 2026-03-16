@@ -110,7 +110,7 @@ dhan-live-trader/
 │   └── notify-telegram.sh             # Sends Telegram alerts via real AWS SSM
 └── docs/
     ├── tech-stack-bible.md          # 113 components (converted from PDF)
-    ├── codebase_map.md                 # THIS FILE
+    ├── architecture/codebase-map.md     # THIS FILE
     └── phases/
         └── phase-1-live-trading.md     # Full Phase 1 spec (1,412 lines)
 ```

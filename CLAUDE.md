@@ -264,12 +264,12 @@ make prometheus                      # localhost:9090
 - Mutation testing (survived mutants = hard fail)
 - Safety net: cargo-careful + AddressSanitizer + ThreadSanitizer
 
-## LOCAL HOOKS (24 scripts)
+## LOCAL HOOKS (19 scripts)
 
 **Pre-commit (8 gates):** fmt → banned patterns → data integrity → O(1)/dedup scan → secrets → version pinning → commit msg → typos
 **Pre-push (7 gates):** fmt → banned patterns → secrets → test count → data integrity → pub fn test guard → financial test guard
 **Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+`
-**Other hooks:** pre-tool-dispatch, auto-save, session-sanity, coverage-guard, dry-run-guard, plan-verify, testing-standards-guard
+**Other hooks:** pre-tool-dispatch, auto-save, session-sanity, coverage-guard, plan-verify, block-env-files
 
 ## DOCKER SERVICES (8 containers)
 
@@ -289,17 +289,6 @@ All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.ym
 ## ENFORCEMENT RULES
 
 Auto-loaded `.claude/rules/` files by directory:
-
-### Root rules (7 files)
-| Rule File | Enforces |
-|-----------|----------|
-| `rust-code.md` | Error handling, naming, logging, no hardcoded values, secrets |
-| `hot-path.md` | Zero allocation, O(1) constraints, banned hot-path patterns |
-| `testing.md` | Test naming, coverage, property testing requirements |
-| `enforcement.md` | Gap enforcement cross-cutting rules |
-| `cargo-and-docker.md` | Version pinning, Docker digest, workspace deps |
-| `data-integrity.md` | Price precision, f32→f64, dedup keys |
-| `market-hours.md` | IST timezone, market hour checks, holiday handling |
 
 ### Dhan API rules (21 files in `dhan/`)
 | Rule File | Enforces |
@@ -329,16 +318,16 @@ Auto-loaded `.claude/rules/` files by directory:
 ### Project rules (10 files in `project/`)
 | Rule File | Enforces |
 |-----------|----------|
+| `rust-code.md` | Error handling, naming, logging, no hardcoded values, secrets |
+| `hot-path.md` | Zero allocation, O(1) constraints, banned hot-path patterns |
+| `testing.md` | 22 test categories, coverage, property testing requirements |
+| `enforcement.md` | 13 pre-push gates, scoped testing, gap enforcement |
+| `cargo-and-docker.md` | Version pinning, Docker digest, workspace deps |
+| `data-integrity.md` | Price precision, f32→f64, dedup keys |
+| `market-hours.md` | IST timezone, market hour checks, holiday handling |
 | `plan-enforcement.md` | Multi-file plan → verify → archive workflow |
 | `gap-enforcement.md` | 28 tracked gaps with mandatory tests |
 | `aws-migration.md` | Mac cleanup when deploying to AWS |
-| `rust-code.md` | Rust-specific (duplicate of root, crate-scoped) |
-| `hot-path.md` | Hot-path rules (duplicate of root, crate-scoped) |
-| `testing.md` | Testing rules (duplicate of root, crate-scoped) |
-| `enforcement.md` | Enforcement rules (duplicate of root, crate-scoped) |
-| `cargo-and-docker.md` | Cargo/Docker rules (duplicate of root, crate-scoped) |
-| `data-integrity.md` | Data integrity rules (duplicate of root, crate-scoped) |
-| `market-hours.md` | Market hours rules (duplicate of root, crate-scoped) |
 
 ## GAP ENFORCEMENT (28 tracked gaps)
 
@@ -378,7 +367,7 @@ Override per environment via `config/{env}.toml` or env vars.
 
 | Purpose | Path |
 |---------|------|
-| Phase 1 spec | `docs/phases/PHASE_1_LIVE_TRADING.md` |
+| Phase 1 spec | `docs/phases/phase-1-live-trading.md` |
 | Tech Stack Bible | `docs/architecture/tech-stack-bible.md` |
 | Dhan API reference | `docs/dhan-ref/*.md` (21 files) |
 | Benchmark budgets | `quality/benchmark-budgets.toml` |
@@ -411,7 +400,7 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 
 ## CURRENT CONTEXT
 
-**Phase:** Phase 1 — Live Trading System → `docs/phases/PHASE_1_LIVE_TRADING.md`
+**Phase:** Phase 1 — Live Trading System → `docs/phases/phase-1-live-trading.md`
 **Boot sequence:** CryptoProvider → Config → Observability → Logging → Notification → Auth → QuestDB → Universe → HistoricalCandles → WebSocket → TickProcessor → OrderUpdateWS → API → TokenRenewal → Shutdown
 **Codebase size:** ~74K LoC Rust (~61K production, ~14K tests), 158 files, 6 crates
 **Test count:** 2,299 passing tests (unit + integration), 33 integration test files, 5 benchmarks, 2 fuzz targets

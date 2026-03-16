@@ -102,14 +102,12 @@ Automated scripts that run at specific lifecycle points.
 | `data-integrity-guard.sh` | Quality gate | Validates data contracts |
 | `dedup-latency-scanner.sh` | Quality gate | Checks dedup + latency budgets |
 | `financial-test-guard.sh` | Quality gate | Extra rigor for financial code |
-| `testing-standards-guard.sh` | Quality gate | Enforces test taxonomy |
-| `dry-run-guard.sh` | Quality gate | Blocks dry-run bypasses |
-| `session-status.sh` | On demand | Dashboard: safety systems status |
 | `session-sanity.sh` | Session start | Verifies environment is sane |
 | `auto-save-remote.sh` | Background | Auto-pushes WIP to remote |
 | `auto-save-watchdog.sh` | Background | Monitors auto-save health |
 | `recover-wip.sh` | Recovery | Recovers from interrupted sessions |
-| `post-commit-state.sh` | After commit | Records commit state |
+| `block-env-files.sh` | Quality gate | Prevents .env file creation |
+| `plan-verify.sh` | Plan verification | Validates plan items are complete |
 | `pre-tool-dispatch.sh` | Before tool use | Routes to correct hook |
 
 ---

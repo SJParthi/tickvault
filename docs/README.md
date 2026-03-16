@@ -54,15 +54,12 @@ These 21 files are the **verified source of truth** for every Dhan API endpoint.
 |----------|---------|
 | [Codebase Map](architecture/codebase-map.md) | Full file tree, public APIs, byte layouts, boot sequence |
 | [Tech Stack Bible](architecture/tech-stack-bible.md) | All 109 components and technology decisions |
-| [Authentication Design](architecture/authentication-technical-design.md) | SSM → TOTP → JWT auth pipeline design |
 | [Instrument Design](architecture/instrument-technical-design.md) | 5-pass universe build, CSV parsing, registry |
 | [Instrument Dependency Map](architecture/instrument-dhan-dependency-map.md) | How instruments map to Dhan API |
-| [Instrument Gaps](architecture/instrument-gaps-consolidated.md) | Known gaps and edge cases |
 | [Instrument Guarantee](architecture/instrument-guarantee.md) | Data integrity guarantees |
-| [Holiday Calendar Design](architecture/holiday-calendar-technical-design.md) | Market holiday handling |
-| [Holiday Calendar Requirements](architecture/holiday-calendar-requirements.md) | Holiday calendar specs |
-| [Static IP Design](architecture/static-ip-technical-design.md) | Network infrastructure |
-| [Static IP Requirements](architecture/static-ip-requirements.md) | Static IP specs |
+| [Instrument Complete Reference](architecture/instrument-complete-reference.md) | Exhaustive type/function/config quick-reference |
+
+*Archived specs (implemented):* `docs/archive/` — auth design, static IP, holiday calendar, instrument gaps
 
 ---
 

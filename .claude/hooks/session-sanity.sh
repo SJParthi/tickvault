@@ -78,4 +78,4 @@ fi
 # Remind about principles and phase
 echo "" >&2
 echo "Three principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned" >&2
-echo "Current phase: docs/phases/PHASE_1_LIVE_TRADING.md" >&2
+echo "Current phase: docs/phases/phase-1-live-trading.md" >&2
