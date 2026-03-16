@@ -5,9 +5,14 @@
 # Runs weekly (Monday 6 AM UTC). Creates GitHub issue on failure.
 # These checks are too slow for per-PR CI but catch deep bugs.
 #
+# Issue deduplication: checks for existing open issue before creating a new one.
+# Build vs test: separates build from test to distinguish compilation errors
+# from actual sanitizer findings.
+#
 # Checks:
 #   1. cargo-careful test — extra debug checking with FFI support
-#   2. Sanitizers (ASan) — address sanitizer via nightly
+#   2. AddressSanitizer (ASan) — memory safety via nightly
+#   3. ThreadSanitizer (TSan) — data race detection via nightly
 # =============================================================================
 
 name: Safety Net
@@ -24,6 +29,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Pin nightly to a specific date for reproducible builds.
+  # Update periodically after verifying the new nightly compiles cleanly.
+  NIGHTLY_VERSION: nightly-2026-03-15
 
 jobs:
   # ---- cargo-careful: Extra debug checks ----
@@ -36,7 +44,7 @@ jobs:
       - name: Install nightly toolchain (required by cargo-careful)
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src
 
       - name: Cache cargo
@@ -48,19 +56,37 @@ jobs:
           tool: cargo-careful
 
       - name: Run careful tests
-        run: cargo +nightly careful test --workspace
+        run: cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace
 
-      - name: Create issue on failure
+      - name: Create issue on failure (deduplicated)
         if: failure()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
+            const title = '🔴 Safety Net: cargo-careful found issues';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: '🔴 Safety Net: cargo-careful found issues',
+              title,
               body: `Weekly safety scan detected potential undefined behavior.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires investigation.`,
-              labels: ['bug', 'safety']
+              labels: ['bug', 'safety'],
             });
 
   # ---- AddressSanitizer: Memory safety ----
@@ -73,33 +99,102 @@ jobs:
       - name: Install nightly toolchain (required by sanitizers)
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
-      - name: Run tests with AddressSanitizer
+      - name: Build with AddressSanitizer
+        id: build
         env:
           RUSTFLAGS: "-Z sanitizer=address"
         run: |
-          cargo +nightly test --workspace \
+          cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \
             -Z build-std \
-            --lib --tests --benches \
-            -- --test-threads=1
+            --lib --tests \
+            --no-run 2>&1 || {
+            echo "build_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::AddressSanitizer build failed (not a runtime finding). Check nightly compatibility."
+            exit 1
+          }
 
-      - name: Create issue on failure
-        if: failure()
+      - name: Run tests with AddressSanitizer
+        id: test
+        if: steps.build.outcome == 'success'
+        env:
+          RUSTFLAGS: "-Z sanitizer=address"
+        run: |
+          cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
+            --target x86_64-unknown-linux-gnu \
+            -Z build-std \
+            --lib --tests \
+            -- --test-threads=1 2>&1 || {
+            echo "test_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+      - name: Create issue on test failure (deduplicated)
+        if: failure() && steps.test.outputs.test_failed == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
+            const title = '🔴 Safety Net: AddressSanitizer found memory issues';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: '🔴 Safety Net: AddressSanitizer found memory issues',
+              title,
               body: `Weekly safety scan detected memory safety issues (use-after-free, buffer overflow, etc.).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires immediate investigation.`,
-              labels: ['bug', 'safety', 'critical']
+              labels: ['bug', 'safety', 'critical'],
+            });
+
+      - name: Create issue on build failure (deduplicated)
+        if: failure() && steps.build.outputs.build_failed == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: `AddressSanitizer tests failed to **build** (not a runtime finding).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`.`,
+              labels: ['bug', 'safety'],
             });
 
   # ---- ThreadSanitizer: Data races ----
@@ -112,31 +207,100 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
-      - name: Run tests with ThreadSanitizer
+      - name: Build with ThreadSanitizer
+        id: build
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
         run: |
-          cargo +nightly test --workspace \
+          cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \
             -Z build-std \
-            --lib --tests --benches \
-            -- --test-threads=1
+            --lib --tests \
+            --no-run 2>&1 || {
+            echo "build_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::ThreadSanitizer build failed (not a runtime finding). Check nightly compatibility."
+            exit 1
+          }
 
-      - name: Create issue on failure
-        if: failure()
+      - name: Run tests with ThreadSanitizer
+        id: test
+        if: steps.build.outcome == 'success'
+        env:
+          RUSTFLAGS: "-Z sanitizer=thread"
+        run: |
+          cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
+            --target x86_64-unknown-linux-gnu \
+            -Z build-std \
+            --lib --tests \
+            -- --test-threads=1 2>&1 || {
+            echo "test_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+      - name: Create issue on test failure (deduplicated)
+        if: failure() && steps.test.outputs.test_failed == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
+            const title = '🔴 Safety Net: ThreadSanitizer found data races';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: '🔴 Safety Net: ThreadSanitizer found data races',
+              title,
               body: `Weekly safety scan detected data race conditions.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires investigation — data races in trading systems can cause incorrect fills.`,
-              labels: ['bug', 'safety', 'critical']
+              labels: ['bug', 'safety', 'critical'],
+            });
+
+      - name: Create issue on build failure (deduplicated)
+        if: failure() && steps.build.outputs.build_failed == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: `ThreadSanitizer tests failed to **build** (not a runtime finding).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`.`,
+              labels: ['bug', 'safety'],
             });

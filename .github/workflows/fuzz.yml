@@ -1,8 +1,11 @@
 # =============================================================================
-# dhan-live-trader — Fuzz Testing (Nightly Scheduled)
+# dhan-live-trader — Fuzz Testing (Weekly Scheduled)
 # =============================================================================
 # Runs cargo-fuzz targets weekly. Creates GitHub issue on crash.
 # Catches panic/crash bugs from malformed input (WebSocket frames, configs).
+#
+# Issue deduplication: checks for existing open issue before creating a new one.
+# Build vs crash: separates build step from fuzz step to avoid false positives.
 # =============================================================================
 
 name: Fuzz
@@ -18,10 +21,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pin nightly to a specific date for reproducible builds.
+  # Update periodically after verifying the new nightly compiles cleanly.
+  NIGHTLY_VERSION: nightly-2026-03-15
 
 jobs:
   fuzz:
-    name: "Fuzz Targets"
+    name: "Fuzz Targets (${{ matrix.target }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,10 +39,12 @@ jobs:
       - name: Install nightly toolchain (required by cargo-fuzz)
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.NIGHTLY_VERSION }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          workspaces: fuzz -> target
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-fuzz
@@ -53,37 +61,100 @@ jobs:
             echo "No fuzz targets configured yet — skipping."
           fi
 
-      - name: Run fuzz target (${{ matrix.target }})
+      - name: Build fuzz target (${{ matrix.target }})
+        id: build
         if: steps.check.outputs.exists == 'true'
         run: |
+          cargo +${{ env.NIGHTLY_VERSION }} fuzz build ${{ matrix.target }} 2>&1 || {
+            echo "build_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Fuzz target ${{ matrix.target }} failed to BUILD (not a crash). Check nightly compatibility."
+            exit 1
+          }
+
+      - name: Run fuzz target (${{ matrix.target }})
+        id: fuzz
+        if: steps.check.outputs.exists == 'true' && steps.build.outcome == 'success'
+        run: |
           # Run for 5 minutes per target
-          timeout 300 cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 || {
+          timeout 300 cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} -- -max_total_time=300 || {
             EXIT_CODE=$?
             if [ "$EXIT_CODE" -eq 124 ]; then
               echo "Fuzz run completed (timeout reached — no crashes found)"
             else
               echo "Fuzz run found a crash!"
+              echo "fuzz_crashed=true" >> "$GITHUB_OUTPUT"
               exit 1
             fi
           }
 
       - name: Upload crash artifacts
-        if: failure()
+        if: failure() && steps.fuzz.outputs.fuzz_crashed == 'true'
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/
           retention-days: 90
 
-      - name: Create issue on crash
-        if: failure()
+      - name: Create issue on crash (deduplicated)
+        if: failure() && steps.fuzz.outputs.fuzz_crashed == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
         with:
           script: |
+            const title = `🔴 Fuzz: Crash in ${{ matrix.target }}`;
+            // Check for existing open issue with same title
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'fuzz',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              // Comment on existing issue instead of creating a new one
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `🔴 Fuzz: Crash in ${{ matrix.target }}`,
-              body: `Nightly fuzz testing found a crash in target \`${{ matrix.target }}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCrash artifacts uploaded — reproduce with:\n\`\`\`\ncargo +nightly fuzz run ${{ matrix.target }}\n\`\`\``,
-              labels: ['bug', 'fuzz', 'critical']
+              title,
+              body: `Fuzz testing found a crash in target \`${{ matrix.target }}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCrash artifacts uploaded — reproduce with:\n\`\`\`\ncargo +nightly fuzz run ${{ matrix.target }}\n\`\`\``,
+              labels: ['bug', 'fuzz', 'critical'],
+            });
+
+      - name: Create issue on build failure (deduplicated)
+        if: failure() && steps.build.outputs.build_failed == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = `⚠️ Fuzz: Build failure for ${{ matrix.target }}`;
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'fuzz',
+              per_page: 100,
+            });
+            const duplicate = existing.find(i => i.title === title);
+            if (duplicate) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: `Fuzz target \`${{ matrix.target }}\` failed to **build** (not a crash).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/fuzz.yml\` to a compatible nightly date.`,
+              labels: ['bug', 'fuzz'],
             });
