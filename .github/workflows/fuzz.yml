@@ -45,6 +45,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           workspaces: fuzz -> target
+          prefix-key: fuzz-${{ env.NIGHTLY_VERSION }}
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-fuzz
