@@ -401,7 +401,7 @@ impl Default for HistoricalDataConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            lookback_days: 5,
+            lookback_days: 90,
             request_timeout_secs: 30,
             max_retries: 3,
             request_delay_ms: 500,

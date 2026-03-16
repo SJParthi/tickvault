@@ -1,7 +1,7 @@
 //! Cross-verification of live tick data against historical candles.
 //!
 //! Queries QuestDB to compare live ticks stored in the `ticks` table against
-//! 1-minute candles in `historical_candles_1m`. Reports discrepancies to detect data
+//! 1-minute candles in `historical_candles`. Reports discrepancies to detect data
 //! quality issues, missed ticks, or stale feeds.
 //!
 //! # Verification Checks
@@ -18,7 +18,9 @@ use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{CANDLES_PER_TRADING_DAY, QUESTDB_TABLE_CANDLES_1M};
+use dhan_live_trader_common::constants::{
+    CANDLES_PER_TRADING_DAY, QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M,
+};
 
 // ---------------------------------------------------------------------------
 // Verification Result
@@ -91,14 +93,14 @@ pub async fn verify_candle_integrity(questdb_config: &QuestDbConfig) -> CrossVer
         }
     };
 
-    // Query: count candles per security_id for the latest trading day
+    // Query: count 1m candles per security_id for the latest trading day
     let count_query = format!(
         "SELECT security_id, count() as candle_count \
          FROM {} \
-         WHERE ts IN today() \
+         WHERE ts IN today() AND timeframe = '{}' \
          GROUP BY security_id \
          ORDER BY candle_count DESC",
-        QUESTDB_TABLE_CANDLES_1M
+        QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M
     );
 
     let query_result = client

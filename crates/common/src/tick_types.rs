@@ -124,11 +124,12 @@ pub struct DeepDepthLevel {
 // Historical Candle — 1-minute OHLCV from Dhan intraday API
 // ---------------------------------------------------------------------------
 
-/// A single 1-minute OHLCV candle from Dhan's historical intraday API.
+/// An OHLCV candle from Dhan's historical API (intraday or daily).
 ///
 /// Used for cross-verification against live tick data and for backfill.
 /// Timestamps are standard UTC epoch seconds from Dhan V2 REST API.
-#[derive(Debug, Clone, Copy)]
+/// The `timeframe` field discriminates between 1m, 5m, 15m, 60m, and 1d candles.
+#[derive(Debug, Clone)]
 pub struct HistoricalCandle {
     /// Candle open timestamp as UTC epoch seconds from Dhan V2 REST API.
     pub timestamp_utc_secs: i64,
@@ -136,6 +137,8 @@ pub struct HistoricalCandle {
     pub security_id: u32,
     /// Exchange segment code (matches `ParsedTick::exchange_segment_code`).
     pub exchange_segment_code: u8,
+    /// Timeframe label: "1m", "5m", "15m", "60m", or "1d".
+    pub timeframe: &'static str,
     /// Open price in rupees.
     pub open: f64,
     /// High price in rupees.
@@ -203,6 +206,54 @@ where
 }
 
 impl DhanIntradayResponse {
+    /// Returns the number of candles in this response.
+    pub fn len(&self) -> usize {
+        self.timestamp.len()
+    }
+
+    /// Returns true if the response contains no candles.
+    pub fn is_empty(&self) -> bool {
+        self.timestamp.is_empty()
+    }
+
+    /// Validates that all parallel arrays have the same length.
+    pub fn is_consistent(&self) -> bool {
+        let n = self.timestamp.len();
+        self.open.len() == n
+            && self.high.len() == n
+            && self.low.len() == n
+            && self.close.len() == n
+            && self.volume.len() == n
+            && (self.open_interest.is_empty() || self.open_interest.len() == n)
+    }
+}
+
+/// Response from Dhan's daily charts API (`/charts/historical`).
+///
+/// Same columnar parallel array format as `DhanIntradayResponse`.
+/// Daily timestamps represent IST midnight as UTC epoch seconds.
+#[derive(Debug, serde::Deserialize)]
+pub struct DhanDailyResponse {
+    /// Opening prices per candle.
+    pub open: Vec<f64>,
+    /// High prices per candle.
+    pub high: Vec<f64>,
+    /// Low prices per candle.
+    pub low: Vec<f64>,
+    /// Closing prices per candle.
+    pub close: Vec<f64>,
+    /// Volume per candle (Dhan may return as int or float).
+    #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
+    pub volume: Vec<i64>,
+    /// Timestamps as UTC epoch seconds from Dhan V2 REST API.
+    #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
+    pub timestamp: Vec<i64>,
+    /// Open interest per candle (present when `oi: true` in request).
+    #[serde(default, deserialize_with = "deserialize_f64_as_i64_vec_or_default")]
+    pub open_interest: Vec<i64>,
+}
+
+impl DhanDailyResponse {
     /// Returns the number of candles in this response.
     pub fn len(&self) -> usize {
         self.timestamp.len()
@@ -368,11 +419,12 @@ mod tests {
     // --- HistoricalCandle ---
 
     #[test]
-    fn test_historical_candle_is_copy() {
+    fn test_historical_candle_is_clone() {
         let candle = HistoricalCandle {
             timestamp_utc_secs: 1700000000,
             security_id: 42,
             exchange_segment_code: 2,
+            timeframe: "1m",
             open: 100.0,
             high: 102.0,
             low: 99.0,
@@ -380,8 +432,25 @@ mod tests {
             volume: 1000,
             open_interest: 5000,
         };
-        let copy = candle;
-        assert_eq!(candle.security_id, copy.security_id);
-        assert_eq!(candle.timestamp_utc_secs, copy.timestamp_utc_secs);
+        let cloned = candle.clone();
+        assert_eq!(cloned.security_id, 42);
+        assert_eq!(cloned.timestamp_utc_secs, 1700000000);
+        assert_eq!(cloned.timeframe, "1m");
+    }
+
+    #[test]
+    fn test_daily_response_consistent() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![100_000, 200_000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_empty());
+        assert_eq!(resp.len(), 2);
+        assert!(resp.is_consistent());
     }
 }

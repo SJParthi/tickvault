@@ -668,7 +668,7 @@ async fn main() -> Result<()> {
     // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!(
-        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles_1m + materialized views)"
+        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views)"
     );
 
     // All table creation queries are independent — run in parallel for faster boot.

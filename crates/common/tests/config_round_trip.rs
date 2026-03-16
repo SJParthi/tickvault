@@ -348,7 +348,7 @@ fn test_config_default_values() {
 
     // HistoricalDataConfig defaults.
     assert!(config.historical.enabled);
-    assert_eq!(config.historical.lookback_days, 5);
+    assert_eq!(config.historical.lookback_days, 90);
 
     // NotificationConfig defaults.
     assert_eq!(

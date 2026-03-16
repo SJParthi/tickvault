@@ -1,16 +1,16 @@
-//! Dhan intraday candle fetcher — fully automated 1-minute OHLCV retrieval.
+//! Dhan historical candle fetcher — multi-timeframe OHLCV retrieval.
 //!
 //! Fetches historical candles from Dhan's V2 REST API for all subscribed
-//! instruments and persists to QuestDB via the `CandlePersistenceWriter`.
+//! instruments across 5 timeframes (1m, 5m, 15m, 60m, daily) and persists
+//! to QuestDB via the `CandlePersistenceWriter`.
 //!
 //! # Timestamp Format
-//! Dhan V2 REST API returns standard UTC epoch seconds. Timestamps are
-//! stored as-is in QuestDB (no conversion). Grafana dashboard uses
-//! `timezone: Asia/Kolkata` to display them in IST.
+//! Dhan V2 REST API returns standard UTC epoch seconds. The persistence layer
+//! converts to IST-as-UTC by adding +19800s before writing to QuestDB.
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
-//! - Server-side: QuestDB DEDUP UPSERT KEYS(ts, security_id) prevents duplicates
+//! - Server-side: QuestDB DEDUP UPSERT KEYS(ts, security_id, timeframe) prevents duplicates
 //!
 //! # Automation
 //! Runs without human intervention in the boot sequence after authentication.
@@ -27,10 +27,13 @@ use zeroize::Zeroizing;
 
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
-    DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS,
+    DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
+    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
-use dhan_live_trader_common::tick_types::{DhanIntradayResponse, HistoricalCandle};
+use dhan_live_trader_common::tick_types::{
+    DhanDailyResponse, DhanIntradayResponse, HistoricalCandle,
+};
 
 use dhan_live_trader_storage::candle_persistence::CandlePersistenceWriter;
 
@@ -39,7 +42,7 @@ use crate::auth::types::TokenState;
 /// Type alias for the token handle used across the codebase.
 type TokenHandle = std::sync::Arc<ArcSwap<Option<TokenState>>>;
 
-/// Maximum response body size for Dhan intraday API (10 MB).
+/// Maximum response body size for Dhan historical API (10 MB).
 /// Prevents OOM from malicious/corrupted responses. A single instrument's
 /// 90-day × 375-candle response is ~100 KB of JSON — 10 MB is 100× headroom.
 const MAX_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024;
@@ -57,6 +60,20 @@ struct IntradayRequest {
     instrument: String,
     interval: String,
     oi: bool,
+    from_date: String,
+    to_date: String,
+}
+
+/// Request body for Dhan daily charts API.
+/// Note: `toDate` is NON-INCLUSIVE — requesting toDate "2026-03-13" returns data up to 2026-03-12.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DailyRequest {
+    security_id: String,
+    exchange_segment: String,
+    instrument: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiry_code: Option<u8>,
     from_date: String,
     to_date: String,
 }
@@ -82,7 +99,10 @@ pub struct CandleFetchSummary {
 // Main Fetch Logic
 // ---------------------------------------------------------------------------
 
-/// Fetches 1-minute candles for all subscribed instruments and persists to QuestDB.
+/// Fetches historical candles across all timeframes for all subscribed instruments.
+///
+/// Fetches 4 intraday timeframes (1m, 5m, 15m, 60m) and daily candles for each
+/// instrument, persisting all to the unified `historical_candles` table.
 ///
 /// This runs automatically in the boot sequence — zero human intervention.
 ///
@@ -121,14 +141,24 @@ pub async fn fetch_historical_candles(
     let from_date = today - chrono::Duration::days(i64::from(historical_config.lookback_days));
     let to_date = today;
 
-    let from_str = from_date.format("%Y-%m-%d").to_string();
-    let to_str = to_date.format("%Y-%m-%d").to_string();
+    // Intraday requests use datetime format with market hours
+    let from_date_str = from_date.format("%Y-%m-%d").to_string();
+    let to_date_str = to_date.format("%Y-%m-%d").to_string();
+
+    // Intraday: "YYYY-MM-DD HH:MM:SS" with market hours (09:15 to 15:30 exclusive)
+    let intraday_from = format!("{} {}", from_date_str, MARKET_OPEN_TIME_IST);
+    let intraday_to = format!("{} {}", to_date_str, MARKET_CLOSE_TIME_IST_EXCLUSIVE);
+
+    // Daily: date-only format, toDate is NON-INCLUSIVE so add 1 day
+    let daily_to_date = to_date + chrono::Duration::days(1);
+    let daily_to_str = daily_to_date.format("%Y-%m-%d").to_string();
 
     info!(
-        from_date = %from_str,
-        to_date = %to_str,
+        from_date = %from_date_str,
+        to_date = %to_date_str,
         lookback_days = historical_config.lookback_days,
-        "starting historical candle fetch"
+        timeframes = "1m,5m,15m,60m,1d",
+        "starting multi-timeframe historical candle fetch"
     );
 
     let http_client = match reqwest::Client::builder()
@@ -147,9 +177,13 @@ pub async fn fetch_historical_candles(
         }
     };
 
-    let endpoint = format!(
+    let intraday_endpoint = format!(
         "{}{}",
         dhan_config.rest_api_base_url, DHAN_CHARTS_INTRADAY_PATH
+    );
+    let daily_endpoint = format!(
+        "{}{}",
+        dhan_config.rest_api_base_url, DHAN_CHARTS_HISTORICAL_PATH
     );
 
     let mut fetched_security_ids: HashSet<u32> = HashSet::new();
@@ -189,226 +223,128 @@ pub async fn fetch_historical_candles(
             | SubscriptionCategory::DisplayIndex => continue,
         };
 
-        // Rate limiting delay between requests
-        if historical_config.request_delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
-        }
+        let segment_code = instrument.exchange_segment.binary_code();
+        let exchange_segment_str = instrument.exchange_segment.as_str().to_string();
+        let security_id_str = security_id.to_string();
 
-        // Load current access token (Zeroizing ensures the plaintext is wiped from heap on drop)
-        let token_guard = token_handle.load();
-        let access_token = match token_guard.as_ref() {
-            Some(token_state) => {
-                Zeroizing::new(token_state.access_token().expose_secret().to_string())
-            }
-            None => {
-                warn!("no access token available — skipping historical fetch");
-                instruments_failed = instruments_failed.saturating_add(1);
-                continue;
-            }
-        };
+        let mut instrument_candles = 0_usize;
+        let mut instrument_failed = false;
 
-        let request_body = IntradayRequest {
-            security_id: security_id.to_string(),
-            exchange_segment: instrument.exchange_segment.as_str().to_string(),
-            instrument: instrument_type.to_string(),
-            interval: DHAN_CANDLE_INTERVAL_1MIN.to_string(),
-            oi: true,
-            from_date: from_str.clone(),
-            to_date: to_str.clone(),
-        };
-
-        // Make the API call with retries
-        let mut candles_for_instrument = 0_usize;
-        let mut success = false;
-
-        for attempt in 0..=historical_config.max_retries {
-            if attempt > 0 {
-                let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        // --- Fetch all 4 intraday timeframes ---
+        for &(interval, timeframe_label) in INTRADAY_TIMEFRAMES {
+            // Rate limiting delay between requests
+            if historical_config.request_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
             }
 
-            let result = http_client
-                .post(&endpoint)
-                .header("access-token", access_token.as_str())
-                .header("client-id", client_id.expose_secret())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .json(&request_body)
-                .send()
-                .await;
-
-            match result {
-                Ok(response) => {
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        if attempt < historical_config.max_retries {
-                            debug!(
-                                %status,
-                                security_id,
-                                attempt,
-                                "historical API non-success — retrying"
-                            );
-                            continue;
-                        }
-                        warn!(
-                            %status,
-                            security_id,
-                            "historical API failed after all retries"
-                        );
-                        m_api_errors.increment(1);
-                        break;
-                    }
-
-                    // Read body with size limit to prevent OOM from oversized responses
-                    let body_bytes = match response.bytes().await {
-                        Ok(b) => b,
-                        Err(err) => {
-                            if attempt < historical_config.max_retries {
-                                debug!(
-                                    ?err,
-                                    security_id, attempt, "failed to read response body — retrying"
-                                );
-                                continue;
-                            }
-                            warn!(
-                                ?err,
-                                security_id, "failed to read response body after all retries"
-                            );
-                            m_api_errors.increment(1);
-                            break;
-                        }
-                    };
-
-                    if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
-                        warn!(
-                            security_id,
-                            body_size = body_bytes.len(),
-                            max = MAX_RESPONSE_BODY_SIZE,
-                            "response body exceeds size limit — skipping"
-                        );
-                        m_api_errors.increment(1);
-                        break;
-                    }
-
-                    match serde_json::from_slice::<DhanIntradayResponse>(&body_bytes) {
-                        Ok(data) => {
-                            if data.is_empty() {
-                                debug!(security_id, "no candle data returned");
-                                success = true;
-                                break;
-                            }
-
-                            if !data.is_consistent() {
-                                warn!(
-                                    security_id,
-                                    "inconsistent array lengths in historical response"
-                                );
-                                m_api_errors.increment(1);
-                                break;
-                            }
-
-                            let segment_code = instrument.exchange_segment.binary_code();
-
-                            // Convert parallel arrays to candles and persist
-                            for i in 0..data.len() {
-                                let open = data.open[i];
-                                let high = data.high[i];
-                                let low = data.low[i];
-                                let close = data.close[i];
-
-                                // Reject NaN/Infinity prices — corrupted data must not reach QuestDB
-                                if !open.is_finite()
-                                    || !high.is_finite()
-                                    || !low.is_finite()
-                                    || !close.is_finite()
-                                {
-                                    warn!(
-                                        security_id,
-                                        idx = i,
-                                        "NaN/Inf price in API response — skipping candle"
-                                    );
-                                    m_api_errors.increment(1);
-                                    continue;
-                                }
-
-                                // Dhan V2 REST API returns standard UTC epoch seconds.
-                                // Store as-is — no conversion needed.
-                                let utc_epoch = data.timestamp[i];
-
-                                let oi_value = if i < data.open_interest.len() {
-                                    data.open_interest[i]
-                                } else {
-                                    0
-                                };
-
-                                let candle = HistoricalCandle {
-                                    timestamp_utc_secs: utc_epoch,
-                                    security_id,
-                                    exchange_segment_code: segment_code,
-                                    open,
-                                    high,
-                                    low,
-                                    close,
-                                    volume: data.volume[i],
-                                    open_interest: oi_value,
-                                };
-
-                                if let Err(err) = candle_writer.append_candle(&candle) {
-                                    warn!(?err, security_id, "failed to append candle to QuestDB");
-                                }
-                                candles_for_instrument = candles_for_instrument.saturating_add(1);
-                            }
-
-                            success = true;
-                            break;
-                        }
-                        Err(err) => {
-                            if attempt < historical_config.max_retries {
-                                debug!(
-                                    ?err,
-                                    security_id,
-                                    attempt,
-                                    "failed to parse historical response — retrying"
-                                );
-                                continue;
-                            }
-                            warn!(
-                                ?err,
-                                security_id,
-                                "failed to parse historical response after all retries"
-                            );
-                            m_api_errors.increment(1);
-                            break;
-                        }
-                    }
+            // Load current access token
+            let token_guard = token_handle.load();
+            let access_token = match token_guard.as_ref() {
+                Some(token_state) => {
+                    Zeroizing::new(token_state.access_token().expose_secret().to_string())
                 }
-                Err(err) => {
-                    if attempt < historical_config.max_retries {
-                        debug!(
-                            ?err,
-                            security_id, attempt, "historical API request failed — retrying"
-                        );
-                        continue;
-                    }
-                    warn!(
-                        ?err,
-                        security_id, "historical API request failed after all retries"
-                    );
-                    m_api_errors.increment(1);
+                None => {
+                    warn!("no access token available — skipping historical fetch");
+                    instrument_failed = true;
                     break;
                 }
+            };
+
+            let request_body = IntradayRequest {
+                security_id: security_id_str.clone(),
+                exchange_segment: exchange_segment_str.clone(),
+                instrument: instrument_type.to_string(),
+                interval: interval.to_string(),
+                oi: true,
+                from_date: intraday_from.clone(),
+                to_date: intraday_to.clone(),
+            };
+
+            match fetch_intraday_with_retry(
+                &http_client,
+                &intraday_endpoint,
+                &request_body,
+                &access_token,
+                client_id,
+                historical_config,
+                security_id,
+                segment_code,
+                timeframe_label,
+                candle_writer,
+                &m_api_errors,
+            )
+            .await
+            {
+                Some(count) => {
+                    instrument_candles = instrument_candles.saturating_add(count);
+                }
+                None => {
+                    instrument_failed = true;
+                }
             }
         }
 
-        if success {
+        // --- Fetch daily candles ---
+        if !instrument_failed {
+            if historical_config.request_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
+            }
+
+            let token_guard = token_handle.load();
+            let access_token = match token_guard.as_ref() {
+                Some(token_state) => {
+                    Zeroizing::new(token_state.access_token().expose_secret().to_string())
+                }
+                None => {
+                    warn!("no access token available — skipping daily fetch");
+                    instrument_failed = true;
+                    Zeroizing::new(String::new()) // placeholder, not used
+                }
+            };
+
+            if !instrument_failed {
+                let daily_body = DailyRequest {
+                    security_id: security_id_str.clone(),
+                    exchange_segment: exchange_segment_str.clone(),
+                    instrument: instrument_type.to_string(),
+                    expiry_code: None,
+                    from_date: from_date_str.clone(),
+                    to_date: daily_to_str.clone(),
+                };
+
+                match fetch_daily_with_retry(
+                    &http_client,
+                    &daily_endpoint,
+                    &daily_body,
+                    &access_token,
+                    client_id,
+                    historical_config,
+                    security_id,
+                    segment_code,
+                    candle_writer,
+                    &m_api_errors,
+                )
+                .await
+                {
+                    Some(count) => {
+                        instrument_candles = instrument_candles.saturating_add(count);
+                    }
+                    None => {
+                        instrument_failed = true;
+                    }
+                }
+            }
+        }
+
+        if instrument_failed {
+            instruments_failed = instruments_failed.saturating_add(1);
+        } else {
             fetched_security_ids.insert(security_id);
             instruments_fetched = instruments_fetched.saturating_add(1);
-            total_candles = total_candles.saturating_add(candles_for_instrument);
+            total_candles = total_candles.saturating_add(instrument_candles);
             // APPROVED: usize->u64 is lossless on 64-bit targets (our only deployment target)
             #[allow(clippy::cast_possible_truncation)]
-            m_fetched.increment(candles_for_instrument as u64);
-        } else {
-            instruments_failed = instruments_failed.saturating_add(1);
+            m_fetched.increment(instrument_candles as u64);
         }
     }
 
@@ -431,6 +367,464 @@ pub async fn fetch_historical_candles(
 }
 
 // ---------------------------------------------------------------------------
+// Intraday Fetch Helper
+// ---------------------------------------------------------------------------
+
+/// Fetches a single intraday timeframe for one instrument with retries.
+/// Returns `Some(candle_count)` on success, `None` on failure.
+#[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
+async fn fetch_intraday_with_retry(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    request_body: &IntradayRequest,
+    access_token: &Zeroizing<String>,
+    client_id: &SecretString,
+    config: &HistoricalDataConfig,
+    security_id: u32,
+    segment_code: u8,
+    timeframe_label: &'static str,
+    candle_writer: &mut CandlePersistenceWriter,
+    m_api_errors: &metrics::Counter,
+) -> Option<usize> {
+    for attempt in 0..=config.max_retries {
+        if attempt > 0 {
+            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let result = http_client
+            .post(endpoint)
+            .header("access-token", access_token.as_str())
+            .header("client-id", client_id.expose_secret())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(request_body)
+            .send()
+            .await;
+
+        match result {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    if attempt < config.max_retries {
+                        debug!(
+                            %status, security_id, timeframe = timeframe_label, attempt,
+                            "historical API non-success — retrying"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        %status, security_id, timeframe = timeframe_label,
+                        "historical API failed after all retries"
+                    );
+                    m_api_errors.increment(1);
+                    return None;
+                }
+
+                let body_bytes = match response.bytes().await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        if attempt < config.max_retries {
+                            debug!(
+                                ?err,
+                                security_id,
+                                timeframe = timeframe_label,
+                                attempt,
+                                "failed to read response body — retrying"
+                            );
+                            continue;
+                        }
+                        warn!(
+                            ?err,
+                            security_id,
+                            timeframe = timeframe_label,
+                            "failed to read response body after all retries"
+                        );
+                        m_api_errors.increment(1);
+                        return None;
+                    }
+                };
+
+                if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                    warn!(
+                        security_id,
+                        timeframe = timeframe_label,
+                        body_size = body_bytes.len(),
+                        max = MAX_RESPONSE_BODY_SIZE,
+                        "response body exceeds size limit — skipping"
+                    );
+                    m_api_errors.increment(1);
+                    return None;
+                }
+
+                match serde_json::from_slice::<DhanIntradayResponse>(&body_bytes) {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            debug!(
+                                security_id,
+                                timeframe = timeframe_label,
+                                "no candle data returned"
+                            );
+                            return Some(0);
+                        }
+
+                        if !data.is_consistent() {
+                            warn!(
+                                security_id,
+                                timeframe = timeframe_label,
+                                "inconsistent array lengths in historical response"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
+
+                        let count = persist_intraday_candles(
+                            &data,
+                            security_id,
+                            segment_code,
+                            timeframe_label,
+                            candle_writer,
+                            m_api_errors,
+                        );
+                        return Some(count);
+                    }
+                    Err(err) => {
+                        if attempt < config.max_retries {
+                            debug!(
+                                ?err,
+                                security_id,
+                                timeframe = timeframe_label,
+                                attempt,
+                                "failed to parse historical response — retrying"
+                            );
+                            continue;
+                        }
+                        warn!(
+                            ?err,
+                            security_id,
+                            timeframe = timeframe_label,
+                            "failed to parse historical response after all retries"
+                        );
+                        m_api_errors.increment(1);
+                        return None;
+                    }
+                }
+            }
+            Err(err) => {
+                if attempt < config.max_retries {
+                    debug!(
+                        ?err,
+                        security_id,
+                        timeframe = timeframe_label,
+                        attempt,
+                        "historical API request failed — retrying"
+                    );
+                    continue;
+                }
+                warn!(
+                    ?err,
+                    security_id,
+                    timeframe = timeframe_label,
+                    "historical API request failed after all retries"
+                );
+                m_api_errors.increment(1);
+                return None;
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Daily Fetch Helper
+// ---------------------------------------------------------------------------
+
+/// Fetches daily candles for one instrument with retries.
+/// Returns `Some(candle_count)` on success, `None` on failure.
+#[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
+async fn fetch_daily_with_retry(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    request_body: &DailyRequest,
+    access_token: &Zeroizing<String>,
+    client_id: &SecretString,
+    config: &HistoricalDataConfig,
+    security_id: u32,
+    segment_code: u8,
+    candle_writer: &mut CandlePersistenceWriter,
+    m_api_errors: &metrics::Counter,
+) -> Option<usize> {
+    for attempt in 0..=config.max_retries {
+        if attempt > 0 {
+            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let result = http_client
+            .post(endpoint)
+            .header("access-token", access_token.as_str())
+            .header("client-id", client_id.expose_secret())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(request_body)
+            .send()
+            .await;
+
+        match result {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    if attempt < config.max_retries {
+                        debug!(
+                            %status, security_id, timeframe = TIMEFRAME_1D, attempt,
+                            "daily API non-success — retrying"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        %status, security_id, timeframe = TIMEFRAME_1D,
+                        "daily API failed after all retries"
+                    );
+                    m_api_errors.increment(1);
+                    return None;
+                }
+
+                let body_bytes = match response.bytes().await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        if attempt < config.max_retries {
+                            debug!(
+                                ?err,
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                attempt,
+                                "failed to read daily response body — retrying"
+                            );
+                            continue;
+                        }
+                        warn!(
+                            ?err,
+                            security_id,
+                            timeframe = TIMEFRAME_1D,
+                            "failed to read daily response body after all retries"
+                        );
+                        m_api_errors.increment(1);
+                        return None;
+                    }
+                };
+
+                if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                    warn!(
+                        security_id,
+                        timeframe = TIMEFRAME_1D,
+                        body_size = body_bytes.len(),
+                        max = MAX_RESPONSE_BODY_SIZE,
+                        "daily response body exceeds size limit — skipping"
+                    );
+                    m_api_errors.increment(1);
+                    return None;
+                }
+
+                match serde_json::from_slice::<DhanDailyResponse>(&body_bytes) {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            debug!(
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                "no daily data returned"
+                            );
+                            return Some(0);
+                        }
+
+                        if !data.is_consistent() {
+                            warn!(
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                "inconsistent array lengths in daily response"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
+
+                        let count = persist_daily_candles(
+                            &data,
+                            security_id,
+                            segment_code,
+                            candle_writer,
+                            m_api_errors,
+                        );
+                        return Some(count);
+                    }
+                    Err(err) => {
+                        if attempt < config.max_retries {
+                            debug!(
+                                ?err,
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                attempt,
+                                "failed to parse daily response — retrying"
+                            );
+                            continue;
+                        }
+                        warn!(
+                            ?err,
+                            security_id,
+                            timeframe = TIMEFRAME_1D,
+                            "failed to parse daily response after all retries"
+                        );
+                        m_api_errors.increment(1);
+                        return None;
+                    }
+                }
+            }
+            Err(err) => {
+                if attempt < config.max_retries {
+                    debug!(
+                        ?err,
+                        security_id,
+                        timeframe = TIMEFRAME_1D,
+                        attempt,
+                        "daily API request failed — retrying"
+                    );
+                    continue;
+                }
+                warn!(
+                    ?err,
+                    security_id,
+                    timeframe = TIMEFRAME_1D,
+                    "daily API request failed after all retries"
+                );
+                m_api_errors.increment(1);
+                return None;
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Candle Persistence Helpers
+// ---------------------------------------------------------------------------
+
+/// Converts intraday response to HistoricalCandle structs and persists them.
+fn persist_intraday_candles(
+    data: &DhanIntradayResponse,
+    security_id: u32,
+    segment_code: u8,
+    timeframe_label: &'static str,
+    candle_writer: &mut CandlePersistenceWriter,
+    m_api_errors: &metrics::Counter,
+) -> usize {
+    let mut count = 0_usize;
+    for i in 0..data.len() {
+        let open = data.open[i];
+        let high = data.high[i];
+        let low = data.low[i];
+        let close = data.close[i];
+
+        // Reject NaN/Infinity prices — corrupted data must not reach QuestDB
+        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
+            warn!(
+                security_id,
+                idx = i,
+                timeframe = timeframe_label,
+                "NaN/Inf price in API response — skipping candle"
+            );
+            m_api_errors.increment(1);
+            continue;
+        }
+
+        let oi_value = if i < data.open_interest.len() {
+            data.open_interest[i]
+        } else {
+            0
+        };
+
+        let candle = HistoricalCandle {
+            timestamp_utc_secs: data.timestamp[i],
+            security_id,
+            exchange_segment_code: segment_code,
+            timeframe: timeframe_label,
+            open,
+            high,
+            low,
+            close,
+            volume: data.volume[i],
+            open_interest: oi_value,
+        };
+
+        if let Err(err) = candle_writer.append_candle(&candle) {
+            warn!(
+                ?err,
+                security_id,
+                timeframe = timeframe_label,
+                "failed to append candle to QuestDB"
+            );
+        }
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// Converts daily response to HistoricalCandle structs and persists them.
+fn persist_daily_candles(
+    data: &DhanDailyResponse,
+    security_id: u32,
+    segment_code: u8,
+    candle_writer: &mut CandlePersistenceWriter,
+    m_api_errors: &metrics::Counter,
+) -> usize {
+    let mut count = 0_usize;
+    for i in 0..data.len() {
+        let open = data.open[i];
+        let high = data.high[i];
+        let low = data.low[i];
+        let close = data.close[i];
+
+        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
+            warn!(
+                security_id,
+                idx = i,
+                timeframe = TIMEFRAME_1D,
+                "NaN/Inf price in daily response — skipping candle"
+            );
+            m_api_errors.increment(1);
+            continue;
+        }
+
+        let oi_value = if i < data.open_interest.len() {
+            data.open_interest[i]
+        } else {
+            0
+        };
+
+        let candle = HistoricalCandle {
+            timestamp_utc_secs: data.timestamp[i],
+            security_id,
+            exchange_segment_code: segment_code,
+            timeframe: TIMEFRAME_1D,
+            open,
+            high,
+            low,
+            close,
+            volume: data.volume[i],
+            open_interest: oi_value,
+        };
+
+        if let Err(err) = candle_writer.append_candle(&candle) {
+            warn!(
+                ?err,
+                security_id,
+                timeframe = TIMEFRAME_1D,
+                "failed to append daily candle to QuestDB"
+            );
+        }
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -446,8 +840,8 @@ mod tests {
             instrument: "FUTIDX".to_string(),
             interval: "1".to_string(),
             oi: true,
-            from_date: "2025-01-01".to_string(),
-            to_date: "2025-01-05".to_string(),
+            from_date: "2025-01-01 09:15:00".to_string(),
+            to_date: "2025-01-05 15:30:00".to_string(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -458,6 +852,25 @@ mod tests {
         // Verify camelCase serialization
         assert!(!json.contains("security_id"));
         assert!(!json.contains("exchange_segment"));
+    }
+
+    #[test]
+    fn test_daily_request_serialization() {
+        let request = DailyRequest {
+            security_id: "13".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2025-12-14".to_string(),
+            to_date: "2026-03-14".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("securityId"));
+        assert!(json.contains("fromDate"));
+        assert!(json.contains("toDate"));
+        // expiryCode should be omitted when None
+        assert!(!json.contains("expiryCode"));
     }
 
     #[test]
@@ -521,16 +934,15 @@ mod tests {
         assert_eq!(ist_minute, 0, "IST minute must be 0");
     }
 
-    /// Verifies the store-as-is approach: UTC epoch stored directly in
-    /// HistoricalCandle without any offset manipulation.
+    /// Verifies HistoricalCandle stores UTC epoch and timeframe correctly.
     #[test]
-    fn test_historical_candle_stores_utc_epoch_as_is() {
-        // 15:29 IST = 09:59 UTC on 2026-03-09
+    fn test_historical_candle_stores_utc_epoch_and_timeframe() {
         let dhan_epoch: i64 = 1_773_050_340;
         let candle = HistoricalCandle {
-            timestamp_utc_secs: dhan_epoch, // Stored as-is, no manipulation
+            timestamp_utc_secs: dhan_epoch,
             security_id: 42,
             exchange_segment_code: 2,
+            timeframe: "5m",
             open: 100.0,
             high: 102.0,
             low: 99.0,
@@ -538,8 +950,16 @@ mod tests {
             volume: 1000,
             open_interest: 0,
         };
-        // Timestamp stored is exactly what Dhan returned — raw UTC epoch
         assert_eq!(candle.timestamp_utc_secs, dhan_epoch);
-        assert_eq!(candle.timestamp_utc_secs, 1_773_050_340);
+        assert_eq!(candle.timeframe, "5m");
+    }
+
+    #[test]
+    fn test_intraday_timeframes_constant() {
+        assert_eq!(INTRADAY_TIMEFRAMES.len(), 4);
+        assert_eq!(INTRADAY_TIMEFRAMES[0], ("1", "1m"));
+        assert_eq!(INTRADAY_TIMEFRAMES[1], ("5", "5m"));
+        assert_eq!(INTRADAY_TIMEFRAMES[2], ("15", "15m"));
+        assert_eq!(INTRADAY_TIMEFRAMES[3], ("60", "60m"));
     }
 }

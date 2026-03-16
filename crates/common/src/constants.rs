@@ -757,12 +757,25 @@ pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 /// Endpoint: POST <https://api.dhan.co/v2/charts/intraday>
 pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
 
+/// Path for daily candle data (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
+pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
+
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants
 // ---------------------------------------------------------------------------
 
 /// 1-minute candle interval identifier for Dhan intraday API.
 pub const DHAN_CANDLE_INTERVAL_1MIN: &str = "1";
+
+/// 5-minute candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_5MIN: &str = "5";
+
+/// 15-minute candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_15MIN: &str = "15";
+
+/// 60-minute (1-hour) candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_60MIN: &str = "60";
 
 /// Maximum days of intraday data per API request (Dhan limit: 90 days).
 pub const DHAN_INTRADAY_MAX_DAYS_PER_REQUEST: u32 = 90;
@@ -774,12 +787,37 @@ pub const MARKET_OPEN_TIME_IST: &str = "09:15:00";
 /// The last 1-minute candle runs from 15:29:00 to 15:29:59 IST.
 pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 
+/// Market close time for intraday API toDate parameter (exclusive upper bound).
+/// Dhan intraday API uses datetime format: "YYYY-MM-DD 15:30:00" is exclusive,
+/// meaning the last candle returned starts at 15:29.
+pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
+
 /// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
 /// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
 pub const CANDLES_PER_TRADING_DAY: usize = 375;
 
 /// Batch size for QuestDB ILP flushes during historical candle ingestion.
 pub const CANDLE_FLUSH_BATCH_SIZE: usize = 500;
+
+/// Timeframe identifier for 1-minute candles in `historical_candles` table.
+pub const TIMEFRAME_1M: &str = "1m";
+
+/// Timeframe identifier for 5-minute candles in `historical_candles` table.
+pub const TIMEFRAME_5M: &str = "5m";
+
+/// Timeframe identifier for 15-minute candles in `historical_candles` table.
+pub const TIMEFRAME_15M: &str = "15m";
+
+/// Timeframe identifier for 60-minute candles in `historical_candles` table.
+pub const TIMEFRAME_60M: &str = "60m";
+
+/// Timeframe identifier for daily candles in `historical_candles` table.
+pub const TIMEFRAME_1D: &str = "1d";
+
+/// All intraday timeframes to fetch from Dhan API.
+/// Each tuple: (interval for API request, timeframe label for storage).
+pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] =
+    &[("1", "1m"), ("5", "5m"), ("15", "15m"), ("60", "60m")];
 
 // ---------------------------------------------------------------------------
 // Authentication — SSM Path Construction
@@ -944,10 +982,15 @@ pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
 /// QuestDB table: previous close reference data from code 6 packets.
 pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 
-/// QuestDB table: 1-minute OHLCV candles from Dhan historical API.
-/// Named `historical_candles_1m` to avoid collision with the `candles_1m`
-/// materialized view (which aggregates live 1s candles).
+/// QuestDB table: 1-minute OHLCV candles from Dhan historical API (legacy).
+/// Kept for backward compatibility with existing tests and cross-verify.
+/// New code should use `QUESTDB_TABLE_HISTORICAL_CANDLES`.
 pub const QUESTDB_TABLE_CANDLES_1M: &str = "historical_candles_1m";
+
+/// QuestDB table: multi-timeframe OHLCV candles from Dhan historical API.
+/// Stores 1m, 5m, 15m, 60m intraday candles and daily candles in a single table.
+/// Discriminated by `timeframe` SYMBOL column. DEDUP on `(ts, security_id, timeframe)`.
+pub const QUESTDB_TABLE_HISTORICAL_CANDLES: &str = "historical_candles";
 
 /// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
 pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
