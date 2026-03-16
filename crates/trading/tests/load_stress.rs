@@ -2,8 +2,17 @@
 //!
 //! Verifies risk engine and indicator ring buffer handle
 //! sustained throughput without degradation.
+//!
+//! NOTE: Timing assertions are skipped under instrumented builds
+//! (cargo-careful, sanitizers) where execution is 10-100x slower.
+//! Set `DLT_SKIP_PERF_ASSERTIONS=1` to skip timing checks.
 
 use std::time::{Duration, Instant};
+
+/// Returns true when running under instrumented builds (cargo-careful, sanitizers).
+fn skip_perf_assertions() -> bool {
+    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+}
 
 // ---------------------------------------------------------------------------
 // Sustained: Risk engine under load
@@ -29,10 +38,12 @@ fn stress_risk_engine_100k_checks() {
 
     let elapsed = start.elapsed();
     assert_eq!(engine.total_checks(), 100_000);
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "100K risk checks took {elapsed:?} — too slow"
-    );
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100K risk checks took {elapsed:?} — too slow"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -51,10 +62,12 @@ fn stress_ring_buffer_1m_pushes() {
     }
 
     let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(200),
-        "1M ring buffer pushes took {elapsed:?} — too slow"
-    );
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "1M ring buffer pushes took {elapsed:?} — too slow"
+        );
+    }
     // Capacity should be stable
     assert_eq!(
         ring.len() as usize,

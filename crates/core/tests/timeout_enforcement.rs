@@ -3,8 +3,16 @@
 //! Verifies that async operations respect deadlines and do not
 //! hang indefinitely. Critical for a trading system where stuck
 //! operations can block order execution.
+//!
+//! NOTE: Upper-bound timing assertions are skipped under instrumented
+//! builds where execution is 10-100x slower.
 
 use std::time::Duration;
+
+/// Returns true when running under instrumented builds.
+fn skip_perf_assertions() -> bool {
+    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+}
 
 use tokio::time::timeout;
 
@@ -57,12 +65,14 @@ async fn timeout_tokio_sleep_completes_within_bounds() {
     tokio::time::sleep(target).await;
 
     let elapsed = start.elapsed();
-    // Should complete within 2x the target (generous for CI)
-    assert!(
-        elapsed < target * 3,
-        "sleep took {elapsed:?}, expected ~{target:?}"
-    );
-    // Should not complete too early
+    // Upper bound: skip under instrumentation (cargo-careful adds overhead)
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < target * 3,
+            "sleep took {elapsed:?}, expected ~{target:?}"
+        );
+    }
+    // Lower bound: should not complete too early (always valid)
     assert!(
         elapsed >= target - Duration::from_millis(5),
         "sleep completed too early: {elapsed:?}"
