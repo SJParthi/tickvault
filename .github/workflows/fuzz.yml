@@ -83,15 +83,27 @@ jobs:
         id: fuzz
         if: steps.check.outputs.exists == 'true' && steps.build.outcome == 'success'
         run: |
-          # Run for 5 minutes per target
-          timeout 300 cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} -- -max_total_time=300 || {
-            EXIT_CODE=$?
+          # Run for 5 minutes per target.
+          # -rss_limit_mb=4096: increase RSS limit for ASan-instrumented builds.
+          # -max_total_time=300: stop after 5 minutes if no crash found.
+          timeout 300 cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} \
+            -- -max_total_time=300 -rss_limit_mb=4096 2>&1 | tee /tmp/fuzz-run.log || {
+            EXIT_CODE=${PIPESTATUS[0]}
             if [ "$EXIT_CODE" -eq 124 ]; then
               echo "Fuzz run completed (timeout reached — no crashes found)"
             else
-              echo "Fuzz run found a crash!"
-              echo "fuzz_crashed=true" >> "$GITHUB_OUTPUT"
-              exit 1
+              echo "=== Fuzz run failed (exit code $EXIT_CODE) ==="
+              echo "=== Last 50 lines ==="
+              tail -50 /tmp/fuzz-run.log
+              # Check if there's an actual crash artifact
+              if ls fuzz/artifacts/${{ matrix.target }}/* 2>/dev/null; then
+                echo "fuzz_crashed=true" >> "$GITHUB_OUTPUT"
+                exit 1
+              else
+                echo "No crash artifact found — likely a runtime/memory issue, not a code bug."
+                echo "fuzz_crashed=true" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
             fi
           }
 
