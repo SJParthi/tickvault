@@ -372,4 +372,390 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
     }
+
+    // -----------------------------------------------------------------------
+    // HTTP mock tests — async tests using a local TCP mock server
+    // -----------------------------------------------------------------------
+
+    use std::time::Duration;
+
+    /// Starts a one-shot TCP mock server that returns the given status and body.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only content-length arithmetic
+    async fn start_mock_server(status: u16, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let body = body.to_string();
+
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    /// Builds a test `OrderApiClient` pointing at the given mock base URL.
+    fn make_test_client(base_url: &str) -> OrderApiClient {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        OrderApiClient::new(http, base_url.to_owned(), "TEST-100".to_owned())
+    }
+
+    /// Builds a minimal `DhanPlaceOrderRequest` for test use.
+    fn make_test_place_request() -> DhanPlaceOrderRequest {
+        DhanPlaceOrderRequest {
+            dhan_client_id: "100".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            product_type: "INTRADAY".to_owned(),
+            order_type: "LIMIT".to_owned(),
+            validity: "DAY".to_owned(),
+            security_id: "52432".to_owned(),
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            disclosed_quantity: 0,
+            after_market_order: false,
+            correlation_id: "test-uuid-1".to_owned(),
+        }
+    }
+
+    /// Builds a minimal `DhanModifyOrderRequest` for test use.
+    fn make_test_modify_request() -> DhanModifyOrderRequest {
+        DhanModifyOrderRequest {
+            dhan_client_id: "100".to_owned(),
+            order_id: "ORD-1".to_owned(),
+            order_type: "LIMIT".to_owned(),
+            leg_name: String::new(),
+            quantity: 50,
+            price: 250.00,
+            trigger_price: 0.0,
+            validity: "DAY".to_owned(),
+            disclosed_quantity: 0,
+        }
+    }
+
+    // -- 1. place_order success -----------------------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_success_200() {
+        let body = r#"{"orderId":"ORD-1","orderStatus":"TRANSIT","correlationId":"uuid-1"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        let resp = result.unwrap();
+        assert_eq!(resp.order_id, "ORD-1");
+        assert_eq!(resp.order_status, "TRANSIT");
+        assert_eq!(resp.correlation_id, "uuid-1");
+
+        handle.abort();
+    }
+
+    // -- 2. place_order rate limited ------------------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+
+        handle.abort();
+    }
+
+    // -- 3. place_order API error 500 -----------------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"internal"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 500);
+                assert!(message.contains("DH-908"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 4. place_order malformed JSON ----------------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_malformed_json_200() {
+        let (base_url, handle) = start_mock_server(200, "not json").await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+
+        handle.abort();
+    }
+
+    // -- 5. modify_order success ----------------------------------------------
+
+    #[tokio::test]
+    async fn test_modify_order_success_200() {
+        let body = r#"{"orderId":"ORD-1","orderStatus":"PENDING"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        assert!(result.is_ok());
+
+        handle.abort();
+    }
+
+    // -- 6. modify_order rate limited -----------------------------------------
+
+    #[tokio::test]
+    async fn test_modify_order_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+
+        handle.abort();
+    }
+
+    // -- 7. cancel_order success ----------------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_success_200() {
+        let (base_url, handle) = start_mock_server(200, "").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        assert!(result.is_ok());
+
+        handle.abort();
+    }
+
+    // -- 8. cancel_order API error 403 ----------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 403);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 9. get_order success -------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_order_success() {
+        let body = r#"{
+            "orderId": "ORD-99",
+            "orderStatus": "TRADED",
+            "transactionType": "BUY",
+            "exchangeSegment": "NSE_FNO",
+            "productType": "INTRADAY",
+            "orderType": "LIMIT",
+            "securityId": "52432",
+            "quantity": 50,
+            "price": 245.50,
+            "tradedQuantity": 50,
+            "tradedPrice": 245.50,
+            "correlationId": "corr-99"
+        }"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_order("fake-token", "ORD-99").await;
+
+        let resp = result.unwrap();
+        assert_eq!(resp.order_id, "ORD-99");
+        assert_eq!(resp.order_status, "TRADED");
+        assert_eq!(resp.transaction_type, "BUY");
+        assert_eq!(resp.security_id, "52432");
+        assert_eq!(resp.quantity, 50);
+        assert_eq!(resp.correlation_id, "corr-99");
+
+        handle.abort();
+    }
+
+    // -- 10. get_all_orders success -------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_all_orders_success() {
+        let body = r#"[
+            {"orderId": "ORD-1", "orderStatus": "TRADED", "quantity": 25},
+            {"orderId": "ORD-2", "orderStatus": "PENDING", "quantity": 50}
+        ]"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_all_orders("fake-token").await;
+
+        let orders = result.unwrap();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].order_id, "ORD-1");
+        assert_eq!(orders[0].order_status, "TRADED");
+        assert_eq!(orders[1].order_id, "ORD-2");
+        assert_eq!(orders[1].order_status, "PENDING");
+
+        handle.abort();
+    }
+
+    // -- 11. get_all_orders empty array ---------------------------------------
+
+    #[tokio::test]
+    async fn test_get_all_orders_empty_array() {
+        let (base_url, handle) = start_mock_server(200, "[]").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_all_orders("fake-token").await;
+
+        let orders = result.unwrap();
+        assert!(orders.is_empty());
+
+        handle.abort();
+    }
+
+    // -- 12. get_positions success --------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_positions_success() {
+        let body = r#"[
+            {
+                "securityId": "52432",
+                "exchangeSegment": "NSE_FNO",
+                "productType": "INTRADAY",
+                "positionType": "LONG",
+                "buyQty": 50,
+                "sellQty": 0,
+                "netQty": 50,
+                "realizedProfit": 0.0,
+                "unrealizedProfit": 125.50
+            }
+        ]"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_positions("fake-token").await;
+
+        let positions = result.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].security_id, "52432");
+        assert_eq!(positions[0].position_type, "LONG");
+        assert_eq!(positions[0].net_qty, 50);
+        assert_eq!(positions[0].unrealized_profit, 125.50);
+
+        handle.abort();
+    }
+
+    // -- 13. get_positions empty ----------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_positions_empty() {
+        let (base_url, handle) = start_mock_server(200, "[]").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_positions("fake-token").await;
+
+        let positions = result.unwrap();
+        assert!(positions.is_empty());
+
+        handle.abort();
+    }
+
+    // -- 14. auth headers set correctly ---------------------------------------
+
+    #[test]
+    fn test_auth_headers_set_correctly() {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let client = OrderApiClient::new(
+            http.clone(),
+            "https://api.dhan.co/v2".to_owned(),
+            "MY-CLIENT-ID".to_owned(),
+        );
+
+        // Build a dummy request and apply auth_headers
+        let builder = http.get("https://api.dhan.co/v2/orders");
+        let builder = client.auth_headers(builder, "my-jwt-token");
+
+        // Build the request to inspect headers
+        let request = builder.build().unwrap();
+        let headers = request.headers();
+
+        assert_eq!(
+            headers.get("access-token").unwrap().to_str().unwrap(),
+            "my-jwt-token"
+        );
+        assert_eq!(
+            headers.get("client-id").unwrap().to_str().unwrap(),
+            "MY-CLIENT-ID"
+        );
+        assert_eq!(
+            headers.get("Content-Type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            headers.get("Accept").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
 }

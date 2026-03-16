@@ -1001,4 +1001,153 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("build_window_start"));
     }
+
+    // -----------------------------------------------------------------------
+    // Cross-field and boundary validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_market_close_before_open_time_values() {
+        // Verify that market_close_time > market_open_time in the default config.
+        // The validator doesn't currently reject this cross-field case,
+        // but the parsed times should have the expected ordering.
+        let config = make_valid_config();
+        let open = NaiveTime::parse_from_str(&config.trading.market_open_time, "%H:%M:%S").unwrap();
+        let close =
+            NaiveTime::parse_from_str(&config.trading.market_close_time, "%H:%M:%S").unwrap();
+        assert!(
+            close > open,
+            "market_close_time ({close}) must be after market_open_time ({open})"
+        );
+    }
+
+    #[test]
+    fn test_order_cutoff_before_close() {
+        // Verify that order_cutoff_time < market_close_time in the default config.
+        let config = make_valid_config();
+        let cutoff =
+            NaiveTime::parse_from_str(&config.trading.order_cutoff_time, "%H:%M:%S").unwrap();
+        let close =
+            NaiveTime::parse_from_str(&config.trading.market_close_time, "%H:%M:%S").unwrap();
+        assert!(
+            cutoff < close,
+            "order_cutoff_time ({cutoff}) must be before market_close_time ({close})"
+        );
+    }
+
+    #[test]
+    fn test_historical_lookback_zero_fails() {
+        let mut config = make_valid_config();
+        config.historical.enabled = true;
+        config.historical.lookback_days = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("lookback_days"));
+    }
+
+    #[test]
+    fn test_historical_lookback_over_90_fails() {
+        let mut config = make_valid_config();
+        config.historical.enabled = true;
+        config.historical.lookback_days = 91;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("lookback_days"));
+    }
+
+    #[test]
+    fn test_historical_lookback_at_90_passes() {
+        let mut config = make_valid_config();
+        config.historical.enabled = true;
+        config.historical.lookback_days = 90;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_historical_lookback_at_1_passes() {
+        let mut config = make_valid_config();
+        config.historical.enabled = true;
+        config.historical.lookback_days = 1;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_historical_request_timeout_zero_fails() {
+        let mut config = make_valid_config();
+        config.historical.enabled = true;
+        config.historical.request_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("request_timeout_secs"));
+    }
+
+    #[test]
+    fn test_historical_disabled_skips_validation() {
+        let mut config = make_valid_config();
+        config.historical.enabled = false;
+        config.historical.lookback_days = 999; // Would fail if validated
+        config.historical.request_timeout_secs = 0; // Would fail if validated
+        assert!(
+            config.validate().is_ok(),
+            "disabled historical config should skip validation"
+        );
+    }
+
+    #[test]
+    fn test_websocket_excessive_read_timeout_fails() {
+        let mut config = make_valid_config();
+        // ping_interval_secs * (max_consecutive_pong_failures + 1) + pong_timeout_secs
+        // = 30 * (10 + 1) + 30 = 360s, which exceeds 2 * SERVER_PING_TIMEOUT_SECS
+        config.websocket.ping_interval_secs = 30;
+        config.websocket.max_consecutive_pong_failures = 10;
+        config.websocket.pong_timeout_secs = 30;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("websocket read timeout"));
+    }
+
+    #[test]
+    fn test_feed_mode_ticker_passes() {
+        let config = SubscriptionConfig {
+            feed_mode: "Ticker".to_string(),
+            ..SubscriptionConfig::default()
+        };
+        assert!(config.parsed_feed_mode().is_ok());
+    }
+
+    #[test]
+    fn test_feed_mode_quote_passes() {
+        let config = SubscriptionConfig {
+            feed_mode: "Quote".to_string(),
+            ..SubscriptionConfig::default()
+        };
+        assert!(config.parsed_feed_mode().is_ok());
+    }
+
+    #[test]
+    fn test_feed_mode_full_passes() {
+        let config = SubscriptionConfig {
+            feed_mode: "Full".to_string(),
+            ..SubscriptionConfig::default()
+        };
+        assert!(config.parsed_feed_mode().is_ok());
+    }
+
+    #[test]
+    fn test_feed_mode_invalid_string_fails() {
+        let config = SubscriptionConfig {
+            feed_mode: "invalid".to_string(),
+            ..SubscriptionConfig::default()
+        };
+        let err = config.parsed_feed_mode().unwrap_err();
+        assert!(err.to_string().contains("Ticker/Quote/Full"));
+    }
+
+    #[test]
+    fn test_feed_mode_case_sensitive() {
+        let config = SubscriptionConfig {
+            feed_mode: "ticker".to_string(), // lowercase — must fail
+            ..SubscriptionConfig::default()
+        };
+        assert!(
+            config.parsed_feed_mode().is_err(),
+            "feed_mode is case-sensitive — 'ticker' should fail"
+        );
+    }
 }

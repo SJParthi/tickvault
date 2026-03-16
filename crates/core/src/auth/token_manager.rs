@@ -2186,4 +2186,116 @@ mod tests {
     fn test_network_error_not_rate_limited() {
         assert!(!is_dhan_rate_limited("error sending request"));
     }
+
+    // -----------------------------------------------------------------------
+    // TokenHandle atomic tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a `TokenState` for testing using `from_cached`.
+    fn make_test_token_state(token_value: &str) -> TokenState {
+        let now_ist = chrono::Utc::now().with_timezone(
+            &chrono::FixedOffset::east_opt(
+                dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS,
+            )
+            .expect("IST offset always valid"), // APPROVED: test-only, compile-time constant
+        );
+        let expires_at = now_ist + chrono::Duration::hours(24);
+        TokenState::from_cached(
+            secrecy::SecretString::from(token_value.to_string()),
+            expires_at,
+            now_ist,
+        )
+    }
+
+    #[test]
+    fn test_token_handle_starts_as_none() {
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+        let guard = handle.load();
+        assert!(
+            guard.as_ref().is_none(),
+            "Fresh TokenHandle must load as None"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_store_and_load() {
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+        let state = make_test_token_state("test-jwt-store-load");
+        handle.store(Arc::new(Some(state)));
+
+        let guard = handle.load();
+        let loaded = guard.as_ref().as_ref().expect("should have token after store");
+        assert_eq!(
+            loaded.access_token().expose_secret(),
+            "test-jwt-store-load"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_swap_updates_atomically() {
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+
+        // Store first token
+        let state_a = make_test_token_state("token-alpha");
+        handle.store(Arc::new(Some(state_a)));
+
+        // Verify first token
+        let guard = handle.load();
+        let loaded = guard.as_ref().as_ref().expect("should have token-alpha");
+        assert_eq!(loaded.access_token().expose_secret(), "token-alpha");
+
+        // Swap to second token
+        let state_b = make_test_token_state("token-beta");
+        handle.store(Arc::new(Some(state_b)));
+
+        // Verify second token is returned
+        let guard = handle.load();
+        let loaded = guard.as_ref().as_ref().expect("should have token-beta");
+        assert_eq!(loaded.access_token().expose_secret(), "token-beta");
+    }
+
+    #[test]
+    fn test_build_generate_token_url() {
+        let auth_base = "https://auth.dhan.co";
+        let url = format!("{auth_base}{}", DHAN_GENERATE_TOKEN_PATH);
+        assert_eq!(url, "https://auth.dhan.co/app/generateAccessToken");
+        assert!(url.contains(DHAN_GENERATE_TOKEN_PATH));
+    }
+
+    #[test]
+    fn test_build_renew_token_url() {
+        let api_base = "https://api.dhan.co/v2";
+        let url = format!("{api_base}{}", DHAN_RENEW_TOKEN_PATH);
+        assert_eq!(url, "https://api.dhan.co/v2/RenewToken");
+        assert!(url.contains(DHAN_RENEW_TOKEN_PATH));
+    }
+
+    #[test]
+    fn test_multiple_handles_share_state() {
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+        let handle_clone = Arc::clone(&handle);
+
+        // Update via the original handle
+        let state = make_test_token_state("shared-jwt");
+        handle.store(Arc::new(Some(state)));
+
+        // Read via the cloned handle — must see the same value
+        let guard = handle_clone.load();
+        let loaded = guard
+            .as_ref()
+            .as_ref()
+            .expect("cloned handle should see stored token");
+        assert_eq!(loaded.access_token().expose_secret(), "shared-jwt");
+
+        // Update via the clone, read via original
+        let state_updated = make_test_token_state("shared-jwt-v2");
+        handle_clone.store(Arc::new(Some(state_updated)));
+
+        let guard = handle.load();
+        let loaded = guard
+            .as_ref()
+            .as_ref()
+            .expect("original handle should see clone's update");
+        assert_eq!(loaded.access_token().expose_secret(), "shared-jwt-v2");
+    }
 }

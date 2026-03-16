@@ -751,4 +751,107 @@ mod tests {
     fn test_mask_phone_us_number() {
         assert_eq!(mask_phone("+12025551234"), "+12XXXX51234");
     }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_unclosed_tag() {
+        // Unclosed `<` means everything after it is treated as inside a tag
+        assert_eq!(strip_html_tags("before<unclosed"), "before");
+    }
+
+    #[test]
+    fn test_strip_html_tags_only_tags() {
+        assert_eq!(strip_html_tags("<b></b><i></i>"), "");
+    }
+
+    #[test]
+    fn test_strip_html_tags_special_chars_in_content() {
+        // `&amp;` and `&lt;` entities are NOT HTML tags — preserved as-is
+        assert_eq!(strip_html_tags("a &amp; b"), "a &amp; b");
+    }
+
+    #[test]
+    fn test_strip_html_tags_angle_brackets_in_text() {
+        // `>` without a preceding `<` is just text
+        assert_eq!(strip_html_tags("5 > 3 and 2 < 4"), "5  3 and 2 ");
+    }
+
+    #[test]
+    fn test_strip_html_tags_multiple_nested_tags() {
+        assert_eq!(strip_html_tags("<b><i><u>deep</u></i></b>"), "deep");
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_exact_boundary_8_chars() {
+        // Exactly 8 chars → masked (boundary)
+        assert_eq!(mask_phone("12345678"), "***");
+    }
+
+    #[test]
+    fn test_mask_phone_9_chars() {
+        // 9 chars → first 3 + 1 X + last 5
+        assert_eq!(mask_phone("123456789"), "123X56789");
+    }
+
+    #[test]
+    fn test_mask_phone_empty() {
+        assert_eq!(mask_phone(""), "***");
+    }
+
+    #[test]
+    fn test_mask_phone_single_char() {
+        assert_eq!(mask_phone("X"), "***");
+    }
+
+    // -----------------------------------------------------------------------
+    // Disabled service — all critical event types are safe
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disabled_service_all_critical_events_safe() {
+        let service = NotificationService::disabled();
+        // Every event variant must be safe to fire on a disabled service
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "test".to_string(),
+        });
+        service.notify(NotificationEvent::TokenRenewalFailed {
+            attempts: 99,
+            reason: "catastrophic".to_string(),
+        });
+        service.notify(NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        });
+        service.notify(NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 0,
+            instruments_failed: 500,
+            total_candles: 0,
+        });
+        service.notify(NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 0,
+            instruments_with_gaps: 100,
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Severity routing — Low severity does NOT trigger SMS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_severity_low_does_not_trigger_sms_path() {
+        // StartupComplete is Low severity — it should NOT trigger the
+        // SNS SMS code path. We verify this by checking severity.
+        let event = NotificationEvent::StartupComplete { mode: "PAPER" };
+        assert!(
+            event.severity() < Severity::High,
+            "Low-severity events must not reach SMS path (< High)"
+        );
+    }
 }

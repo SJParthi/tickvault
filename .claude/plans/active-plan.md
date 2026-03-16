@@ -1,95 +1,56 @@
-# Implementation Plan: Wire-to-Done Latency Measurement
+# Implementation Plan: Test Coverage Gap Closure
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-03-16
-**Approved by:** pending
-
-## Problem
-
-Currently `received_at` is captured AFTER the mpsc channel hop (tick_processor line 185),
-not at WebSocket frame arrival. We cannot measure:
-- Channel transit latency (WS read loop → tick processor)
-- True wire-to-done latency (WS frame arrival → processing complete)
+**Approved by:** Parthiban
 
 ## Plan Items
 
-- [ ] **1. Add `TimestampedFrame` type in common crate**
-  - Files: `crates/common/src/tick_types.rs`
-  - Struct: `TimestampedFrame { data: bytes::Bytes, ws_arrived_at: Instant, wall_clock_nanos: i64 }`
-  - `ws_arrived_at: Instant` — monotonic clock for latency math (cannot serialize, cannot store)
-  - `wall_clock_nanos: i64` — `Utc::now()` at same moment, for QuestDB `received_at` column
-  - Must be `Clone` (Bytes is cheaply cloneable, Instant is Copy, i64 is Copy)
-  - Zero allocation — Instant is 8 bytes on stack, Bytes is arc-counted
-  - Tests: `test_timestamped_frame_is_clone`, `test_timestamped_frame_preserves_instant`
+- [x] **1. OMS API Client — HTTP error path tests**
+  - Files: `crates/trading/src/oms/api_client.rs`
+  - Tests: `test_place_order_success_response`, `test_place_order_rate_limited_429`, `test_place_order_dhan_api_error_non_2xx`, `test_place_order_json_parse_error`, `test_modify_order_success`, `test_modify_order_rate_limited`, `test_cancel_order_success`, `test_cancel_order_api_error`, `test_get_order_success`, `test_get_all_orders_success`, `test_get_all_orders_empty_array`, `test_get_positions_success`, `test_get_positions_empty`, `test_auth_headers_correct`
 
-- [ ] **2. Change channel type from `Bytes` to `TimestampedFrame`**
+- [x] **2. Token Manager — lifecycle unit tests**
+  - Files: `crates/core/src/auth/token_manager.rs`
+  - Tests: `test_token_handle_starts_none`, `test_token_handle_load_after_store`, `test_build_generate_token_url_format`, `test_build_renew_token_url_format`, `test_classify_generate_response_success`, `test_classify_generate_response_missing_token`, `test_token_renewal_needed_check`, `test_token_not_expired_within_validity`
+
+- [x] **3. Historical Candle Fetcher — edge case tests**
+  - Files: `crates/core/src/historical/candle_fetcher.rs`
+  - Tests: `test_max_response_body_size_is_10mb`, `test_intraday_request_oi_field_serialized`, `test_intraday_request_all_fields_camel_case`, `test_candle_fetch_summary_all_zeroes`, `test_nan_price_detection`, `test_infinity_price_detection`, `test_neg_infinity_price_detection`, `test_normal_price_is_finite`, `test_dhan_response_consistency_check`
+
+- [x] **4. Risk Engine — P&L edge case tests**
+  - Files: `crates/trading/src/risk/engine.rs`
+  - Tests: `test_position_reversal_long_to_short_pnl`, `test_position_reversal_short_to_long_pnl`, `test_weighted_avg_entry_many_fills`, `test_close_reopen_same_instrument`, `test_short_loss_calculation`, `test_multiple_instruments_pnl_independent`, `test_reset_daily_then_new_fills`, `test_exact_max_lots_boundary`, `test_negative_lots_sell_short`, `test_fill_at_zero_price`
+
+- [x] **5. WebSocket Connection Pool — already comprehensive (32+ tests)**
   - Files: `crates/core/src/websocket/connection_pool.rs`
-  - Change: `mpsc::channel::<bytes::Bytes>(65536)` → `mpsc::channel::<TimestampedFrame>(65536)`
-  - Change: `take_frame_receiver()` return type → `mpsc::Receiver<TimestampedFrame>`
-  - Change: `frame_receiver` field type on `WebSocketConnectionPool`
-  - Tests: existing pool tests compile
+  - Pre-existing: `test_pool_debug_format`, `test_pool_capacity_exceeded`, `test_pool_empty_instruments_ok`, `test_pool_single_instrument`, `test_pool_exact_capacity_boundary`, `test_pool_round_robin_distribution`, plus 26+ more including proptest
 
-- [ ] **3. Update WebSocketConnection to stamp frames at arrival**
-  - Files: `crates/core/src/websocket/connection.rs`
-  - Change: `frame_sender` type from `mpsc::Sender<bytes::Bytes>` → `mpsc::Sender<TimestampedFrame>`
-  - Change: `new()` parameter type accordingly
-  - At line 481 (`Message::Binary(data)` match arm): wrap in `TimestampedFrame { data, ws_arrived_at: Instant::now(), wall_clock_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0) }`
-  - Tests: existing connection tests compile
+- [x] **6. Notification Service — helper function tests**
+  - Files: `crates/core/src/notification/service.rs`
+  - Tests: `test_strip_html_tags_unclosed_tag`, `test_strip_html_tags_only_tags`, `test_strip_html_tags_special_chars_in_content`, `test_strip_html_tags_angle_brackets_in_text`, `test_strip_html_tags_multiple_nested_tags`, `test_mask_phone_exact_boundary_8_chars`, `test_mask_phone_9_chars`, `test_mask_phone_empty`, `test_mask_phone_single_char`, `test_disabled_service_all_critical_events_safe`, `test_severity_low_does_not_trigger_sms_path`
 
-- [ ] **4. Update tick processor to use carried timestamp + emit 3 histograms**
-  - Files: `crates/core/src/pipeline/tick_processor.rs`
-  - Change: `run_tick_processor` parameter `frame_receiver: mpsc::Receiver<bytes::Bytes>` → `mpsc::Receiver<TimestampedFrame>`
-  - Destructure: `let TimestampedFrame { data: raw_frame, ws_arrived_at, wall_clock_nanos } = frame;`
-  - Remove: `let received_at_nanos = chrono::Utc::now()...` at line 185 — replaced by `wall_clock_nanos` from frame
-  - Pass `wall_clock_nanos` to `dispatch_frame()` instead of locally computed value
-  - Three metrics (all in nanoseconds as f64):
-    - `dlt_channel_transit_duration_ns` = `tick_start.duration_since(ws_arrived_at).as_nanos()` — time spent in mpsc channel
-    - `dlt_wire_to_done_duration_ns` = `ws_arrived_at.elapsed().as_nanos()` — recorded at end of tick processing (after existing `tick_start.elapsed()`)
-    - Keep existing `dlt_tick_processing_duration_ns` = `tick_start.elapsed()` — unchanged
-  - Tests: `test_channel_transit_metric_exists`, `test_wire_to_done_metric_exists`
+- [x] **7. Config Validation — cross-field and boundary tests**
+  - Files: `crates/common/src/config.rs`
+  - Tests: `test_market_close_before_open_time_values`, `test_order_cutoff_before_close`, `test_historical_lookback_zero_fails`, `test_historical_lookback_over_90_fails`, `test_historical_lookback_at_90_passes`, `test_historical_lookback_at_1_passes`, `test_historical_request_timeout_zero_fails`, `test_historical_disabled_skips_validation`, `test_websocket_excessive_read_timeout_fails`, `test_feed_mode_ticker_passes`, `test_feed_mode_quote_passes`, `test_feed_mode_full_passes`, `test_feed_mode_invalid_string_fails`, `test_feed_mode_case_sensitive`
 
-- [ ] **5. Build verification**
-  - Run `cargo check --workspace` — all types align
-  - Run `cargo test -p dhan-live-trader-common -p dhan-live-trader-core -p dhan-live-trader-storage`
-  - All existing tests pass + new tests pass
+- [x] **8. Order Update WebSocket — field mapping tests**
+  - Files: `crates/core/src/parser/order_update.rs`
+  - Tests: `test_product_code_c_is_cnc`, `test_product_code_i_is_intraday`, `test_txn_type_b_is_buy`, `test_txn_type_s_is_sell`, `test_source_p_is_api`, `test_opt_type_xx_is_non_option`, `test_opt_type_ce_is_call`, `test_opt_type_pe_is_put`, `test_leg_number_mapping`, `test_super_order_remark`, `test_correlation_id_roundtrip`, `test_extra_unknown_fields_ignored`, `test_partial_fill_fields`
 
-## Architecture After Change
-
-```
-[Dhan Server] ──network──▶ [WS read loop]
-                                │
-                                ├─ ws_arrived_at = Instant::now()      ← NEW: monotonic
-                                ├─ wall_clock_nanos = Utc::now()       ← NEW: wall clock (moved here from tick_processor)
-                                ▼
-                           TimestampedFrame { data, ws_arrived_at, wall_clock_nanos }
-                                │
-                                ▼  mpsc channel (65536 buffer)
-                                │
-                           tick_processor receives frame
-                                │
-                                ├─ tick_start = Instant::now()         ← existing
-                                ├─ channel_transit = tick_start - ws_arrived_at  ← NEW metric
-                                │
-                                ▼  parse → dedup → store → broadcast
-                                │
-                                ├─ processing_duration = tick_start.elapsed()    ← existing metric
-                                └─ wire_to_done = ws_arrived_at.elapsed()        ← NEW metric
-```
-
-## Three Latency Metrics in Grafana
-
-| Metric | What it measures | Expected range |
-|--------|-----------------|----------------|
-| `dlt_channel_transit_duration_ns` | Time in mpsc channel (WS → tick processor) | 1–10 μs normal, spikes = backpressure |
-| `dlt_tick_processing_duration_ns` | Parse + dedup + store + broadcast | 0.5–5 μs (existing) |
-| `dlt_wire_to_done_duration_ns` | Total: channel transit + processing | 2–15 μs normal |
+- [x] **9. Build verification**
+  - `cargo test --workspace` — 2380 tests pass, 0 failures
+  - `cargo clippy --workspace --tests` — 0 warnings
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Normal tick flow | channel_transit ~1-10μs, wire_to_done ~5-50μs |
-| 2 | Tick processor backpressure | channel_transit spikes visible in Grafana |
-| 3 | Multiple WS connections | Each stamps independently, all flow to same receiver |
-| 4 | Reconnection | New frames get fresh Instants, no stale timestamps |
-| 5 | `received_at` in QuestDB | Now reflects WS arrival time (more accurate than before) |
+| 1 | OMS client receives HTTP 429 | Returns `OmsError::DhanRateLimited` |
+| 2 | OMS client receives HTTP 500 with body | Returns `OmsError::DhanApiError` with body |
+| 3 | OMS client receives valid JSON | Deserializes into typed response |
+| 4 | Risk engine: long 10 → sell 15 → short 5 | Correct realized P&L, entry price = fill price |
+| 5 | Risk engine: many partial fills | Weighted avg doesn't drift from true value |
+| 6 | Config: lookback_days = 91 | Validation fails with descriptive error |
+| 7 | Order update: unknown fields in JSON | Parsed without error (serde default) |
+| 8 | Notification: HTML with `<`, `>` in text | `strip_html_tags` handles correctly |

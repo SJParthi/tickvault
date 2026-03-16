@@ -542,4 +542,250 @@ mod tests {
         let engine = make_engine();
         assert!(engine.position(9999).is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // P&L edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_position_reversal_long_to_short_pnl() {
+        let mut engine = make_engine();
+        // Buy 10 at 100
+        engine.record_fill(1001, 10, 100.0, 25);
+        // Sell 15 at 110 → closes 10 long, opens 5 short
+        engine.record_fill(1001, -15, 110.0, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, -5);
+        // Realized P&L from closing 10 long: (110-100)*10*25 = 2500
+        assert!((pos.realized_pnl - 2500.0).abs() < 0.01);
+        // New short entry price = 110.0
+        assert!((pos.avg_entry_price - 110.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_position_reversal_short_to_long_pnl() {
+        let mut engine = make_engine();
+        // Sell 10 at 200
+        engine.record_fill(1001, -10, 200.0, 50);
+        // Buy 15 at 180 → closes 10 short, opens 5 long
+        engine.record_fill(1001, 15, 180.0, 50);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 5);
+        // Realized P&L from closing 10 short: (200-180)*10*50 = 10000
+        assert!((pos.realized_pnl - 10000.0).abs() < 0.01);
+        // New long entry price = 180.0
+        assert!((pos.avg_entry_price - 180.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_weighted_avg_entry_many_fills() {
+        let mut engine = make_engine();
+        // 5 incremental buys at different prices
+        engine.record_fill(1001, 2, 100.0, 25);
+        engine.record_fill(1001, 3, 110.0, 25);
+        engine.record_fill(1001, 5, 120.0, 25);
+        engine.record_fill(1001, 4, 130.0, 25);
+        engine.record_fill(1001, 6, 140.0, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 20);
+        // Weighted avg = (2*100 + 3*110 + 5*120 + 4*130 + 6*140) / 20
+        //              = (200 + 330 + 600 + 520 + 840) / 20
+        //              = 2490 / 20 = 124.5
+        let expected = 124.5;
+        assert!((pos.avg_entry_price - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_close_and_reopen_same_instrument() {
+        let mut engine = make_engine();
+        // Open long
+        engine.record_fill(1001, 10, 100.0, 25);
+        // Close long → realized = (120-100)*10*25 = 5000
+        engine.record_fill(1001, -10, 120.0, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 0);
+        assert!((pos.realized_pnl - 5000.0).abs() < 0.01);
+
+        // Reopen same instrument at new price
+        engine.record_fill(1001, 5, 200.0, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 5);
+        assert!((pos.avg_entry_price - 200.0).abs() < 0.01);
+        // Old realized P&L persists on the position
+        assert!((pos.realized_pnl - 5000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_short_loss_calculation() {
+        let mut engine = make_engine();
+        // Short 10 at 100
+        engine.record_fill(1001, -10, 100.0, 25);
+        // Cover at 110 → loss = (100-110)*10*25 = -2500
+        engine.record_fill(1001, 10, 110.0, 25);
+
+        assert!((engine.total_realized_pnl() - (-2500.0)).abs() < 0.01);
+        let pos = engine.position(1001).unwrap();
+        assert!((pos.realized_pnl - (-2500.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_multiple_instruments_pnl_independent() {
+        let mut engine = make_engine();
+        // Instrument A: buy 10 at 100, sell 10 at 120 → profit 5000
+        engine.record_fill(1001, 10, 100.0, 25);
+        engine.record_fill(1001, -10, 120.0, 25);
+        // Instrument B: sell 5 at 200, cover at 180 → profit 5000
+        engine.record_fill(2002, -5, 200.0, 25);
+        engine.record_fill(2002, 5, 180.0, 25);
+
+        let pos_a = engine.position(1001).unwrap();
+        let pos_b = engine.position(2002).unwrap();
+
+        // Each instrument tracks its own realized P&L
+        assert!((pos_a.realized_pnl - 5000.0).abs() < 0.01);
+        assert!((pos_b.realized_pnl - 2500.0).abs() < 0.01);
+
+        // Total is the sum
+        assert!((engine.total_realized_pnl() - 7500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_reset_daily_then_new_fills() {
+        let mut engine = make_engine();
+        // Fill, halt
+        engine.record_fill(1001, 10, 100.0, 25);
+        engine.manual_halt();
+        assert!(engine.is_halted());
+        assert_eq!(engine.open_position_count(), 1);
+
+        // Reset daily
+        engine.reset_daily();
+        assert!(!engine.is_halted());
+        assert_eq!(engine.total_realized_pnl(), 0.0);
+        assert_eq!(engine.open_position_count(), 0);
+        assert_eq!(engine.total_checks(), 0);
+        assert_eq!(engine.total_rejections(), 0);
+
+        // Fill again — everything starts fresh
+        engine.record_fill(2002, 5, 200.0, 25);
+        let pos = engine.position(2002).unwrap();
+        assert_eq!(pos.net_lots, 5);
+        assert!((pos.avg_entry_price - 200.0).abs() < 0.01);
+        assert!((pos.realized_pnl).abs() < 0.01);
+        // Old instrument should be gone
+        assert!(engine.position(1001).is_none());
+    }
+
+    #[test]
+    fn test_exact_max_lots_boundary() {
+        let mut engine = make_engine();
+        // Buy exactly 100 lots (the max)
+        engine.record_fill(1001, 100, 100.0, 25);
+        // check_order with 0 more → approved (100 + 0 = 100, not exceeding)
+        assert!(engine.check_order(1001, 0).is_approved());
+        // Buy 1 more → rejected (100 + 1 = 101 > 100)
+        assert!(!engine.check_order(1001, 1).is_approved());
+    }
+
+    #[test]
+    fn test_negative_lots_short_position_limit() {
+        let mut engine = make_engine();
+        // Short 100 lots (by selling)
+        engine.record_fill(1001, -100, 100.0, 25);
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, -100);
+
+        // Try to short 1 more → net = -101, abs = 101 > 100 → rejected
+        assert!(!engine.check_order(1001, -1).is_approved());
+        // Covering (buying) should still be allowed
+        assert!(engine.check_order(1001, 1).is_approved());
+    }
+
+    #[test]
+    fn test_fill_at_zero_price_no_nan() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 5, 0.0, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 5);
+        assert!((pos.avg_entry_price - 0.0).abs() < 0.01);
+        // Ensure no NaN
+        assert!(!pos.avg_entry_price.is_nan());
+        assert!(!pos.realized_pnl.is_nan());
+    }
+
+    #[test]
+    fn test_fill_at_very_large_price() {
+        let mut engine = make_engine();
+        let large_price = f64::MAX / 2.0;
+        engine.record_fill(1001, 1, large_price, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 1);
+        // Should not overflow — avg_entry_price should be the large price
+        assert!((pos.avg_entry_price - large_price).abs() < 1.0);
+        assert!(pos.avg_entry_price.is_finite());
+    }
+
+    #[test]
+    fn test_partial_close_avg_entry_unchanged() {
+        let mut engine = make_engine();
+        // Buy 20 at 100
+        engine.record_fill(1001, 20, 100.0, 25);
+        // Sell 10 at 150 → partial close, remaining 10 still at avg 100.0
+        engine.record_fill(1001, -10, 150.0, 25);
+
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 10);
+        assert!((pos.avg_entry_price - 100.0).abs() < 0.01);
+        // Realized = (150-100)*10*25 = 12500
+        assert!((pos.realized_pnl - 12500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_halt_persists_across_checks() {
+        let mut engine = make_engine();
+        engine.manual_halt();
+
+        // 100 consecutive check_order calls all rejected
+        for i in 0..100 {
+            let result = engine.check_order(1001 + i, 1);
+            assert!(!result.is_approved());
+        }
+        assert!(engine.is_halted());
+        assert_eq!(engine.total_rejections(), 100);
+    }
+
+    #[test]
+    fn test_pnl_accumulates_across_instruments() {
+        let mut engine = make_engine();
+
+        // Instrument 1: buy 10 at 100, sell at 110 → (110-100)*10*25 = 2500
+        engine.record_fill(1001, 10, 100.0, 25);
+        engine.record_fill(1001, -10, 110.0, 25);
+
+        // Instrument 2: sell 5 at 200, cover at 190 → (200-190)*5*25 = 1250
+        engine.record_fill(2002, -5, 200.0, 25);
+        engine.record_fill(2002, 5, 190.0, 25);
+
+        // Instrument 3: buy 8 at 50, sell at 45 → (45-50)*8*25 = -1000
+        engine.record_fill(3003, 8, 50.0, 25);
+        engine.record_fill(3003, -8, 45.0, 25);
+
+        // Total = 2500 + 1250 + (-1000) = 2750
+        assert!((engine.total_realized_pnl() - 2750.0).abs() < 0.01);
+
+        // Verify individual positions
+        let pos1 = engine.position(1001).unwrap();
+        assert!((pos1.realized_pnl - 2500.0).abs() < 0.01);
+        let pos2 = engine.position(2002).unwrap();
+        assert!((pos2.realized_pnl - 1250.0).abs() < 0.01);
+        let pos3 = engine.position(3003).unwrap();
+        assert!((pos3.realized_pnl - (-1000.0)).abs() < 0.01);
+    }
 }
