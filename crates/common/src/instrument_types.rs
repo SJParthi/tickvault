@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
@@ -708,6 +708,117 @@ impl<D: rkyv::rancor::Fallible + ?Sized>
         _deserializer: &mut D,
     ) -> Result<Duration, <D as rkyv::rancor::Fallible>::Error> {
         Ok(Duration::from_millis((*archived).into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index Constituency (niftyindices.com data)
+// ---------------------------------------------------------------------------
+
+/// A single constituent stock within an NSE index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexConstituent {
+    /// Index name (e.g., "Nifty 50", "Nifty Bank").
+    pub index_name: String,
+    /// Stock symbol (e.g., "RELIANCE", "HDFCBANK").
+    pub symbol: String,
+    /// ISIN code (e.g., "INE002A01018").
+    pub isin: String,
+    /// Weight in the index (percentage, 0.0 if not available).
+    pub weight: f64,
+    /// Industry/sector classification from the CSV.
+    pub sector: String,
+    /// Date when this constituency data was last downloaded.
+    pub last_updated: NaiveDate,
+}
+
+/// Bidirectional index ↔ stock mapping built from niftyindices.com CSVs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexConstituencyMap {
+    /// Forward map: index name → list of constituent stocks.
+    pub index_to_constituents: HashMap<String, Vec<IndexConstituent>>,
+    /// Reverse map: stock symbol → list of index names containing this stock.
+    pub stock_to_indices: HashMap<String, Vec<String>>,
+    /// Build metadata for diagnostics.
+    pub build_metadata: ConstituencyBuildMetadata,
+}
+
+impl IndexConstituencyMap {
+    /// O(1) forward lookup: get all constituents of an index.
+    pub fn get_constituents(&self, index_name: &str) -> Option<&[IndexConstituent]> {
+        self.index_to_constituents
+            .get(index_name)
+            .map(|v| v.as_slice())
+    }
+
+    /// O(1) reverse lookup: get all indices containing a stock.
+    pub fn get_indices_for_stock(&self, symbol: &str) -> Option<&[String]> {
+        self.stock_to_indices.get(symbol).map(|v| v.as_slice())
+    }
+
+    /// Number of indices in the map.
+    pub fn index_count(&self) -> usize {
+        self.index_to_constituents.len()
+    }
+
+    /// Number of unique stocks across all indices.
+    pub fn stock_count(&self) -> usize {
+        self.stock_to_indices.len()
+    }
+
+    /// Sorted list of all index names.
+    pub fn all_index_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .index_to_constituents
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Quick membership check for a stock symbol.
+    pub fn contains_stock(&self, symbol: &str) -> bool {
+        self.stock_to_indices.contains_key(symbol)
+    }
+
+    /// Quick membership check for an index name.
+    pub fn contains_index(&self, index_name: &str) -> bool {
+        self.index_to_constituents.contains_key(index_name)
+    }
+}
+
+/// Build metadata for index constituency download and parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstituencyBuildMetadata {
+    /// Total time spent downloading and parsing CSVs.
+    #[serde(with = "duration_serde")]
+    pub download_duration: Duration,
+    /// Number of indices successfully downloaded.
+    pub indices_downloaded: usize,
+    /// Number of indices that failed to download.
+    pub indices_failed: usize,
+    /// Number of unique stocks across all indices.
+    pub unique_stocks: usize,
+    /// Total number of (index, stock) mappings.
+    pub total_mappings: usize,
+    /// Timestamp when the build completed (IST).
+    pub build_timestamp: DateTime<FixedOffset>,
+}
+
+impl Default for ConstituencyBuildMetadata {
+    fn default() -> Self {
+        #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
+        let ist = FixedOffset::east_opt(crate::constants::IST_UTC_OFFSET_SECONDS)
+            .expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+        Self {
+            download_duration: Duration::default(),
+            indices_downloaded: 0,
+            indices_failed: 0,
+            unique_stocks: 0,
+            total_mappings: 0,
+            build_timestamp: Utc::now().with_timezone(&ist),
+        }
     }
 }
 

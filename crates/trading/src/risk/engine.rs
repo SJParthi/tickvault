@@ -89,7 +89,7 @@ impl RiskEngine {
             self.total_rejections = self.total_rejections.saturating_add(1);
             return RiskCheck::Rejected {
                 breach: self.halt_reason.unwrap_or(RiskBreach::ManualHalt),
-                reason: "trading halted due to risk breach".to_string(),
+                reason: "trading halted due to risk breach".to_string(), // O(1) EXEMPT: halt path, not normal execution
             };
         }
 
@@ -104,6 +104,7 @@ impl RiskEngine {
             self.total_rejections = self.total_rejections.saturating_add(1);
             return RiskCheck::Rejected {
                 breach: RiskBreach::MaxDailyLossExceeded,
+                // O(1) EXEMPT: error path, only reached on daily loss breach
                 reason: format!(
                     "daily loss {:.2} exceeds max {:.2} ({:.1}% of {:.0})",
                     total_pnl.abs(),
@@ -125,6 +126,7 @@ impl RiskEngine {
             self.total_rejections = self.total_rejections.saturating_add(1);
             return RiskCheck::Rejected {
                 breach: RiskBreach::PositionSizeLimitExceeded,
+                // O(1) EXEMPT: error path, only reached on position limit breach
                 reason: format!(
                     "resulting position {} lots exceeds max {} for security {}",
                     new_net, self.max_position_lots, security_id

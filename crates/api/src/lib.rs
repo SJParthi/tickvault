@@ -13,6 +13,7 @@
 //! Pipeline → **API Server**
 
 pub mod handlers;
+pub mod middleware;
 pub mod state;
 
 use axum::Router;
@@ -50,6 +51,18 @@ pub fn build_router(state: SharedAppState) -> Router {
             axum::routing::get(handlers::instruments::instrument_diagnostic),
         )
         .route("/portal", axum::routing::get(handlers::static_file::portal))
+        .route(
+            "/api/index-constituency",
+            axum::routing::get(handlers::index_constituency::get_constituency_summary),
+        )
+        .route(
+            "/api/index-constituency/{index_name}",
+            axum::routing::get(handlers::index_constituency::get_index_constituents),
+        )
+        .route(
+            "/api/stock-indices/{symbol}",
+            axum::routing::get(handlers::index_constituency::get_stock_indices),
+        )
         .layer(cors)
         .with_state(state)
 }

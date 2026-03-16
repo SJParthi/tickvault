@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  C1: launchd LaunchAgent for dhan-live-trader
+  Triggers at 08:15 AM IST daily. Runs as LaunchAgent (not LaunchDaemon)
+  because Docker Desktop requires a GUI session.
+
+  Install:
+    cp deploy/launchd/co.dhan.live-trader.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/co.dhan.live-trader.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/co.dhan.live-trader.plist
+    rm ~/Library/LaunchAgents/co.dhan.live-trader.plist
+
+  Prerequisites:
+    - macOS auto-login enabled (System Preferences > Users > Login Options)
+    - Power management configured (run deploy/launchd/setup-power-management.sh)
+    - Docker Desktop installed at /Applications/Docker.app
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>co.dhan.live-trader</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/Shared/dhan-live-trader/deploy/launchd/trading-launcher.sh</string>
+    </array>
+
+    <!-- Trigger at 08:15 AM daily (IST — macOS uses system timezone) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <!-- Also run at login (fallback for power-off -> power-on scenario) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Logging for debugging -->
+    <key>StandardOutPath</key>
+    <string>/tmp/dlt-launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/dlt-launchd-stderr.log</string>
+
+    <!-- Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>Asia/Kolkata</string>
+        <key>ENVIRONMENT</key>
+        <string>dev</string>
+    </dict>
+
+    <!-- Prevent launchd from killing long-running process -->
+    <key>TimeOut</key>
+    <integer>0</integer>
+
+    <!-- Keep alive only during calendar interval, not always -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

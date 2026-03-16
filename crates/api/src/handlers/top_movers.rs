@@ -140,6 +140,7 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             snapshot,
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
         );
         let Json(result) = get_top_movers(State(state)).await;
         assert!(!result.available);

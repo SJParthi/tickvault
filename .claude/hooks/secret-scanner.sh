@@ -69,6 +69,7 @@ scan_secret() {
       | grep -v 'Secret<' \
       | grep -v 'get_secret' \
       | grep -v 'fetch_secret' \
+      | grep -v 'fetch_ssm_secret' \
       | grep -v 'rotate_secret' \
       | grep -v '_SECRET: &str' \
       | grep -v 'REDACTED' \

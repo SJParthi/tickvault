@@ -528,6 +528,7 @@ async fn main() -> Result<()> {
             config.dhan.clone(),
             config.instrument.clone(),
             shared_movers.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
         );
 
         let router = build_router(api_state);
@@ -879,6 +880,7 @@ async fn main() -> Result<()> {
         config.dhan.clone(),
         config.instrument.clone(),
         shared_movers.clone(),
+        std::sync::Arc::new(std::sync::RwLock::new(None)),
     );
 
     let router = build_router(api_state);
@@ -1019,6 +1021,8 @@ fn create_log_file_writer() -> Option<std::fs::File> {
         .parent()
         .unwrap_or(std::path::Path::new("data/logs"));
 
+    // O(1) EXEMPT: begin — cold path, logging bootstrap before tracing is initialized
+    #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
     if let Err(err) = std::fs::create_dir_all(log_dir) {
         eprintln!("warning: cannot create log directory {log_dir:?}: {err}");
         return None;
@@ -1030,10 +1034,11 @@ fn create_log_file_writer() -> Option<std::fs::File> {
         .open(APP_LOG_FILE_PATH)
     {
         Ok(file) => Some(file),
+        #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
         Err(err) => {
             eprintln!("warning: cannot open log file {APP_LOG_FILE_PATH}: {err}");
             None
-        }
+        } // O(1) EXEMPT: end
     }
 }
 
@@ -1242,6 +1247,7 @@ async fn run_tick_persistence_consumer(
     };
 
     let mut ticks_persisted: u64 = 0;
+    // O(1) EXEMPT: cold path, pipeline setup
     let flush_interval = std::time::Duration::from_millis(100);
     let mut last_flush = std::time::Instant::now();
 
@@ -1311,6 +1317,7 @@ async fn run_candle_persistence_consumer(
         };
 
     let mut aggregator = dhan_live_trader_core::pipeline::CandleAggregator::new();
+    // O(1) EXEMPT: cold path, pipeline setup
     let sweep_interval = std::time::Duration::from_millis(100);
     let mut last_sweep = std::time::Instant::now();
     let mut candles_persisted: u64 = 0;

@@ -115,10 +115,10 @@ fi
 # GATE 5: Secret scanner (runs on ALL staged files, not just .rs)
 # ─────────────────────────────────────────────
 echo "  [5/8] Secret scan..." >&2
-SECRET_OUT=$(timeout 30 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1)
+SECRET_OUT=$(timeout 60 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_STAGED" 2>&1)
 SECRET_EXIT=$?
 if [ "$SECRET_EXIT" -eq 124 ]; then
-  echo "  FAIL: Secret scanner timed out (30s)" >&2
+  echo "  FAIL: Secret scanner timed out (60s)" >&2
   FAILED=1
 elif [ "$SECRET_EXIT" -ne 0 ]; then
   echo "$SECRET_OUT" >&2

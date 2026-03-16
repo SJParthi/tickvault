@@ -21,6 +21,7 @@ use dhan_live_trader_core::auth::secret_manager;
 // Constants
 // ---------------------------------------------------------------------------
 
+// O(1) EXEMPT: begin — named constants, not hardcoded Duration
 /// TCP probe timeout for infrastructure services.
 const INFRA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -32,6 +33,7 @@ const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+// O(1) EXEMPT: end
 
 /// Path to docker-compose file relative to project root.
 const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
@@ -43,6 +45,7 @@ const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
 /// Grafana host for TCP reachability probe.
+// O(1) EXEMPT: localhost probe for local Docker infrastructure
 const GRAFANA_HOST: &str = "127.0.0.1";
 
 /// Grafana HTTP port for TCP reachability probe.
@@ -302,6 +305,7 @@ fn is_service_reachable(host: &str, port: u16) -> bool {
     TcpStream::connect_timeout(
         &addr.parse().unwrap_or_else(|_| {
             // Fallback for hostname resolution — try localhost.
+            // O(1) EXEMPT: cold path, infrastructure probe
             format!("127.0.0.1:{port}")
                 .parse()
                 .expect("127.0.0.1:<port> must parse") // APPROVED: infallible for valid port

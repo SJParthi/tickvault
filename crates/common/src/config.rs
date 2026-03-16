@@ -409,6 +409,49 @@ impl Default for HistoricalDataConfig {
     }
 }
 
+/// Index constituency download configuration.
+///
+/// Controls the download of NSE index constituent CSVs from niftyindices.com.
+/// Used to build a bidirectional index-stock mapping for the trading system.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexConstituencyConfig {
+    /// Whether constituency download is enabled.
+    #[serde(default = "default_constituency_enabled")]
+    pub enabled: bool,
+    /// HTTP request timeout in seconds for individual CSV downloads.
+    #[serde(default = "default_constituency_download_timeout_secs")]
+    pub download_timeout_secs: u64,
+    /// Maximum concurrent CSV downloads.
+    #[serde(default = "default_constituency_max_concurrent_downloads")]
+    pub max_concurrent_downloads: usize,
+    /// Delay in milliseconds between batches of concurrent downloads.
+    #[serde(default)]
+    pub inter_batch_delay_ms: u64,
+}
+
+impl Default for IndexConstituencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_constituency_enabled(),
+            download_timeout_secs: default_constituency_download_timeout_secs(),
+            max_concurrent_downloads: default_constituency_max_concurrent_downloads(),
+            inter_batch_delay_ms: 0,
+        }
+    }
+}
+
+const fn default_constituency_enabled() -> bool {
+    true
+}
+
+const fn default_constituency_download_timeout_secs() -> u64 {
+    30
+}
+
+const fn default_constituency_max_concurrent_downloads() -> usize {
+    5
+}
+
 // ---------------------------------------------------------------------------
 // Configuration Validation
 // ---------------------------------------------------------------------------

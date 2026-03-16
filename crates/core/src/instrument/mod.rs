@@ -10,8 +10,10 @@
 pub mod binary_cache;
 pub mod csv_downloader;
 pub mod csv_parser;
+pub mod daily_scheduler;
 pub mod diagnostic;
 pub mod instrument_loader;
+pub mod s3_backup;
 pub mod subscription_planner;
 pub mod universe_builder;
 pub mod validation;

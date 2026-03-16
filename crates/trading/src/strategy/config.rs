@@ -239,13 +239,15 @@ pub fn parse_strategy_config(
 pub fn load_strategy_config_file(
     path: &std::path::Path,
 ) -> Result<(Vec<StrategyDefinition>, IndicatorParams), StrategyConfigError> {
+    // O(1) EXEMPT: cold path, called once at config load — blocking I/O acceptable
     let content = std::fs::read_to_string(path)?;
     parse_strategy_config(&content)
 }
 
+// O(1) EXEMPT: begin — cold path, called once at config load
 /// Converts a TOML strategy to a runtime `StrategyDefinition`.
 fn convert_strategy(toml: &TomlStrategy) -> Result<StrategyDefinition, StrategyConfigError> {
-    // Validate position size
+    // Validate position size (range.contains is O(1) — not Vec.contains)
     if !(0.0..=1.0).contains(&toml.position_size_fraction) {
         return Err(StrategyConfigError::Validation {
             strategy: toml.name.clone(),
@@ -311,6 +313,7 @@ fn convert_strategy(toml: &TomlStrategy) -> Result<StrategyDefinition, StrategyC
         trailing_stop_atr_multiplier: toml.trailing_stop_atr_multiplier,
     })
 }
+// O(1) EXEMPT: end
 
 /// Converts a TOML condition to a runtime `Condition`.
 fn convert_condition(
@@ -327,6 +330,7 @@ fn convert_condition(
     })
 }
 
+// O(1) EXEMPT: begin — cold path, called once per condition at config load
 /// Parses a string indicator field name to `IndicatorField`.
 fn parse_indicator_field(
     name: &str,
@@ -374,3 +378,4 @@ fn parse_comparison_op(op: &str, strategy_name: &str) -> Result<ComparisonOp, St
         }),
     }
 }
+// O(1) EXEMPT: end

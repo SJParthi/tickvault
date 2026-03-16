@@ -140,9 +140,10 @@ async fn connect_and_listen(
         return Err(OrderUpdateConnectionError::TokenExpired);
     }
 
+    // O(1) EXEMPT: begin — cold path, runs once per WebSocket connect
     let access_token = token_state.access_token().expose_secret().to_string();
 
-    // Build TLS connector (O(1) EXEMPT: cold path, runs once per connect).
+    // Build TLS connector.
     let tls_connector = build_websocket_tls_connector()
         .map_err(|err| OrderUpdateConnectionError::Tls(err.to_string()))?;
 
@@ -155,6 +156,7 @@ async fn connect_and_listen(
         connect_async_tls_with_config(request, None, false, Some(tls_connector))
             .await
             .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
+    // O(1) EXEMPT: end
 
     info!("order update WebSocket connected");
 
@@ -165,7 +167,7 @@ async fn connect_and_listen(
     write
         .send(Message::Text(login_msg.into()))
         .await
-        .map_err(|err| OrderUpdateConnectionError::Send(err.to_string()))?;
+        .map_err(|err| OrderUpdateConnectionError::Send(err.to_string()))?; // O(1) EXEMPT: cold path, once per connect
 
     debug!("order update WebSocket login sent");
 
@@ -182,6 +184,7 @@ async fn connect_and_listen(
         let msg = match time::timeout(read_timeout, read.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
+                // O(1) EXEMPT: error path, not hot path
                 return Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
             Ok(None) => {

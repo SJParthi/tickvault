@@ -37,6 +37,7 @@ impl OrderRateLimiter {
     pub fn new(max_orders_per_second: u32) -> Self {
         #[allow(clippy::expect_used)] // APPROVED: config validation ensures > 0
         let max_burst = NonZeroU32::new(max_orders_per_second)
+            // APPROVED: constructor validation — config guarantees > 0 at load time
             .expect("max_orders_per_second must be > 0 (validated at config load)");
 
         let quota = Quota::per_second(max_burst);

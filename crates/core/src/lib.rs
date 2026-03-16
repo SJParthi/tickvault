@@ -23,6 +23,7 @@
 
 pub mod auth;
 pub mod historical;
+pub mod index_constituency;
 pub mod instrument;
 pub mod network;
 pub mod notification;
