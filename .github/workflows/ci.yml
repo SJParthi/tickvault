@@ -31,21 +31,23 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/**'
       - 'deny.toml'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/*.yml'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/**'
+      - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/**'
       - 'deny.toml'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/*.yml'
 
 # Least-privilege: read-only by default
 permissions:
