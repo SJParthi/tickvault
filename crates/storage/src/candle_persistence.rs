@@ -42,8 +42,10 @@ use crate::tick_persistence::f32_to_f64_clean;
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// DEDUP UPSERT KEY columns for the historical candles table.
-/// Compound key: (ts, security_id, timeframe) ensures uniqueness per candle.
-const DEDUP_KEY_CANDLES: &str = "security_id, timeframe";
+/// Compound key: (ts, security_id, timeframe, segment) ensures uniqueness per candle.
+/// `segment` is required because security IDs 13 (NIFTY) and 25 (BANKNIFTY) exist
+/// in both `IDX_I` and `NSE_EQ` segments with different data.
+const DEDUP_KEY_CANDLES: &str = "security_id, timeframe, segment";
 
 /// Maps the binary exchange_segment_code to a human-readable symbol name.
 ///
@@ -503,9 +505,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_includes_timeframe() {
+    fn test_dedup_key_includes_timeframe_and_segment() {
         assert!(DEDUP_KEY_CANDLES.contains("security_id"));
         assert!(DEDUP_KEY_CANDLES.contains("timeframe"));
+        assert!(
+            DEDUP_KEY_CANDLES.contains("segment"),
+            "DEDUP key must include segment — security IDs 13/25 exist in both IDX_I and NSE_EQ"
+        );
     }
 
     #[tokio::test]

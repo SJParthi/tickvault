@@ -186,7 +186,9 @@ pub async fn fetch_historical_candles(
         dhan_config.rest_api_base_url, DHAN_CHARTS_HISTORICAL_PATH
     );
 
-    let mut fetched_security_ids: HashSet<u32> = HashSet::new();
+    // Dedup key: (security_id, segment) — same security_id (e.g. 13, 25)
+    // can exist in both IDX_I and NSE_EQ with different candle data.
+    let mut fetched_instruments: HashSet<(u32, String)> = HashSet::new();
     let mut instruments_fetched: usize = 0;
     let mut instruments_failed: usize = 0;
     let mut instruments_skipped: usize = 0;
@@ -208,11 +210,6 @@ pub async fn fetch_historical_candles(
             continue;
         }
 
-        // Skip already-fetched security IDs (dedup across categories)
-        if fetched_security_ids.contains(&security_id) {
-            continue;
-        }
-
         // Determine the Dhan API instrument type (only INDEX and EQUITY after skip above)
         let instrument_type = match instrument.category {
             SubscriptionCategory::MajorIndexValue => "INDEX",
@@ -225,6 +222,14 @@ pub async fn fetch_historical_candles(
 
         let segment_code = instrument.exchange_segment.binary_code();
         let exchange_segment_str = instrument.exchange_segment.as_str().to_string();
+
+        // Skip already-fetched (security_id, segment) pairs.
+        // Same security_id (e.g. 13=NIFTY, 25=BANKNIFTY) can exist in both
+        // IDX_I and NSE_EQ with different candle data — dedup must include segment.
+        let dedup_key = (security_id, exchange_segment_str.clone());
+        if fetched_instruments.contains(&dedup_key) {
+            continue;
+        }
         let security_id_str = security_id.to_string();
 
         let mut instrument_candles = 0_usize;
@@ -339,7 +344,7 @@ pub async fn fetch_historical_candles(
         if instrument_failed {
             instruments_failed = instruments_failed.saturating_add(1);
         } else {
-            fetched_security_ids.insert(security_id);
+            fetched_instruments.insert(dedup_key);
             instruments_fetched = instruments_fetched.saturating_add(1);
             total_candles = total_candles.saturating_add(instrument_candles);
             // APPROVED: usize->u64 is lossless on 64-bit targets (our only deployment target)
