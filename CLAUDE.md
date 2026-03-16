@@ -48,7 +48,7 @@ crates/
 
 **Dependency flow:** `common` ← `core` ← `trading` ← `storage` ← `api` ← `app`
 
-### crates/common — Shared Foundation
+### crates/common — Shared Foundation (10 modules)
 
 | File | Contains |
 |------|----------|
@@ -60,7 +60,6 @@ crates/
 | `instrument_types.rs` | `InstrumentType`, `ExpiryCode`, `InstrumentRecord` |
 | `instrument_registry.rs` | `InstrumentRegistry` (papaya concurrent map) |
 | `tick_types.rs` | `TickerData`, `QuoteData`, `FullPacketData`, `DepthLevel` |
-| `segment.rs` | `ExchangeSegment` numeric ↔ string conversion |
 | `trading_calendar.rs` | Market hours, holiday checks, IST handling |
 | `sanitize.rs` | Input sanitization utilities |
 
@@ -98,16 +97,17 @@ crates/
 | `materialized_views.rs` | QuestDB materialized view DDL |
 | `valkey_cache.rs` | Redis/Valkey caching layer |
 
-### crates/api — HTTP Server
+### crates/api — HTTP Server (10 routes)
 
 | File | Contains |
 |------|----------|
-| `handlers/health.rs` | Health check endpoint |
-| `handlers/quote.rs` | Latest tick data |
-| `handlers/stats.rs` | QuestDB table stats |
-| `handlers/top_movers.rs` | Top gainers/losers |
-| `handlers/instruments.rs` | Instrument rebuild & diagnostics |
-| `handlers/index_constituency.rs` | Index composition |
+| `handlers/health.rs` | `GET /health` — health check |
+| `handlers/quote.rs` | `GET /api/quote/{security_id}` — latest tick |
+| `handlers/stats.rs` | `GET /api/stats` — QuestDB table counts |
+| `handlers/top_movers.rs` | `GET /api/top-movers` — gainers/losers/most active |
+| `handlers/instruments.rs` | `POST /api/instruments/rebuild`, `GET /api/instruments/diagnostic` |
+| `handlers/index_constituency.rs` | `GET /api/index-constituency`, `GET /api/index-constituency/{index_name}`, `GET /api/stock-indices/{symbol}` |
+| `handlers/static_file.rs` | `GET /portal` — DLT Control Panel |
 | `middleware.rs` | Auth middleware, request tracing |
 | `state.rs` | Shared application state |
 
@@ -206,7 +206,7 @@ make quality                         # Full CI-equivalent pipeline
 make coverage                        # llvm-cov with threshold
 
 # Docker
-make docker-up                       # Start all 9 services
+make docker-up                       # Start all 8 services
 make docker-down                     # Stop all services
 make docker-status                   # Show container health
 
@@ -255,7 +255,7 @@ make prometheus                      # localhost:9090
 4. Secret Scan: blocks .env, AWS keys, private keys, tokens
 
 **Post-merge only:**
-5. Coverage (60% workspace threshold, per-crate thresholds in `quality/crate-coverage-thresholds.toml`)
+5. Coverage (per-crate thresholds: common 80%, core 60%, trading 50%, storage 60%, api 60%, app 50% — see `quality/crate-coverage-thresholds.toml`)
 6. Benchmarks (budgets in `quality/benchmark-budgets.toml`, 5% regression gate)
 7. DHAT zero-allocation (hard fail for core + trading crates)
 
@@ -264,13 +264,14 @@ make prometheus                      # localhost:9090
 - Mutation testing (survived mutants = hard fail)
 - Safety net: cargo-careful + AddressSanitizer + ThreadSanitizer
 
-## LOCAL HOOKS
+## LOCAL HOOKS (24 scripts)
 
-**Pre-commit (6 gates):** fmt → banned patterns → O(1)/dedup scan → secrets → version pinning → typos
-**Pre-push (7 gates):** all pre-commit + heavy checks via `.claude/hooks/pre-push-gate.sh`
+**Pre-commit (8 gates):** fmt → banned patterns → data integrity → O(1)/dedup scan → secrets → version pinning → commit msg → typos
+**Pre-push (7 gates):** fmt → banned patterns → secrets → test count → data integrity → pub fn test guard → financial test guard
 **Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+`
+**Other hooks:** pre-tool-dispatch, auto-save, session-sanity, coverage-guard, dry-run-guard, plan-verify, testing-standards-guard
 
-## DOCKER SERVICES (9 containers)
+## DOCKER SERVICES (8 containers)
 
 | Service | Image Version | Port | Purpose |
 |---------|--------------|------|---------|
@@ -282,14 +283,25 @@ make prometheus                      # localhost:9090
 | dlt-loki | 3.3.0 | 3100 | Log aggregation |
 | dlt-alloy | 1.3.2 | — | Observability collector |
 | dlt-traefik | v3.6.0 | 80/443/8080 | API gateway |
-| dlt-app | — | — | Application container (future) |
 
 All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.yml`.
 
 ## ENFORCEMENT RULES
 
-Auto-loaded `.claude/rules/` files enforce Dhan API compliance. 16 rule files cover:
+Auto-loaded `.claude/rules/` files by directory:
 
+### Root rules (7 files)
+| Rule File | Enforces |
+|-----------|----------|
+| `rust-code.md` | Error handling, naming, logging, no hardcoded values, secrets |
+| `hot-path.md` | Zero allocation, O(1) constraints, banned hot-path patterns |
+| `testing.md` | Test naming, coverage, property testing requirements |
+| `enforcement.md` | Gap enforcement cross-cutting rules |
+| `cargo-and-docker.md` | Version pinning, Docker digest, workspace deps |
+| `data-integrity.md` | Price precision, f32→f64, dedup keys |
+| `market-hours.md` | IST timezone, market hour checks, holiday handling |
+
+### Dhan API rules (21 files in `dhan/`)
 | Rule File | Enforces |
 |-----------|----------|
 | `api-introduction.md` | Base URL v2, `access-token` header, rate limits, DH-904 backoff |
@@ -308,6 +320,25 @@ Auto-loaded `.claude/rules/` files enforce Dhan API compliance. 16 rule files co
 | `traders-control.md` | Kill switch prereqs, P&L exit strings, session-scoped |
 | `super-order.md` | 3 leg types, cancel entry = cancel all, trailingJump=0 |
 | `forever-order.md` | CNC/MTF only, OCO second leg fields, CONFIRM status |
+| `conditional-trigger.md` | Equities/Indices only, indicator names, operators |
+| `edis.md` | T-PIN flow, CDSL mandate for holdings sell |
+| `postback.md` | Webhook format, snake_case filled_qty |
+| `statements.md` | String debit/credit, page 0-indexed, date formats |
+| `release-notes.md` | v2 only, breaking changes awareness |
+
+### Project rules (10 files in `project/`)
+| Rule File | Enforces |
+|-----------|----------|
+| `plan-enforcement.md` | Multi-file plan → verify → archive workflow |
+| `gap-enforcement.md` | 28 tracked gaps with mandatory tests |
+| `aws-migration.md` | Mac cleanup when deploying to AWS |
+| `rust-code.md` | Rust-specific (duplicate of root, crate-scoped) |
+| `hot-path.md` | Hot-path rules (duplicate of root, crate-scoped) |
+| `testing.md` | Testing rules (duplicate of root, crate-scoped) |
+| `enforcement.md` | Enforcement rules (duplicate of root, crate-scoped) |
+| `cargo-and-docker.md` | Cargo/Docker rules (duplicate of root, crate-scoped) |
+| `data-integrity.md` | Data integrity rules (duplicate of root, crate-scoped) |
+| `market-hours.md` | Market hours rules (duplicate of root, crate-scoped) |
 
 ## GAP ENFORCEMENT (28 tracked gaps)
 
@@ -335,6 +366,13 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 | full_tick_processing | 10 μs |
 | oms_state_transition | 100 ns |
 | market_hour_validation | 50 ns |
+| config_toml_load | 10 ms |
+
+## CONFIGURATION
+
+`config/base.toml` — 17 sections: `trading` (incl. nse_holidays), `dhan`, `questdb`, `valkey`, `prometheus`, `websocket`, `network`, `token`, `risk`, `strategy` (**`dry_run = true` by default**), `logging`, `instrument`, `api` (port 3001), `subscription`, `notification`, `observability`, `historical`
+
+Override per environment via `config/{env}.toml` or env vars.
 
 ## KEY FILES
 
@@ -342,7 +380,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 |---------|------|
 | Phase 1 spec | `docs/phases/PHASE_1_LIVE_TRADING.md` |
 | Tech Stack Bible | `docs/architecture/tech-stack-bible.md` |
-| Dhan API reference | `docs/dhan-ref/*.md` (16 files) |
+| Dhan API reference | `docs/dhan-ref/*.md` (21 files) |
 | Benchmark budgets | `quality/benchmark-budgets.toml` |
 | Coverage thresholds | `quality/crate-coverage-thresholds.toml` |
 | Docker compose | `deploy/docker/docker-compose.yml` |
@@ -375,5 +413,5 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 
 **Phase:** Phase 1 — Live Trading System → `docs/phases/PHASE_1_LIVE_TRADING.md`
 **Boot sequence:** CryptoProvider → Config → Observability → Logging → Notification → Auth → QuestDB → Universe → HistoricalCandles → WebSocket → TickProcessor → OrderUpdateWS → API → TokenRenewal → Shutdown
-**Codebase size:** ~74K LoC Rust (61K production, 13K tests), 158 files, 6 crates
-**Test count:** ~80 unit tests + 30 integration tests + 5 benchmarks + 2 fuzz targets
+**Codebase size:** ~74K LoC Rust (~61K production, ~14K tests), 158 files, 6 crates
+**Test count:** 2,299 passing tests (unit + integration), 33 integration test files, 5 benchmarks, 2 fuzz targets
