@@ -69,9 +69,19 @@ jobs:
       - name: Run careful tests
         id: test
         if: steps.build.outcome == 'success'
+        env:
+          DLT_SKIP_PERF_ASSERTIONS: "1"
         run: |
-          cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace 2>&1 || {
+          # --test-threads=1: reduces memory pressure on CI runners
+          # DLT_SKIP_PERF_ASSERTIONS: skip timing assertions (instrumentation = 10-100x slower)
+          cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace \
+            -- --test-threads=1 2>&1 | tee /tmp/careful-test.log || {
             echo "test_failed=true" >> "$GITHUB_OUTPUT"
+            echo "=== cargo-careful test failed (exit code: ${PIPESTATUS[0]}) ==="
+            echo "=== Failed tests ==="
+            grep -E "^test .+ FAILED|^failures:" /tmp/careful-test.log || true
+            echo "=== Last 80 lines ==="
+            tail -80 /tmp/careful-test.log
             exit 1
           }
 
@@ -175,6 +185,7 @@ jobs:
         if: steps.build.outcome == 'success'
         env:
           RUSTFLAGS: "-Z sanitizer=address"
+          DLT_SKIP_PERF_ASSERTIONS: "1"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \
@@ -285,6 +296,7 @@ jobs:
         if: steps.build.outcome == 'success'
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
+          DLT_SKIP_PERF_ASSERTIONS: "1"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \

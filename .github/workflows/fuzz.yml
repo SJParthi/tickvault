@@ -67,10 +67,6 @@ jobs:
         id: build
         if: steps.check.outputs.exists == 'true'
         run: |
-          echo "=== Environment ==="
-          rustc +${{ env.NIGHTLY_VERSION }} --version
-          cargo fuzz --version || true
-          echo "=== Building ==="
           cargo +${{ env.NIGHTLY_VERSION }} fuzz build ${{ matrix.target }} 2>&1 | tee /tmp/fuzz-build.log || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
             echo "::error::Fuzz target ${{ matrix.target }} failed to BUILD (not a crash). Check nightly compatibility."

@@ -3,8 +3,18 @@
 //! Verifies that the system handles sustained throughput and burst traffic
 //! without degradation, memory leaks, or panics. These tests simulate
 //! real market conditions: ~25,000 instruments × 1-5 ticks/sec.
+//!
+//! NOTE: Timing assertions are skipped under instrumented builds
+//! (cargo-careful, sanitizers) where execution is 10-100x slower.
+//! Set `DLT_SKIP_PERF_ASSERTIONS=1` to skip timing checks.
 
 use std::time::{Duration, Instant};
+
+/// Returns true when running under instrumented builds (cargo-careful, sanitizers).
+/// Timing assertions are unreliable under instrumentation overhead.
+fn skip_perf_assertions() -> bool {
+    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+}
 
 use dhan_live_trader_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
@@ -61,10 +71,12 @@ fn stress_parse_100k_tickers() {
     assert_eq!(success_count, 100_000);
 
     // Sanity check: 100K parses should complete in under 1 second
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "100K ticker parses took {elapsed:?} — too slow"
-    );
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100K ticker parses took {elapsed:?} — too slow"
+        );
+    }
 }
 
 #[test]
@@ -81,10 +93,12 @@ fn stress_parse_100k_quotes() {
 
     let elapsed = start.elapsed();
     assert_eq!(success_count, 100_000);
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "100K quote parses took {elapsed:?} — too slow"
-    );
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "100K quote parses took {elapsed:?} — too slow"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -110,10 +124,12 @@ fn stress_burst_10k_mixed_packets() {
     }
 
     let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "10K mixed burst took {elapsed:?} — too slow"
-    );
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "10K mixed burst took {elapsed:?} — too slow"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,10 +157,12 @@ fn stress_candle_aggregator_50k_ticks() {
     }
 
     let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "50K candle updates took {elapsed:?} — too slow"
-    );
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "50K candle updates took {elapsed:?} — too slow"
+        );
+    }
     // Should have produced some completed candles (new seconds)
     let total_completed = agg.completed_slice().len();
     assert!(total_completed > 0, "should produce completed candles");
