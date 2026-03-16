@@ -2224,11 +2224,11 @@ mod tests {
         handle.store(Arc::new(Some(state)));
 
         let guard = handle.load();
-        let loaded = guard.as_ref().as_ref().expect("should have token after store");
-        assert_eq!(
-            loaded.access_token().expose_secret(),
-            "test-jwt-store-load"
-        );
+        let loaded = guard
+            .as_ref()
+            .as_ref()
+            .expect("should have token after store");
+        assert_eq!(loaded.access_token().expose_secret(), "test-jwt-store-load");
     }
 
     #[test]
