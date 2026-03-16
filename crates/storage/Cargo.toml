@@ -20,5 +20,13 @@ deadpool-redis = { workspace = true }
 questdb-rs = { workspace = true }
 reqwest = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+dhat = { workspace = true }
+
+[[bench]]
+name = "tick_persistence"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "deadpool-redis", "questdb-rs", "redis", "serde", "serde_json", "thiserror"]

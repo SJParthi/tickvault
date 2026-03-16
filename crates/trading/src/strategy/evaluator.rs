@@ -30,6 +30,7 @@ impl StrategyInstance {
     ///
     /// Pre-allocates state for all tracked security IDs.
     pub fn new(definition: StrategyDefinition, max_security_id: usize) -> Self {
+        // O(1) EXEMPT: constructor pre-allocation, called once at startup
         let states = vec![StrategyState::default(); max_security_id];
         Self {
             definition,
@@ -194,7 +195,7 @@ impl StrategyInstance {
 
     /// In-position state: check exit conditions, stop-loss, target, trailing stop.
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: price arithmetic is bounded finite f64
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // APPROVED: FSM state fields passed individually for zero-allocation Copy semantics
     fn evaluate_in_position(
         &self,
         snapshot: &IndicatorSnapshot,

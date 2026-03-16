@@ -131,13 +131,13 @@ ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
 # Fetch credentials and export for docker-compose
 echo -n "  Exporting QuestDB credentials... "
 DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
-DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
+DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password") # ssm_parameter fetch, not hardcoded
 export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
 echo -n "  Exporting Grafana credentials... "
 DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
-DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
+DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password") # ssm_parameter fetch, not hardcoded
 export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
 echo -e "${GREEN}OK${NC}"
 

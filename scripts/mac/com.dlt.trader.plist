@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  dhan-live-trader — launchd Agent (macOS)
+
+  Triggers dlt-daily-start.sh at 8:30 AM daily (system timezone = IST).
+  Mirrors AWS systemd timer.
+
+  Install: ./scripts/mac/install-autostart.sh
+  Manual load: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dlt.trader.plist
+  Manual unload: launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.dlt.trader.plist
+-->
+<dict>
+    <key>Label</key>
+    <string>com.dlt.trader</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__INSTALL_DIR__/dlt-daily-start.sh</string>
+    </array>
+
+    <!-- Fire at 8:30 AM daily (system timezone).
+         If Mac was asleep at 8:30, launchd fires when it wakes. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <!-- Log stdout/stderr for debugging -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/.dlt/logs/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.dlt/logs/launchd-stderr.log</string>
+
+    <!-- Do NOT run on login — only at scheduled time -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Do NOT restart if script exits — one run per day -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Background process classification -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Allow the job to run for up to 8 hours (market hours) -->
+    <key>TimeOut</key>
+    <integer>28800</integer>
+</dict>
+</plist>

@@ -1,10 +1,14 @@
 //! Shared application state for the API server.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use dhan_live_trader_common::instrument_types::IndexConstituencyMap;
 use dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot;
+
+/// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
+pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
 
 /// Shared state available to all API handlers via axum's `State` extractor.
 #[derive(Clone)]
@@ -23,6 +27,8 @@ struct AppStateInner {
     rebuild_in_progress: AtomicBool,
     /// Shared top movers snapshot from the tick pipeline.
     top_movers_snapshot: SharedTopMoversSnapshot,
+    /// Shared index constituency map.
+    constituency_map: SharedConstituencyMap,
 }
 
 impl SharedAppState {
@@ -32,6 +38,7 @@ impl SharedAppState {
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
         top_movers_snapshot: SharedTopMoversSnapshot,
+        constituency_map: SharedConstituencyMap,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
@@ -40,6 +47,7 @@ impl SharedAppState {
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
                 top_movers_snapshot,
+                constituency_map,
             }),
         }
     }
@@ -67,6 +75,11 @@ impl SharedAppState {
     /// Returns the shared top movers snapshot handle.
     pub fn top_movers_snapshot(&self) -> &SharedTopMoversSnapshot {
         &self.inner.top_movers_snapshot
+    }
+
+    /// Returns the shared index constituency map handle.
+    pub fn constituency_map(&self) -> &SharedConstituencyMap {
+        &self.inner.constituency_map
     }
 }
 
@@ -105,6 +118,10 @@ mod tests {
         std::sync::Arc::new(std::sync::RwLock::new(None))
     }
 
+    fn empty_constituency() -> SharedConstituencyMap {
+        std::sync::Arc::new(std::sync::RwLock::new(None))
+    }
+
     #[test]
     fn test_shared_app_state_new_and_questdb_config() {
         let config = QuestDbConfig {
@@ -118,6 +135,7 @@ mod tests {
             test_dhan_config(),
             test_instrument_config(),
             empty_snapshot(),
+            empty_constituency(),
         );
         assert_eq!(state.questdb_config().host, "test-host");
         assert_eq!(state.questdb_config().ilp_port, 9009);
@@ -137,6 +155,7 @@ mod tests {
             test_dhan_config(),
             test_instrument_config(),
             empty_snapshot(),
+            empty_constituency(),
         );
         let state2 = state1.clone();
         assert_eq!(state2.questdb_config().host, "clone-test");

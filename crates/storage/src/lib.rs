@@ -23,3 +23,11 @@ pub mod instrument_persistence;
 pub mod materialized_views;
 pub mod tick_persistence;
 pub mod valkey_cache;
+
+/// Test support: re-exports internal functions for DHAT and benchmark tests.
+pub mod tick_persistence_testing {
+    /// Re-export of `f32_to_f64_clean` for DHAT and Criterion benchmarks.
+    pub fn f32_to_f64_clean_pub(v: f32) -> f64 {
+        crate::tick_persistence::f32_to_f64_clean(v)
+    }
+}

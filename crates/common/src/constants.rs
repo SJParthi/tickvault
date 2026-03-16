@@ -1262,3 +1262,42 @@ const _: () = assert!(PREVIOUS_CLOSE_PACKET_SIZE == 16, "prev_close total = 16")
 // Disconnect packet: <BHBIH> = 10 bytes
 const _: () = assert!(DISCONNECT_OFFSET_CODE == 8, "disconnect: code at 8");
 const _: () = assert!(DISCONNECT_PACKET_SIZE == 10, "disconnect total = 10");
+
+// ---------------------------------------------------------------------------
+// Index Constituency — NSE index constituent CSV download
+// Source: niftyindices.com public CSV endpoints
+// ---------------------------------------------------------------------------
+
+/// Base URL for NSE index constituent CSV downloads.
+// O(1) EXEMPT: compile-time constant, not runtime allocation
+pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://niftyindices.com/IndexConstituent/";
+
+/// Cache filename for the serialized constituency map.
+pub const INDEX_CONSTITUENCY_CSV_CACHE_FILENAME: &str = "constituency-map.json";
+
+/// Minimum number of indices that must download successfully.
+/// Below this threshold, a warning is emitted (map may be incomplete).
+pub const INDEX_CONSTITUENCY_MIN_INDICES: usize = 3;
+
+/// Retry: minimum backoff delay in seconds between download attempts.
+pub const INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS: u64 = 1;
+
+/// Retry: maximum backoff delay in seconds between download attempts.
+pub const INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS: u64 = 10;
+
+/// Retry: maximum number of retry attempts per CSV download.
+pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
+
+/// NSE index slugs: `(display_name, csv_slug)`.
+/// URL = `{INDEX_CONSTITUENCY_BASE_URL}{slug}.csv`
+pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
+    ("Nifty 50", "ind_nifty50list"),
+    ("Nifty Next 50", "ind_niftynext50list"),
+    ("Nifty Bank", "ind_niftybanklist"),
+    ("Nifty IT", "ind_niftyitlist"),
+    ("Nifty Financial Services", "ind_niftyfinancelist"),
+    ("Nifty Midcap 50", "ind_niftymidcap50list"),
+];
+
+/// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
+pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();

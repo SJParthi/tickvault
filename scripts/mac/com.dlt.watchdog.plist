@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  dhan-live-trader — Watchdog Health Monitor (macOS)
+
+  Runs every 5 minutes. Checks trader process, Docker, infra, QuestDB, tick flow.
+  Auto-recovers and sends Telegram alerts.
+
+  Install: ./scripts/mac/install-autostart.sh
+-->
+<dict>
+    <key>Label</key>
+    <string>com.dlt.watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__INSTALL_DIR__/dlt-watchdog.sh</string>
+    </array>
+
+    <!-- Run every 300 seconds (5 minutes) -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Log output -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/.dlt/logs/watchdog-launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.dlt/logs/watchdog-launchd-stderr.log</string>
+
+    <!-- Start monitoring immediately after login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Do NOT keep alive — interval-based, not persistent -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Fast execution — should complete in seconds -->
+    <key>TimeOut</key>
+    <integer>60</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -23,6 +23,7 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+dhan-live-trader-trading = { path = "../trading" }
 
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "dhan-live-trader-storage", "thiserror", "tower"]

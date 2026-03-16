@@ -160,6 +160,7 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             empty_snapshot(),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
         );
         let result = get_stats(State(state)).await;
         assert!(!result.questdb_reachable);
@@ -525,6 +526,7 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             empty_snapshot(),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
         );
         let result = get_stats(axum::extract::State(state)).await;
         assert!(result.questdb_reachable);

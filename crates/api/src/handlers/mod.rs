@@ -1,6 +1,7 @@
 //! API request handlers.
 
 pub mod health;
+pub mod index_constituency;
 pub mod instruments;
 pub mod quote;
 pub mod static_file;
