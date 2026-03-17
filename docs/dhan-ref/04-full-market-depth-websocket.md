@@ -169,10 +169,10 @@ Server disconnect packet: response code `50` with reason code in bytes 13-14 (se
 
 #[derive(Debug, Clone)]
 pub struct DepthResponseHeader {
-    pub message_length: i16,           // bytes 1-2, int16 LE
+    pub message_length: u16,           // bytes 1-2, uint16 LE (Dhan docs say int16; values always non-negative)
     pub response_code: u8,             // byte 3 (41=Bid, 51=Ask)
     pub exchange_segment: u8,          // byte 4 (numeric enum)
-    pub security_id: i32,              // bytes 5-8, int32 LE
+    pub security_id: u32,              // bytes 5-8, uint32 LE (Dhan docs say int32; values always non-negative)
     pub seq_or_rows: u32,              // bytes 9-12: sequence (20-lvl) OR row count (200-lvl)
 }
 

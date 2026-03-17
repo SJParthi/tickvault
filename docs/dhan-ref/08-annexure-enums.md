@@ -88,6 +88,8 @@ impl ExchangeSegment {
 | `23` | Subscribe — Full Market Depth  |
 | `25` | Unsubscribe — Full Market Depth|
 
+> **SDK Note**: Python SDK `marketfeed.py` defines `Depth = 19` as a v1-only depth subscribe code (standalone market depth packet). This is deprecated in v2 and NOT listed above. The SDK rejects it for v2 subscriptions. Also note: the SDK's generic unsubscribe logic (`subscribe_code + 1`) produces code `24` for depth unsubscribe, but the correct code per this annexure is `25`. Our code uses `25`.
+
 ---
 
 ## 3. Feed Response Codes (Binary Header Byte 1)
@@ -160,6 +162,8 @@ impl ExchangeSegment {
 | `0`  | Current Expiry/Near Expiry |
 | `1`  | Next Expiry                |
 | `2`  | Far Expiry                 |
+
+> **SDK Note**: Python SDK `_historical_data.py` validates `expiry_code` against `[0, 1, 2, 3]`, accepting a fourth value `3`. The Dhan API documentation only lists 0/1/2. The meaning of `3` is undocumented — avoid using it unless verified.
 
 ---
 

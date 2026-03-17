@@ -203,7 +203,7 @@ pub const BINARY_HEADER_SIZE: usize = 8;
 pub const OI_PACKET_SIZE: usize = 12;
 
 /// Market depth level size in bytes (per level within Full packet).
-/// Format: bid_qty(i32) + ask_qty(i32) + bid_orders(i16) + ask_orders(i16) + bid_price(f32) + ask_price(f32) = 20.
+/// Format: bid_qty(u32) + ask_qty(u32) + bid_orders(u16) + ask_orders(u16) + bid_price(f32) + ask_price(f32) = 20.
 pub const MARKET_DEPTH_LEVEL_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
