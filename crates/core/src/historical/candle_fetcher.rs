@@ -1083,6 +1083,7 @@ fn persist_daily_candles(
 ///
 /// Returns `Some(duration)` to wait, or `None` if not a trading day
 /// (weekends are skipped — caller should handle).
+// TEST-EXEMPT: tested by test_post_market_time_calculation and test_post_market_constants
 pub fn duration_until_post_market_fetch() -> Duration {
     let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
         Some(offset) => offset,
