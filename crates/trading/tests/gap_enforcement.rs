@@ -8,7 +8,7 @@
 //! - OMS-GAP-05: Idempotency (UUID generation, correlation tracking)
 //! - RISK-GAP-01: Pre-trade risk checks (halt, daily loss, position limit)
 //! - RISK-GAP-02: Position & P&L tracking (fills, market price, reset)
-//! - RISK-GAP-03: Tick gap detection — deferred (tick_gap_tracker not yet implemented)
+//! - RISK-GAP-03: Tick gap detection (tick_gap_tracker — warmup, warning/error thresholds, per-security isolation)
 
 // ===========================================================================
 // OMS-GAP-01: Order Lifecycle State Machine

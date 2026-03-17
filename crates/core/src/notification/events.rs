@@ -255,6 +255,7 @@ impl NotificationEvent {
     pub fn severity(&self) -> Severity {
         match self {
             Self::IpVerificationFailed { .. } => Severity::Critical,
+            Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
@@ -271,6 +272,7 @@ impl NotificationEvent {
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
+            Self::BootHealthCheck { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
         }

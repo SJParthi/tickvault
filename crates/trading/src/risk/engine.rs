@@ -40,6 +40,8 @@ pub struct RiskEngine {
     capital: f64,
     /// Per-instrument positions keyed by security_id.
     positions: HashMap<u32, PositionInfo>,
+    /// Latest market prices keyed by security_id (for unrealized P&L).
+    market_prices: HashMap<u32, f64>,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -65,6 +67,7 @@ impl RiskEngine {
             max_position_lots,
             capital,
             positions: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
+            market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             total_realized_pnl: 0.0,
             halted: false,
             halt_reason: None,

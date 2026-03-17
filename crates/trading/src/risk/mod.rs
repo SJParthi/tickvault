@@ -12,7 +12,9 @@
 //! - Reset: manual reset only (prevents accidental re-entry after breach)
 
 pub mod engine;
+pub mod tick_gap_tracker;
 pub mod types;
 
 pub use engine::RiskEngine;
+pub use tick_gap_tracker::{TickGapResult, TickGapTracker};
 pub use types::{PositionInfo, RiskBreach, RiskCheck};

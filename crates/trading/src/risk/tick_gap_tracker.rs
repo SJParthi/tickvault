@@ -328,8 +328,7 @@ mod tests {
             tracker.record_tick(1001, base_ts + i);
         }
         // Gap one second below warning threshold
-        let gap_ts =
-            base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS - 1;
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS - 1;
         let result = tracker.record_tick(1001, gap_ts);
         assert_eq!(result, TickGapResult::Ok);
     }
