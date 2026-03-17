@@ -46,7 +46,9 @@ use dhan_live_trader_common::trading_calendar::TradingCalendar;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
-use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
+use dhan_live_trader_core::historical::candle_fetcher::{
+    duration_until_post_market_fetch, fetch_historical_candles,
+};
 use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
 use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
 use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
@@ -1191,11 +1193,22 @@ fn spawn_historical_candle_fetch(
                 instruments_failed: summary.instruments_failed,
                 total_candles: summary.total_candles,
             });
+        } else {
+            bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
+                instruments_fetched: summary.instruments_fetched,
+                instruments_skipped: summary.instruments_skipped,
+                total_candles: summary.total_candles,
+            });
         }
 
         // Cross-verify candle integrity in QuestDB
         let verify_report = verify_candle_integrity(&bg_questdb_config).await;
-        if !verify_report.passed {
+        if verify_report.passed {
+            bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
+                instruments_checked: verify_report.instruments_checked,
+                total_candles: verify_report.total_candles_in_db,
+            });
+        } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
                 instruments_checked: verify_report.instruments_checked,
                 instruments_with_gaps: verify_report.instruments_with_gaps,
@@ -1208,6 +1221,84 @@ fn spawn_historical_candle_fetch(
             total_candles = summary.total_candles,
             verification_passed = verify_report.passed,
             "background historical candle fetch complete"
+        );
+
+        // --- Post-market re-fetch: wait until 15:35 IST, then fetch today's data ---
+        let wait_duration = duration_until_post_market_fetch();
+        if wait_duration > std::time::Duration::ZERO {
+            info!(
+                wait_secs = wait_duration.as_secs(),
+                "scheduling post-market re-fetch at 15:35 IST"
+            );
+            tokio::time::sleep(wait_duration).await;
+        } else {
+            info!("past 15:35 IST — running post-market re-fetch immediately");
+        }
+
+        // Re-create writer for post-market fetch (previous may have been consumed)
+        let mut pm_candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
+            Ok(writer) => writer,
+            Err(err) => {
+                warn!(?err, "failed to create candle writer for post-market fetch");
+                return;
+            }
+        };
+
+        // Re-fetch credentials (token may have been refreshed)
+        let pm_client_id = match secret_manager::fetch_dhan_credentials().await {
+            Ok(creds) => creds.client_id,
+            Err(err) => {
+                warn!(?err, "failed to fetch credentials for post-market re-fetch");
+                return;
+            }
+        };
+
+        info!("starting post-market historical candle re-fetch");
+
+        let pm_summary = fetch_historical_candles(
+            &bg_registry,
+            &bg_dhan_config,
+            &bg_historical_config,
+            &bg_token_handle,
+            &pm_client_id,
+            &mut pm_candle_writer,
+        )
+        .await;
+
+        if pm_summary.instruments_failed > 0 {
+            bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
+                instruments_fetched: pm_summary.instruments_fetched,
+                instruments_failed: pm_summary.instruments_failed,
+                total_candles: pm_summary.total_candles,
+            });
+        } else {
+            bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
+                instruments_fetched: pm_summary.instruments_fetched,
+                instruments_skipped: pm_summary.instruments_skipped,
+                total_candles: pm_summary.total_candles,
+            });
+        }
+
+        // Re-verify after post-market fetch
+        let pm_verify = verify_candle_integrity(&bg_questdb_config).await;
+        if pm_verify.passed {
+            bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
+                instruments_checked: pm_verify.instruments_checked,
+                total_candles: pm_verify.total_candles_in_db,
+            });
+        } else {
+            bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
+                instruments_checked: pm_verify.instruments_checked,
+                instruments_with_gaps: pm_verify.instruments_with_gaps,
+            });
+        }
+
+        info!(
+            instruments_fetched = pm_summary.instruments_fetched,
+            instruments_failed = pm_summary.instruments_failed,
+            total_candles = pm_summary.total_candles,
+            verification_passed = pm_verify.passed,
+            "post-market historical candle re-fetch complete"
         );
     });
 

@@ -792,6 +792,12 @@ pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 /// meaning the last candle returned starts at 15:29.
 pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 
+/// Post-market historical data fetch trigger time — 5 minutes after market close.
+/// At 15:35 IST, all market data for the day is finalized and available via REST API.
+pub const POST_MARKET_FETCH_TIME_IST_HOUR: u32 = 15;
+/// Post-market fetch minute component (15:35 IST).
+pub const POST_MARKET_FETCH_TIME_IST_MINUTE: u32 = 35;
+
 /// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
 /// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
 pub const CANDLES_PER_TRADING_DAY: usize = 375;

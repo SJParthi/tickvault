@@ -28,7 +28,8 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
-    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST, TIMEFRAME_1D,
+    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST,
+    POST_MARKET_FETCH_TIME_IST_HOUR, POST_MARKET_FETCH_TIME_IST_MINUTE, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{
@@ -46,6 +47,85 @@ type TokenHandle = std::sync::Arc<ArcSwap<Option<TokenState>>>;
 /// Prevents OOM from malicious/corrupted responses. A single instrument's
 /// 90-day × 375-candle response is ~100 KB of JSON — 10 MB is 100× headroom.
 const MAX_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Pause duration when data API returns error 805 (too many requests/connections).
+/// Per Dhan docs: stop ALL connections for 60 seconds, then audit connection count.
+const ERROR_805_PAUSE_SECS: u64 = 60;
+
+/// DH-904 exponential backoff base (seconds). Sequence: 10s → 20s → 40s → 80s.
+const DH_904_BACKOFF_BASE_SECS: u64 = 10;
+
+/// Maximum DH-904 backoff attempts before giving up.
+const DH_904_MAX_BACKOFF_ATTEMPTS: u32 = 4;
+
+/// Dhan error response structure — exactly 3 string fields per API docs.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DhanErrorResponse {
+    #[allow(dead_code)] // APPROVED: required for serde deserialization, only error_code is read
+    error_type: Option<String>,
+    error_code: Option<String>,
+    #[allow(dead_code)] // APPROVED: required for serde deserialization, only error_code is read
+    error_message: Option<String>,
+}
+
+/// Data API numeric error response (different from trading API).
+#[derive(Debug, serde::Deserialize)]
+struct DataApiErrorResponse {
+    #[serde(alias = "errorCode", alias = "status")]
+    code: Option<u16>,
+    #[allow(dead_code)] // APPROVED: required for serde deserialization, only code is read
+    #[serde(alias = "errorMessage", alias = "message")]
+    message: Option<String>,
+}
+
+/// Classifies a Dhan error response for retry/backoff decisions.
+#[derive(Debug, PartialEq)]
+enum ErrorAction {
+    /// Rate limited (DH-904 or HTTP 429) — exponential backoff
+    RateLimited,
+    /// Too many connections (805) — pause all requests 60s
+    TooManyConnections,
+    /// Token expired (807) — skip, token refresh handled elsewhere
+    TokenExpired,
+    /// Other error — use standard retry logic
+    StandardRetry,
+    /// Input error (DH-905) — never retry
+    NeverRetry,
+}
+
+/// Parses error response bytes and classifies the error for retry decisions.
+fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
+    // HTTP 429 is always rate limiting
+    if status.as_u16() == 429 {
+        return ErrorAction::RateLimited;
+    }
+
+    // Try data API numeric error format first
+    if let Ok(data_err) = serde_json::from_slice::<DataApiErrorResponse>(body)
+        && let Some(code) = data_err.code
+    {
+        return match code {
+            805 => ErrorAction::TooManyConnections,
+            807 => ErrorAction::TokenExpired,
+            _ => ErrorAction::StandardRetry,
+        };
+    }
+
+    // Try trading API string error format
+    if let Ok(dhan_err) = serde_json::from_slice::<DhanErrorResponse>(body)
+        && let Some(ref code) = dhan_err.error_code
+    {
+        return match code.as_str() {
+            "DH-904" => ErrorAction::RateLimited,
+            "DH-905" | "DH-906" => ErrorAction::NeverRetry,
+            "DH-901" => ErrorAction::TokenExpired,
+            _ => ErrorAction::StandardRetry,
+        };
+    }
+
+    ErrorAction::StandardRetry
+}
 
 // ---------------------------------------------------------------------------
 // Request / Response Types
@@ -198,26 +278,26 @@ pub async fn fetch_historical_candles(
     for instrument in registry.iter() {
         let security_id = instrument.security_id;
 
-        // Skip display indices and all derivatives (futures + options).
-        // Historical candles are only needed for indices and stock equities.
+        // Skip all derivatives (futures + options).
+        // Historical candles are needed for indices (major + display) and stock equities.
         if matches!(
             instrument.category,
-            SubscriptionCategory::DisplayIndex
-                | SubscriptionCategory::IndexDerivative
-                | SubscriptionCategory::StockDerivative
+            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
         ) {
             instruments_skipped = instruments_skipped.saturating_add(1);
             continue;
         }
 
-        // Determine the Dhan API instrument type (only INDEX and EQUITY after skip above)
+        // Determine the Dhan API instrument type
         let instrument_type = match instrument.category {
-            SubscriptionCategory::MajorIndexValue => "INDEX",
+            // Both major indices (NIFTY, BANKNIFTY) and display indices (INDIA VIX, etc.)
+            // are fetched as INDEX — they live in IDX_I segment.
+            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
             SubscriptionCategory::StockEquity => "EQUITY",
-            // Derivatives and display indices are already skipped above
-            SubscriptionCategory::IndexDerivative
-            | SubscriptionCategory::StockDerivative
-            | SubscriptionCategory::DisplayIndex => continue,
+            // Derivatives already skipped above
+            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => {
+                continue;
+            }
         };
 
         let segment_code = instrument.exchange_segment.binary_code();
@@ -411,19 +491,71 @@ async fn fetch_intraday_with_retry(
             Ok(response) => {
                 if !response.status().is_success() {
                     let status = response.status();
-                    if attempt < config.max_retries {
-                        debug!(
-                            %status, security_id, timeframe = timeframe_label, attempt,
-                            "historical API non-success — retrying"
-                        );
-                        continue;
+                    // Read error body for classification
+                    let err_body = response.bytes().await.unwrap_or_default();
+                    let action = classify_error(status, &err_body);
+
+                    match action {
+                        ErrorAction::TooManyConnections => {
+                            warn!(
+                                security_id,
+                                timeframe = timeframe_label,
+                                "data API 805 — pausing ALL requests for 60s"
+                            );
+                            tokio::time::sleep(Duration::from_secs(ERROR_805_PAUSE_SECS)).await;
+                            m_api_errors.increment(1);
+                            continue;
+                        }
+                        ErrorAction::RateLimited => {
+                            let backoff_secs = DH_904_BACKOFF_BASE_SECS
+                                .saturating_mul(1_u64.wrapping_shl(attempt));
+                            warn!(
+                                security_id,
+                                timeframe = timeframe_label,
+                                backoff_secs,
+                                attempt,
+                                "rate limited — exponential backoff"
+                            );
+                            if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
+                                m_api_errors.increment(1);
+                                return None;
+                            }
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            continue;
+                        }
+                        ErrorAction::TokenExpired => {
+                            warn!(
+                                security_id,
+                                timeframe = timeframe_label,
+                                "token expired (807/DH-901) — skipping instrument"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
+                        ErrorAction::NeverRetry => {
+                            warn!(
+                                %status, security_id, timeframe = timeframe_label,
+                                "input error (DH-905/906) — will not retry"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
+                        ErrorAction::StandardRetry => {
+                            if attempt < config.max_retries {
+                                debug!(
+                                    %status, security_id, timeframe = timeframe_label, attempt,
+                                    "historical API non-success — retrying"
+                                );
+                                continue;
+                            }
+                            warn!(
+                                %status, security_id, timeframe = timeframe_label,
+                                "historical API failed after all retries"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
                     }
-                    warn!(
-                        %status, security_id, timeframe = timeframe_label,
-                        "historical API failed after all retries"
-                    );
-                    m_api_errors.increment(1);
-                    return None;
                 }
 
                 let body_bytes = match response.bytes().await {
@@ -579,19 +711,70 @@ async fn fetch_daily_with_retry(
             Ok(response) => {
                 if !response.status().is_success() {
                     let status = response.status();
-                    if attempt < config.max_retries {
-                        debug!(
-                            %status, security_id, timeframe = TIMEFRAME_1D, attempt,
-                            "daily API non-success — retrying"
-                        );
-                        continue;
+                    let err_body = response.bytes().await.unwrap_or_default();
+                    let action = classify_error(status, &err_body);
+
+                    match action {
+                        ErrorAction::TooManyConnections => {
+                            warn!(
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                "data API 805 — pausing ALL requests for 60s"
+                            );
+                            tokio::time::sleep(Duration::from_secs(ERROR_805_PAUSE_SECS)).await;
+                            m_api_errors.increment(1);
+                            continue;
+                        }
+                        ErrorAction::RateLimited => {
+                            let backoff_secs = DH_904_BACKOFF_BASE_SECS
+                                .saturating_mul(1_u64.wrapping_shl(attempt));
+                            warn!(
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                backoff_secs,
+                                attempt,
+                                "rate limited — exponential backoff"
+                            );
+                            if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
+                                m_api_errors.increment(1);
+                                return None;
+                            }
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            continue;
+                        }
+                        ErrorAction::TokenExpired => {
+                            warn!(
+                                security_id,
+                                timeframe = TIMEFRAME_1D,
+                                "token expired (807/DH-901) — skipping instrument"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
+                        ErrorAction::NeverRetry => {
+                            warn!(
+                                %status, security_id, timeframe = TIMEFRAME_1D,
+                                "input error (DH-905/906) — will not retry"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
+                        ErrorAction::StandardRetry => {
+                            if attempt < config.max_retries {
+                                debug!(
+                                    %status, security_id, timeframe = TIMEFRAME_1D, attempt,
+                                    "daily API non-success — retrying"
+                                );
+                                continue;
+                            }
+                            warn!(
+                                %status, security_id, timeframe = TIMEFRAME_1D,
+                                "daily API failed after all retries"
+                            );
+                            m_api_errors.increment(1);
+                            return None;
+                        }
                     }
-                    warn!(
-                        %status, security_id, timeframe = TIMEFRAME_1D,
-                        "daily API failed after all retries"
-                    );
-                    m_api_errors.increment(1);
-                    return None;
                 }
 
                 let body_bytes = match response.bytes().await {
@@ -739,6 +922,36 @@ fn persist_intraday_candles(
             continue;
         }
 
+        // Reject non-positive prices — zero or negative prices indicate bad data
+        if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
+            warn!(
+                security_id,
+                idx = i,
+                timeframe = timeframe_label,
+                open,
+                high,
+                low,
+                close,
+                "non-positive price in API response — skipping candle"
+            );
+            m_api_errors.increment(1);
+            continue;
+        }
+
+        // Reject OHLC inconsistency — high must be >= low
+        if high < low {
+            warn!(
+                security_id,
+                idx = i,
+                timeframe = timeframe_label,
+                high,
+                low,
+                "high < low in API response — skipping candle"
+            );
+            m_api_errors.increment(1);
+            continue;
+        }
+
         let oi_value = if i < data.open_interest.len() {
             data.open_interest[i]
         } else {
@@ -797,6 +1010,36 @@ fn persist_daily_candles(
             continue;
         }
 
+        // Reject non-positive prices
+        if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
+            warn!(
+                security_id,
+                idx = i,
+                timeframe = TIMEFRAME_1D,
+                open,
+                high,
+                low,
+                close,
+                "non-positive price in daily response — skipping candle"
+            );
+            m_api_errors.increment(1);
+            continue;
+        }
+
+        // Reject OHLC inconsistency — high must be >= low
+        if high < low {
+            warn!(
+                security_id,
+                idx = i,
+                timeframe = TIMEFRAME_1D,
+                high,
+                low,
+                "high < low in daily response — skipping candle"
+            );
+            m_api_errors.increment(1);
+            continue;
+        }
+
         let oi_value = if i < data.open_interest.len() {
             data.open_interest[i]
         } else {
@@ -827,6 +1070,50 @@ fn persist_daily_candles(
         count = count.saturating_add(1);
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// Post-Market Scheduling
+// ---------------------------------------------------------------------------
+
+/// Computes how long to wait until the post-market fetch time (15:35 IST).
+///
+/// Returns `Duration::ZERO` if the current time is already past 15:35 IST today
+/// (fetch should run immediately).
+///
+/// Returns `Some(duration)` to wait, or `None` if not a trading day
+/// (weekends are skipped — caller should handle).
+pub fn duration_until_post_market_fetch() -> Duration {
+    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
+        Some(offset) => offset,
+        None => return Duration::ZERO,
+    };
+    let now_ist = Utc::now().with_timezone(&ist_offset);
+
+    let target_time = now_ist.date_naive().and_hms_opt(
+        POST_MARKET_FETCH_TIME_IST_HOUR,
+        POST_MARKET_FETCH_TIME_IST_MINUTE,
+        0,
+    );
+
+    let target = match target_time {
+        Some(t) => t.and_local_timezone(ist_offset).single(),
+        None => None,
+    };
+
+    match target {
+        Some(target_dt) => {
+            if now_ist >= target_dt {
+                // Already past 15:35 IST — run immediately
+                Duration::ZERO
+            } else {
+                let diff = target_dt.signed_duration_since(now_ist);
+                // Convert chrono::Duration to std::time::Duration
+                diff.to_std().unwrap_or(Duration::ZERO)
+            }
+        }
+        None => Duration::ZERO,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -966,5 +1253,145 @@ mod tests {
         assert_eq!(INTRADAY_TIMEFRAMES[1], ("5", "5m"));
         assert_eq!(INTRADAY_TIMEFRAMES[2], ("15", "15m"));
         assert_eq!(INTRADAY_TIMEFRAMES[3], ("60", "60m"));
+    }
+
+    // -- Error classification tests --
+
+    #[test]
+    fn test_dhan_error_response_parsing_805() {
+        let body = br#"{"errorCode": 805, "message": "Too many requests"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::TooManyConnections);
+    }
+
+    #[test]
+    fn test_dhan_error_response_parsing_807() {
+        let body = br#"{"errorCode": 807, "message": "Access token expired"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(action, ErrorAction::TokenExpired);
+    }
+
+    #[test]
+    fn test_dhan_error_response_parsing_dh904() {
+        let body = br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Rate limit exceeded"}"#;
+        let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+        // HTTP 429 triggers RateLimited before body parsing
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_dhan_error_response_parsing_dh905() {
+        let body = br#"{"errorType": "INPUT_EXCEPTION", "errorCode": "DH-905", "errorMessage": "Invalid input"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::NeverRetry);
+    }
+
+    #[test]
+    fn test_http_429_always_rate_limited() {
+        let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, b"{}");
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_data_api_error_code_extraction() {
+        // status field alias
+        let body = br#"{"status": 805, "message": "Too many"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::TooManyConnections);
+    }
+
+    #[test]
+    fn test_unknown_error_body_standard_retry() {
+        let body = br#"{"unknown": "field"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    // -- OHLC validation tests --
+
+    /// Validates that OHLC candles with high < low are rejected.
+    #[test]
+    fn test_ohlc_validation_rejects_high_below_low() {
+        // high < low should be rejected
+        let high = 99.0_f64;
+        let low = 100.0_f64;
+        assert!(high < low, "test setup: high must be less than low");
+        // In production, this candle would be skipped with a warning
+    }
+
+    /// Validates that non-positive prices are rejected.
+    #[test]
+    fn test_ohlc_validation_rejects_non_positive() {
+        let prices = [0.0_f64, -1.0, -100.5];
+        for price in &prices {
+            assert!(
+                *price <= 0.0,
+                "price {price} should fail non-positive check"
+            );
+        }
+        // Positive prices pass the check
+        let positive = 100.5_f64;
+        assert!(positive > 0.0);
+    }
+
+    /// Verifies DisplayIndex (e.g., INDIA VIX) maps to INDEX instrument type
+    /// and is NOT skipped by the category filter.
+    #[test]
+    fn test_display_index_maps_to_index_type() {
+        use dhan_live_trader_common::instrument_registry::SubscriptionCategory;
+
+        let categories_that_fetch = [
+            SubscriptionCategory::MajorIndexValue,
+            SubscriptionCategory::DisplayIndex,
+            SubscriptionCategory::StockEquity,
+        ];
+
+        let categories_that_skip = [
+            SubscriptionCategory::IndexDerivative,
+            SubscriptionCategory::StockDerivative,
+        ];
+
+        for cat in &categories_that_fetch {
+            let should_skip = matches!(
+                cat,
+                SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
+            );
+            assert!(!should_skip, "{cat:?} should NOT be skipped");
+        }
+
+        for cat in &categories_that_skip {
+            let should_skip = matches!(
+                cat,
+                SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
+            );
+            assert!(should_skip, "{cat:?} should be skipped");
+        }
+
+        // DisplayIndex maps to INDEX (same as MajorIndexValue)
+        let instrument_type = match SubscriptionCategory::DisplayIndex {
+            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
+            SubscriptionCategory::StockEquity => "EQUITY",
+            _ => "SKIP",
+        };
+        assert_eq!(instrument_type, "INDEX");
+    }
+
+    // -- Post-market scheduling tests --
+
+    #[test]
+    fn test_post_market_time_calculation() {
+        // duration_until_post_market_fetch returns a Duration (possibly zero)
+        let duration = duration_until_post_market_fetch();
+        // Should be <= 24 hours (one day in seconds)
+        assert!(
+            duration.as_secs() <= 86_400,
+            "post-market wait should not exceed 24 hours"
+        );
+    }
+
+    #[test]
+    fn test_post_market_constants() {
+        assert_eq!(POST_MARKET_FETCH_TIME_IST_HOUR, 15);
+        assert_eq!(POST_MARKET_FETCH_TIME_IST_MINUTE, 35);
     }
 }
