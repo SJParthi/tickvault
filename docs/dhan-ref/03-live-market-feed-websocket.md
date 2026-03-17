@@ -390,7 +390,7 @@ pub struct PrevClosePacket {
 pub struct QuotePacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12
-    pub ltq: i16,                      // bytes 13-14
+    pub ltq: u16,                      // bytes 13-14 (unsigned — quantity cannot be negative)
     pub ltt: i32,                      // bytes 15-18 (UNIX epoch UTC)
     pub atp: f32,                      // bytes 19-22
     pub volume: i32,                   // bytes 23-26
@@ -416,7 +416,7 @@ pub struct OIPacket {
 pub struct FullPacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12
-    pub ltq: i16,                      // bytes 13-14
+    pub ltq: u16,                      // bytes 13-14 (unsigned — quantity cannot be negative)
     pub ltt: i32,                      // bytes 15-18 (UNIX epoch UTC)
     pub atp: f32,                      // bytes 19-22
     pub volume: i32,                   // bytes 23-26
@@ -436,10 +436,10 @@ pub struct FullPacket {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MarketDepthLevel {
-    pub bid_qty: i32,          // 4 bytes, int32 LE
-    pub ask_qty: i32,          // 4 bytes, int32 LE
-    pub bid_orders: i16,       // 2 bytes, int16 LE
-    pub ask_orders: i16,       // 2 bytes, int16 LE
+    pub bid_qty: u32,          // 4 bytes, uint32 LE (unsigned — quantities cannot be negative)
+    pub ask_qty: u32,          // 4 bytes, uint32 LE (unsigned)
+    pub bid_orders: u16,       // 2 bytes, uint16 LE (unsigned)
+    pub ask_orders: u16,       // 2 bytes, uint16 LE (unsigned)
     pub bid_price: f32,        // 4 bytes, float32 LE
     pub ask_price: f32,        // 4 bytes, float32 LE
 }

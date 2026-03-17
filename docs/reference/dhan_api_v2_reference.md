@@ -983,7 +983,7 @@ Segments supported: NSE_EQ (1), NSE_FNO (2) ONLY
 }
 ```
 
-**Unsubscribe:** RequestCode = 24
+**Unsubscribe:** RequestCode = 25 (Dhan Annexure: UnsubscribeFullDepth = 25, NOT 24)
 **Disconnect:** RequestCode = 12
 
 ### Binary Packet — 12-Byte Header
@@ -1026,7 +1026,7 @@ URL: wss://full-depth-api.dhan.co/?token=<access_token>&clientId=<client_id>&aut
 Max instruments per connection: 1 (CRITICAL LIMITATION)
 Segments supported: NSE_EQ and NSE_FNO ONLY
 Subscribe: RequestCode = 23
-Unsubscribe: RequestCode = 24
+Unsubscribe: RequestCode = 25
 ```
 
 ### Packet Format

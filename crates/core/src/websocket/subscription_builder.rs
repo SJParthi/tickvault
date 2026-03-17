@@ -160,7 +160,7 @@ pub fn build_twenty_depth_subscription_messages(
 
 /// Builds unsubscription JSON messages for the 20-level depth WebSocket feed.
 ///
-/// Uses RequestCode 25 (per annexure-enums.md: UnsubscribeFullDepth = 25).
+/// Uses RequestCode 25 (Dhan Annexure: UnsubscribeFullDepth = 25).
 pub fn build_twenty_depth_unsubscription_messages(
     instruments: &[InstrumentSubscription],
     batch_size: usize,
@@ -518,7 +518,6 @@ mod tests {
         let instruments = make_instruments(3);
         let messages = build_twenty_depth_unsubscription_messages(&instruments, 100);
         assert_eq!(messages.len(), 1);
-        // Per annexure-enums.md: UnsubscribeFullDepth is 25, NOT 24
         assert!(messages[0].contains("\"RequestCode\":25"));
     }
 
