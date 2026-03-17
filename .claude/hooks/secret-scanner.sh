@@ -133,7 +133,7 @@ if [ "$VIOLATIONS" -gt 0 ]; then
   echo -e "$REPORT" >&2
   echo "" >&2
   echo "Secrets must come from AWS SSM Parameter Store, never hardcoded." >&2
-  echo "Use Secret<String> wrapper. See docs/reference/secret_rotation.md" >&2
+  echo "Use Secret<String> wrapper. See docs/standards/secret-rotation.md" >&2
   exit 2
 fi
 

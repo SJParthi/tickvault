@@ -2,7 +2,7 @@
 # dhan-live-trader — Benchmark Latency Budgets
 # =============================================================================
 # Used by: scripts/bench-gate.sh (CI Stage 5)
-# Source: docs/reference/quality_gates.md Gate 5a
+# Source: docs/standards/quality-gates.md Gate 5a
 #
 # Each entry: benchmark_name = max_ns (nanoseconds)
 # >5% regression from previous baseline = FAIL
