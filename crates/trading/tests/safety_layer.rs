@@ -198,6 +198,7 @@ mod reconciliation_safety {
             created_at_us: 0,
             updated_at_us: 0,
             needs_reconciliation: false,
+            modification_count: 0,
         }
     }
 

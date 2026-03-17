@@ -24,8 +24,9 @@ use super::rate_limiter::OrderRateLimiter;
 use super::reconciliation::reconcile_orders;
 use super::state_machine::{is_valid_transition, parse_order_status};
 use super::types::{
-    DhanModifyOrderRequest, DhanPlaceOrderRequest, EXCHANGE_SEGMENT_NSE_FNO, ManagedOrder,
-    ModifyOrderRequest, OmsError, PlaceOrderRequest, ReconciliationReport,
+    DhanModifyOrderRequest, DhanPlaceOrderRequest, EXCHANGE_SEGMENT_NSE_FNO,
+    MAX_MODIFICATIONS_PER_ORDER, ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest,
+    ReconciliationReport,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,9 @@ impl OrderManagementSystem {
     /// - `OmsError::DhanApiError` — Dhan returned an error
     /// - `OmsError::DhanRateLimited` — HTTP 429 from Dhan
     pub async fn place_order(&mut self, request: PlaceOrderRequest) -> Result<String, OmsError> {
+        // Step 0: Pre-submission validation gates (before consuming rate limit)
+        validate_order_fields(&request)?;
+
         // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
         self.rate_limiter.check()?;
 
@@ -166,6 +170,7 @@ impl OrderManagementSystem {
                 created_at_us: now_us,
                 updated_at_us: now_us,
                 needs_reconciliation: false,
+                modification_count: 0,
             };
 
             self.correlations
@@ -246,6 +251,7 @@ impl OrderManagementSystem {
             created_at_us: now_us,
             updated_at_us: now_us,
             needs_reconciliation: false,
+            modification_count: 0,
         };
 
         // Step 7: Track in state
@@ -292,6 +298,29 @@ impl OrderManagementSystem {
             });
         }
 
+        // Enforce Dhan's max 25 modifications per order
+        if order.modification_count >= MAX_MODIFICATIONS_PER_ORDER {
+            return Err(OmsError::RiskRejected {
+                reason: format!(
+                    "order {} has reached max {} modifications",
+                    order_id, MAX_MODIFICATIONS_PER_ORDER
+                ),
+            });
+        }
+
+        // Validate disclosed quantity if specified
+        if request.disclosed_quantity > 0 {
+            let min_disclosed = (request.quantity * 3) / 10;
+            if request.disclosed_quantity < min_disclosed {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "disclosedQuantity ({}) must be >=30% of quantity ({})",
+                        request.disclosed_quantity, request.quantity
+                    ),
+                });
+            }
+        }
+
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
 
@@ -303,6 +332,7 @@ impl OrderManagementSystem {
                 order.price = request.price;
                 order.trigger_price = request.trigger_price;
                 order.validity = request.validity;
+                order.modification_count = order.modification_count.saturating_add(1);
                 order.updated_at_us = now_epoch_us();
             }
             info!(order_id = %order_id, "PAPER TRADE: order modify simulated (no HTTP call)");
@@ -345,6 +375,7 @@ impl OrderManagementSystem {
             order.price = request.price;
             order.trigger_price = request.trigger_price;
             order.validity = request.validity;
+            order.modification_count = order.modification_count.saturating_add(1);
             order.updated_at_us = now_epoch_us();
         }
 
@@ -594,6 +625,38 @@ impl OrderManagementSystem {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-submission Validation
+// ---------------------------------------------------------------------------
+
+/// Validates order fields before submission to avoid wasting Dhan rate limits.
+///
+/// - MARKET orders must have price = 0.0 (Dhan rejects non-zero → DH-905)
+/// - STOP_LOSS / STOP_LOSS_MARKET orders require triggerPrice > 0.0
+fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
+    use dhan_live_trader_common::order_types::OrderType;
+
+    // MARKET orders: price must be 0 (Dhan API spec)
+    if request.order_type == OrderType::Market && request.price != 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("MARKET order must have price=0.0, got {}", request.price),
+        });
+    }
+
+    // SL/SLM orders: triggerPrice is mandatory
+    if matches!(
+        request.order_type,
+        OrderType::StopLoss | OrderType::StopLossMarket
+    ) && request.trigger_price == 0.0
+    {
+        return Err(OmsError::RiskRejected {
+            reason: "STOP_LOSS/STOP_LOSS_MARKET orders require triggerPrice > 0".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
@@ -656,6 +719,7 @@ mod tests {
             created_at_us: 0,
             updated_at_us: 0,
             needs_reconciliation: false,
+            modification_count: 0,
         };
 
         oms.orders.insert(order_id.to_owned(), order);
@@ -704,6 +768,8 @@ mod tests {
             product_name: String::new(),
             ref_ltp: 0.0,
             tick_size: 0.0,
+            source: String::new(),
+            off_mkt_flag: String::new(),
         }
     }
 
@@ -834,6 +900,7 @@ mod tests {
             created_at_us: 0,
             updated_at_us: 0,
             needs_reconciliation: false,
+            modification_count: 0,
         };
         oms.orders.insert("2".to_owned(), terminal);
 
@@ -1049,5 +1116,175 @@ mod tests {
         // Traded → Pending is invalid
         let _ = oms.handle_order_update(&make_order_update("1", "PENDING"));
         assert!(oms.order("1").unwrap().needs_reconciliation);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-submission validation gate tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_market_order_nonzero_price_rejected() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50, // BUG: MARKET orders must have price=0
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let result = oms.place_order(request).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
+            "MARKET order with non-zero price must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sl_order_zero_trigger_rejected() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::StopLoss,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0, // BUG: SL orders require triggerPrice > 0
+            lot_size: 25,
+        };
+
+        let result = oms.place_order(request).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
+            "SL order with zero triggerPrice must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_market_order_zero_price_accepted() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0, // Correct: MARKET order with price=0
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let result = oms.place_order(request).await;
+        assert!(result.is_ok(), "MARKET order with price=0 must be accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // PartTraded status handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_part_traded_transition() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 245.0;
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.status, OrderStatus::PartTraded);
+        assert_eq!(order.traded_qty, 25);
+        assert!(!order.is_terminal(), "PartTraded is NOT terminal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Modification count enforcement
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_modification_count_enforced() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        // Set modification count to max (25)
+        oms.orders.get_mut("1").unwrap().modification_count = 25;
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
+            "Order at max modifications must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disclosed_quantity_below_30_percent_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 100,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 20, // 20% < 30% minimum
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
+            "disclosedQuantity < 30% of quantity must be rejected"
+        );
     }
 }

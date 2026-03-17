@@ -110,6 +110,24 @@ impl ExchangeSegment {
             Self::BseFno => 8,
         }
     }
+
+    /// Converts a binary wire code (from WebSocket packet header byte 3) to an `ExchangeSegment`.
+    ///
+    /// Returns `None` for unknown values. Note: there is NO enum 6 in Dhan's mapping
+    /// (gap between MCX_COMM=5 and BSE_CURRENCY=7). Unknown codes must not panic.
+    pub fn from_byte(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::IdxI),
+            1 => Some(Self::NseEquity),
+            2 => Some(Self::NseFno),
+            3 => Some(Self::NseCurrency),
+            4 => Some(Self::BseEquity),
+            5 => Some(Self::McxComm),
+            7 => Some(Self::BseCurrency),
+            8 => Some(Self::BseFno),
+            _ => None, // includes gap at 6
+        }
+    }
 }
 
 impl fmt::Display for ExchangeSegment {
@@ -476,6 +494,68 @@ mod tests {
             ExchangeSegment::BseFno.binary_code(),
             EXCHANGE_SEGMENT_BSE_FNO
         );
+    }
+
+    // --- from_byte (reverse mapping) ---
+
+    #[test]
+    fn test_from_byte_all_known_codes() {
+        assert_eq!(ExchangeSegment::from_byte(0), Some(ExchangeSegment::IdxI));
+        assert_eq!(
+            ExchangeSegment::from_byte(1),
+            Some(ExchangeSegment::NseEquity)
+        );
+        assert_eq!(ExchangeSegment::from_byte(2), Some(ExchangeSegment::NseFno));
+        assert_eq!(
+            ExchangeSegment::from_byte(3),
+            Some(ExchangeSegment::NseCurrency)
+        );
+        assert_eq!(
+            ExchangeSegment::from_byte(4),
+            Some(ExchangeSegment::BseEquity)
+        );
+        assert_eq!(
+            ExchangeSegment::from_byte(5),
+            Some(ExchangeSegment::McxComm)
+        );
+        assert_eq!(
+            ExchangeSegment::from_byte(7),
+            Some(ExchangeSegment::BseCurrency)
+        );
+        assert_eq!(ExchangeSegment::from_byte(8), Some(ExchangeSegment::BseFno));
+    }
+
+    #[test]
+    fn test_from_byte_gap_at_6_returns_none() {
+        assert_eq!(ExchangeSegment::from_byte(6), None);
+    }
+
+    #[test]
+    fn test_from_byte_unknown_returns_none() {
+        assert_eq!(ExchangeSegment::from_byte(9), None);
+        assert_eq!(ExchangeSegment::from_byte(255), None);
+    }
+
+    #[test]
+    fn test_from_byte_roundtrips_with_binary_code() {
+        let segments = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        for seg in segments {
+            assert_eq!(
+                ExchangeSegment::from_byte(seg.binary_code()),
+                Some(seg),
+                "from_byte(binary_code()) must roundtrip for {:?}",
+                seg
+            );
+        }
     }
 
     // --- Hash consistency (used as HashMap keys) ---

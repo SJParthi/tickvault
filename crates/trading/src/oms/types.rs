@@ -53,10 +53,18 @@ pub struct ManagedOrder {
     pub updated_at_us: i64,
     /// Whether this order needs reconciliation with Dhan REST API.
     pub needs_reconciliation: bool,
+    /// Number of times this order has been modified (Dhan max: 25 per order).
+    pub modification_count: u32,
 }
+
+/// Dhan maximum modifications per order.
+pub const MAX_MODIFICATIONS_PER_ORDER: u32 = 25;
 
 impl ManagedOrder {
     /// Returns true if the order is in a terminal state.
+    ///
+    /// Terminal states: Traded, Cancelled, Rejected, Expired, Closed.
+    /// Non-terminal: Transit, Pending, Confirmed, PartTraded, Triggered.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
@@ -64,6 +72,7 @@ impl ManagedOrder {
                 | OrderStatus::Cancelled
                 | OrderStatus::Rejected
                 | OrderStatus::Expired
+                | OrderStatus::Closed
         )
     }
 }
@@ -106,7 +115,8 @@ pub struct PlaceOrderRequest {
 pub struct ModifyOrderRequest {
     /// New order type (may differ from original).
     pub order_type: OrderType,
-    /// New quantity.
+    /// Total order quantity (NOT remaining quantity).
+    /// Setting quantity=75 on a 100-qty order with 30 filled → new total = 75.
     pub quantity: i64,
     /// New price.
     pub price: f64,
@@ -399,8 +409,10 @@ mod tests {
             created_at_us: 0,
             updated_at_us: 0,
             needs_reconciliation: false,
+            modification_count: 0,
         };
 
+        // Non-terminal states
         assert!(!order.is_terminal());
 
         order.status = OrderStatus::Pending;
@@ -409,6 +421,19 @@ mod tests {
         order.status = OrderStatus::Confirmed;
         assert!(!order.is_terminal());
 
+        order.status = OrderStatus::PartTraded;
+        assert!(
+            !order.is_terminal(),
+            "PartTraded is NOT terminal — order still active"
+        );
+
+        order.status = OrderStatus::Triggered;
+        assert!(
+            !order.is_terminal(),
+            "Triggered is NOT terminal — condition fired, order active"
+        );
+
+        // Terminal states
         order.status = OrderStatus::Traded;
         assert!(order.is_terminal());
 
@@ -420,6 +445,12 @@ mod tests {
 
         order.status = OrderStatus::Expired;
         assert!(order.is_terminal());
+
+        order.status = OrderStatus::Closed;
+        assert!(
+            order.is_terminal(),
+            "Closed is terminal — Super Order complete"
+        );
     }
 
     #[test]

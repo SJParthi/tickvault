@@ -38,12 +38,20 @@ impl CorrelationTracker {
         }
     }
 
-    /// Generates a new UUID v4 correlation ID.
+    /// Generates a new correlation ID (≤30 chars, Dhan API limit).
+    ///
+    /// Uses UUID v4 simple (hex, no hyphens) truncated to 30 characters.
+    /// Charset: `[0-9a-f]` — valid within Dhan's `[a-zA-Z0-9 _-]` allowlist.
     ///
     /// # Returns
-    /// A new unique correlation ID string.
+    /// A 30-character unique correlation ID string.
     pub fn generate_id(&self) -> String {
-        Uuid::new_v4().to_string()
+        // UUID v4 simple = 32 hex chars. Dhan max = 30. Truncate last 2.
+        // 30 hex chars = 120 bits of entropy — collision risk negligible.
+        let uuid = Uuid::new_v4().simple().to_string();
+        // CORRELATION_ID_MAX_LENGTH: Dhan enforces max 30 chars on correlationId.
+        const CORRELATION_ID_MAX_LENGTH: usize = 30;
+        uuid[..CORRELATION_ID_MAX_LENGTH].to_owned()
     }
 
     /// Records a mapping from correlation ID to order ID.
@@ -88,10 +96,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_id_returns_valid_uuid() {
+    fn generate_id_returns_30_char_hex_string() {
         let tracker = CorrelationTracker::new();
         let id = tracker.generate_id();
-        assert!(Uuid::parse_str(&id).is_ok());
+        assert_eq!(
+            id.len(),
+            30,
+            "correlationId must be exactly 30 chars (Dhan limit)"
+        );
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "correlationId must be hex chars only"
+        );
     }
 
     #[test]
@@ -100,6 +116,20 @@ mod tests {
         let id1 = tracker.generate_id();
         let id2 = tracker.generate_id();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_correlation_id_max_length_30() {
+        let tracker = CorrelationTracker::new();
+        for _ in 0..100 {
+            let id = tracker.generate_id();
+            assert!(
+                id.len() <= 30,
+                "correlationId exceeds Dhan 30-char max: len={}, id={}",
+                id.len(),
+                id
+            );
+        }
     }
 
     #[test]
