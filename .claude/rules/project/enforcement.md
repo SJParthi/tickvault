@@ -10,16 +10,13 @@ paths:
 - **PreToolUse (Edit|Write):** block-env-files.sh — prevents .env file creation
 - **PostToolUse (Edit|Write):** REMOVED — pre-commit gate enforces fmt; no per-edit rustfmt
 - **SubagentStart:** REMOVED — principles already in CLAUDE.md context
-- **Pre-push (13 gates — SCOPED):** Detects changed crates via `changed-crates.sh`, then runs all gates scoped to those crates only. `cargo clippy -p <changed>` and `cargo test -p <changed>` instead of `--workspace`. Full workspace only when explicitly requested.
+- **Pre-push (12 gates):** Runs fmt, clippy, test, and quality gates on workspace. Full workspace validation.
 - **Pre-PR (5 gates):** branch check, naming, clean tree, quality state, commit format
 - **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage). Smart skip: heavy Rust steps (build/clippy/test) skipped when only config/scripts change.
 
-## Scoped Testing (Industry Standard)
-- **Default:** Only test crates with changes since last push (affected target testing)
-- **Detection:** `.claude/hooks/changed-crates.sh` — uses `git diff` to find changed crate names
-- **Fallback:** If detection fails, falls back to full workspace (safe default)
-- **Full workspace:** Only via explicit request, `/quality` skill, or CI on PR merge
-- **Rationale:** Same quality, 5x faster. Google/Meta/Nx all do this. Done = done.
+## Testing Scope
+- **Pre-push:** Full workspace validation (fmt, clippy, test)
+- **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage)
 
 ## State File (.last-quality-pass)
 - Written by pre-PR quality check on success

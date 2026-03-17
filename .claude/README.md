@@ -93,9 +93,7 @@ Automated scripts that run at specific lifecycle points.
 | `pre-push-gate.sh` | Before push | 13 scoped quality gates |
 | `pre-pr-gate.sh` | Before PR | Branch check, naming, clean tree |
 | `pre-merge-gate.sh` | Before merge | Full workspace validation |
-| `changed-crates.sh` | Helper | Detects which crates changed (used by other hooks) |
 | `test-count-guard.sh` | Quality gate | Ensures test count doesn't decrease |
-| `coverage-guard.sh` | Quality gate | Enforces coverage thresholds |
 | `pub-fn-test-guard.sh` | Quality gate | Every public function needs a test |
 | `banned-pattern-scanner.sh` | Quality gate | Blocks unsafe patterns |
 | `secret-scanner.sh` | Quality gate | Detects leaked secrets |

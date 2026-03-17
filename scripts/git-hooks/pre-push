@@ -188,30 +188,8 @@ else
   echo "  SKIP: cargo-deny not installed" >&2
 fi
 
-# Gate 8: Coverage ratchet guard
-echo "  [8/12] Coverage ratchet guard..." >&2
-if [ -x "$CLAUDE_HOOKS/coverage-guard.sh" ]; then
-  if command -v cargo-llvm-cov > /dev/null 2>&1; then
-    COV_OUT=$(timeout 180 "$CLAUDE_HOOKS/coverage-guard.sh" "$PROJECT_DIR" 2>&1)
-    COV_EXIT=$?
-    if [ "$COV_EXIT" -eq 124 ]; then
-      echo "  FAIL: Coverage guard timed out (180s)" >&2
-      FAILED=1
-    elif [ "$COV_EXIT" -ne 0 ]; then
-      echo "$COV_OUT" >&2
-      FAILED=1
-    else
-      echo "$COV_OUT" >&2
-    fi
-  else
-    echo "  SKIP: cargo-llvm-cov not installed" >&2
-  fi
-else
-  echo "  SKIP: coverage-guard.sh not found" >&2
-fi
-
-# Gate 9: Loom concurrency tests
-echo "  [9/12] Loom concurrency tests (hot-path crates)..." >&2
+# Gate 8: Loom concurrency tests
+echo "  [8/11] Loom concurrency tests (hot-path crates)..." >&2
 HOT_CRATES="core trading"
 LOOM_FOUND=false
 for crate in $HOT_CRATES; do
@@ -237,11 +215,11 @@ if [ "$LOOM_FOUND" = "false" ]; then
 fi
 
 # ─────────────────────────────────────────────
-# Gates 10-12: Test coverage enforcement (always run)
+# Gates 9-11: Test coverage enforcement (always run)
 # ─────────────────────────────────────────────
 
-# Gate 10: Data integrity guard (full workspace scan)
-echo "  [10/12] Data integrity guard (full workspace)..." >&2
+# Gate 9: Data integrity guard (full workspace scan)
+echo "  [9/11] Data integrity guard (full workspace)..." >&2
 if [ -x "$CLAUDE_HOOKS/data-integrity-guard.sh" ]; then
   DIG_OUT=$(timeout 60 "$CLAUDE_HOOKS/data-integrity-guard.sh" "$PROJECT_DIR" 2>&1)
   DIG_EXIT=$?
@@ -258,8 +236,8 @@ else
   echo "  SKIP: data-integrity-guard.sh not found" >&2
 fi
 
-# Gate 11: Pub fn test guard (every public function has a test)
-echo "  [11/12] Pub fn test guard (full workspace)..." >&2
+# Gate 10: Pub fn test guard (every public function has a test)
+echo "  [10/11] Pub fn test guard (full workspace)..." >&2
 if [ -x "$CLAUDE_HOOKS/pub-fn-test-guard.sh" ]; then
   PUBFN_OUT=$(timeout 120 "$CLAUDE_HOOKS/pub-fn-test-guard.sh" "$PROJECT_DIR" "all" 2>&1)
   PUBFN_EXIT=$?
@@ -276,8 +254,8 @@ else
   echo "  SKIP: pub-fn-test-guard.sh not found" >&2
 fi
 
-# Gate 12: Financial test guard (price/money fns have boundary tests)
-echo "  [12/12] Financial test guard..." >&2
+# Gate 11: Financial test guard (price/money fns have boundary tests)
+echo "  [11/11] Financial test guard..." >&2
 if [ -x "$CLAUDE_HOOKS/financial-test-guard.sh" ]; then
   FIN_OUT=$(timeout 120 "$CLAUDE_HOOKS/financial-test-guard.sh" "$PROJECT_DIR" 2>&1)
   FIN_EXIT=$?
