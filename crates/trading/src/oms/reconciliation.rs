@@ -65,7 +65,7 @@ pub fn reconcile_orders(
             Some(oms_order) => {
                 let status_mismatch = oms_order.status != dhan_status;
                 let fill_mismatch = oms_order.traded_qty != dhan_order.traded_quantity
-                    || (oms_order.avg_traded_price - dhan_order.average_trade_price).abs()
+                    || (oms_order.avg_traded_price - dhan_order.average_traded_price).abs()
                         > f64::EPSILON;
 
                 if status_mismatch {
@@ -86,7 +86,7 @@ pub fn reconcile_orders(
                         order_id: dhan_order.order_id.clone(),
                         status: dhan_status,
                         traded_qty: dhan_order.traded_quantity,
-                        avg_traded_price: dhan_order.average_trade_price,
+                        avg_traded_price: dhan_order.average_traded_price,
                     });
                 }
             }
@@ -188,7 +188,7 @@ mod tests {
             traded_price: 0.0,
             remaining_quantity: 0,
             filled_qty: 0,
-            average_trade_price: 0.0,
+            average_traded_price: 0.0,
             exchange_order_id: String::new(),
             exchange_time: String::new(),
             create_time: String::new(),
@@ -278,7 +278,7 @@ mod tests {
 
         let mut dhan = make_dhan_order("1", "TRADED");
         dhan.traded_quantity = 50; // Dhan says 50 filled
-        dhan.average_trade_price = 102.5;
+        dhan.average_traded_price = 102.5;
         let dhan = vec![dhan];
 
         let (report, updates) = reconcile_orders(&oms, &dhan);

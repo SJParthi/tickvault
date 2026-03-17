@@ -20,8 +20,8 @@
    - **UnsubscribeFullDepth is 25, NOT 24.**
 
 4. **FeedResponseCode — exact numeric codes.**
-   - `1`=Index, `2`=Ticker, `4`=Quote, `5`=OI, `6`=PrevClose, `7`=MarketStatus, `8`=Full, `50`=Disconnect
-   - **There is NO response code 3.** Gap between Ticker(2) and Quote(4).
+   - `1`=Index, `2`=Ticker, `3`=MarketDepth (v1 legacy, deprecated in v2 — replaced by Full code 8; Python SDK still handles for backward compat), `4`=Quote, `5`=OI, `6`=PrevClose, `7`=MarketStatus (8 bytes, header only), `8`=Full, `50`=Disconnect
+   - Code `3` is v1 legacy only. Our code handles it defensively (112-byte parser) but v2 subscriptions will not receive it.
    - Unknown codes must log + skip. Never panic.
 
 5. **ProductType — 4 variants.**

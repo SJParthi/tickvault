@@ -228,7 +228,7 @@ Everything: trade data + OI + 5-level market depth in a single packet.
 | `13-16`                     | float32 | 4            | Bid Price         |
 | `17-20`                     | float32 | 4            | Ask Price         |
 
-> **Implementation Note**: Bytes 63-162 contain 5 consecutive 20-byte depth structures. Parse as: `for level in 0..5 { offset = 63 + (level * 20); ... }`
+> **Implementation Note**: Bytes 62-161 (0-based) contain 5 consecutive 20-byte depth structures. Parse as: `for level in 0..5 { offset = 62 + (level * 20); ... }`
 
 ---
 
@@ -600,8 +600,8 @@ Do NOT confuse this WebSocket with the **Full Market Depth** WebSocket:
 
 | Aspect               | Live Market Feed (this doc)          | Full Market Depth                      |
 |-----------------------|--------------------------------------|----------------------------------------|
-| Endpoint              | `wss://api-feed.dhan.co`            | `wss://api-feed.dhan.co/marketdepth`  |
+| Endpoint              | `wss://api-feed.dhan.co`            | 20-lvl: `wss://depth-api-feed.dhan.co/twentydepth`, 200-lvl: `wss://full-depth-api.dhan.co/twohundreddepth` |
 | Depth levels          | 5 levels (in Full mode only)         | 20 or 200 levels                       |
-| Header bytes 9-12     | Part of payload data                 | Sequence number (20-lvl) or row count (200-lvl) |
-| Extra headers         | None                                 | Requires `client-id` header            |
+| Header size           | 8 bytes                              | 12 bytes (different byte order!)       |
+| Depth prices          | f32 (4 bytes)                        | f64 (8 bytes)                          |
 | Use case              | General market data + basic depth    | Deep order book analysis               |

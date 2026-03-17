@@ -222,7 +222,7 @@ mod reconciliation_safety {
             traded_price: 0.0,
             remaining_quantity: 0,
             filled_qty: 0,
-            average_trade_price: 0.0,
+            average_traded_price: 0.0,
             exchange_order_id: String::new(),
             exchange_time: String::new(),
             create_time: String::new(),
@@ -249,7 +249,7 @@ mod reconciliation_safety {
 
         let mut dhan = make_dhan_order("1", "TRADED");
         dhan.traded_quantity = 8; // Dhan says 8, OMS says 10
-        dhan.average_trade_price = 100.0;
+        dhan.average_traded_price = 100.0;
         let dhan = vec![dhan];
 
         let (report, updates) = reconcile_orders(&oms, &dhan);

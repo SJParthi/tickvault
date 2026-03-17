@@ -113,6 +113,7 @@ impl ExchangeSegment {
 | `CNC`      | Cash & Carry for equity deliveries      |
 | `INTRADAY` | Intraday for Equity, Futures & Options  |
 | `MARGIN`   | Carry Forward in Futures & Options      |
+| `MTF`      | Margin Trading Facility (appears in Order/Forever Order APIs, not in annexure table) |
 
 ---
 
@@ -128,6 +129,7 @@ impl ExchangeSegment {
 | `CANCELLED`    | Cancelled by user                                         |
 | `PART_TRADED`  | Partial quantity traded                                   |
 | `TRADED`       | Executed successfully                                     |
+| `EXPIRED`      | Order expired (Order Book, Forever Orders, Order Update WS — not in original annexure table) |
 
 ---
 
