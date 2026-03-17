@@ -148,11 +148,14 @@ Every rule here is checked by tests, hooks, or clippy — never by human review 
 # WebSocket Gap Enforcement
 
 ## WS-GAP-01: Disconnect Code Classification
-- `DisconnectCode::from_u16()` must handle all 11 known codes (801–814)
+- `DisconnectCode::from_u16()` must handle all 12 known codes from annexure Section 11
+- Codes: 800, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814
+  (NOTE: codes 801, 802, 803 do NOT exist in annexure — they map to Unknown)
 - `from_u16()` ↔ `as_u16()` must roundtrip for all variants
-- Reconnectable: 801, 804, 807, 810, Unknown
-- Non-reconnectable: 802, 803, 805, 806, 808, 809, 814
+- Reconnectable: 800 (InternalServerError), 807 (AccessTokenExpired), Unknown
+- Non-reconnectable: 804, 805, 806, 808, 809, 810, 811, 812, 813, 814
 - Only 807 (AccessTokenExpired) requires token refresh
+- Naming per annexure: 808=AuthenticationFailed, 809=AccessTokenInvalid, 810=ClientIdInvalid
 - Test: integration `ws_disconnect_codes::*`
 
 ## WS-GAP-02: Subscription Batching

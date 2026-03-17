@@ -34,9 +34,9 @@ pub fn parse_disconnect_packet(
 mod tests {
     use super::*;
     use dhan_live_trader_common::constants::{
-        DISCONNECT_ACCESS_TOKEN_EXPIRED, DISCONNECT_AUTH_FAILED,
-        DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED, DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS,
-        DISCONNECT_INVALID_CLIENT_ID,
+        DATA_API_ACCESS_TOKEN_EXPIRED, DATA_API_ACCESS_TOKEN_INVALID,
+        DATA_API_AUTHENTICATION_FAILED, DATA_API_EXCEEDED_ACTIVE_CONNECTIONS,
+        DATA_API_NOT_SUBSCRIBED,
     };
 
     fn make_disconnect_packet(code: u16) -> (Vec<u8>, PacketHeader) {
@@ -57,37 +57,37 @@ mod tests {
 
     #[test]
     fn test_parse_disconnect_805() {
-        let (buf, hdr) = make_disconnect_packet(DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS);
+        let (buf, hdr) = make_disconnect_packet(DATA_API_EXCEEDED_ACTIVE_CONNECTIONS);
         let code = parse_disconnect_packet(&buf, &hdr).unwrap();
         assert_eq!(code, DisconnectCode::ExceededActiveConnections);
     }
 
     #[test]
     fn test_parse_disconnect_806() {
-        let (buf, hdr) = make_disconnect_packet(DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED);
+        let (buf, hdr) = make_disconnect_packet(DATA_API_NOT_SUBSCRIBED);
         let code = parse_disconnect_packet(&buf, &hdr).unwrap();
         assert_eq!(code, DisconnectCode::DataApiSubscriptionRequired);
     }
 
     #[test]
     fn test_parse_disconnect_807() {
-        let (buf, hdr) = make_disconnect_packet(DISCONNECT_ACCESS_TOKEN_EXPIRED);
+        let (buf, hdr) = make_disconnect_packet(DATA_API_ACCESS_TOKEN_EXPIRED);
         let code = parse_disconnect_packet(&buf, &hdr).unwrap();
         assert_eq!(code, DisconnectCode::AccessTokenExpired);
     }
 
     #[test]
     fn test_parse_disconnect_808() {
-        let (buf, hdr) = make_disconnect_packet(DISCONNECT_INVALID_CLIENT_ID);
+        let (buf, hdr) = make_disconnect_packet(DATA_API_AUTHENTICATION_FAILED);
         let code = parse_disconnect_packet(&buf, &hdr).unwrap();
-        assert_eq!(code, DisconnectCode::InvalidClientId);
+        assert_eq!(code, DisconnectCode::AuthenticationFailed);
     }
 
     #[test]
     fn test_parse_disconnect_809() {
-        let (buf, hdr) = make_disconnect_packet(DISCONNECT_AUTH_FAILED);
+        let (buf, hdr) = make_disconnect_packet(DATA_API_ACCESS_TOKEN_INVALID);
         let code = parse_disconnect_packet(&buf, &hdr).unwrap();
-        assert_eq!(code, DisconnectCode::AuthenticationFailed);
+        assert_eq!(code, DisconnectCode::AccessTokenInvalid);
     }
 
     #[test]

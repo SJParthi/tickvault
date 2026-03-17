@@ -555,16 +555,17 @@ fn golden_disconnect_807_token_expired() {
 fn golden_disconnect_all_known_codes() {
     let expected = [
         (801_u16, DisconnectCode::Unknown(801)),
+        (800, DisconnectCode::InternalServerError),
         (802, DisconnectCode::Unknown(802)),
         (803, DisconnectCode::Unknown(803)),
-        (804, DisconnectCode::Unknown(804)),
+        (804, DisconnectCode::InstrumentsExceedLimit),
         (805, DisconnectCode::ExceededActiveConnections),
         (806, DisconnectCode::DataApiSubscriptionRequired),
         (807, DisconnectCode::AccessTokenExpired),
-        (808, DisconnectCode::InvalidClientId),
-        (809, DisconnectCode::AuthenticationFailed),
-        (810, DisconnectCode::Unknown(810)),
-        (814, DisconnectCode::Unknown(814)),
+        (808, DisconnectCode::AuthenticationFailed),
+        (809, DisconnectCode::AccessTokenInvalid),
+        (810, DisconnectCode::ClientIdInvalid),
+        (814, DisconnectCode::InvalidRequest),
     ];
 
     for (code, expected_variant) in expected {

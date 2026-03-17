@@ -1,8 +1,8 @@
 # Implementation Plan: Fix All Audit Discrepancies Between Dhan Reference Docs and Code
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-03-17
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Summary
 
@@ -10,19 +10,19 @@ The comprehensive audit found zero bugs but identified discrepancies where code 
 
 ## Plan Items
 
-- [ ] **1. Fix disconnect code constant names (808/809 swap) + add 800,804,810-814**
+- [x] **1. Fix disconnect code constant names (808/809 swap) + add 800,804,810-814**
   - Files: `crates/common/src/constants.rs`
   - Rationale: Reference doc says 808="Authentication Failed", 809="Access token invalid", 810="Client ID invalid". Current code has 808=InvalidClientId and 809=AuthFailed — names are swapped vs reference.
   - Add constants for all 12 Data API error codes from annexure Section 11: 800, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814
   - Tests: compile-time usage in DisconnectCode
 
-- [ ] **2. Add missing feed/interval constants**
+- [x] **2. Add missing feed/interval constants**
   - Files: `crates/common/src/constants.rs`
   - Add: `FEED_REQUEST_CONNECT = 11` (annexure Section 2, code 11=Connect Feed)
   - Add: `DHAN_CANDLE_INTERVAL_25MIN = "25"` (reference doc 05-historical-data.md lists "25" as valid interval)
   - Tests: none needed (constants only)
 
-- [ ] **3. Update DisconnectCode enum with all 12 reference doc variants**
+- [x] **3. Update DisconnectCode enum with all 12 reference doc variants**
   - Files: `crates/core/src/websocket/types.rs`
   - Add named variants: InternalServerError(800), InstrumentsExceedLimit(804), ClientIdInvalid(810), InvalidExpiryDate(811), InvalidDateFormat(812), InvalidSecurityId(813), InvalidRequest(814)
   - Fix naming: 808→AuthenticationFailed, 809→AccessTokenInvalid
@@ -30,7 +30,7 @@ The comprehensive audit found zero bugs but identified discrepancies where code 
   - Only 807 requires token refresh (unchanged)
   - Tests: update all unit tests in types.rs
 
-- [ ] **4. Add documentation comments on SDK-derived / practical values**
+- [x] **4. Add documentation comments on SDK-derived / practical values**
   - Files: `crates/common/src/constants.rs`, `crates/common/src/order_types.rs`
   - RESPONSE_CODE_MARKET_DEPTH=3: clarify "Not in annexure Section 3 (gap between Ticker(2) and Quote(4)); documented in DhanHQ Python SDK"
   - OrderStatus::Confirmed: clarify "Not in annexure Section 5; observed in Dhan WS order update responses"
@@ -38,22 +38,22 @@ The comprehensive audit found zero bugs but identified discrepancies where code 
   - ProductType::Co, Bo: clarify "Not in annexure Section 4; from WS order update single-char Product codes (V=CO, B=BO)"
   - Tests: none (doc comments only)
 
-- [ ] **5. Update gap enforcement rule to match reference doc**
+- [x] **5. Update gap enforcement rule to match reference doc**
   - Files: `.claude/rules/project/gap-enforcement.md`
   - Fix WS-GAP-01: codes 801,802,803 don't exist in annexure Section 11. Correct list is 800,804,805,806,807,808,809,810,811,812,813,814 (12 codes)
   - Fix reconnectable/non-reconnectable classification to match reference doc semantics
 
-- [ ] **6. Update gap enforcement tests**
+- [x] **6. Update gap enforcement tests**
   - Files: `crates/core/tests/gap_enforcement.rs`
   - Update `roundtrip_all_known_codes` to use correct codes from reference doc
   - Update reconnectable/non-reconnectable tests to match new named variants
   - Tests: `roundtrip_all_known_codes`, `reconnectable_codes`, `non_reconnectable_codes`, `only_807_requires_token_refresh`
 
-- [ ] **7. Fix CLAUDE.md market status packet size**
+- [x] **7. Fix CLAUDE.md market status packet size**
   - Files: `CLAUDE.md`
   - Change "MarketStatus (code 7) = **10 bytes**" to "**8 bytes**" (matches SDK `<BHBI>` = 8 bytes, code constant, and parser)
 
-- [ ] **8. Update disconnect parser to use new constant names**
+- [x] **8. Update disconnect parser to use new constant names**
   - Files: `crates/core/src/parser/disconnect.rs` (if it references renamed constants)
   - Ensure all imports/usages of renamed disconnect constants compile
 

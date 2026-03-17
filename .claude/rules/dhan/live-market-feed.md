@@ -30,7 +30,7 @@
    - Quote (code 4) = **50 bytes**
    - OI (code 5) = **12 bytes**
    - PrevClose (code 6) = **16 bytes**
-   - MarketStatus (code 7) = **10 bytes**
+   - MarketStatus (code 7) = **8 bytes** (header only, no payload; SDK format `<BHBI>`)
    - Full (code 8) = **162 bytes**
    - Disconnect (code 50) = **10 bytes**
 

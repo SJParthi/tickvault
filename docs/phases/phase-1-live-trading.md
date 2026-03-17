@@ -463,7 +463,7 @@ Bytes 12-15: Previous OI (u32 LE)
 
 **When received:** Sent once per instrument on subscription or market open. Used to calculate day change percentages.
 
-### Response Code 7 — Market Status (10 bytes total)
+### Response Code 7 — Market Status (8 bytes total, header only)
 
 ```
 Bytes 0-7:   Header (response_code=7)

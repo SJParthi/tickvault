@@ -23,6 +23,9 @@ pub enum OrderStatus {
     /// Pending at exchange.
     Pending,
     /// Confirmed/open in exchange order book.
+    /// NOTE: Not in annexure Section 5. Observed in Dhan WS order update responses
+    /// and REST Order Book API. Also note: Forever Orders use a distinct `CONFIRM`
+    /// status (per docs/dhan-ref/07b-forever-order.md) — different from `CONFIRMED`.
     Confirmed,
     /// Partially executed — some quantity filled, remainder still open.
     PartTraded,
@@ -33,6 +36,8 @@ pub enum OrderStatus {
     /// Rejected by exchange or RMS.
     Rejected,
     /// Expired at end of validity.
+    /// NOTE: Not in annexure Section 5. Used in Order Book API
+    /// (docs/dhan-ref/07-orders.md) and WS order update status subset.
     Expired,
     /// Super Order closed (all legs complete).
     Closed,
@@ -99,8 +104,12 @@ pub enum ProductType {
     /// Margin Trading Facility — broker-funded leverage.
     Mtf,
     /// Cover Order — with stop-loss.
+    /// NOTE: Not in annexure Section 4 (which lists CNC, INTRADAY, MARGIN only).
+    /// Present in WS order update single-char Product codes: "V" = CO.
     Co,
     /// Bracket Order — with target + stop-loss.
+    /// NOTE: Not in annexure Section 4 (which lists CNC, INTRADAY, MARGIN only).
+    /// Present in WS order update single-char Product codes: "B" = BO.
     Bo,
 }
 

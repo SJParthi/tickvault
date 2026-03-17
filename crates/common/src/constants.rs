@@ -107,24 +107,68 @@ pub const EXCHANGE_SEGMENT_BSE_CURRENCY: u8 = 7;
 pub const EXCHANGE_SEGMENT_BSE_FNO: u8 = 8;
 
 // ---------------------------------------------------------------------------
-// Dhan WebSocket V2 — Disconnect Error Codes
-// Source: DhanHQ Python SDK v2 on_close handler (src/dhanhq/marketfeed.py)
+// Dhan Data API Error Codes (WebSocket disconnect + REST error responses)
+// Source: docs/dhan-ref/08-annexure-enums.md Section 11
+// These codes appear in WebSocket disconnect packets (code 50) and REST
+// error responses. All 12 codes from the reference doc are defined here.
 // ---------------------------------------------------------------------------
 
-/// 805 — Active WebSocket connections exceeded (max 5 per account).
-pub const DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS: u16 = 805;
+/// 800 — Internal Server Error. Retry with backoff.
+pub const DATA_API_INTERNAL_SERVER_ERROR: u16 = 800;
 
-/// 806 — Data API subscription required (plan/subscription issue).
-pub const DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED: u16 = 806;
+/// 804 — Requested number of instruments exceeds limit.
+pub const DATA_API_INSTRUMENTS_EXCEED_LIMIT: u16 = 804;
+
+/// 805 — Too many requests/connections — may result in user being blocked.
+/// STOP ALL connections for 60s, then audit connection count.
+pub const DATA_API_EXCEEDED_ACTIVE_CONNECTIONS: u16 = 805;
+
+/// 806 — Data APIs not subscribed (plan/subscription issue).
+pub const DATA_API_NOT_SUBSCRIBED: u16 = 806;
 
 /// 807 — Access token expired. Refresh token, then reconnect.
-pub const DISCONNECT_ACCESS_TOKEN_EXPIRED: u16 = 807;
+pub const DATA_API_ACCESS_TOKEN_EXPIRED: u16 = 807;
 
-/// 808 — Invalid client ID. Check SSM credentials.
-pub const DISCONNECT_INVALID_CLIENT_ID: u16 = 808;
+/// 808 — Authentication Failed — Client ID or Access Token invalid.
+/// Per annexure Section 11: this is "Authentication Failed", NOT "Invalid Client ID".
+pub const DATA_API_AUTHENTICATION_FAILED: u16 = 808;
 
-/// 809 — Authentication failed. Invalid credentials.
-pub const DISCONNECT_AUTH_FAILED: u16 = 809;
+/// 809 — Access token invalid.
+/// Per annexure Section 11: this is "Access token invalid", NOT "Authentication Failed".
+pub const DATA_API_ACCESS_TOKEN_INVALID: u16 = 809;
+
+/// 810 — Client ID invalid.
+/// Per annexure Section 11: this is where "Client ID invalid" lives (NOT 808).
+pub const DATA_API_CLIENT_ID_INVALID: u16 = 810;
+
+/// 811 — Invalid Expiry Date.
+pub const DATA_API_INVALID_EXPIRY_DATE: u16 = 811;
+
+/// 812 — Invalid Date Format.
+pub const DATA_API_INVALID_DATE_FORMAT: u16 = 812;
+
+/// 813 — Invalid SecurityId.
+pub const DATA_API_INVALID_SECURITY_ID: u16 = 813;
+
+/// 814 — Invalid Request.
+pub const DATA_API_INVALID_REQUEST: u16 = 814;
+
+// Legacy aliases for backward compatibility with existing imports.
+// These map to the same numeric values; only the names changed.
+/// Legacy alias for `DATA_API_EXCEEDED_ACTIVE_CONNECTIONS` (805).
+pub const DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS: u16 = DATA_API_EXCEEDED_ACTIVE_CONNECTIONS;
+/// Legacy alias for `DATA_API_NOT_SUBSCRIBED` (806).
+pub const DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED: u16 = DATA_API_NOT_SUBSCRIBED;
+/// Legacy alias for `DATA_API_ACCESS_TOKEN_EXPIRED` (807).
+pub const DISCONNECT_ACCESS_TOKEN_EXPIRED: u16 = DATA_API_ACCESS_TOKEN_EXPIRED;
+/// Legacy alias for `DATA_API_AUTHENTICATION_FAILED` (808).
+/// NOTE: Previously named `DISCONNECT_INVALID_CLIENT_ID` — renamed to match
+/// annexure Section 11 which says 808 = "Authentication Failed".
+pub const DISCONNECT_AUTHENTICATION_FAILED: u16 = DATA_API_AUTHENTICATION_FAILED;
+/// Legacy alias for `DATA_API_ACCESS_TOKEN_INVALID` (809).
+/// NOTE: Previously named `DISCONNECT_AUTH_FAILED` — renamed to match
+/// annexure Section 11 which says 809 = "Access token invalid".
+pub const DISCONNECT_ACCESS_TOKEN_INVALID: u16 = DATA_API_ACCESS_TOKEN_INVALID;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
@@ -140,6 +184,9 @@ pub const RESPONSE_CODE_TICKER: u8 = 2;
 /// Response code for market depth standalone packet (112 bytes).
 /// Format: `<BHBIf100s>` — Header(8) + LTP(f32) + Depth(5×20 bytes).
 /// Dhan Python SDK: `process_market_depth(data)`.
+///
+/// NOTE: Not in annexure Section 3 (gap between Ticker(2) and Quote(4)).
+/// Documented and handled in DhanHQ Python SDK v2 `process_market_depth()`.
 pub const RESPONSE_CODE_MARKET_DEPTH: u8 = 3;
 
 /// Response code for quote packet (50 bytes).
@@ -183,6 +230,10 @@ pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
 // Unsubscribe = subscribe_code + 1: 16 (Ticker), 18 (Quote), 22 (Full).
 // Disconnect = 12 (closes the WebSocket connection).
 // ---------------------------------------------------------------------------
+
+/// Connect Feed request code.
+/// Annexure Section 2: code 11 = Connect Feed.
+pub const FEED_REQUEST_CONNECT: u8 = 11;
 
 /// Disconnect request code (closes the WebSocket connection).
 pub const FEED_REQUEST_DISCONNECT: u8 = 12;
@@ -877,6 +928,10 @@ pub const DHAN_CANDLE_INTERVAL_5MIN: &str = "5";
 
 /// 15-minute candle interval identifier for Dhan intraday API.
 pub const DHAN_CANDLE_INTERVAL_15MIN: &str = "15";
+
+/// 25-minute candle interval identifier for Dhan intraday API.
+/// Per docs/dhan-ref/05-historical-data.md: valid intervals are "1", "5", "15", "25", "60".
+pub const DHAN_CANDLE_INTERVAL_25MIN: &str = "25";
 
 /// 60-minute (1-hour) candle interval identifier for Dhan intraday API.
 pub const DHAN_CANDLE_INTERVAL_60MIN: &str = "60";
@@ -1597,12 +1652,29 @@ mod tests {
     }
 
     #[test]
-    fn test_disconnect_codes_match_dhan_spec() {
+    fn test_data_api_error_codes_match_annexure_section_11() {
+        // All 12 codes from docs/dhan-ref/08-annexure-enums.md Section 11
+        assert_eq!(DATA_API_INTERNAL_SERVER_ERROR, 800);
+        assert_eq!(DATA_API_INSTRUMENTS_EXCEED_LIMIT, 804);
+        assert_eq!(DATA_API_EXCEEDED_ACTIVE_CONNECTIONS, 805);
+        assert_eq!(DATA_API_NOT_SUBSCRIBED, 806);
+        assert_eq!(DATA_API_ACCESS_TOKEN_EXPIRED, 807);
+        assert_eq!(DATA_API_AUTHENTICATION_FAILED, 808);
+        assert_eq!(DATA_API_ACCESS_TOKEN_INVALID, 809);
+        assert_eq!(DATA_API_CLIENT_ID_INVALID, 810);
+        assert_eq!(DATA_API_INVALID_EXPIRY_DATE, 811);
+        assert_eq!(DATA_API_INVALID_DATE_FORMAT, 812);
+        assert_eq!(DATA_API_INVALID_SECURITY_ID, 813);
+        assert_eq!(DATA_API_INVALID_REQUEST, 814);
+    }
+
+    #[test]
+    fn test_disconnect_legacy_aliases_match_primary_constants() {
         assert_eq!(DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS, 805);
         assert_eq!(DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED, 806);
         assert_eq!(DISCONNECT_ACCESS_TOKEN_EXPIRED, 807);
-        assert_eq!(DISCONNECT_INVALID_CLIENT_ID, 808);
-        assert_eq!(DISCONNECT_AUTH_FAILED, 809);
+        assert_eq!(DISCONNECT_AUTHENTICATION_FAILED, 808);
+        assert_eq!(DISCONNECT_ACCESS_TOKEN_INVALID, 809);
     }
 
     #[test]
