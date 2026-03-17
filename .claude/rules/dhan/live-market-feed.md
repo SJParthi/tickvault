@@ -30,7 +30,7 @@
    - Quote (code 4) = **50 bytes**
    - OI (code 5) = **12 bytes**
    - PrevClose (code 6) = **16 bytes**
-   - MarketStatus (code 7) = **10 bytes**
+   - MarketStatus (code 7) = **8 bytes** (header only, no payload — Python SDK also reads only 8)
    - Full (code 8) = **162 bytes**
    - Disconnect (code 50) = **10 bytes**
 
@@ -52,12 +52,12 @@
    | Byte (0-based) | Type | Field |
    |---|---|---|
    | `8-11` | f32 LE | LTP |
-   | `12-13` | i16 LE | LTQ |
+   | `12-13` | u16 LE | LTQ |
    | `14-17` | i32 LE | LTT |
    | `18-21` | f32 LE | ATP |
-   | `22-25` | i32 LE | Volume |
-   | `26-29` | i32 LE | Total Sell Qty |
-   | `30-33` | i32 LE | Total Buy Qty |
+   | `22-25` | u32 LE | Volume |
+   | `26-29` | u32 LE | Total Sell Qty |
+   | `30-33` | u32 LE | Total Buy Qty |
    | `34-37` | f32 LE | Day Open |
    | `38-41` | f32 LE | Day Close (post-market only) |
    | `42-45` | f32 LE | Day High |
@@ -72,15 +72,15 @@
     | Byte (0-based) | Type | Field |
     |---|---|---|
     | `8-11` | f32 LE | LTP |
-    | `12-13` | i16 LE | LTQ |
+    | `12-13` | u16 LE | LTQ |
     | `14-17` | i32 LE | LTT |
     | `18-21` | f32 LE | ATP |
-    | `22-25` | i32 LE | Volume |
-    | `26-29` | i32 LE | Total Sell Qty |
-    | `30-33` | i32 LE | Total Buy Qty |
-    | `34-37` | i32 LE | OI (Derivatives only) |
-    | `38-41` | i32 LE | Highest OI (NSE_FNO only) |
-    | `42-45` | i32 LE | Lowest OI (NSE_FNO only) |
+    | `22-25` | u32 LE | Volume |
+    | `26-29` | u32 LE | Total Sell Qty |
+    | `30-33` | u32 LE | Total Buy Qty |
+    | `34-37` | u32 LE | OI (Derivatives only) |
+    | `38-41` | u32 LE | Highest OI (NSE_FNO only) |
+    | `42-45` | u32 LE | Lowest OI (NSE_FNO only) |
     | `46-49` | f32 LE | Day Open |
     | `50-53` | f32 LE | Day Close (post-market only) |
     | `54-57` | f32 LE | Day High |
@@ -91,10 +91,10 @@
     Each level (byte offset within level, 0-based):
     | Offset | Type | Field |
     |---|---|---|
-    | `0-3` | i32 LE | Bid Quantity |
-    | `4-7` | i32 LE | Ask Quantity |
-    | `8-9` | i16 LE | Bid Orders |
-    | `10-11` | i16 LE | Ask Orders |
+    | `0-3` | u32 LE | Bid Quantity |
+    | `4-7` | u32 LE | Ask Quantity |
+    | `8-9` | u16 LE | Bid Orders |
+    | `10-11` | u16 LE | Ask Orders |
     | `12-15` | f32 LE | Bid Price |
     | `16-19` | f32 LE | Ask Price |
     Parse as: `for level in 0..5 { offset = 62 + (level * 20); ... }`
@@ -109,10 +109,10 @@
 
 14. **Field types must match exactly.**
     - LTP, ATP, prices: `f32` (NOT f64 — that's Full Market Depth)
-    - Volume, OI, quantities: `i32`
-    - LTQ: `i16`
-    - Orders count: `i16`
-    - SecurityId: `i32`
+    - Volume, OI, quantities: `u32` (unsigned — quantities/OI cannot be negative)
+    - LTQ: `u16` (unsigned)
+    - Orders count: `u16` (unsigned)
+    - SecurityId: `i32` (signed in header) / `u32` (in ParsedTick)
 
 15. **Subscription messages are JSON with STRING security IDs.**
     - `SecurityId` must serialize as `"1333"` not `1333`

@@ -158,7 +158,7 @@ pub fn build_twenty_depth_subscription_messages(
 
 /// Builds unsubscription JSON messages for the 20-level depth WebSocket feed.
 ///
-/// Uses RequestCode 24 (= 23 + 1).
+/// Uses RequestCode 25 (Dhan Annexure: UnsubscribeFullDepth = 25).
 pub fn build_twenty_depth_unsubscription_messages(
     instruments: &[InstrumentSubscription],
     batch_size: usize,
@@ -436,11 +436,11 @@ mod tests {
     }
 
     #[test]
-    fn test_twenty_depth_unsubscription_request_code_24() {
+    fn test_twenty_depth_unsubscription_request_code_25() {
         let instruments = make_instruments(3);
         let messages = build_twenty_depth_unsubscription_messages(&instruments, 100);
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("\"RequestCode\":24"));
+        assert!(messages[0].contains("\"RequestCode\":25"));
     }
 
     #[test]

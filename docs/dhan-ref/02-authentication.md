@@ -88,6 +88,8 @@ curl --location 'https://auth.dhan.co/app/consumeApp-consent?tokenId={Token ID}'
 
 Response: access token + expiry time.
 
+> **SDK note:** DhanHQ Python SDK (v2.2.0) uses GET for this endpoint instead of POST (the curl example above omits `-X POST`). The HTTP method may be flexible; verify with actual API behavior.
+
 ---
 
 ## 4. Partner Authentication

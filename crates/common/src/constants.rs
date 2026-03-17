@@ -321,7 +321,9 @@ pub const MAX_INSTRUMENTS_PER_TWO_HUNDRED_DEPTH_CONNECTION: usize = 1;
 pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
 /// Unsubscription request code for 20-level depth feed.
-pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 24;
+/// Dhan Annexure: UnsubscribeFullDepth = 25. There is NO code 24.
+/// Python SDK (fulldepth.py) also uses 25 for unsubscribe.
+pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — Header Byte Offsets

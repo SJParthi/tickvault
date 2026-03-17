@@ -96,10 +96,11 @@ impl ExchangeSegment {
 |------|------------------------|
 | `1`  | Index Packet           |
 | `2`  | Ticker Packet          |
+| `3`  | Market Depth Packet (v1 legacy — deprecated in v2, replaced by Full packet code 8. Python SDK still handles it for backward compat.) |
 | `4`  | Quote Packet           |
 | `5`  | OI Packet              |
 | `6`  | Prev Close Packet      |
-| `7`  | Market Status Packet   |
+| `7`  | Market Status Packet (8 bytes, header only — no additional payload) |
 | `8`  | Full Packet            |
 | `50` | Feed Disconnect        |
 
