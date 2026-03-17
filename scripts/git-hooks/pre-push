@@ -17,11 +17,10 @@
 #   5. Test count guard            [skippable if commit-verified]
 #   6. cargo audit (CVEs + yanked)
 #   7. cargo deny check (license + advisory)
-#   8. Coverage ratchet guard
-#   9. Loom concurrency tests
-#  10. Data integrity guard (price precision)
-#  11. Pub fn test guard (every pub fn has a test)
-#  12. Financial test guard (price/money fns have boundary tests)
+#   8. Loom concurrency tests
+#   9. Data integrity guard (price precision)
+#  10. Pub fn test guard (every pub fn has a test)
+#  11. Financial test guard (price/money fns have boundary tests)
 #
 # Install: git config core.hooksPath scripts/git-hooks
 # =============================================================================
@@ -142,7 +141,7 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# Gates 6-9: Push-only gates (always run)
+# Gates 6-8: Push-only gates (always run)
 # ─────────────────────────────────────────────
 
 # Gate 6: cargo audit
@@ -289,7 +288,7 @@ echo "$HEAD_CURRENT $(date +%s) $TEST_COUNT" > "$CLAUDE_HOOKS/.last-quality-pass
 
 if [ "$COMMIT_VERIFIED" = "true" ]; then
   echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  PUSH ALLOWED (fast path — 7 gates only)     ║" >&2
+  echo "║  PUSH ALLOWED (fast path — 6 gates only)     ║" >&2
   echo "╚══════════════════════════════════════════════╝" >&2
 else
   echo "╔══════════════════════════════════════════════╗" >&2
