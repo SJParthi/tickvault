@@ -415,6 +415,130 @@ impl TokenManager {
     }
 
     // -----------------------------------------------------------------------
+    // Public — User Profile & Pre-Market Validation
+    // Source: docs/dhan-ref/02-authentication.md
+    // -----------------------------------------------------------------------
+
+    /// Fetches the user profile from `GET /v2/profile`.
+    ///
+    /// Returns `UserProfileResponse` containing `dataPlan`, `activeSegment`,
+    /// `tokenValidity`, etc. Used by `pre_market_check()` for pre-trading
+    /// validation at 08:45 IST.
+    #[instrument(skip_all, name = "get_user_profile")]
+    // TEST-EXEMPT: requires live HTTP server + valid token; types tested in auth::types::tests
+    pub async fn get_user_profile(
+        &self,
+    ) -> Result<super::types::UserProfileResponse, ApplicationError> {
+        // Load token and extract access token string while guard is alive
+        let access_token_value = {
+            let token_guard = self.token.load();
+            let token_state = token_guard.as_ref().as_ref().ok_or_else(|| {
+                ApplicationError::AuthenticationFailed {
+                    reason: "no access token available for profile request".to_string(),
+                }
+            })?;
+            token_state.access_token().expose_secret().to_string()
+        };
+
+        let url = format!(
+            "{}{}",
+            self.rest_api_base_url,
+            dhan_live_trader_common::constants::DHAN_USER_PROFILE_PATH
+        );
+
+        let response = self
+            .http_client
+            .get(&url)
+            .header("access-token", &access_token_value)
+            .send()
+            .await
+            .map_err(|err| ApplicationError::AuthenticationFailed {
+                reason: format!("profile request failed: {err}"),
+            })?;
+
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!("profile request HTTP {status}: {body_text}"),
+            });
+        }
+
+        serde_json::from_str(&body_text).map_err(|err| ApplicationError::AuthenticationFailed {
+            reason: format!("profile response parse error: {err}"),
+        })
+    }
+
+    /// Pre-market validation at 08:45 IST.
+    ///
+    /// Checks:
+    /// 1. `dataPlan == "Active"` — required for market data WebSocket access
+    /// 2. `activeSegment` contains `"Derivative"` — required for F&O trading
+    /// 3. Token has > 4 hours until expiry — prevents token death during market hours
+    ///
+    /// On failure: returns error for CRITICAL alert via Telegram + token rotation attempt.
+    #[instrument(skip_all, name = "pre_market_check")]
+    // TEST-EXEMPT: requires live HTTP server + valid token; calls get_user_profile()
+    pub async fn pre_market_check(&self) -> Result<(), ApplicationError> {
+        let profile = self.get_user_profile().await?;
+
+        // Check 1: data plan must be Active
+        if profile.data_plan != "Active" {
+            error!(
+                data_plan = %profile.data_plan,
+                "pre-market check FAILED: data plan is not Active"
+            );
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "data plan is '{}', must be 'Active' for market data access",
+                    profile.data_plan
+                ),
+            });
+        }
+
+        // Check 2: active segment must contain "Derivative" for F&O
+        if !profile.active_segment.contains("Derivative") {
+            error!(
+                active_segment = %profile.active_segment,
+                "pre-market check FAILED: Derivative segment not active"
+            );
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!(
+                    "active segment '{}' does not contain 'Derivative' — F&O trading not enabled",
+                    profile.active_segment
+                ),
+            });
+        }
+
+        // Check 3: token must have > 4 hours until expiry
+        let token_guard = self.token.load();
+        if let Some(token_state) = token_guard.as_ref().as_ref() {
+            let remaining = token_state.time_until_refresh(0);
+            let four_hours = Duration::from_secs(4 * 3600);
+            if remaining < four_hours {
+                warn!(
+                    remaining_secs = remaining.as_secs(),
+                    "pre-market check WARNING: token has less than 4 hours until expiry"
+                );
+                return Err(ApplicationError::AuthenticationFailed {
+                    reason: format!(
+                        "token expires in {} seconds — less than 4 hours until expiry, rotate token",
+                        remaining.as_secs()
+                    ),
+                });
+            }
+        }
+
+        info!(
+            data_plan = %profile.data_plan,
+            active_segment = %profile.active_segment,
+            "pre-market check PASSED"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Private — Token Acquisition
     // -----------------------------------------------------------------------
 

@@ -3,8 +3,9 @@
 //! These types are internal to the parser module. The `ParsedTick` and
 //! `MarketDepthLevel` types live in `common::tick_types` for cross-crate use.
 
-use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
+use dhan_live_trader_common::tick_types::{DeepDepthLevel, MarketDepthLevel, ParsedTick};
 
+use crate::parser::deep_depth::DepthSide;
 use crate::websocket::types::DisconnectCode;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +58,15 @@ pub enum ParsedFrame {
         security_id: u32,
         exchange_segment_code: u8,
     },
+    /// Deep depth packet (20-level or 200-level) — one side (bid or ask).
+    DeepDepth {
+        security_id: u32,
+        exchange_segment_code: u8,
+        side: DepthSide,
+        levels: Vec<DeepDepthLevel>,
+        message_sequence: u32,
+        received_at_nanos: i64,
+    },
     /// Server-initiated disconnect with reason code.
     Disconnect(DisconnectCode),
 }
@@ -94,6 +104,36 @@ mod tests {
     fn test_parse_error_display_unknown_response_code() {
         let err = ParseError::UnknownResponseCode(99);
         assert_eq!(err.to_string(), "unknown response code: 99");
+    }
+
+    #[test]
+    fn test_parsed_frame_deep_depth_variant() {
+        let frame = ParsedFrame::DeepDepth {
+            security_id: 52432,
+            exchange_segment_code: 2,
+            side: DepthSide::Bid,
+            levels: vec![DeepDepthLevel {
+                price: 24500.0,
+                quantity: 1000,
+                orders: 50,
+            }],
+            message_sequence: 1,
+            received_at_nanos: 999,
+        };
+        match frame {
+            ParsedFrame::DeepDepth {
+                security_id,
+                side,
+                levels,
+                ..
+            } => {
+                assert_eq!(security_id, 52432);
+                assert_eq!(side, DepthSide::Bid);
+                assert_eq!(levels.len(), 1);
+                assert!((levels[0].price - 24500.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
     }
 
     #[test]

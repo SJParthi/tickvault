@@ -172,6 +172,27 @@ pub struct SubscriptionRequest {
     pub instrument_list: Vec<InstrumentSubscription>,
 }
 
+/// JSON subscription request for 200-level depth (flat structure, no InstrumentList).
+///
+/// 200-level depth supports only 1 instrument per connection and uses a
+/// different JSON structure from the standard feed and 20-level depth.
+///
+/// ```json
+/// { "RequestCode": 23, "ExchangeSegment": "NSE_EQ", "SecurityId": "1333" }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoHundredDepthSubscriptionRequest {
+    /// Feed request code (23 = subscribe, 25 = unsubscribe).
+    #[serde(rename = "RequestCode")]
+    pub request_code: u8,
+    /// Exchange segment string (e.g., "NSE_EQ", "NSE_FNO").
+    #[serde(rename = "ExchangeSegment")]
+    pub exchange_segment: String,
+    /// Security ID as string (Dhan requires string in JSON).
+    #[serde(rename = "SecurityId")]
+    pub security_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket Error
 // ---------------------------------------------------------------------------
@@ -619,5 +640,61 @@ mod tests {
         assert_eq!(health.connection_id, 0);
         assert_eq!(health.state, ConnectionState::Disconnected);
         assert_eq!(health.subscribed_count, 0);
+    }
+
+    // --- TwoHundredDepthSubscriptionRequest ---
+
+    #[test]
+    fn test_two_hundred_depth_subscription_serialize() {
+        let request = TwoHundredDepthSubscriptionRequest {
+            request_code: 23,
+            exchange_segment: "NSE_EQ".to_string(),
+            security_id: "1333".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"RequestCode\":23"));
+        assert!(json.contains("\"ExchangeSegment\":\"NSE_EQ\""));
+        assert!(json.contains("\"SecurityId\":\"1333\""));
+        // Must NOT contain InstrumentList or InstrumentCount
+        assert!(!json.contains("InstrumentList"));
+        assert!(!json.contains("InstrumentCount"));
+    }
+
+    #[test]
+    fn test_two_hundred_depth_subscription_deserialize_roundtrip() {
+        let request = TwoHundredDepthSubscriptionRequest {
+            request_code: 23,
+            exchange_segment: "NSE_FNO".to_string(),
+            security_id: "52432".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let deserialized: TwoHundredDepthSubscriptionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.request_code, 23);
+        assert_eq!(deserialized.exchange_segment, "NSE_FNO");
+        assert_eq!(deserialized.security_id, "52432");
+    }
+
+    #[test]
+    fn test_two_hundred_depth_unsubscribe_request_code_25() {
+        let request = TwoHundredDepthSubscriptionRequest {
+            request_code: 25,
+            exchange_segment: "NSE_EQ".to_string(),
+            security_id: "2885".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"RequestCode\":25"));
+    }
+
+    #[test]
+    fn test_two_hundred_depth_security_id_is_string() {
+        let request = TwoHundredDepthSubscriptionRequest {
+            request_code: 23,
+            exchange_segment: "NSE_EQ".to_string(),
+            security_id: "2885".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        // SecurityId must be string, not number
+        assert!(json.contains("\"SecurityId\":\"2885\""));
+        assert!(!json.contains("\"SecurityId\":2885"));
     }
 }

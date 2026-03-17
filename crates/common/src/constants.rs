@@ -320,8 +320,9 @@ pub const MAX_INSTRUMENTS_PER_TWO_HUNDRED_DEPTH_CONNECTION: usize = 1;
 /// Subscription request code for 20-level depth feed.
 pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
-/// Unsubscription request code for 20-level depth feed.
-pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 24;
+/// Unsubscription request code for full market depth feed (both 20 and 200 level).
+/// Per annexure-enums.md: UnsubscribeFullDepth is 25, NOT 24.
+pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — Header Byte Offsets
@@ -798,6 +799,71 @@ pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
 /// Path for daily candle data (appended to rest_api_base_url).
 /// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
 pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
+
+// ---------------------------------------------------------------------------
+// Authentication — User Profile & IP Management Endpoints
+// ---------------------------------------------------------------------------
+
+/// Path for user profile (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/profile>
+pub const DHAN_USER_PROFILE_PATH: &str = "/profile";
+
+/// Path to set static IP for order APIs (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/ip/setIP>
+pub const DHAN_SET_IP_PATH: &str = "/ip/setIP";
+
+/// Path to modify static IP for order APIs (appended to rest_api_base_url).
+/// Endpoint: PUT <https://api.dhan.co/v2/ip/modifyIP>
+/// WARNING: 7-day cooldown after modification.
+pub const DHAN_MODIFY_IP_PATH: &str = "/ip/modifyIP";
+
+/// Path to get current static IP configuration (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/ip/getIP>
+pub const DHAN_GET_IP_PATH: &str = "/ip/getIP";
+
+// ---------------------------------------------------------------------------
+// Portfolio & Positions — REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for holdings list (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/holdings>
+pub const DHAN_HOLDINGS_PATH: &str = "/holdings";
+
+/// Path for positions list (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/positions>
+pub const DHAN_POSITIONS_PATH: &str = "/positions";
+
+/// Path for position conversion (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/positions/convert>
+pub const DHAN_POSITIONS_CONVERT_PATH: &str = "/positions/convert";
+
+// ---------------------------------------------------------------------------
+// Funds & Margin — REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for single-instrument margin calculator (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/margincalculator>
+pub const DHAN_MARGIN_CALCULATOR_PATH: &str = "/margincalculator";
+
+/// Path for multi-instrument margin calculator (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/margincalculator/multi>
+pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
+
+/// Path for fund limit query (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
+pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
+
+// ---------------------------------------------------------------------------
+// Full Market Depth — WebSocket Base URLs
+// ---------------------------------------------------------------------------
+
+/// 20-level depth WebSocket base URL.
+/// Full URL: wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
+pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/twentydepth"; // APPROVED: infrastructure constant
+
+/// 200-level depth WebSocket base URL.
+/// Full URL: wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
+pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth"; // APPROVED: infrastructure constant
 
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants

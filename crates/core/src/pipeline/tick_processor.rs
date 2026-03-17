@@ -511,6 +511,21 @@ pub async fn run_tick_processor(
                 m_market_status_updates.increment(1);
                 info!(exchange_segment_code, security_id, "market status update");
             }
+            ParsedFrame::DeepDepth {
+                security_id,
+                exchange_segment_code,
+                side,
+                ..
+            } => {
+                // Deep depth frames are from a separate WS connection.
+                // Log receipt; full order book assembly is done downstream.
+                debug!(
+                    security_id,
+                    exchange_segment_code,
+                    ?side,
+                    "deep depth frame received"
+                );
+            }
             ParsedFrame::Disconnect(code) => {
                 m_disconnects.increment(1);
                 error!(
