@@ -1,4 +1,4 @@
-# Implementation Plan: Auth + Portfolio + Funds/Margin — Full E2E Coverage
+# Implementation Plan: Auth + Portfolio + Funds/Margin + Full Market Depth — Full E2E Coverage
 
 **Status:** DRAFT
 **Date:** 2026-03-17
@@ -6,8 +6,12 @@
 
 ## Summary
 
-Implement 100% API coverage for Authentication (gaps), Portfolio & Positions, and Funds & Margin.
-Historical Data is already 100% complete — no work needed.
+Implement 100% API coverage for:
+- Authentication (fill remaining gaps)
+- Portfolio & Positions (build from ~15% → 100%)
+- Funds & Margin (build from 0% → 100%)
+- Full Market Depth 20/200-level integration (parsers done, add dispatch + subscription + validation)
+- Historical Data (already 100% — verify only)
 
 ## Plan Items
 
@@ -40,10 +44,11 @@ Historical Data is already 100% complete — no work needed.
   - Tests: `test_set_ip_request_format`, `test_get_ip_response_parsing`
 
 - [ ] A6. Add endpoint path constants to `crates/common/src/constants.rs`
-  - `DHAN_USER_PROFILE_PATH`, `DHAN_SET_IP_PATH`, `DHAN_MODIFY_IP_PATH`, `DHAN_GET_IP_PATH`
-  - `DHAN_HOLDINGS_PATH`, `DHAN_POSITIONS_PATH`, `DHAN_POSITIONS_CONVERT_PATH`
-  - `DHAN_MARGIN_CALCULATOR_PATH`, `DHAN_MARGIN_CALCULATOR_MULTI_PATH`, `DHAN_FUND_LIMIT_PATH`
-  - Tests: `test_dhan_endpoint_path_constants`
+  - Auth: `DHAN_USER_PROFILE_PATH`, `DHAN_SET_IP_PATH`, `DHAN_MODIFY_IP_PATH`, `DHAN_GET_IP_PATH`
+  - Portfolio: `DHAN_HOLDINGS_PATH`, `DHAN_POSITIONS_PATH`, `DHAN_POSITIONS_CONVERT_PATH`
+  - Margin: `DHAN_MARGIN_CALCULATOR_PATH`, `DHAN_MARGIN_CALCULATOR_MULTI_PATH`, `DHAN_FUND_LIMIT_PATH`
+  - Depth WS: `DHAN_TWENTY_DEPTH_WS_BASE_URL`, `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL`
+  - Tests: `test_dhan_endpoint_path_constants`, `test_depth_ws_url_constants`
 
 ### B. Portfolio & Positions (build from ~15% → 100%)
 
@@ -84,7 +89,7 @@ Historical Data is already 100% complete — no work needed.
 ### C. Funds & Margin (build from 0% → 100%)
 
 - [ ] C1. Add `MarginCalculatorRequest` struct to `crates/trading/src/oms/types.rs`
-  - Fields: dhanClientId, exchangeSegment, transactionType, quantity (i32), productType, securityId (STRING), price (f64), triggerPrice (Option<f64>)
+  - Fields: dhanClientId, exchangeSegment, transactionType, quantity (i64), productType, securityId (STRING), price (f64), triggerPrice (f64)
   - Uses `#[serde(rename_all = "camelCase")]`
   - Tests: `test_margin_calculator_request_serializes_camel_case`, `test_margin_calculator_security_id_is_string`
 
@@ -96,7 +101,7 @@ Historical Data is already 100% complete — no work needed.
   - Request: camelCase (includePosition, includeOrders, scripts array)
   - Response: snake_case, ALL values are STRINGS (not floats!)
   - Fields: total_margin, span_margin, exposure_margin, equity_margin, fo_margin, commodity_margin, currency, hedge_benefit
-  - Tests: `test_multi_margin_request_serializes`, `test_multi_margin_response_all_strings`, `test_multi_margin_response_snake_case`
+  - Tests: `test_multi_margin_request_serializes`, `test_multi_margin_response_all_strings`
 
 - [ ] C4. Add `FundLimitResponse` struct to `crates/trading/src/oms/types.rs`
   - CRITICAL: `availabelBalance` is a TYPO in Dhan API — use `#[serde(rename = "availabelBalance")]`
@@ -109,7 +114,7 @@ Historical Data is already 100% complete — no work needed.
 
 - [ ] C6. Add `calculate_multi_margin()` method to `crates/trading/src/oms/api_client.rs`
   - Endpoint: `POST /v2/margincalculator/multi` with access-token + client-id headers
-  - Tests: `test_calculate_multi_margin_success`, `test_calculate_multi_margin_hedge_benefit`
+  - Tests: `test_calculate_multi_margin_success`
 
 - [ ] C7. Add `get_fund_limit()` method to `crates/trading/src/oms/api_client.rs`
   - Endpoint: `GET /v2/fundlimit` with access-token header
@@ -125,6 +130,45 @@ Historical Data is already 100% complete — no work needed.
   - Tests: 50+ existing tests ✓
   - No code changes needed — just verification
 
+### E. Full Market Depth Integration (parsers done → add dispatch + subscription + validation)
+
+**Status: Parsers 100% done. Integration ~40% missing.**
+
+- [ ] E1. Fix `FEED_UNSUBSCRIBE_TWENTY_DEPTH` from 24 → 25 in `crates/common/src/constants.rs`
+  - Per annexure-enums.md: "UnsubscribeFullDepth is 25, NOT 24"
+  - RequestCode 23 = subscribe (both 20 & 200 level), 25 = unsubscribe (both)
+  - Tests: `test_depth_unsubscribe_code_is_25`
+
+- [ ] E2. Add `ParsedFrame::DeepDepth` variant to `crates/core/src/parser/types.rs`
+  - Carries: security_id, exchange_segment_code, side (Bid/Ask), levels (Vec<DeepDepthLevel>), received_at_nanos
+  - Re-export `DepthSide` from deep_depth module
+  - Tests: `test_parsed_frame_deep_depth_variant`
+
+- [ ] E3. Add `dispatch_deep_depth_frame()` to `crates/core/src/parser/dispatcher.rs`
+  - Separate entry point for depth WS connections (12-byte header, not 8-byte)
+  - Routes feed codes 41 (Bid) and 51 (Ask) via existing `parse_twenty_depth_packet` / `parse_two_hundred_depth_packet`
+  - Tests: `test_dispatch_deep_depth_bid`, `test_dispatch_deep_depth_ask`, `test_dispatch_deep_depth_unknown_code`
+
+- [ ] E4. Add `split_stacked_depth_packets()` to `crates/core/src/parser/dispatcher.rs`
+  - For 20-level: multiple instrument bid/ask pairs stacked in one WS message
+  - Splits by reading message_length from bytes 0-1 of each sub-packet
+  - Tests: `test_split_stacked_single_packet`, `test_split_stacked_two_instruments`, `test_split_stacked_empty`
+
+- [ ] E5. Add 200-level subscription types to `crates/core/src/websocket/types.rs`
+  - `TwoHundredDepthSubscriptionRequest` — flat JSON: `{ "RequestCode": 23, "ExchangeSegment": "NSE_EQ", "SecurityId": "1333" }`
+  - No InstrumentList array (different from 20-level)
+  - Tests: `test_two_hundred_depth_subscription_serializes_flat_json`, `test_two_hundred_depth_no_instrument_list`
+
+- [ ] E6. Add 200-level subscription builder to `crates/core/src/websocket/subscription_builder.rs`
+  - `build_two_hundred_depth_subscription_message()` — single instrument, flat JSON
+  - `build_two_hundred_depth_unsubscription_message()` — RequestCode 25
+  - Tests: `test_two_hundred_depth_subscribe_flat_json`, `test_two_hundred_depth_unsubscribe_code_25`
+
+- [ ] E7. Add NSE-only validation for depth subscriptions to `crates/core/src/websocket/subscription_builder.rs`
+  - Reject BSE, MCX, Currency segments for depth subscriptions
+  - Only NSE_EQ and NSE_FNO valid for Full Market Depth
+  - Tests: `test_depth_nse_only_rejects_bse`, `test_depth_nse_only_accepts_nse_eq`, `test_depth_nse_only_accepts_nse_fno`
+
 ## Scenarios
 
 | # | Scenario | Expected |
@@ -139,16 +183,24 @@ Historical Data is already 100% complete — no work needed.
 | 8 | GET /v2/fundlimit returns `availabelBalance` typo | Correctly deserialized via `#[serde(rename)]` |
 | 9 | GET /v2/ip/getIP returns modification dates | `modifyDatePrimary` parsed |
 | 10 | Historical candle system verified complete | No gaps, all endpoints, all timeframes |
+| 11 | 20-level depth bid/ask stacked packets | Split correctly, each side parsed independently |
+| 12 | 200-level depth single instrument flat JSON | No InstrumentList array, flat fields |
+| 13 | BSE instrument depth subscription attempt | Rejected at build time with clear error |
+| 14 | 20-level depth unsubscribe | Uses RequestCode 25 (not 24) |
 
 ## Files Modified
 
 | File | Changes |
 |------|---------|
-| `crates/common/src/constants.rs` | Add 9 endpoint path constants |
+| `crates/common/src/constants.rs` | Add 12 endpoint path constants, fix FEED_UNSUBSCRIBE_TWENTY_DEPTH 24→25, add depth WS URLs |
 | `crates/core/src/auth/types.rs` | Add UserProfileResponse, IP API types |
 | `crates/core/src/auth/token_manager.rs` | Add get_user_profile(), pre_market_check() |
 | `crates/core/src/network/ip_verifier.rs` | Add set_ip(), modify_ip(), get_ip() |
 | `crates/trading/src/oms/types.rs` | Add Holding, ConvertPosition, Margin, Fund types |
 | `crates/trading/src/oms/api_client.rs` | Add 6 new API methods + tests |
+| `crates/core/src/parser/types.rs` | Add ParsedFrame::DeepDepth variant |
+| `crates/core/src/parser/dispatcher.rs` | Add dispatch_deep_depth_frame(), split_stacked_depth_packets() |
+| `crates/core/src/websocket/types.rs` | Add TwoHundredDepthSubscriptionRequest |
+| `crates/core/src/websocket/subscription_builder.rs` | Add 200-level builders, NSE-only validation |
 
-## Total New Tests: ~50+
+## Total New Tests: ~65+
