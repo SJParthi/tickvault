@@ -3,6 +3,8 @@
 > **Ground truth:** `docs/dhan-ref/16-release-notes.md`
 > **Scope:** Any file touching API version checks, feature flags, or backward compatibility handling.
 > **Cross-reference:** All other `docs/dhan-ref/` files
+>
+> **Note**: Version labels (v2.0-v2.5) are our internal mapping of Dhan's feature-dated releases. Dhan does not use formal version numbers.
 
 ## Mechanical Rules
 

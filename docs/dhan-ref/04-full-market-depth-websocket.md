@@ -126,6 +126,8 @@ Each of the 20 levels (16 bytes per level):
 
 > **CRITICAL DIFFERENCE from 20-level**: Bytes 9-12 = **row count** (not sequence number). This tells you how many of the 200 levels actually have data.
 
+> **CRITICAL**: For 200-level depth, bytes 8-11 of the header contain the **row count** (number of active levels), NOT a sequence number. The actual packet size is `12 + (row_count × 16)` bytes, which may be LESS than the maximum 3212 bytes. Parsers MUST read the row count and parse only that many levels. Demanding the full 3212 bytes will cause parse failures on real-world data where the order book has fewer than 200 active levels.
+
 ### 6.2 Depth Packet (up to 200 levels × 16 bytes = 3200 bytes)
 
 Same per-level structure as 20-level:
@@ -243,6 +245,8 @@ pub struct TwoHundredDepthPacket {
 8. **Response header byte order differs from Live Market Feed** — message length is bytes 1-2 (first), response code is byte 3. In Live Market Feed, response code is byte 1.
 
 9. **Disconnect code `805`** — same as Live Market Feed, >5 connections kills the oldest.
+
+10. **SDK Bug**: The DhanHQ Python SDK's `fulldepth.py` uses `subscribe_code + 1` for unsubscribe, which yields RequestCode 24 for depth. The correct unsubscribe code per the Dhan Annexure is **25**, not 24. Our implementation correctly uses 25.
 
 ---
 

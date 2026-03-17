@@ -640,7 +640,7 @@ fn golden_twenty_depth_bid_round_trip_exact() {
         EXCHANGE_SEGMENT_NSE_FNO
     );
     assert_eq!(parsed.header.security_id, 52432);
-    assert_eq!(parsed.header.message_sequence, 100);
+    assert_eq!(parsed.header.seq_or_row_count, 100);
     assert_eq!(parsed.received_at_nanos, 12345);
     assert_eq!(parsed.side, DepthSide::Bid);
 
@@ -676,7 +676,7 @@ fn golden_twenty_depth_ask_side() {
 
     let parsed = parse_twenty_depth_packet(&buf, 0).unwrap();
     assert_eq!(parsed.side, DepthSide::Ask);
-    assert_eq!(parsed.header.message_sequence, 101);
+    assert_eq!(parsed.header.seq_or_row_count, 101);
 }
 
 #[test]
@@ -701,5 +701,5 @@ fn golden_twenty_depth_header_layout_differs_from_standard_feed() {
     assert_eq!(parsed.header.feed_code, 41);
     assert_eq!(parsed.header.exchange_segment_code, 1);
     assert_eq!(parsed.header.security_id, 9999);
-    assert_eq!(parsed.header.message_sequence, 42);
+    assert_eq!(parsed.header.seq_or_row_count, 42);
 }

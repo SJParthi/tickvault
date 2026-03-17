@@ -289,7 +289,7 @@ ParsedTick (from broadcast channel)
 ┌─────────────────────────────────────────────────────┐
 │  ORDER MANAGEMENT SYSTEM (OMS)                       │
 │                                                      │
-│  Rate Limiter (GCRA):   10/sec, 7000/day             │
+│  Rate Limiter (GCRA):   10/sec, 5000/day             │
 │  Circuit Breaker:       3 failures → open → block    │
 │  Idempotency:           correlation_id → UUID v4     │
 │                                                      │
@@ -484,7 +484,7 @@ Layer 3 │   POSITION SIZE       │  |current + new lots|
                     ▼
         ┌───────────────────────┐
 Layer 4 │   RATE LIMITER        │  GCRA: 10 orders/sec
-        │   (SEBI mandate)      │  7,000 orders/day
+        │   (SEBI mandate)      │  5,000 orders/day
         │   exceeded? → REJECT  │
         └───────────┬───────────┘
                     │ allowed

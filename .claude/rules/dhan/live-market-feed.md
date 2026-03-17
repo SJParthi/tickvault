@@ -21,9 +21,9 @@
    | Byte (0-based) | Type | Description |
    |---|---|---|
    | `0` | u8 | Feed Response Code |
-   | `1-2` | i16 LE | Message Length |
+   | `1-2` | u16 LE | Message Length (Dhan docs say i16 but values are non-negative; SDK and our code use unsigned) |
    | `3` | u8 | Exchange Segment (numeric) |
-   | `4-7` | i32 LE | Security ID |
+   | `4-7` | u32 LE | Security ID (Dhan docs say i32 but values are non-negative; SDK and our code use unsigned) |
 
 5. **Packet sizes must match exactly.**
    - Ticker (code 2) = **16 bytes**
@@ -39,21 +39,21 @@
    |---|---|---|
    | `0-7` | header | 8 bytes |
    | `8-11` | f32 LE | LTP |
-   | `12-15` | i32 LE | LTT (UNIX epoch UTC) |
+   | `12-15` | u32 LE | LTT (UNIX epoch UTC; non-negative, SDK uses unsigned) |
 
 7. **PrevClose packet (code 6) — 16 bytes.** Arrives on EVERY subscription, any mode.
    | Byte (0-based) | Type | Field |
    |---|---|---|
    | `0-7` | header | 8 bytes |
    | `8-11` | f32 LE | Previous Close Price |
-   | `12-15` | i32 LE | Previous Day OI |
+   | `12-15` | u32 LE | Previous Day OI |
 
 8. **Quote packet (code 4) — 50 bytes.**
    | Byte (0-based) | Type | Field |
    |---|---|---|
    | `8-11` | f32 LE | LTP |
    | `12-13` | u16 LE | LTQ |
-   | `14-17` | i32 LE | LTT |
+   | `14-17` | u32 LE | LTT (UNIX epoch UTC) |
    | `18-21` | f32 LE | ATP |
    | `22-25` | u32 LE | Volume |
    | `26-29` | u32 LE | Total Sell Qty |
@@ -66,14 +66,14 @@
 9. **OI packet (code 5) — 12 bytes.** Separate packet from Quote. Both arrive when subscribed to Quote mode.
    | Byte (0-based) | Type | Field |
    |---|---|---|
-   | `8-11` | i32 LE | Open Interest |
+   | `8-11` | u32 LE | Open Interest |
 
 10. **Full packet (code 8) — 162 bytes.**
     | Byte (0-based) | Type | Field |
     |---|---|---|
     | `8-11` | f32 LE | LTP |
     | `12-13` | u16 LE | LTQ |
-    | `14-17` | i32 LE | LTT |
+    | `14-17` | u32 LE | LTT (UNIX epoch UTC) |
     | `18-21` | f32 LE | ATP |
     | `22-25` | u32 LE | Volume |
     | `26-29` | u32 LE | Total Sell Qty |
@@ -102,7 +102,7 @@
 12. **Disconnect packet (code 50) — 10 bytes.**
     | Byte (0-based) | Type | Field |
     |---|---|---|
-    | `8-9` | i16 LE | Disconnect reason code |
+    | `8-9` | u16 LE | Disconnect reason code |
     Key code: `805` = >5 connections, oldest killed.
 
 13. **All reads are Little Endian.** Every `from_le_bytes()` call. NEVER `from_be_bytes()`. No exceptions.
@@ -112,7 +112,10 @@
     - Volume, OI, quantities: `u32` (unsigned — quantities/OI cannot be negative)
     - LTQ: `u16` (unsigned)
     - Orders count: `u16` (unsigned)
-    - SecurityId: `i32` (signed in header) / `u32` (in ParsedTick)
+    - LTT (timestamps): `u32` (unsigned — UNIX epoch seconds are non-negative)
+    - Message length: `u16` (unsigned)
+    - SecurityId: `u32` (unsigned in header and ParsedTick; Dhan docs say i32 but values are non-negative)
+    - Disconnect reason code: `u16` (unsigned)
 
 15. **Subscription messages are JSON with STRING security IDs.**
     - `SecurityId` must serialize as `"1333"` not `1333`
@@ -122,6 +125,8 @@
 16. **Ping/pong is handled by the WebSocket library.** Do NOT implement manual ping frames. Server pings every 10s, timeout at 40s.
 
 17. **Byte indexing: Dhan docs use 1-based, code uses 0-based.** "Bytes 9-12" in docs = `buffer[8..12]` in Rust. All byte tables in THIS rule file use 0-based indexing.
+
+18. **Signedness**: All integer fields in the binary protocol (quantities, volumes, OI, timestamps, message lengths, security IDs) are non-negative. The Python SDK uses unsigned types (`H`=u16, `I`=u32). Our Rust code follows this convention with `u16`/`u32`.
 
 ## What This Prevents
 

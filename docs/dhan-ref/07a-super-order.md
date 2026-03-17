@@ -79,6 +79,8 @@ GET /super/orders
 
 Response includes `legDetails[]` array with nested target and stop loss legs. Key statuses: `CLOSED` (entry + one exit executed), `TRIGGERED` (target or SL leg triggered).
 
+> **API Typo**: The Dhan API returns `totalQuatity` (missing 'n' in Quantity) in Super Order leg details, similar to the `availabelBalance` typo in the Funds API. Use `#[serde(rename = "totalQuatity")]` in Rust structs.
+
 ---
 
 ## 6. Rust Structs

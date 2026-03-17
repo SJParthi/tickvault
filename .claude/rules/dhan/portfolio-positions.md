@@ -29,6 +29,7 @@
 9. **Convert position request:**
    - `fromProductType` → `toProductType` (e.g., `INTRADAY` → `CNC`)
    - `convertQty` is a STRING, not integer
+   - **SDK Note**: Python SDK sends `convertQty` as integer. Dhan API may accept both string and integer.
    - Response: `202 Accepted`
 
 10. **Exit all (`DELETE /v2/positions`)** — exits ALL open positions AND cancels ALL pending orders. Use as emergency stop alongside kill switch.

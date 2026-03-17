@@ -262,6 +262,22 @@ pub struct DhanPositionResponse {
     #[serde(default)]
     pub sell_avg: f64,
     #[serde(default)]
+    pub carry_forward_buy_qty: i64,
+    #[serde(default)]
+    pub carry_forward_sell_qty: i64,
+    #[serde(default)]
+    pub carry_forward_buy_value: f64,
+    #[serde(default)]
+    pub carry_forward_sell_value: f64,
+    #[serde(default)]
+    pub day_buy_qty: i64,
+    #[serde(default)]
+    pub day_sell_qty: i64,
+    #[serde(default)]
+    pub day_buy_value: f64,
+    #[serde(default)]
+    pub day_sell_value: f64,
+    #[serde(default)]
     pub realized_profit: f64,
     #[serde(default)]
     pub unrealized_profit: f64,

@@ -115,6 +115,8 @@ Headers: access-token
 
 > **NOTE**: All multi-margin response values are **strings** (e.g., `"150000.00"`), unlike single-margin which returns floats.
 
+> **Note**: Dhan's own documentation shows inconsistent field names for multi-margin requests: `includeOrders` vs `includeOrder` (singular/plural), and `scripts` vs `scripList`. Our implementation uses `includeOrders` (plural) and `scripts`. Verify with live API testing.
+
 ---
 
 ## 4. Fund Limit

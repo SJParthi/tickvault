@@ -34,7 +34,8 @@ Where `{exchangeSegment}` is the string enum like `NSE_EQ`, `NSE_FNO`, etc. (see
 | Detailed Tag                | Compact Tag                | Description                                                       |
 |-----------------------------|----------------------------|-------------------------------------------------------------------|
 | `EXCH_ID`                   | `SEM_EXM_EXCH_ID`         | Exchange: `NSE`, `BSE`, `MCX`                                     |
-| `SEGMENT`                   | `SEM_SEGMENT`              | `C`=Currency, `D`=Derivatives, `E`=Equity, `M`=Commodity         |
+| `SEGMENT`                   | `SEM_SEGMENT`              | `C`=Currency, `D`=Derivatives, `E`=Equity, `I`=Index, `M`=Commodity |
+| `SECURITY_ID`               | `SEM_SMST_SECURITY_ID`     | SecurityId — primary key for all Dhan API calls                   |
 | `ISIN`                      | —                          | 12-digit ISIN (International Securities Identification Number)    |
 | `INSTRUMENT`                | `SEM_INSTRUMENT_NAME`      | Instrument type as defined by exchange (see 08-annexure Section 6)|
 | —                           | `SEM_EXPIRY_CODE`          | Expiry code for futures (see 08-annexure Section 7)               |
@@ -86,7 +87,7 @@ When subscribing to instruments via WebSocket, you need:
 #[derive(Debug, Clone)]
 pub struct InstrumentMaster {
     pub exchange: String,              // NSE, BSE, MCX
-    pub segment: char,                 // C, D, E, M
+    pub segment: char,                 // C, D, E, I, M
     pub security_id: u32,              // Primary key for all API calls
     pub isin: Option<String>,          // Only in detailed CSV
     pub instrument: String,            // EQUITY, FUTIDX, OPTIDX, etc.
@@ -111,7 +112,7 @@ pub struct InstrumentMaster {
 
 1. **Download the CSV daily** — instrument list changes when new F&O contracts are listed, old ones expire, or corporate actions happen.
 
-2. **Compact vs Detailed** — use compact for trading (smaller, faster to parse). Use detailed only when you need ISIN, ASM/GSM flags, or MTF leverage.
+2. **Compact vs Detailed** — use compact for equity-only trading (smaller, faster to parse). **For F&O, the detailed CSV is required** because it contains `UNDERLYING_SECURITY_ID` and `UNDERLYING_SYMBOL` which are essential for F&O universe building (mapping derivative contracts to their underlying) and are NOT available in the compact CSV.
 
 3. **SecurityId is NOT the same as ISIN** — SecurityId is Dhan/exchange-specific numeric. ISIN is the universal 12-char alphanumeric.
 

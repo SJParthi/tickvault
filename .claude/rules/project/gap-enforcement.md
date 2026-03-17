@@ -125,7 +125,7 @@ Every rule here is checked by tests, hooks, or clippy — never by human review 
 - `OrderRateLimiter::new(0)` must panic (fail-fast at config time)
 - SEBI limit: max 10 orders/sec enforced via GCRA algorithm
 - Burst capacity exhausted → `OmsError::RateLimited` (no retry — regulatory risk)
-- `DailyRequestTracker`: 7,000 orders/day, 100,000 data API calls/day
+- `DailyRequestTracker`: 5,000 orders/day, 100,000 data API calls/day
 - Counter must NOT exceed limit (saturating decrement on rejection)
 - `reset()` clears all counters to 0
 - Test: all `rate_limiter::tests::*` + integration `oms_rate_limiter::*`

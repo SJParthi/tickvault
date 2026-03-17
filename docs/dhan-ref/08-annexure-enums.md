@@ -132,6 +132,7 @@ impl ExchangeSegment {
 | `PART_TRADED`  | Partial quantity traded                                   |
 | `TRADED`       | Executed successfully                                     |
 | `EXPIRED`      | Order expired (Order Book, Forever Orders, Order Update WS — not in original annexure table) |
+| `CONFIRM`      | Forever Order specific: active and waiting for trigger condition to be met |
 
 ---
 
@@ -179,8 +180,8 @@ impl ExchangeSegment {
 |-------------|-----------|-----------|------------|------------------|
 | per second  | 10        | 5         | 1          | 20               |
 | per minute  | 250       | —         | Unlimited  | Unlimited        |
-| per hour    | 1000      | —         | Unlimited  | Unlimited        |
-| per day     | 7000      | 100000    | Unlimited  | Unlimited        |
+| per hour    | 500       | —         | Unlimited  | Unlimited        |
+| per day     | 5000      | 100000    | Unlimited  | Unlimited        |
 
 > Order modifications capped at **25 modifications per order**.
 
@@ -284,3 +285,5 @@ Others: `RSI_14`, `ATR_14`, `STOCHASTIC`, `STOCHRSI_14`, `MACD_26`, `MACD_12`, `
 | `TRIGGERED` | Condition met         |
 | `EXPIRED`   | Alert expired         |
 | `CANCELLED` | Alert cancelled       |
+
+> **Note**: Conditional trigger order sub-objects use `discQuantity` (abbreviated), while regular orders use `disclosedQuantity`. Use the exact field name for each endpoint.

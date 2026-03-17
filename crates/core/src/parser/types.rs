@@ -75,6 +75,10 @@ pub enum ParseError {
     /// Response code is not recognized.
     #[error("unknown response code: {0}")]
     UnknownResponseCode(u8),
+
+    /// Row count in 200-level depth header exceeds maximum.
+    #[error("invalid row count: {actual} exceeds max {max}")]
+    InvalidRowCount { actual: u32, max: usize },
 }
 
 #[cfg(test)]
