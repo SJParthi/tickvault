@@ -214,7 +214,7 @@ pub struct DhanOrderResponse {
     #[serde(default)]
     pub filled_qty: i64,
     #[serde(default)]
-    pub average_trade_price: f64,
+    pub average_traded_price: f64,
     #[serde(default)]
     pub exchange_order_id: String,
     #[serde(default)]

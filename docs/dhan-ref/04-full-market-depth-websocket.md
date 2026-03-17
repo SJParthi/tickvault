@@ -30,6 +30,8 @@ wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&auth
 wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 ```
 
+> **SDK note:** DhanHQ Python SDK (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (no path segment) for 200-level. Our ground truth follows the official Dhan API documentation which specifies `/twohundreddepth`. Verify against live API.
+
 | Parameter   | Required | Value                          |
 |-------------|----------|--------------------------------|
 | `token`     | Yes      | Access Token                   |

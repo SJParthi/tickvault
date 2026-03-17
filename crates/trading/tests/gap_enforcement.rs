@@ -266,7 +266,7 @@ mod oms_reconciliation {
             traded_price: 0.0,
             remaining_quantity: 0,
             filled_qty: 0,
-            average_trade_price: 0.0,
+            average_traded_price: 0.0,
             exchange_order_id: String::new(),
             exchange_time: String::new(),
             create_time: String::new(),
@@ -340,7 +340,7 @@ mod oms_reconciliation {
 
         let mut dhan = make_dhan("ORD-1", "TRADED");
         dhan.traded_quantity = 50;
-        dhan.average_trade_price = 102.5;
+        dhan.average_traded_price = 102.5;
         let dhan = vec![dhan];
 
         let (report, updates) = reconcile_orders(&oms, &dhan);
