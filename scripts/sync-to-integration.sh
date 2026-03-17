@@ -7,16 +7,26 @@
 #
 # Safety guarantees:
 #   1. Worktree = isolated directory. No checkout in main repo.
-#   2. Lock file = no concurrent syncs. Second push waits or skips.
+#   2. Lock file = no concurrent syncs (mkdir atomic lock + stale PID recovery).
 #   3. -X theirs = session branch always wins conflicts.
 #   4. Cleanup trap = worktree removed on any exit (success, error, signal).
-#   5. Background execution = never blocks Claude's session.
-#   6. All errors caught = never hangs, never corrupts.
+#   5. Called via nohup/disown + timeout = never blocks, never lingers.
+#   6. All git commands have stderr/stdout redirected = never hangs on prompt.
+#   7. Explicit fetch of session branch = never merges stale ref.
 # =============================================================================
 
 set -uo pipefail
 
-REPO_ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+# --- Resolve REPO_ROOT safely ---
+REPO_ROOT="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$REPO_ROOT" ]; then
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || true
+fi
+if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT/.git" ]; then
+  echo "FATAL: cannot determine repo root" >&2
+  exit 0
+fi
+
 INTEGRATION_BRANCH="claude/integration"
 LOG_FILE="$REPO_ROOT/.claude/hooks/.integration-sync.log"
 LOCK_FILE="$REPO_ROOT/.claude/hooks/.integration-sync.lock"
@@ -29,25 +39,24 @@ log() {
 
 # --- Lock (prevent concurrent syncs) ---
 acquire_lock() {
-  # Use mkdir as atomic lock — works on all platforms
+  # Use mkdir as atomic lock — works on all platforms, race-free
   if mkdir "$LOCK_FILE" 2>/dev/null; then
-    echo $$ > "$LOCK_FILE/pid"
+    echo $$ > "$LOCK_FILE/pid" 2>/dev/null
     return 0
   fi
 
   # Lock exists — check if holder is still alive
   if [ -f "$LOCK_FILE/pid" ]; then
-    OLD_PID=$(cat "$LOCK_FILE/pid" 2>/dev/null)
+    OLD_PID=$(cat "$LOCK_FILE/pid" 2>/dev/null || echo "")
     if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-      # Previous sync still running — skip this one
       log "SKIP: another sync is running (PID $OLD_PID)"
       return 1
     fi
-    # Stale lock — previous sync crashed. Clean up and take it.
+    # Stale lock — previous sync crashed or was killed by timeout
     rm -rf "$LOCK_FILE" 2>/dev/null
     if mkdir "$LOCK_FILE" 2>/dev/null; then
-      echo $$ > "$LOCK_FILE/pid"
-      log "RECOVERED: stale lock from PID $OLD_PID"
+      echo $$ > "$LOCK_FILE/pid" 2>/dev/null
+      log "RECOVERED: stale lock from PID ${OLD_PID:-unknown}"
       return 0
     fi
   fi
@@ -60,22 +69,27 @@ release_lock() {
   rm -rf "$LOCK_FILE" 2>/dev/null
 }
 
-# --- Cleanup (runs on ANY exit) ---
+# --- Cleanup (runs on ANY exit: success, error, signal, timeout kill) ---
 cleanup() {
-  # Remove worktree if it exists
   if [ -d "$WORKTREE_DIR" ]; then
-    git -C "$REPO_ROOT" worktree remove "$WORKTREE_DIR" --force 2>/dev/null
-    # Fallback: manual removal if git worktree remove fails
-    rm -rf "$WORKTREE_DIR" 2>/dev/null
-    # Prune worktree bookkeeping
-    git -C "$REPO_ROOT" worktree prune 2>/dev/null
+    # Try git worktree remove first (updates bookkeeping)
+    git -C "$REPO_ROOT" worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
+    # Fallback: brute-force removal if git command fails
+    rm -rf "$WORKTREE_DIR" 2>/dev/null || true
+    # Clean up any stale worktree bookkeeping entries
+    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
   fi
   release_lock
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # --- Pre-checks ---
-CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)
+CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+# Skip if HEAD is detached or empty
+if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "HEAD" ]; then
+  exit 0
+fi
 
 # Skip if on integration branch (avoid infinite loop)
 if [ "$CURRENT_BRANCH" = "$INTEGRATION_BRANCH" ]; then
@@ -88,40 +102,58 @@ case "$CURRENT_BRANCH" in
   *) exit 0 ;;
 esac
 
-# Acquire lock or skip
+# Acquire lock or skip (another sync is already running)
 if ! acquire_lock; then
   exit 0
 fi
 
 log "START: syncing $CURRENT_BRANCH → $INTEGRATION_BRANCH"
 
-# --- Ensure integration branch exists ---
+# --- Fetch both branches to ensure refs are current ---
+# Fetch integration branch (or create it if first time)
 if ! git -C "$REPO_ROOT" fetch origin "$INTEGRATION_BRANCH" 2>/dev/null; then
-  # Create integration branch from main
-  git -C "$REPO_ROOT" fetch origin main 2>/dev/null
-  git -C "$REPO_ROOT" branch "$INTEGRATION_BRANCH" origin/main 2>/dev/null
-  git -C "$REPO_ROOT" push -u origin "$INTEGRATION_BRANCH" 2>/dev/null
-  log "CREATED: $INTEGRATION_BRANCH from main"
+  # First time: create integration branch from main
+  if git -C "$REPO_ROOT" fetch origin main 2>/dev/null; then
+    git -C "$REPO_ROOT" branch "$INTEGRATION_BRANCH" origin/main 2>/dev/null || true
+    if ! git -C "$REPO_ROOT" push -u origin "$INTEGRATION_BRANCH" 2>/dev/null; then
+      log "FAIL: could not create remote $INTEGRATION_BRANCH"
+      exit 0
+    fi
+    # Re-fetch so origin/claude/integration ref exists locally
+    git -C "$REPO_ROOT" fetch origin "$INTEGRATION_BRANCH" 2>/dev/null
+    log "CREATED: $INTEGRATION_BRANCH from main"
+  else
+    log "FAIL: could not fetch origin/main to create integration branch"
+    exit 0
+  fi
 fi
 
-# --- Clean up any leftover worktree ---
+# Fetch session branch to ensure origin/$CURRENT_BRANCH is up-to-date
+# (push just happened, so remote has it, but local ref might be stale)
+git -C "$REPO_ROOT" fetch origin "$CURRENT_BRANCH" 2>/dev/null || true
+
+# --- Clean up any leftover worktree from a previous crashed run ---
 if [ -d "$WORKTREE_DIR" ]; then
-  git -C "$REPO_ROOT" worktree remove "$WORKTREE_DIR" --force 2>/dev/null
-  rm -rf "$WORKTREE_DIR" 2>/dev/null
-  git -C "$REPO_ROOT" worktree prune 2>/dev/null
+  git -C "$REPO_ROOT" worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
+  rm -rf "$WORKTREE_DIR" 2>/dev/null || true
+  git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 fi
 
-# --- Create worktree for integration branch ---
+# --- Create isolated worktree for integration branch ---
 if ! git -C "$REPO_ROOT" worktree add "$WORKTREE_DIR" "origin/$INTEGRATION_BRANCH" --detach 2>/dev/null; then
-  log "FAIL: could not create worktree"
+  log "FAIL: could not create worktree (origin/$INTEGRATION_BRANCH may not exist)"
   exit 0
 fi
 
-# Inside the worktree: checkout integration branch
+# Inside the worktree: set up integration branch
 cd "$WORKTREE_DIR" || { log "FAIL: could not cd to worktree"; exit 0; }
 
-# Create local integration branch tracking remote
-git checkout -B "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH" 2>/dev/null
+# Create/reset local integration branch tracking remote
+# -B = create or reset if exists, avoids "already checked out" errors
+git checkout -B "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH" 2>/dev/null || {
+  log "FAIL: could not checkout $INTEGRATION_BRANCH in worktree"
+  exit 0
+}
 
 # --- Merge session branch (session wins all conflicts) ---
 MERGE_OK=false
@@ -133,52 +165,50 @@ if git merge "origin/$CURRENT_BRANCH" -X theirs --no-edit \
 else
   log "CONFLICT: attempting auto-resolve for $CURRENT_BRANCH"
 
-  # Strategy 1: checkout --theirs on each conflicted file
-  CONFLICTED=$(git diff --name-only --diff-filter=U 2>/dev/null)
+  # Strategy 1: checkout --theirs on each conflicted file individually
+  CONFLICTED=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "")
   if [ -n "$CONFLICTED" ]; then
-    RESOLVED_ALL=true
     echo "$CONFLICTED" | while IFS= read -r file; do
-      if [ -f "$file" ]; then
-        # File exists in both — take session version
-        git checkout --theirs "$file" 2>/dev/null && git add "$file" 2>/dev/null
+      if [ -e "$file" ]; then
+        git checkout --theirs -- "$file" 2>/dev/null && git add "$file" 2>/dev/null
         log "  RESOLVED: $file (took session version)"
       else
-        # File deleted in one branch — accept deletion or addition
-        git rm "$file" 2>/dev/null || git add "$file" 2>/dev/null
+        # File deleted in one side — accept whichever state exists
+        git rm -f "$file" 2>/dev/null || git add "$file" 2>/dev/null
         log "  RESOLVED: $file (accepted delete/add)"
       fi
     done
 
-    # Verify no conflicts remain
-    REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null)
+    # Check if all conflicts resolved
+    REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "")
     if [ -z "$REMAINING" ]; then
       git commit --no-edit \
         -m "chore(integration): merge $CURRENT_BRANCH (conflicts auto-resolved)" 2>/dev/null
       MERGE_OK=true
       log "RESOLVED: all conflicts auto-resolved"
     else
-      # Strategy 2: Nuclear option — accept ALL theirs
-      git checkout --theirs . 2>/dev/null
+      # Strategy 2: Nuclear — accept ALL theirs for everything
+      git checkout --theirs -- . 2>/dev/null || true
       git add -A 2>/dev/null
-      STILL_REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null)
-      if [ -z "$STILL_REMAINING" ]; then
+      STILL=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "")
+      if [ -z "$STILL" ]; then
         git commit --no-edit \
           -m "chore(integration): merge $CURRENT_BRANCH (force-resolved)" 2>/dev/null
         MERGE_OK=true
         log "FORCE-RESOLVED: took all session changes"
       else
-        git merge --abort 2>/dev/null
-        log "ABORT: unresolvable conflicts remain: $STILL_REMAINING"
+        git merge --abort 2>/dev/null || true
+        log "ABORT: unresolvable conflicts: $STILL"
       fi
     fi
   else
-    # Merge failed but no conflicted files — unknown error
-    git merge --abort 2>/dev/null
-    log "ABORT: merge failed for unknown reason"
+    # Merge failed but no conflicted files — could be index.lock contention
+    git merge --abort 2>/dev/null || true
+    log "ABORT: merge failed (no conflicts detected — possible git lock contention)"
   fi
 fi
 
-# --- Push integration branch ---
+# --- Push integration branch (with retry + exponential backoff) ---
 if [ "$MERGE_OK" = true ]; then
   PUSH_OK=false
   for attempt in 1 2 3 4; do
@@ -195,6 +225,8 @@ if [ "$MERGE_OK" = true ]; then
   if [ "$PUSH_OK" = false ]; then
     log "FAIL: could not push $INTEGRATION_BRANCH after 4 attempts"
   fi
+else
+  log "SKIP-PUSH: merge did not succeed"
 fi
 
 log "END: sync complete for $CURRENT_BRANCH"
