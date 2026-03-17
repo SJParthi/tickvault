@@ -149,11 +149,18 @@ fi
 cd "$WORKTREE_DIR" || { log "FAIL: could not cd to worktree"; exit 0; }
 
 # Create/reset local integration branch tracking remote
-# -B = create or reset if exists, avoids "already checked out" errors
+# -B = create or reset if exists
 git checkout -B "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH" 2>/dev/null || {
-  log "FAIL: could not checkout $INTEGRATION_BRANCH in worktree"
+  log "FAIL: could not checkout $INTEGRATION_BRANCH in worktree (may be checked out elsewhere)"
   exit 0
 }
+
+# Verify checkout actually succeeded (defense against silent failures)
+ACTUAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [ "$ACTUAL_BRANCH" != "$INTEGRATION_BRANCH" ]; then
+  log "FAIL: worktree is on '$ACTUAL_BRANCH' not '$INTEGRATION_BRANCH'"
+  exit 0
+fi
 
 # --- Merge session branch (session wins all conflicts) ---
 MERGE_OK=false
@@ -220,6 +227,9 @@ if [ "$MERGE_OK" = true ]; then
     WAIT=$((2 ** attempt))
     log "RETRY: push failed, waiting ${WAIT}s (attempt $attempt)"
     sleep "$WAIT"
+    # Rebase on remote before retrying — if another session pushed first,
+    # our push fails with non-fast-forward. Rebase puts our merge on top.
+    git pull --rebase origin "$INTEGRATION_BRANCH" 2>/dev/null || true
   done
 
   if [ "$PUSH_OK" = false ]; then
