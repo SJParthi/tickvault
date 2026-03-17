@@ -1,8 +1,13 @@
 //! Order idempotency using UUID v4 correlation IDs.
 //!
-//! Each order placed through the OMS gets a unique correlation ID (UUID v4).
+//! Each order placed through the OMS gets a unique correlation ID.
 //! Dhan echoes this ID back in the place response and in WebSocket order updates,
 //! enabling matching between our request and the resulting order.
+//!
+//! Dhan `correlationId` max length is **30 characters**, charset `[a-zA-Z0-9 _-]`.
+//! UUID v4 (36 chars) exceeds this limit, so we strip hyphens to produce a
+//! 32-char hex string, then truncate to 30 chars. This preserves 120 bits of
+//! entropy (30 hex chars = 120 bits), which is collision-safe for our volume.
 //!
 //! # Phase 1
 //! In-memory `HashMap<String, String>` mapping `correlation_id → order_id`.
@@ -10,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use dhan_live_trader_common::constants::DHAN_CORRELATION_ID_MAX_LENGTH;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -38,20 +44,17 @@ impl CorrelationTracker {
         }
     }
 
-    /// Generates a new correlation ID (≤30 chars, Dhan API limit).
+    /// Generates a new correlation ID from UUID v4, truncated to 30 chars.
     ///
-    /// Uses UUID v4 simple (hex, no hyphens) truncated to 30 characters.
-    /// Charset: `[0-9a-f]` — valid within Dhan's `[a-zA-Z0-9 _-]` allowlist.
+    /// Dhan `correlationId` max length is 30 characters with charset `[a-zA-Z0-9 _-]`.
+    /// UUID v4 simple (no hyphens) = 32 hex chars; we take first 30 for Dhan compliance.
     ///
     /// # Returns
-    /// A 30-character unique correlation ID string.
+    /// A 30-character hex string (120 bits of entropy).
     pub fn generate_id(&self) -> String {
-        // UUID v4 simple = 32 hex chars. Dhan max = 30. Truncate last 2.
-        // 30 hex chars = 120 bits of entropy — collision risk negligible.
-        let uuid = Uuid::new_v4().simple().to_string();
-        // CORRELATION_ID_MAX_LENGTH: Dhan enforces max 30 chars on correlationId.
-        const CORRELATION_ID_MAX_LENGTH: usize = 30;
-        uuid[..CORRELATION_ID_MAX_LENGTH].to_owned()
+        let uuid = Uuid::new_v4();
+        let hex = uuid.as_simple().to_string(); // 32 hex chars, no hyphens
+        hex[..DHAN_CORRELATION_ID_MAX_LENGTH].to_string()
     }
 
     /// Records a mapping from correlation ID to order ID.
@@ -96,18 +99,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_id_returns_30_char_hex_string() {
+    fn generate_id_fits_dhan_correlation_id_limit() {
         let tracker = CorrelationTracker::new();
         let id = tracker.generate_id();
-        assert_eq!(
-            id.len(),
-            30,
-            "correlationId must be exactly 30 chars (Dhan limit)"
-        );
-        assert!(
-            id.chars().all(|c| c.is_ascii_hexdigit()),
-            "correlationId must be hex chars only"
-        );
+        assert_eq!(id.len(), DHAN_CORRELATION_ID_MAX_LENGTH);
+        // Must be valid hex (subset of Dhan's allowed charset [a-zA-Z0-9 _-])
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -116,20 +113,6 @@ mod tests {
         let id1 = tracker.generate_id();
         let id2 = tracker.generate_id();
         assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn test_correlation_id_max_length_30() {
-        let tracker = CorrelationTracker::new();
-        for _ in 0..100 {
-            let id = tracker.generate_id();
-            assert!(
-                id.len() <= 30,
-                "correlationId exceeds Dhan 30-char max: len={}, id={}",
-                id.len(),
-                id
-            );
-        }
     }
 
     #[test]

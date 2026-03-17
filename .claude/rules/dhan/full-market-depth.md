@@ -42,7 +42,7 @@
 
 9. **Bytes 8-11 meaning changes by depth type.**
    - 20-level: Sequence number (ignore it — informational only)
-   - 200-level: **Row count** (how many levels actually have data). Parse only this many levels.
+   - 200-level: **Row count** — determines how many levels actually have data. The packet size is variable: `12 + (row_count × 16)`. Parse ONLY this many levels. Do NOT demand the full 3212 bytes. Validate `row_count <= 200` before parsing.
    - Getting this wrong on 200-level = parsing N garbage levels.
 
 10. **200-level = 1 instrument per connection.** Different JSON structure — no `InstrumentList` array, fields are flat:

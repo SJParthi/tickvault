@@ -53,6 +53,8 @@ curl --location 'https://api.dhan.co/v2/RenewToken' \
 - Only renews **active** tokens. Expired tokens return error.
 - Extends validity by another 24 hours.
 
+> **Important**: RenewToken may only work for tokens generated via Dhan Web, not for tokens generated programmatically via the `generateAccessToken` API (TOTP method). For TOTP-generated tokens, prefer regenerating via `generateAccessToken` instead. Our code correctly falls back to `acquire_token()` when renewal fails.
+
 ---
 
 ## 3. API Key & Secret (Individual — OAuth Flow)
@@ -172,6 +174,8 @@ Headers: access-token: {JWT}
     "dataValidity": "2024-12-05 09:37:52.0"
 }
 ```
+
+> **SDK Note**: The DhanHQ Python SDK (v2.2.0+) sends both `access-token` AND `dhanClientId` headers for the profile endpoint, although the official docs only require `access-token`.
 
 ---
 

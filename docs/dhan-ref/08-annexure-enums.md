@@ -88,6 +88,8 @@ impl ExchangeSegment {
 | `23` | Subscribe — Full Market Depth  |
 | `25` | Unsubscribe — Full Market Depth|
 
+> **SDK Note**: Python SDK `marketfeed.py` defines `Depth = 19` as a v1-only depth subscribe code (standalone market depth packet). This is deprecated in v2 and NOT listed above. The SDK rejects it for v2 subscriptions. Also note: the SDK's generic unsubscribe logic (`subscribe_code + 1`) produces code `24` for depth unsubscribe, but the correct code per this annexure is `25`. Our code uses `25`.
+
 ---
 
 ## 3. Feed Response Codes (Binary Header Byte 1)
@@ -114,6 +116,8 @@ impl ExchangeSegment {
 | `INTRADAY` | Intraday for Equity, Futures & Options  |
 | `MARGIN`   | Carry Forward in Futures & Options      |
 | `MTF`      | Margin Trading Facility (appears in Order/Forever Order APIs, not in annexure table) |
+| `CO`       | Cover Order — with stop-loss (appears in Order Update WS `Product` field as `"V"`) |
+| `BO`       | Bracket Order — with target + stop-loss (appears in Order Update WS `Product` field as `"B"`) |
 
 ---
 
@@ -130,6 +134,7 @@ impl ExchangeSegment {
 | `PART_TRADED`  | Partial quantity traded                                   |
 | `TRADED`       | Executed successfully                                     |
 | `EXPIRED`      | Order expired (Order Book, Forever Orders, Order Update WS — not in original annexure table) |
+| `CONFIRM`      | Forever Order specific: active and waiting for trigger condition to be met |
 
 ---
 
@@ -158,6 +163,8 @@ impl ExchangeSegment {
 | `1`  | Next Expiry                |
 | `2`  | Far Expiry                 |
 
+> **SDK Note**: Python SDK `_historical_data.py` validates `expiry_code` against `[0, 1, 2, 3]`, accepting a fourth value `3`. The Dhan API documentation only lists 0/1/2. The meaning of `3` is undocumented — avoid using it unless verified.
+
 ---
 
 ## 8. After Market Order Time
@@ -177,8 +184,8 @@ impl ExchangeSegment {
 |-------------|-----------|-----------|------------|------------------|
 | per second  | 10        | 5         | 1          | 20               |
 | per minute  | 250       | —         | Unlimited  | Unlimited        |
-| per hour    | 1000      | —         | Unlimited  | Unlimited        |
-| per day     | 7000      | 100000    | Unlimited  | Unlimited        |
+| per hour    | 500       | —         | Unlimited  | Unlimited        |
+| per day     | 5000      | 100000    | Unlimited  | Unlimited        |
 
 > Order modifications capped at **25 modifications per order**.
 
@@ -282,3 +289,5 @@ Others: `RSI_14`, `ATR_14`, `STOCHASTIC`, `STOCHRSI_14`, `MACD_26`, `MACD_12`, `
 | `TRIGGERED` | Condition met         |
 | `EXPIRED`   | Alert expired         |
 | `CANCELLED` | Alert cancelled       |
+
+> **Note**: Conditional trigger order sub-objects use `discQuantity` (abbreviated), while regular orders use `disclosedQuantity`. Use the exact field name for each endpoint.

@@ -170,6 +170,9 @@ pub const DISCONNECT_AUTHENTICATION_FAILED: u16 = DATA_API_AUTHENTICATION_FAILED
 /// annexure Section 11 which says 809 = "Access token invalid".
 pub const DISCONNECT_ACCESS_TOKEN_INVALID: u16 = DATA_API_ACCESS_TOKEN_INVALID;
 
+/// 810 — Client ID invalid. Distinct from 808 (auth failed).
+pub const DISCONNECT_CLIENT_ID_INVALID: u16 = 810;
+
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
 // Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
@@ -251,7 +254,7 @@ pub const BINARY_HEADER_SIZE: usize = 8;
 pub const OI_PACKET_SIZE: usize = 12;
 
 /// Market depth level size in bytes (per level within Full packet).
-/// Format: bid_qty(i32) + ask_qty(i32) + bid_orders(i16) + ask_orders(i16) + bid_price(f32) + ask_price(f32) = 20.
+/// Format: bid_qty(u32) + ask_qty(u32) + bid_orders(u16) + ask_orders(u16) + bid_price(f32) + ask_price(f32) = 20.
 pub const MARKET_DEPTH_LEVEL_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
@@ -441,6 +444,10 @@ pub const OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 
 /// Seconds before the OMS circuit breaker transitions from Open to Half-Open.
 pub const OMS_CIRCUIT_BREAKER_RESET_SECS: u64 = 30;
+
+/// Maximum length for Dhan `correlationId` field.
+/// Dhan spec: max 30 chars, charset `[a-zA-Z0-9 _-]`.
+pub const DHAN_CORRELATION_ID_MAX_LENGTH: usize = 30;
 
 // ---------------------------------------------------------------------------
 // Risk — Tick Gap Detection Thresholds

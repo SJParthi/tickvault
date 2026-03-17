@@ -133,6 +133,10 @@ Headers: access-token
 
 Response: `202 Accepted`
 
+> **SDK Note**: The Python SDK sends `convertQty` as an integer, while the official docs show it as a string `"40"`. The Dhan API likely accepts both. Our implementation should use the string format per official documentation.
+
+> **Note**: The Traders Control API uses `"DELIVERY"` as a product type value (in the `productType` array for P&L exit), which is different from `"CNC"` used in order placement. These refer to the same concept but use different string values depending on the API.
+
 ---
 
 ## 5. Exit All Positions

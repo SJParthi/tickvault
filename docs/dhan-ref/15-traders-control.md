@@ -63,7 +63,11 @@ Headers: access-token
 
 > **WARNING**: If `profitValue` < current profit OR `lossValue` < current loss, exit triggers **immediately**.
 
+Response: `{ "pnlExitStatus": "ACTIVE", "message": "P&L based exit configured successfully" }`
+
 Active for current day only — resets at end of session.
+
+> **Note**: The `productType` array uses `"DELIVERY"` (not `"CNC"`) to refer to delivery/cash-and-carry positions. This differs from the `"CNC"` value used in order placement APIs. Both refer to the same concept but use different string values depending on the API.
 
 ### Stop
 

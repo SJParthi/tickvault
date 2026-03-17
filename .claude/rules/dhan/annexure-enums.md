@@ -24,9 +24,9 @@
    - Code `3` is v1 legacy only. Our code handles it defensively (112-byte parser) but v2 subscriptions will not receive it.
    - Unknown codes must log + skip. Never panic.
 
-5. **ProductType — 4 variants.**
-   - `CNC` (Cash & Carry), `INTRADAY`, `MARGIN` (Carry Forward F&O), `MTF` (Margin Trading Facility)
-   - Annexure table lists 3; `MTF` appears in Order/Forever Order APIs.
+5. **ProductType — 6 variants.**
+   - `CNC` (Cash & Carry), `INTRADAY`, `MARGIN` (Carry Forward F&O), `MTF` (Margin Trading Facility), `CO` (Cover Order), `BO` (Bracket Order)
+   - Annexure table lists 3; `MTF` appears in Order/Forever Order APIs. `CO`/`BO` appear in Order Update WebSocket (`Product` field: `V`=CO, `B`=BO).
 
 6. **OrderStatus — 9 variants.**
    - `TRANSIT`, `PENDING`, `CLOSED`, `TRIGGERED`, `REJECTED`, `CANCELLED`, `PART_TRADED`, `TRADED`, `EXPIRED`
@@ -43,7 +43,7 @@
    - `PRE_OPEN`, `OPEN`, `OPEN_30`, `OPEN_60`
 
 10. **Rate limits — exact numbers per API category.**
-    - Order: 10/sec, 250/min, 1000/hr, 7000/day. Max 25 modifications per order.
+    - Order: 10/sec, 250/min, 500/hr, 5000/day. Max 25 modifications per order.
     - Data: 5/sec, 100,000/day
     - Quote: 1/sec (unlimited per min/hr/day)
     - Non-Trading: 20/sec (unlimited per min/hr/day)

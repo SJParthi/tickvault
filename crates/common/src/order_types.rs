@@ -27,7 +27,7 @@ pub enum OrderStatus {
     /// and REST Order Book API. Also note: Forever Orders use a distinct `CONFIRM`
     /// status (per docs/dhan-ref/07b-forever-order.md) — different from `CONFIRMED`.
     Confirmed,
-    /// Partially executed — some quantity filled, remainder still open.
+    /// Partially filled — some quantity traded, remainder still open.
     PartTraded,
     /// Fully executed.
     Traded,
@@ -325,6 +325,9 @@ pub struct OrderUpdate {
 pub struct OrderUpdateMessage {
     /// The order update payload.
     pub data: OrderUpdate,
+    /// Message type (e.g., "order_alert").
+    #[serde(default)]
+    pub r#type: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +561,7 @@ mod tests {
 
         let msg = OrderUpdateMessage {
             data: update.clone(),
+            r#type: "order_alert".to_owned(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: OrderUpdateMessage = serde_json::from_str(&json).unwrap();

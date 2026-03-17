@@ -30,7 +30,7 @@
 
 9. **Derivatives have two SecurityIds.** The derivative contract has its own SecurityId, and `UNDERLYING_SECURITY_ID` points to the underlying equity/index.
 
-10. **Segment codes in CSV.** `C`=Currency, `D`=Derivatives, `E`=Equity, `M`=Commodity.
+10. **Segment codes in CSV.** `C`=Currency, `D`=Derivatives, `E`=Equity, `I`=Index, `M`=Commodity.
 
 11. **Option type values.** `CE`=Call European, `PE`=Put European. Use `Option<String>` — not all instruments have option types.
 

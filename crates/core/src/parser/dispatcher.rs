@@ -119,7 +119,7 @@ pub fn dispatch_deep_depth_frame(
         exchange_segment_code: parsed.header.exchange_segment_code,
         side: parsed.side,
         levels: parsed.levels,
-        message_sequence: parsed.header.message_sequence,
+        message_sequence: parsed.header.seq_or_row_count,
         received_at_nanos,
     })
 }

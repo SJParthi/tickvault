@@ -66,6 +66,10 @@ Headers: access-token, Content-Type: application/json
 | `triggerPrice`      | float       | Conditional  | For SL/SLM orders                                  |
 | `afterMarketOrder`  | boolean     | Conditional  | AMO flag                                           |
 | `amoTime`           | enum string | Conditional  | `PRE_OPEN`, `OPEN`, `OPEN_30`, `OPEN_60`           |
+| `boProfitValue`     | float       | No           | Bracket order target profit value. Only when `productType` is `BO`. |
+| `boStopLossValue`   | float       | No           | Bracket order stop loss value. Only when `productType` is `BO`.     |
+
+> **Bracket Order fields** (optional): `boProfitValue` (f64) and `boStopLossValue` (f64) enable bracket order behavior through the standard order endpoint. Only used when `productType` is `BO`.
 
 **Response**: `{ "orderId": "...", "orderStatus": "PENDING" }`
 
@@ -91,6 +95,8 @@ PUT https://api.dhan.co/v2/orders/{order-id}
 ```
 
 > **NOTE**: `quantity` = total order quantity (NOT remaining). Max 25 modifications per order.
+
+> **SDK Note**: The Python SDK includes a `legName` field in the modify order request, which is needed for modifying specific legs of Bracket/Cover orders.
 
 ---
 
@@ -230,7 +236,7 @@ pub struct TradeEntry {
 ## 9. Critical Notes
 
 1. **Static IP mandatory** for place/modify/cancel since v2.4.
-2. **Rate limit: 10 orders/sec**, 250/min, 1000/hr, 7000/day. 25 modifications per order.
+2. **Rate limit: 10 orders/sec**, 250/min, 500/hr, 5000/day. 25 modifications per order.
 3. **`quantity` in modify = TOTAL order qty**, not remaining qty.
 4. **`correlationId`** — set this on every order for tracking. Max 30 chars.
 5. **Timestamps are IST strings** (`YYYY-MM-DD HH:MM:SS`), not epoch.
