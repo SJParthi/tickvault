@@ -10,7 +10,7 @@ paths:
 - **PreToolUse (Edit|Write):** block-env-files.sh — prevents .env file creation
 - **PostToolUse (Edit|Write):** REMOVED — pre-commit gate enforces fmt; no per-edit rustfmt
 - **SubagentStart:** REMOVED — principles already in CLAUDE.md context
-- **Pre-push (12 gates):** Runs fmt, clippy, test, and quality gates on workspace. Full workspace validation.
+- **Pre-push (11 gates):** Runs fmt, clippy, test, and quality gates on workspace. Full workspace validation.
 - **Pre-PR (5 gates):** branch check, naming, clean tree, quality state, commit format
 - **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage). Smart skip: heavy Rust steps (build/clippy/test) skipped when only config/scripts change.
 
