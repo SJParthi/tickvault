@@ -87,6 +87,22 @@ quality/.binary-size-baseline
 .claude/hooks/.integration-sync.lock/
 .claude/hooks/.integration-sync.log
 
+# ---- Instrument data cache (large CSVs) ----
+data/
+data/instrument-cache/
+
+# ---- Database artifacts (stray files outside docker-data/) ----
+*.sqlite
+*.db
+*.rdb
+
+# ---- Profiling artifacts ----
+*.profraw
+*.profdata
+
+# ---- PID files ----
+*.pid
+
 # ---- Temporary files ----
 *.tmp
 *.bak

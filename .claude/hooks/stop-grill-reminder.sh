@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # stop-grill-reminder.sh — Stop hook that reminds about /grill before shipping
 # Fires when Claude's turn ends. Checks if there are unpushed commits with
 # changed .rs files that haven't been /grill'd.
@@ -62,8 +62,12 @@ RS_CHANGED=""
 if [ -n "$REMOTE_REF" ]; then
   RS_CHANGED=$(git -C "$CWD" diff --name-only "origin/$BRANCH..HEAD" 2>/dev/null | grep '\.rs$' | head -1)
 else
-  # No remote — check all commits on branch
-  RS_CHANGED=$(git -C "$CWD" diff --name-only HEAD~5..HEAD 2>/dev/null | grep '\.rs$' | head -1)
+  # No remote — check recent commits (use --root to handle repos with <5 commits)
+  COMMIT_COUNT=$(git -C "$CWD" rev-list --count HEAD 2>/dev/null || echo "0")
+  if [ "$COMMIT_COUNT" -gt 0 ]; then
+    LOOKBACK=$((COMMIT_COUNT < 5 ? COMMIT_COUNT : 5))
+    RS_CHANGED=$(git -C "$CWD" diff --name-only "HEAD~${LOOKBACK}..HEAD" 2>/dev/null | grep '\.rs$' | head -1) || true
+  fi
 fi
 
 # Also check uncommitted .rs changes

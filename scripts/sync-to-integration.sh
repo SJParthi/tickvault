@@ -85,7 +85,12 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 # --- Pre-checks ---
-CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+# Accept branch name as argument (from post-push-sync.sh) to avoid race condition
+# where Claude switches branches before this background script reads HEAD.
+CURRENT_BRANCH="${1:-}"
+if [ -z "$CURRENT_BRANCH" ]; then
+  CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+fi
 
 # Skip if HEAD is detached or empty
 if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "HEAD" ]; then
@@ -176,7 +181,8 @@ else
   # Strategy 1: checkout --theirs on each conflicted file individually
   CONFLICTED=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "")
   if [ -n "$CONFLICTED" ]; then
-    echo "$CONFLICTED" | while IFS= read -r file; do
+    while IFS= read -r file; do
+      [ -z "$file" ] && continue
       if [ -e "$file" ]; then
         git checkout --theirs -- "$file" 2>/dev/null && git add "$file" 2>/dev/null
         log "  RESOLVED: $file (took session version)"
@@ -185,7 +191,7 @@ else
         git rm -f "$file" 2>/dev/null || git add "$file" 2>/dev/null
         log "  RESOLVED: $file (accepted delete/add)"
       fi
-    done
+    done <<< "$CONFLICTED"
 
     # Check if all conflicts resolved
     REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "")
