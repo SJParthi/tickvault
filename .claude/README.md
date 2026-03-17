@@ -9,8 +9,8 @@
 
 | Folder / File | What It Does |
 |---------------|-------------|
-| [`rules/`](rules/) | **29 rules in 2 folders: dhan/ (21 API) + project/ (8 general)** — auto-loaded when editing matching file paths |
-| [`hooks/`](hooks/) | **23 hook scripts** — run automatically on commits, pushes, PRs |
+| [`rules/`](rules/) | **31 rules in 2 folders: dhan/ (21 API) + project/ (10 general)** — auto-loaded when editing matching file paths |
+| [`hooks/`](hooks/) | **18 hook scripts** — run automatically on commits, pushes, PRs |
 | [`commands/`](commands/) | **6 slash commands** — `/status`, `/grill`, `/commit-push`, etc. |
 | [`agents/`](agents/) | **3 specialized agents** — code review, hot-path audit, build verify |
 | [`skills/`](skills/) | **2 skills** — phase status, quality gates |
