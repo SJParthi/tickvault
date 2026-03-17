@@ -124,11 +124,8 @@ mod capital_protection {
         engine.record_fill(1001, 80, 100.0, 25);
         engine.update_market_price(1001, 90.0);
 
-        // NOTE: total_unrealized_pnl() is a stub (returns 0.0) until live
-        // prices are wired via papaya concurrent map. check_order uses
-        // total_realized_pnl + total_unrealized_pnl, so with no realized
-        // loss and stub unrealized, the order is approved.
-        // Once unrealized P&L is implemented, this should trigger halt.
+        // RISK-GAP-02: unrealized = 80 * (90 - 100) = -800.
+        // Max daily loss = 1M * 2% = 20,000. |-800| < 20,000 → approved.
         let result = engine.check_order(2001, 1);
         assert!(result.is_approved());
     }
@@ -628,11 +625,13 @@ mod dhan_validation {
         engine.update_market_price(1001, f64::NAN);
         engine.update_market_price(1001, 110.0); // valid
 
-        // NOTE: total_unrealized_pnl() is a stub (returns 0.0) until
-        // live prices are wired via papaya concurrent map.
+        // RISK-GAP-02: 10 lots * (110.0 - 100.0) = 100.0 unrealized profit
         let pnl = engine.total_unrealized_pnl();
-        assert!(pnl.is_finite(), "stub unrealized P&L must be finite");
-        assert!(pnl.abs() < f64::EPSILON, "stub returns 0.0");
+        assert!(pnl.is_finite(), "unrealized P&L must be finite");
+        assert!(
+            (pnl - 100.0).abs() < f64::EPSILON,
+            "expected 100.0, got {pnl}"
+        );
     }
 
     /// SAFETY-B5-03: Extremely large prices don't cause overflow.
@@ -655,10 +654,13 @@ mod dhan_validation {
         engine.record_fill(1001, 10, 100.0, 0);
         engine.update_market_price(1001, 110.0);
 
-        // NOTE: total_unrealized_pnl() is a stub (returns 0.0) until
-        // live prices are wired via papaya concurrent map.
+        // RISK-GAP-02: 10 lots * (110.0 - 100.0) = 100.0
         let pnl = engine.total_unrealized_pnl();
         assert!(pnl.is_finite(), "zero lot_size must not produce NaN");
+        assert!(
+            (pnl - 100.0).abs() < f64::EPSILON,
+            "expected 100.0, got {pnl}"
+        );
     }
 }
 

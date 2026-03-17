@@ -138,6 +138,22 @@ pub enum NotificationEvent {
         verified_ip: String,
     },
 
+    /// Boot health check completed — infrastructure services verified.
+    BootHealthCheck {
+        /// Number of services that passed health check.
+        services_healthy: usize,
+        /// Total services checked.
+        services_total: usize,
+    },
+
+    /// Boot deadline missed — system did not complete startup within allowed time.
+    BootDeadlineMissed {
+        /// Deadline in seconds that was exceeded.
+        deadline_secs: u64,
+        /// Step that was running when deadline hit.
+        step: String,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -240,6 +256,20 @@ impl NotificationEvent {
             }
             Self::IpVerificationSuccess { verified_ip } => {
                 format!("<b>IP verified</b> — {verified_ip}")
+            }
+            Self::BootHealthCheck {
+                services_healthy,
+                services_total,
+            } => {
+                format!("<b>Boot health check</b>\nHealthy: {services_healthy}/{services_total}")
+            }
+            Self::BootDeadlineMissed {
+                deadline_secs,
+                step,
+            } => {
+                format!(
+                    "<b>BOOT DEADLINE MISSED</b>\nDeadline: {deadline_secs}s\nBlocked at: {step}"
+                )
             }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),

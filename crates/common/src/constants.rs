@@ -390,6 +390,22 @@ pub const OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 pub const OMS_CIRCUIT_BREAKER_RESET_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
+// Risk — Tick Gap Detection Thresholds
+// ---------------------------------------------------------------------------
+
+/// Minimum ticks per security before gap detection activates (warmup phase).
+/// Prevents false positives during initial subscription when ticks are sparse.
+pub const TICK_GAP_MIN_TICKS_BEFORE_ACTIVE: u32 = 5;
+
+/// Warning-level gap threshold in seconds. Gaps >= this trigger a WARN log.
+/// 30 seconds without a tick indicates potential feed degradation.
+pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
+
+/// Error-level gap threshold in seconds. Gaps >= this trigger an ERROR log
+/// (which routes to Telegram alert). 120 seconds suggests feed disconnection.
+pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 120;
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
 // ---------------------------------------------------------------------------
 

@@ -197,12 +197,12 @@ impl RiskEngine {
     ///
     /// # Performance
     /// O(1) — HashMap lookup + field update.
-    pub fn update_market_price(&mut self, security_id: u32, _current_price: f64) {
-        // Unrealized P&L is computed on-demand in total_unrealized_pnl().
-        // We store the latest price for each position. For now, this is a
-        // no-op placeholder — unrealized P&L computation will use live tick
-        // prices from the papaya concurrent map in the pipeline.
-        let _ = security_id;
+    pub fn update_market_price(&mut self, security_id: u32, current_price: f64) {
+        // RISK-GAP-02: Reject non-positive and non-finite prices.
+        if !current_price.is_finite() || current_price <= 0.0 {
+            return;
+        }
+        self.market_prices.insert(security_id, current_price);
     }
 
     /// Manually halts trading (operator-initiated).
@@ -224,6 +224,7 @@ impl RiskEngine {
     /// Resets all daily state (P&L, positions, halt) for a new trading day.
     pub fn reset_daily(&mut self) {
         self.positions.clear();
+        self.market_prices.clear();
         self.total_realized_pnl = 0.0;
         self.halted = false;
         self.halt_reason = None;
@@ -249,11 +250,21 @@ impl RiskEngine {
 
     /// Returns the total unrealized P&L across all open positions.
     ///
-    /// Currently returns 0.0 — will be computed from live market prices
-    /// once the papaya price map integration is wired.
+    /// RISK-GAP-02: Conservative — skips securities with no market price.
+    /// O(N) where N = open positions (cold path, called during risk checks).
     pub fn total_unrealized_pnl(&self) -> f64 {
-        // TODO: compute from live prices via papaya concurrent map
-        0.0
+        let mut total = 0.0_f64;
+        for (security_id, pos) in &self.positions {
+            if pos.net_lots == 0 {
+                continue;
+            }
+            if let Some(&market_price) = self.market_prices.get(security_id) {
+                let unrealized = (pos.net_lots as f64) * (market_price - pos.avg_entry_price);
+                total += unrealized;
+            }
+            // Conservative: skip securities without a market price
+        }
+        total
     }
 
     /// Returns the position info for a specific instrument.

@@ -61,8 +61,8 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
 fn is_within_persist_window(exchange_timestamp: u32) -> bool {
     let ist_secs_of_day =
         exchange_timestamp.wrapping_add(IST_UTC_OFFSET_SECONDS as u32) % SECONDS_PER_DAY;
-    ist_secs_of_day >= TICK_PERSIST_START_SECS_OF_DAY_IST
-        && ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+        .contains(&ist_secs_of_day)
 }
 
 // ---------------------------------------------------------------------------

@@ -531,8 +531,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_dedup_key_candles_is_security_id() {
-        assert_eq!(DEDUP_KEY_CANDLES, "security_id");
+    fn test_dedup_key_candles_includes_all_components() {
+        assert_eq!(DEDUP_KEY_CANDLES, "security_id, timeframe, segment");
     }
 
     #[test]
