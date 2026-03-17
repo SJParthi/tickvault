@@ -875,4 +875,179 @@ mod tests {
         let _ = oms.handle_order_update(&update);
         assert_eq!(oms.total_updates(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Dry-run mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oms_defaults_to_dry_run() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        assert!(oms.is_dry_run(), "OMS must default to dry-run mode");
+    }
+
+    #[tokio::test]
+    async fn dry_run_place_order_returns_paper_id() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let order_id = oms.place_order(request).await.unwrap();
+        assert!(
+            order_id.starts_with("PAPER-"),
+            "dry-run order ID must start with PAPER-"
+        );
+        assert_eq!(oms.total_placed(), 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_sequential_paper_ids() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let make_request = || PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let id1 = oms.place_order(make_request()).await.unwrap();
+        let id2 = oms.place_order(make_request()).await.unwrap();
+        assert_eq!(id1, "PAPER-1");
+        assert_eq!(id2, "PAPER-2");
+    }
+
+    #[tokio::test]
+    async fn dry_run_order_tracked_in_transit() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Sell,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 25,
+            price: 300.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let order_id = oms.place_order(request).await.unwrap();
+        let order = oms.order(&order_id).unwrap();
+        // Dry-run orders skip Transit and go straight to Confirmed
+        assert_eq!(order.status, OrderStatus::Confirmed);
+        assert_eq!(order.quantity, 25);
+        assert!(oms.active_orders().iter().any(|o| o.order_id == order_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Correlation + order update edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_update_via_correlation_re_indexes_order() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Transit);
+        // Simulate Dhan assigning a real order_no via the WS update
+        let mut update = make_order_update("DHAN-999", "PENDING");
+        update.correlation_id = "corr-1".to_owned();
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        // The order should still be accessible by its original ID
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Pending);
+    }
+
+    #[test]
+    fn multiple_updates_increment_counter() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Transit);
+
+        let _ = oms.handle_order_update(&make_order_update("1", "PENDING"));
+        let _ = oms.handle_order_update(&make_order_update("1", "CONFIRMED"));
+        assert_eq!(oms.total_updates(), 2);
+    }
+
+    #[test]
+    fn handle_update_fills_data() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 50;
+        update.avg_traded_price = 246.0;
+
+        let _ = oms.handle_order_update(&update);
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.traded_qty, 50);
+        assert!((order.avg_traded_price - 246.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reset_daily_also_resets_paper_counter() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Traded);
+        oms.paper_order_counter = 42;
+        oms.reset_daily();
+        assert_eq!(oms.paper_order_counter, 0);
+    }
+
+    #[test]
+    fn needs_reconciliation_flag_set_on_invalid_transition() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Traded);
+        // Traded → Pending is invalid
+        let _ = oms.handle_order_update(&make_order_update("1", "PENDING"));
+        assert!(oms.order("1").unwrap().needs_reconciliation);
+    }
 }

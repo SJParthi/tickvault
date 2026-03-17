@@ -1435,6 +1435,35 @@ mod tests {
         assert_eq!(DEDUP_KEY_TICKS, "security_id");
     }
 
+    /// STORAGE-GAP-01: Verify that the ticks DDL includes exchange_segment
+    /// column, which is needed to prevent cross-segment tick collision
+    /// when the same security_id exists on different segments.
+    #[test]
+    fn test_ticks_ddl_has_segment_column() {
+        assert!(
+            TICKS_CREATE_DDL.contains("segment"),
+            "ticks DDL must include segment column for cross-segment safety"
+        );
+    }
+
+    /// STORAGE-GAP-01: The DEDUP key for ticks is currently security_id.
+    /// This test documents the current state and will catch any regression.
+    #[test]
+    fn test_tick_dedup_key_is_pinned() {
+        // If this test fails, the DEDUP key was changed — review for
+        // backward compatibility with existing QuestDB data.
+        assert_eq!(DEDUP_KEY_TICKS, "security_id");
+    }
+
+    /// Verify the depth DDL also includes segment column.
+    #[test]
+    fn test_depth_ddl_has_segment_column() {
+        assert!(
+            MARKET_DEPTH_CREATE_DDL.contains("segment"),
+            "market_depth DDL must include segment column"
+        );
+    }
+
     #[test]
     fn test_questdb_ddl_timeout_is_reasonable() {
         assert!((5..=60).contains(&QUESTDB_DDL_TIMEOUT_SECS));

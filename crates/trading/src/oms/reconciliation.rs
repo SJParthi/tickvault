@@ -329,4 +329,127 @@ mod tests {
         assert_eq!(report.missing_from_dhan, 0); // both OMS orders appear in Dhan
         assert_eq!(updates.len(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Edge cases: epsilon boundary, combined mismatches, unknown status count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn epsilon_boundary_fill_mismatch() {
+        // If the price difference is exactly at f64::EPSILON, it should NOT
+        // trigger a mismatch (comparison uses strict >).
+        let mut oms = HashMap::new();
+        let mut order = make_managed_order("1", OrderStatus::Traded);
+        order.avg_traded_price = 100.0;
+        oms.insert("1".to_owned(), order);
+
+        let mut dhan = make_dhan_order("1", "TRADED");
+        dhan.average_trade_price = 100.0 + f64::EPSILON;
+        let dhan = vec![dhan];
+
+        let (_report, updates) = reconcile_orders(&oms, &dhan);
+        // Exactly EPSILON → not > EPSILON → no mismatch
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn price_beyond_epsilon_triggers_fill_update() {
+        let mut oms = HashMap::new();
+        let mut order = make_managed_order("1", OrderStatus::Traded);
+        order.avg_traded_price = 100.0;
+        oms.insert("1".to_owned(), order);
+
+        let mut dhan = make_dhan_order("1", "TRADED");
+        // Use a clearly-different price that exceeds EPSILON tolerance
+        dhan.average_trade_price = 100.5;
+        let dhan = vec![dhan];
+
+        let (_report, updates) = reconcile_orders(&oms, &dhan);
+        assert_eq!(updates.len(), 1, "price difference should trigger update");
+    }
+
+    #[test]
+    fn status_and_fill_mismatch_on_same_order() {
+        let mut oms = HashMap::new();
+        let mut order = make_managed_order("1", OrderStatus::Pending);
+        order.traded_qty = 0;
+        oms.insert("1".to_owned(), order);
+
+        let mut dhan = make_dhan_order("1", "TRADED");
+        dhan.traded_quantity = 50;
+        dhan.average_trade_price = 99.5;
+        let dhan = vec![dhan];
+
+        let (report, updates) = reconcile_orders(&oms, &dhan);
+        assert_eq!(report.mismatches_found, 1);
+        // Both status and fill mismatch → single update with both corrections
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Traded);
+        assert_eq!(updates[0].traded_qty, 50);
+    }
+
+    #[test]
+    fn unknown_status_not_counted_in_total_checked() {
+        // OMS-GAP-02: Unknown Dhan status → skip, NOT counted in total_checked
+        let oms: HashMap<String, ManagedOrder> = HashMap::new();
+        let dhan = vec![
+            make_dhan_order("1", "GIBBERISH"),
+            make_dhan_order("2", "TRADED"),
+        ];
+        let (report, _) = reconcile_orders(&oms, &dhan);
+        // Only the TRADED order is counted (GIBBERISH skipped)
+        assert_eq!(report.total_checked, 1);
+    }
+
+    #[test]
+    fn all_unknown_statuses_yields_zero_checked() {
+        let oms: HashMap<String, ManagedOrder> = HashMap::new();
+        let dhan = vec![
+            make_dhan_order("1", "UNKNOWN_1"),
+            make_dhan_order("2", "UNKNOWN_2"),
+        ];
+        let (report, updates) = reconcile_orders(&oms, &dhan);
+        assert_eq!(report.total_checked, 0);
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn terminal_oms_order_missing_from_dhan_not_ghost() {
+        // Terminal (Traded, Rejected, Cancelled, Expired) orders missing from
+        // Dhan response should NOT count as ghost orders.
+        let mut oms = HashMap::new();
+        oms.insert(
+            "t1".to_owned(),
+            make_managed_order("t1", OrderStatus::Traded),
+        );
+        oms.insert(
+            "t2".to_owned(),
+            make_managed_order("t2", OrderStatus::Rejected),
+        );
+        oms.insert(
+            "t3".to_owned(),
+            make_managed_order("t3", OrderStatus::Cancelled),
+        );
+        oms.insert(
+            "t4".to_owned(),
+            make_managed_order("t4", OrderStatus::Expired),
+        );
+        let dhan: Vec<DhanOrderResponse> = vec![];
+
+        let (report, _) = reconcile_orders(&oms, &dhan);
+        assert_eq!(
+            report.missing_from_dhan, 0,
+            "terminal orders should not be flagged as ghosts"
+        );
+    }
+
+    #[test]
+    fn reconciliation_report_default_all_zeros() {
+        let report = ReconciliationReport::default();
+        assert_eq!(report.total_checked, 0);
+        assert_eq!(report.mismatches_found, 0);
+        assert_eq!(report.missing_from_oms, 0);
+        assert_eq!(report.missing_from_dhan, 0);
+        assert!(report.mismatched_order_ids.is_empty());
+    }
 }

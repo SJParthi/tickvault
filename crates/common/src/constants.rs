@@ -1301,3 +1301,186 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
 
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
 pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- IST offset verification ---
+
+    #[test]
+    fn test_ist_offset_seconds_is_5h30m() {
+        // IST = UTC + 5:30 = 5 * 3600 + 30 * 60 = 19800
+        assert_eq!(IST_UTC_OFFSET_SECONDS, 19_800);
+        assert_eq!(IST_UTC_OFFSET_SECONDS_I64, 19_800);
+    }
+
+    #[test]
+    fn test_ist_offset_nanos_consistent_with_seconds() {
+        let expected_nanos = IST_UTC_OFFSET_SECONDS_I64 * 1_000_000_000;
+        assert_eq!(IST_UTC_OFFSET_NANOS, expected_nanos);
+    }
+
+    // --- SEBI compliance constants ---
+
+    #[test]
+    fn test_sebi_max_orders_per_second() {
+        assert_eq!(SEBI_MAX_ORDERS_PER_SECOND, 10);
+    }
+
+    #[test]
+    fn test_sebi_audit_retention_years() {
+        assert_eq!(SEBI_AUDIT_RETENTION_YEARS, 5);
+    }
+
+    // --- Packet sizes match Dhan protocol spec ---
+
+    #[test]
+    fn test_ticker_packet_size() {
+        // Header(8) + LTP(4) + LTT(4) = 16
+        assert_eq!(TICKER_PACKET_SIZE, 16);
+    }
+
+    #[test]
+    fn test_quote_packet_size() {
+        // Header(8) + fields = 50
+        assert_eq!(QUOTE_PACKET_SIZE, 50);
+    }
+
+    #[test]
+    fn test_full_packet_size() {
+        // Header(8) + fields(54) + depth(5 * 20) = 162
+        assert_eq!(FULL_QUOTE_PACKET_SIZE, 162);
+    }
+
+    #[test]
+    fn test_oi_packet_size() {
+        // Header(8) + OI(4) = 12
+        assert_eq!(OI_PACKET_SIZE, 12);
+    }
+
+    #[test]
+    fn test_disconnect_packet_size() {
+        // Header(8) + reason_code(2) = 10
+        assert_eq!(DISCONNECT_PACKET_SIZE, 10);
+    }
+
+    // --- Exchange segment codes match Dhan protocol ---
+
+    #[test]
+    fn test_exchange_segment_code_6_is_unused() {
+        // Gap in Dhan's enum: no code 6 exists
+        assert_ne!(EXCHANGE_SEGMENT_IDX_I, 6);
+        assert_ne!(EXCHANGE_SEGMENT_NSE_EQ, 6);
+        assert_ne!(EXCHANGE_SEGMENT_NSE_FNO, 6);
+        assert_ne!(EXCHANGE_SEGMENT_NSE_CURRENCY, 6);
+        assert_ne!(EXCHANGE_SEGMENT_BSE_EQ, 6);
+        assert_ne!(EXCHANGE_SEGMENT_MCX_COMM, 6);
+        assert_ne!(EXCHANGE_SEGMENT_BSE_CURRENCY, 6);
+        assert_ne!(EXCHANGE_SEGMENT_BSE_FNO, 6);
+    }
+
+    #[test]
+    fn test_exchange_segment_sequential_except_gap() {
+        assert_eq!(EXCHANGE_SEGMENT_IDX_I, 0);
+        assert_eq!(EXCHANGE_SEGMENT_NSE_EQ, 1);
+        assert_eq!(EXCHANGE_SEGMENT_NSE_FNO, 2);
+        assert_eq!(EXCHANGE_SEGMENT_NSE_CURRENCY, 3);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_EQ, 4);
+        assert_eq!(EXCHANGE_SEGMENT_MCX_COMM, 5);
+        // 6 is unused
+        assert_eq!(EXCHANGE_SEGMENT_BSE_CURRENCY, 7);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_FNO, 8);
+    }
+
+    // --- Feed request/response codes ---
+
+    #[test]
+    fn test_disconnect_codes_match_dhan_spec() {
+        assert_eq!(DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS, 805);
+        assert_eq!(DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED, 806);
+        assert_eq!(DISCONNECT_ACCESS_TOKEN_EXPIRED, 807);
+        assert_eq!(DISCONNECT_INVALID_CLIENT_ID, 808);
+        assert_eq!(DISCONNECT_AUTH_FAILED, 809);
+    }
+
+    #[test]
+    fn test_response_code_disconnect_is_50() {
+        assert_eq!(RESPONSE_CODE_DISCONNECT, 50);
+    }
+
+    // --- WebSocket limits ---
+
+    #[test]
+    fn test_max_connections_is_5() {
+        assert_eq!(MAX_WEBSOCKET_CONNECTIONS, 5);
+    }
+
+    #[test]
+    fn test_max_instruments_per_connection_is_5000() {
+        assert_eq!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, 5000);
+    }
+
+    #[test]
+    fn test_subscription_batch_size_within_spec() {
+        // Dhan spec: max 100 instruments per single JSON subscribe message
+        let batch = SUBSCRIPTION_BATCH_SIZE;
+        assert!(batch <= 100);
+    }
+
+    #[test]
+    fn test_total_subscriptions_consistent() {
+        // max_connections * max_per_connection = max_total
+        assert_eq!(
+            MAX_TOTAL_SUBSCRIPTIONS,
+            MAX_WEBSOCKET_CONNECTIONS * MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+        );
+    }
+
+    // --- Deep depth protocol ---
+
+    #[test]
+    fn test_deep_depth_header_is_12_not_8() {
+        // Full Market Depth uses 12-byte header, NOT 8 like Live Market Feed
+        assert_eq!(DEEP_DEPTH_HEADER_SIZE, 12);
+        assert_eq!(BINARY_HEADER_SIZE, 8);
+        assert_ne!(DEEP_DEPTH_HEADER_SIZE, BINARY_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_deep_depth_bid_ask_codes() {
+        assert_eq!(DEEP_DEPTH_FEED_CODE_BID, 41);
+        assert_eq!(DEEP_DEPTH_FEED_CODE_ASK, 51);
+    }
+
+    // --- Market times ---
+
+    #[test]
+    fn test_market_open_time() {
+        assert_eq!(MARKET_OPEN_TIME_IST, "09:15:00");
+    }
+
+    // --- Order update login ---
+
+    #[test]
+    fn test_order_update_login_msg_code_is_42() {
+        assert_eq!(ORDER_UPDATE_LOGIN_MSG_CODE, 42);
+    }
+
+    // --- Indicator constants ---
+
+    #[test]
+    fn test_indicator_warmup_ticks_positive() {
+        let warmup = MAX_INDICATOR_WARMUP_TICKS;
+        assert!(warmup > 0);
+    }
+
+    #[test]
+    fn test_indicator_ring_buffer_capacity_power_of_two() {
+        assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
+    }
+}

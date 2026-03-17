@@ -384,4 +384,130 @@ mod tests {
         assert_eq!(candle.security_id, copy.security_id);
         assert_eq!(candle.timestamp_utc_secs, copy.timestamp_utc_secs);
     }
+
+    // -----------------------------------------------------------------------
+    // DhanIntradayResponse deserialization (JSON → struct)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_intraday_response_full_json_deserialize() {
+        let json = r#"{
+            "open": [100.0, 101.0],
+            "high": [102.0, 103.0],
+            "low": [99.0, 100.0],
+            "close": [101.0, 102.0],
+            "volume": [1000.0, 2000.0],
+            "timestamp": [1700000000.0, 1700000060.0],
+            "open_interest": [5000.0, 6000.0]
+        }"#;
+        let resp: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.len(), 2);
+        assert!(resp.is_consistent());
+        assert_eq!(resp.volume, vec![1000, 2000]);
+        assert_eq!(resp.timestamp, vec![1700000000, 1700000060]);
+        assert_eq!(resp.open_interest, vec![5000, 6000]);
+    }
+
+    #[test]
+    fn test_intraday_response_volume_as_float_truncated_to_i64() {
+        // Dhan sometimes returns volume as float with .0
+        let json = r#"{
+            "open": [100.0],
+            "high": [102.0],
+            "low": [99.0],
+            "close": [101.0],
+            "volume": [1234.0],
+            "timestamp": [1700000000.0]
+        }"#;
+        let resp: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.volume[0], 1234);
+    }
+
+    #[test]
+    fn test_intraday_response_missing_oi_defaults_empty() {
+        let json = r#"{
+            "open": [100.0],
+            "high": [102.0],
+            "low": [99.0],
+            "close": [101.0],
+            "volume": [1000.0],
+            "timestamp": [1700000000.0]
+        }"#;
+        let resp: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.open_interest.is_empty());
+    }
+
+    #[test]
+    fn test_intraday_response_empty_arrays() {
+        let json = r#"{
+            "open": [],
+            "high": [],
+            "low": [],
+            "close": [],
+            "volume": [],
+            "timestamp": []
+        }"#;
+        let resp: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.is_empty());
+        assert!(resp.is_consistent());
+    }
+
+    // -----------------------------------------------------------------------
+    // MarketDepthLevel edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_market_depth_level_equality() {
+        let a = MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 245.5,
+            ask_price: 246.0,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_deep_depth_level_f64_precision_preserved() {
+        let level = DeepDepthLevel {
+            price: 24500.05,
+            quantity: 100,
+            orders: 5,
+        };
+        // f64 should preserve this precision exactly
+        assert!((level.price - 24500.05).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // ParsedTick field access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parsed_tick_all_fields_settable() {
+        let tick = ParsedTick {
+            security_id: 52432,
+            exchange_segment_code: 2,
+            last_traded_price: 245.5,
+            last_trade_quantity: 75,
+            exchange_timestamp: 1740556500,
+            received_at_nanos: 1_740_556_500_123_456_789,
+            average_traded_price: 244.0,
+            volume: 50000,
+            total_sell_quantity: 25000,
+            total_buy_quantity: 25000,
+            day_open: 242.0,
+            day_close: 240.0,
+            day_high: 248.0,
+            day_low: 238.0,
+            open_interest: 120000,
+            oi_day_high: 130000,
+            oi_day_low: 110000,
+        };
+        assert_eq!(tick.security_id, 52432);
+        assert_eq!(tick.exchange_segment_code, 2);
+        assert!((tick.last_traded_price - 245.5).abs() < f32::EPSILON);
+    }
 }

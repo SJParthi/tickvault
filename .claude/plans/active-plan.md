@@ -1,45 +1,77 @@
-# Implementation Plan: Test Coverage Gap Closure
+# Implementation Plan: Test Coverage Gap Closure (Phase 2 — Deep Scan)
 
 **Status:** VERIFIED
-**Date:** 2026-03-16
+**Date:** 2026-03-17
 **Approved by:** Parthiban
 
-## Plan Items
+## Plan Items (Phase 1 — Completed Previously)
 
 - [x] **1. OMS API Client — HTTP error path tests**
   - Files: `crates/trading/src/oms/api_client.rs`
-  - Tests: `test_place_order_success_response`, `test_place_order_rate_limited_429`, `test_place_order_dhan_api_error_non_2xx`, `test_place_order_json_parse_error`, `test_modify_order_success`, `test_modify_order_rate_limited`, `test_cancel_order_success`, `test_cancel_order_api_error`, `test_get_order_success`, `test_get_all_orders_success`, `test_get_all_orders_empty_array`, `test_get_positions_success`, `test_get_positions_empty`, `test_auth_headers_correct`
+  - Tests: 14 mock HTTP tests
 
 - [x] **2. Token Manager — lifecycle unit tests**
   - Files: `crates/core/src/auth/token_manager.rs`
-  - Tests: `test_token_handle_starts_none`, `test_token_handle_load_after_store`, `test_build_generate_token_url_format`, `test_build_renew_token_url_format`, `test_classify_generate_response_success`, `test_classify_generate_response_missing_token`, `test_token_renewal_needed_check`, `test_token_not_expired_within_validity`
+  - Tests: 6 lifecycle tests
 
 - [x] **3. Historical Candle Fetcher — edge case tests**
   - Files: `crates/core/src/historical/candle_fetcher.rs`
-  - Tests: `test_max_response_body_size_is_10mb`, `test_intraday_request_oi_field_serialized`, `test_intraday_request_all_fields_camel_case`, `test_candle_fetch_summary_all_zeroes`, `test_nan_price_detection`, `test_infinity_price_detection`, `test_neg_infinity_price_detection`, `test_normal_price_is_finite`, `test_dhan_response_consistency_check`
+  - Tests: 9 edge case tests
 
 - [x] **4. Risk Engine — P&L edge case tests**
   - Files: `crates/trading/src/risk/engine.rs`
-  - Tests: `test_position_reversal_long_to_short_pnl`, `test_position_reversal_short_to_long_pnl`, `test_weighted_avg_entry_many_fills`, `test_close_reopen_same_instrument`, `test_short_loss_calculation`, `test_multiple_instruments_pnl_independent`, `test_reset_daily_then_new_fills`, `test_exact_max_lots_boundary`, `test_negative_lots_sell_short`, `test_fill_at_zero_price`
+  - Tests: 14 P&L edge tests
 
 - [x] **5. WebSocket Connection Pool — already comprehensive (32+ tests)**
-  - Files: `crates/core/src/websocket/connection_pool.rs`
-  - Pre-existing: `test_pool_debug_format`, `test_pool_capacity_exceeded`, `test_pool_empty_instruments_ok`, `test_pool_single_instrument`, `test_pool_exact_capacity_boundary`, `test_pool_round_robin_distribution`, plus 26+ more including proptest
 
 - [x] **6. Notification Service — helper function tests**
   - Files: `crates/core/src/notification/service.rs`
-  - Tests: `test_strip_html_tags_unclosed_tag`, `test_strip_html_tags_only_tags`, `test_strip_html_tags_special_chars_in_content`, `test_strip_html_tags_angle_brackets_in_text`, `test_strip_html_tags_multiple_nested_tags`, `test_mask_phone_exact_boundary_8_chars`, `test_mask_phone_9_chars`, `test_mask_phone_empty`, `test_mask_phone_single_char`, `test_disabled_service_all_critical_events_safe`, `test_severity_low_does_not_trigger_sms_path`
+  - Tests: 11 helper tests
 
 - [x] **7. Config Validation — cross-field and boundary tests**
   - Files: `crates/common/src/config.rs`
-  - Tests: `test_market_close_before_open_time_values`, `test_order_cutoff_before_close`, `test_historical_lookback_zero_fails`, `test_historical_lookback_over_90_fails`, `test_historical_lookback_at_90_passes`, `test_historical_lookback_at_1_passes`, `test_historical_request_timeout_zero_fails`, `test_historical_disabled_skips_validation`, `test_websocket_excessive_read_timeout_fails`, `test_feed_mode_ticker_passes`, `test_feed_mode_quote_passes`, `test_feed_mode_full_passes`, `test_feed_mode_invalid_string_fails`, `test_feed_mode_case_sensitive`
+  - Tests: 14 boundary tests
 
 - [x] **8. Order Update WebSocket — field mapping tests**
   - Files: `crates/core/src/parser/order_update.rs`
-  - Tests: `test_product_code_c_is_cnc`, `test_product_code_i_is_intraday`, `test_txn_type_b_is_buy`, `test_txn_type_s_is_sell`, `test_source_p_is_api`, `test_opt_type_xx_is_non_option`, `test_opt_type_ce_is_call`, `test_opt_type_pe_is_put`, `test_leg_number_mapping`, `test_super_order_remark`, `test_correlation_id_roundtrip`, `test_extra_unknown_fields_ignored`, `test_partial_fill_fields`
+  - Tests: 13 field mapping tests
 
-- [x] **9. Build verification**
-  - `cargo test --workspace` — 2380 tests pass, 0 failures
+## Plan Items (Phase 2 — Deep Scan)
+
+- [x] **9. Indicator Engine — O(1) per-tick indicator tests (was 0 tests)**
+  - Files: `crates/trading/src/indicator/engine.rs`
+  - Tests: `test_new_engine_pre_allocates_state`, `test_new_engine_alpha_values_positive`, `test_fast_alpha_greater_than_slow`, `test_out_of_bounds_security_id_returns_default_snapshot`, `test_first_tick_initializes_ema_to_price`, `test_first_tick_not_warm`, `test_first_tick_rsi_is_neutral`, `test_first_tick_atr_is_zero`, `test_warmup_completes_after_threshold`, `test_ema_converges_to_constant_price`, `test_rsi_all_gains_approaches_100`, `test_rsi_all_losses_approaches_0`, `test_macd_at_constant_price_converges_to_zero`, `test_vwap_with_volume`, `test_vwap_zero_volume_stays_zero`, `test_vwap_reset_daily_clears_accumulators`, `test_bollinger_at_constant_price_bands_collapse`, `test_bollinger_reset_daily`, `test_sma_single_value_equals_price`, `test_sma_within_period_is_exact`, `test_atr_second_tick_initializes_to_true_range`, `test_obv_increases_on_price_up`, `test_obv_decreases_on_price_down`, `test_obv_unchanged_on_same_price`, `test_supertrend_first_tick_sets_initial_bands`, `test_instruments_are_independent`, `test_snapshot_carries_price_context`, `test_params_accessor`, `test_adx_starts_at_zero`, `test_adx_positive_after_trending`
+
+- [x] **10. Indicator Types — RingBuffer, IndicatorState, IndicatorParams, Snapshot tests**
+  - Files: `crates/trading/src/indicator/types.rs`
+  - Tests: `test_ring_buffer_new_is_empty`, `test_ring_buffer_push_increments_count`, `test_ring_buffer_push_returns_evicted_zero_when_not_full`, `test_ring_buffer_wraps_at_capacity`, `test_ring_buffer_oldest_when_full`, `test_ring_buffer_eviction_order`, `test_ring_buffer_default_same_as_new`, `test_indicator_state_new_all_zeros`, `test_indicator_state_not_warm_initially`, `test_indicator_state_warm_at_threshold`, `test_indicator_state_not_warm_below_threshold`, `test_indicator_state_default_same_as_new`, `test_indicator_params_default_values`, `test_ema_alpha_period_1`, `test_ema_alpha_period_12`, `test_wilder_factor_period_14`, `test_wilder_factor_period_1`, `test_indicator_snapshot_default_all_zeros`, `test_indicator_snapshot_is_copy`, `test_indicator_state_is_copy`
+
+- [x] **11. Storage DEDUP Key Gap Tests (STORAGE-GAP-01, I-P1-05)**
+  - Files: `crates/storage/src/tick_persistence.rs`, `crates/storage/src/instrument_persistence.rs`
+  - Tests: `test_ticks_ddl_has_segment_column`, `test_tick_dedup_key_is_pinned`, `test_depth_ddl_has_segment_column`, `test_dedup_key_derivative_contracts_includes_security_id`, `test_dedup_key_fno_underlyings_is_underlying_symbol`, `test_dedup_key_build_metadata_is_csv_source`, `test_dedup_key_subscribed_indices_is_security_id`, `test_derivative_contracts_ddl_contains_dedup_column`, `test_fno_underlyings_ddl_contains_dedup_column`, `test_derivative_contracts_ddl_has_underlying_symbol`
+
+- [x] **12. Tick Gap Tracker — edge case tests**
+  - Files: `crates/trading/src/risk/tick_gap_tracker.rs`
+  - Tests: `out_of_order_timestamp_returns_ok`, `warning_result_carries_gap_seconds`, `error_result_carries_gap_seconds`, `reset_mid_warmup_restarts_from_scratch`, `gap_just_below_warning_threshold_is_ok`, `cumulative_counters_increment`, `zero_capacity_tracker_works`
+
+- [x] **13. Reconciliation — edge case tests**
+  - Files: `crates/trading/src/oms/reconciliation.rs`
+  - Tests: `epsilon_boundary_fill_mismatch`, `price_beyond_epsilon_triggers_fill_update`, `status_and_fill_mismatch_on_same_order`, `unknown_status_not_counted_in_total_checked`, `all_unknown_statuses_yields_zero_checked`, `terminal_oms_order_missing_from_dhan_not_ghost`, `reconciliation_report_default_all_zeros`
+
+- [x] **14. OMS Engine — dry-run mode + lifecycle tests**
+  - Files: `crates/trading/src/oms/engine.rs`
+  - Tests: `oms_defaults_to_dry_run`, `dry_run_place_order_returns_paper_id`, `dry_run_sequential_paper_ids`, `dry_run_order_tracked_in_transit`, `handle_update_via_correlation_re_indexes_order`, `multiple_updates_increment_counter`, `handle_update_fills_data`, `reset_daily_also_resets_paper_counter`, `needs_reconciliation_flag_set_on_invalid_transition`
+
+- [x] **15. Common Crate — constants sanity + DhanIntradayResponse deserialization**
+  - Files: `crates/common/src/constants.rs`, `crates/common/src/tick_types.rs`
+  - Tests: `test_ist_offset_seconds_is_5h30m`, `test_ist_offset_nanos_consistent_with_seconds`, `test_sebi_max_orders_per_second`, `test_sebi_audit_retention_years`, `test_ticker_packet_size`, `test_quote_packet_size`, `test_full_packet_size`, `test_oi_packet_size`, `test_disconnect_packet_size`, `test_exchange_segment_code_6_is_unused`, `test_exchange_segment_sequential_except_gap`, `test_disconnect_codes_match_dhan_spec`, `test_response_code_disconnect_is_50`, `test_max_connections_is_5`, `test_max_instruments_per_connection_is_5000`, `test_subscription_batch_size_within_spec`, `test_total_subscriptions_consistent`, `test_deep_depth_header_is_12_not_8`, `test_deep_depth_bid_ask_codes`, `test_market_open_time`, `test_order_update_login_msg_code_is_42`, `test_indicator_warmup_ticks_positive`, `test_indicator_ring_buffer_capacity_power_of_two`, `test_intraday_response_full_json_deserialize`, `test_intraday_response_volume_as_float_truncated_to_i64`, `test_intraday_response_missing_oi_defaults_empty`, `test_intraday_response_empty_arrays`, `test_market_depth_level_equality`, `test_deep_depth_level_f64_precision_preserved`, `test_parsed_tick_all_fields_settable`
+
+- [x] **16. Candle Persistence — DDL and constant validation**
+  - Files: `crates/storage/src/candle_persistence.rs`
+  - Tests: `test_dedup_key_candles_is_security_id`, `test_candles_1m_ddl_has_segment_column`, `test_candles_1m_ddl_has_security_id`, `test_candles_1m_ddl_has_ohlcv_columns`, `test_live_candle_flush_batch_size_positive`, `test_questdb_ddl_timeout_is_reasonable_candle`
+
+- [x] **17. Build verification**
+  - `cargo test --workspace` — 2492 tests pass, 0 failures
   - `cargo clippy --workspace --tests` — 0 warnings
 
 ## Scenarios
@@ -54,3 +86,9 @@
 | 6 | Config: lookback_days = 91 | Validation fails with descriptive error |
 | 7 | Order update: unknown fields in JSON | Parsed without error (serde default) |
 | 8 | Notification: HTML with `<`, `>` in text | `strip_html_tags` handles correctly |
+| 9 | Indicator engine: out-of-bounds security_id | Returns default snapshot |
+| 10 | Indicator engine: VWAP with zero volume | Returns 0.0, no division by zero |
+| 11 | Tick gap: out-of-order timestamp | saturating_sub → Ok, no panic |
+| 12 | Reconciliation: unknown Dhan status | Skipped, not counted in total_checked |
+| 13 | OMS dry-run: place order | Returns PAPER-N ID, no HTTP call |
+| 14 | DEDUP_KEY_TICKS | Currently "security_id", DDL has segment column |
