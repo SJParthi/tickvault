@@ -68,7 +68,7 @@
 | 2.4 | Condition coverage | Each boolean sub-expression T/F | `if size > limit && drawdown > max` — each condition independent | `GAP` | Not standard in Rust ecosystem | See Gap #6 (partial via llvm-cov) |
 | 2.5 | Path coverage | All execution paths through function | 5 sequential ifs = 32 paths — approximated by proptest | `DOCUMENTED` | Approximated by property-based testing | Infeasible for full coverage |
 | 2.6 | MC/DC | Modified Condition/Decision Coverage | Aviation/safety-critical standard — partial relevance for risk checks | `N/A` | Overkill for this system | DO-178C level, not required |
-| 2.7 | Crate-level thresholds | Per-crate minimum coverage % | core/trading 95%, common/storage/api 90%, app 80% | `DOCUMENTED` | Thresholds defined in testing.md, NOT enforced in CI | See Gap #7 |
+| 2.7 | Crate-level thresholds | Per-crate minimum coverage % | ALL crates 95% minimum | `ENFORCED` | Thresholds in `quality/crate-coverage-thresholds.toml`, enforced by CI + `make coverage` | Resolved |
 | 2.8 | Coverage ratcheting | Coverage % can only go up | Test count ratchets but coverage % doesn't | `GAP` | Test count guard exists, coverage % not gated | See Gap #7 |
 
 ---
@@ -575,7 +575,7 @@ services:
 
 ### Pre-Release
 
-- [ ] Coverage thresholds met: core/trading ≥ 95%, common/storage/api ≥ 90%, app ≥ 80%
+- [ ] Coverage thresholds met: ALL crates ≥ 95%
 - [ ] Benchmark regressions < 5% (all 10 baselines in quality_gates.md)
 - [ ] Docker image < 15MB (scratch base)
 - [ ] All TODOs/FIXMEs resolved in production code

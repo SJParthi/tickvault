@@ -255,7 +255,7 @@ make prometheus                      # localhost:9090
 4. Secret Scan: blocks .env, AWS keys, private keys, tokens
 
 **Post-merge only:**
-5. Coverage (per-crate thresholds: common 80%, core 60%, trading 50%, storage 60%, api 60%, app 50% — see `quality/crate-coverage-thresholds.toml`)
+5. Coverage (95% minimum for ALL crates — see `quality/crate-coverage-thresholds.toml`)
 6. Benchmarks (budgets in `quality/benchmark-budgets.toml`, 5% regression gate)
 7. DHAT zero-allocation (hard fail for core + trading crates)
 
