@@ -79,10 +79,29 @@ quality/.binary-size-baseline
 .claude/hooks/.session-network.log
 .claude/hooks/.push-in-progress
 
+# ---- Grill review state (runtime state) ----
+.claude/hooks/.last-grill-pass
+
 # ---- Integration sync (runtime state) ----
 .claude/.integration-worktree/
 .claude/hooks/.integration-sync.lock/
 .claude/hooks/.integration-sync.log
+
+# ---- Instrument data cache (large CSVs) ----
+data/
+data/instrument-cache/
+
+# ---- Database artifacts (stray files outside docker-data/) ----
+*.sqlite
+*.db
+*.rdb
+
+# ---- Profiling artifacts ----
+*.profraw
+*.profdata
+
+# ---- PID files ----
+*.pid
 
 # ---- Temporary files ----
 *.tmp
