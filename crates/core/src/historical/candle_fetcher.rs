@@ -58,6 +58,14 @@ const DH_904_BACKOFF_BASE_SECS: u64 = 10;
 /// Maximum DH-904 backoff attempts before giving up.
 const DH_904_MAX_BACKOFF_ATTEMPTS: u32 = 4;
 
+/// Maximum retry waves for failed instruments after the initial pass.
+/// Each wave re-attempts all transiently-failed instruments with increasing backoff.
+const RETRY_WAVE_MAX: usize = 5;
+
+/// Base backoff between retry waves (seconds). Wave N sleeps N * base seconds.
+/// Wave 1: 30s, Wave 2: 60s, Wave 3: 90s, Wave 4: 120s, Wave 5: 150s.
+const RETRY_WAVE_BACKOFF_BASE_SECS: u64 = 30;
+
 /// Dhan error response structure — exactly 3 string fields per API docs.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +133,16 @@ fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
     }
 
     ErrorAction::StandardRetry
+}
+
+/// Result of a single instrument fetch attempt.
+#[derive(Debug)]
+enum InstrumentFetchResult {
+    /// Successfully fetched — candle count.
+    Success(usize),
+    /// Failure — eligible for retry in next wave.
+    /// NeverRetry errors (DH-905) will fail fast on re-attempt (no wasted time).
+    Failed,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,11 +226,18 @@ pub async fn fetch_historical_candles(
     let m_fetched = counter!("dlt_historical_candles_fetched_total");
     let m_api_errors = counter!("dlt_historical_api_errors_total");
 
-    #[allow(clippy::expect_used)] // APPROVED: compile-time constant 19800 is always valid
-    // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800 = 5h30m),
-    // always valid for east_opt(). The expect is unreachable but satisfies no-unwrap lint.
-    let ist_offset =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time constant
+    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
+        Some(offset) => offset,
+        None => {
+            warn!("invalid IST offset constant — cannot compute date range");
+            return CandleFetchSummary {
+                instruments_fetched: 0,
+                instruments_failed: 0,
+                total_candles: 0,
+                instruments_skipped: 0,
+            };
+        }
+    };
 
     let now_ist = Utc::now().with_timezone(&ist_offset);
     let today = now_ist.date_naive();
@@ -270,16 +295,21 @@ pub async fn fetch_historical_candles(
     // can exist in both IDX_I and NSE_EQ with different candle data.
     let mut fetched_instruments: HashSet<(u32, String)> = HashSet::new();
     let mut instruments_fetched: usize = 0;
-    let mut instruments_failed: usize = 0;
     let mut instruments_skipped: usize = 0;
     let mut total_candles: usize = 0;
 
-    // Iterate all subscribed instruments
-    for instrument in registry.iter() {
-        let security_id = instrument.security_id;
+    // Build the list of fetchable instruments (skip derivatives, dedup)
+    struct FetchTarget {
+        security_id: u32,
+        security_id_str: String,
+        segment_code: u8,
+        exchange_segment_str: String,
+        instrument_type: &'static str,
+    }
 
+    let mut targets: Vec<FetchTarget> = Vec::new();
+    for instrument in registry.iter() {
         // Skip all derivatives (futures + options).
-        // Historical candles are needed for indices (major + display) and stock equities.
         if matches!(
             instrument.category,
             SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
@@ -288,149 +318,109 @@ pub async fn fetch_historical_candles(
             continue;
         }
 
-        // Determine the Dhan API instrument type
         let instrument_type = match instrument.category {
-            // Both major indices (NIFTY, BANKNIFTY) and display indices (INDIA VIX, etc.)
-            // are fetched as INDEX — they live in IDX_I segment.
             SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
             SubscriptionCategory::StockEquity => "EQUITY",
-            // Derivatives already skipped above
             SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => {
                 continue;
             }
         };
 
-        let segment_code = instrument.exchange_segment.binary_code();
         let exchange_segment_str = instrument.exchange_segment.as_str().to_string();
-
-        // Skip already-fetched (security_id, segment) pairs.
-        // Same security_id (e.g. 13=NIFTY, 25=BANKNIFTY) can exist in both
-        // IDX_I and NSE_EQ with different candle data — dedup must include segment.
-        let dedup_key = (security_id, exchange_segment_str.clone());
+        let dedup_key = (instrument.security_id, exchange_segment_str.clone());
         if fetched_instruments.contains(&dedup_key) {
             continue;
         }
-        let security_id_str = security_id.to_string();
+        // Reserve the dedup slot so duplicates in the registry are skipped
+        fetched_instruments.insert(dedup_key);
 
-        let mut instrument_candles = 0_usize;
-        let mut instrument_failed = false;
+        targets.push(FetchTarget {
+            security_id: instrument.security_id,
+            security_id_str: instrument.security_id.to_string(),
+            segment_code: instrument.exchange_segment.binary_code(),
+            exchange_segment_str,
+            instrument_type,
+        });
+    }
 
-        // --- Fetch all 4 intraday timeframes ---
-        for &(interval, timeframe_label) in INTRADAY_TIMEFRAMES {
-            // Rate limiting delay between requests
-            if historical_config.request_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
-            }
+    // Track which target indices still need fetching
+    let mut pending_indices: Vec<usize> = (0..targets.len()).collect();
 
-            // Load current access token
-            let token_guard = token_handle.load();
-            let access_token = match token_guard.as_ref() {
-                Some(token_state) => {
-                    Zeroizing::new(token_state.access_token().expose_secret().to_string())
-                }
-                None => {
-                    warn!("no access token available — skipping historical fetch");
-                    instrument_failed = true;
-                    break;
-                }
-            };
+    // --- Wave 0 = initial pass, Waves 1..=RETRY_WAVE_MAX = retries ---
+    for wave in 0..=RETRY_WAVE_MAX {
+        if pending_indices.is_empty() {
+            break;
+        }
 
-            let request_body = IntradayRequest {
-                security_id: security_id_str.clone(),
-                exchange_segment: exchange_segment_str.clone(),
-                instrument: instrument_type.to_string(),
-                interval: interval.to_string(),
-                oi: true,
-                from_date: intraday_from.clone(),
-                to_date: intraday_to.clone(),
-            };
+        if wave > 0 {
+            let backoff_secs = RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64);
+            warn!(
+                wave,
+                remaining = pending_indices.len(),
+                backoff_secs,
+                "retry wave — backing off before re-attempting failed instruments"
+            );
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        }
 
-            match fetch_intraday_with_retry(
+        let mut still_pending: Vec<usize> = Vec::new();
+
+        for &idx in &pending_indices {
+            let target = &targets[idx];
+
+            let result = fetch_single_instrument(
                 &http_client,
                 &intraday_endpoint,
-                &request_body,
-                &access_token,
+                &daily_endpoint,
+                &intraday_from,
+                &intraday_to,
+                &from_date_str,
+                &daily_to_str,
+                target.security_id,
+                &target.security_id_str,
+                target.segment_code,
+                &target.exchange_segment_str,
+                target.instrument_type,
+                token_handle,
                 client_id,
                 historical_config,
-                security_id,
-                segment_code,
-                timeframe_label,
                 candle_writer,
                 &m_api_errors,
             )
-            .await
-            {
-                Some(count) => {
-                    instrument_candles = instrument_candles.saturating_add(count);
-                }
-                None => {
-                    instrument_failed = true;
-                }
-            }
-        }
+            .await;
 
-        // --- Fetch daily candles ---
-        if !instrument_failed {
-            if historical_config.request_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
-            }
-
-            let token_guard = token_handle.load();
-            let access_token = match token_guard.as_ref() {
-                Some(token_state) => {
-                    Zeroizing::new(token_state.access_token().expose_secret().to_string())
+            match result {
+                InstrumentFetchResult::Success(candle_count) => {
+                    instruments_fetched = instruments_fetched.saturating_add(1);
+                    total_candles = total_candles.saturating_add(candle_count);
+                    #[allow(clippy::cast_possible_truncation)]
+                    // APPROVED: usize->u64 is lossless on 64-bit targets
+                    m_fetched.increment(candle_count as u64);
                 }
-                None => {
-                    warn!("no access token available — skipping daily fetch");
-                    instrument_failed = true;
-                    Zeroizing::new(String::new()) // placeholder, not used
-                }
-            };
-
-            if !instrument_failed {
-                let daily_body = DailyRequest {
-                    security_id: security_id_str.clone(),
-                    exchange_segment: exchange_segment_str.clone(),
-                    instrument: instrument_type.to_string(),
-                    expiry_code: None,
-                    from_date: from_date_str.clone(),
-                    to_date: daily_to_str.clone(),
-                };
-
-                match fetch_daily_with_retry(
-                    &http_client,
-                    &daily_endpoint,
-                    &daily_body,
-                    &access_token,
-                    client_id,
-                    historical_config,
-                    security_id,
-                    segment_code,
-                    candle_writer,
-                    &m_api_errors,
-                )
-                .await
-                {
-                    Some(count) => {
-                        instrument_candles = instrument_candles.saturating_add(count);
-                    }
-                    None => {
-                        instrument_failed = true;
-                    }
+                InstrumentFetchResult::Failed => {
+                    still_pending.push(idx);
                 }
             }
         }
 
-        if instrument_failed {
-            instruments_failed = instruments_failed.saturating_add(1);
-        } else {
-            fetched_instruments.insert(dedup_key);
-            instruments_fetched = instruments_fetched.saturating_add(1);
-            total_candles = total_candles.saturating_add(instrument_candles);
-            // APPROVED: usize->u64 is lossless on 64-bit targets (our only deployment target)
-            #[allow(clippy::cast_possible_truncation)]
-            m_fetched.increment(instrument_candles as u64);
+        if wave == 0 && !still_pending.is_empty() {
+            info!(
+                failed = still_pending.len(),
+                total = targets.len(),
+                "initial pass complete — scheduling retry waves for failed instruments"
+            );
         }
+
+        pending_indices = still_pending;
+    }
+
+    let instruments_failed = pending_indices.len();
+    if instruments_failed > 0 {
+        warn!(
+            instruments_failed,
+            retry_waves = RETRY_WAVE_MAX,
+            "instruments still failed after all retry waves"
+        );
     }
 
     // Final flush
@@ -449,6 +439,136 @@ pub async fn fetch_historical_candles(
         total_candles,
         instruments_skipped,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-Instrument Fetch Helper
+// ---------------------------------------------------------------------------
+
+/// Fetches all timeframes (4 intraday + daily) for a single instrument.
+/// Returns whether the fetch succeeded, failed transiently, or permanently.
+#[allow(clippy::too_many_arguments)] // APPROVED: single-instrument fetch needs full context
+async fn fetch_single_instrument(
+    http_client: &reqwest::Client,
+    intraday_endpoint: &str,
+    daily_endpoint: &str,
+    intraday_from: &str,
+    intraday_to: &str,
+    daily_from: &str,
+    daily_to: &str,
+    security_id: u32,
+    security_id_str: &str,
+    segment_code: u8,
+    exchange_segment_str: &str,
+    instrument_type: &str,
+    token_handle: &TokenHandle,
+    client_id: &SecretString,
+    historical_config: &HistoricalDataConfig,
+    candle_writer: &mut CandlePersistenceWriter,
+    m_api_errors: &metrics::Counter,
+) -> InstrumentFetchResult {
+    let mut instrument_candles = 0_usize;
+
+    // --- Fetch all 4 intraday timeframes ---
+    for &(interval, timeframe_label) in INTRADAY_TIMEFRAMES {
+        if historical_config.request_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
+        }
+
+        let token_guard = token_handle.load();
+        let access_token = match token_guard.as_ref() {
+            Some(token_state) => {
+                Zeroizing::new(token_state.access_token().expose_secret().to_string())
+            }
+            None => {
+                warn!("no access token available — skipping historical fetch");
+                return InstrumentFetchResult::Failed;
+            }
+        };
+
+        let request_body = IntradayRequest {
+            security_id: security_id_str.to_string(),
+            exchange_segment: exchange_segment_str.to_string(),
+            instrument: instrument_type.to_string(),
+            interval: interval.to_string(),
+            oi: true,
+            from_date: intraday_from.to_string(),
+            to_date: intraday_to.to_string(),
+        };
+
+        match fetch_intraday_with_retry(
+            http_client,
+            intraday_endpoint,
+            &request_body,
+            &access_token,
+            client_id,
+            historical_config,
+            security_id,
+            segment_code,
+            timeframe_label,
+            candle_writer,
+            m_api_errors,
+        )
+        .await
+        {
+            Some(count) => {
+                instrument_candles = instrument_candles.saturating_add(count);
+            }
+            None => {
+                // Cannot distinguish transient vs permanent here — return transient
+                // so the retry wave re-attempts. If it's truly permanent (DH-905),
+                // the retry will fail fast (NeverRetry returns immediately).
+                return InstrumentFetchResult::Failed;
+            }
+        }
+    }
+
+    // --- Fetch daily candles ---
+    if historical_config.request_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
+    }
+
+    let token_guard = token_handle.load();
+    let access_token = match token_guard.as_ref() {
+        Some(token_state) => Zeroizing::new(token_state.access_token().expose_secret().to_string()),
+        None => {
+            warn!("no access token available — skipping daily fetch");
+            return InstrumentFetchResult::Failed;
+        }
+    };
+
+    let daily_body = DailyRequest {
+        security_id: security_id_str.to_string(),
+        exchange_segment: exchange_segment_str.to_string(),
+        instrument: instrument_type.to_string(),
+        expiry_code: None,
+        from_date: daily_from.to_string(),
+        to_date: daily_to.to_string(),
+    };
+
+    match fetch_daily_with_retry(
+        http_client,
+        daily_endpoint,
+        &daily_body,
+        &access_token,
+        client_id,
+        historical_config,
+        security_id,
+        segment_code,
+        candle_writer,
+        m_api_errors,
+    )
+    .await
+    {
+        Some(count) => {
+            instrument_candles = instrument_candles.saturating_add(count);
+        }
+        None => {
+            return InstrumentFetchResult::Failed;
+        }
+    }
+
+    InstrumentFetchResult::Success(instrument_candles)
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,5 +1514,57 @@ mod tests {
     fn test_post_market_constants() {
         assert_eq!(POST_MARKET_FETCH_TIME_IST_HOUR, 15);
         assert_eq!(POST_MARKET_FETCH_TIME_IST_MINUTE, 35);
+    }
+
+    // -- Retry wave tests --
+
+    #[test]
+    fn test_retry_wave_constants() {
+        const {
+            assert!(
+                RETRY_WAVE_MAX >= 3,
+                // "need at least 3 retry waves for resilient fetching"
+            );
+            assert!(
+                RETRY_WAVE_BACKOFF_BASE_SECS >= 10,
+                // "retry wave backoff must be at least 10s"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retry_wave_backoff_sequence() {
+        // Wave 1: 30s, Wave 2: 60s, Wave 3: 90s, Wave 4: 120s, Wave 5: 150s
+        for wave in 1..=RETRY_WAVE_MAX {
+            let backoff = RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64);
+            assert!(backoff > 0, "wave {wave} backoff must be positive");
+            assert!(
+                backoff <= 300,
+                "wave {wave} backoff {backoff}s should not exceed 5 minutes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_instrument_fetch_result_variants() {
+        // Verify enum variants exist and Debug works
+        let success = InstrumentFetchResult::Success(100);
+        let failed = InstrumentFetchResult::Failed;
+        assert!(format!("{success:?}").contains("100"));
+        assert!(format!("{failed:?}").contains("Failed"));
+    }
+
+    #[test]
+    fn test_retry_wave_max_total_backoff() {
+        // Total maximum backoff across all waves: sum(1..=5) * 30 = 15 * 30 = 450s = 7.5 min
+        let mut total_backoff = 0_u64;
+        for wave in 1..=RETRY_WAVE_MAX {
+            total_backoff = total_backoff
+                .saturating_add(RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64));
+        }
+        assert!(
+            total_backoff <= 600,
+            "total retry backoff {total_backoff}s should not exceed 10 minutes"
+        );
     }
 }
