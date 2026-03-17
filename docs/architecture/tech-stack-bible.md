@@ -43,9 +43,9 @@
 |---|-----------|---------|---------|
 | 16 | QuestDB | 8.3.3 | Time-series DB: tick storage, OHLCV, audit |
 | 17 | questdb-rs | 6.1.0 | ILP client: high-throughput row ingestion |
-| 18 | Valkey | 8.1.1 | In-memory cache (Redis fork): OMS state, live greeks |
-| 19 | redis (crate) | 1.0.4 | Rust client for Valkey — async, connection pool |
-| 20 | deadpool-redis | 0.22.1 | Async connection pool for Valkey |
+| 18 | Valkey | 9.0.2-alpine | In-memory cache (Redis fork): OMS state, live greeks |
+| 19 | redis (crate) | 1.0.5 | Rust client for Valkey — async, connection pool |
+| 20 | deadpool-redis | 0.23.0 | Async connection pool for Valkey |
 
 ---
 
@@ -109,7 +109,7 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 49 | toml (crate) | 1.0.2 | Parse base.toml + local-overrides.toml |
+| 49 | toml (crate) | 1.0.6 | Parse base.toml + local-overrides.toml |
 
 ---
 

@@ -276,7 +276,7 @@ Disconnect (10):      Header + [code:u16LE]
 CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT paise).
 ```
 
-## Test Counts (~2,427 total)
+## Test Counts (~2,439 total)
 
 | Crate | Tests |
 |-------|-------|
@@ -286,7 +286,7 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 | storage | 259 |
 | api | 105 |
 | app | 21 |
-| **Total** | **~2,427** |
+| **Total** | **~2,439** |
 
 ## QuestDB Tables (5) — DEDUP UPSERT KEYS enabled on all
 
