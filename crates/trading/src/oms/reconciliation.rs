@@ -345,7 +345,7 @@ mod tests {
         oms.insert("1".to_owned(), order);
 
         let mut dhan = make_dhan_order("1", "TRADED");
-        dhan.average_trade_price = 100.0 + f64::EPSILON;
+        dhan.average_traded_price = 100.0 + f64::EPSILON;
         let dhan = vec![dhan];
 
         let (_report, updates) = reconcile_orders(&oms, &dhan);
@@ -362,7 +362,7 @@ mod tests {
 
         let mut dhan = make_dhan_order("1", "TRADED");
         // Use a clearly-different price that exceeds EPSILON tolerance
-        dhan.average_trade_price = 100.5;
+        dhan.average_traded_price = 100.5;
         let dhan = vec![dhan];
 
         let (_report, updates) = reconcile_orders(&oms, &dhan);
@@ -378,7 +378,7 @@ mod tests {
 
         let mut dhan = make_dhan_order("1", "TRADED");
         dhan.traded_quantity = 50;
-        dhan.average_trade_price = 99.5;
+        dhan.average_traded_price = 99.5;
         let dhan = vec![dhan];
 
         let (report, updates) = reconcile_orders(&oms, &dhan);
