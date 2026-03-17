@@ -55,14 +55,21 @@ wss://api-feed.dhan.co?version=2&token={access_token}&clientId={client_id}&authT
 
 | Code | Enum Variant | Reconnectable? | Token Refresh? | Action |
 |------|-------------|----------------|---------------|--------|
+| 800 | InternalServerError | ✅ | No | Transient — reconnect with backoff |
+| 804 | InstrumentsExceedLimit | ❌ | No | Reduce instrument count — config bug |
 | 805 | ExceededActiveConnections | ❌ | No | Reduce connections — config bug |
 | 806 | DataApiSubscriptionRequired | ❌ | No | User needs active Dhan data subscription (₹499/mo) |
 | 807 | AccessTokenExpired | ✅ | **YES** | Refresh token via auth pipeline, then reconnect |
-| 808 | InvalidClientId | ❌ | No | Check SSM credentials — wrong client_id |
-| 809 | AuthenticationFailed | ❌ | No | Check token/credentials — auth rejected |
+| 808 | AuthenticationFailed | ❌ | No | Check token/credentials — auth rejected |
+| 809 | AccessTokenInvalid | ❌ | No | Token corrupted or revoked — re-authenticate |
+| 810 | ClientIdInvalid | ❌ | No | Check SSM credentials — wrong client_id |
+| 811 | InvalidExpiryDate | ❌ | No | Fix expiry date in request — DH-905 class |
+| 812 | InvalidDateFormat | ❌ | No | Fix date format in request — DH-905 class |
+| 813 | InvalidSecurityId | ❌ | No | Fix security ID in request — DH-905 class |
+| 814 | InvalidRequest | ❌ | No | Fix request format — DH-905 class |
 | Unknown(n) | Unknown | ✅ (assume transient) | No | Log + reconnect with backoff |
 
-**Key difference from original spec:** Only code 807 (AccessTokenExpired) triggers token refresh. Codes 805-809 are from the actual Dhan Python SDK `on_close` handler, replacing the previously assumed 801-814 range.
+**Source:** `docs/dhan-ref/08-annexure-enums.md` Section 11 — 12 codes total (800, 804-814). Codes 801, 802, 803 do NOT exist in the annexure. Only code 807 (AccessTokenExpired) triggers token refresh.
 
 ---
 
@@ -138,11 +145,18 @@ type ConnectionId = u8;  // 0–4
 enum ConnectionState { Disconnected, Connecting, Connected, Reconnecting }
 
 enum DisconnectCode {
+    InternalServerError,            // 800
+    InstrumentsExceedLimit,         // 804
     ExceededActiveConnections,      // 805
     DataApiSubscriptionRequired,    // 806
     AccessTokenExpired,             // 807
-    InvalidClientId,                // 808
-    AuthenticationFailed,           // 809
+    AuthenticationFailed,           // 808
+    AccessTokenInvalid,             // 809
+    ClientIdInvalid,                // 810
+    InvalidExpiryDate,              // 811
+    InvalidDateFormat,              // 812
+    InvalidSecurityId,              // 813
+    InvalidRequest,                 // 814
     Unknown(u16),
 }
 
@@ -256,12 +270,19 @@ SERVER_PING_INTERVAL_SECS = 10        // Server pings client every 10s
 SERVER_PING_TIMEOUT_SECS = 40         // Server disconnects if no pong for 40s
 SUBSCRIPTION_BATCH_SIZE = 100
 
-// Disconnect codes (Dhan SDK on_close handler)
-DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS = 805
-DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED = 806
-DISCONNECT_ACCESS_TOKEN_EXPIRED = 807
-DISCONNECT_INVALID_CLIENT_ID = 808
-DISCONNECT_AUTH_FAILED = 809
+// Disconnect codes (docs/dhan-ref/08-annexure-enums.md Section 11 — 12 codes)
+DATA_API_INTERNAL_SERVER_ERROR = 800
+DATA_API_INSTRUMENTS_EXCEED_LIMIT = 804
+DATA_API_EXCEEDED_ACTIVE_CONNECTIONS = 805
+DATA_API_NOT_SUBSCRIBED = 806
+DATA_API_ACCESS_TOKEN_EXPIRED = 807
+DATA_API_AUTHENTICATION_FAILED = 808
+DATA_API_ACCESS_TOKEN_INVALID = 809
+DATA_API_CLIENT_ID_INVALID = 810
+DATA_API_INVALID_EXPIRY_DATE = 811
+DATA_API_INVALID_DATE_FORMAT = 812
+DATA_API_INVALID_SECURITY_ID = 813
+DATA_API_INVALID_REQUEST = 814
 
 // Subscribe request codes
 FEED_REQUEST_TICKER = 15
