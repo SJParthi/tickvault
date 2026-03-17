@@ -8,7 +8,7 @@
 #
 #   ALL 3 launchd agents:
 #     - co.dhan.live-trader  (8:15 AM trigger — original)
-#     - com.dlt.trader       (8:30 AM trigger — newer, with crash recovery)
+#     - com.dlt.trader       (8:15 AM trigger — newer, with crash recovery)
 #     - com.dlt.watchdog     (every 5 min — auto-restarts trader if dead)
 #
 #   ALL project directories:
@@ -25,7 +25,7 @@
 #     - Volumes matching "dhan" or "dlt"
 #
 #   Power management:
-#     - pmset repeat cancel (kills 8:25 AM wake schedule)
+#     - pmset repeat cancel (kills 8:10 AM wake schedule)
 #     - pmset restoredefaults (resets sleep/wake settings)
 #
 #   Desktop shortcuts:
@@ -104,7 +104,7 @@ if launchctl list 2>/dev/null | grep -q "co.dhan.live-trader"; then
 fi
 rm -f "$PLIST_1"
 
-# Agent 2: com.dlt.trader (newer, 8:30 AM, uses launchctl bootstrap/bootout)
+# Agent 2: com.dlt.trader (newer, 8:15 AM, uses launchctl bootstrap/bootout)
 PLIST_2="${HOME}/Library/LaunchAgents/com.dlt.trader.plist"
 if launchctl list "com.dlt.trader" >/dev/null 2>&1; then
     launchctl bootout "gui/${GUI_UID}" "$PLIST_2" 2>/dev/null || \
@@ -133,7 +133,7 @@ for plist in "${HOME}"/Library/LaunchAgents/*dhan* "${HOME}"/Library/LaunchAgent
     fi
 done
 
-echo "      All launchd agents removed (8:15 AM, 8:30 AM, watchdog — all gone)"
+echo "      All launchd agents removed (8:15 AM original, 8:15 AM newer, watchdog — all gone)"
 
 # ---- Step 3: Stop + remove ALL Docker containers, images, volumes ----
 STEP=$((STEP + 1))
@@ -204,9 +204,9 @@ echo "[${STEP}/${TOTAL}] Cancelling wake schedule + reverting power management..
 if command -v pmset &> /dev/null; then
     # pmset repeat cancel — THIS IS THE CRITICAL ONE
     # restoredefaults does NOT cancel scheduled wakes
-    # Without this, Mac still wakes at 8:25 AM every weekday
+    # Without this, Mac still wakes at 8:10 AM every weekday
     sudo pmset repeat cancel 2>/dev/null && \
-        echo "      Cancelled wake schedule (no more 8:25 AM wake)" || \
+        echo "      Cancelled wake schedule (no more 8:10 AM wake)" || \
         echo "      NOTE: Run manually: sudo pmset repeat cancel"
     sudo pmset restoredefaults 2>/dev/null && \
         echo "      Power management restored to defaults" || \
@@ -231,7 +231,7 @@ echo "      Created ~/.dhan-aws-is-primary"
 echo "      Created ~/.dhan-live-trader-disabled"
 
 # ---- Send Telegram ----
-send_telegram "Mac FULLY WIPED. All 3 launchd agents removed (8:15, 8:30, watchdog). All project dirs deleted. ~/.dlt deleted. Docker cleaned. Wake schedule cancelled. Nothing remains. AWS is the only trading host."
+send_telegram "Mac FULLY WIPED. All 3 launchd agents removed (8:15 original, 8:15 newer, watchdog). All project dirs deleted. ~/.dlt deleted. Docker cleaned. Wake schedule cancelled. Nothing remains. AWS is the only trading host."
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -241,7 +241,7 @@ echo ""
 echo "Removed:"
 echo "  LAUNCHD AGENTS (all 3):"
 echo "    - co.dhan.live-trader  (8:15 AM auto-start)"
-echo "    - com.dlt.trader       (8:30 AM auto-start + crash recovery)"
+echo "    - com.dlt.trader       (8:15 AM auto-start + crash recovery)"
 echo "    - com.dlt.watchdog     (every 5 min auto-restart)"
 echo ""
 echo "  DIRECTORIES:"
@@ -254,7 +254,7 @@ echo "  DOCKER:"
 echo "    - All dhan/dlt containers, images, volumes"
 echo ""
 echo "  POWER MANAGEMENT:"
-echo "    - pmset repeat cancelled (no more 8:25 AM wake)"
+echo "    - pmset repeat cancelled (no more 8:10 AM wake)"
 echo "    - pmset defaults restored"
 echo ""
 echo "  OTHER:"

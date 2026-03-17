@@ -87,7 +87,7 @@ echo ""
 echo -e "${CYAN}launchd agents:${NC}"
 
 if launchctl list "com.dlt.trader" >/dev/null 2>&1; then
-    check "com.dlt.trader agent loaded (daily 8:30 AM)" 0
+    check "com.dlt.trader agent loaded (daily 8:15 AM)" 0
 else
     check "com.dlt.trader agent loaded" 1
 fi
