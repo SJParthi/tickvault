@@ -77,12 +77,22 @@ if [ -z "$SESSION_BRANCHES" ]; then
   exit 0
 fi
 
+# Detect default branch for commit count display
+_DEFAULT=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+if [ -z "$_DEFAULT" ]; then
+  if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
+    _DEFAULT="main"
+  else
+    _DEFAULT="master"
+  fi
+fi
+
 echo ""
 echo "Session branches found:"
 while IFS= read -r branch; do
   [ -z "$branch" ] && continue
-  COMMITS=$(git log --oneline "origin/main..origin/${branch}" 2>/dev/null | wc -l | tr -d ' ') || true
-  printf '  - %s (%s commits ahead of main)\n' "$branch" "${COMMITS:-0}"
+  COMMITS=$(git log --oneline "origin/${_DEFAULT}..origin/${branch}" 2>/dev/null | wc -l | tr -d ' ') || true
+  printf '  - %s (%s commits ahead of %s)\n' "$branch" "${COMMITS:-0}" "$_DEFAULT"
 done <<< "$SESSION_BRANCHES"
 
 if [ "$DRY_RUN" = true ]; then
@@ -120,9 +130,22 @@ if git show-ref --verify --quiet "refs/remotes/origin/${INTEGRATION_BRANCH}"; th
     git checkout -b "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH"
   }
 else
-  echo "Creating ${INTEGRATION_BRANCH} from main..."
-  if ! git checkout -b "$INTEGRATION_BRANCH" origin/main; then
-    echo "ERROR: Could not create integration branch (does origin/main exist?)" >&2
+  # Detect default branch (main or master)
+  DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  if [ -z "$DEFAULT_BRANCH" ]; then
+    # Fallback: try main, then master
+    if git show-ref --verify --quiet refs/remotes/origin/main; then
+      DEFAULT_BRANCH="main"
+    elif git show-ref --verify --quiet refs/remotes/origin/master; then
+      DEFAULT_BRANCH="master"
+    else
+      echo "ERROR: Cannot find origin/main or origin/master." >&2
+      exit 1
+    fi
+  fi
+  echo "Creating ${INTEGRATION_BRANCH} from ${DEFAULT_BRANCH}..."
+  if ! git checkout -b "$INTEGRATION_BRANCH" "origin/$DEFAULT_BRANCH"; then
+    echo "ERROR: Could not create integration branch from origin/$DEFAULT_BRANCH" >&2
     exit 1
   fi
 fi
