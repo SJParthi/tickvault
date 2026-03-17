@@ -949,15 +949,22 @@ Each level format: `<IIHHff`
 | 0-7 | 8 | Header | (as above) |
 | 8-9 | 2 | Disconnect Code | u16 LE |
 
-### Disconnect Codes (SDK-Verified)
+### Disconnect Codes (Annexure Section 11 — 12 codes)
 
 | Code | Meaning | Reconnectable? | Token Refresh? |
 |------|---------|----------------|----------------|
+| 800 | Internal server error | Yes | No |
+| 804 | Instruments exceed limit | No | No |
 | 805 | Exceeded active WebSocket connections | No | No |
 | 806 | Data API subscription required | No | No |
 | 807 | Access token expired | Yes | Yes |
-| 808 | Invalid client ID | No | No |
-| 809 | Authentication failed | No | No |
+| 808 | Authentication failed | No | No |
+| 809 | Access token invalid | No | No |
+| 810 | Client ID invalid | No | No |
+| 811 | Invalid expiry date | No | No |
+| 812 | Invalid date format | No | No |
+| 813 | Invalid security ID | No | No |
+| 814 | Invalid request | No | No |
 
 ---
 
@@ -1242,15 +1249,22 @@ Note: SDK uses `SL` and `SLM` as shorthand.
 | 50 | Disconnect | 10 |
 | 51 | Deep Depth Ask | 332 (20-lvl) / 3212 (200-lvl) |
 
-### Disconnect Codes
+### Disconnect Codes (Annexure Section 11)
 
 | Code | Meaning | Action |
 |------|---------|--------|
+| 800 | Internal server error | Reconnect with backoff |
+| 804 | Instruments exceed limit | Reduce instrument count |
 | 805 | Exceeded active connections (5 max) | Reduce connections |
 | 806 | Data API subscription required | User needs active subscription |
 | 807 | Access token expired | Refresh token, reconnect |
-| 808 | Invalid client ID | Check credentials |
-| 809 | Authentication failed | Check token/credentials |
+| 808 | Authentication failed | Check token/credentials |
+| 809 | Access token invalid | Re-authenticate |
+| 810 | Client ID invalid | Check SSM credentials |
+| 811 | Invalid expiry date | Fix request |
+| 812 | Invalid date format | Fix request |
+| 813 | Invalid security ID | Fix request |
+| 814 | Invalid request | Fix request |
 
 ### Market Status Codes
 
