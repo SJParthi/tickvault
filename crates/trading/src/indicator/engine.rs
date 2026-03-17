@@ -342,3 +342,416 @@ impl IndicatorEngine {
         &self.params
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dhan_live_trader_common::constants::MAX_INDICATOR_WARMUP_TICKS;
+
+    fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+        ParsedTick {
+            security_id,
+            last_traded_price: ltp,
+            day_high: high,
+            day_low: low,
+            volume,
+            ..Default::default()
+        }
+    }
+
+    fn default_engine() -> IndicatorEngine {
+        IndicatorEngine::new(IndicatorParams::default())
+    }
+
+    // --- Construction ---
+
+    #[test]
+    fn test_new_engine_pre_allocates_state() {
+        let engine = default_engine();
+        assert_eq!(engine.states.len(), MAX_INDICATOR_INSTRUMENTS);
+    }
+
+    #[test]
+    fn test_new_engine_alpha_values_positive() {
+        let engine = default_engine();
+        assert!(engine.alpha_fast > 0.0 && engine.alpha_fast < 1.0);
+        assert!(engine.alpha_slow > 0.0 && engine.alpha_slow < 1.0);
+        assert!(engine.alpha_signal > 0.0 && engine.alpha_signal < 1.0);
+        assert!(engine.wilder_factor > 0.0 && engine.wilder_factor < 1.0);
+    }
+
+    #[test]
+    fn test_fast_alpha_greater_than_slow() {
+        let engine = default_engine();
+        // Fast EMA (period 12) reacts faster → larger alpha
+        assert!(engine.alpha_fast > engine.alpha_slow);
+    }
+
+    // --- Bounds check ---
+
+    #[test]
+    fn test_out_of_bounds_security_id_returns_default_snapshot() {
+        let mut engine = default_engine();
+        let tick = ParsedTick {
+            security_id: u32::MAX,
+            last_traded_price: 100.0,
+            ..Default::default()
+        };
+        let snap = engine.update(&tick);
+        assert_eq!(snap.security_id, u32::MAX);
+        assert!(!snap.is_warm);
+        // All indicators should be default (0.0)
+        assert_eq!(snap.ema_fast, 0.0);
+        assert_eq!(snap.rsi, 0.0);
+    }
+
+    // --- First tick initialization ---
+
+    #[test]
+    fn test_first_tick_initializes_ema_to_price() {
+        let mut engine = default_engine();
+        let tick = make_tick(100, 250.0, 255.0, 245.0, 1000);
+        let snap = engine.update(&tick);
+        assert!((snap.ema_fast - 250.0).abs() < f64::EPSILON);
+        assert!((snap.ema_slow - 250.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_first_tick_not_warm() {
+        let mut engine = default_engine();
+        let tick = make_tick(100, 250.0, 255.0, 245.0, 1000);
+        let snap = engine.update(&tick);
+        assert!(!snap.is_warm);
+    }
+
+    #[test]
+    fn test_first_tick_rsi_is_neutral() {
+        let mut engine = default_engine();
+        let tick = make_tick(100, 250.0, 255.0, 245.0, 1000);
+        let snap = engine.update(&tick);
+        // First tick: avg_gain = 0, avg_loss = 0 → RSI = 50 (neutral)
+        assert!((snap.rsi - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_first_tick_atr_is_zero() {
+        let mut engine = default_engine();
+        let tick = make_tick(100, 250.0, 255.0, 245.0, 1000);
+        let snap = engine.update(&tick);
+        assert_eq!(snap.atr, 0.0);
+    }
+
+    // --- Warmup ---
+
+    #[test]
+    fn test_warmup_completes_after_threshold() {
+        let mut engine = default_engine();
+        let warmup = u32::from(MAX_INDICATOR_WARMUP_TICKS);
+        for i in 0..warmup {
+            let tick = make_tick(100, 250.0 + i as f32, 260.0, 240.0, 1000);
+            let snap = engine.update(&tick);
+            if i + 1 < warmup {
+                assert!(!snap.is_warm, "should not be warm at tick {}", i + 1);
+            } else {
+                assert!(snap.is_warm, "should be warm at tick {}", i + 1);
+            }
+        }
+    }
+
+    // --- EMA convergence ---
+
+    #[test]
+    fn test_ema_converges_to_constant_price() {
+        let mut engine = default_engine();
+        let price = 100.0_f32;
+        // Feed many ticks at the same price — EMA should converge to price
+        for _ in 0..200 {
+            engine.update(&make_tick(100, price, price, price, 1000));
+        }
+        let snap = engine.update(&make_tick(100, price, price, price, 1000));
+        assert!(
+            (snap.ema_fast - f64::from(price)).abs() < 0.01,
+            "ema_fast should converge to constant price"
+        );
+        assert!(
+            (snap.ema_slow - f64::from(price)).abs() < 0.01,
+            "ema_slow should converge to constant price"
+        );
+    }
+
+    // --- RSI ---
+
+    #[test]
+    fn test_rsi_all_gains_approaches_100() {
+        let mut engine = default_engine();
+        // Steadily increasing prices → RSI should approach 100
+        for i in 0..100 {
+            engine.update(&make_tick(
+                100,
+                100.0 + i as f32,
+                110.0 + i as f32,
+                95.0 + i as f32,
+                1000,
+            ));
+        }
+        let snap = engine.update(&make_tick(100, 200.0, 210.0, 195.0, 1000));
+        assert!(
+            snap.rsi > 90.0,
+            "RSI should be > 90 for all-gain series, got {}",
+            snap.rsi
+        );
+    }
+
+    #[test]
+    fn test_rsi_all_losses_approaches_0() {
+        let mut engine = default_engine();
+        // Steadily decreasing prices → RSI should approach 0
+        for i in 0..100 {
+            engine.update(&make_tick(
+                100,
+                200.0 - i as f32,
+                210.0 - i as f32,
+                195.0 - i as f32,
+                1000,
+            ));
+        }
+        let snap = engine.update(&make_tick(100, 99.0, 100.0, 98.0, 1000));
+        assert!(
+            snap.rsi < 10.0,
+            "RSI should be < 10 for all-loss series, got {}",
+            snap.rsi
+        );
+    }
+
+    // --- MACD ---
+
+    #[test]
+    fn test_macd_at_constant_price_converges_to_zero() {
+        let mut engine = default_engine();
+        for _ in 0..200 {
+            engine.update(&make_tick(100, 100.0, 100.0, 100.0, 1000));
+        }
+        let snap = engine.update(&make_tick(100, 100.0, 100.0, 100.0, 1000));
+        assert!(
+            snap.macd_line.abs() < 0.01,
+            "MACD line should be ~0 at constant price, got {}",
+            snap.macd_line
+        );
+        assert!(
+            snap.macd_histogram.abs() < 0.01,
+            "MACD histogram should be ~0 at constant price, got {}",
+            snap.macd_histogram
+        );
+    }
+
+    // --- VWAP ---
+
+    #[test]
+    fn test_vwap_with_volume() {
+        let mut engine = default_engine();
+        // Tick with price=100, high=105, low=95, volume=1000
+        // typical_price = (105 + 95 + 100) / 3 = 100.0
+        let snap = engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        assert!((snap.vwap - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_vwap_zero_volume_stays_zero() {
+        let mut engine = default_engine();
+        let snap = engine.update(&make_tick(100, 100.0, 105.0, 95.0, 0));
+        assert_eq!(snap.vwap, 0.0);
+    }
+
+    #[test]
+    fn test_vwap_reset_daily_clears_accumulators() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        engine.reset_vwap_daily();
+        // After reset, VWAP should return 0 until new volume arrives
+        let snap = engine.update(&make_tick(100, 100.0, 105.0, 95.0, 0));
+        assert_eq!(snap.vwap, 0.0);
+    }
+
+    // --- Bollinger Bands ---
+
+    #[test]
+    fn test_bollinger_at_constant_price_bands_collapse() {
+        let mut engine = default_engine();
+        for _ in 0..50 {
+            engine.update(&make_tick(100, 100.0, 100.0, 100.0, 1000));
+        }
+        let snap = engine.update(&make_tick(100, 100.0, 100.0, 100.0, 1000));
+        // With constant price, stddev → 0, so all bands converge to mean
+        assert!((snap.bollinger_upper - 100.0).abs() < 0.01);
+        assert!((snap.bollinger_middle - 100.0).abs() < 0.01);
+        assert!((snap.bollinger_lower - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_bollinger_reset_daily() {
+        let mut engine = default_engine();
+        for _ in 0..10 {
+            engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        }
+        engine.reset_bollinger_daily();
+        // After reset, bb_count = 0 → next snapshot should behave like fresh start
+        let snap = engine.update(&make_tick(100, 200.0, 210.0, 190.0, 1000));
+        assert!(
+            (snap.bollinger_middle - 200.0).abs() < 0.01,
+            "bollinger middle after reset should be new price"
+        );
+    }
+
+    // --- SMA ---
+
+    #[test]
+    fn test_sma_single_value_equals_price() {
+        let mut engine = default_engine();
+        let snap = engine.update(&make_tick(100, 50.0, 55.0, 45.0, 1000));
+        assert!((snap.sma - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_sma_within_period_is_exact() {
+        let mut engine = default_engine();
+        // Within the SMA period (20), running sum is just accumulated prices.
+        // After 10 pushes at 100.0: sma = 1000 / 10 = 100.0
+        for _ in 0..10 {
+            engine.update(&make_tick(100, 100.0, 100.0, 100.0, 1000));
+        }
+        let snap = engine.update(&make_tick(100, 100.0, 100.0, 100.0, 1000));
+        // sma_ring.len() = 11, sma_period = 20 → sma_count = min(11, 20) = 11
+        // sma = 1100 / 11 = 100.0
+        assert!(
+            (snap.sma - 100.0).abs() < f64::EPSILON,
+            "SMA within period should be exact avg, got {}",
+            snap.sma
+        );
+    }
+
+    // --- ATR ---
+
+    #[test]
+    fn test_atr_second_tick_initializes_to_true_range() {
+        let mut engine = default_engine();
+        // First tick: sets prev values
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        // Second tick: ATR = TR
+        let snap = engine.update(&make_tick(100, 102.0, 108.0, 96.0, 1000));
+        // TR = max(108-96, |108-100|, |96-100|) = max(12, 8, 4) = 12
+        assert!((snap.atr - 12.0).abs() < f64::EPSILON);
+    }
+
+    // --- OBV ---
+
+    #[test]
+    fn test_obv_increases_on_price_up() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let snap = engine.update(&make_tick(100, 101.0, 106.0, 96.0, 500));
+        // Price went up (100→101), so OBV += volume
+        assert!((snap.obv - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_obv_decreases_on_price_down() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let snap = engine.update(&make_tick(100, 99.0, 104.0, 94.0, 500));
+        // Price went down (100→99), so OBV -= volume
+        assert!((snap.obv - (-500.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_obv_unchanged_on_same_price() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let snap = engine.update(&make_tick(100, 100.0, 105.0, 95.0, 500));
+        assert_eq!(snap.obv, 0.0);
+    }
+
+    // --- Supertrend ---
+
+    #[test]
+    fn test_supertrend_first_tick_sets_initial_bands() {
+        let mut engine = default_engine();
+        let snap = engine.update(&make_tick(100, 100.0, 110.0, 90.0, 1000));
+        // First tick: supertrend_upper = high, supertrend_lower = low
+        // Direction starts bullish → supertrend = lower band
+        assert!((snap.supertrend - 90.0).abs() < f64::EPSILON);
+        assert!(snap.supertrend_bullish);
+    }
+
+    // --- Multiple instruments independent ---
+
+    #[test]
+    fn test_instruments_are_independent() {
+        let mut engine = default_engine();
+        // Feed different prices to two instruments
+        engine.update(&make_tick(100, 200.0, 210.0, 190.0, 1000));
+        engine.update(&make_tick(200, 50.0, 55.0, 45.0, 500));
+
+        let snap1 = engine.update(&make_tick(100, 201.0, 211.0, 191.0, 1000));
+        let snap2 = engine.update(&make_tick(200, 51.0, 56.0, 46.0, 500));
+
+        assert!(snap1.ema_fast > 199.0 && snap1.ema_fast < 202.0);
+        assert!(snap2.ema_fast > 49.0 && snap2.ema_fast < 52.0);
+    }
+
+    // --- Snapshot completeness ---
+
+    #[test]
+    fn test_snapshot_carries_price_context() {
+        let mut engine = default_engine();
+        let tick = make_tick(100, 100.0, 105.0, 95.0, 1000);
+        let snap = engine.update(&tick);
+        assert!((snap.last_traded_price - 100.0).abs() < f64::EPSILON);
+        assert!((snap.day_high - 105.0).abs() < f64::EPSILON);
+        assert!((snap.day_low - 95.0).abs() < f64::EPSILON);
+        assert!((snap.volume - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_params_accessor() {
+        let params = IndicatorParams {
+            ema_fast_period: 5,
+            ..Default::default()
+        };
+        let engine = IndicatorEngine::new(params);
+        assert_eq!(engine.params().ema_fast_period, 5);
+    }
+
+    // --- ADX ---
+
+    #[test]
+    fn test_adx_starts_at_zero() {
+        let mut engine = default_engine();
+        let snap = engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        assert_eq!(snap.adx, 0.0);
+    }
+
+    #[test]
+    fn test_adx_positive_after_trending() {
+        let mut engine = default_engine();
+        // Strong uptrend — ADX should become positive
+        for i in 0..50 {
+            engine.update(&make_tick(
+                100,
+                100.0 + i as f32 * 2.0,
+                110.0 + i as f32 * 2.0,
+                95.0 + i as f32 * 2.0,
+                1000,
+            ));
+        }
+        let snap = engine.update(&make_tick(100, 200.0, 210.0, 195.0, 1000));
+        assert!(
+            snap.adx > 0.0,
+            "ADX should be > 0 in trending market, got {}",
+            snap.adx
+        );
+    }
+}

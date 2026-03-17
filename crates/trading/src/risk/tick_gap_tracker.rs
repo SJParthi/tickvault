@@ -250,4 +250,112 @@ mod tests {
         assert_eq!(tracker.total_warnings(), 0);
         assert_eq!(tracker.total_errors(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Edge cases: out-of-order timestamps, gap_secs values, counters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn out_of_order_timestamp_returns_ok() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        // Fill warmup
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Send an older timestamp (out-of-order) — saturating_sub → gap = 0 → Ok
+        let result = tracker.record_tick(1001, base_ts);
+        assert_eq!(result, TickGapResult::Ok);
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+    }
+
+    #[test]
+    fn warning_result_carries_gap_seconds() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        match result {
+            TickGapResult::Warning { gap_secs } => {
+                assert_eq!(gap_secs, TICK_GAP_ALERT_THRESHOLD_SECS);
+            }
+            other => panic!("expected Warning, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_result_carries_gap_seconds() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        match result {
+            TickGapResult::Error { gap_secs } => {
+                assert_eq!(gap_secs, TICK_GAP_ERROR_THRESHOLD_SECS);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reset_mid_warmup_restarts_from_scratch() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        // Partial warmup
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE / 2 {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        tracker.reset();
+
+        // After reset, warmup starts fresh — large gaps should still be suppressed
+        let result = tracker.record_tick(1001, base_ts + 1_000_000);
+        assert_eq!(result, TickGapResult::Ok);
+        assert_eq!(tracker.total_warnings(), 0);
+    }
+
+    #[test]
+    fn gap_just_below_warning_threshold_is_ok() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Gap one second below warning threshold
+        let gap_ts =
+            base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS - 1;
+        let result = tracker.record_tick(1001, gap_ts);
+        assert_eq!(result, TickGapResult::Ok);
+    }
+
+    #[test]
+    fn cumulative_counters_increment() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let last = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE;
+        // Two consecutive warning-level gaps
+        tracker.record_tick(1001, last + TICK_GAP_ALERT_THRESHOLD_SECS);
+        tracker.record_tick(
+            1001,
+            last + TICK_GAP_ALERT_THRESHOLD_SECS + TICK_GAP_ALERT_THRESHOLD_SECS,
+        );
+        assert_eq!(tracker.total_warnings(), 2);
+    }
+
+    #[test]
+    fn zero_capacity_tracker_works() {
+        let mut tracker = TickGapTracker::new(0);
+        let result = tracker.record_tick(1001, 1_700_000_000);
+        assert_eq!(result, TickGapResult::Ok);
+        assert_eq!(tracker.tracked_securities(), 1);
+    }
 }

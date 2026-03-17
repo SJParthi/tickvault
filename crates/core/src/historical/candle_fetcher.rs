@@ -1567,4 +1567,139 @@ mod tests {
             "total retry backoff {total_backoff}s should not exceed 10 minutes"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Additional unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_max_response_body_size_is_10mb() {
+        assert_eq!(MAX_RESPONSE_BODY_SIZE, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_intraday_request_oi_field_serialized() {
+        let request = IntradayRequest {
+            security_id: "1333".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            instrument: "EQUITY".to_string(),
+            interval: "1".to_string(),
+            oi: false,
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-01-05".to_string(),
+        };
+        let json = serde_json::to_string(&request).expect("should serialize");
+        assert!(
+            json.contains("\"oi\":false"),
+            "JSON must contain oi field serialized as false"
+        );
+    }
+
+    #[test]
+    fn test_intraday_request_all_fields_camel_case() {
+        let request = IntradayRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            interval: "5".to_string(),
+            oi: true,
+            from_date: "2026-03-01".to_string(),
+            to_date: "2026-03-10".to_string(),
+        };
+        let json = serde_json::to_string(&request).expect("should serialize");
+
+        // Verify no snake_case keys leaked into the JSON
+        assert!(
+            !json.contains("security_id"),
+            "must not contain snake_case security_id"
+        );
+        assert!(
+            !json.contains("exchange_segment"),
+            "must not contain snake_case exchange_segment"
+        );
+        assert!(
+            !json.contains("from_date"),
+            "must not contain snake_case from_date"
+        );
+        assert!(
+            !json.contains("to_date"),
+            "must not contain snake_case to_date"
+        );
+
+        // Verify camelCase keys are present
+        assert!(
+            json.contains("securityId"),
+            "must contain camelCase securityId"
+        );
+        assert!(
+            json.contains("exchangeSegment"),
+            "must contain camelCase exchangeSegment"
+        );
+        assert!(json.contains("fromDate"), "must contain camelCase fromDate");
+        assert!(json.contains("toDate"), "must contain camelCase toDate");
+    }
+
+    #[test]
+    fn test_candle_fetch_summary_all_zeroes() {
+        let summary = CandleFetchSummary {
+            instruments_fetched: 0,
+            instruments_failed: 0,
+            total_candles: 0,
+            instruments_skipped: 0,
+        };
+        assert_eq!(summary.instruments_fetched, 0);
+        assert_eq!(summary.instruments_failed, 0);
+        assert_eq!(summary.total_candles, 0);
+        assert_eq!(summary.instruments_skipped, 0);
+    }
+
+    #[test]
+    fn test_nan_price_detection() {
+        assert!(
+            !f64::NAN.is_finite(),
+            "NaN must be detected as non-finite (guard in fetch loop)"
+        );
+    }
+
+    #[test]
+    fn test_infinity_price_detection() {
+        assert!(
+            !f64::INFINITY.is_finite(),
+            "INFINITY must be detected as non-finite (guard in fetch loop)"
+        );
+    }
+
+    #[test]
+    fn test_neg_infinity_price_detection() {
+        assert!(
+            !f64::NEG_INFINITY.is_finite(),
+            "NEG_INFINITY must be detected as non-finite (guard in fetch loop)"
+        );
+    }
+
+    #[test]
+    fn test_normal_price_is_finite() {
+        assert!(
+            245.50_f64.is_finite(),
+            "Normal price values must pass the is_finite() guard"
+        );
+    }
+
+    #[test]
+    fn test_dhan_response_consistency_check() {
+        // Mismatched array lengths: open has 3 elements, high has 2
+        let response = DhanIntradayResponse {
+            open: vec![100.0, 101.0, 102.0],
+            high: vec![103.0, 104.0], // mismatched — only 2
+            low: vec![99.0, 100.0, 101.0],
+            close: vec![101.0, 102.0, 103.0],
+            volume: vec![1000, 2000, 3000],
+            timestamp: vec![1700000000, 1700000060, 1700000120],
+            open_interest: vec![],
+        };
+        assert!(
+            !response.is_consistent(),
+            "Response with mismatched array lengths must return is_consistent() == false"
+        );
+    }
 }

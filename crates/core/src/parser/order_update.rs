@@ -227,4 +227,150 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("failed to parse order update JSON"));
     }
+
+    // -----------------------------------------------------------------------
+    // Product code mapping tests (WS abbreviations)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_product_code_c_is_cnc() {
+        let json = r#"{"Data": {"Product": "C", "ProductName": "CNC"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.product, "C");
+        assert_eq!(update.product_name, "CNC");
+    }
+
+    #[test]
+    fn test_product_code_i_is_intraday() {
+        let json = r#"{"Data": {"Product": "I", "ProductName": "INTRADAY"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.product, "I");
+        assert_eq!(update.product_name, "INTRADAY");
+    }
+
+    #[test]
+    fn test_txn_type_b_is_buy() {
+        let json = r#"{"Data": {"TxnType": "B"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.txn_type, "B");
+    }
+
+    #[test]
+    fn test_txn_type_s_is_sell() {
+        let json = r#"{"Data": {"TxnType": "S"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.txn_type, "S");
+    }
+
+    #[test]
+    fn test_source_p_is_api() {
+        // Source field is not in OrderUpdate struct — verify unknown fields
+        // don't break deserialization (serde default behavior)
+        let json = r#"{"Data": {"Source": "P", "OrderNo": "123"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.order_no, "123");
+    }
+
+    #[test]
+    fn test_opt_type_xx_is_non_option() {
+        let json = r#"{"Data": {"OptType": "XX"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.opt_type, "XX");
+    }
+
+    #[test]
+    fn test_opt_type_ce_is_call() {
+        let json = r#"{"Data": {"OptType": "CE"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.opt_type, "CE");
+    }
+
+    #[test]
+    fn test_opt_type_pe_is_put() {
+        let json = r#"{"Data": {"OptType": "PE"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.opt_type, "PE");
+    }
+
+    // -----------------------------------------------------------------------
+    // AMO and leg number mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_leg_number_mapping() {
+        let json = r#"{"Data": {"LegNo": 1}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.leg_no, 1, "LegNo 1 = Entry leg");
+
+        let json2 = r#"{"Data": {"LegNo": 2}}"#;
+        let update2 = parse_order_update(json2).unwrap();
+        assert_eq!(update2.leg_no, 2, "LegNo 2 = Stop Loss leg");
+
+        let json3 = r#"{"Data": {"LegNo": 3}}"#;
+        let update3 = parse_order_update(json3).unwrap();
+        assert_eq!(update3.leg_no, 3, "LegNo 3 = Target leg");
+    }
+
+    #[test]
+    fn test_super_order_remark() {
+        let json = r#"{"Data": {"Remarks": "Super Order", "OrderNo": "789"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.remarks, "Super Order");
+    }
+
+    #[test]
+    fn test_correlation_id_roundtrip() {
+        let correlation = "my-corr-id-abc-123";
+        let json = format!(
+            r#"{{"Data": {{"CorrelationId": "{}", "OrderNo": "111"}}}}"#,
+            correlation
+        );
+        let update = parse_order_update(&json).unwrap();
+        assert_eq!(update.correlation_id, correlation);
+    }
+
+    // -----------------------------------------------------------------------
+    // Extra unknown fields — serde should ignore them
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extra_unknown_fields_ignored() {
+        let json = r#"{
+            "Data": {
+                "OrderNo": "999",
+                "Status": "TRADED",
+                "SomeNewField": "value",
+                "AnotherFuture": 42,
+                "Nested": {"deep": true}
+            }
+        }"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.order_no, "999");
+        assert_eq!(update.status, "TRADED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Partial fill fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_partial_fill_fields() {
+        let json = r#"{
+            "Data": {
+                "OrderNo": "444",
+                "Status": "PENDING",
+                "Quantity": 100,
+                "TradedQty": 40,
+                "RemainingQuantity": 60,
+                "AvgTradedPrice": 250.25,
+                "TradedPrice": 250.50
+            }
+        }"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.quantity, 100);
+        assert_eq!(update.traded_qty, 40);
+        assert_eq!(update.remaining_quantity, 60);
+        assert!((update.avg_traded_price - 250.25).abs() < f64::EPSILON);
+        assert!((update.traded_price - 250.50).abs() < f64::EPSILON);
+    }
 }

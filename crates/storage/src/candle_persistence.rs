@@ -525,4 +525,43 @@ mod tests {
         // Should not panic — just logs warnings and returns.
         ensure_candle_table_dedup_keys(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // DEDUP key and DDL constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_candles_is_security_id() {
+        assert_eq!(DEDUP_KEY_CANDLES, "security_id");
+    }
+
+    #[test]
+    fn test_candles_1m_ddl_has_segment_column() {
+        assert!(CANDLES_1M_CREATE_DDL.contains("segment"));
+    }
+
+    #[test]
+    fn test_candles_1m_ddl_has_security_id() {
+        assert!(CANDLES_1M_CREATE_DDL.contains("security_id"));
+    }
+
+    #[test]
+    fn test_candles_1m_ddl_has_ohlcv_columns() {
+        assert!(CANDLES_1M_CREATE_DDL.contains("open"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("high"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("low"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("close"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("volume"));
+    }
+
+    #[test]
+    fn test_live_candle_flush_batch_size_positive() {
+        let size = LIVE_CANDLE_FLUSH_BATCH_SIZE;
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn test_questdb_ddl_timeout_is_reasonable_candle() {
+        assert!((5..=60).contains(&QUESTDB_DDL_TIMEOUT_SECS));
+    }
 }

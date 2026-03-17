@@ -358,3 +358,201 @@ impl IndicatorParams {
         1.0 / f64::from(period)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- RingBuffer ---
+
+    #[test]
+    fn test_ring_buffer_new_is_empty() {
+        let rb = RingBuffer::new();
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+    }
+
+    #[test]
+    fn test_ring_buffer_push_increments_count() {
+        let mut rb = RingBuffer::new();
+        rb.push(1.0);
+        assert_eq!(rb.len(), 1);
+        assert!(!rb.is_empty());
+    }
+
+    #[test]
+    fn test_ring_buffer_push_returns_evicted_zero_when_not_full() {
+        let mut rb = RingBuffer::new();
+        let evicted = rb.push(42.0);
+        assert_eq!(evicted, 0.0);
+    }
+
+    #[test]
+    fn test_ring_buffer_wraps_at_capacity() {
+        let mut rb = RingBuffer::new();
+        // Fill to capacity
+        for i in 0..INDICATOR_RING_BUFFER_CAPACITY {
+            rb.push(i as f64);
+        }
+        assert_eq!(rb.len() as usize, INDICATOR_RING_BUFFER_CAPACITY);
+
+        // Push one more — should evict the oldest (0.0)
+        let evicted = rb.push(999.0);
+        assert_eq!(evicted, 0.0);
+        assert_eq!(rb.len() as usize, INDICATOR_RING_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn test_ring_buffer_oldest_when_full() {
+        let mut rb = RingBuffer::new();
+        for i in 0..INDICATOR_RING_BUFFER_CAPACITY {
+            rb.push(i as f64 + 1.0);
+        }
+        // Oldest should be the first pushed value (1.0)
+        assert_eq!(rb.oldest(), 1.0);
+    }
+
+    #[test]
+    fn test_ring_buffer_eviction_order() {
+        let mut rb = RingBuffer::new();
+        // Fill entirely
+        for i in 0..INDICATOR_RING_BUFFER_CAPACITY {
+            rb.push(i as f64);
+        }
+        // Evictions should come out in FIFO order
+        for i in 0..INDICATOR_RING_BUFFER_CAPACITY {
+            let evicted = rb.push(1000.0 + i as f64);
+            assert_eq!(evicted, i as f64, "eviction {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn test_ring_buffer_default_same_as_new() {
+        let d = RingBuffer::default();
+        let n = RingBuffer::new();
+        assert_eq!(d.len(), n.len());
+        assert_eq!(d.is_empty(), n.is_empty());
+    }
+
+    // --- IndicatorState ---
+
+    #[test]
+    fn test_indicator_state_new_all_zeros() {
+        let state = IndicatorState::new();
+        assert_eq!(state.ema_fast, 0.0);
+        assert_eq!(state.ema_slow, 0.0);
+        assert_eq!(state.rsi_avg_gain, 0.0);
+        assert_eq!(state.rsi_avg_loss, 0.0);
+        assert_eq!(state.atr, 0.0);
+        assert_eq!(state.obv, 0.0);
+        assert_eq!(state.warmup_count, 0);
+        assert!(state.supertrend_direction); // starts bullish
+    }
+
+    #[test]
+    fn test_indicator_state_not_warm_initially() {
+        let state = IndicatorState::new();
+        assert!(!state.is_warm());
+    }
+
+    #[test]
+    fn test_indicator_state_warm_at_threshold() {
+        let mut state = IndicatorState::new();
+        state.warmup_count = MAX_INDICATOR_WARMUP_TICKS;
+        assert!(state.is_warm());
+    }
+
+    #[test]
+    fn test_indicator_state_not_warm_below_threshold() {
+        let mut state = IndicatorState::new();
+        state.warmup_count = MAX_INDICATOR_WARMUP_TICKS - 1;
+        assert!(!state.is_warm());
+    }
+
+    #[test]
+    fn test_indicator_state_default_same_as_new() {
+        let d = IndicatorState::default();
+        let n = IndicatorState::new();
+        assert_eq!(d.warmup_count, n.warmup_count);
+        assert_eq!(d.ema_fast, n.ema_fast);
+    }
+
+    // --- IndicatorParams ---
+
+    #[test]
+    fn test_indicator_params_default_values() {
+        let params = IndicatorParams::default();
+        assert_eq!(params.ema_fast_period, 12);
+        assert_eq!(params.ema_slow_period, 26);
+        assert_eq!(params.macd_signal_period, 9);
+        assert_eq!(params.rsi_period, 14);
+        assert_eq!(params.sma_period, 20);
+        assert_eq!(params.atr_period, 14);
+        assert_eq!(params.adx_period, 14);
+        assert!((params.supertrend_multiplier - 3.0).abs() < f64::EPSILON);
+        assert!((params.bollinger_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ema_alpha_period_1() {
+        // alpha = 2 / (1 + 1) = 1.0
+        let alpha = IndicatorParams::ema_alpha(1);
+        assert!((alpha - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ema_alpha_period_12() {
+        // alpha = 2 / (12 + 1) ≈ 0.153846
+        let alpha = IndicatorParams::ema_alpha(12);
+        assert!((alpha - 2.0 / 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wilder_factor_period_14() {
+        // factor = 1 / 14 ≈ 0.071428
+        let factor = IndicatorParams::wilder_factor(14);
+        assert!((factor - 1.0 / 14.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wilder_factor_period_1() {
+        let factor = IndicatorParams::wilder_factor(1);
+        assert!((factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    // --- IndicatorSnapshot ---
+
+    #[test]
+    fn test_indicator_snapshot_default_all_zeros() {
+        let snap = IndicatorSnapshot::default();
+        assert_eq!(snap.security_id, 0);
+        assert_eq!(snap.ema_fast, 0.0);
+        assert_eq!(snap.rsi, 0.0);
+        assert_eq!(snap.vwap, 0.0);
+        assert!(!snap.is_warm);
+        assert!(!snap.supertrend_bullish);
+    }
+
+    #[test]
+    fn test_indicator_snapshot_is_copy() {
+        let snap = IndicatorSnapshot {
+            security_id: 42,
+            ema_fast: 100.0,
+            ..Default::default()
+        };
+        let copy = snap;
+        assert_eq!(copy.security_id, snap.security_id);
+        assert_eq!(copy.ema_fast, snap.ema_fast);
+    }
+
+    #[test]
+    fn test_indicator_state_is_copy() {
+        let state = IndicatorState::new();
+        let copy = state;
+        assert_eq!(copy.warmup_count, state.warmup_count);
+    }
+}
