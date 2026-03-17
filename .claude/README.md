@@ -34,11 +34,11 @@ rules/
 │   ├── live-market-feed.md
 │   └── ...18 more
 │
-└── project/                   ← 8 general project rules
+└── project/                   ← 10 general project rules
     ├── rust-code.md
     ├── hot-path.md
     ├── testing.md
-    └── ...5 more
+    └── ...7 more
 ```
 
 ### Dhan V2 API Rules (`rules/dhan/` — 21 rules)
