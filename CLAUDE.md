@@ -267,7 +267,8 @@ make prometheus                      # localhost:9090
 ## LOCAL HOOKS (18 scripts)
 
 **Pre-commit (8 gates):** fmt → banned patterns → data integrity → O(1)/dedup scan → secrets → version pinning → commit msg → typos
-**Pre-push (11 gates):** fmt → clippy → test → banned patterns → test count → audit → deny → loom → data integrity → pub fn test guard → financial test guard
+**Pre-push (7 fast gates):** fmt → banned patterns → secrets → test count → data integrity → pub fn test guard → financial test guard
+**Git hook pre-push (11 gates):** fmt → clippy → test → banned patterns → test count → audit → deny → loom → data integrity → pub fn test guard → financial test guard
 **Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+`
 **Other hooks:** pre-tool-dispatch, auto-save, session-sanity, plan-verify, block-env-files
 
@@ -321,7 +322,7 @@ Auto-loaded `.claude/rules/` files by directory:
 | `rust-code.md` | Error handling, naming, logging, no hardcoded values, secrets |
 | `hot-path.md` | Zero allocation, O(1) constraints, banned hot-path patterns |
 | `testing.md` | 22 test categories, coverage, property testing requirements |
-| `enforcement.md` | 11 pre-push gates, scoped testing, gap enforcement |
+| `enforcement.md` | Pre-push gates (7 fast + 11 git hook), scoped testing, gap enforcement |
 | `cargo-and-docker.md` | Version pinning, Docker digest, workspace deps |
 | `data-integrity.md` | Price precision, f32→f64, dedup keys |
 | `market-hours.md` | IST timezone, market hour checks, holiday handling |

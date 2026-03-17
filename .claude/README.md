@@ -90,7 +90,7 @@ Automated scripts that run at specific lifecycle points.
 |------|-------------|-------------|
 | `block-env-files.sh` | Before file edit | Prevents `.env` file creation |
 | `pre-commit-gate.sh` | Before commit | fmt, clippy, test on changed crates |
-| `pre-push-gate.sh` | Before push | 13 scoped quality gates |
+| `pre-push-gate.sh` | Before push | 7 fast quality gates (CI handles heavy checks) |
 | `pre-pr-gate.sh` | Before PR | Branch check, naming, clean tree |
 | `pre-merge-gate.sh` | Before merge | Full workspace validation |
 | `test-count-guard.sh` | Quality gate | Ensures test count doesn't decrease |
@@ -104,7 +104,6 @@ Automated scripts that run at specific lifecycle points.
 | `auto-save-remote.sh` | Background | Auto-pushes WIP to remote |
 | `auto-save-watchdog.sh` | Background | Monitors auto-save health |
 | `recover-wip.sh` | Recovery | Recovers from interrupted sessions |
-| `block-env-files.sh` | Quality gate | Prevents .env file creation |
 | `plan-verify.sh` | Plan verification | Validates plan items are complete |
 | `pre-tool-dispatch.sh` | Before tool use | Routes to correct hook |
 
