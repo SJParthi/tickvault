@@ -22,9 +22,10 @@ REPO_ROOT="${CLAUDE_PROJECT_DIR:-}"
 if [ -z "$REPO_ROOT" ]; then
   REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || true
 fi
-if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT/.git" ]; then
+if [ -z "$REPO_ROOT" ] || [ ! -e "$REPO_ROOT/.git" ]; then
+  # .git is a directory in normal repos, a file in worktrees — use -e for both
   echo "FATAL: cannot determine repo root" >&2
-  exit 0
+  exit 1
 fi
 
 INTEGRATION_BRANCH="claude/integration"
@@ -117,14 +118,14 @@ if ! git -C "$REPO_ROOT" fetch origin "$INTEGRATION_BRANCH" 2>/dev/null; then
     git -C "$REPO_ROOT" branch "$INTEGRATION_BRANCH" origin/main 2>/dev/null || true
     if ! git -C "$REPO_ROOT" push -u origin "$INTEGRATION_BRANCH" 2>/dev/null; then
       log "FAIL: could not create remote $INTEGRATION_BRANCH"
-      exit 0
+      exit 1
     fi
     # Re-fetch so origin/claude/integration ref exists locally
     git -C "$REPO_ROOT" fetch origin "$INTEGRATION_BRANCH" 2>/dev/null
     log "CREATED: $INTEGRATION_BRANCH from main"
   else
     log "FAIL: could not fetch origin/main to create integration branch"
-    exit 0
+    exit 1
   fi
 fi
 
@@ -142,24 +143,24 @@ fi
 # --- Create isolated worktree for integration branch ---
 if ! git -C "$REPO_ROOT" worktree add "$WORKTREE_DIR" "origin/$INTEGRATION_BRANCH" --detach 2>/dev/null; then
   log "FAIL: could not create worktree (origin/$INTEGRATION_BRANCH may not exist)"
-  exit 0
+  exit 1
 fi
 
 # Inside the worktree: set up integration branch
-cd "$WORKTREE_DIR" || { log "FAIL: could not cd to worktree"; exit 0; }
+cd "$WORKTREE_DIR" || { log "FAIL: could not cd to worktree"; exit 1; }
 
 # Create/reset local integration branch tracking remote
 # -B = create or reset if exists
 git checkout -B "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH" 2>/dev/null || {
   log "FAIL: could not checkout $INTEGRATION_BRANCH in worktree (may be checked out elsewhere)"
-  exit 0
+  exit 1
 }
 
 # Verify checkout actually succeeded (defense against silent failures)
 ACTUAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 if [ "$ACTUAL_BRANCH" != "$INTEGRATION_BRANCH" ]; then
   log "FAIL: worktree is on '$ACTUAL_BRANCH' not '$INTEGRATION_BRANCH'"
-  exit 0
+  exit 1
 fi
 
 # --- Merge session branch (session wins all conflicts) ---
@@ -229,7 +230,12 @@ if [ "$MERGE_OK" = true ]; then
     sleep "$WAIT"
     # Rebase on remote before retrying — if another session pushed first,
     # our push fails with non-fast-forward. Rebase puts our merge on top.
-    git pull --rebase origin "$INTEGRATION_BRANCH" 2>/dev/null || true
+    if ! git pull --rebase origin "$INTEGRATION_BRANCH" 2>/dev/null; then
+      # Rebase had conflicts — abort and stop retrying (can't auto-resolve)
+      git rebase --abort 2>/dev/null || true
+      log "FAIL: rebase conflicts during push retry — aborting"
+      break
+    fi
   done
 
   if [ "$PUSH_OK" = false ]; then

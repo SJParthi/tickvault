@@ -80,8 +80,11 @@ if git show-ref --verify --quiet "refs/remotes/origin/${INTEGRATION_BRANCH}"; th
   echo "Checking out existing ${INTEGRATION_BRANCH}..."
   git checkout "$INTEGRATION_BRANCH" 2>/dev/null || git checkout -b "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH"
   git pull --ff-only origin "$INTEGRATION_BRANCH" 2>/dev/null || {
-    echo "WARNING: integration branch has diverged from remote. Resetting to remote."
-    git reset --hard "origin/$INTEGRATION_BRANCH"
+    echo "WARNING: integration branch has diverged from remote."
+    echo "Deleting local branch and re-creating from remote (preserves reflog)."
+    git checkout --detach 2>/dev/null
+    git branch -D "$INTEGRATION_BRANCH" 2>/dev/null || true
+    git checkout -b "$INTEGRATION_BRANCH" "origin/$INTEGRATION_BRANCH"
   }
 else
   echo "Creating ${INTEGRATION_BRANCH} from main..."
@@ -94,7 +97,7 @@ FAILED=0
 for branch in $SESSION_BRANCHES; do
   echo ""
   echo "--- Merging ${branch} ---"
-  if git merge "origin/${branch}" --no-edit -m "chore(integration): merge ${branch}"; then
+  if git merge "origin/${branch}" --no-ff --no-edit -m "chore(integration): merge ${branch}"; then
     MERGED=$((MERGED + 1))
     echo "OK: ${branch} merged"
   else
@@ -116,8 +119,7 @@ if [ "$PUSH" = true ] && [ "$MERGED" -gt 0 ]; then
   git push -u origin "$INTEGRATION_BRANCH"
 fi
 
-# Return to original branch (trap handles this, but be explicit)
-cleanup
+# Return to original branch (EXIT trap handles this automatically)
 
 echo ""
 echo "Done. Integration branch: ${INTEGRATION_BRANCH}"

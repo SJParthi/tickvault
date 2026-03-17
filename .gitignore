@@ -79,6 +79,9 @@ quality/.binary-size-baseline
 .claude/hooks/.session-network.log
 .claude/hooks/.push-in-progress
 
+# ---- Grill review state (runtime state) ----
+.claude/hooks/.last-grill-pass
+
 # ---- Integration sync (runtime state) ----
 .claude/.integration-worktree/
 .claude/hooks/.integration-sync.lock/

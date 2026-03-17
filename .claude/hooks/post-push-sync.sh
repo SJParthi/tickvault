@@ -7,7 +7,10 @@
 # (separate from post-commit-state.sh) so each gets independent stdin.
 
 # Require jq — without it, JSON parsing fails silently and sync never fires
-command -v jq >/dev/null 2>&1 || exit 0
+if ! command -v jq >/dev/null 2>&1; then
+  echo "post-push-sync: jq not found, skipping integration sync" >&2
+  exit 0
+fi
 
 # Read stdin (hook framework pipes JSON)
 INPUT=$(cat)
@@ -27,8 +30,10 @@ case "$COMMAND" in
 esac
 
 # Skip if pushing to integration branch (avoid infinite loop)
+# Exact match only — don't skip branches like claude/integration-v2
 case "$COMMAND" in
-  *claude/integration*) exit 0 ;;
+  *" claude/integration "*|*" claude/integration") exit 0 ;;
+  *"claude/integration "*|*"claude/integration") exit 0 ;;
 esac
 
 # Skip if push clearly failed — check for git-specific error patterns only.
