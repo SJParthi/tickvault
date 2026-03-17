@@ -1,40 +1,49 @@
 #!/bin/bash
-# post-push-sync.sh — PostToolUse hook for Bash matching "git push"
-# Triggers sync of current session branch to claude/integration.
+# post-push-sync.sh — PostToolUse hook for Bash
+# After a successful git push, sync session branch to claude/integration.
+# Runs sync-to-integration.sh in background — never blocks Claude.
 
 # Read stdin (hook framework pipes JSON)
 INPUT=$(cat)
 
-# Fast string check — skip jq for non-push commands
+# Fast string check — skip jq for non-push commands (99% of invocations)
 case "$INPUT" in
   *"git push"*) ;;
   *) exit 0 ;;
 esac
 
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
 # Only act on git push commands
-if ! echo "$COMMAND" | grep -q 'git push'; then
+case "$COMMAND" in
+  git\ push*) ;;
+  *) exit 0 ;;
+esac
+
+# Skip if pushing to integration branch (avoid infinite loop)
+case "$COMMAND" in
+  *claude/integration*) exit 0 ;;
+esac
+
+# Skip if push failed
+STDOUT=$(echo "$INPUT" | jq -r '.tool_response.stdout // empty' 2>/dev/null)
+STDERR=$(echo "$INPUT" | jq -r '.tool_response.stderr // empty' 2>/dev/null)
+case "$STDOUT$STDERR" in
+  *"rejected"*|*"error"*|*"fatal"*) exit 0 ;;
+esac
+
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+PROJECT_DIR="${CWD:-${CLAUDE_PROJECT_DIR:-.}}"
+SYNC_SCRIPT="$PROJECT_DIR/scripts/sync-to-integration.sh"
+
+# Verify script exists
+if [ ! -x "$SYNC_SCRIPT" ]; then
   exit 0
 fi
 
-# Skip if push was to integration branch itself (avoid infinite loop)
-if echo "$COMMAND" | grep -q 'claude/integration'; then
-  exit 0
-fi
-
-# Check if push succeeded (tool_response should indicate success)
-EXIT_CODE=$(echo "$INPUT" | jq -r '.tool_response.exitCode // .tool_response.exit_code // "0"')
-if [ "$EXIT_CODE" != "0" ]; then
-  exit 0
-fi
-
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-if [ -z "$CWD" ]; then
-  CWD="${CLAUDE_PROJECT_DIR:-.}"
-fi
-
-# Run sync in background so it doesn't block the session
-cd "$CWD" && "$CWD/scripts/sync-to-integration.sh" &
+# Run sync in background — completely detached from Claude's process
+# stdout/stderr to log file, not to hook output (would confuse Claude)
+nohup "$SYNC_SCRIPT" >> "$PROJECT_DIR/.claude/hooks/.integration-sync.log" 2>&1 &
+disown
 
 exit 0
