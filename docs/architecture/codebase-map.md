@@ -2,7 +2,7 @@
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
 > Bible: `tech-stack-bible.md` — read ONLY when adding a new dependency.
-> Updated: 2026-03-08 (1458 tests).
+> Updated: 2026-03-17 (~2,439 tests).
 
 ## File Tree
 
@@ -276,17 +276,17 @@ Disconnect (10):      Header + [code:u16LE]
 CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT paise).
 ```
 
-## Test Counts (1458 total)
+## Test Counts (~2,427 total)
 
 | Crate | Tests |
 |-------|-------|
-| common | 132 |
-| core | 1012 (unit) + 5 (integration) |
-| storage | 187 |
-| trading | 86 |
-| api | 31 (unit) + 3 (integration) |
-| app | 6 |
-| **Total** | **1458** |
+| common | 191 |
+| core | 1450 |
+| trading | 401 |
+| storage | 259 |
+| api | 105 |
+| app | 21 |
+| **Total** | **~2,427** |
 
 ## QuestDB Tables (5) — DEDUP UPSERT KEYS enabled on all
 

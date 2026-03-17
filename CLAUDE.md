@@ -81,7 +81,7 @@ crates/
 
 | Module | Contains |
 |--------|----------|
-| `oms/` | Engine, API client (`access-token` header, v2 base URL), state machine (26 valid transitions), rate limiter (GCRA: 10/sec, 7000/day), circuit breaker (3-state FSM), idempotency (UUID v4), reconciliation (f64::EPSILON) |
+| `oms/` | Engine, API client (`access-token` header, v2 base URL), state machine (10 valid transitions, 26 target), rate limiter (GCRA: 10/sec, 7000/day), circuit breaker (3-state FSM), idempotency (UUID v4), reconciliation (f64::EPSILON) |
 | `risk/` | Pre-trade checks (halt → daily loss → position limit), P&L tracker, tick gap detection |
 | `indicator/` | O(1) indicator engine (SMA, EMA, RSI, MACD, BB via yata), types |
 | `strategy/` | FSM evaluator, TOML config, hot reload (notify crate) |
@@ -142,7 +142,7 @@ Token renewal → Shutdown signal
 3. **Instrument cache:** `rkyv` zero-copy deserialization. Daily refresh, binary cache on disk.
 4. **Rate limiting:** `governor` GCRA algorithm. Dual limits (per-second burst + per-day cumulative).
 5. **Pipeline:** SPSC 65,536-buffer async channel. No blocking I/O in hot loop.
-6. **State machine:** 26 explicit OMS transitions. Terminal states block outgoing. Pure function.
+6. **State machine:** 10 implemented OMS transitions (26 target). Terminal states block outgoing. Pure function.
 7. **Circuit breaker:** 3-state FSM (Closed → Open → Half-Open). `failsafe` crate.
 
 ## GIT
@@ -279,11 +279,11 @@ make prometheus                      # localhost:9090
 | dlt-questdb | 9.3.2 | 9000/8812/9009 | Time-series DB |
 | dlt-valkey | 9.0.2-alpine | 6379 | Cache (Redis replacement) |
 | dlt-prometheus | v3.9.1 | 9090 | Metrics |
-| dlt-grafana | 11.4.0 | 3000 | Dashboards |
-| dlt-jaeger | 2.6.0 | 16686 | Distributed tracing |
-| dlt-loki | 3.3.0 | 3100 | Log aggregation |
-| dlt-alloy | 1.3.2 | — | Observability collector |
-| dlt-traefik | v3.6.0 | 80/443/8080 | API gateway |
+| dlt-grafana | 12.3.3 | 3000 | Dashboards |
+| dlt-jaeger | 2.15.0 | 16686 | Distributed tracing |
+| dlt-loki | 3.6.6 | 3100 | Log aggregation |
+| dlt-alloy | v1.8.0 | — | Observability collector |
+| dlt-traefik | v3.6.8 | 80/443/8080 | API gateway |
 
 All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.yml`.
 
@@ -327,10 +327,10 @@ Auto-loaded `.claude/rules/` files by directory:
 | `data-integrity.md` | Price precision, f32→f64, dedup keys |
 | `market-hours.md` | IST timezone, market hour checks, holiday handling |
 | `plan-enforcement.md` | Multi-file plan → verify → archive workflow |
-| `gap-enforcement.md` | 28 tracked gaps with mandatory tests |
+| `gap-enforcement.md` | 31 tracked gaps with mandatory tests |
 | `aws-migration.md` | Mac cleanup when deploying to AWS |
 
-## GAP ENFORCEMENT (28 tracked gaps)
+## GAP ENFORCEMENT (31 tracked gaps)
 
 Tests in `crates/*/tests/gap_enforcement.rs` verify:
 - Instrument gaps (I-P0-01..06, I-P1-01..08): dedup, expiry validation, cache, backup
@@ -404,4 +404,4 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 **Phase:** Phase 1 — Live Trading System → `docs/phases/phase-1-live-trading.md`
 **Boot sequence:** CryptoProvider → Config → Observability → Logging → Notification → Auth → QuestDB → Universe → HistoricalCandles → WebSocket → TickProcessor → OrderUpdateWS → API → TokenRenewal → Shutdown
 **Codebase size:** ~74K LoC Rust (~61K production, ~14K tests), 158 files, 6 crates
-**Test count:** 2,299 passing tests (unit + integration), 33 integration test files, 5 benchmarks, 2 fuzz targets
+**Test count:** ~2,439 passing tests (unit + integration + proptest), 33 integration test files, 5 benchmarks, 2 fuzz targets

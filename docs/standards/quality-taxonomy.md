@@ -3,7 +3,7 @@
 > **Single source of truth** for all quality dimensions in dhan-live-trader.
 > Open this file at the start of every session. Verify every applicable dimension before committing.
 >
-> **Last updated:** 2026-03-13 | **Total dimensions:** 98 | **Test baseline:** 2292
+> **Last updated:** 2026-03-17 | **Total dimensions:** 98 | **Test baseline:** 2439
 > **22 test types canonical definition:** `docs/standards/22-test-types.md`
 
 ## Status Legend
@@ -518,7 +518,7 @@ services:
 
 - [ ] `cargo fmt --all` passes (pre-commit gate 1)
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf` passes (gate 2)
-- [ ] `cargo test --workspace` passes, all 477+ tests green (gate 3)
+- [ ] `cargo test --workspace` passes, all 2439+ tests green (gate 3)
 - [ ] Banned pattern scanner passes (gate 4)
 - [ ] O(1) latency scanner passes (gate 5)
 - [ ] Secret scanner passes on all staged files (gate 6)
