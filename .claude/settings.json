@@ -108,6 +108,16 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-sanity.sh"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/integrate-sessions.sh --push 2>&1 || true",
+            "timeout": 120,
+            "statusMessage": "Integrating session branches..."
+          }
+        ]
       }
     ],
     "SubagentStart": [],
