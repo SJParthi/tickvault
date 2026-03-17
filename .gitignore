@@ -79,6 +79,11 @@ quality/.binary-size-baseline
 .claude/hooks/.session-network.log
 .claude/hooks/.push-in-progress
 
+# ---- Integration sync (runtime state) ----
+.claude/.integration-worktree/
+.claude/hooks/.integration-sync.lock/
+.claude/hooks/.integration-sync.log
+
 # ---- Temporary files ----
 *.tmp
 *.bak
