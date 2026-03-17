@@ -1618,6 +1618,13 @@ async fn run_shutdown_fast(
                 .to_string(),
         });
 
+        // Drain buffer: let in-flight ticks (last 15:29 candle) reach the
+        // tick processor channel BEFORE aborting WebSocket read loops.
+        let drain = std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
+        );
+        tokio::time::sleep(drain).await;
+
         // Stop real-time data pipeline (WS + tick processor + trading)
         for handle in &ws_handles {
             handle.abort();

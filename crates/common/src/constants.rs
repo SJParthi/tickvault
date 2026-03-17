@@ -724,6 +724,28 @@ pub const ILP_FLUSH_BATCH_SIZE: usize = 10_000;
 pub const IST_UTC_OFFSET_SECONDS: i32 = 19_800;
 
 // ---------------------------------------------------------------------------
+// Market Hours — Tick Persistence Window
+// ---------------------------------------------------------------------------
+// Only ticks with exchange timestamps inside [09:00, 15:30) IST are persisted
+// to QuestDB. Pre-market and post-market ticks still flow through broadcast
+// and candle aggregation but are NOT stored.
+
+/// Seconds-of-day (IST) at which tick persistence starts: 09:00:00 = 9 × 3600.
+pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
+
+/// Seconds-of-day (IST) at which tick persistence ends: 15:30:00 = 15 × 3600 + 30 × 60.
+/// The end is **exclusive** — a tick at exactly 15:30:00 is NOT persisted.
+pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
+
+/// Seconds in a day (86,400). Used for modulo arithmetic in persist window check.
+pub const SECONDS_PER_DAY: u32 = 86_400;
+
+/// Drain buffer (seconds) after market close before aborting WebSocket handles.
+/// Allows in-flight ticks (last 15:29 candle) to reach the tick processor channel
+/// before the WebSocket read loop is killed.
+pub const MARKET_CLOSE_DRAIN_BUFFER_SECS: u64 = 2;
+
+// ---------------------------------------------------------------------------
 // Authentication — TOTP Configuration
 // ---------------------------------------------------------------------------
 
@@ -1187,6 +1209,25 @@ const _: () = assert!(
     "DEDUP_RING_BUFFER_POWER must be in [8, 24]"
 );
 
+// Sanity: tick persist window — start < end, both within a day, values match IST times.
+const _: () = assert!(
+    TICK_PERSIST_START_SECS_OF_DAY_IST == 9 * 3600,
+    "TICK_PERSIST_START must equal 09:00 IST (32400)"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
+    "TICK_PERSIST_END must equal 15:30 IST (55800)"
+);
+const _: () = assert!(
+    TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST,
+    "TICK_PERSIST_START must be before TICK_PERSIST_END"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
+    "TICK_PERSIST_END must be within a single day"
+);
+const _: () = assert!(SECONDS_PER_DAY == 86_400, "SECONDS_PER_DAY must be 86400");
+
 // Sanity: indicator ring buffer capacity must be a power of two (bitmask indexing).
 const _: () = assert!(
     INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two(),
@@ -1354,3 +1395,45 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
 
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
 pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
+
+// ---------------------------------------------------------------------------
+// Tests — Market Hours Constants
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod market_hours_tests {
+    use super::*;
+
+    #[test]
+    fn test_tick_persist_start_matches_nine_am() {
+        // 09:00:00 IST = 9 hours * 3600 seconds = 32,400
+        assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 9 * 3600);
+        assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 32_400);
+    }
+
+    #[test]
+    fn test_tick_persist_end_matches_three_thirty() {
+        // 15:30:00 IST = 15 * 3600 + 30 * 60 = 55,800
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 55_800);
+    }
+
+    #[test]
+    fn test_seconds_per_day_correct() {
+        assert_eq!(SECONDS_PER_DAY, 24 * 3600);
+        assert_eq!(SECONDS_PER_DAY, 86_400);
+    }
+
+    #[test]
+    fn test_market_close_drain_buffer_constant() {
+        // Drain buffer must be positive and small (1-5 seconds).
+        assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS >= 1);
+        assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS <= 5);
+    }
+
+    #[test]
+    fn test_persist_window_is_subset_of_day() {
+        assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
+        assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+    }
+}

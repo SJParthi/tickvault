@@ -194,7 +194,7 @@ mod tests {
             market_close_time: "15:30:00".to_string(),
             order_cutoff_time: "15:29:00".to_string(),
             data_collection_start: "09:00:00".to_string(),
-            data_collection_end: "16:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
             nse_holidays: vec![
