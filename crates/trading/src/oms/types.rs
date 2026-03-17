@@ -409,6 +409,9 @@ mod tests {
         order.status = OrderStatus::Confirmed;
         assert!(!order.is_terminal());
 
+        order.status = OrderStatus::PartTraded;
+        assert!(!order.is_terminal());
+
         order.status = OrderStatus::Traded;
         assert!(order.is_terminal());
 

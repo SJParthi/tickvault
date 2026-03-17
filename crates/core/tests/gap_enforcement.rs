@@ -711,19 +711,19 @@ mod ws_disconnect_codes {
     fn reconnectable_codes() {
         // 807 (token expired) is reconnectable; Unknown codes are also reconnectable
         assert!(DisconnectCode::from_u16(807).is_reconnectable());
-        // Unknown codes (801, 804, 810) map to Unknown and are reconnectable
+        // Unknown codes (801, 804) map to Unknown and are reconnectable
         assert!(DisconnectCode::from_u16(801).is_reconnectable());
         assert!(DisconnectCode::from_u16(804).is_reconnectable());
-        assert!(DisconnectCode::from_u16(810).is_reconnectable());
     }
 
     #[test]
     fn non_reconnectable_codes() {
-        // Named variants 805, 806, 808, 809 are non-reconnectable
+        // Named variants 805, 806, 808, 809, 810 are non-reconnectable
         assert!(!DisconnectCode::from_u16(805).is_reconnectable());
         assert!(!DisconnectCode::from_u16(806).is_reconnectable());
         assert!(!DisconnectCode::from_u16(808).is_reconnectable());
         assert!(!DisconnectCode::from_u16(809).is_reconnectable());
+        assert!(!DisconnectCode::from_u16(810).is_reconnectable());
     }
 
     #[test]
@@ -783,7 +783,7 @@ mod ws_disconnect_codes {
     // -- Enum variant coverage (exhaustive) --------------------------------
 
     #[test]
-    fn all_5_known_codes_mapped() {
+    fn all_6_known_codes_mapped() {
         // Verify each named code maps to a distinct named variant (not Unknown)
         let known: &[(u16, &str)] = &[
             (805, "ExceededActiveConnections"),
@@ -791,6 +791,7 @@ mod ws_disconnect_codes {
             (807, "AccessTokenExpired"),
             (808, "InvalidClientId"),
             (809, "AuthenticationFailed"),
+            (810, "ClientIdInvalid"),
         ];
         for &(code, expected_name) in known {
             let dc = DisconnectCode::from_u16(code);
@@ -803,8 +804,8 @@ mod ws_disconnect_codes {
                 expected_name
             );
         }
-        // Codes outside 805-809 map to Unknown
-        for code in [801_u16, 802, 803, 804, 810, 814] {
+        // Codes outside 805-810 map to Unknown
+        for code in [801_u16, 802, 803, 804, 814] {
             let dc = DisconnectCode::from_u16(code);
             let debug = format!("{:?}", dc);
             assert!(

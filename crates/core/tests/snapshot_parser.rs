@@ -563,7 +563,7 @@ fn golden_disconnect_all_known_codes() {
         (807, DisconnectCode::AccessTokenExpired),
         (808, DisconnectCode::InvalidClientId),
         (809, DisconnectCode::AuthenticationFailed),
-        (810, DisconnectCode::Unknown(810)),
+        (810, DisconnectCode::ClientIdInvalid),
         (814, DisconnectCode::Unknown(814)),
     ];
 

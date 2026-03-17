@@ -126,6 +126,9 @@ pub const DISCONNECT_INVALID_CLIENT_ID: u16 = 808;
 /// 809 — Authentication failed. Invalid credentials.
 pub const DISCONNECT_AUTH_FAILED: u16 = 809;
 
+/// 810 — Client ID invalid. Distinct from 808 (auth failed).
+pub const DISCONNECT_CLIENT_ID_INVALID: u16 = 810;
+
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
 // Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
@@ -390,6 +393,10 @@ pub const OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 
 /// Seconds before the OMS circuit breaker transitions from Open to Half-Open.
 pub const OMS_CIRCUIT_BREAKER_RESET_SECS: u64 = 30;
+
+/// Maximum length for Dhan `correlationId` field.
+/// Dhan spec: max 30 chars, charset `[a-zA-Z0-9 _-]`.
+pub const DHAN_CORRELATION_ID_MAX_LENGTH: usize = 30;
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes

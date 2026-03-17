@@ -532,12 +532,13 @@ fn test_disconnect_codes_match_dhan_spec() {
 
 #[test]
 fn test_disconnect_code_from_u16_roundtrip() {
-    let pairs: [(u16, DisconnectCode); 5] = [
+    let pairs: [(u16, DisconnectCode); 6] = [
         (805, DisconnectCode::ExceededActiveConnections),
         (806, DisconnectCode::DataApiSubscriptionRequired),
         (807, DisconnectCode::AccessTokenExpired),
         (808, DisconnectCode::InvalidClientId),
         (809, DisconnectCode::AuthenticationFailed),
+        (810, DisconnectCode::ClientIdInvalid),
     ];
     for (raw, expected) in &pairs {
         let code = DisconnectCode::from_u16(*raw);
@@ -554,6 +555,7 @@ fn test_only_807_triggers_token_refresh() {
         DisconnectCode::AccessTokenExpired,
         DisconnectCode::InvalidClientId,
         DisconnectCode::AuthenticationFailed,
+        DisconnectCode::ClientIdInvalid,
         DisconnectCode::Unknown(999),
     ];
     for code in &codes {
@@ -578,6 +580,7 @@ fn test_reconnectable_codes_are_807_and_unknown_only() {
     assert!(DisconnectCode::AccessTokenExpired.is_reconnectable());
     assert!(!DisconnectCode::InvalidClientId.is_reconnectable());
     assert!(!DisconnectCode::AuthenticationFailed.is_reconnectable());
+    assert!(!DisconnectCode::ClientIdInvalid.is_reconnectable());
     assert!(DisconnectCode::Unknown(999).is_reconnectable());
 }
 
@@ -1020,12 +1023,13 @@ fn test_e2e_market_status_packet() {
 
 #[test]
 fn test_e2e_disconnect_packet_all_codes() {
-    let test_cases: [(u16, DisconnectCode); 6] = [
+    let test_cases: [(u16, DisconnectCode); 7] = [
         (805, DisconnectCode::ExceededActiveConnections),
         (806, DisconnectCode::DataApiSubscriptionRequired),
         (807, DisconnectCode::AccessTokenExpired),
         (808, DisconnectCode::InvalidClientId),
         (809, DisconnectCode::AuthenticationFailed),
+        (810, DisconnectCode::ClientIdInvalid),
         (999, DisconnectCode::Unknown(999)),
     ];
 

@@ -6,7 +6,7 @@
 use std::fmt;
 
 use dhan_live_trader_common::constants::{
-    DISCONNECT_ACCESS_TOKEN_EXPIRED, DISCONNECT_AUTH_FAILED,
+    DISCONNECT_ACCESS_TOKEN_EXPIRED, DISCONNECT_AUTH_FAILED, DISCONNECT_CLIENT_ID_INVALID,
     DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED, DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS,
     DISCONNECT_INVALID_CLIENT_ID,
 };
@@ -48,9 +48,9 @@ impl fmt::Display for ConnectionState {
 // Disconnect Code
 // ---------------------------------------------------------------------------
 
-/// Dhan WebSocket disconnect error codes (805–809).
+/// Dhan WebSocket disconnect error codes (805–810).
 ///
-/// Source: DhanHQ Python SDK v2 on_close handler.
+/// Source: Dhan V2 API Annexure (Section 11) + DhanHQ Python SDK v2.
 /// Each code maps to a specific recovery action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectCode {
@@ -60,11 +60,13 @@ pub enum DisconnectCode {
     DataApiSubscriptionRequired,
     /// 807 — Access token expired. Refresh token, then reconnect.
     AccessTokenExpired,
-    /// 808 — Invalid client ID. Check SSM credentials.
+    /// 808 — Authentication failed. Client ID or Access Token invalid.
     InvalidClientId,
-    /// 809 — Authentication failed. Invalid credentials.
+    /// 809 — Access token invalid (different from 807 expired).
     AuthenticationFailed,
-    /// Unknown disconnect code not in the Dhan V2 SDK.
+    /// 810 — Client ID invalid. Check SSM credentials.
+    ClientIdInvalid,
+    /// Unknown disconnect code not in the Dhan V2 API.
     Unknown(u16),
 }
 
@@ -77,6 +79,7 @@ impl DisconnectCode {
             DISCONNECT_ACCESS_TOKEN_EXPIRED => Self::AccessTokenExpired,
             DISCONNECT_INVALID_CLIENT_ID => Self::InvalidClientId,
             DISCONNECT_AUTH_FAILED => Self::AuthenticationFailed,
+            DISCONNECT_CLIENT_ID_INVALID => Self::ClientIdInvalid,
             other => Self::Unknown(other),
         }
     }
@@ -89,6 +92,7 @@ impl DisconnectCode {
             Self::AccessTokenExpired => DISCONNECT_ACCESS_TOKEN_EXPIRED,
             Self::InvalidClientId => DISCONNECT_INVALID_CLIENT_ID,
             Self::AuthenticationFailed => DISCONNECT_AUTH_FAILED,
+            Self::ClientIdInvalid => DISCONNECT_CLIENT_ID_INVALID,
             Self::Unknown(code) => *code,
         }
     }
@@ -103,7 +107,8 @@ impl DisconnectCode {
             Self::ExceededActiveConnections
             | Self::DataApiSubscriptionRequired
             | Self::InvalidClientId
-            | Self::AuthenticationFailed => false,
+            | Self::AuthenticationFailed
+            | Self::ClientIdInvalid => false,
             Self::Unknown(_) => true, // assume transient for unknown codes
         }
     }
@@ -124,8 +129,9 @@ impl fmt::Display for DisconnectCode {
                 write!(f, "806: Data API subscription required")
             }
             Self::AccessTokenExpired => write!(f, "807: Access token expired"),
-            Self::InvalidClientId => write!(f, "808: Invalid client ID"),
-            Self::AuthenticationFailed => write!(f, "809: Authentication failed"),
+            Self::InvalidClientId => write!(f, "808: Authentication failed"),
+            Self::AuthenticationFailed => write!(f, "809: Access token invalid"),
+            Self::ClientIdInvalid => write!(f, "810: Client ID invalid"),
             Self::Unknown(code) => write!(f, "{code}: Unknown disconnect"),
         }
     }
@@ -278,6 +284,10 @@ mod tests {
             DisconnectCode::from_u16(809),
             DisconnectCode::AuthenticationFailed
         );
+        assert_eq!(
+            DisconnectCode::from_u16(810),
+            DisconnectCode::ClientIdInvalid
+        );
     }
 
     #[test]
@@ -288,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_disconnect_code_roundtrip() {
-        let codes: &[u16] = &[805, 806, 807, 808, 809];
+        let codes: &[u16] = &[805, 806, 807, 808, 809, 810];
         for &code in codes {
             let parsed = DisconnectCode::from_u16(code);
             assert_eq!(parsed.as_u16(), code, "roundtrip failed for code {code}");
@@ -300,11 +310,12 @@ mod tests {
         // Reconnectable: only 807 (token expired)
         assert!(DisconnectCode::AccessTokenExpired.is_reconnectable());
 
-        // NOT reconnectable: 805, 806, 808, 809
+        // NOT reconnectable: 805, 806, 808, 809, 810
         assert!(!DisconnectCode::ExceededActiveConnections.is_reconnectable());
         assert!(!DisconnectCode::DataApiSubscriptionRequired.is_reconnectable());
         assert!(!DisconnectCode::InvalidClientId.is_reconnectable());
         assert!(!DisconnectCode::AuthenticationFailed.is_reconnectable());
+        assert!(!DisconnectCode::ClientIdInvalid.is_reconnectable());
 
         // Unknown: assume reconnectable (transient)
         assert!(DisconnectCode::Unknown(999).is_reconnectable());
@@ -318,6 +329,7 @@ mod tests {
         assert!(!DisconnectCode::DataApiSubscriptionRequired.requires_token_refresh());
         assert!(!DisconnectCode::InvalidClientId.requires_token_refresh());
         assert!(!DisconnectCode::AuthenticationFailed.requires_token_refresh());
+        assert!(!DisconnectCode::ClientIdInvalid.requires_token_refresh());
         assert!(!DisconnectCode::Unknown(999).requires_token_refresh());
     }
 
@@ -325,7 +337,11 @@ mod tests {
     fn test_disconnect_code_display() {
         assert_eq!(
             DisconnectCode::AuthenticationFailed.to_string(),
-            "809: Authentication failed"
+            "809: Access token invalid"
+        );
+        assert_eq!(
+            DisconnectCode::ClientIdInvalid.to_string(),
+            "810: Client ID invalid"
         );
         assert_eq!(
             DisconnectCode::Unknown(999).to_string(),
@@ -392,6 +408,7 @@ mod tests {
                 .to_string()
                 .contains("809")
         );
+        assert!(DisconnectCode::ClientIdInvalid.to_string().contains("810"));
     }
 
     #[test]

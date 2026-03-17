@@ -6,16 +6,20 @@
 //!
 //! # Valid Transitions (from Phase 1 spec §10)
 //! ```text
-//! Transit   → Pending     (reached exchange)
-//! Transit   → Rejected    (exchange rejected immediately)
-//! Pending   → Confirmed   (exchange accepted)
-//! Pending   → Traded      (immediate fill, skips Confirmed)
-//! Pending   → Cancelled   (cancelled before confirmation)
-//! Pending   → Rejected    (exchange rejected after pending)
-//! Pending   → Expired     (order expired while pending)
-//! Confirmed → Traded      (fully filled)
-//! Confirmed → Cancelled   (user cancelled)
-//! Confirmed → Expired     (end of validity)
+//! Transit    → Pending     (reached exchange)
+//! Transit    → Rejected    (exchange rejected immediately)
+//! Pending    → Confirmed   (exchange accepted)
+//! Pending    → Traded      (immediate fill, skips Confirmed)
+//! Pending    → PartTraded  (partial fill)
+//! Pending    → Cancelled   (cancelled before confirmation)
+//! Pending    → Rejected    (exchange rejected after pending)
+//! Pending    → Expired     (order expired while pending)
+//! Confirmed  → Traded      (fully filled)
+//! Confirmed  → PartTraded  (partial fill)
+//! Confirmed  → Cancelled   (user cancelled)
+//! Confirmed  → Expired     (end of validity)
+//! PartTraded → Traded      (remaining quantity filled)
+//! PartTraded → Cancelled   (user cancelled remaining)
 //! ```
 
 use dhan_live_trader_common::order_types::OrderStatus;
@@ -33,16 +37,21 @@ pub fn is_valid_transition(from: OrderStatus, to: OrderStatus) -> bool {
         // Transit can go to Pending or Rejected
         (OrderStatus::Transit, OrderStatus::Pending)
             | (OrderStatus::Transit, OrderStatus::Rejected)
-            // Pending can go to Confirmed, Traded, Cancelled, Rejected, or Expired
+            // Pending can go to Confirmed, Traded, PartTraded, Cancelled, Rejected, or Expired
             | (OrderStatus::Pending, OrderStatus::Confirmed)
             | (OrderStatus::Pending, OrderStatus::Traded)
+            | (OrderStatus::Pending, OrderStatus::PartTraded)
             | (OrderStatus::Pending, OrderStatus::Cancelled)
             | (OrderStatus::Pending, OrderStatus::Rejected)
             | (OrderStatus::Pending, OrderStatus::Expired)
-            // Confirmed can go to Traded, Cancelled, or Expired
+            // Confirmed can go to Traded, PartTraded, Cancelled, or Expired
             | (OrderStatus::Confirmed, OrderStatus::Traded)
+            | (OrderStatus::Confirmed, OrderStatus::PartTraded)
             | (OrderStatus::Confirmed, OrderStatus::Cancelled)
             | (OrderStatus::Confirmed, OrderStatus::Expired)
+            // PartTraded can go to Traded or Cancelled
+            | (OrderStatus::PartTraded, OrderStatus::Traded)
+            | (OrderStatus::PartTraded, OrderStatus::Cancelled)
     )
 }
 
@@ -60,6 +69,7 @@ pub fn parse_order_status(status_str: &str) -> Option<OrderStatus> {
         "TRADED" => Some(OrderStatus::Traded),
         "CANCELLED" | "Cancelled" => Some(OrderStatus::Cancelled),
         "REJECTED" => Some(OrderStatus::Rejected),
+        "PART_TRADED" | "PARTIALLY_FILLED" => Some(OrderStatus::PartTraded),
         "EXPIRED" => Some(OrderStatus::Expired),
         _ => None,
     }
@@ -155,6 +165,40 @@ mod tests {
         ));
     }
 
+    // -- PartTraded transitions --
+
+    #[test]
+    fn pending_to_part_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Pending,
+            OrderStatus::PartTraded
+        ));
+    }
+
+    #[test]
+    fn confirmed_to_part_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Confirmed,
+            OrderStatus::PartTraded
+        ));
+    }
+
+    #[test]
+    fn part_traded_to_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::Traded
+        ));
+    }
+
+    #[test]
+    fn part_traded_to_cancelled_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::Cancelled
+        ));
+    }
+
     // --- Invalid transitions ---
 
     #[test]
@@ -233,6 +277,10 @@ mod tests {
             OrderStatus::Transit,
             OrderStatus::Transit
         ));
+        assert!(!is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::PartTraded
+        ));
     }
 
     // --- parse_order_status ---
@@ -255,6 +303,14 @@ mod tests {
             Some(OrderStatus::Cancelled)
         );
         assert_eq!(parse_order_status("REJECTED"), Some(OrderStatus::Rejected));
+        assert_eq!(
+            parse_order_status("PART_TRADED"),
+            Some(OrderStatus::PartTraded)
+        );
+        assert_eq!(
+            parse_order_status("PARTIALLY_FILLED"),
+            Some(OrderStatus::PartTraded)
+        );
         assert_eq!(parse_order_status("EXPIRED"), Some(OrderStatus::Expired));
     }
 

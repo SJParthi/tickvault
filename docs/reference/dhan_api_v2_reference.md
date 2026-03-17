@@ -577,7 +577,7 @@ Headers: Standard
 Request Body:
 {
     "UnderlyingScrip": 13,          // security ID (integer)
-    "UnderlyingSeg": "NSE",         // exchange segment
+    "UnderlyingSeg": "IDX_I",         // exchange segment
     "Expiry": "2026-03-27"          // expiry date string
 }
 
@@ -593,7 +593,7 @@ Headers: Standard
 Request Body:
 {
     "UnderlyingScrip": 13,
-    "UnderlyingSeg": "NSE"
+    "UnderlyingSeg": "IDX_I"
 }
 
 Response: List of expiry dates for the underlying instrument.

@@ -114,6 +114,8 @@ impl ExchangeSegment {
 | `INTRADAY` | Intraday for Equity, Futures & Options  |
 | `MARGIN`   | Carry Forward in Futures & Options      |
 | `MTF`      | Margin Trading Facility (appears in Order/Forever Order APIs, not in annexure table) |
+| `CO`       | Cover Order — with stop-loss (appears in Order Update WS `Product` field as `"V"`) |
+| `BO`       | Bracket Order — with target + stop-loss (appears in Order Update WS `Product` field as `"B"`) |
 
 ---
 

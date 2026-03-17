@@ -704,6 +704,8 @@ mod tests {
             product_name: String::new(),
             ref_ltp: 0.0,
             tick_size: 0.0,
+            source: String::new(),
+            off_mkt_flag: String::new(),
         }
     }
 

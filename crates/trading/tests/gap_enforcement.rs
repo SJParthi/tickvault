@@ -27,12 +27,16 @@ mod oms_state_machine {
             (OrderStatus::Transit, OrderStatus::Rejected),
             (OrderStatus::Pending, OrderStatus::Confirmed),
             (OrderStatus::Pending, OrderStatus::Traded),
+            (OrderStatus::Pending, OrderStatus::PartTraded),
             (OrderStatus::Pending, OrderStatus::Cancelled),
             (OrderStatus::Pending, OrderStatus::Rejected),
             (OrderStatus::Pending, OrderStatus::Expired),
             (OrderStatus::Confirmed, OrderStatus::Traded),
+            (OrderStatus::Confirmed, OrderStatus::PartTraded),
             (OrderStatus::Confirmed, OrderStatus::Cancelled),
             (OrderStatus::Confirmed, OrderStatus::Expired),
+            (OrderStatus::PartTraded, OrderStatus::Traded),
+            (OrderStatus::PartTraded, OrderStatus::Cancelled),
         ];
 
         for (from, to) in &valid_transitions {
@@ -53,6 +57,7 @@ mod oms_state_machine {
             OrderStatus::Transit,
             OrderStatus::Pending,
             OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
             OrderStatus::Cancelled,
             OrderStatus::Rejected,
             OrderStatus::Expired,
@@ -72,6 +77,7 @@ mod oms_state_machine {
             OrderStatus::Transit,
             OrderStatus::Pending,
             OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
             OrderStatus::Traded,
             OrderStatus::Cancelled,
             OrderStatus::Expired,
@@ -91,6 +97,7 @@ mod oms_state_machine {
             OrderStatus::Transit,
             OrderStatus::Pending,
             OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
             OrderStatus::Traded,
             OrderStatus::Rejected,
             OrderStatus::Expired,
@@ -110,6 +117,7 @@ mod oms_state_machine {
             OrderStatus::Transit,
             OrderStatus::Pending,
             OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
             OrderStatus::Traded,
             OrderStatus::Cancelled,
             OrderStatus::Rejected,
@@ -131,6 +139,7 @@ mod oms_state_machine {
             OrderStatus::Transit,
             OrderStatus::Pending,
             OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
             OrderStatus::Traded,
             OrderStatus::Cancelled,
             OrderStatus::Rejected,
@@ -184,6 +193,14 @@ mod oms_state_machine {
             Some(OrderStatus::Cancelled)
         );
         assert_eq!(parse_order_status("REJECTED"), Some(OrderStatus::Rejected));
+        assert_eq!(
+            parse_order_status("PART_TRADED"),
+            Some(OrderStatus::PartTraded)
+        );
+        assert_eq!(
+            parse_order_status("PARTIALLY_FILLED"),
+            Some(OrderStatus::PartTraded)
+        );
         assert_eq!(parse_order_status("EXPIRED"), Some(OrderStatus::Expired));
     }
 
@@ -552,12 +569,12 @@ mod oms_idempotency {
     use dhan_live_trader_trading::oms::idempotency::CorrelationTracker;
 
     #[test]
-    fn generate_id_returns_valid_uuid() {
+    fn generate_id_fits_dhan_limit() {
         let tracker = CorrelationTracker::new();
         let id = tracker.generate_id();
-        // UUID v4 format: 8-4-4-4-12 hex with hyphens
-        assert_eq!(id.len(), 36);
-        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+        // Dhan correlationId: max 30 chars, hex only (no hyphens)
+        assert_eq!(id.len(), 30);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub enum OrderStatus {
     Cancelled,
     /// Rejected by exchange or RMS.
     Rejected,
+    /// Partially filled — some quantity traded, remainder still open.
+    PartTraded,
     /// Expired at end of validity.
     Expired,
 }
@@ -40,6 +42,7 @@ impl OrderStatus {
             Self::Traded => "TRADED",
             Self::Cancelled => "CANCELLED",
             Self::Rejected => "REJECTED",
+            Self::PartTraded => "PART_TRADED",
             Self::Expired => "EXPIRED",
         }
     }
@@ -286,6 +289,12 @@ pub struct OrderUpdate {
     /// Tick size.
     #[serde(default, rename = "tickSize")]
     pub tick_size: f64,
+    /// Order source ("P" = API, "N" = Normal/Dhan web/app).
+    #[serde(default)]
+    pub source: String,
+    /// After-market order flag ("1" = AMO, "0" = normal).
+    #[serde(default)]
+    pub off_mkt_flag: String,
 }
 
 /// Wrapper for the Dhan order update WebSocket message.
@@ -296,6 +305,9 @@ pub struct OrderUpdate {
 pub struct OrderUpdateMessage {
     /// The order update payload.
     pub data: OrderUpdate,
+    /// Message type (e.g., "order_alert").
+    #[serde(default)]
+    pub r#type: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +328,7 @@ mod tests {
         assert_eq!(OrderStatus::Traded.as_str(), "TRADED");
         assert_eq!(OrderStatus::Cancelled.as_str(), "CANCELLED");
         assert_eq!(OrderStatus::Rejected.as_str(), "REJECTED");
+        assert_eq!(OrderStatus::PartTraded.as_str(), "PART_TRADED");
         assert_eq!(OrderStatus::Expired.as_str(), "EXPIRED");
     }
 
@@ -496,10 +509,13 @@ mod tests {
             product_name: "INTRADAY".to_owned(),
             ref_ltp: 245.0,
             tick_size: 0.05,
+            source: "P".to_owned(),
+            off_mkt_flag: "0".to_owned(),
         };
 
         let msg = OrderUpdateMessage {
             data: update.clone(),
+            r#type: "order_alert".to_owned(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: OrderUpdateMessage = serde_json::from_str(&json).unwrap();
