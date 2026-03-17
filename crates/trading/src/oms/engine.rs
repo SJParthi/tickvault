@@ -308,9 +308,13 @@ impl OrderManagementSystem {
             });
         }
 
+        // Validate order type / price / trigger consistency
+        validate_modify_fields(&request)?;
+
         // Validate disclosed quantity if specified
         if request.disclosed_quantity > 0 {
-            let min_disclosed = (request.quantity * 3) / 10;
+            // Ceiling division: (qty * 3 + 9) / 10 to avoid floor-division undercount
+            let min_disclosed = (request.quantity * 3 + 9) / 10;
             if request.disclosed_quantity < min_disclosed {
                 return Err(OmsError::RiskRejected {
                     reason: format!(
@@ -643,6 +647,31 @@ fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
     }
 
     // SL/SLM orders: triggerPrice is mandatory
+    if matches!(
+        request.order_type,
+        OrderType::StopLoss | OrderType::StopLossMarket
+    ) && request.trigger_price == 0.0
+    {
+        return Err(OmsError::RiskRejected {
+            reason: "STOP_LOSS/STOP_LOSS_MARKET orders require triggerPrice > 0".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validates modify-order fields before submission to avoid wasting Dhan rate limits.
+///
+/// Same rules as place: MARKET→price=0, SL→triggerPrice>0.
+fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> {
+    use dhan_live_trader_common::order_types::OrderType;
+
+    if request.order_type == OrderType::Market && request.price != 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("MARKET order must have price=0.0, got {}", request.price),
+        });
+    }
+
     if matches!(
         request.order_type,
         OrderType::StopLoss | OrderType::StopLossMarket
@@ -1285,6 +1314,73 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
             "disclosedQuantity < 30% of quantity must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disclosed_qty_ceiling_division_edge_case() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        // quantity=9, 30% = 2.7, ceiling = 3. disclosed_quantity=2 must fail.
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 9,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 2, // 22.2% < 30%
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(
+            result.is_err(),
+            "disclosed_quantity=2 on quantity=9 (22%) must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Modify order validation gates
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_modify_market_order_nonzero_price_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Market,
+            quantity: 50,
+            price: 245.50, // MARKET must have price=0
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
+            "MARKET modify with non-zero price must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_sl_order_zero_trigger_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLoss,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0, // SL must have triggerPrice > 0
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
+            "SL modify with zero triggerPrice must be rejected"
         );
     }
 }
