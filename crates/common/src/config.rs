@@ -35,6 +35,8 @@ pub struct ApplicationConfig {
     pub historical: HistoricalDataConfig,
     #[serde(default)]
     pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub index_constituency: IndexConstituencyConfig,
 }
 
 /// Strategy and paper-trading configuration.
@@ -759,6 +761,7 @@ mod tests {
             observability: ObservabilityConfig::default(),
             historical: HistoricalDataConfig::default(),
             strategy: StrategyConfig::default(),
+            index_constituency: IndexConstituencyConfig::default(),
         }
     }
 

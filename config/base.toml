@@ -186,3 +186,9 @@ lookback_days = 90
 request_timeout_secs = 30
 max_retries = 3
 request_delay_ms = 500
+
+[index_constituency]
+enabled = true
+download_timeout_secs = 30
+max_concurrent_downloads = 5
+inter_batch_delay_ms = 0

@@ -524,13 +524,24 @@ async fn main() -> Result<()> {
             }
         };
 
+        // --- Background: Index constituency download (best-effort) ---
+        let bg_constituency =
+            dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+                &config.index_constituency,
+                &config.instrument.csv_cache_directory,
+            )
+            .await;
+
+        let bg_shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+            std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
+
         // --- Background: API server ---
         let api_state = SharedAppState::new(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
             shared_movers.clone(),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            bg_shared_constituency,
         );
 
         let router = build_router(api_state);
@@ -890,6 +901,19 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 10.5: Download index constituency data (non-blocking, best-effort)
+    // -----------------------------------------------------------------------
+    let constituency_map =
+        dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+            &config.index_constituency,
+            &config.instrument.csv_cache_directory,
+        )
+        .await;
+
+    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+        std::sync::Arc::new(std::sync::RwLock::new(constituency_map));
+
+    // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
     let api_state = SharedAppState::new(
@@ -897,7 +921,7 @@ async fn main() -> Result<()> {
         config.dhan.clone(),
         config.instrument.clone(),
         shared_movers.clone(),
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
+        shared_constituency.clone(),
     );
 
     let router = build_router(api_state);
