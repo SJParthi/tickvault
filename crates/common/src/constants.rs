@@ -917,11 +917,11 @@ pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
 // ---------------------------------------------------------------------------
 
 /// 20-level depth WebSocket base URL.
-/// Full URL: wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
+/// Full URL: `wss://depth-api-feed.dhan.co/twentydepth?token=TOKEN&clientId=CLIENT_ID&authType=2`
 pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/twentydepth"; // APPROVED: infrastructure constant
 
 /// 200-level depth WebSocket base URL.
-/// Full URL: wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
+/// Full URL: `wss://full-depth-api.dhan.co/twohundreddepth?token=TOKEN&clientId=CLIENT_ID&authType=2`
 pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth"; // APPROVED: infrastructure constant
 
 // ---------------------------------------------------------------------------
