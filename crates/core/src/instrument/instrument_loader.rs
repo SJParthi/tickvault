@@ -1,10 +1,12 @@
 //! Market-hours-aware instrument loader with rkyv binary cache.
 //!
 //! # Semantics
-//! - **Market hours** `[08:45, 16:00)` IST — NEVER download. Load from:
+//! - **Market hours** `[09:00, 15:30)` IST — cache first, emergency download
+//!   as last resort (I-P0-06). Load order:
 //!   1. rkyv zero-copy binary cache (sub-0.5ms via `MappedUniverse`)
 //!   2. CSV file cache fallback (~400ms, then writes rkyv for next restart)
-//!   3. `Unavailable` — no instruments available
+//!   3. Emergency download (all caches missing — logs CRITICAL)
+//!   4. `Unavailable` — all sources exhausted
 //! - **Outside market hours** — ALWAYS download fresh CSV (ignores freshness
 //!   marker). On download failure, falls back to rkyv → CSV → error.
 //! - **Manual API** — `POST /api/instruments/rebuild`. Bypasses market hours
