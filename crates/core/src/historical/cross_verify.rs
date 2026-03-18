@@ -261,10 +261,13 @@ pub async fn verify_candle_integrity(
 
     // --- Step 1: Per-timeframe coverage query ---
     // Groups by (timeframe, security_id) to get counts per instrument per timeframe.
+    // Use 3-day window to ensure daily candles (stamped at IST midnight = hour 0)
+    // are always captured regardless of when verification runs.
+    // Intraday candles from today are also within this window.
     let coverage_query = format!(
         "SELECT timeframe, security_id, count() as candle_count \
          FROM {} \
-         WHERE ts > dateadd('d', -1, now()) \
+         WHERE ts > dateadd('d', -3, now()) \
          GROUP BY timeframe, security_id \
          ORDER BY timeframe, candle_count DESC",
         QUESTDB_TABLE_HISTORICAL_CANDLES
@@ -351,7 +354,7 @@ pub async fn verify_candle_integrity(
     // --- Step 3: OHLC consistency check (high < low) with details ---
     let ohlc_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -1, now()) AND high < low",
+         WHERE ts > dateadd('d', -3, now()) AND high < low",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
 
@@ -361,7 +364,7 @@ pub async fn verify_candle_integrity(
         let ohlc_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -1, now()) AND high < low \
+             WHERE ts > dateadd('d', -3, now()) AND high < low \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
         );
@@ -387,7 +390,7 @@ pub async fn verify_candle_integrity(
     // --- Step 4: Data integrity check (non-positive prices) with details ---
     let data_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -1, now()) \
+         WHERE ts > dateadd('d', -3, now()) \
          AND (open <= 0 OR high <= 0 OR low <= 0 OR close <= 0)",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
@@ -398,7 +401,7 @@ pub async fn verify_candle_integrity(
         let data_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -1, now()) \
+             WHERE ts > dateadd('d', -3, now()) \
              AND (open <= 0 OR high <= 0 OR low <= 0 OR close <= 0) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
@@ -423,14 +426,16 @@ pub async fn verify_candle_integrity(
     }
 
     // --- Step 5: Timestamp bounds check (intraday outside market hours) ---
-    // QuestDB stores IST-as-UTC: market hours 09:15-15:29 IST = 03:45-09:59 UTC
+    // QuestDB stores IST-as-UTC: hours in DB ARE IST hours directly.
+    // Market hours: 09:15 IST to 15:29 IST. So valid range: hour 9 min 15 through hour 15 min 29.
+    // Anything outside that = violation (for intraday candles only, not daily).
     let ts_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -1, now()) \
+         WHERE ts > dateadd('d', -3, now()) \
          AND timeframe != '1d' \
-         AND (hour(ts) < 3 OR hour(ts) > 10 \
-              OR (hour(ts) = 3 AND minute(ts) < 45) \
-              OR (hour(ts) = 10 AND minute(ts) > 0))",
+         AND (hour(ts) < 9 OR hour(ts) > 15 \
+              OR (hour(ts) = 9 AND minute(ts) < 15) \
+              OR (hour(ts) = 15 AND minute(ts) > 29))",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
 
@@ -440,11 +445,11 @@ pub async fn verify_candle_integrity(
         let ts_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -1, now()) \
+             WHERE ts > dateadd('d', -3, now()) \
              AND timeframe != '1d' \
-             AND (hour(ts) < 3 OR hour(ts) > 10 \
-                  OR (hour(ts) = 3 AND minute(ts) < 45) \
-                  OR (hour(ts) = 10 AND minute(ts) > 0)) \
+             AND (hour(ts) < 9 OR hour(ts) > 15 \
+                  OR (hour(ts) = 9 AND minute(ts) < 15) \
+                  OR (hour(ts) = 15 AND minute(ts) > 29)) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
         );
@@ -578,7 +583,7 @@ pub async fn cross_match_historical_vs_live(
         let count_query = format!(
             "SELECT count() FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -1, now())",
+             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -3, now())",
             QUESTDB_TABLE_HISTORICAL_CANDLES, live_table, hist_tf
         );
 
@@ -599,7 +604,7 @@ pub async fn cross_match_historical_vs_live(
                     h.open_interest, m.open_interest \
              FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -1, now()) \
+             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -3, now()) \
              AND (m.open IS NULL \
                   OR abs(h.open - m.open) > {eps} \
                   OR abs(h.high - m.high) > {eps} \
