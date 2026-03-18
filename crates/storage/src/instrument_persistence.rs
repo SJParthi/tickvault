@@ -60,7 +60,9 @@ const DEDUP_KEY_BUILD_METADATA: &str = "csv_source";
 const DEDUP_KEY_FNO_UNDERLYINGS: &str = "underlying_symbol";
 
 /// DEDUP UPSERT KEY for `derivative_contracts` table.
-const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id";
+/// I-P1-05: Includes `underlying_symbol` to prevent security_id reuse collision
+/// across different underlyings (e.g., same ID reused for NIFTY → BANKNIFTY).
+const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id, underlying_symbol";
 
 /// DEDUP UPSERT KEY for `subscribed_indices` table.
 const DEDUP_KEY_SUBSCRIBED_INDICES: &str = "security_id";
@@ -2619,12 +2621,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_dedup_key_derivative_contracts_includes_security_id() {
-        // I-P1-05: Current key is "security_id" — verify the constant value
-        // is explicitly tested so changes are noticed.
+    fn test_dedup_key_derivative_contracts_includes_security_id_and_underlying() {
+        // I-P1-05: Compound key must include both security_id and underlying_symbol
+        // to prevent cross-underlying collision when security_ids are reused.
         assert!(
             DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("security_id"),
             "DEDUP_KEY_DERIVATIVE_CONTRACTS must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("underlying_symbol"),
+            "I-P1-05: DEDUP_KEY_DERIVATIVE_CONTRACTS must include underlying_symbol \
+             to prevent cross-underlying security_id collisions"
+        );
+        assert_eq!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol",
+            "I-P1-05: exact dedup key value"
         );
     }
 

@@ -25,8 +25,10 @@ use dhan_live_trader_common::constants::{QUESTDB_IST_ALIGN_OFFSET, QUESTDB_TABLE
 /// Timeout for QuestDB DDL HTTP requests.
 const DDL_TIMEOUT_SECS: u64 = 15;
 
-/// DEDUP UPSERT KEY column for the candles_1s table.
-const DEDUP_KEY_CANDLES_1S: &str = "security_id";
+/// DEDUP UPSERT KEY columns for the candles_1s table.
+/// Includes `segment` to prevent cross-segment collision when IDX_I and NSE_EQ
+/// share a security_id (e.g., NIFTY index vs NIFTY equity).
+const DEDUP_KEY_CANDLES_1S: &str = "security_id, segment";
 
 // ---------------------------------------------------------------------------
 // candles_1s Base Table DDL
@@ -404,6 +406,24 @@ mod tests {
         // QuestDB materialized views are separate objects from tables.
         let has_1m = VIEW_DEFS.iter().any(|d| d.name == "candles_1m");
         assert!(has_1m, "must have candles_1m materialized view");
+    }
+
+    #[test]
+    fn test_candles_1s_dedup_key_includes_segment() {
+        // Prevents cross-segment collision when IDX_I and NSE_EQ share a
+        // security_id (e.g., NIFTY index vs NIFTY equity).
+        assert!(
+            DEDUP_KEY_CANDLES_1S.contains("security_id"),
+            "candles_1s DEDUP key must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_CANDLES_1S.contains("segment"),
+            "candles_1s DEDUP key must include segment to prevent cross-segment collision"
+        );
+        assert_eq!(
+            DEDUP_KEY_CANDLES_1S, "security_id, segment",
+            "exact candles_1s dedup key value"
+        );
     }
 
     #[tokio::test]

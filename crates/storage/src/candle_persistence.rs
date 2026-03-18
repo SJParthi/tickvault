@@ -1,7 +1,7 @@
 //! QuestDB persistence for OHLCV candles from Dhan historical API.
 //!
 //! Stores candles in `historical_candles` table with DEDUP UPSERT KEYS
-//! on `(ts, security_id, timeframe)` to ensure idempotent re-ingestion.
+//! on `(ts, security_id, timeframe, segment)` to ensure idempotent re-ingestion.
 //! Supports multiple timeframes: 1m, 5m, 15m, 60m, and daily.
 //!
 //! # Table Schema
