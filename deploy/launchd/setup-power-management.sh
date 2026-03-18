@@ -6,7 +6,7 @@
 #   - Display sleeps after 10 minutes (save screen)
 #   - Disk never sleeps
 #   - Wake on LAN enabled
-#   - Wake at 08:00 AM weekdays (safety net, 15 min before launchd trigger)
+#   - Wake at 07:55 AM weekdays (safety net, 5 min before 08:00 launchd trigger)
 #
 # Usage: sudo bash deploy/launchd/setup-power-management.sh
 #
@@ -30,9 +30,9 @@ pmset -c displaysleep 10  # Display sleeps after 10 min
 pmset -c disksleep 0      # Disk never sleeps
 pmset -c womp 1           # Wake on LAN enabled
 
-# Wake schedule — 08:00 AM weekdays (safety net before 08:15 launchd trigger)
-echo "Setting wake schedule (08:00 AM weekdays)..."
-pmset repeat wakeorpoweron MTWRF 08:00:00
+# Wake schedule — 07:55 AM weekdays (safety net before 08:00 launchd trigger)
+echo "Setting wake schedule (07:55 AM weekdays)..."
+pmset repeat wakeorpoweron MTWRF 07:55:00
 
 echo ""
 echo "=== Configuration applied ==="

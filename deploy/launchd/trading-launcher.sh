@@ -1,7 +1,7 @@
 #!/bin/bash
 # C2: Mac trading launcher with Docker Desktop recovery
 #
-# Called by launchd at 08:15 AM IST. Handles:
+# Called by launchd at 08:00 AM IST. Handles:
 #   1. Kill switch check
 #   2. DNS cache flush (post-sleep recovery)
 #   3. Docker Desktop launch + health verification

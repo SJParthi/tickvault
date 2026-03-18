@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   C1: launchd LaunchAgent for dhan-live-trader
-  Triggers at 08:15 AM IST daily. Runs as LaunchAgent (not LaunchDaemon)
+  Triggers at 08:00 AM IST daily. Runs as LaunchAgent (not LaunchDaemon)
   because Docker Desktop requires a GUI session.
 
   Install:
@@ -29,13 +29,13 @@
         <string>/Users/Shared/dhan-live-trader/deploy/launchd/trading-launcher.sh</string>
     </array>
 
-    <!-- Trigger at 08:15 AM daily (IST — macOS uses system timezone) -->
+    <!-- Trigger at 08:00 AM daily (IST — macOS uses system timezone) -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
         <integer>8</integer>
         <key>Minute</key>
-        <integer>15</integer>
+        <integer>0</integer>
     </dict>
 
     <!-- Also run at login (fallback for power-off -> power-on scenario) -->
