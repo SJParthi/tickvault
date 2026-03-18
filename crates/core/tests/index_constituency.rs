@@ -399,6 +399,87 @@ fn slug_count_matches_constant() {
 }
 
 // ---------------------------------------------------------------------------
+// Slug validation — no duplicates, no empty, URL-safe
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_no_duplicate_slugs() {
+    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
+        assert!(
+            seen.insert(*slug),
+            "duplicate CSV slug: {slug} (index: {name})"
+        );
+    }
+}
+
+#[test]
+fn test_no_duplicate_index_names() {
+    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
+        assert!(
+            seen.insert(*name),
+            "duplicate index name: {name} (slug: {slug})"
+        );
+    }
+}
+
+#[test]
+fn test_all_slugs_valid_format() {
+    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+
+    for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
+        // Names must be non-empty
+        assert!(!name.is_empty(), "empty index name for slug {slug}");
+
+        // Slugs must be non-empty
+        assert!(!slug.is_empty(), "empty slug for index {name}");
+
+        // Slugs must start with "ind_nifty" (niftyindices.com convention)
+        assert!(
+            slug.starts_with("ind_nifty") || slug.starts_with("ind_Nifty"),
+            "slug {slug} does not start with ind_nifty or ind_Nifty"
+        );
+
+        // Slugs must end with "list" (niftyindices.com convention)
+        assert!(
+            slug.ends_with("list"),
+            "slug {slug} does not end with 'list'"
+        );
+
+        // Slugs must be URL-safe (alphanumeric + underscore only)
+        assert!(
+            slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "slug {slug} contains non-URL-safe characters"
+        );
+
+        // Names must be printable ASCII
+        assert!(
+            name.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+            "index name {name} contains non-printable characters"
+        );
+    }
+}
+
+#[test]
+fn test_slug_count_covers_all_categories() {
+    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+
+    // We must have at least 40 indices to cover broad + sectoral + thematic
+    assert!(
+        INDEX_CONSTITUENCY_SLUGS.len() >= 40,
+        "expected at least 40 indices, got {}",
+        INDEX_CONSTITUENCY_SLUGS.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // IndexConstituencyMap methods
 // ---------------------------------------------------------------------------
 

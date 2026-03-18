@@ -427,7 +427,8 @@ pub struct IndexConstituencyConfig {
     #[serde(default = "default_constituency_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
     /// Delay in milliseconds between batches of concurrent downloads.
-    #[serde(default)]
+    /// Default 200ms to be respectful to niftyindices.com when downloading ~50 indices.
+    #[serde(default = "default_constituency_inter_batch_delay_ms")]
     pub inter_batch_delay_ms: u64,
 }
 
@@ -437,7 +438,7 @@ impl Default for IndexConstituencyConfig {
             enabled: default_constituency_enabled(),
             download_timeout_secs: default_constituency_download_timeout_secs(),
             max_concurrent_downloads: default_constituency_max_concurrent_downloads(),
-            inter_batch_delay_ms: 0,
+            inter_batch_delay_ms: default_constituency_inter_batch_delay_ms(),
         }
     }
 }
@@ -452,6 +453,10 @@ const fn default_constituency_download_timeout_secs() -> u64 {
 
 const fn default_constituency_max_concurrent_downloads() -> usize {
     5
+}
+
+const fn default_constituency_inter_batch_delay_ms() -> u64 {
+    200
 }
 
 // ---------------------------------------------------------------------------

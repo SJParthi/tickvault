@@ -1520,7 +1520,7 @@ pub const INDEX_CONSTITUENCY_CSV_CACHE_FILENAME: &str = "constituency-map.json";
 
 /// Minimum number of indices that must download successfully.
 /// Below this threshold, a warning is emitted (map may be incomplete).
-pub const INDEX_CONSTITUENCY_MIN_INDICES: usize = 3;
+pub const INDEX_CONSTITUENCY_MIN_INDICES: usize = 15;
 
 /// Retry: minimum backoff delay in seconds between download attempts.
 pub const INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS: u64 = 1;
@@ -1533,13 +1533,75 @@ pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
 
 /// NSE index slugs: `(display_name, csv_slug)`.
 /// URL = `{INDEX_CONSTITUENCY_BASE_URL}{slug}.csv`
+///
+/// Comprehensive list covering all broad-based, sectoral, and thematic NSE indices.
+/// Source: niftyindices.com public CSV endpoints.
+/// Individual download failures are handled gracefully (logged + skipped).
 pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
+    // -----------------------------------------------------------------------
+    // Broad-Based Indices (16)
+    // -----------------------------------------------------------------------
     ("Nifty 50", "ind_nifty50list"),
     ("Nifty Next 50", "ind_niftynext50list"),
-    ("Nifty Bank", "ind_niftybanklist"),
-    ("Nifty IT", "ind_niftyitlist"),
-    ("Nifty Financial Services", "ind_niftyfinancelist"),
+    ("Nifty 100", "ind_nifty100list"),
+    ("Nifty 200", "ind_nifty200list"),
+    ("Nifty 500", "ind_nifty500list"),
     ("Nifty Midcap 50", "ind_niftymidcap50list"),
+    ("Nifty Midcap 100", "ind_niftymidcap100list"),
+    ("Nifty Midcap 150", "ind_niftymidcap150list"),
+    ("Nifty Midcap Select", "ind_niftymidcap_selectlist"),
+    ("Nifty Smallcap 50", "ind_niftysmallcap50list"),
+    ("Nifty Smallcap 100", "ind_niftysmallcap100list"),
+    ("Nifty Smallcap 250", "ind_niftysmallcap250list"),
+    ("Nifty LargeMidcap 250", "ind_niftylargemidcap250list"),
+    ("Nifty MidSmallcap 400", "ind_niftymidsmallcap400list"),
+    ("Nifty Microcap 250", "ind_niftymicrocap250_list"),
+    ("Nifty Total Market", "ind_niftytotalmarket_list"),
+    // -----------------------------------------------------------------------
+    // Sectoral Indices (15)
+    // -----------------------------------------------------------------------
+    ("Nifty Auto", "ind_niftyautolist"),
+    ("Nifty Bank", "ind_niftybanklist"),
+    ("Nifty Financial Services", "ind_niftyfinancelist"),
+    (
+        "Nifty Financial Services 25/50",
+        "ind_niftyfinancialservices25_50list",
+    ),
+    ("Nifty FMCG", "ind_niftyfmcglist"),
+    ("Nifty Healthcare", "ind_niftyhealthcarelist"),
+    ("Nifty IT", "ind_niftyitlist"),
+    ("Nifty Media", "ind_niftymedialist"),
+    ("Nifty Metal", "ind_niftymetallist"),
+    ("Nifty Pharma", "ind_niftypharmalist"),
+    ("Nifty PSU Bank", "ind_niftypsubanklist"),
+    ("Nifty Private Bank", "ind_niftypvtbanklist"),
+    ("Nifty Realty", "ind_niftyrealtylist"),
+    ("Nifty Consumer Durables", "ind_niftyconsumerdurablelist"),
+    ("Nifty Oil & Gas", "ind_niftyoilandgaslist"),
+    // -----------------------------------------------------------------------
+    // Thematic / Strategy Indices (18)
+    // -----------------------------------------------------------------------
+    ("Nifty Commodities", "ind_niftycommoditieslist"),
+    ("Nifty India Consumption", "ind_niftyindiaconsumptionlist"),
+    ("Nifty CPSE", "ind_niftycpselist"),
+    ("Nifty Energy", "ind_niftyenergylist"),
+    ("Nifty Infrastructure", "ind_niftyinfrastructurelist"),
+    ("Nifty MNC", "ind_niftymnclist"),
+    ("Nifty PSE", "ind_niftypselist"),
+    ("Nifty Growth Sectors 15", "ind_niftyGrowthSectors15list"),
+    ("Nifty100 Quality 30", "ind_nifty100_Quality30list"),
+    ("Nifty50 Value 20", "ind_nifty50_value20list"),
+    ("Nifty Alpha 50", "ind_niftyAlpha50list"),
+    ("Nifty High Beta 50", "ind_niftyHighBeta50list"),
+    ("Nifty Low Volatility 50", "ind_niftyLowVolatility50list"),
+    ("Nifty India Digital", "ind_niftyIndiaDigital_list"),
+    ("Nifty India Defence", "ind_niftyIndiaDefence_list"),
+    ("Nifty India Manufacturing", "ind_niftyIndiaMfg_list"),
+    ("Nifty Mobility", "ind_niftymobility_list"),
+    (
+        "Nifty500 Multicap 50:25:25",
+        "ind_nifty500Multicap502525_list",
+    ),
 ];
 
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
