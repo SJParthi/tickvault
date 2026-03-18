@@ -148,7 +148,7 @@ level = "info"
 format = "json"
 
 [instrument]
-daily_download_time = "08:45:00"
+daily_download_time = "08:15:00"
 csv_cache_directory = "/app/data/instrument-cache"
 csv_cache_filename = "api-scrip-master-detailed.csv"
 csv_download_timeout_secs = 120
