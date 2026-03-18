@@ -1,6 +1,6 @@
 # Implementation Plan: Historical Candle Fetch Hardening — Precise Diagnostics
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-03-18
 **Approved by:** Parthiban
 
@@ -101,7 +101,7 @@ pub struct CrossMatchReport {
 
 ## Plan Items
 
-- [ ] 1. Add `ViolationDetail` struct and detailed SQL queries to cross-verify
+- [x] 1. Add `ViolationDetail` struct and detailed SQL queries to cross-verify
   - Files: crates/core/src/historical/cross_verify.rs
   - Changes:
     - Add `ViolationDetail` struct
@@ -146,13 +146,13 @@ pub struct CrossMatchReport {
     - Update pass/fail: `passed = gaps==0 && ohlc==0 && data==0 && timestamp==0 && checked>0`
   - Tests: test_violation_detail_struct, test_cross_verify_report_new_fields
 
-- [ ] 2. Fix zero-instruments-passes-verification bug
+- [x] 2. Fix zero-instruments-passes-verification bug
   - Files: crates/core/src/historical/cross_verify.rs
   - Remove `|| instruments_checked == 0` from pass condition
   - `instruments_checked == 0` → `passed = false`
   - Tests: test_zero_instruments_fails_verification
 
-- [ ] 3. Track failed instrument names in `CandleFetchSummary`
+- [x] 3. Track failed instrument names in `CandleFetchSummary`
   - Files: crates/core/src/historical/candle_fetcher.rs
   - Add `failed_instruments: Vec<String>` to `CandleFetchSummary`
   - Use `registry.get(security_id).display_label` for symbol name, fall back to `"{security_id} ({segment})"`
@@ -160,7 +160,7 @@ pub struct CrossMatchReport {
   - Add `persist_failures: usize` to `CandleFetchSummary`
   - Tests: test_candle_fetch_summary_includes_failed_names, test_failed_names_capped_at_max
 
-- [ ] 4. Fix QuestDB persist failure counting
+- [x] 4. Fix QuestDB persist failure counting
   - Files: crates/core/src/historical/candle_fetcher.rs
   - Both `persist_intraday_candles` and `persist_daily_candles`:
     - On `append_candle` error: do NOT increment `count`, increment `persist_failures` instead
@@ -168,7 +168,7 @@ pub struct CrossMatchReport {
   - Caller accumulates `persist_failures` into `CandleFetchSummary`
   - Tests: test_persist_failure_not_counted_as_success
 
-- [ ] 5. Enhance Telegram notifications with precise violation details
+- [x] 5. Enhance Telegram notifications with precise violation details
   - Files: crates/core/src/notification/events.rs
   - **A. `HistoricalFetchFailed`** — add:
     - `failed_instruments: Vec<String>` (up to 10 shown + "+N more")
@@ -186,7 +186,7 @@ pub struct CrossMatchReport {
     - `timestamp_violations: usize`
   - Tests: all message format tests (see item 9)
 
-- [ ] 6. Wire new fields through main.rs for historical verification
+- [x] 6. Wire new fields through main.rs for historical verification
   - Files: crates/app/src/main.rs
   - Pass `InstrumentRegistry` to `verify_candle_integrity()` (new param)
   - Format `ViolationDetail` → pre-formatted strings for Telegram
@@ -195,7 +195,7 @@ pub struct CrossMatchReport {
   - Same for post-market re-fetch path
   - Tests: (covered by notification tests)
 
-- [ ] 7. Add Historical vs Live candle cross-match verification
+- [x] 7. Add Historical vs Live candle cross-match verification
   - Files: crates/core/src/historical/cross_verify.rs, crates/core/src/notification/events.rs, crates/app/src/main.rs
   - **New function:** `pub async fn cross_match_historical_vs_live(questdb_config, registry) -> CrossMatchReport`
   - **For each overlapping timeframe (5 queries):**
@@ -235,7 +235,7 @@ pub struct CrossMatchReport {
   - **New notification event: `CandleCrossMatchPassed` / `CandleCrossMatchFailed`**
   - Tests: test_cross_match_report_struct, test_cross_match_mismatch_struct, test_cross_match_timeframe_mapping
 
-- [ ] 8. Add cross-match Telegram notification events
+- [x] 8. Add cross-match Telegram notification events
   - Files: crates/core/src/notification/events.rs
   - **`CandleCrossMatchPassed`:**
     ```
@@ -268,7 +268,7 @@ pub struct CrossMatchReport {
   - Severity: `CandleCrossMatchFailed` = High (Telegram + SNS)
   - Tests: test_cross_match_failed_shows_details, test_cross_match_passed_message, test_cross_match_missing_live_format
 
-- [ ] 9. Add comprehensive tests for all changes
+- [x] 9. Add comprehensive tests for all changes
   - Files: cross_verify.rs, candle_fetcher.rs, events.rs
   - **cross_verify.rs:**
     - test_violation_detail_struct
