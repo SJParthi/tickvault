@@ -148,7 +148,7 @@ impl TradingCalendar {
     /// Sorted by date ascending.
     pub fn all_entries(&self) -> Vec<HolidayInfo> {
         let mut entries: Vec<HolidayInfo> =
-            Vec::with_capacity(self.holidays.len() + self.muhurat_dates.len());
+            Vec::with_capacity(self.holidays.len().saturating_add(self.muhurat_dates.len()));
 
         for (&date, name) in &self.holiday_names {
             entries.push(HolidayInfo {
@@ -194,7 +194,7 @@ mod tests {
             market_close_time: "15:30:00".to_string(),
             order_cutoff_time: "15:29:00".to_string(),
             data_collection_start: "09:00:00".to_string(),
-            data_collection_end: "16:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
             nse_holidays: vec![

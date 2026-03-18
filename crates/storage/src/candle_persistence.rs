@@ -1,18 +1,19 @@
-//! QuestDB persistence for 1-minute OHLCV candles from Dhan historical API.
+//! QuestDB persistence for OHLCV candles from Dhan historical API.
 //!
-//! Stores candles in a dedicated `historical_candles_1m` table with DEDUP UPSERT KEYS
-//! on `(ts, security_id)` to ensure idempotent re-ingestion.
+//! Stores candles in `historical_candles` table with DEDUP UPSERT KEYS
+//! on `(ts, security_id, timeframe)` to ensure idempotent re-ingestion.
+//! Supports multiple timeframes: 1m, 5m, 15m, 60m, and daily.
 //!
 //! # Table Schema
 //! - `ts` TIMESTAMP (designated) — candle open time (IST-as-UTC: UTC epoch + 19800s)
 //! - `security_id` LONG — Dhan security identifier
 //! - `segment` SYMBOL — exchange segment (NSE_FNO, NSE_EQ, etc.)
+//! - `timeframe` SYMBOL — candle interval: 1m, 5m, 15m, 60m, 1d
 //! - OHLCV + OI as DOUBLE/LONG columns
 //!
 //! # Deduplication
-//! Server-side: QuestDB DEDUP UPSERT KEYS(ts, security_id) prevents
-//! duplicate candles from re-fetches. Client-side: timestamp uniqueness
-//! per security_id is guaranteed by Dhan API (one candle per minute).
+//! Server-side: QuestDB DEDUP UPSERT KEYS(ts, security_id, timeframe) prevents
+//! duplicate candles from re-fetches.
 
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use dhan_live_trader_common::constants::{
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
     IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
+    QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
@@ -39,8 +41,11 @@ use crate::tick_persistence::f32_to_f64_clean;
 /// Timeout for QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// DEDUP UPSERT KEY column for the candles table.
-const DEDUP_KEY_CANDLES: &str = "security_id";
+/// DEDUP UPSERT KEY columns for the historical candles table.
+/// Compound key: (ts, security_id, timeframe, segment) ensures uniqueness per candle.
+/// `segment` is required because security IDs 13 (NIFTY) and 25 (BANKNIFTY) exist
+/// in both `IDX_I` and `NSE_EQ` segments with different data.
+const DEDUP_KEY_CANDLES: &str = "security_id, timeframe, segment";
 
 /// Maps the binary exchange_segment_code to a human-readable symbol name.
 ///
@@ -98,6 +103,8 @@ impl CandlePersistenceWriter {
     /// IST-as-UTC by adding `IST_UTC_OFFSET_SECONDS_I64`, so QuestDB displays
     /// IST wall-clock time directly (e.g., 09:15 instead of 03:45).
     ///
+    /// Writes to the unified `historical_candles` table with a `timeframe` column.
+    ///
     /// Auto-flushes if the buffer reaches `CANDLE_FLUSH_BATCH_SIZE`.
     ///
     /// # Performance
@@ -110,10 +117,12 @@ impl CandlePersistenceWriter {
         let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
 
         self.buffer
-            .table(QUESTDB_TABLE_CANDLES_1M)
+            .table(QUESTDB_TABLE_HISTORICAL_CANDLES)
             .context("table name")?
             .symbol("segment", segment_code_to_str(candle.exchange_segment_code))
             .context("segment")?
+            .symbol("timeframe", candle.timeframe)
+            .context("timeframe")?
             .column_i64("security_id", i64::from(candle.security_id))
             .context("security_id")?
             .column_f64("open", candle.open)
@@ -280,9 +289,27 @@ impl LiveCandleWriter {
 // Table DDL + DEDUP Setup
 // ---------------------------------------------------------------------------
 
-/// SQL to create the `historical_candles_1m` table with explicit schema.
+/// SQL to create the `historical_candles` table with explicit schema.
+/// Includes `timeframe` SYMBOL column for multi-timeframe candle storage.
 ///
 /// Idempotent — safe to call every startup.
+const HISTORICAL_CANDLES_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS historical_candles (\
+        segment SYMBOL,\
+        timeframe SYMBOL,\
+        security_id LONG,\
+        open DOUBLE,\
+        high DOUBLE,\
+        low DOUBLE,\
+        close DOUBLE,\
+        volume LONG,\
+        oi LONG,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
+";
+
+/// SQL to create the legacy `historical_candles_1m` table.
+/// Kept for backward compatibility with existing data.
 const CANDLES_1M_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS historical_candles_1m (\
         segment SYMBOL,\
@@ -297,9 +324,11 @@ const CANDLES_1M_CREATE_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
 
-/// Creates the `candles_1m` table (if not exists) and enables DEDUP UPSERT KEYS.
+/// Creates candle tables (if not exist) and enables DEDUP UPSERT KEYS.
 ///
-/// Best-effort: if QuestDB is unreachable, logs a warning and continues.
+/// Creates both the new `historical_candles` table (multi-timeframe) and the
+/// legacy `historical_candles_1m` table. Best-effort: if QuestDB is unreachable,
+/// logs a warning and continues.
 pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -314,45 +343,48 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
         Err(err) => {
             warn!(
                 ?err,
-                "failed to build HTTP client for candle table DDL — table not pre-created"
+                "failed to build HTTP client for candle table DDL — tables not pre-created"
             );
             return;
         }
     };
 
-    // Step 1: Create the table with explicit schema (idempotent).
+    // Step 1: Create the new multi-timeframe table.
     match client
         .get(&base_url)
-        .query(&[("query", CANDLES_1M_CREATE_DDL)])
+        .query(&[("query", HISTORICAL_CANDLES_CREATE_DDL)])
         .send()
         .await
     {
         Ok(response) => {
             if response.status().is_success() {
-                info!("historical_candles_1m table ensured (CREATE TABLE IF NOT EXISTS)");
+                info!(
+                    table = QUESTDB_TABLE_HISTORICAL_CANDLES,
+                    "historical_candles table ensured (CREATE TABLE IF NOT EXISTS)"
+                );
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 warn!(
                     %status,
                     body = body.chars().take(200).collect::<String>(),
-                    "historical_candles_1m table CREATE DDL returned non-success"
+                    "historical_candles table CREATE DDL returned non-success"
                 );
             }
         }
         Err(err) => {
             warn!(
                 ?err,
-                "historical_candles_1m table CREATE DDL request failed — table not pre-created"
+                "historical_candles table CREATE DDL request failed — table not pre-created"
             );
             return;
         }
     }
 
-    // Step 2: Enable DEDUP UPSERT KEYS (idempotent — re-enabling is a no-op).
+    // Step 2: Enable DEDUP UPSERT KEYS on new table (ts, security_id, timeframe).
     let dedup_sql = format!(
         "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_CANDLES_1M, DEDUP_KEY_CANDLES
+        QUESTDB_TABLE_HISTORICAL_CANDLES, DEDUP_KEY_CANDLES
     );
     match client
         .get(&base_url)
@@ -362,23 +394,57 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     {
         Ok(response) => {
             if response.status().is_success() {
-                debug!("DEDUP UPSERT KEYS enabled for historical_candles_1m table");
+                debug!(
+                    table = QUESTDB_TABLE_HISTORICAL_CANDLES,
+                    "DEDUP UPSERT KEYS enabled"
+                );
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 warn!(
                     %status,
                     body = body.chars().take(200).collect::<String>(),
-                    "historical_candles_1m table DEDUP DDL returned non-success"
+                    "historical_candles table DEDUP DDL returned non-success"
                 );
             }
         }
         Err(err) => {
-            warn!(?err, "historical_candles_1m table DEDUP DDL request failed");
+            warn!(?err, "historical_candles table DEDUP DDL request failed");
         }
     }
 
-    info!("historical_candles_1m table setup complete (DDL + DEDUP UPSERT KEYS)");
+    // Step 3: Create legacy table (backward compatibility).
+    match client
+        .get(&base_url)
+        .query(&[("query", CANDLES_1M_CREATE_DDL)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                debug!(
+                    table = QUESTDB_TABLE_CANDLES_1M,
+                    "legacy historical_candles_1m table ensured"
+                );
+            } else {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!(
+                    %status,
+                    body = body.chars().take(200).collect::<String>(),
+                    "legacy historical_candles_1m CREATE DDL returned non-success"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "legacy historical_candles_1m CREATE DDL request failed"
+            );
+        }
+    }
+
+    info!("historical candle tables setup complete (DDL + DEDUP UPSERT KEYS)");
 }
 
 // ---------------------------------------------------------------------------
@@ -424,10 +490,28 @@ mod tests {
     }
 
     #[test]
-    fn test_candles_1m_ddl_contains_table_name() {
+    fn test_historical_candles_ddl_contains_table_and_timeframe() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("historical_candles"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("timeframe SYMBOL"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("TIMESTAMP(ts)"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("PARTITION BY DAY"));
+    }
+
+    #[test]
+    fn test_legacy_candles_1m_ddl_contains_table_name() {
         assert!(CANDLES_1M_CREATE_DDL.contains("historical_candles_1m"));
         assert!(CANDLES_1M_CREATE_DDL.contains("TIMESTAMP(ts)"));
         assert!(CANDLES_1M_CREATE_DDL.contains("PARTITION BY DAY"));
+    }
+
+    #[test]
+    fn test_dedup_key_includes_timeframe_and_segment() {
+        assert!(DEDUP_KEY_CANDLES.contains("security_id"));
+        assert!(DEDUP_KEY_CANDLES.contains("timeframe"));
+        assert!(
+            DEDUP_KEY_CANDLES.contains("segment"),
+            "DEDUP key must include segment — security IDs 13/25 exist in both IDX_I and NSE_EQ"
+        );
     }
 
     #[tokio::test]
@@ -440,5 +524,44 @@ mod tests {
         };
         // Should not panic — just logs warnings and returns.
         ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // DEDUP key and DDL constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_candles_includes_all_components() {
+        assert_eq!(DEDUP_KEY_CANDLES, "security_id, timeframe, segment");
+    }
+
+    #[test]
+    fn test_candles_1m_ddl_has_segment_column() {
+        assert!(CANDLES_1M_CREATE_DDL.contains("segment"));
+    }
+
+    #[test]
+    fn test_candles_1m_ddl_has_security_id() {
+        assert!(CANDLES_1M_CREATE_DDL.contains("security_id"));
+    }
+
+    #[test]
+    fn test_candles_1m_ddl_has_ohlcv_columns() {
+        assert!(CANDLES_1M_CREATE_DDL.contains("open"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("high"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("low"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("close"));
+        assert!(CANDLES_1M_CREATE_DDL.contains("volume"));
+    }
+
+    #[test]
+    fn test_live_candle_flush_batch_size_positive() {
+        let size = LIVE_CANDLE_FLUSH_BATCH_SIZE;
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn test_questdb_ddl_timeout_is_reasonable_candle() {
+        assert!((5..=60).contains(&QUESTDB_DDL_TIMEOUT_SECS));
     }
 }

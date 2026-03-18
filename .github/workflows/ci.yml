@@ -356,7 +356,7 @@ jobs:
           pct = (totals['covered'] / totals['count'] * 100) if totals['count'] > 0 else 0
           print(f'{pct:.1f}')
           ")
-          THRESHOLD=60.0
+          THRESHOLD=95.0
           echo "Workspace line coverage: ${COV_PCT}% (threshold: ${THRESHOLD}%)"
           if python3 -c "import sys; sys.exit(0 if float('$COV_PCT') >= $THRESHOLD else 1)"; then
             echo "Coverage meets ${THRESHOLD}% target"

@@ -53,10 +53,18 @@ pub struct ManagedOrder {
     pub updated_at_us: i64,
     /// Whether this order needs reconciliation with Dhan REST API.
     pub needs_reconciliation: bool,
+    /// Number of times this order has been modified (Dhan max: 25 per order).
+    pub modification_count: u32,
 }
+
+/// Dhan maximum modifications per order.
+pub const MAX_MODIFICATIONS_PER_ORDER: u32 = 25;
 
 impl ManagedOrder {
     /// Returns true if the order is in a terminal state.
+    ///
+    /// Terminal states: Traded, Cancelled, Rejected, Expired, Closed.
+    /// Non-terminal: Transit, Pending, Confirmed, PartTraded, Triggered.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
@@ -64,6 +72,7 @@ impl ManagedOrder {
                 | OrderStatus::Cancelled
                 | OrderStatus::Rejected
                 | OrderStatus::Expired
+                | OrderStatus::Closed
         )
     }
 }
@@ -106,7 +115,8 @@ pub struct PlaceOrderRequest {
 pub struct ModifyOrderRequest {
     /// New order type (may differ from original).
     pub order_type: OrderType,
-    /// New quantity.
+    /// Total order quantity (NOT remaining quantity).
+    /// Setting quantity=75 on a 100-qty order with 30 filled → new total = 75.
     pub quantity: i64,
     /// New price.
     pub price: f64,
@@ -204,7 +214,7 @@ pub struct DhanOrderResponse {
     #[serde(default)]
     pub filled_qty: i64,
     #[serde(default)]
-    pub average_trade_price: f64,
+    pub average_traded_price: f64,
     #[serde(default)]
     pub exchange_order_id: String,
     #[serde(default)]
@@ -238,6 +248,9 @@ pub struct DhanOrderResponse {
 }
 
 /// Dhan REST API positions response.
+///
+/// Source: docs/dhan-ref/12-portfolio-positions.md
+/// Endpoint: GET /v2/positions — returns array of position objects.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhanPositionResponse {
@@ -249,20 +262,24 @@ pub struct DhanPositionResponse {
     pub exchange_segment: String,
     #[serde(default)]
     pub product_type: String,
+    /// Position type: `LONG`, `SHORT`, or `CLOSED`.
     #[serde(default)]
     pub position_type: String,
     #[serde(default)]
     pub buy_qty: i64,
     #[serde(default)]
     pub sell_qty: i64,
+    /// Net quantity = buyQty - sellQty. Can be negative (short position).
     #[serde(default)]
     pub net_qty: i64,
     #[serde(default)]
     pub buy_avg: f64,
     #[serde(default)]
     pub sell_avg: f64,
+    /// Booked P&L.
     #[serde(default)]
     pub realized_profit: f64,
+    /// Open/mark-to-market P&L.
     #[serde(default)]
     pub unrealized_profit: f64,
     /// Trading symbol (e.g., "NIFTY-Mar2026-24500-CE").
@@ -283,6 +300,316 @@ pub struct DhanPositionResponse {
     /// Derivative strike price.
     #[serde(default)]
     pub drv_strike_price: f64,
+    /// RBI reference rate (for currency derivatives).
+    #[serde(default)]
+    pub rbi_reference_rate: f64,
+    /// Carry-forward buy quantity from previous sessions.
+    #[serde(default)]
+    pub carry_forward_buy_qty: i64,
+    /// Carry-forward sell quantity from previous sessions.
+    #[serde(default)]
+    pub carry_forward_sell_qty: i64,
+    /// Carry-forward buy value from previous sessions.
+    #[serde(default)]
+    pub carry_forward_buy_value: f64,
+    /// Carry-forward sell value from previous sessions.
+    #[serde(default)]
+    pub carry_forward_sell_value: f64,
+    /// Today's intraday buy quantity.
+    #[serde(default)]
+    pub day_buy_qty: i64,
+    /// Today's intraday sell quantity.
+    #[serde(default)]
+    pub day_sell_qty: i64,
+    /// Today's intraday buy value.
+    #[serde(default)]
+    pub day_buy_value: f64,
+    /// Today's intraday sell value.
+    #[serde(default)]
+    pub day_sell_value: f64,
+    /// Whether this is a cross-currency position.
+    #[serde(default)]
+    pub cross_currency: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Holdings Response (GET /v2/holdings)
+// Source: docs/dhan-ref/12-portfolio-positions.md
+// ---------------------------------------------------------------------------
+
+/// Dhan REST API holdings response — a single holding entry.
+///
+/// Response is an array of these objects (not wrapped in `data`).
+/// NOTE: `mtf_tq_qty` and `mtf_qty` use snake_case in Dhan API
+/// (inconsistent with camelCase used elsewhere).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanHoldingResponse {
+    /// Exchange (e.g., "NSE", "BSE").
+    #[serde(default)]
+    pub exchange: String,
+    /// Trading symbol.
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Dhan security identifier (string).
+    #[serde(default)]
+    pub security_id: String,
+    /// ISIN (12-character universal identifier).
+    #[serde(default)]
+    pub isin: String,
+    /// Total quantity held.
+    #[serde(default)]
+    pub total_qty: i64,
+    /// Quantity in DP (Depository Participant) — settled shares.
+    #[serde(default)]
+    pub dp_qty: i64,
+    /// T+1 settlement quantity.
+    #[serde(default)]
+    pub t1_qty: i64,
+    /// MTF total quantity — Dhan API uses snake_case here (inconsistent).
+    #[serde(default, rename = "mtf_tq_qty")]
+    pub mtf_tq_qty: i64,
+    /// MTF quantity — Dhan API uses snake_case here (inconsistent).
+    #[serde(default, rename = "mtf_qty")]
+    pub mtf_qty: i64,
+    /// Available quantity for sell/pledge. May differ from totalQty due to
+    /// T+1 settlement or collateral.
+    #[serde(default)]
+    pub available_qty: i64,
+    /// Collateral quantity.
+    #[serde(default)]
+    pub collateral_qty: i64,
+    /// Average cost price.
+    #[serde(default)]
+    pub avg_cost_price: f64,
+    /// Last traded price.
+    #[serde(default)]
+    pub last_traded_price: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Convert Position Request (POST /v2/positions/convert)
+// Source: docs/dhan-ref/12-portfolio-positions.md
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /v2/positions/convert`.
+///
+/// CRITICAL: `convertQty` is a STRING, not an integer.
+/// Response: `202 Accepted`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanConvertPositionRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Source product type (e.g., "INTRADAY").
+    pub from_product_type: String,
+    /// Exchange segment (e.g., "NSE_FNO").
+    pub exchange_segment: String,
+    /// Position type ("LONG", "SHORT").
+    pub position_type: String,
+    /// Dhan security identifier (STRING).
+    pub security_id: String,
+    /// Trading symbol.
+    pub trading_symbol: String,
+    /// Quantity to convert — STRING, NOT integer.
+    pub convert_qty: String,
+    /// Target product type (e.g., "CNC").
+    pub to_product_type: String,
+}
+
+// ---------------------------------------------------------------------------
+// Exit All Response (DELETE /v2/positions)
+// Source: docs/dhan-ref/12-portfolio-positions.md
+// ---------------------------------------------------------------------------
+
+/// Response from `DELETE /v2/positions` — exits ALL positions AND cancels ALL pending orders.
+///
+/// DANGER: This is a nuclear option. Use as emergency stop alongside kill switch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanExitAllResponse {
+    /// Status of the exit-all operation.
+    #[serde(default)]
+    pub status: String,
+    /// Additional message.
+    #[serde(default)]
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Margin Calculator Request (POST /v2/margincalculator)
+// Source: docs/dhan-ref/13-funds-margin.md
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /v2/margincalculator`.
+///
+/// Uses same fields as order placement.
+/// `securityId` is STRING (consistent with order APIs).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginCalculatorRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Exchange segment (e.g., "NSE_FNO").
+    pub exchange_segment: String,
+    /// Transaction type ("BUY" or "SELL").
+    pub transaction_type: String,
+    /// Quantity in lots.
+    pub quantity: i64,
+    /// Product type (e.g., "INTRADAY", "MARGIN").
+    pub product_type: String,
+    /// Dhan security identifier (STRING).
+    pub security_id: String,
+    /// Order price.
+    pub price: f64,
+    /// Trigger price (for stop-loss).
+    pub trigger_price: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Margin Calculator Response
+// Source: docs/dhan-ref/13-funds-margin.md
+// ---------------------------------------------------------------------------
+
+/// Response from `POST /v2/margincalculator`.
+///
+/// NOTE: `leverage` is a STRING (e.g., `"4.00"`), NOT a float.
+/// NOTE: `availableBalance` here is spelled correctly (unlike fund limit).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginCalculatorResponse {
+    /// Total margin required.
+    #[serde(default)]
+    pub total_margin: f64,
+    /// SPAN margin component.
+    #[serde(default)]
+    pub span_margin: f64,
+    /// Exposure margin component.
+    #[serde(default)]
+    pub exposure_margin: f64,
+    /// Available balance in account (correctly spelled here).
+    #[serde(default)]
+    pub available_balance: f64,
+    /// Variable margin.
+    #[serde(default)]
+    pub variable_margin: f64,
+    /// Shortfall amount (0 if sufficient).
+    #[serde(default)]
+    pub insufficient_balance: f64,
+    /// Brokerage charges.
+    #[serde(default)]
+    pub brokerage: f64,
+    /// Leverage ratio — STRING, NOT float (e.g., "4.00").
+    #[serde(default)]
+    pub leverage: String,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Margin Calculator Types (POST /v2/margincalculator/multi)
+// Source: docs/dhan-ref/13-funds-margin.md
+// ---------------------------------------------------------------------------
+
+/// A single script entry in the multi-margin calculator request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginScript {
+    /// Exchange segment (e.g., "NSE_FNO").
+    pub exchange_segment: String,
+    /// Transaction type ("BUY" or "SELL").
+    pub transaction_type: String,
+    /// Quantity in lots.
+    pub quantity: i64,
+    /// Product type.
+    pub product_type: String,
+    /// Dhan security identifier (STRING).
+    pub security_id: String,
+    /// Order price.
+    pub price: f64,
+    /// Trigger price.
+    pub trigger_price: f64,
+}
+
+/// Request body for `POST /v2/margincalculator/multi`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiMarginRequest {
+    /// Whether to include existing positions in calculation.
+    pub include_position: bool,
+    /// Whether to include pending orders in calculation.
+    pub include_orders: bool,
+    /// Array of scripts (instruments) to calculate margin for.
+    pub scripts: Vec<MarginScript>,
+}
+
+/// Response from `POST /v2/margincalculator/multi`.
+///
+/// CRITICAL: ALL values are STRINGS, not floats.
+/// Uses snake_case (inconsistent with other Dhan APIs).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MultiMarginResponse {
+    /// Total margin required (STRING).
+    #[serde(default)]
+    pub total_margin: String,
+    /// SPAN margin (STRING).
+    #[serde(default)]
+    pub span_margin: String,
+    /// Exposure margin (STRING).
+    #[serde(default)]
+    pub exposure_margin: String,
+    /// Equity margin (STRING).
+    #[serde(default)]
+    pub equity_margin: String,
+    /// F&O margin (STRING).
+    #[serde(default)]
+    pub fo_margin: String,
+    /// Commodity margin (STRING).
+    #[serde(default)]
+    pub commodity_margin: String,
+    /// Currency margin (STRING).
+    #[serde(default)]
+    pub currency: String,
+    /// Hedge benefit from offsetting positions (STRING).
+    #[serde(default)]
+    pub hedge_benefit: String,
+}
+
+// ---------------------------------------------------------------------------
+// Fund Limit Response (GET /v2/fundlimit)
+// Source: docs/dhan-ref/13-funds-margin.md
+// ---------------------------------------------------------------------------
+
+/// Response from `GET /v2/fundlimit`.
+///
+/// CRITICAL: `availabelBalance` has a TYPO in Dhan's API — missing 'l'.
+/// We use `#[serde(rename = "availabelBalance")]` to match the actual API field name.
+/// Do NOT "fix" this typo — the API literally sends `availabelBalance`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundLimitResponse {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Available balance — TYPO in Dhan API: `availabelBalance` (missing 'l').
+    #[serde(default, rename = "availabelBalance")]
+    pub availabel_balance: f64,
+    /// Start-of-day limit.
+    #[serde(default)]
+    pub sod_limit: f64,
+    /// Collateral amount.
+    #[serde(default)]
+    pub collateral_amount: f64,
+    /// Receivable amount.
+    #[serde(default)]
+    pub receiveable_amount: f64,
+    /// Utilized amount.
+    #[serde(default)]
+    pub utilized_amount: f64,
+    /// Blocked payout amount.
+    #[serde(default)]
+    pub blocked_payout_amount: f64,
+    /// Withdrawable balance.
+    #[serde(default)]
+    pub withdrawable_balance: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +726,10 @@ mod tests {
             created_at_us: 0,
             updated_at_us: 0,
             needs_reconciliation: false,
+            modification_count: 0,
         };
 
+        // Non-terminal states
         assert!(!order.is_terminal());
 
         order.status = OrderStatus::Pending;
@@ -409,6 +738,19 @@ mod tests {
         order.status = OrderStatus::Confirmed;
         assert!(!order.is_terminal());
 
+        order.status = OrderStatus::PartTraded;
+        assert!(
+            !order.is_terminal(),
+            "PartTraded is NOT terminal — order still active"
+        );
+
+        order.status = OrderStatus::Triggered;
+        assert!(
+            !order.is_terminal(),
+            "Triggered is NOT terminal — condition fired, order active"
+        );
+
+        // Terminal states
         order.status = OrderStatus::Traded;
         assert!(order.is_terminal());
 
@@ -420,6 +762,12 @@ mod tests {
 
         order.status = OrderStatus::Expired;
         assert!(order.is_terminal());
+
+        order.status = OrderStatus::Closed;
+        assert!(
+            order.is_terminal(),
+            "Closed is terminal — Super Order complete"
+        );
     }
 
     #[test]
@@ -509,5 +857,311 @@ mod tests {
     #[test]
     fn exchange_segment_constant() {
         assert_eq!(EXCHANGE_SEGMENT_NSE_FNO, "NSE_FNO");
+    }
+
+    // --- DhanHoldingResponse (B1) ---
+
+    #[test]
+    fn test_holding_response_deserializes() {
+        let json = r#"{
+            "exchange": "NSE",
+            "tradingSymbol": "RELIANCE",
+            "securityId": "2885",
+            "isin": "INE002A01018",
+            "totalQty": 100,
+            "dpQty": 90,
+            "t1Qty": 10,
+            "availableQty": 90,
+            "collateralQty": 0,
+            "avgCostPrice": 2450.50,
+            "lastTradedPrice": 2500.00
+        }"#;
+
+        let holding: DhanHoldingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(holding.exchange, "NSE");
+        assert_eq!(holding.security_id, "2885");
+        assert_eq!(holding.total_qty, 100);
+        assert_eq!(holding.available_qty, 90);
+        assert!((holding.avg_cost_price - 2450.50).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_holding_response_mtf_snake_case_fields() {
+        // mtf_tq_qty and mtf_qty use snake_case in Dhan API (inconsistent)
+        let json = r#"{
+            "exchange": "NSE",
+            "tradingSymbol": "RELIANCE",
+            "securityId": "2885",
+            "isin": "INE002A01018",
+            "totalQty": 100,
+            "dpQty": 90,
+            "t1Qty": 10,
+            "mtf_tq_qty": 50,
+            "mtf_qty": 25,
+            "availableQty": 90,
+            "collateralQty": 0,
+            "avgCostPrice": 2450.50,
+            "lastTradedPrice": 2500.00
+        }"#;
+
+        let holding: DhanHoldingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(holding.mtf_tq_qty, 50);
+        assert_eq!(holding.mtf_qty, 25);
+    }
+
+    // --- DhanPositionResponse completeness (B2) ---
+
+    #[test]
+    fn test_position_response_all_fields_deserialize() {
+        let json = r#"{
+            "dhanClientId": "1000000001",
+            "securityId": "52432",
+            "exchangeSegment": "NSE_FNO",
+            "productType": "INTRADAY",
+            "positionType": "LONG",
+            "buyQty": 50,
+            "sellQty": 0,
+            "netQty": 50,
+            "buyAvg": 245.50,
+            "sellAvg": 0.0,
+            "realizedProfit": 0.0,
+            "unrealizedProfit": 1250.00,
+            "tradingSymbol": "NIFTY-Mar2026-24500-CE",
+            "costPrice": 245.50,
+            "multiplier": 25,
+            "drvExpiryDate": "2026-03-27",
+            "drvOptionType": "CALL",
+            "drvStrikePrice": 24500.0,
+            "rbiReferenceRate": 0.0,
+            "carryForwardBuyQty": 25,
+            "carryForwardSellQty": 0,
+            "carryForwardBuyValue": 6137.50,
+            "carryForwardSellValue": 0.0,
+            "dayBuyQty": 25,
+            "daySellQty": 0,
+            "dayBuyValue": 6137.50,
+            "daySellValue": 0.0,
+            "crossCurrency": false
+        }"#;
+
+        let pos: DhanPositionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(pos.position_type, "LONG");
+        assert_eq!(pos.net_qty, 50);
+        assert_eq!(pos.carry_forward_buy_qty, 25);
+        assert_eq!(pos.day_buy_qty, 25);
+        assert!(!pos.cross_currency);
+    }
+
+    #[test]
+    fn test_position_response_carry_forward_fields() {
+        let json = r#"{
+            "carryForwardBuyQty": 100,
+            "carryForwardSellQty": 50,
+            "carryForwardBuyValue": 25000.0,
+            "carryForwardSellValue": 12500.0
+        }"#;
+
+        let pos: DhanPositionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(pos.carry_forward_buy_qty, 100);
+        assert_eq!(pos.carry_forward_sell_qty, 50);
+        assert!((pos.carry_forward_buy_value - 25000.0).abs() < f64::EPSILON);
+        assert!((pos.carry_forward_sell_value - 12500.0).abs() < f64::EPSILON);
+    }
+
+    // --- DhanConvertPositionRequest (B3) ---
+
+    #[test]
+    fn test_convert_position_request_serializes() {
+        let req = DhanConvertPositionRequest {
+            dhan_client_id: "1000000001".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            exchange_segment: EXCHANGE_SEGMENT_NSE_FNO.to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "52432".to_owned(),
+            trading_symbol: "NIFTY-Mar2026-24500-CE".to_owned(),
+            convert_qty: "40".to_owned(),
+            to_product_type: "CNC".to_owned(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("dhanClientId"));
+        assert!(json.contains("fromProductType"));
+        assert!(json.contains("convertQty"));
+        assert!(json.contains("toProductType"));
+    }
+
+    #[test]
+    fn test_convert_position_convert_qty_is_string() {
+        let req = DhanConvertPositionRequest {
+            dhan_client_id: "100".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "52432".to_owned(),
+            trading_symbol: "NIFTY".to_owned(),
+            convert_qty: "40".to_owned(),
+            to_product_type: "CNC".to_owned(),
+        };
+        let json_value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        // convertQty MUST be a string "40", not integer 40
+        assert!(
+            json_value["convertQty"].is_string(),
+            "convertQty must be a STRING, not integer"
+        );
+        assert_eq!(json_value["convertQty"], "40");
+    }
+
+    // --- DhanExitAllResponse (B4) ---
+
+    #[test]
+    fn test_exit_all_response_deserializes() {
+        let json = r#"{"status": "success", "message": "All positions exited"}"#;
+        let resp: DhanExitAllResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "success");
+    }
+
+    // --- MarginCalculatorRequest (C1) ---
+
+    #[test]
+    fn test_margin_calculator_request_serializes_camel_case() {
+        let req = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("dhanClientId"));
+        assert!(json.contains("exchangeSegment"));
+        assert!(json.contains("transactionType"));
+        assert!(json.contains("securityId"));
+    }
+
+    #[test]
+    fn test_margin_calculator_security_id_is_string() {
+        let req = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+        let json_value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(json_value["securityId"].is_string());
+    }
+
+    // --- MarginCalculatorResponse (C2) ---
+
+    #[test]
+    fn test_margin_calculator_response_deserializes() {
+        let json = r#"{
+            "totalMargin": 12500.00,
+            "spanMargin": 10000.00,
+            "exposureMargin": 2500.00,
+            "availableBalance": 50000.00,
+            "variableMargin": 0.0,
+            "insufficientBalance": 0.0,
+            "brokerage": 20.0,
+            "leverage": "4.00"
+        }"#;
+
+        let resp: MarginCalculatorResponse = serde_json::from_str(json).unwrap();
+        assert!((resp.total_margin - 12500.0).abs() < f64::EPSILON);
+        assert!((resp.span_margin - 10000.0).abs() < f64::EPSILON);
+        assert_eq!(resp.leverage, "4.00");
+    }
+
+    #[test]
+    fn test_margin_calculator_leverage_is_string() {
+        let json = r#"{"leverage": "4.00"}"#;
+        let resp: MarginCalculatorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.leverage, "4.00");
+    }
+
+    // --- Multi Margin (C3) ---
+
+    #[test]
+    fn test_multi_margin_request_serializes() {
+        let req = MultiMarginRequest {
+            include_position: true,
+            include_orders: false,
+            scripts: vec![MarginScript {
+                exchange_segment: "NSE_FNO".to_owned(),
+                transaction_type: "BUY".to_owned(),
+                quantity: 50,
+                product_type: "INTRADAY".to_owned(),
+                security_id: "52432".to_owned(),
+                price: 245.50,
+                trigger_price: 0.0,
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("includePosition"));
+        assert!(json.contains("includeOrders"));
+        assert!(json.contains("scripts"));
+    }
+
+    #[test]
+    fn test_multi_margin_response_all_strings() {
+        let json = r#"{
+            "total_margin": "12500.00",
+            "span_margin": "10000.00",
+            "exposure_margin": "2500.00",
+            "equity_margin": "0.00",
+            "fo_margin": "12500.00",
+            "commodity_margin": "0.00",
+            "currency": "0.00",
+            "hedge_benefit": "500.00"
+        }"#;
+
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_margin, "12500.00");
+        assert_eq!(resp.span_margin, "10000.00");
+        assert_eq!(resp.hedge_benefit, "500.00");
+        // All fields are strings
+        assert_eq!(resp.fo_margin, "12500.00");
+        assert_eq!(resp.commodity_margin, "0.00");
+    }
+
+    // --- FundLimitResponse (C4) ---
+
+    #[test]
+    fn test_fund_limit_response_deserializes() {
+        let json = r#"{
+            "dhanClientId": "1000000001",
+            "availabelBalance": 50000.00,
+            "sodLimit": 100000.00,
+            "collateralAmount": 0.0,
+            "receiveableAmount": 5000.00,
+            "utilizedAmount": 50000.00,
+            "blockedPayoutAmount": 0.0,
+            "withdrawableBalance": 45000.00
+        }"#;
+
+        let resp: FundLimitResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.dhan_client_id, "1000000001");
+        assert!((resp.availabel_balance - 50000.0).abs() < f64::EPSILON);
+        assert!((resp.sod_limit - 100000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_fund_limit_availabel_balance_typo() {
+        // The typo "availabelBalance" (missing 'l') is in Dhan's API.
+        // Our serde rename maps it correctly.
+        let json = r#"{"availabelBalance": 99999.99}"#;
+        let resp: FundLimitResponse = serde_json::from_str(json).unwrap();
+        assert!((resp.availabel_balance - 99999.99).abs() < f64::EPSILON);
+
+        // Verify that the CORRECT spelling does NOT deserialize
+        let json_correct = r#"{"availableBalance": 99999.99}"#;
+        let resp_correct: FundLimitResponse = serde_json::from_str(json_correct).unwrap();
+        // availabel_balance should default to 0.0 since the correct spelling doesn't match
+        assert!((resp_correct.availabel_balance - 0.0).abs() < f64::EPSILON);
     }
 }

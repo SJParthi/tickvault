@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Order lifecycle status as reported by Dhan.
+///
+/// Variants match Dhan's annexure (docs/dhan-ref/08-annexure-enums.md):
+/// TRANSIT, PENDING, CONFIRMED, TRADED, CANCELLED, REJECTED, EXPIRED,
+/// PART_TRADED (partial fill), CLOSED (Super Order), TRIGGERED (Super/Forever Order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
@@ -19,7 +23,12 @@ pub enum OrderStatus {
     /// Pending at exchange.
     Pending,
     /// Confirmed/open in exchange order book.
+    /// NOTE: Not in annexure Section 5. Observed in Dhan WS order update responses
+    /// and REST Order Book API. Also note: Forever Orders use a distinct `CONFIRM`
+    /// status (per docs/dhan-ref/07b-forever-order.md) — different from `CONFIRMED`.
     Confirmed,
+    /// Partially filled — some quantity traded, remainder still open.
+    PartTraded,
     /// Fully executed.
     Traded,
     /// Cancelled by user or system.
@@ -27,7 +36,13 @@ pub enum OrderStatus {
     /// Rejected by exchange or RMS.
     Rejected,
     /// Expired at end of validity.
+    /// NOTE: Not in annexure Section 5. Used in Order Book API
+    /// (docs/dhan-ref/07-orders.md) and WS order update status subset.
     Expired,
+    /// Super Order closed (all legs complete).
+    Closed,
+    /// Condition triggered (Super Order / Forever Order).
+    Triggered,
 }
 
 impl OrderStatus {
@@ -37,10 +52,13 @@ impl OrderStatus {
             Self::Transit => "TRANSIT",
             Self::Pending => "PENDING",
             Self::Confirmed => "CONFIRMED",
+            Self::PartTraded => "PART_TRADED",
             Self::Traded => "TRADED",
             Self::Cancelled => "CANCELLED",
             Self::Rejected => "REJECTED",
             Self::Expired => "EXPIRED",
+            Self::Closed => "CLOSED",
+            Self::Triggered => "TRIGGERED",
         }
     }
 }
@@ -86,8 +104,12 @@ pub enum ProductType {
     /// Margin Trading Facility — broker-funded leverage.
     Mtf,
     /// Cover Order — with stop-loss.
+    /// NOTE: Not in annexure Section 4 (which lists CNC, INTRADAY, MARGIN only).
+    /// Present in WS order update single-char Product codes: "V" = CO.
     Co,
     /// Bracket Order — with target + stop-loss.
+    /// NOTE: Not in annexure Section 4 (which lists CNC, INTRADAY, MARGIN only).
+    /// Present in WS order update single-char Product codes: "B" = BO.
     Bo,
 }
 
@@ -286,6 +308,13 @@ pub struct OrderUpdate {
     /// Tick size.
     #[serde(default, rename = "tickSize")]
     pub tick_size: f64,
+    /// Order source: "P" = API, "N" = Dhan web/app.
+    /// Filter by "P" to process only our own API-placed orders.
+    #[serde(default)]
+    pub source: String,
+    /// Off-market flag: "1" = AMO (After Market Order), "0" = normal.
+    #[serde(default)]
+    pub off_mkt_flag: String,
 }
 
 /// Wrapper for the Dhan order update WebSocket message.
@@ -296,6 +325,9 @@ pub struct OrderUpdate {
 pub struct OrderUpdateMessage {
     /// The order update payload.
     pub data: OrderUpdate,
+    /// Message type (e.g., "order_alert").
+    #[serde(default)]
+    pub r#type: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,10 +345,13 @@ mod tests {
         assert_eq!(OrderStatus::Transit.as_str(), "TRANSIT");
         assert_eq!(OrderStatus::Pending.as_str(), "PENDING");
         assert_eq!(OrderStatus::Confirmed.as_str(), "CONFIRMED");
+        assert_eq!(OrderStatus::PartTraded.as_str(), "PART_TRADED");
         assert_eq!(OrderStatus::Traded.as_str(), "TRADED");
         assert_eq!(OrderStatus::Cancelled.as_str(), "CANCELLED");
         assert_eq!(OrderStatus::Rejected.as_str(), "REJECTED");
         assert_eq!(OrderStatus::Expired.as_str(), "EXPIRED");
+        assert_eq!(OrderStatus::Closed.as_str(), "CLOSED");
+        assert_eq!(OrderStatus::Triggered.as_str(), "TRIGGERED");
     }
 
     #[test]
@@ -326,6 +361,30 @@ mod tests {
         assert_eq!(json, "\"TRADED\"");
         let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_order_status_serde_part_traded() {
+        let original = OrderStatus::PartTraded;
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, "\"PART_TRADED\"");
+        let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_order_status_serde_closed_and_triggered() {
+        let closed = OrderStatus::Closed;
+        let json = serde_json::to_string(&closed).unwrap();
+        assert_eq!(json, "\"CLOSED\"");
+        let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(closed, deserialized);
+
+        let triggered = OrderStatus::Triggered;
+        let json = serde_json::to_string(&triggered).unwrap();
+        assert_eq!(json, "\"TRIGGERED\"");
+        let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(triggered, deserialized);
     }
 
     // --- TransactionType ---
@@ -496,10 +555,13 @@ mod tests {
             product_name: "INTRADAY".to_owned(),
             ref_ltp: 245.0,
             tick_size: 0.05,
+            source: "P".to_owned(),
+            off_mkt_flag: "0".to_owned(),
         };
 
         let msg = OrderUpdateMessage {
             data: update.clone(),
+            r#type: "order_alert".to_owned(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: OrderUpdateMessage = serde_json::from_str(&json).unwrap();

@@ -88,7 +88,7 @@ echo -e "${CYAN}Automation:${NC}"
 
 echo -n "  Auto-start agent: "
 if launchctl list "com.dlt.trader" >/dev/null 2>&1; then
-    echo -e "${GREEN}LOADED${NC} (daily at 8:30 AM)"
+    echo -e "${GREEN}LOADED${NC} (daily at 8:15 AM)"
 else
     echo -e "${RED}NOT LOADED${NC}"
 fi

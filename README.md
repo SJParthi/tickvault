@@ -48,8 +48,8 @@ cargo run
 ## Key Documents
 
 - [`CLAUDE.md`](CLAUDE.md) — Project rules and session protocol
-- [`docs/codebase_map.md`](docs/codebase_map.md) — Full codebase map with module descriptions
-- [`docs/phases/PHASE_1_LIVE_TRADING.md`](docs/phases/PHASE_1_LIVE_TRADING.md) — Current phase specification
+- [`docs/architecture/codebase-map.md`](docs/architecture/codebase-map.md) — Full codebase map with module descriptions
+- [`docs/phases/phase-1-live-trading.md`](docs/phases/phase-1-live-trading.md) — Current phase specification
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — Contribution guidelines
 - [`SECURITY.md`](SECURITY.md) — Security policy
 

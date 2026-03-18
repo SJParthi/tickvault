@@ -9,8 +9,8 @@
 
 | Folder / File | What It Does |
 |---------------|-------------|
-| [`rules/`](rules/) | **29 rules in 2 folders: dhan/ (21 API) + project/ (8 general)** — auto-loaded when editing matching file paths |
-| [`hooks/`](hooks/) | **23 hook scripts** — run automatically on commits, pushes, PRs |
+| [`rules/`](rules/) | **31 rules in 2 folders: dhan/ (21 API) + project/ (10 general)** — auto-loaded when editing matching file paths |
+| [`hooks/`](hooks/) | **18 hook scripts** — run automatically on commits, pushes, PRs |
 | [`commands/`](commands/) | **6 slash commands** — `/status`, `/grill`, `/commit-push`, etc. |
 | [`agents/`](agents/) | **3 specialized agents** — code review, hot-path audit, build verify |
 | [`skills/`](skills/) | **2 skills** — phase status, quality gates |
@@ -34,11 +34,11 @@ rules/
 │   ├── live-market-feed.md
 │   └── ...18 more
 │
-└── project/                   ← 8 general project rules
+└── project/                   ← 10 general project rules
     ├── rust-code.md
     ├── hot-path.md
     ├── testing.md
-    └── ...5 more
+    └── ...7 more
 ```
 
 ### Dhan V2 API Rules (`rules/dhan/` — 21 rules)
@@ -90,26 +90,21 @@ Automated scripts that run at specific lifecycle points.
 |------|-------------|-------------|
 | `block-env-files.sh` | Before file edit | Prevents `.env` file creation |
 | `pre-commit-gate.sh` | Before commit | fmt, clippy, test on changed crates |
-| `pre-push-gate.sh` | Before push | 13 scoped quality gates |
+| `pre-push-gate.sh` | Before push | 7 fast quality gates (CI handles heavy checks) |
 | `pre-pr-gate.sh` | Before PR | Branch check, naming, clean tree |
 | `pre-merge-gate.sh` | Before merge | Full workspace validation |
-| `changed-crates.sh` | Helper | Detects which crates changed (used by other hooks) |
 | `test-count-guard.sh` | Quality gate | Ensures test count doesn't decrease |
-| `coverage-guard.sh` | Quality gate | Enforces coverage thresholds |
 | `pub-fn-test-guard.sh` | Quality gate | Every public function needs a test |
 | `banned-pattern-scanner.sh` | Quality gate | Blocks unsafe patterns |
 | `secret-scanner.sh` | Quality gate | Detects leaked secrets |
 | `data-integrity-guard.sh` | Quality gate | Validates data contracts |
 | `dedup-latency-scanner.sh` | Quality gate | Checks dedup + latency budgets |
 | `financial-test-guard.sh` | Quality gate | Extra rigor for financial code |
-| `testing-standards-guard.sh` | Quality gate | Enforces test taxonomy |
-| `dry-run-guard.sh` | Quality gate | Blocks dry-run bypasses |
-| `session-status.sh` | On demand | Dashboard: safety systems status |
 | `session-sanity.sh` | Session start | Verifies environment is sane |
 | `auto-save-remote.sh` | Background | Auto-pushes WIP to remote |
 | `auto-save-watchdog.sh` | Background | Monitors auto-save health |
 | `recover-wip.sh` | Recovery | Recovers from interrupted sessions |
-| `post-commit-state.sh` | After commit | Records commit state |
+| `plan-verify.sh` | Plan verification | Validates plan items are complete |
 | `pre-tool-dispatch.sh` | Before tool use | Routes to correct hook |
 
 ---

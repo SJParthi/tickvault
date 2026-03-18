@@ -42,7 +42,9 @@ use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// DEDUP UPSERT KEY for the `ticks` table.
-const DEDUP_KEY_TICKS: &str = "security_id";
+/// STORAGE-GAP-01: Must include segment to prevent cross-segment collision
+/// (same security_id can exist on NSE_EQ and BSE_EQ).
+const DEDUP_KEY_TICKS: &str = "security_id, segment";
 
 // ---------------------------------------------------------------------------
 // Exchange segment code → string mapping
@@ -1430,9 +1432,39 @@ mod tests {
         assert!(TICKS_CREATE_DDL.contains("IF NOT EXISTS"));
     }
 
+    /// STORAGE-GAP-01: DEDUP key must include both security_id and segment
+    /// to prevent cross-segment tick collision (same security_id on NSE_EQ vs BSE_EQ).
     #[test]
-    fn test_dedup_key_ticks_constant() {
-        assert_eq!(DEDUP_KEY_TICKS, "security_id");
+    fn test_tick_dedup_key_includes_segment() {
+        assert!(
+            DEDUP_KEY_TICKS.contains("security_id"),
+            "DEDUP_KEY_TICKS must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_TICKS.contains("segment"),
+            "DEDUP_KEY_TICKS must include segment (STORAGE-GAP-01)"
+        );
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+    }
+
+    /// STORAGE-GAP-01: Verify that the ticks DDL includes exchange_segment
+    /// column, which is needed to prevent cross-segment tick collision
+    /// when the same security_id exists on different segments.
+    #[test]
+    fn test_ticks_ddl_has_segment_column() {
+        assert!(
+            TICKS_CREATE_DDL.contains("segment"),
+            "ticks DDL must include segment column for cross-segment safety"
+        );
+    }
+
+    /// Verify the depth DDL also includes segment column.
+    #[test]
+    fn test_depth_ddl_has_segment_column() {
+        assert!(
+            MARKET_DEPTH_CREATE_DDL.contains("segment"),
+            "market_depth DDL must include segment column"
+        );
     }
 
     #[test]

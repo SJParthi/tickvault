@@ -45,7 +45,7 @@ Headers: Content-Type: application/json, access-token: JWT
 | `securityId`      | string      | Yes      | From instrument master CSV                               |
 | `exchangeSegment` | enum string | Yes      | See 08-annexure Section 1                                |
 | `instrument`      | enum string | Yes      | See 08-annexure Section 6                                |
-| `expiryCode`      | enum int    | No       | 0=Current, 1=Next, 2=Far (see 08-annexure Section 7)    |
+| `expiryCode`      | enum int    | No       | 0=Current, 1=Next, 2=Far (see 08-annexure Section 7). **SDK Note**: The Python SDK (v2.0.2) validates expiryCode values as `[0, 1, 2, 3]`, accepting an additional value `3` beyond the documented range of `[0, 1, 2]`. The meaning of expiryCode `3` is undocumented. |
 | `oi`              | boolean     | No       | Include Open Interest (F&O only)                         |
 | `fromDate`        | string      | Yes      | Start date `YYYY-MM-DD`                                  |
 | `toDate`          | string      | Yes      | End date `YYYY-MM-DD` (**non-inclusive**)                 |
@@ -106,6 +106,10 @@ Headers: Content-Type: application/json, access-token: JWT
 Same columnar parallel array format as daily data.
 
 > **NOTE**: Max 90 days per request. Store data locally for long-term analysis.
+
+> **SDK Note**: The Python SDK (v2.0.2) sends intraday `interval` as an integer (e.g., `1`, `5`) rather than a string. The Dhan API likely accepts both, but our implementation uses strings per the official documentation.
+
+> **SDK Note**: The Python SDK does not send the `oi` field in intraday requests. Our implementation sends `oi: true` by default to include open interest data for F&O instruments.
 
 ---
 

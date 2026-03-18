@@ -33,16 +33,27 @@ pub fn is_valid_transition(from: OrderStatus, to: OrderStatus) -> bool {
         // Transit can go to Pending or Rejected
         (OrderStatus::Transit, OrderStatus::Pending)
             | (OrderStatus::Transit, OrderStatus::Rejected)
-            // Pending can go to Confirmed, Traded, Cancelled, Rejected, or Expired
+            // Pending can go to Confirmed, PartTraded, Traded, Cancelled, Rejected, or Expired
             | (OrderStatus::Pending, OrderStatus::Confirmed)
+            | (OrderStatus::Pending, OrderStatus::PartTraded)
             | (OrderStatus::Pending, OrderStatus::Traded)
             | (OrderStatus::Pending, OrderStatus::Cancelled)
             | (OrderStatus::Pending, OrderStatus::Rejected)
             | (OrderStatus::Pending, OrderStatus::Expired)
-            // Confirmed can go to Traded, Cancelled, or Expired
+            // Confirmed can go to PartTraded, Traded, Cancelled, or Expired
+            | (OrderStatus::Confirmed, OrderStatus::PartTraded)
             | (OrderStatus::Confirmed, OrderStatus::Traded)
             | (OrderStatus::Confirmed, OrderStatus::Cancelled)
             | (OrderStatus::Confirmed, OrderStatus::Expired)
+            // PartTraded can go to Traded (fully filled), Cancelled, or Expired
+            | (OrderStatus::PartTraded, OrderStatus::Traded)
+            | (OrderStatus::PartTraded, OrderStatus::Cancelled)
+            | (OrderStatus::PartTraded, OrderStatus::Expired)
+            // Triggered (Forever/Super Order) can go to Pending, Traded, Cancelled, Rejected
+            | (OrderStatus::Triggered, OrderStatus::Pending)
+            | (OrderStatus::Triggered, OrderStatus::Traded)
+            | (OrderStatus::Triggered, OrderStatus::Cancelled)
+            | (OrderStatus::Triggered, OrderStatus::Rejected)
     )
 }
 
@@ -57,10 +68,13 @@ pub fn parse_order_status(status_str: &str) -> Option<OrderStatus> {
         "TRANSIT" => Some(OrderStatus::Transit),
         "PENDING" => Some(OrderStatus::Pending),
         "CONFIRMED" => Some(OrderStatus::Confirmed),
+        "PART_TRADED" | "PARTIALLY_FILLED" => Some(OrderStatus::PartTraded),
         "TRADED" => Some(OrderStatus::Traded),
         "CANCELLED" | "Cancelled" => Some(OrderStatus::Cancelled),
         "REJECTED" => Some(OrderStatus::Rejected),
         "EXPIRED" => Some(OrderStatus::Expired),
+        "CLOSED" => Some(OrderStatus::Closed),
+        "TRIGGERED" | "CONFIRM" => Some(OrderStatus::Triggered),
         _ => None,
     }
 }
@@ -155,6 +169,88 @@ mod tests {
         ));
     }
 
+    // --- PartTraded transitions ---
+
+    #[test]
+    fn pending_to_part_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Pending,
+            OrderStatus::PartTraded
+        ));
+    }
+
+    #[test]
+    fn confirmed_to_part_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Confirmed,
+            OrderStatus::PartTraded
+        ));
+    }
+
+    #[test]
+    fn part_traded_to_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::Traded
+        ));
+    }
+
+    #[test]
+    fn part_traded_to_cancelled_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn part_traded_to_expired_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::PartTraded,
+            OrderStatus::Expired
+        ));
+    }
+
+    // --- Triggered transitions ---
+
+    #[test]
+    fn triggered_to_pending_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Triggered,
+            OrderStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn triggered_to_traded_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Triggered,
+            OrderStatus::Traded
+        ));
+    }
+
+    #[test]
+    fn triggered_to_cancelled_valid() {
+        assert!(is_valid_transition(
+            OrderStatus::Triggered,
+            OrderStatus::Cancelled
+        ));
+    }
+
+    // --- Closed is terminal ---
+
+    #[test]
+    fn closed_to_anything_invalid() {
+        assert!(!is_valid_transition(
+            OrderStatus::Closed,
+            OrderStatus::Pending
+        ));
+        assert!(!is_valid_transition(
+            OrderStatus::Closed,
+            OrderStatus::Traded
+        ));
+    }
+
     // --- Invalid transitions ---
 
     #[test]
@@ -245,6 +341,14 @@ mod tests {
             parse_order_status("CONFIRMED"),
             Some(OrderStatus::Confirmed)
         );
+        assert_eq!(
+            parse_order_status("PART_TRADED"),
+            Some(OrderStatus::PartTraded)
+        );
+        assert_eq!(
+            parse_order_status("PARTIALLY_FILLED"),
+            Some(OrderStatus::PartTraded)
+        );
         assert_eq!(parse_order_status("TRADED"), Some(OrderStatus::Traded));
         assert_eq!(
             parse_order_status("CANCELLED"),
@@ -256,6 +360,13 @@ mod tests {
         );
         assert_eq!(parse_order_status("REJECTED"), Some(OrderStatus::Rejected));
         assert_eq!(parse_order_status("EXPIRED"), Some(OrderStatus::Expired));
+        assert_eq!(parse_order_status("CLOSED"), Some(OrderStatus::Closed));
+        assert_eq!(
+            parse_order_status("TRIGGERED"),
+            Some(OrderStatus::Triggered)
+        );
+        // Forever Order uses "CONFIRM" for active-waiting-for-trigger
+        assert_eq!(parse_order_status("CONFIRM"), Some(OrderStatus::Triggered));
     }
 
     #[test]

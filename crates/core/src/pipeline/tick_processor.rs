@@ -17,7 +17,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 use dhan_live_trader_common::constants::{
-    DEDUP_RING_BUFFER_POWER, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
+    DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
+    SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 use dhan_live_trader_common::tick_types::ParsedTick;
 
@@ -37,6 +38,31 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
     depth
         .iter()
         .all(|level| level.bid_price.is_finite() && level.ask_price.is_finite())
+}
+
+// ---------------------------------------------------------------------------
+// O(1) Market Hours Persist Window
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the exchange timestamp falls within [09:00, 15:30) IST.
+///
+/// Only ticks inside this window are persisted to QuestDB. Pre-market and
+/// post-market ticks still flow through broadcast and candle aggregation.
+///
+/// # Algorithm (O(1), zero allocation)
+/// 1. Add IST offset to UTC epoch seconds.
+/// 2. Modulo 86,400 → seconds-of-day in IST.
+/// 3. Range check: `[TICK_PERSIST_START, TICK_PERSIST_END)`.
+///
+/// # Performance
+/// 1 add + 1 modulo + 2 comparisons. No branching beyond the range check.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: IST_UTC_OFFSET is +19800 (fits u32); modulo by 86400 is safe
+#[inline(always)]
+fn is_within_persist_window(exchange_timestamp: u32) -> bool {
+    let ist_secs_of_day =
+        exchange_timestamp.wrapping_add(IST_UTC_OFFSET_SECONDS as u32) % SECONDS_PER_DAY;
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+        .contains(&ist_secs_of_day)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +182,7 @@ pub async fn run_tick_processor(
     let m_pipeline_active = gauge!("dlt_pipeline_active");
     let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
     let m_crossed_market = counter!("dlt_crossed_market_total");
+    let m_outside_hours = counter!("dlt_outside_hours_filtered_total");
 
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
@@ -163,6 +190,7 @@ pub async fn run_tick_processor(
     let mut storage_errors: u64 = 0;
     let mut junk_ticks_filtered: u64 = 0;
     let mut dedup_filtered: u64 = 0;
+    let mut outside_hours_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
     let mut last_snapshot_check = Instant::now();
 
@@ -234,19 +262,25 @@ pub async fn run_tick_processor(
                     continue;
                 }
 
-                // Persist tick to QuestDB
-                if let Some(ref mut writer) = tick_writer
-                    && let Err(err) = writer.append_tick(&tick)
-                {
-                    storage_errors = storage_errors.saturating_add(1);
-                    m_storage_errors.increment(1);
-                    if storage_errors <= 100 {
-                        warn!(
-                            ?err,
-                            security_id = tick.security_id,
-                            total_errors = storage_errors,
-                            "failed to append tick to QuestDB"
-                        );
+                // Persist tick to QuestDB — only during market hours [09:00, 15:30) IST.
+                // Pre/post-market ticks still broadcast + aggregate but are NOT stored.
+                if let Some(ref mut writer) = tick_writer {
+                    if is_within_persist_window(tick.exchange_timestamp) {
+                        if let Err(err) = writer.append_tick(&tick) {
+                            storage_errors = storage_errors.saturating_add(1);
+                            m_storage_errors.increment(1);
+                            if storage_errors <= 100 {
+                                warn!(
+                                    ?err,
+                                    security_id = tick.security_id,
+                                    total_errors = storage_errors,
+                                    "failed to append tick to QuestDB"
+                                );
+                            }
+                        }
+                    } else {
+                        outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                        m_outside_hours.increment(1);
                     }
                 }
 
@@ -299,18 +333,24 @@ pub async fn run_tick_processor(
                     }
 
                     // Persist tick to QuestDB (Full packet with valid timestamp)
-                    if let Some(ref mut writer) = tick_writer
-                        && let Err(err) = writer.append_tick(&tick)
-                    {
-                        storage_errors = storage_errors.saturating_add(1);
-                        m_storage_errors.increment(1);
-                        if storage_errors <= 100 {
-                            warn!(
-                                ?err,
-                                security_id = tick.security_id,
-                                total_errors = storage_errors,
-                                "failed to append tick to QuestDB"
-                            );
+                    // — only during market hours [09:00, 15:30) IST.
+                    if let Some(ref mut writer) = tick_writer {
+                        if is_within_persist_window(tick.exchange_timestamp) {
+                            if let Err(err) = writer.append_tick(&tick) {
+                                storage_errors = storage_errors.saturating_add(1);
+                                m_storage_errors.increment(1);
+                                if storage_errors <= 100 {
+                                    warn!(
+                                        ?err,
+                                        security_id = tick.security_id,
+                                        total_errors = storage_errors,
+                                        "failed to append tick to QuestDB"
+                                    );
+                                }
+                            }
+                        } else {
+                            outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                            m_outside_hours.increment(1);
                         }
                     }
                 } else if !ltp_valid {
@@ -354,25 +394,41 @@ pub async fn run_tick_processor(
                 }
 
                 // Persist 5-level depth to QuestDB (separate table)
-                m_depth_snapshots.increment(1);
-                if let Some(ref mut dw) = depth_writer
-                    && let Err(err) = dw.append_depth(
-                        tick.security_id,
-                        tick.exchange_segment_code,
-                        tick.received_at_nanos,
-                        &depth,
-                    )
-                {
-                    storage_errors = storage_errors.saturating_add(1);
-                    m_storage_errors.increment(1);
-                    if storage_errors <= 100 {
-                        warn!(
-                            ?err,
-                            security_id = tick.security_id,
-                            total_errors = storage_errors,
-                            "failed to append depth to QuestDB"
-                        );
+                // — only during market hours [09:00, 15:30) IST.
+                // For Full packets (code 8), use exchange_timestamp.
+                // For Market Depth standalone (code 3), exchange_timestamp=0,
+                // so derive wall-clock seconds from received_at_nanos.
+                // APPROVED: i64→u32 truncation is safe: epoch fits u32 until 2106
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let depth_ts_secs = if tick_is_valid {
+                    tick.exchange_timestamp
+                } else {
+                    (tick.received_at_nanos / 1_000_000_000) as u32
+                };
+                if is_within_persist_window(depth_ts_secs) {
+                    m_depth_snapshots.increment(1);
+                    if let Some(ref mut dw) = depth_writer
+                        && let Err(err) = dw.append_depth(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.received_at_nanos,
+                            &depth,
+                        )
+                    {
+                        storage_errors = storage_errors.saturating_add(1);
+                        m_storage_errors.increment(1);
+                        if storage_errors <= 100 {
+                            warn!(
+                                ?err,
+                                security_id = tick.security_id,
+                                total_errors = storage_errors,
+                                "failed to append depth to QuestDB"
+                            );
+                        }
                     }
+                } else {
+                    outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                    m_outside_hours.increment(1);
                 }
 
                 // O(1) broadcast to browser WebSocket clients (if tick has valid LTP).
@@ -455,6 +511,21 @@ pub async fn run_tick_processor(
                 m_market_status_updates.increment(1);
                 info!(exchange_segment_code, security_id, "market status update");
             }
+            ParsedFrame::DeepDepth {
+                security_id,
+                exchange_segment_code,
+                side,
+                ..
+            } => {
+                // Deep depth frames are from a separate WS connection.
+                // Log receipt; full order book assembly is done downstream.
+                debug!(
+                    security_id,
+                    exchange_segment_code,
+                    ?side,
+                    "deep depth frame received"
+                );
+            }
             ParsedFrame::Disconnect(code) => {
                 m_disconnects.increment(1);
                 error!(
@@ -492,6 +563,10 @@ pub async fn run_tick_processor(
                 if !completed.is_empty() {
                     if let Some(ref mut cw) = live_candle_writer {
                         for c in completed {
+                            // Only persist candles within market hours [09:00, 15:30) IST.
+                            if !is_within_persist_window(c.timestamp_secs) {
+                                continue;
+                            }
                             if let Err(err) = cw.append_candle(
                                 c.security_id,
                                 c.exchange_segment_code,
@@ -554,6 +629,10 @@ pub async fn run_tick_processor(
         let final_count = agg.completed_slice().len();
         if let Some(ref mut cw) = live_candle_writer {
             for c in agg.completed_slice() {
+                // Only persist candles within market hours [09:00, 15:30) IST.
+                if !is_within_persist_window(c.timestamp_secs) {
+                    continue;
+                }
                 let _ = cw.append_candle(
                     c.security_id,
                     c.exchange_segment_code,
@@ -593,6 +672,7 @@ pub async fn run_tick_processor(
         ticks_processed,
         junk_ticks_filtered,
         dedup_filtered,
+        outside_hours_filtered,
         parse_errors,
         storage_errors,
         "tick processor stopped"
@@ -2105,5 +2185,75 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
         let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_persist_window tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: convert IST hours:minutes:seconds to a UTC epoch u32.
+    /// Uses a fixed reference date (2026-03-17) — the actual date doesn't
+    /// matter because `is_within_persist_window` only checks seconds-of-day.
+    fn ist_hms_to_utc_epoch(hours: u32, minutes: u32, seconds: u32) -> u32 {
+        // 2026-03-17 00:00:00 IST = 2026-03-16 18:30:00 UTC = epoch 1773685800
+        let ist_midnight_utc: u32 = 1_773_685_800;
+        let ist_secs_of_day = hours * 3600 + minutes * 60 + seconds;
+        // IST midnight is at UTC 18:30 of the previous day.
+        // Adding IST seconds-of-day gives the correct UTC epoch.
+        ist_midnight_utc + ist_secs_of_day
+    }
+
+    #[test]
+    fn test_persist_window_market_open_boundary() {
+        // 09:00:00 IST = first second of the window (inclusive)
+        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 0, 0)));
+        // 09:00:01 IST = well within window
+        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 0, 1)));
+    }
+
+    #[test]
+    fn test_persist_window_market_close_boundary() {
+        // 15:29:59 IST = last second of the window (inclusive)
+        assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 29, 59)));
+        // 15:30:00 IST = first second outside the window (exclusive)
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(15, 30, 0)));
+        // 15:30:01 IST = outside
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(15, 30, 1)));
+    }
+
+    #[test]
+    fn test_persist_window_pre_market_rejected() {
+        // 08:59:59 IST = one second before window
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(8, 59, 59)));
+        // 08:00:00 IST = well before market
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(8, 0, 0)));
+        // 06:00:00 IST = early morning
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(6, 0, 0)));
+    }
+
+    #[test]
+    fn test_persist_window_post_market_rejected() {
+        // 16:00:00 IST = post-market
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(16, 0, 0)));
+        // 20:00:00 IST = evening
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(20, 0, 0)));
+    }
+
+    #[test]
+    fn test_persist_window_midnight_rejected() {
+        // 00:00:00 IST = midnight
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(0, 0, 0)));
+        // 23:59:59 IST = end of day
+        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(23, 59, 59)));
+    }
+
+    #[test]
+    fn test_persist_window_mid_session() {
+        // 12:00:00 IST = mid-session
+        assert!(is_within_persist_window(ist_hms_to_utc_epoch(12, 0, 0)));
+        // 09:15:00 IST = actual market open
+        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 15, 0)));
+        // 15:15:00 IST = near close
+        assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 15, 0)));
     }
 }

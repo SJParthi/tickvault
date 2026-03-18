@@ -79,7 +79,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "id": 2,
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Historical Candles (1m)",
+      "title": "Historical Candles",
       "type": "stat",
       "targets": [
         {
@@ -87,7 +87,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM historical_candles_1m;",
+          "rawSql": "SELECT count() AS total FROM historical_candles;",
           "refId": "A"
         }
       ]
@@ -201,7 +201,7 @@
     },
     {
       "datasource": { "type": "postgres", "uid": "questdb" },
-      "description": "Historical OHLCV candlestick chart from Dhan REST API. Pick Underlying → Instrument from dropdowns above. 1m candles queried directly. SMA 20 overlay.",
+      "description": "Historical OHLCV candlestick chart from Dhan REST API. Pick Underlying → Instrument from dropdowns above. Queries unified historical_candles table with timeframe filter. SMA 20 overlay.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -257,7 +257,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles_1m\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
+          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND timeframe = '${timeframe}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
           "refId": "OHLCV"
         },
         {
@@ -265,7 +265,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM historical_candles_1m\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
+          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM historical_candles\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND timeframe = '${timeframe}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
           "refId": "SMA",
           "hide": true
         }
@@ -419,7 +419,7 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
       "id": 300,
-      "title": "Historical Candles (1 Min)",
+      "title": "Historical Candles (All Timeframes)",
       "type": "row"
     },
     {
@@ -474,8 +474,8 @@
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
-      "title": "Historical Candles 1m — All Instruments",
-      "description": "1-minute historical candles from Dhan REST API. Timestamps stored as IST-as-UTC; Grafana UTC timezone displays IST wall-clock directly.",
+      "title": "Historical Candles — All Instruments",
+      "description": "Multi-timeframe historical candles from Dhan REST API. Timestamps stored as IST-as-UTC; Grafana UTC timezone displays IST wall-clock directly.",
       "type": "table",
       "targets": [
         {
@@ -483,7 +483,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  ts AS candle_time\nFROM historical_candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  timeframe,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  ts AS candle_time\nFROM historical_candles\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -600,7 +600,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  timestamp AS loaded_at\nFROM fno_underlyings\nORDER BY underlying_symbol;",
+          "rawSql": "SELECT\n  underlying_symbol,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  to_str(timestamp, 'yyyy-MM-dd') AS loaded_at\nFROM fno_underlyings\nORDER BY underlying_symbol;",
           "refId": "A"
         }
       ]
@@ -642,7 +642,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  timestamp AS loaded_at\nFROM derivative_contracts\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
+          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  to_str(timestamp, 'yyyy-MM-dd') AS loaded_at\nFROM derivative_contracts\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
           "refId": "A"
         }
       ]
@@ -686,7 +686,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  symbol,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  timestamp AS loaded_at\nFROM subscribed_indices\nORDER BY symbol;",
+          "rawSql": "SELECT\n  symbol,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  to_str(timestamp, 'yyyy-MM-dd') AS loaded_at\nFROM subscribed_indices\nORDER BY symbol;",
           "refId": "A"
         }
       ]
@@ -927,7 +927,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  name,\n  holiday_type,\n  ts AS holiday_date\nFROM nse_holidays\nORDER BY ts;",
+          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date\nFROM nse_holidays\nORDER BY ts;",
           "refId": "A"
         }
       ]
@@ -935,7 +935,7 @@
   ],
   "refresh": "5s",
   "schemaVersion": 40,
-  "tags": ["dhan-live-trader", "market-data", "questdb", "candlestick"],
+  "tags": ["dhan-live-trader", "market-data", "questdb"],
   "templating": {
     "list": [
       {

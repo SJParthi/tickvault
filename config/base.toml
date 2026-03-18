@@ -10,7 +10,7 @@ market_open_time = "09:15:00"
 market_close_time = "15:30:00"
 order_cutoff_time = "15:29:00"
 data_collection_start = "09:00:00"
-data_collection_end = "16:00:00"
+data_collection_end = "15:30:00"
 timezone = "Asia/Kolkata"
 max_orders_per_second = 10
 
@@ -182,7 +182,7 @@ tracing_enabled = true
 
 [historical]
 enabled = true
-lookback_days = 5
+lookback_days = 90
 request_timeout_secs = 30
 max_retries = 3
 request_delay_ms = 500

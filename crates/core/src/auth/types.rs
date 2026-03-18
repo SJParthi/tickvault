@@ -408,6 +408,115 @@ impl fmt::Debug for DhanAuthResponseData {
 }
 
 // ---------------------------------------------------------------------------
+// User Profile Response (GET /v2/profile)
+// Source: docs/dhan-ref/02-authentication.md Section 2.5
+// ---------------------------------------------------------------------------
+
+/// Response from `GET /v2/profile` with `access-token` header.
+///
+/// Used for pre-market validation: check `dataPlan`, `activeSegment`,
+/// and `tokenValidity` before trading begins.
+///
+/// `tokenValidity` format: `"DD/MM/YYYY HH:MM"` IST (NOT ISO format).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProfileResponse {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Token validity timestamp in `"DD/MM/YYYY HH:MM"` IST format.
+    pub token_validity: String,
+    /// Active trading segments (e.g., contains `"Derivative"` for F&O access).
+    pub active_segment: String,
+    /// DDPI status.
+    #[serde(default)]
+    pub ddpi: String,
+    /// MTF (Margin Trading Facility) status.
+    #[serde(default)]
+    pub mtf: String,
+    /// Data plan status (must be `"Active"` for market data access).
+    pub data_plan: String,
+    /// Data plan validity date.
+    #[serde(default)]
+    pub data_validity: String,
+}
+
+// ---------------------------------------------------------------------------
+// Static IP API Types (POST/PUT/GET /v2/ip/*)
+// Source: docs/dhan-ref/02-authentication.md Section 2.4
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /v2/ip/setIP` — sets a static IP for order APIs.
+///
+/// Dhan requires static IP whitelisting for all Order API endpoints.
+/// Supports both IPv4 and IPv6. Primary + Secondary IP per account.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetIpRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// IP address to whitelist (IPv4 or IPv6).
+    pub ip: String,
+    /// IP slot: `"PRIMARY"` or `"SECONDARY"`.
+    pub ip_flag: String,
+}
+
+/// Response from `POST /v2/ip/setIP`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetIpResponse {
+    /// Status message from Dhan.
+    #[serde(default)]
+    pub status: String,
+    /// Additional message or confirmation.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// Request body for `PUT /v2/ip/modifyIP` — modifies the whitelisted IP.
+///
+/// WARNING: 7-day cooldown after modification. Do NOT modify during live trading.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModifyIpRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// New IP address.
+    pub ip: String,
+    /// IP slot: `"PRIMARY"` or `"SECONDARY"`.
+    pub ip_flag: String,
+}
+
+/// Response from `PUT /v2/ip/modifyIP`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModifyIpResponse {
+    /// Status message from Dhan.
+    #[serde(default)]
+    pub status: String,
+    /// Additional message or confirmation.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// Response from `GET /v2/ip/getIP` — retrieves current IP configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetIpResponse {
+    /// Currently whitelisted IP address.
+    #[serde(default)]
+    pub ip: String,
+    /// IP slot: `"PRIMARY"` or `"SECONDARY"`.
+    #[serde(default)]
+    pub ip_flag: String,
+    /// Last modification date for primary IP.
+    #[serde(default)]
+    pub modify_date_primary: String,
+    /// Last modification date for secondary IP.
+    #[serde(default)]
+    pub modify_date_secondary: String,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1020,5 +1129,110 @@ mod tests {
         let debug = format!("{response:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret-token"));
+    }
+
+    // -----------------------------------------------------------------------
+    // UserProfileResponse tests (A1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_user_profile_response_deserializes() {
+        let json = r#"{
+            "dhanClientId": "1000000001",
+            "tokenValidity": "17/03/2026 23:59",
+            "activeSegment": "Equity, Derivative",
+            "ddpi": "Active",
+            "mtf": "Active",
+            "dataPlan": "Active",
+            "dataValidity": "31/12/2026"
+        }"#;
+
+        let profile: UserProfileResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(profile.dhan_client_id, "1000000001");
+        assert_eq!(profile.token_validity, "17/03/2026 23:59");
+        assert!(profile.active_segment.contains("Derivative"));
+        assert_eq!(profile.data_plan, "Active");
+    }
+
+    #[test]
+    fn test_user_profile_token_validity_format() {
+        // tokenValidity is DD/MM/YYYY HH:MM IST, NOT ISO format
+        let json = r#"{
+            "dhanClientId": "1000000001",
+            "tokenValidity": "17/03/2026 23:59",
+            "activeSegment": "Equity",
+            "dataPlan": "Active"
+        }"#;
+
+        let profile: UserProfileResponse = serde_json::from_str(json).expect("should deserialize");
+        // Must contain "/" separators (DD/MM/YYYY), not "-" (ISO)
+        assert!(
+            profile.token_validity.contains('/'),
+            "tokenValidity must be DD/MM/YYYY format, got: {}",
+            profile.token_validity
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IP API types tests (A4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_ip_request_serializes() {
+        let request = SetIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "203.0.113.42".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+
+        let json_value: serde_json::Value =
+            serde_json::to_value(&request).expect("should serialize");
+
+        assert_eq!(json_value["dhanClientId"], "1000000001");
+        assert_eq!(json_value["ip"], "203.0.113.42");
+        assert_eq!(json_value["ipFlag"], "PRIMARY");
+    }
+
+    #[test]
+    fn test_get_ip_response_deserializes() {
+        let json = r#"{
+            "ip": "203.0.113.42",
+            "ipFlag": "PRIMARY",
+            "modifyDatePrimary": "2026-01-15",
+            "modifyDateSecondary": ""
+        }"#;
+
+        let response: GetIpResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(response.ip, "203.0.113.42");
+        assert_eq!(response.ip_flag, "PRIMARY");
+        assert_eq!(response.modify_date_primary, "2026-01-15");
+    }
+
+    #[test]
+    fn test_modify_ip_request_serializes_camel_case() {
+        let request = ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "198.51.100.1".to_string(),
+            ip_flag: "SECONDARY".to_string(),
+        };
+
+        let json_value: serde_json::Value =
+            serde_json::to_value(&request).expect("should serialize");
+        assert_eq!(json_value["dhanClientId"], "1000000001");
+        assert_eq!(json_value["ipFlag"], "SECONDARY");
+    }
+
+    #[test]
+    fn test_set_ip_response_deserializes() {
+        let json = r#"{"status": "success", "message": "IP set successfully"}"#;
+        let response: SetIpResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(response.status, "success");
+    }
+
+    #[test]
+    fn test_modify_ip_response_deserializes() {
+        let json = r#"{"status": "success", "message": "IP modified"}"#;
+        let response: ModifyIpResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(response.status, "success");
     }
 }

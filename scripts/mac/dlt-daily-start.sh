@@ -2,7 +2,7 @@
 # =============================================================================
 # dhan-live-trader — Daily Auto-Start with Crash Recovery (macOS)
 # =============================================================================
-# Triggered by launchd at 8:30 AM IST daily.
+# Triggered by launchd at 8:15 AM IST daily.
 # Mirrors AWS systemd: start infra -> start binary -> auto-restart on crash.
 #
 # Self-healing behavior:
@@ -13,8 +13,8 @@
 #   - Docker auto-recovery if daemon stops
 #
 # Flow:
-#   8:25 AM — Mac wakes (pmset)
-#   8:30 AM — This script fires (launchd)
+#   8:10 AM — Mac wakes (pmset)
+#   8:15 AM — This script fires (launchd)
 #     1. Restore PATH (launchd has minimal env)
 #     2. Start Docker Desktop if sleeping
 #     3. Fetch SSM secrets, start infra containers

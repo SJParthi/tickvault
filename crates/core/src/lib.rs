@@ -10,13 +10,15 @@
 //! binary parsing, tick pipeline.
 //!
 //! # Modules
-//! - `auth` — Authentication, TOTP generation, JWT token lifecycle (Block 02)
-//! - `instrument` — Master instrument download, CSV parsing, F&O universe building (Block 01)
-//!
-//! # Key Modules (to be built)
-//! - `websocket_client` — Dhan WebSocket V2 connection lifecycle
-//! - `binary_parser` — Zero-copy tick data parsing via zerocopy
-//! - `tick_pipeline` — SPSC ring buffer routing to downstream consumers
+//! - `auth` — Authentication, TOTP generation, JWT token lifecycle
+//! - `historical` — Historical OHLCV candle fetching and chunked retrieval
+//! - `index_constituency` — Index constituent mapping and validation
+//! - `instrument` — Master instrument download, CSV parsing, F&O universe building
+//! - `network` — IP monitoring, verification, and network health checks
+//! - `notification` — Telegram alerting for critical events
+//! - `parser` — Zero-copy binary packet parsing (ticker, quote, full, depth)
+//! - `pipeline` — Tick processing and candle aggregation pipeline
+//! - `websocket` — Dhan WebSocket V2 connection lifecycle, subscription, and reconnection
 //!
 //! # Boot Sequence Position
 //! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route

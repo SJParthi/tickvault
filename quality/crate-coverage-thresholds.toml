@@ -2,22 +2,21 @@
 # dhan-live-trader — Per-Crate Coverage Thresholds
 # =============================================================================
 # Used by: scripts/coverage-gate.sh (CI Stage 6)
-# Used by: .claude/hooks/coverage-guard.sh (pre-push ratchet)
 #
 # All values are line coverage percentages.
 # Any crate not listed uses the default threshold.
 #
-# Phase 1 thresholds — ratchet up as crates gain production code + tests.
-# Target: 99% once each crate is feature-complete.
+# POLICY: 95% minimum coverage for ALL crates. No exceptions.
+# Mechanical enforcement: CI blocks merge if any crate falls below threshold.
 # =============================================================================
 
 # Default threshold for any crate not explicitly listed
-default = 60.0
+default = 95.0
 
 [crates]
-common  = 80.0
-core    = 60.0
-trading = 50.0
-storage = 60.0
-api     = 60.0
-app     = 50.0
+common  = 95.0
+core    = 95.0
+trading = 95.0
+storage = 95.0
+api     = 95.0
+app     = 95.0

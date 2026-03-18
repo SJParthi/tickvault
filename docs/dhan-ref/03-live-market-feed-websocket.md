@@ -114,9 +114,9 @@ Every response = **Response Header (8 bytes)** + **Payload (variable)**
 | Byte Position | Type     | Size (bytes) | Description                                                     |
 |---------------|----------|--------------|-----------------------------------------------------------------|
 | `1`           | byte     | 1            | Feed Response Code (see 08-annexure Section 3)                  |
-| `2-3`         | int16    | 2            | Message Length of entire payload packet                          |
+| `2-3`         | uint16   | 2            | Message Length of entire payload packet                          |
 | `4`           | byte     | 1            | Exchange Segment numeric code (see 08-annexure Section 1)       |
-| `5-8`         | int32    | 4            | Security ID                                                     |
+| `5-8`         | uint32   | 4            | Security ID (Dhan docs say int32; Python SDK uses unsigned u32; our code uses u32) |
 
 **Total header: 8 bytes**
 
@@ -132,7 +132,7 @@ Smallest packet. LTP + LTT only.
 |---------------|---------|--------------|------------------------------------|
 | `0-8`         | array   | 8            | Response Header (code `2`)         |
 | `9-12`        | float32 | 4            | Last Traded Price (LTP)            |
-| `13-16`       | int32   | 4            | Last Trade Time (LTT) — UNIX EPOCH |
+| `13-16`       | uint32  | 4            | Last Trade Time (LTT) — UNIX EPOCH |
 
 **Total: 16 bytes**
 
@@ -146,7 +146,7 @@ Sent automatically whenever ANY instrument is subscribed (any mode). Provides pr
 |---------------|---------|--------------|--------------------------------------|
 | `0-8`         | array   | 8            | Response Header (code `6`)           |
 | `9-12`        | float32 | 4            | Previous day closing price           |
-| `13-16`       | int32   | 4            | Open Interest — previous day         |
+| `13-16`       | uint32  | 4            | Open Interest — previous day         |
 
 **Total: 16 bytes**
 
@@ -162,12 +162,12 @@ Complete trade data without market depth.
 |---------------|---------|--------------|----------------------------------------------------|
 | `0-8`         | array   | 8            | Response Header (code `4`)                         |
 | `9-12`        | float32 | 4            | Last Traded Price (LTP)                            |
-| `13-14`       | int16   | 2            | Last Traded Quantity                                |
-| `15-18`       | int32   | 4            | Last Trade Time (LTT) — UNIX EPOCH                 |
+| `13-14`       | uint16  | 2            | Last Traded Quantity                                |
+| `15-18`       | uint32  | 4            | Last Trade Time (LTT) — UNIX EPOCH                 |
 | `19-22`       | float32 | 4            | Average Trade Price (ATP)                           |
-| `23-26`       | int32   | 4            | Volume                                              |
-| `27-30`       | int32   | 4            | Total Sell Quantity                                 |
-| `31-34`       | int32   | 4            | Total Buy Quantity                                  |
+| `23-26`       | uint32  | 4            | Volume                                              |
+| `27-30`       | uint32  | 4            | Total Sell Quantity                                 |
+| `31-34`       | uint32  | 4            | Total Buy Quantity                                  |
 | `35-38`       | float32 | 4            | Day Open                                            |
 | `39-42`       | float32 | 4            | Day Close (only sent **post market close**)         |
 | `43-46`       | float32 | 4            | Day High                                            |
@@ -184,7 +184,7 @@ Sent automatically when subscribed to Quote mode. Important for derivative contr
 | Byte Position | Type  | Size (bytes) | Description                    |
 |---------------|-------|--------------|--------------------------------|
 | `0-8`         | array | 8            | Response Header (code `5`)     |
-| `9-12`        | int32 | 4            | Open Interest of the contract  |
+| `9-12`        | uint32 | 4           | Open Interest of the contract  |
 
 **Total: 12 bytes**
 
@@ -200,15 +200,15 @@ Everything: trade data + OI + 5-level market depth in a single packet.
 |---------------|-----------------------|--------------|-----------------------------------------------------|
 | `0-8`         | array                 | 8            | Response Header (code `8`)                          |
 | `9-12`        | float32               | 4            | Last Traded Price (LTP)                             |
-| `13-14`       | int16                 | 2            | Last Traded Quantity                                 |
-| `15-18`       | int32                 | 4            | Last Trade Time (LTT) — UNIX EPOCH                  |
+| `13-14`       | uint16                | 2            | Last Traded Quantity                                 |
+| `15-18`       | uint32                | 4            | Last Trade Time (LTT) — UNIX EPOCH                  |
 | `19-22`       | float32               | 4            | Average Trade Price (ATP)                            |
-| `23-26`       | int32                 | 4            | Volume                                               |
-| `27-30`       | int32                 | 4            | Total Sell Quantity                                  |
-| `31-34`       | int32                 | 4            | Total Buy Quantity                                   |
-| `35-38`       | int32                 | 4            | Open Interest (Derivatives only)                     |
-| `39-42`       | int32                 | 4            | Highest OI for the day (NSE_FNO only)                |
-| `43-46`       | int32                 | 4            | Lowest OI for the day (NSE_FNO only)                 |
+| `23-26`       | uint32                | 4            | Volume                                               |
+| `27-30`       | uint32                | 4            | Total Sell Quantity                                  |
+| `31-34`       | uint32                | 4            | Total Buy Quantity                                   |
+| `35-38`       | uint32                | 4            | Open Interest (Derivatives only)                     |
+| `39-42`       | uint32                | 4            | Highest OI for the day (NSE_FNO only)                |
+| `43-46`       | uint32                | 4            | Lowest OI for the day (NSE_FNO only)                 |
 | `47-50`       | float32               | 4            | Day Open                                             |
 | `51-54`       | float32               | 4            | Day Close (only sent **post market close**)          |
 | `55-58`       | float32               | 4            | Day High                                             |
@@ -221,14 +221,14 @@ Everything: trade data + OI + 5-level market depth in a single packet.
 
 | Byte Offset (within level) | Type    | Size (bytes) | Description       |
 |-----------------------------|---------|--------------|-------------------|
-| `1-4`                       | int32   | 4            | Bid Quantity      |
-| `5-8`                       | int32   | 4            | Ask Quantity      |
-| `9-10`                      | int16   | 2            | No. of Bid Orders |
-| `11-12`                     | int16   | 2            | No. of Ask Orders |
+| `1-4`                       | uint32  | 4            | Bid Quantity      |
+| `5-8`                       | uint32  | 4            | Ask Quantity      |
+| `9-10`                      | uint16  | 2            | No. of Bid Orders |
+| `11-12`                     | uint16  | 2            | No. of Ask Orders |
 | `13-16`                     | float32 | 4            | Bid Price         |
 | `17-20`                     | float32 | 4            | Ask Price         |
 
-> **Implementation Note**: Bytes 63-162 contain 5 consecutive 20-byte depth structures. Parse as: `for level in 0..5 { offset = 63 + (level * 20); ... }`
+> **Implementation Note**: Bytes 62-161 (0-based) contain 5 consecutive 20-byte depth structures. Parse as: `for level in 0..5 { offset = 62 + (level * 20); ... }`
 
 ---
 
@@ -247,7 +247,7 @@ Everything: trade data + OI + 5-level market depth in a single packet.
 | Byte Position | Type  | Size (bytes) | Description                                       |
 |---------------|-------|--------------|---------------------------------------------------|
 | `0-8`         | array | 8            | Response Header (code `50`)                       |
-| `9-10`        | int16 | 2            | Disconnection reason code (see 08-annexure Section 11)|
+| `9-10`        | uint16 | 2           | Disconnection reason code (see 08-annexure Section 11)|
 
 **Key disconnect code**: `805` — sent when >5 WebSocket connections exist; first (oldest) socket gets disconnected.
 
@@ -361,9 +361,9 @@ impl FeedResponseCode {
 #[derive(Debug, Clone)]
 pub struct ResponseHeader {
     pub response_code: FeedResponseCode,  // byte 1
-    pub message_length: i16,              // bytes 2-3, int16 LE
+    pub message_length: u16,              // bytes 2-3, uint16 LE
     pub exchange_segment: u8,             // byte 4 (numeric code — see 08-annexure)
-    pub security_id: i32,                 // bytes 5-8, int32 LE
+    pub security_id: u32,                 // bytes 5-8, uint32 LE (Dhan docs say int32; Python SDK uses unsigned)
 }
 
 // ─── Ticker Packet (16 bytes total) ───
@@ -372,7 +372,7 @@ pub struct ResponseHeader {
 pub struct TickerPacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12, float32 LE
-    pub ltt: i32,                      // bytes 13-16, int32 LE (UNIX epoch UTC)
+    pub ltt: u32,                      // bytes 13-16, uint32 LE (UNIX epoch UTC)
 }
 
 // ─── Prev Close Packet (16 bytes total) ───
@@ -381,7 +381,7 @@ pub struct TickerPacket {
 pub struct PrevClosePacket {
     pub header: ResponseHeader,
     pub prev_close: f32,               // bytes 9-12, float32 LE
-    pub prev_oi: i32,                  // bytes 13-16, int32 LE
+    pub prev_oi: u32,                  // bytes 13-16, uint32 LE
 }
 
 // ─── Quote Packet (50 bytes total) ───
@@ -390,12 +390,12 @@ pub struct PrevClosePacket {
 pub struct QuotePacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12
-    pub ltq: i16,                      // bytes 13-14
-    pub ltt: i32,                      // bytes 15-18 (UNIX epoch UTC)
+    pub ltq: u16,                      // bytes 13-14 (unsigned — quantity cannot be negative)
+    pub ltt: u32,                      // bytes 15-18 (UNIX epoch UTC)
     pub atp: f32,                      // bytes 19-22
-    pub volume: i32,                   // bytes 23-26
-    pub total_sell_qty: i32,           // bytes 27-30
-    pub total_buy_qty: i32,            // bytes 31-34
+    pub volume: u32,                   // bytes 23-26
+    pub total_sell_qty: u32,           // bytes 27-30
+    pub total_buy_qty: u32,            // bytes 31-34
     pub day_open: f32,                 // bytes 35-38
     pub day_close: f32,                // bytes 39-42 (post-market only)
     pub day_high: f32,                 // bytes 43-46
@@ -407,7 +407,7 @@ pub struct QuotePacket {
 #[derive(Debug, Clone)]
 pub struct OIPacket {
     pub header: ResponseHeader,
-    pub open_interest: i32,            // bytes 9-12, int32 LE
+    pub open_interest: u32,            // bytes 9-12, uint32 LE
 }
 
 // ─── Full Packet (162 bytes total) ───
@@ -416,15 +416,15 @@ pub struct OIPacket {
 pub struct FullPacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12
-    pub ltq: i16,                      // bytes 13-14
-    pub ltt: i32,                      // bytes 15-18 (UNIX epoch UTC)
+    pub ltq: u16,                      // bytes 13-14 (unsigned — quantity cannot be negative)
+    pub ltt: u32,                      // bytes 15-18 (UNIX epoch UTC)
     pub atp: f32,                      // bytes 19-22
-    pub volume: i32,                   // bytes 23-26
-    pub total_sell_qty: i32,           // bytes 27-30
-    pub total_buy_qty: i32,            // bytes 31-34
-    pub oi: i32,                       // bytes 35-38 (Derivatives only)
-    pub highest_oi: i32,               // bytes 39-42 (NSE_FNO only)
-    pub lowest_oi: i32,                // bytes 43-46 (NSE_FNO only)
+    pub volume: u32,                   // bytes 23-26
+    pub total_sell_qty: u32,           // bytes 27-30
+    pub total_buy_qty: u32,            // bytes 31-34
+    pub oi: u32,                       // bytes 35-38 (Derivatives only)
+    pub highest_oi: u32,               // bytes 39-42 (NSE_FNO only)
+    pub lowest_oi: u32,                // bytes 43-46 (NSE_FNO only)
     pub day_open: f32,                 // bytes 47-50
     pub day_close: f32,                // bytes 51-54 (post-market only)
     pub day_high: f32,                 // bytes 55-58
@@ -436,10 +436,10 @@ pub struct FullPacket {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MarketDepthLevel {
-    pub bid_qty: i32,          // 4 bytes, int32 LE
-    pub ask_qty: i32,          // 4 bytes, int32 LE
-    pub bid_orders: i16,       // 2 bytes, int16 LE
-    pub ask_orders: i16,       // 2 bytes, int16 LE
+    pub bid_qty: u32,          // 4 bytes, uint32 LE (unsigned — quantities cannot be negative)
+    pub ask_qty: u32,          // 4 bytes, uint32 LE (unsigned)
+    pub bid_orders: u16,       // 2 bytes, uint16 LE (unsigned)
+    pub ask_orders: u16,       // 2 bytes, uint16 LE (unsigned)
     pub bid_price: f32,        // 4 bytes, float32 LE
     pub ask_price: f32,        // 4 bytes, float32 LE
 }
@@ -449,7 +449,7 @@ pub struct MarketDepthLevel {
 #[derive(Debug, Clone)]
 pub struct DisconnectPacket {
     pub header: ResponseHeader,
-    pub reason_code: i16,              // bytes 9-10, int16 LE
+    pub reason_code: u16,              // bytes 9-10, uint16 LE
 }
 ```
 
@@ -464,7 +464,7 @@ pub struct DisconnectPacket {
    let dt = ist.timestamp_opt(ltt as i64, 0).unwrap();
    ```
 
-2. **Byte ordering is Little Endian** — all multi-byte fields (int16, int32, float32) must be read as LE. In Rust: `f32::from_le_bytes()`, `i32::from_le_bytes()`, etc.
+2. **Byte ordering is Little Endian** — all multi-byte fields (uint16, uint32, float32) must be read as LE. In Rust: `f32::from_le_bytes()`, `u32::from_le_bytes()`, etc.
 
 3. **Byte indexing in docs is 1-based** — Dhan docs use 1-based byte positions. In code (0-based arrays), subtract 1. E.g., "bytes 9-12" in docs = `buffer[8..12]` in code.
 
@@ -484,6 +484,8 @@ pub struct DisconnectPacket {
 
 11. **Exchange Segment in binary header (byte 4) is NUMERIC**, not string. See 08-annexure Section 1 for the mapping.
 
+12. **Note on signedness**: Dhan's own documentation uses "int16" and "int32" without specifying signed/unsigned. The Python SDK (DhanHQ v2.0.2+) uses unsigned types (`H`=u16, `I`=u32) for all quantity, volume, OI, timestamp, and message length fields. Our Rust code follows the Python SDK's unsigned convention. All these values are always non-negative in practice.
+
 ---
 
 ## 11. Parsing Pseudocode (Rust-style)
@@ -495,34 +497,34 @@ fn parse_market_feed(buffer: &[u8]) -> Result<MarketFeedMessage, ParseError> {
     }
 
     let response_code = buffer[0];
-    let msg_len = i16::from_le_bytes([buffer[1], buffer[2]]);
+    let msg_len = u16::from_le_bytes([buffer[1], buffer[2]]);
     let exchange_seg = buffer[3];
-    let security_id = i32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+    let security_id = u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
 
     match response_code {
         2 => {
             // Ticker: 16 bytes total
             let ltp = f32::from_le_bytes(buffer[8..12].try_into()?);
-            let ltt = i32::from_le_bytes(buffer[12..16].try_into()?);
+            let ltt = u32::from_le_bytes(buffer[12..16].try_into()?);
             Ok(MarketFeedMessage::Ticker { security_id, ltp, ltt })
         }
         4 => {
             // Quote: 50 bytes total
             let ltp = f32::from_le_bytes(buffer[8..12].try_into()?);
-            let ltq = i16::from_le_bytes(buffer[12..14].try_into()?);
-            let ltt = i32::from_le_bytes(buffer[14..18].try_into()?);
+            let ltq = u16::from_le_bytes(buffer[12..14].try_into()?);
+            let ltt = u32::from_le_bytes(buffer[14..18].try_into()?);
             // ... parse remaining fields
             Ok(MarketFeedMessage::Quote { /* fields */ })
         }
         5 => {
             // OI: 12 bytes total
-            let oi = i32::from_le_bytes(buffer[8..12].try_into()?);
+            let oi = u32::from_le_bytes(buffer[8..12].try_into()?);
             Ok(MarketFeedMessage::OI { security_id, oi })
         }
         6 => {
             // Prev Close: 16 bytes total
             let prev_close = f32::from_le_bytes(buffer[8..12].try_into()?);
-            let prev_oi = i32::from_le_bytes(buffer[12..16].try_into()?);
+            let prev_oi = u32::from_le_bytes(buffer[12..16].try_into()?);
             Ok(MarketFeedMessage::PrevClose { security_id, prev_close, prev_oi })
         }
         8 => {
@@ -530,14 +532,14 @@ fn parse_market_feed(buffer: &[u8]) -> Result<MarketFeedMessage, ParseError> {
             // ... parse all fields including 5 depth levels
             // for level in 0..5 {
             //     let offset = 62 + (level * 20);
-            //     let bid_qty = i32::from_le_bytes(buffer[offset..offset+4]);
+            //     let bid_qty = u32::from_le_bytes(buffer[offset..offset+4]);
             //     ...
             // }
             Ok(MarketFeedMessage::Full { /* fields */ })
         }
         50 => {
             // Disconnect
-            let reason = i16::from_le_bytes(buffer[8..10].try_into()?);
+            let reason = u16::from_le_bytes(buffer[8..10].try_into()?);
             Ok(MarketFeedMessage::Disconnect { reason })
         }
         _ => Err(ParseError::UnknownResponseCode(response_code)),
@@ -560,7 +562,7 @@ Expected:
   - exchange_segment = 1 (NSE_EQ)
   - security_id = 1333
   - ltp = parsed float32 LE
-  - ltt = parsed int32 LE epoch (convert to IST with +5:30)
+  - ltt = parsed uint32 LE epoch (convert to IST with +5:30)
 ```
 
 ### Test: Subscribe 100+ instruments
@@ -600,8 +602,8 @@ Do NOT confuse this WebSocket with the **Full Market Depth** WebSocket:
 
 | Aspect               | Live Market Feed (this doc)          | Full Market Depth                      |
 |-----------------------|--------------------------------------|----------------------------------------|
-| Endpoint              | `wss://api-feed.dhan.co`            | `wss://api-feed.dhan.co/marketdepth`  |
+| Endpoint              | `wss://api-feed.dhan.co`            | 20-lvl: `wss://depth-api-feed.dhan.co/twentydepth`, 200-lvl: `wss://full-depth-api.dhan.co/twohundreddepth` |
 | Depth levels          | 5 levels (in Full mode only)         | 20 or 200 levels                       |
-| Header bytes 9-12     | Part of payload data                 | Sequence number (20-lvl) or row count (200-lvl) |
-| Extra headers         | None                                 | Requires `client-id` header            |
+| Header size           | 8 bytes                              | 12 bytes (different byte order!)       |
+| Depth prices          | f32 (4 bytes)                        | f64 (8 bytes)                          |
 | Use case              | General market data + basic depth    | Deep order book analysis               |

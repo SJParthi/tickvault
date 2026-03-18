@@ -65,7 +65,7 @@ notify_all() {
 
 # ---- Market Hours Detection (IST) ----
 # Market: 9:00-15:30 IST, Mon-Fri
-# Pre-market prep: 8:30-9:00
+# Pre-market prep: 8:15-9:00
 # Post-market: 15:30-16:00
 is_market_hours() {
     local day hour minute
@@ -87,7 +87,7 @@ is_market_hours() {
     return 1
 }
 
-# Should the trader be running? (8:30 AM to 16:00 PM on weekdays)
+# Should the trader be running? (8:15 AM to 16:00 PM on weekdays)
 is_trading_session() {
     local day hour minute
     day=$(TZ="Asia/Kolkata" date +%u)
@@ -99,8 +99,8 @@ is_trading_session() {
     fi
 
     local time_mins=$((10#${hour} * 60 + 10#${minute}))
-    # Trading session: 8:30 (510) to 16:00 (960)
-    if [ "${time_mins}" -ge 510 ] && [ "${time_mins}" -le 960 ]; then
+    # Trading session: 8:15 (495) to 16:00 (960)
+    if [ "${time_mins}" -ge 495 ] && [ "${time_mins}" -le 960 ]; then
         return 0
     fi
     return 1

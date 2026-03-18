@@ -8,7 +8,7 @@
 //! - OMS-GAP-05: Idempotency (UUID generation, correlation tracking)
 //! - RISK-GAP-01: Pre-trade risk checks (halt, daily loss, position limit)
 //! - RISK-GAP-02: Position & P&L tracking (fills, market price, reset)
-//! - RISK-GAP-03: Tick gap detection — deferred (tick_gap_tracker not yet implemented)
+//! - RISK-GAP-03: Tick gap detection (tick_gap_tracker — warmup, warning/error thresholds, per-security isolation)
 
 // ===========================================================================
 // OMS-GAP-01: Order Lifecycle State Machine
@@ -174,6 +174,14 @@ mod oms_state_machine {
             parse_order_status("CONFIRMED"),
             Some(OrderStatus::Confirmed)
         );
+        assert_eq!(
+            parse_order_status("PART_TRADED"),
+            Some(OrderStatus::PartTraded)
+        );
+        assert_eq!(
+            parse_order_status("PARTIALLY_FILLED"),
+            Some(OrderStatus::PartTraded)
+        );
         assert_eq!(parse_order_status("TRADED"), Some(OrderStatus::Traded));
         assert_eq!(
             parse_order_status("CANCELLED"),
@@ -185,6 +193,12 @@ mod oms_state_machine {
         );
         assert_eq!(parse_order_status("REJECTED"), Some(OrderStatus::Rejected));
         assert_eq!(parse_order_status("EXPIRED"), Some(OrderStatus::Expired));
+        assert_eq!(parse_order_status("CLOSED"), Some(OrderStatus::Closed));
+        assert_eq!(
+            parse_order_status("TRIGGERED"),
+            Some(OrderStatus::Triggered)
+        );
+        assert_eq!(parse_order_status("CONFIRM"), Some(OrderStatus::Triggered));
     }
 
     #[test]
@@ -230,6 +244,7 @@ mod oms_reconciliation {
             created_at_us: 0,
             updated_at_us: 0,
             needs_reconciliation: false,
+            modification_count: 0,
         }
     }
 
@@ -251,7 +266,7 @@ mod oms_reconciliation {
             traded_price: 0.0,
             remaining_quantity: 0,
             filled_qty: 0,
-            average_trade_price: 0.0,
+            average_traded_price: 0.0,
             exchange_order_id: String::new(),
             exchange_time: String::new(),
             create_time: String::new(),
@@ -325,7 +340,7 @@ mod oms_reconciliation {
 
         let mut dhan = make_dhan("ORD-1", "TRADED");
         dhan.traded_quantity = 50;
-        dhan.average_trade_price = 102.5;
+        dhan.average_traded_price = 102.5;
         let dhan = vec![dhan];
 
         let (report, updates) = reconcile_orders(&oms, &dhan);
@@ -552,12 +567,15 @@ mod oms_idempotency {
     use dhan_live_trader_trading::oms::idempotency::CorrelationTracker;
 
     #[test]
-    fn generate_id_returns_valid_uuid() {
+    fn generate_id_returns_valid_correlation_id() {
         let tracker = CorrelationTracker::new();
         let id = tracker.generate_id();
-        // UUID v4 format: 8-4-4-4-12 hex with hyphens
-        assert_eq!(id.len(), 36);
-        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+        // Dhan correlationId: max 30 chars, hex-only (truncated UUID v4 simple)
+        assert_eq!(id.len(), 30, "correlationId must be 30 chars (Dhan limit)");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "correlationId must be hex chars only"
+        );
     }
 
     #[test]
@@ -804,10 +822,10 @@ mod risk_pnl_tracking {
         engine.record_fill(1001, 2, 100.0, 25); // buy 2 at 100
         engine.update_market_price(1001, 110.0);
 
-        // NOTE: total_unrealized_pnl() is a placeholder (returns 0.0)
-        // until live prices are wired via papaya concurrent map.
+        // RISK-GAP-02: unrealized = net_lots * (market_price - avg_entry)
+        // 2 lots * (110.0 - 100.0) = 20.0
         let unrealized = engine.total_unrealized_pnl();
-        assert!((unrealized).abs() < f64::EPSILON);
+        assert!((unrealized - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]

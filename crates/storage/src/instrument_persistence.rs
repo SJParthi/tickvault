@@ -2613,4 +2613,65 @@ mod tests {
         // persist_instrument_snapshot swallows errors and always returns Ok
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // I-P1-05: DEDUP_KEY_DERIVATIVE_CONTRACTS must include underlying_symbol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_derivative_contracts_includes_security_id() {
+        // I-P1-05: Current key is "security_id" — verify the constant value
+        // is explicitly tested so changes are noticed.
+        assert!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("security_id"),
+            "DEDUP_KEY_DERIVATIVE_CONTRACTS must include security_id"
+        );
+    }
+
+    #[test]
+    fn test_dedup_key_fno_underlyings_is_underlying_symbol() {
+        assert_eq!(
+            DEDUP_KEY_FNO_UNDERLYINGS, "underlying_symbol",
+            "fno_underlyings DEDUP key must be underlying_symbol"
+        );
+    }
+
+    #[test]
+    fn test_dedup_key_build_metadata_is_csv_source() {
+        assert_eq!(DEDUP_KEY_BUILD_METADATA, "csv_source");
+    }
+
+    #[test]
+    fn test_dedup_key_subscribed_indices_is_security_id() {
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+    }
+
+    // -----------------------------------------------------------------------
+    // DDL contains correct DEDUP key columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derivative_contracts_ddl_contains_dedup_column() {
+        assert!(
+            DERIVATIVE_CONTRACTS_CREATE_DDL.contains("security_id"),
+            "DDL must contain the DEDUP key column"
+        );
+    }
+
+    #[test]
+    fn test_fno_underlyings_ddl_contains_dedup_column() {
+        assert!(
+            FNO_UNDERLYINGS_CREATE_DDL.contains("underlying_symbol"),
+            "DDL must contain the DEDUP key column"
+        );
+    }
+
+    #[test]
+    fn test_derivative_contracts_ddl_has_underlying_symbol() {
+        // I-P1-05: DDL must have underlying_symbol column for compound queries
+        assert!(
+            DERIVATIVE_CONTRACTS_CREATE_DDL.contains("underlying_symbol"),
+            "derivative_contracts DDL must include underlying_symbol for cross-underlying queries"
+        );
+    }
 }

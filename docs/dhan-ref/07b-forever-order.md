@@ -16,6 +16,8 @@ Good Till Triggered (GTT) orders. Two types: `SINGLE` (one trigger) and `OCO` (t
 | DELETE | `/forever/orders/{order-id}`    | Delete               |
 | GET    | `/forever/all`                  | List all forever orders |
 
+> **SDK note:** DhanHQ Python SDK (v2.0.2) uses `GET /forever/orders` for listing instead of `/forever/all`. Both may be valid; our ground truth follows the official Dhan API documentation.
+
 **Static IP required.** Product types: `CNC`, `MTF` only.
 
 ---
@@ -51,6 +53,8 @@ Good Till Triggered (GTT) orders. Two types: `SINGLE` (one trigger) and `OCO` (t
 | `price1`       | OCO only     | Second leg (target) price             |
 | `triggerPrice1` | OCO only    | Second leg trigger                    |
 | `quantity1`    | OCO only     | Second leg quantity                   |
+
+> **SDK Note**: The DhanHQ Python SDK (v2.0.2+) includes a `tradingSymbol` field (empty string `""`) in the forever order create request body. This field is not documented in the official API but may be accepted/ignored by the server.
 
 ---
 

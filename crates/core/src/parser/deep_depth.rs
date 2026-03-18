@@ -19,7 +19,7 @@ use dhan_live_trader_common::constants::{
     DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE, DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID,
     DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_OFFSET_ORDERS, DEEP_DEPTH_LEVEL_OFFSET_PRICE,
     DEEP_DEPTH_LEVEL_OFFSET_QUANTITY, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
-    TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_LEVELS, TWO_HUNDRED_DEPTH_PACKET_SIZE,
+    TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_LEVELS,
 };
 use dhan_live_trader_common::tick_types::DeepDepthLevel;
 
@@ -32,7 +32,7 @@ use super::types::ParseError;
 
 /// Parsed header from a 20-level or 200-level depth binary packet.
 ///
-/// 12 bytes: msg_length(u16) + feed_code(u8) + exchange_segment(u8) + security_id(u32) + msg_sequence(u32).
+/// 12 bytes: msg_length(u16) + feed_code(u8) + exchange_segment(u8) + security_id(u32) + seq_or_row_count(u32).
 #[derive(Debug, Clone, Copy)]
 pub struct DeepDepthHeader {
     /// Total message length in bytes.
@@ -43,8 +43,10 @@ pub struct DeepDepthHeader {
     pub exchange_segment_code: u8,
     /// Dhan security identifier.
     pub security_id: u32,
-    /// Message sequence number (for ordering/gap detection).
-    pub message_sequence: u32,
+    /// Dual-purpose field (bytes 8-11):
+    /// - 20-level depth: sequence number (informational, for ordering/gap detection)
+    /// - 200-level depth: row count (number of levels with actual data, determines packet size)
+    pub seq_or_row_count: u32,
 }
 
 /// Which side of the order book this packet represents.
@@ -77,7 +79,7 @@ pub fn parse_deep_depth_header(raw: &[u8]) -> Result<DeepDepthHeader, ParseError
         feed_code: raw[DEEP_DEPTH_HEADER_OFFSET_FEED_CODE],
         exchange_segment_code: raw[DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT],
         security_id: read_u32_le(raw, DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID),
-        message_sequence: read_u32_le(raw, DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE),
+        seq_or_row_count: read_u32_le(raw, DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE),
     })
 }
 
@@ -179,18 +181,33 @@ pub fn parse_twenty_depth_packet(
 
 /// Parses a 200-level depth packet (one side: bid or ask).
 ///
-/// Expected packet size: 3212 bytes (12 header + 200 × 16 body).
+/// Unlike 20-level packets which are fixed-size (332 bytes), 200-level packets
+/// are variable-size. The header's `seq_or_row_count` field (bytes 8-11) contains
+/// the actual number of levels with data. The packet size is:
+/// `12 + (row_count × 16)`, up to a maximum of 3212 bytes (200 levels).
 ///
 /// # Performance
-/// O(1) — fixed 200 level reads.
+/// O(N) where N = row_count (at most 200).
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: row_count bounded by TWO_HUNDRED_DEPTH_LEVELS check
 pub fn parse_two_hundred_depth_packet(
     raw: &[u8],
     received_at_nanos: i64,
 ) -> Result<ParsedDeepDepth, ParseError> {
     let header = parse_deep_depth_header(raw)?;
     let side = feed_code_to_side(header.feed_code)?;
-    let levels =
-        parse_deep_depth_levels(raw, TWO_HUNDRED_DEPTH_LEVELS, TWO_HUNDRED_DEPTH_PACKET_SIZE)?;
+
+    // For 200-level depth, bytes 8-11 = row count (not sequence number).
+    let row_count = header.seq_or_row_count;
+    if row_count as usize > TWO_HUNDRED_DEPTH_LEVELS {
+        return Err(ParseError::InvalidRowCount {
+            actual: row_count,
+            max: TWO_HUNDRED_DEPTH_LEVELS,
+        });
+    }
+
+    let row_count_usize = row_count as usize;
+    let expected_size = DEEP_DEPTH_HEADER_SIZE + row_count_usize * DEEP_DEPTH_LEVEL_SIZE;
+    let levels = parse_deep_depth_levels(raw, row_count_usize, expected_size)?;
 
     Ok(ParsedDeepDepth {
         header,
@@ -208,6 +225,7 @@ pub fn parse_two_hundred_depth_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
+    use dhan_live_trader_common::constants::TWO_HUNDRED_DEPTH_PACKET_SIZE;
 
     /// Builds a deep depth packet for testing.
     fn make_deep_depth_packet(
@@ -253,7 +271,7 @@ mod tests {
         assert_eq!(header.feed_code, 41);
         assert_eq!(header.exchange_segment_code, 2);
         assert_eq!(header.security_id, 52432);
-        assert_eq!(header.message_sequence, 100);
+        assert_eq!(header.seq_or_row_count, 100);
     }
 
     #[test]
@@ -320,7 +338,7 @@ mod tests {
         assert_eq!(result.side, DepthSide::Bid);
         assert_eq!(result.header.security_id, 52432);
         assert_eq!(result.header.exchange_segment_code, 2);
-        assert_eq!(result.header.message_sequence, 1);
+        assert_eq!(result.header.seq_or_row_count, 1);
         assert_eq!(result.received_at_nanos, 999);
         assert_eq!(result.levels.len(), 20);
 
@@ -424,7 +442,7 @@ mod tests {
     // --- 200-depth parsing ---
 
     #[test]
-    fn test_parse_two_hundred_depth_bid_packet() {
+    fn test_parse_two_hundred_depth_bid_packet_full() {
         let level_data: Vec<(f64, u32, u32)> = (0..200)
             .map(|i| {
                 let i_f64 = f64::from(i);
@@ -432,7 +450,8 @@ mod tests {
             })
             .collect();
 
-        let buf = make_deep_depth_packet(41, 2, 13, 1, 200, Some(&level_data));
+        // row_count=200 means all 200 levels have data
+        let buf = make_deep_depth_packet(41, 2, 13, 200, 200, Some(&level_data));
         let result = parse_two_hundred_depth_packet(&buf, 777).unwrap();
 
         assert_eq!(result.side, DepthSide::Bid);
@@ -449,24 +468,70 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_two_hundred_depth_ask_packet() {
-        let buf = make_deep_depth_packet(51, 1, 2885, 42, 200, None);
+    fn test_parse_two_hundred_depth_partial_row_count() {
+        // Simulate a 200-level packet where only 42 levels have data
+        let level_data: Vec<(f64, u32, u32)> = (0..42)
+            .map(|i| {
+                let i_f64 = f64::from(i);
+                (24500.0 - i_f64 * 0.05, 100 + i as u32, 10 + i as u32)
+            })
+            .collect();
+
+        // Build a buffer large enough for 42 levels, row_count=42
+        let buf = make_deep_depth_packet(51, 1, 2885, 42, 42, Some(&level_data));
         let result = parse_two_hundred_depth_packet(&buf, 0).unwrap();
+
         assert_eq!(result.side, DepthSide::Ask);
-        assert_eq!(result.levels.len(), 200);
+        assert_eq!(result.levels.len(), 42);
         assert_eq!(result.header.security_id, 2885);
-        assert_eq!(result.header.message_sequence, 42);
+        assert_eq!(result.header.seq_or_row_count, 42);
+        assert!((result.levels[0].price - 24500.0).abs() < 1e-9);
+        assert!((result.levels[41].price - (24500.0 - 41.0 * 0.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_two_hundred_depth_zero_row_count() {
+        // row_count=0 → no levels, only header required
+        let buf = make_deep_depth_packet(41, 2, 13, 0, 0, None);
+        let result = parse_two_hundred_depth_packet(&buf, 0).unwrap();
+        assert_eq!(result.levels.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_two_hundred_depth_row_count_exceeds_max() {
+        // Build a minimal buffer with row_count=201 in header
+        let mut buf = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        buf[0..2].copy_from_slice(&(DEEP_DEPTH_HEADER_SIZE as u16).to_le_bytes());
+        buf[2] = DEEP_DEPTH_FEED_CODE_BID;
+        buf[3] = 2;
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&201u32.to_le_bytes()); // row_count > 200
+        let err = parse_two_hundred_depth_packet(&buf, 0).unwrap_err();
+        match err {
+            ParseError::InvalidRowCount { actual, max } => {
+                assert_eq!(actual, 201);
+                assert_eq!(max, TWO_HUNDRED_DEPTH_LEVELS);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
     fn test_parse_two_hundred_depth_truncated() {
-        let mut buf = vec![0u8; TWO_HUNDRED_DEPTH_PACKET_SIZE - 1];
-        buf[2] = DEEP_DEPTH_FEED_CODE_ASK; // Valid feed code so we hit the size check
+        // row_count=100 but buffer is too short for 100 levels
+        let expected_size = DEEP_DEPTH_HEADER_SIZE + 100 * DEEP_DEPTH_LEVEL_SIZE;
+        let short_size = expected_size - 1;
+        let mut buf = vec![0u8; short_size];
+        buf[0..2].copy_from_slice(&(short_size as u16).to_le_bytes());
+        buf[2] = DEEP_DEPTH_FEED_CODE_ASK;
+        buf[3] = 2;
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&100u32.to_le_bytes()); // row_count=100
         let err = parse_two_hundred_depth_packet(&buf, 0).unwrap_err();
         match err {
             ParseError::InsufficientBytes { expected, actual } => {
-                assert_eq!(expected, TWO_HUNDRED_DEPTH_PACKET_SIZE);
-                assert_eq!(actual, TWO_HUNDRED_DEPTH_PACKET_SIZE - 1);
+                assert_eq!(expected, expected_size);
+                assert_eq!(actual, short_size);
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -474,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_parse_two_hundred_depth_unknown_feed_code() {
-        let buf = make_deep_depth_packet(0, 2, 1, 1, 200, None);
+        let buf = make_deep_depth_packet(0, 2, 1, 200, 200, None);
         let err = parse_two_hundred_depth_packet(&buf, 0).unwrap_err();
         assert!(matches!(err, ParseError::UnknownResponseCode(0)));
     }
@@ -525,6 +590,6 @@ mod tests {
     fn test_deep_depth_header_max_msg_sequence() {
         let buf = make_deep_depth_packet(51, 2, 1, u32::MAX, 20, None);
         let header = parse_deep_depth_header(&buf).unwrap();
-        assert_eq!(header.message_sequence, u32::MAX);
+        assert_eq!(header.seq_or_row_count, u32::MAX);
     }
 }

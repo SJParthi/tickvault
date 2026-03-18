@@ -90,6 +90,16 @@ pub enum NotificationEvent {
         manual_trigger_url: String,
     },
 
+    /// Historical candle fetch completed successfully (all instruments OK).
+    HistoricalFetchComplete {
+        /// Number of instruments fetched successfully.
+        instruments_fetched: usize,
+        /// Number of instruments skipped (derivatives, already fetched).
+        instruments_skipped: usize,
+        /// Total candles ingested across all timeframes.
+        total_candles: usize,
+    },
+
     /// Historical candle fetch completed with failures.
     HistoricalFetchFailed {
         /// Number of instruments that succeeded.
@@ -97,6 +107,14 @@ pub enum NotificationEvent {
         /// Number of instruments that failed.
         instruments_failed: usize,
         /// Total candles ingested.
+        total_candles: usize,
+    },
+
+    /// Candle cross-verification passed — all timeframes have expected coverage.
+    CandleVerificationPassed {
+        /// Instruments checked across all timeframes.
+        instruments_checked: usize,
+        /// Total candles in QuestDB.
         total_candles: usize,
     },
 
@@ -118,6 +136,22 @@ pub enum NotificationEvent {
     IpVerificationSuccess {
         /// The verified public IP address.
         verified_ip: String,
+    },
+
+    /// Boot health check completed — infrastructure services verified.
+    BootHealthCheck {
+        /// Number of services that passed health check.
+        services_healthy: usize,
+        /// Total services checked.
+        services_total: usize,
+    },
+
+    /// Boot deadline missed — system did not complete startup within allowed time.
+    BootDeadlineMissed {
+        /// Deadline in seconds that was exceeded.
+        deadline_secs: u64,
+        /// Step that was running when deadline hit.
+        step: String,
     },
 
     /// Custom alert from any component.
@@ -181,6 +215,15 @@ impl NotificationEvent {
             } => {
                 format!("<b>Instruments FAILED</b>\n{reason}\n\nRetry: {manual_trigger_url}")
             }
+            Self::HistoricalFetchComplete {
+                instruments_fetched,
+                instruments_skipped,
+                total_candles,
+            } => {
+                format!(
+                    "<b>Historical candles OK</b>\nFetched: {instruments_fetched}\nSkipped: {instruments_skipped}\nCandles: {total_candles}\nTimeframes: 1m, 5m, 15m, 60m, 1d"
+                )
+            }
             Self::HistoricalFetchFailed {
                 instruments_fetched,
                 instruments_failed,
@@ -188,6 +231,14 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>Historical candle fetch — partial failure</b>\nFetched: {instruments_fetched}\nFailed: {instruments_failed}\nCandles: {total_candles}"
+                )
+            }
+            Self::CandleVerificationPassed {
+                instruments_checked,
+                total_candles,
+            } => {
+                format!(
+                    "<b>Candle verification OK</b>\nInstruments: {instruments_checked}\nTotal candles: {total_candles}"
                 )
             }
             Self::CandleVerificationFailed {
@@ -206,6 +257,20 @@ impl NotificationEvent {
             Self::IpVerificationSuccess { verified_ip } => {
                 format!("<b>IP verified</b> — {verified_ip}")
             }
+            Self::BootHealthCheck {
+                services_healthy,
+                services_total,
+            } => {
+                format!("<b>Boot health check</b>\nHealthy: {services_healthy}/{services_total}")
+            }
+            Self::BootDeadlineMissed {
+                deadline_secs,
+                step,
+            } => {
+                format!(
+                    "<b>BOOT DEADLINE MISSED</b>\nDeadline: {deadline_secs}s\nBlocked at: {step}"
+                )
+            }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
             Self::Custom { message } => message.clone(),
@@ -220,12 +285,15 @@ impl NotificationEvent {
     pub fn severity(&self) -> Severity {
         match self {
             Self::IpVerificationFailed { .. } => Severity::Critical,
+            Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
             Self::HistoricalFetchFailed { .. } => Severity::High,
             Self::CandleVerificationFailed { .. } => Severity::High,
+            Self::HistoricalFetchComplete { .. } => Severity::Low,
+            Self::CandleVerificationPassed { .. } => Severity::Low,
             Self::Custom { .. } => Severity::High,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::ShutdownInitiated => Severity::Medium,
@@ -234,6 +302,7 @@ impl NotificationEvent {
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
+            Self::BootHealthCheck { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
         }
@@ -535,6 +604,52 @@ mod tests {
     fn test_ip_verification_success_is_low() {
         let event = NotificationEvent::IpVerificationSuccess {
             verified_ip: "10.0.0.1".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_historical_fetch_complete_message() {
+        let event = NotificationEvent::HistoricalFetchComplete {
+            instruments_fetched: 50,
+            instruments_skipped: 200,
+            total_candles: 187500,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Historical candles OK"));
+        assert!(msg.contains("50"));
+        assert!(msg.contains("200"));
+        assert!(msg.contains("187500"));
+        assert!(msg.contains("1m, 5m, 15m, 60m, 1d"));
+    }
+
+    #[test]
+    fn test_historical_fetch_complete_is_low() {
+        let event = NotificationEvent::HistoricalFetchComplete {
+            instruments_fetched: 50,
+            instruments_skipped: 200,
+            total_candles: 187500,
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_candle_verification_passed_message() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 50,
+            total_candles: 187500,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Candle verification OK"));
+        assert!(msg.contains("50"));
+        assert!(msg.contains("187500"));
+    }
+
+    #[test]
+    fn test_candle_verification_passed_is_low() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 50,
+            total_candles: 187500,
         };
         assert_eq!(event.severity(), Severity::Low);
     }

@@ -26,7 +26,7 @@
 6. **API Key & Secret flow (OAuth-style, 12-month validity).**
    - Step 1: `POST https://auth.dhan.co/app/generate-consent?client_id={dhanClientId}` with headers `app_id`, `app_secret`. Max 25 consentAppId per day.
    - Step 2: Browser login at `https://auth.dhan.co/login/consentApp-login?consentAppId={consentAppId}`
-   - Step 3: `POST https://auth.dhan.co/app/consumeApp-consent?tokenId={Token ID}` with headers `app_id`, `app_secret`
+   - Step 3: `POST/GET https://auth.dhan.co/app/consumeApp-consent?tokenId={Token ID}` with headers `app_id`, `app_secret`. Note: The DhanHQ Python SDK uses GET. The official docs suggest POST. Both may work.
 
 7. **Static IP — mandatory for Order APIs only.**
    - Set: `POST https://api.dhan.co/v2/ip/setIP` — body: `{ "dhanClientId": "...", "ip": "...", "ipFlag": "PRIMARY" }`

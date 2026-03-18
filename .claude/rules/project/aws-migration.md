@@ -32,7 +32,7 @@ Enforced mechanically at 4 layers — **zero sentinel files, zero human memory r
 The AWS deploy script itself checks for `deploy/launchd/` and **refuses to run**
 if Mac infra still exists. You literally cannot deploy to AWS without cleaning up.
 
-### Layer 2: Pre-Push Gate 15/15 (`.claude/hooks/pre-push-gate.sh`)
+### Layer 2: Pre-Push Gate (`.claude/hooks/pre-push-gate.sh`)
 Detects if your changeset includes `deploy/aws/` files. If yes AND `deploy/launchd/`
 exists → **BLOCKS push**. Lists exactly what needs to be deleted.
 

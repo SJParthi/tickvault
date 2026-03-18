@@ -1,8 +1,13 @@
 //! Order idempotency using UUID v4 correlation IDs.
 //!
-//! Each order placed through the OMS gets a unique correlation ID (UUID v4).
+//! Each order placed through the OMS gets a unique correlation ID.
 //! Dhan echoes this ID back in the place response and in WebSocket order updates,
 //! enabling matching between our request and the resulting order.
+//!
+//! Dhan `correlationId` max length is **30 characters**, charset `[a-zA-Z0-9 _-]`.
+//! UUID v4 (36 chars) exceeds this limit, so we strip hyphens to produce a
+//! 32-char hex string, then truncate to 30 chars. This preserves 120 bits of
+//! entropy (30 hex chars = 120 bits), which is collision-safe for our volume.
 //!
 //! # Phase 1
 //! In-memory `HashMap<String, String>` mapping `correlation_id → order_id`.
@@ -10,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use dhan_live_trader_common::constants::DHAN_CORRELATION_ID_MAX_LENGTH;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -38,12 +44,17 @@ impl CorrelationTracker {
         }
     }
 
-    /// Generates a new UUID v4 correlation ID.
+    /// Generates a new correlation ID from UUID v4, truncated to 30 chars.
+    ///
+    /// Dhan `correlationId` max length is 30 characters with charset `[a-zA-Z0-9 _-]`.
+    /// UUID v4 simple (no hyphens) = 32 hex chars; we take first 30 for Dhan compliance.
     ///
     /// # Returns
-    /// A new unique correlation ID string.
+    /// A 30-character hex string (120 bits of entropy).
     pub fn generate_id(&self) -> String {
-        Uuid::new_v4().to_string()
+        let uuid = Uuid::new_v4();
+        let hex = uuid.as_simple().to_string(); // 32 hex chars, no hyphens
+        hex[..DHAN_CORRELATION_ID_MAX_LENGTH].to_string()
     }
 
     /// Records a mapping from correlation ID to order ID.
@@ -88,10 +99,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_id_returns_valid_uuid() {
+    fn generate_id_fits_dhan_correlation_id_limit() {
         let tracker = CorrelationTracker::new();
         let id = tracker.generate_id();
-        assert!(Uuid::parse_str(&id).is_ok());
+        assert_eq!(id.len(), DHAN_CORRELATION_ID_MAX_LENGTH);
+        // Must be valid hex (subset of Dhan's allowed charset [a-zA-Z0-9 _-])
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

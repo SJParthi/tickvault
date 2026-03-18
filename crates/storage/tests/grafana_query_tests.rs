@@ -248,6 +248,27 @@ async fn schema_historical_candles_1m_table() {
 
 #[tokio::test]
 #[ignore = "requires live QuestDB"]
+async fn schema_historical_candles_table() {
+    validate_table_schema(
+        "historical_candles",
+        &[
+            ("segment", "SYMBOL"),
+            ("timeframe", "SYMBOL"),
+            ("security_id", "LONG"),
+            ("open", "DOUBLE"),
+            ("high", "DOUBLE"),
+            ("low", "DOUBLE"),
+            ("close", "DOUBLE"),
+            ("volume", "LONG"),
+            ("oi", "LONG"),
+            ("ts", "TIMESTAMP"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
 async fn schema_candles_1s_table() {
     validate_table_schema(
         "candles_1s",
@@ -382,7 +403,7 @@ async fn functional_stat_total_ticks() {
 #[tokio::test]
 #[ignore = "requires live QuestDB"]
 async fn functional_stat_historical_candles() {
-    let response = execute_query("SELECT count() AS total FROM historical_candles_1m;").await;
+    let response = execute_query("SELECT count() AS total FROM historical_candles;").await;
     assert_columns_present(&response, &["total"], "stat:historical_candles");
     assert_eq!(response.count, 1);
 }

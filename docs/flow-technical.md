@@ -197,7 +197,7 @@ RiskEngine::check_order(signal) → RiskCheck
   ▼
 OrderRateLimiter::try_acquire() → allowed?
   │  GCRA algorithm: 10 orders/sec (SEBI mandate)
-  │  DailyRequestTracker: 7,000/day cap
+  │  DailyRequestTracker: 5,000/day cap
   ▼
 OmsEngine::place_order(request)
   │  dry_run=true (default): simulate with PAPER-xxx ID
@@ -375,7 +375,7 @@ Data API Errors:
   807     Token expired     → trigger token refresh
 
 Rate Limits (per dhanClientId):
-  Orders:       10/sec, 250/min, 1000/hr, 7000/day
+  Orders:       10/sec, 250/min, 500/hr, 5000/day
   Data APIs:    5/sec, 100K/day
   Quote REST:   1/sec
   Non-Trading:  20/sec

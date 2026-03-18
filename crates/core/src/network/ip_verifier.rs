@@ -257,6 +257,138 @@ fn mask_ip(ip: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Dhan Static IP API Methods
+// Source: docs/dhan-ref/02-authentication.md Section 2.4
+// ---------------------------------------------------------------------------
+
+/// Sets a static IP for Dhan Order APIs.
+///
+/// Endpoint: `POST /v2/ip/setIP`
+/// Dhan requires static IP whitelisting for all Order API endpoints.
+#[instrument(skip_all, name = "set_ip")]
+// TEST-EXEMPT: requires live Dhan API; request/response types tested in auth::types::tests
+pub async fn set_ip(
+    rest_api_base_url: &str,
+    access_token: &str,
+    request: &crate::auth::types::SetIpRequest,
+) -> Result<crate::auth::types::SetIpResponse, ApplicationError> {
+    let url = format!(
+        "{}{}",
+        rest_api_base_url,
+        dhan_live_trader_common::constants::DHAN_SET_IP_PATH
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .header("access-token", access_token)
+        .header("Content-Type", "application/json")
+        .json(request)
+        .send()
+        .await
+        .map_err(|err| ApplicationError::IpVerificationFailed {
+            reason: format!("set_ip request failed: {err}"),
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(ApplicationError::IpVerificationFailed {
+            reason: format!("set_ip HTTP {status}: {body}"),
+        });
+    }
+
+    serde_json::from_str(&body).map_err(|err| ApplicationError::IpVerificationFailed {
+        reason: format!("set_ip response parse error: {err}"),
+    })
+}
+
+/// Modifies the whitelisted static IP for Dhan Order APIs.
+///
+/// Endpoint: `PUT /v2/ip/modifyIP`
+/// WARNING: 7-day cooldown after modification. Do NOT call during live trading.
+#[instrument(skip_all, name = "modify_ip")]
+// TEST-EXEMPT: requires live Dhan API; request/response types tested in auth::types::tests
+pub async fn modify_ip(
+    rest_api_base_url: &str,
+    access_token: &str,
+    request: &crate::auth::types::ModifyIpRequest,
+) -> Result<crate::auth::types::ModifyIpResponse, ApplicationError> {
+    let url = format!(
+        "{}{}",
+        rest_api_base_url,
+        dhan_live_trader_common::constants::DHAN_MODIFY_IP_PATH
+    );
+
+    warn!("modifying Dhan IP — 7-day cooldown applies after this operation");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(&url)
+        .header("access-token", access_token)
+        .header("Content-Type", "application/json")
+        .json(request)
+        .send()
+        .await
+        .map_err(|err| ApplicationError::IpVerificationFailed {
+            reason: format!("modify_ip request failed: {err}"),
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(ApplicationError::IpVerificationFailed {
+            reason: format!("modify_ip HTTP {status}: {body}"),
+        });
+    }
+
+    serde_json::from_str(&body).map_err(|err| ApplicationError::IpVerificationFailed {
+        reason: format!("modify_ip response parse error: {err}"),
+    })
+}
+
+/// Gets the current static IP configuration from Dhan.
+///
+/// Endpoint: `GET /v2/ip/getIP`
+#[instrument(skip_all, name = "get_ip")]
+// TEST-EXEMPT: requires live Dhan API; response type tested in auth::types::tests
+pub async fn get_ip(
+    rest_api_base_url: &str,
+    access_token: &str,
+) -> Result<crate::auth::types::GetIpResponse, ApplicationError> {
+    let url = format!(
+        "{}{}",
+        rest_api_base_url,
+        dhan_live_trader_common::constants::DHAN_GET_IP_PATH
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("access-token", access_token)
+        .send()
+        .await
+        .map_err(|err| ApplicationError::IpVerificationFailed {
+            reason: format!("get_ip request failed: {err}"),
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(ApplicationError::IpVerificationFailed {
+            reason: format!("get_ip HTTP {status}: {body}"),
+        });
+    }
+
+    serde_json::from_str(&body).map_err(|err| ApplicationError::IpVerificationFailed {
+        reason: format!("get_ip response parse error: {err}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -444,5 +576,43 @@ mod tests {
         };
         let cloned = result.clone();
         assert_eq!(cloned.verified_ip, "10.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Dhan IP API — request/response format tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_ip_request_format() {
+        use crate::auth::types::SetIpRequest;
+
+        let req = SetIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "203.0.113.42".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("dhanClientId"));
+        assert!(json.contains("203.0.113.42"));
+        assert!(json.contains("PRIMARY"));
+    }
+
+    #[test]
+    fn test_get_ip_response_parsing() {
+        use crate::auth::types::GetIpResponse;
+
+        let json = r#"{
+            "ip": "203.0.113.42",
+            "ipFlag": "PRIMARY",
+            "modifyDatePrimary": "2026-01-15",
+            "modifyDateSecondary": ""
+        }"#;
+
+        let response: GetIpResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.ip, "203.0.113.42");
+        assert_eq!(response.ip_flag, "PRIMARY");
+        assert_eq!(response.modify_date_primary, "2026-01-15");
+        assert!(response.modify_date_secondary.is_empty());
     }
 }

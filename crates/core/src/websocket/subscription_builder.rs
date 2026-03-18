@@ -4,9 +4,11 @@
 //! splits a list of instruments into batched JSON messages ready to send.
 
 use dhan_live_trader_common::constants::SUBSCRIPTION_BATCH_SIZE;
-use dhan_live_trader_common::types::FeedMode;
+use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
 
-use crate::websocket::types::{InstrumentSubscription, SubscriptionRequest};
+use crate::websocket::types::{
+    InstrumentSubscription, SubscriptionRequest, TwoHundredDepthSubscriptionRequest,
+};
 
 /// Maps a `FeedMode` to the Dhan WebSocket subscribe RequestCode.
 ///
@@ -158,7 +160,7 @@ pub fn build_twenty_depth_subscription_messages(
 
 /// Builds unsubscription JSON messages for the 20-level depth WebSocket feed.
 ///
-/// Uses RequestCode 24 (= 23 + 1).
+/// Uses RequestCode 25 (Dhan Annexure: UnsubscribeFullDepth = 25).
 pub fn build_twenty_depth_unsubscription_messages(
     instruments: &[InstrumentSubscription],
     batch_size: usize,
@@ -184,6 +186,82 @@ pub fn build_twenty_depth_unsubscription_messages(
         })
         .collect()
     // O(1) EXEMPT: end
+}
+
+/// Builds a 200-level depth subscription JSON message for a single instrument.
+///
+/// Uses RequestCode 23. Flat JSON structure (no InstrumentList array).
+/// 200-level depth supports only 1 instrument per connection.
+///
+/// # Arguments
+/// * `segment` — Exchange segment (must be NSE_EQ or NSE_FNO — validated).
+/// * `security_id` — Dhan security identifier.
+///
+/// # Returns
+/// * `Ok(String)` — Serialized JSON subscription message.
+/// * `Err(String)` — If the segment is not NSE (depth only supports NSE).
+// TEST-EXEMPT: tested via test_two_hundred_depth_subscription_nse_eq, test_two_hundred_depth_subscription_nse_fno
+pub fn build_two_hundred_depth_subscription_message(
+    segment: ExchangeSegment,
+    security_id: u32,
+) -> Result<String, String> {
+    // O(1) EXEMPT: begin — subscription building runs once at connect time
+    validate_depth_segment(segment)?;
+
+    let request = TwoHundredDepthSubscriptionRequest {
+        request_code: dhan_live_trader_common::constants::FEED_REQUEST_TWENTY_DEPTH, // 23 for both 20 and 200 depth
+        exchange_segment: segment.as_str().to_string(),
+        security_id: security_id.to_string(),
+    };
+
+    #[allow(clippy::expect_used)]
+    // APPROVED: TwoHundredDepthSubscriptionRequest is infallible to serialize
+    Ok(serde_json::to_string(&request)
+        .expect("TwoHundredDepthSubscriptionRequest serialization cannot fail"))
+    // O(1) EXEMPT: end
+}
+
+/// Builds a 200-level depth unsubscription JSON message for a single instrument.
+///
+/// Uses RequestCode 25.
+// TEST-EXEMPT: tested via test_two_hundred_depth_unsubscription_request_code_25
+pub fn build_two_hundred_depth_unsubscription_message(
+    segment: ExchangeSegment,
+    security_id: u32,
+) -> Result<String, String> {
+    // O(1) EXEMPT: begin — unsubscription building runs once at disconnect time
+    validate_depth_segment(segment)?;
+
+    let request = TwoHundredDepthSubscriptionRequest {
+        request_code: dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 25
+        exchange_segment: segment.as_str().to_string(),
+        security_id: security_id.to_string(),
+    };
+
+    #[allow(clippy::expect_used)]
+    // APPROVED: TwoHundredDepthSubscriptionRequest is infallible to serialize
+    Ok(serde_json::to_string(&request)
+        .expect("TwoHundredDepthSubscriptionRequest serialization cannot fail"))
+    // O(1) EXEMPT: end
+}
+
+/// Validates that the exchange segment is NSE-only (NSE_EQ or NSE_FNO).
+///
+/// Full Market Depth (20-level and 200-level) only supports NSE segments.
+/// BSE, MCX, Currency are NOT available. Reject at subscription build time.
+pub fn validate_depth_segment(segment: ExchangeSegment) -> Result<(), String> {
+    match segment {
+        ExchangeSegment::NseEquity | ExchangeSegment::NseFno => Ok(()),
+        // O(1) EXEMPT: subscription validation runs once at connect time, not per tick
+        other => {
+            let seg = other.as_str();
+            Err([
+                "Full Market Depth only supports NSE_EQ and NSE_FNO, got: ",
+                seg,
+            ]
+            .concat())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,11 +514,11 @@ mod tests {
     }
 
     #[test]
-    fn test_twenty_depth_unsubscription_request_code_24() {
+    fn test_twenty_depth_unsubscription_request_code_25() {
         let instruments = make_instruments(3);
         let messages = build_twenty_depth_unsubscription_messages(&instruments, 100);
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("\"RequestCode\":24"));
+        assert!(messages[0].contains("\"RequestCode\":25"));
     }
 
     #[test]
@@ -457,5 +535,83 @@ mod tests {
         assert_eq!(parsed["RequestCode"], 23);
         assert_eq!(parsed["InstrumentCount"], 5);
         assert_eq!(parsed["InstrumentList"].as_array().unwrap().len(), 5);
+    }
+
+    // --- 200-depth subscription ---
+
+    #[test]
+    fn test_two_hundred_depth_subscription_nse_eq() {
+        let msg =
+            build_two_hundred_depth_subscription_message(ExchangeSegment::NseEquity, 1333).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["RequestCode"], 23);
+        assert_eq!(parsed["ExchangeSegment"], "NSE_EQ");
+        assert_eq!(parsed["SecurityId"], "1333");
+        // Must NOT have InstrumentList or InstrumentCount (flat structure)
+        assert!(parsed.get("InstrumentList").is_none());
+        assert!(parsed.get("InstrumentCount").is_none());
+    }
+
+    #[test]
+    fn test_two_hundred_depth_subscription_nse_fno() {
+        let msg =
+            build_two_hundred_depth_subscription_message(ExchangeSegment::NseFno, 52432).unwrap();
+        assert!(msg.contains("\"ExchangeSegment\":\"NSE_FNO\""));
+        assert!(msg.contains("\"SecurityId\":\"52432\""));
+    }
+
+    #[test]
+    fn test_two_hundred_depth_subscription_rejects_bse() {
+        let result = build_two_hundred_depth_subscription_message(ExchangeSegment::BseEquity, 1000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("NSE_EQ and NSE_FNO"));
+    }
+
+    #[test]
+    fn test_two_hundred_depth_subscription_rejects_idx() {
+        let result = build_two_hundred_depth_subscription_message(ExchangeSegment::IdxI, 13);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_two_hundred_depth_unsubscription_request_code_25() {
+        let msg = build_two_hundred_depth_unsubscription_message(ExchangeSegment::NseEquity, 2885)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["RequestCode"], 25);
+        assert_eq!(parsed["SecurityId"], "2885");
+    }
+
+    #[test]
+    fn test_two_hundred_depth_unsubscription_rejects_non_nse() {
+        let result = build_two_hundred_depth_unsubscription_message(ExchangeSegment::BseFno, 99999);
+        assert!(result.is_err());
+    }
+
+    // --- NSE-only validation ---
+
+    #[test]
+    fn test_validate_depth_segment_nse_eq_ok() {
+        assert!(validate_depth_segment(ExchangeSegment::NseEquity).is_ok());
+    }
+
+    #[test]
+    fn test_validate_depth_segment_nse_fno_ok() {
+        assert!(validate_depth_segment(ExchangeSegment::NseFno).is_ok());
+    }
+
+    #[test]
+    fn test_validate_depth_segment_bse_eq_rejected() {
+        assert!(validate_depth_segment(ExchangeSegment::BseEquity).is_err());
+    }
+
+    #[test]
+    fn test_validate_depth_segment_bse_fno_rejected() {
+        assert!(validate_depth_segment(ExchangeSegment::BseFno).is_err());
+    }
+
+    #[test]
+    fn test_validate_depth_segment_idx_rejected() {
+        assert!(validate_depth_segment(ExchangeSegment::IdxI).is_err());
     }
 }

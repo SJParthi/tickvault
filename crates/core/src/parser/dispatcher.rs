@@ -9,6 +9,9 @@ use dhan_live_trader_common::constants::{
     RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
 };
 
+use dhan_live_trader_common::constants::DEEP_DEPTH_HEADER_SIZE;
+
+use super::deep_depth::{parse_deep_depth_header, parse_twenty_depth_packet};
 use super::disconnect::parse_disconnect_packet;
 use super::full_packet::parse_full_packet;
 use super::header::parse_header;
@@ -86,6 +89,80 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
         }
         code => Err(ParseError::UnknownResponseCode(code)),
     }
+}
+
+/// Dispatches a single deep depth binary frame (20-level or 200-level).
+///
+/// Deep depth packets use a 12-byte header (not 8-byte) with different byte
+/// layout from the standard live market feed. Bid (feed code 41) and Ask
+/// (feed code 51) arrive as separate packets.
+///
+/// # Arguments
+/// * `raw` — Complete binary frame from the depth WebSocket connection.
+/// * `received_at_nanos` — Local receive timestamp in nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(ParsedFrame::DeepDepth { .. })` — Successfully parsed depth frame.
+/// * `Err(ParseError)` — Frame too short or unknown feed code.
+///
+/// # Performance
+/// O(N) where N is level count (20 or 200) — fixed, bounded reads.
+// TEST-EXEMPT: tested via test_dispatch_deep_depth_bid, test_dispatch_deep_depth_ask, test_dispatch_deep_depth_too_short
+pub fn dispatch_deep_depth_frame(
+    raw: &[u8],
+    received_at_nanos: i64,
+) -> Result<ParsedFrame, ParseError> {
+    let parsed = parse_twenty_depth_packet(raw, received_at_nanos)?;
+
+    Ok(ParsedFrame::DeepDepth {
+        security_id: parsed.header.security_id,
+        exchange_segment_code: parsed.header.exchange_segment_code,
+        side: parsed.side,
+        levels: parsed.levels,
+        message_sequence: parsed.header.seq_or_row_count,
+        received_at_nanos,
+    })
+}
+
+/// Splits stacked 20-level depth packets from a single WebSocket message.
+///
+/// When multiple instruments are subscribed on a 20-level depth connection,
+/// Dhan stacks their bid/ask packets sequentially in one WebSocket message:
+/// `[Inst1 Bid][Inst1 Ask][Inst2 Bid][Inst2 Ask]...`
+///
+/// Each packet's length is read from its 12-byte header (bytes 0-1, u16 LE).
+///
+/// # Returns
+/// Vec of byte slices, each pointing to one individual depth packet within `raw`.
+///
+/// # Performance
+/// O(N) where N is number of stacked packets — bounded by subscription count.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: offset advances by validated message_length
+// TEST-EXEMPT: tested via test_split_stacked_single_packet, test_split_stacked_bid_ask_pair, etc.
+pub fn split_stacked_depth_packets(raw: &[u8]) -> Result<Vec<&[u8]>, ParseError> {
+    // O(1) EXEMPT: begin — stacked packet splitting, runs once per WS message at receive time
+    let mut packets = Vec::new();
+    let mut offset = 0;
+
+    while offset < raw.len() {
+        let remaining = &raw[offset..];
+        if remaining.len() < DEEP_DEPTH_HEADER_SIZE {
+            break; // Trailing bytes shorter than header — ignore
+        }
+
+        let header = parse_deep_depth_header(remaining)?;
+        let msg_len = header.message_length as usize;
+
+        if msg_len == 0 || remaining.len() < msg_len {
+            break; // Invalid or truncated packet — stop splitting
+        }
+
+        packets.push(&remaining[..msg_len]);
+        offset += msg_len;
+    }
+
+    Ok(packets)
+    // O(1) EXEMPT: end
 }
 
 #[cfg(test)]
@@ -525,5 +602,128 @@ mod tests {
         buf.extend_from_slice(&[0xFF; 500]);
         let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
         assert_eq!(tick.security_id, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deep depth dispatch + stacked packet tests
+    // -----------------------------------------------------------------------
+
+    use crate::parser::deep_depth::DepthSide;
+    use dhan_live_trader_common::constants::{
+        DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DEEP_DEPTH_HEADER_SIZE,
+        DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
+    };
+
+    fn make_depth_packet(feed_code: u8, security_id: u32, level_count: usize) -> Vec<u8> {
+        let size = DEEP_DEPTH_HEADER_SIZE + level_count * DEEP_DEPTH_LEVEL_SIZE;
+        let mut buf = vec![0u8; size];
+        buf[0..2].copy_from_slice(&(size as u16).to_le_bytes());
+        buf[2] = feed_code;
+        buf[3] = 2; // NSE_FNO
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // sequence
+        buf
+    }
+
+    #[test]
+    fn test_dispatch_deep_depth_bid() {
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 52432, TWENTY_DEPTH_LEVELS);
+        let frame = dispatch_deep_depth_frame(&buf, 999).unwrap();
+        match frame {
+            ParsedFrame::DeepDepth {
+                security_id,
+                exchange_segment_code,
+                side,
+                levels,
+                received_at_nanos,
+                ..
+            } => {
+                assert_eq!(security_id, 52432);
+                assert_eq!(exchange_segment_code, 2);
+                assert_eq!(side, DepthSide::Bid);
+                assert_eq!(levels.len(), 20);
+                assert_eq!(received_at_nanos, 999);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_deep_depth_ask() {
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_ASK, 2885, TWENTY_DEPTH_LEVELS);
+        let frame = dispatch_deep_depth_frame(&buf, 0).unwrap();
+        match frame {
+            ParsedFrame::DeepDepth { side, .. } => assert_eq!(side, DepthSide::Ask),
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_deep_depth_too_short() {
+        let buf = [0u8; 11]; // Less than 12-byte header
+        let err = dispatch_deep_depth_frame(&buf, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::InsufficientBytes {
+                expected: 12,
+                actual: 11
+            }
+        ));
+    }
+
+    #[test]
+    fn test_split_stacked_single_packet() {
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 52432, TWENTY_DEPTH_LEVELS);
+        let packets = split_stacked_depth_packets(&buf).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].len(), buf.len());
+    }
+
+    #[test]
+    fn test_split_stacked_bid_ask_pair() {
+        let bid = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 52432, TWENTY_DEPTH_LEVELS);
+        let ask = make_depth_packet(DEEP_DEPTH_FEED_CODE_ASK, 52432, TWENTY_DEPTH_LEVELS);
+        let mut stacked = Vec::new();
+        stacked.extend_from_slice(&bid);
+        stacked.extend_from_slice(&ask);
+
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].len(), bid.len());
+        assert_eq!(packets[1].len(), ask.len());
+    }
+
+    #[test]
+    fn test_split_stacked_multiple_instruments() {
+        let mut stacked = Vec::new();
+        for id in [52432, 52433, 52434] {
+            stacked.extend_from_slice(&make_depth_packet(
+                DEEP_DEPTH_FEED_CODE_BID,
+                id,
+                TWENTY_DEPTH_LEVELS,
+            ));
+            stacked.extend_from_slice(&make_depth_packet(
+                DEEP_DEPTH_FEED_CODE_ASK,
+                id,
+                TWENTY_DEPTH_LEVELS,
+            ));
+        }
+
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(packets.len(), 6); // 3 instruments × 2 sides
+    }
+
+    #[test]
+    fn test_split_stacked_empty() {
+        let packets = split_stacked_depth_packets(&[]).unwrap();
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn test_split_stacked_trailing_bytes_ignored() {
+        let mut buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        buf.extend_from_slice(&[0xFF; 5]); // trailing garbage < header size
+        let packets = split_stacked_depth_packets(&buf).unwrap();
+        assert_eq!(packets.len(), 1);
     }
 }

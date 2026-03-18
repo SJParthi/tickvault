@@ -107,24 +107,71 @@ pub const EXCHANGE_SEGMENT_BSE_CURRENCY: u8 = 7;
 pub const EXCHANGE_SEGMENT_BSE_FNO: u8 = 8;
 
 // ---------------------------------------------------------------------------
-// Dhan WebSocket V2 — Disconnect Error Codes
-// Source: DhanHQ Python SDK v2 on_close handler (src/dhanhq/marketfeed.py)
+// Dhan Data API Error Codes (WebSocket disconnect + REST error responses)
+// Source: docs/dhan-ref/08-annexure-enums.md Section 11
+// These codes appear in WebSocket disconnect packets (code 50) and REST
+// error responses. All 12 codes from the reference doc are defined here.
 // ---------------------------------------------------------------------------
 
-/// 805 — Active WebSocket connections exceeded (max 5 per account).
-pub const DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS: u16 = 805;
+/// 800 — Internal Server Error. Retry with backoff.
+pub const DATA_API_INTERNAL_SERVER_ERROR: u16 = 800;
 
-/// 806 — Data API subscription required (plan/subscription issue).
-pub const DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED: u16 = 806;
+/// 804 — Requested number of instruments exceeds limit.
+pub const DATA_API_INSTRUMENTS_EXCEED_LIMIT: u16 = 804;
+
+/// 805 — Too many requests/connections — may result in user being blocked.
+/// STOP ALL connections for 60s, then audit connection count.
+pub const DATA_API_EXCEEDED_ACTIVE_CONNECTIONS: u16 = 805;
+
+/// 806 — Data APIs not subscribed (plan/subscription issue).
+pub const DATA_API_NOT_SUBSCRIBED: u16 = 806;
 
 /// 807 — Access token expired. Refresh token, then reconnect.
-pub const DISCONNECT_ACCESS_TOKEN_EXPIRED: u16 = 807;
+pub const DATA_API_ACCESS_TOKEN_EXPIRED: u16 = 807;
 
-/// 808 — Invalid client ID. Check SSM credentials.
-pub const DISCONNECT_INVALID_CLIENT_ID: u16 = 808;
+/// 808 — Authentication Failed — Client ID or Access Token invalid.
+/// Per annexure Section 11: this is "Authentication Failed", NOT "Invalid Client ID".
+pub const DATA_API_AUTHENTICATION_FAILED: u16 = 808;
 
-/// 809 — Authentication failed. Invalid credentials.
-pub const DISCONNECT_AUTH_FAILED: u16 = 809;
+/// 809 — Access token invalid.
+/// Per annexure Section 11: this is "Access token invalid", NOT "Authentication Failed".
+pub const DATA_API_ACCESS_TOKEN_INVALID: u16 = 809;
+
+/// 810 — Client ID invalid.
+/// Per annexure Section 11: this is where "Client ID invalid" lives (NOT 808).
+pub const DATA_API_CLIENT_ID_INVALID: u16 = 810;
+
+/// 811 — Invalid Expiry Date.
+pub const DATA_API_INVALID_EXPIRY_DATE: u16 = 811;
+
+/// 812 — Invalid Date Format.
+pub const DATA_API_INVALID_DATE_FORMAT: u16 = 812;
+
+/// 813 — Invalid SecurityId.
+pub const DATA_API_INVALID_SECURITY_ID: u16 = 813;
+
+/// 814 — Invalid Request.
+pub const DATA_API_INVALID_REQUEST: u16 = 814;
+
+// Legacy aliases for backward compatibility with existing imports.
+// These map to the same numeric values; only the names changed.
+/// Legacy alias for `DATA_API_EXCEEDED_ACTIVE_CONNECTIONS` (805).
+pub const DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS: u16 = DATA_API_EXCEEDED_ACTIVE_CONNECTIONS;
+/// Legacy alias for `DATA_API_NOT_SUBSCRIBED` (806).
+pub const DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED: u16 = DATA_API_NOT_SUBSCRIBED;
+/// Legacy alias for `DATA_API_ACCESS_TOKEN_EXPIRED` (807).
+pub const DISCONNECT_ACCESS_TOKEN_EXPIRED: u16 = DATA_API_ACCESS_TOKEN_EXPIRED;
+/// Legacy alias for `DATA_API_AUTHENTICATION_FAILED` (808).
+/// NOTE: Previously named `DISCONNECT_INVALID_CLIENT_ID` — renamed to match
+/// annexure Section 11 which says 808 = "Authentication Failed".
+pub const DISCONNECT_AUTHENTICATION_FAILED: u16 = DATA_API_AUTHENTICATION_FAILED;
+/// Legacy alias for `DATA_API_ACCESS_TOKEN_INVALID` (809).
+/// NOTE: Previously named `DISCONNECT_AUTH_FAILED` — renamed to match
+/// annexure Section 11 which says 809 = "Access token invalid".
+pub const DISCONNECT_ACCESS_TOKEN_INVALID: u16 = DATA_API_ACCESS_TOKEN_INVALID;
+
+/// 810 — Client ID invalid. Distinct from 808 (auth failed).
+pub const DISCONNECT_CLIENT_ID_INVALID: u16 = 810;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
@@ -140,6 +187,9 @@ pub const RESPONSE_CODE_TICKER: u8 = 2;
 /// Response code for market depth standalone packet (112 bytes).
 /// Format: `<BHBIf100s>` — Header(8) + LTP(f32) + Depth(5×20 bytes).
 /// Dhan Python SDK: `process_market_depth(data)`.
+///
+/// NOTE: Not in annexure Section 3 (gap between Ticker(2) and Quote(4)).
+/// Documented and handled in DhanHQ Python SDK v2 `process_market_depth()`.
 pub const RESPONSE_CODE_MARKET_DEPTH: u8 = 3;
 
 /// Response code for quote packet (50 bytes).
@@ -184,6 +234,10 @@ pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
 // Disconnect = 12 (closes the WebSocket connection).
 // ---------------------------------------------------------------------------
 
+/// Connect Feed request code.
+/// Annexure Section 2: code 11 = Connect Feed.
+pub const FEED_REQUEST_CONNECT: u8 = 11;
+
 /// Disconnect request code (closes the WebSocket connection).
 pub const FEED_REQUEST_DISCONNECT: u8 = 12;
 
@@ -200,7 +254,7 @@ pub const BINARY_HEADER_SIZE: usize = 8;
 pub const OI_PACKET_SIZE: usize = 12;
 
 /// Market depth level size in bytes (per level within Full packet).
-/// Format: bid_qty(i32) + ask_qty(i32) + bid_orders(i16) + ask_orders(i16) + bid_price(f32) + ask_price(f32) = 20.
+/// Format: bid_qty(u32) + ask_qty(u32) + bid_orders(u16) + ask_orders(u16) + bid_price(f32) + ask_price(f32) = 20.
 pub const MARKET_DEPTH_LEVEL_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
@@ -320,8 +374,10 @@ pub const MAX_INSTRUMENTS_PER_TWO_HUNDRED_DEPTH_CONNECTION: usize = 1;
 /// Subscription request code for 20-level depth feed.
 pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
-/// Unsubscription request code for 20-level depth feed.
-pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 24;
+/// Unsubscription request code for full market depth feed (both 20 and 200 level).
+/// Dhan Annexure: UnsubscribeFullDepth = 25. There is NO code 24.
+/// Python SDK (fulldepth.py) also uses 25 for unsubscribe.
+pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — Header Byte Offsets
@@ -388,6 +444,26 @@ pub const OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 
 /// Seconds before the OMS circuit breaker transitions from Open to Half-Open.
 pub const OMS_CIRCUIT_BREAKER_RESET_SECS: u64 = 30;
+
+/// Maximum length for Dhan `correlationId` field.
+/// Dhan spec: max 30 chars, charset `[a-zA-Z0-9 _-]`.
+pub const DHAN_CORRELATION_ID_MAX_LENGTH: usize = 30;
+
+// ---------------------------------------------------------------------------
+// Risk — Tick Gap Detection Thresholds
+// ---------------------------------------------------------------------------
+
+/// Minimum ticks per security before gap detection activates (warmup phase).
+/// Prevents false positives during initial subscription when ticks are sparse.
+pub const TICK_GAP_MIN_TICKS_BEFORE_ACTIVE: u32 = 5;
+
+/// Warning-level gap threshold in seconds. Gaps >= this trigger a WARN log.
+/// 30 seconds without a tick indicates potential feed degradation.
+pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
+
+/// Error-level gap threshold in seconds. Gaps >= this trigger an ERROR log
+/// (which routes to Telegram alert). 120 seconds suggests feed disconnection.
+pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 120;
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
@@ -724,6 +800,28 @@ pub const ILP_FLUSH_BATCH_SIZE: usize = 10_000;
 pub const IST_UTC_OFFSET_SECONDS: i32 = 19_800;
 
 // ---------------------------------------------------------------------------
+// Market Hours — Tick Persistence Window
+// ---------------------------------------------------------------------------
+// Only ticks with exchange timestamps inside [09:00, 15:30) IST are persisted
+// to QuestDB. Pre-market and post-market ticks still flow through broadcast
+// and candle aggregation but are NOT stored.
+
+/// Seconds-of-day (IST) at which tick persistence starts: 09:00:00 = 9 × 3600.
+pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
+
+/// Seconds-of-day (IST) at which tick persistence ends: 15:30:00 = 15 × 3600 + 30 × 60.
+/// The end is **exclusive** — a tick at exactly 15:30:00 is NOT persisted.
+pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
+
+/// Seconds in a day (86,400). Used for modulo arithmetic in persist window check.
+pub const SECONDS_PER_DAY: u32 = 86_400;
+
+/// Drain buffer (seconds) after market close before aborting WebSocket handles.
+/// Allows in-flight ticks (last 15:29 candle) to reach the tick processor channel
+/// before the WebSocket read loop is killed.
+pub const MARKET_CLOSE_DRAIN_BUFFER_SECS: u64 = 2;
+
+// ---------------------------------------------------------------------------
 // Authentication — TOTP Configuration
 // ---------------------------------------------------------------------------
 
@@ -757,12 +855,94 @@ pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 /// Endpoint: POST <https://api.dhan.co/v2/charts/intraday>
 pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
 
+/// Path for daily candle data (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
+pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
+
+// ---------------------------------------------------------------------------
+// Authentication — User Profile & IP Management Endpoints
+// ---------------------------------------------------------------------------
+
+/// Path for user profile (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/profile>
+pub const DHAN_USER_PROFILE_PATH: &str = "/profile";
+
+/// Path to set static IP for order APIs (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/ip/setIP>
+pub const DHAN_SET_IP_PATH: &str = "/ip/setIP";
+
+/// Path to modify static IP for order APIs (appended to rest_api_base_url).
+/// Endpoint: PUT <https://api.dhan.co/v2/ip/modifyIP>
+/// WARNING: 7-day cooldown after modification.
+pub const DHAN_MODIFY_IP_PATH: &str = "/ip/modifyIP";
+
+/// Path to get current static IP configuration (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/ip/getIP>
+pub const DHAN_GET_IP_PATH: &str = "/ip/getIP";
+
+// ---------------------------------------------------------------------------
+// Portfolio & Positions — REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for holdings list (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/holdings>
+pub const DHAN_HOLDINGS_PATH: &str = "/holdings";
+
+/// Path for positions list (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/positions>
+pub const DHAN_POSITIONS_PATH: &str = "/positions";
+
+/// Path for position conversion (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/positions/convert>
+pub const DHAN_POSITIONS_CONVERT_PATH: &str = "/positions/convert";
+
+// ---------------------------------------------------------------------------
+// Funds & Margin — REST API Endpoint Paths
+// ---------------------------------------------------------------------------
+
+/// Path for single-instrument margin calculator (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/margincalculator>
+pub const DHAN_MARGIN_CALCULATOR_PATH: &str = "/margincalculator";
+
+/// Path for multi-instrument margin calculator (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/margincalculator/multi>
+pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
+
+/// Path for fund limit query (appended to rest_api_base_url).
+/// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
+pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
+
+// ---------------------------------------------------------------------------
+// Full Market Depth — WebSocket Base URLs
+// ---------------------------------------------------------------------------
+
+/// 20-level depth WebSocket base URL.
+/// Full URL: `wss://depth-api-feed.dhan.co/twentydepth?token=TOKEN&clientId=CLIENT_ID&authType=2`
+pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/twentydepth"; // APPROVED: infrastructure constant
+
+/// 200-level depth WebSocket base URL.
+/// Full URL: `wss://full-depth-api.dhan.co/twohundreddepth?token=TOKEN&clientId=CLIENT_ID&authType=2`
+pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth"; // APPROVED: infrastructure constant
+
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants
 // ---------------------------------------------------------------------------
 
 /// 1-minute candle interval identifier for Dhan intraday API.
 pub const DHAN_CANDLE_INTERVAL_1MIN: &str = "1";
+
+/// 5-minute candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_5MIN: &str = "5";
+
+/// 15-minute candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_15MIN: &str = "15";
+
+/// 25-minute candle interval identifier for Dhan intraday API.
+/// Per docs/dhan-ref/05-historical-data.md: valid intervals are "1", "5", "15", "25", "60".
+pub const DHAN_CANDLE_INTERVAL_25MIN: &str = "25";
+
+/// 60-minute (1-hour) candle interval identifier for Dhan intraday API.
+pub const DHAN_CANDLE_INTERVAL_60MIN: &str = "60";
 
 /// Maximum days of intraday data per API request (Dhan limit: 90 days).
 pub const DHAN_INTRADAY_MAX_DAYS_PER_REQUEST: u32 = 90;
@@ -774,12 +954,47 @@ pub const MARKET_OPEN_TIME_IST: &str = "09:15:00";
 /// The last 1-minute candle runs from 15:29:00 to 15:29:59 IST.
 pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 
+/// Market close time for intraday API toDate parameter (exclusive upper bound).
+/// Dhan intraday API uses datetime format: "YYYY-MM-DD 15:30:00" is exclusive,
+/// meaning the last candle returned starts at 15:29.
+pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
+
+/// Post-market historical data fetch trigger time — 5 minutes after market close.
+/// At 15:35 IST, all market data for the day is finalized and available via REST API.
+pub const POST_MARKET_FETCH_TIME_IST_HOUR: u32 = 15;
+/// Post-market fetch minute component (15:35 IST).
+pub const POST_MARKET_FETCH_TIME_IST_MINUTE: u32 = 35;
+
+/// Buffer time (seconds) after post-market WebSocket disconnect before re-fetching
+/// historical data. Allows Dhan to finalize end-of-day data.
+pub const POST_MARKET_DATA_FINALIZATION_SECS: u64 = 300;
+
 /// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
 /// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
 pub const CANDLES_PER_TRADING_DAY: usize = 375;
 
 /// Batch size for QuestDB ILP flushes during historical candle ingestion.
 pub const CANDLE_FLUSH_BATCH_SIZE: usize = 500;
+
+/// Timeframe identifier for 1-minute candles in `historical_candles` table.
+pub const TIMEFRAME_1M: &str = "1m";
+
+/// Timeframe identifier for 5-minute candles in `historical_candles` table.
+pub const TIMEFRAME_5M: &str = "5m";
+
+/// Timeframe identifier for 15-minute candles in `historical_candles` table.
+pub const TIMEFRAME_15M: &str = "15m";
+
+/// Timeframe identifier for 60-minute candles in `historical_candles` table.
+pub const TIMEFRAME_60M: &str = "60m";
+
+/// Timeframe identifier for daily candles in `historical_candles` table.
+pub const TIMEFRAME_1D: &str = "1d";
+
+/// All intraday timeframes to fetch from Dhan API.
+/// Each tuple: (interval for API request, timeframe label for storage).
+pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] =
+    &[("1", "1m"), ("5", "5m"), ("15", "15m"), ("60", "60m")];
 
 // ---------------------------------------------------------------------------
 // Authentication — SSM Path Construction
@@ -944,10 +1159,15 @@ pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
 /// QuestDB table: previous close reference data from code 6 packets.
 pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 
-/// QuestDB table: 1-minute OHLCV candles from Dhan historical API.
-/// Named `historical_candles_1m` to avoid collision with the `candles_1m`
-/// materialized view (which aggregates live 1s candles).
+/// QuestDB table: 1-minute OHLCV candles from Dhan historical API (legacy).
+/// Kept for backward compatibility with existing tests and cross-verify.
+/// New code should use `QUESTDB_TABLE_HISTORICAL_CANDLES`.
 pub const QUESTDB_TABLE_CANDLES_1M: &str = "historical_candles_1m";
+
+/// QuestDB table: multi-timeframe OHLCV candles from Dhan historical API.
+/// Stores 1m, 5m, 15m, 60m intraday candles and daily candles in a single table.
+/// Discriminated by `timeframe` SYMBOL column. DEDUP on `(ts, security_id, timeframe)`.
+pub const QUESTDB_TABLE_HISTORICAL_CANDLES: &str = "historical_candles";
 
 /// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
 pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
@@ -1134,6 +1354,25 @@ const _: () = assert!(
     "DEDUP_RING_BUFFER_POWER must be in [8, 24]"
 );
 
+// Sanity: tick persist window — start < end, both within a day, values match IST times.
+const _: () = assert!(
+    TICK_PERSIST_START_SECS_OF_DAY_IST == 9 * 3600,
+    "TICK_PERSIST_START must equal 09:00 IST (32400)"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
+    "TICK_PERSIST_END must equal 15:30 IST (55800)"
+);
+const _: () = assert!(
+    TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST,
+    "TICK_PERSIST_START must be before TICK_PERSIST_END"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
+    "TICK_PERSIST_END must be within a single day"
+);
+const _: () = assert!(SECONDS_PER_DAY == 86_400, "SECONDS_PER_DAY must be 86400");
+
 // Sanity: indicator ring buffer capacity must be a power of two (bitmask indexing).
 const _: () = assert!(
     INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two(),
@@ -1301,3 +1540,210 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
 
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
 pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
+
+// ---------------------------------------------------------------------------
+// Tests — Market Hours Constants
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod market_hours_tests {
+    use super::*;
+
+    #[test]
+    fn test_tick_persist_start_matches_nine_am() {
+        assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 9 * 3600);
+        assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 32_400);
+    }
+
+    #[test]
+    fn test_tick_persist_end_matches_three_thirty() {
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 55_800);
+    }
+
+    #[test]
+    fn test_seconds_per_day_correct() {
+        assert_eq!(SECONDS_PER_DAY, 24 * 3600);
+        assert_eq!(SECONDS_PER_DAY, 86_400);
+    }
+
+    #[test]
+    fn test_market_close_drain_buffer_constant() {
+        const { assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS >= 1) };
+        const { assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS <= 5) };
+    }
+
+    #[test]
+    fn test_persist_window_is_subset_of_day() {
+        const { assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST) };
+        const { assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Protocol & Constant Verification
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ist_offset_seconds_is_5h30m() {
+        assert_eq!(IST_UTC_OFFSET_SECONDS, 19_800);
+        assert_eq!(IST_UTC_OFFSET_SECONDS_I64, 19_800);
+    }
+
+    #[test]
+    fn test_ist_offset_nanos_consistent_with_seconds() {
+        let expected_nanos = IST_UTC_OFFSET_SECONDS_I64 * 1_000_000_000;
+        assert_eq!(IST_UTC_OFFSET_NANOS, expected_nanos);
+    }
+
+    #[test]
+    fn test_sebi_max_orders_per_second() {
+        assert_eq!(SEBI_MAX_ORDERS_PER_SECOND, 10);
+    }
+
+    #[test]
+    fn test_sebi_audit_retention_years() {
+        assert_eq!(SEBI_AUDIT_RETENTION_YEARS, 5);
+    }
+
+    #[test]
+    fn test_ticker_packet_size() {
+        assert_eq!(TICKER_PACKET_SIZE, 16);
+    }
+
+    #[test]
+    fn test_quote_packet_size() {
+        assert_eq!(QUOTE_PACKET_SIZE, 50);
+    }
+
+    #[test]
+    fn test_full_packet_size() {
+        assert_eq!(FULL_QUOTE_PACKET_SIZE, 162);
+    }
+
+    #[test]
+    fn test_oi_packet_size() {
+        assert_eq!(OI_PACKET_SIZE, 12);
+    }
+
+    #[test]
+    fn test_disconnect_packet_size() {
+        assert_eq!(DISCONNECT_PACKET_SIZE, 10);
+    }
+
+    #[test]
+    fn test_exchange_segment_code_6_is_unused() {
+        assert_ne!(EXCHANGE_SEGMENT_IDX_I, 6);
+        assert_ne!(EXCHANGE_SEGMENT_NSE_EQ, 6);
+        assert_ne!(EXCHANGE_SEGMENT_NSE_FNO, 6);
+        assert_ne!(EXCHANGE_SEGMENT_NSE_CURRENCY, 6);
+        assert_ne!(EXCHANGE_SEGMENT_BSE_EQ, 6);
+        assert_ne!(EXCHANGE_SEGMENT_MCX_COMM, 6);
+        assert_ne!(EXCHANGE_SEGMENT_BSE_CURRENCY, 6);
+        assert_ne!(EXCHANGE_SEGMENT_BSE_FNO, 6);
+    }
+
+    #[test]
+    fn test_exchange_segment_sequential_except_gap() {
+        assert_eq!(EXCHANGE_SEGMENT_IDX_I, 0);
+        assert_eq!(EXCHANGE_SEGMENT_NSE_EQ, 1);
+        assert_eq!(EXCHANGE_SEGMENT_NSE_FNO, 2);
+        assert_eq!(EXCHANGE_SEGMENT_NSE_CURRENCY, 3);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_EQ, 4);
+        assert_eq!(EXCHANGE_SEGMENT_MCX_COMM, 5);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_CURRENCY, 7);
+        assert_eq!(EXCHANGE_SEGMENT_BSE_FNO, 8);
+    }
+
+    #[test]
+    fn test_data_api_error_codes_match_annexure_section_11() {
+        // All 12 codes from docs/dhan-ref/08-annexure-enums.md Section 11
+        assert_eq!(DATA_API_INTERNAL_SERVER_ERROR, 800);
+        assert_eq!(DATA_API_INSTRUMENTS_EXCEED_LIMIT, 804);
+        assert_eq!(DATA_API_EXCEEDED_ACTIVE_CONNECTIONS, 805);
+        assert_eq!(DATA_API_NOT_SUBSCRIBED, 806);
+        assert_eq!(DATA_API_ACCESS_TOKEN_EXPIRED, 807);
+        assert_eq!(DATA_API_AUTHENTICATION_FAILED, 808);
+        assert_eq!(DATA_API_ACCESS_TOKEN_INVALID, 809);
+        assert_eq!(DATA_API_CLIENT_ID_INVALID, 810);
+        assert_eq!(DATA_API_INVALID_EXPIRY_DATE, 811);
+        assert_eq!(DATA_API_INVALID_DATE_FORMAT, 812);
+        assert_eq!(DATA_API_INVALID_SECURITY_ID, 813);
+        assert_eq!(DATA_API_INVALID_REQUEST, 814);
+    }
+
+    #[test]
+    fn test_disconnect_legacy_aliases_match_primary_constants() {
+        assert_eq!(DISCONNECT_EXCEEDED_ACTIVE_CONNECTIONS, 805);
+        assert_eq!(DISCONNECT_DATA_API_SUBSCRIPTION_REQUIRED, 806);
+        assert_eq!(DISCONNECT_ACCESS_TOKEN_EXPIRED, 807);
+        assert_eq!(DISCONNECT_AUTHENTICATION_FAILED, 808);
+        assert_eq!(DISCONNECT_ACCESS_TOKEN_INVALID, 809);
+    }
+
+    #[test]
+    fn test_response_code_disconnect_is_50() {
+        assert_eq!(RESPONSE_CODE_DISCONNECT, 50);
+    }
+
+    #[test]
+    fn test_max_connections_is_5() {
+        assert_eq!(MAX_WEBSOCKET_CONNECTIONS, 5);
+    }
+
+    #[test]
+    fn test_max_instruments_per_connection_is_5000() {
+        assert_eq!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, 5000);
+    }
+
+    #[test]
+    fn test_subscription_batch_size_within_spec() {
+        let batch = SUBSCRIPTION_BATCH_SIZE;
+        assert!(batch <= 100);
+    }
+
+    #[test]
+    fn test_total_subscriptions_consistent() {
+        assert_eq!(
+            MAX_TOTAL_SUBSCRIPTIONS,
+            MAX_WEBSOCKET_CONNECTIONS * MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+        );
+    }
+
+    #[test]
+    fn test_deep_depth_header_is_12_not_8() {
+        assert_eq!(DEEP_DEPTH_HEADER_SIZE, 12);
+        assert_eq!(BINARY_HEADER_SIZE, 8);
+        assert_ne!(DEEP_DEPTH_HEADER_SIZE, BINARY_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_deep_depth_bid_ask_codes() {
+        assert_eq!(DEEP_DEPTH_FEED_CODE_BID, 41);
+        assert_eq!(DEEP_DEPTH_FEED_CODE_ASK, 51);
+    }
+
+    #[test]
+    fn test_market_open_time() {
+        assert_eq!(MARKET_OPEN_TIME_IST, "09:15:00");
+    }
+
+    #[test]
+    fn test_order_update_login_msg_code_is_42() {
+        assert_eq!(ORDER_UPDATE_LOGIN_MSG_CODE, 42);
+    }
+
+    #[test]
+    fn test_indicator_warmup_ticks_positive() {
+        const { assert!(MAX_INDICATOR_WARMUP_TICKS > 0) };
+    }
+
+    #[test]
+    fn test_indicator_ring_buffer_capacity_power_of_two() {
+        assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
+    }
+}

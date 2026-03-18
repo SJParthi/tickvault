@@ -681,11 +681,12 @@ mod ip_monitor {
 mod ws_disconnect_codes {
     use dhan_live_trader_core::websocket::types::DisconnectCode;
 
-    // -- from_u16 ↔ as_u16 roundtrip for all known codes ------------------
+    // -- from_u16 ↔ as_u16 roundtrip for all 12 annexure Section 11 codes --
 
     #[test]
     fn roundtrip_all_known_codes() {
-        let known_codes: &[u16] = &[801, 802, 803, 804, 805, 806, 807, 808, 809, 810, 814];
+        // All 12 codes from docs/dhan-ref/08-annexure-enums.md Section 11
+        let known_codes: &[u16] = &[800, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814];
         for &code in known_codes {
             let dc = DisconnectCode::from_u16(code);
             assert_eq!(dc.as_u16(), code, "roundtrip failed for code {}", code);
@@ -705,25 +706,39 @@ mod ws_disconnect_codes {
         assert_eq!(dc.as_u16(), 0);
     }
 
-    // -- Reconnectable classification -------------------------------------
+    #[test]
+    fn codes_801_802_803_not_in_annexure_map_to_unknown() {
+        // Codes 801, 802, 803 do NOT exist in annexure Section 11
+        for code in [801_u16, 802, 803] {
+            let dc = DisconnectCode::from_u16(code);
+            assert!(
+                matches!(dc, DisconnectCode::Unknown(_)),
+                "code {} must map to Unknown (not in annexure)",
+                code
+            );
+        }
+    }
+
+    // -- Reconnectable classification per annexure semantics ---------------
 
     #[test]
     fn reconnectable_codes() {
-        // 807 (token expired) is reconnectable; Unknown codes are also reconnectable
+        // 800 (InternalServerError) and 807 (AccessTokenExpired) are reconnectable
+        assert!(DisconnectCode::from_u16(800).is_reconnectable());
         assert!(DisconnectCode::from_u16(807).is_reconnectable());
-        // Unknown codes (801, 804, 810) map to Unknown and are reconnectable
-        assert!(DisconnectCode::from_u16(801).is_reconnectable());
-        assert!(DisconnectCode::from_u16(804).is_reconnectable());
-        assert!(DisconnectCode::from_u16(810).is_reconnectable());
     }
 
     #[test]
     fn non_reconnectable_codes() {
-        // Named variants 805, 806, 808, 809 are non-reconnectable
-        assert!(!DisconnectCode::from_u16(805).is_reconnectable());
-        assert!(!DisconnectCode::from_u16(806).is_reconnectable());
-        assert!(!DisconnectCode::from_u16(808).is_reconnectable());
-        assert!(!DisconnectCode::from_u16(809).is_reconnectable());
+        // All config/credential/request errors are NOT reconnectable
+        let non_reconnectable: &[u16] = &[804, 805, 806, 808, 809, 810, 811, 812, 813, 814];
+        for &code in non_reconnectable {
+            assert!(
+                !DisconnectCode::from_u16(code).is_reconnectable(),
+                "code {} must NOT be reconnectable",
+                code
+            );
+        }
     }
 
     #[test]
@@ -737,7 +752,8 @@ mod ws_disconnect_codes {
 
     #[test]
     fn only_807_requires_token_refresh() {
-        let all_codes: &[u16] = &[801, 802, 803, 804, 805, 806, 807, 808, 809, 810, 814];
+        // All 12 annexure codes
+        let all_codes: &[u16] = &[800, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814];
         for &code in all_codes {
             let dc = DisconnectCode::from_u16(code);
             if code == 807 {
@@ -783,14 +799,21 @@ mod ws_disconnect_codes {
     // -- Enum variant coverage (exhaustive) --------------------------------
 
     #[test]
-    fn all_5_known_codes_mapped() {
-        // Verify each named code maps to a distinct named variant (not Unknown)
+    fn all_12_known_codes_mapped() {
+        // All 12 annexure codes must map to named variants (not Unknown)
         let known: &[(u16, &str)] = &[
+            (800, "InternalServerError"),
+            (804, "InstrumentsExceedLimit"),
             (805, "ExceededActiveConnections"),
             (806, "DataApiSubscriptionRequired"),
             (807, "AccessTokenExpired"),
-            (808, "InvalidClientId"),
-            (809, "AuthenticationFailed"),
+            (808, "AuthenticationFailed"),
+            (809, "AccessTokenInvalid"),
+            (810, "ClientIdInvalid"),
+            (811, "InvalidExpiryDate"),
+            (812, "InvalidDateFormat"),
+            (813, "InvalidSecurityId"),
+            (814, "InvalidRequest"),
         ];
         for &(code, expected_name) in known {
             let dc = DisconnectCode::from_u16(code);
@@ -803,13 +826,13 @@ mod ws_disconnect_codes {
                 expected_name
             );
         }
-        // Codes outside 805-809 map to Unknown
-        for code in [801_u16, 802, 803, 804, 810, 814] {
+        // Codes NOT in annexure (801, 802, 803) map to Unknown
+        for code in [801_u16, 802, 803] {
             let dc = DisconnectCode::from_u16(code);
             let debug = format!("{:?}", dc);
             assert!(
                 debug.contains("Unknown"),
-                "code {} debug {:?} must be Unknown",
+                "code {} debug {:?} must be Unknown (not in annexure)",
                 code,
                 debug
             );

@@ -3,7 +3,7 @@
 > **Single source of truth** for all quality dimensions in dhan-live-trader.
 > Open this file at the start of every session. Verify every applicable dimension before committing.
 >
-> **Last updated:** 2026-03-13 | **Total dimensions:** 98 | **Test baseline:** 2292
+> **Last updated:** 2026-03-17 | **Total dimensions:** 98 | **Test baseline:** 2439
 > **22 test types canonical definition:** `docs/standards/22-test-types.md`
 
 ## Status Legend
@@ -68,7 +68,7 @@
 | 2.4 | Condition coverage | Each boolean sub-expression T/F | `if size > limit && drawdown > max` — each condition independent | `GAP` | Not standard in Rust ecosystem | See Gap #6 (partial via llvm-cov) |
 | 2.5 | Path coverage | All execution paths through function | 5 sequential ifs = 32 paths — approximated by proptest | `DOCUMENTED` | Approximated by property-based testing | Infeasible for full coverage |
 | 2.6 | MC/DC | Modified Condition/Decision Coverage | Aviation/safety-critical standard — partial relevance for risk checks | `N/A` | Overkill for this system | DO-178C level, not required |
-| 2.7 | Crate-level thresholds | Per-crate minimum coverage % | core/trading 95%, common/storage/api 90%, app 80% | `DOCUMENTED` | Thresholds defined in testing.md, NOT enforced in CI | See Gap #7 |
+| 2.7 | Crate-level thresholds | Per-crate minimum coverage % | ALL crates 95% minimum | `ENFORCED` | Thresholds in `quality/crate-coverage-thresholds.toml`, enforced by CI + `make coverage` | Resolved |
 | 2.8 | Coverage ratcheting | Coverage % can only go up | Test count ratchets but coverage % doesn't | `GAP` | Test count guard exists, coverage % not gated | See Gap #7 |
 
 ---
@@ -518,7 +518,7 @@ services:
 
 - [ ] `cargo fmt --all` passes (pre-commit gate 1)
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf` passes (gate 2)
-- [ ] `cargo test --workspace` passes, all 477+ tests green (gate 3)
+- [ ] `cargo test --workspace` passes, all 2439+ tests green (gate 3)
 - [ ] Banned pattern scanner passes (gate 4)
 - [ ] O(1) latency scanner passes (gate 5)
 - [ ] Secret scanner passes on all staged files (gate 6)
@@ -575,13 +575,13 @@ services:
 
 ### Pre-Release
 
-- [ ] Coverage thresholds met: core/trading ≥ 95%, common/storage/api ≥ 90%, app ≥ 80%
+- [ ] Coverage thresholds met: ALL crates ≥ 95%
 - [ ] Benchmark regressions < 5% (all 10 baselines in quality_gates.md)
 - [ ] Docker image < 15MB (scratch base)
 - [ ] All TODOs/FIXMEs resolved in production code
 - [ ] Health check passes (POST /health)
 - [ ] Smoke test passes (1 tick end-to-end)
-- [ ] Release checklist complete (`docs/templates/release_checklist.md`)
+- [ ] Release checklist complete (`docs/templates/release-checklist.md`)
 - [ ] Parthiban approves
 
 ---

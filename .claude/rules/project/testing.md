@@ -23,9 +23,8 @@ fn test_<module>_<function>_<scenario>_<expected_outcome>()
 ```
 
 ## Coverage Thresholds
-- core/trading crates: 95%
-- common/storage/api crates: 90%
-- app/integration: 80%
+- ALL crates: 95% minimum (no exceptions)
+- Enforced by: `quality/crate-coverage-thresholds.toml` + CI + `make coverage` (99% local)
 
 ## Required Test Types (22 Categories — Mechanical Enforcement, SCOPED)
 **Canonical definition:** `docs/standards/22-test-types.md` (single source of truth).

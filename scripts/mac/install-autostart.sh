@@ -8,9 +8,9 @@
 # What it does:
 #   1. Copies all scripts to ~/.dlt/ (keeps repo clean)
 #   2. Installs TWO launchd agents:
-#      - com.dlt.trader   — daily 8:30 AM auto-start with crash recovery
+#      - com.dlt.trader   — daily 8:15 AM auto-start with crash recovery
 #      - com.dlt.watchdog  — every 5 min health monitor + auto-recovery
-#   3. Schedules Mac wake at 8:25 AM via pmset (requires sudo)
+#   3. Schedules Mac wake at 8:10 AM via pmset (requires sudo)
 #   4. Runs self-test to validate everything works
 #
 # To uninstall (clean removal for AWS migration):
@@ -161,7 +161,7 @@ if ! plutil -lint "${TRADER_PLIST}" >/dev/null 2>&1; then
     exit 1
 fi
 launchctl bootstrap "gui/$(id -u)" "${TRADER_PLIST}"
-echo -e "  ${GREEN}com.dlt.trader${NC} — daily at 8:30 AM (auto-start + crash recovery)"
+echo -e "  ${GREEN}com.dlt.trader${NC} — daily at 8:15 AM (auto-start + crash recovery)"
 
 # Install watchdog plist
 sed -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
@@ -178,11 +178,11 @@ echo -e "  ${GREEN}com.dlt.watchdog${NC} — every 5 minutes (health monitor + a
 
 # ---- 3. Schedule Mac wake ----
 echo ""
-echo -e "${CYAN}[3/4] Scheduling Mac wake at 8:25 AM${NC}"
+echo -e "${CYAN}[3/4] Scheduling Mac wake at 8:10 AM${NC}"
 echo -e "  ${YELLOW}This requires sudo (pmset repeating wakeorpoweron)${NC}"
 echo ""
-sudo pmset repeat wakeorpoweron MTWRFSU 08:25:00
-echo -e "  ${GREEN}Mac will wake at 8:25 AM every day${NC}"
+sudo pmset repeat wakeorpoweron MTWRFSU 08:10:00
+echo -e "  ${GREEN}Mac will wake at 8:10 AM every day${NC}"
 
 # ---- 4. Run self-test ----
 echo ""
@@ -199,8 +199,8 @@ echo -e "${GREEN}║                                                        ║$
 echo -e "${GREEN}║   Two layers of reliability:                           ║${NC}"
 echo -e "${GREEN}║                                                        ║${NC}"
 echo -e "${GREEN}║   Layer 1: Daily Auto-Start (com.dlt.trader)           ║${NC}"
-echo -e "${GREEN}║     8:25 AM — Mac wakes from sleep                     ║${NC}"
-echo -e "${GREEN}║     8:30 AM — Docker + infra + cargo run + IntelliJ    ║${NC}"
+echo -e "${GREEN}║     8:10 AM — Mac wakes from sleep                     ║${NC}"
+echo -e "${GREEN}║     8:15 AM — Docker + infra + cargo run + IntelliJ    ║${NC}"
 echo -e "${GREEN}║     Crash → auto-restart (5x max, exponential backoff) ║${NC}"
 echo -e "${GREEN}║     Telegram alert on every lifecycle event             ║${NC}"
 echo -e "${GREEN}║                                                        ║${NC}"
