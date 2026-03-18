@@ -1179,6 +1179,7 @@ fn spawn_historical_candle_fetch(
                     total_candles: 0,
                     persist_failures: 0,
                     failed_instruments: vec![],
+                    failure_reasons: std::collections::HashMap::new(),
                 });
                 return;
             }
@@ -1194,6 +1195,7 @@ fn spawn_historical_candle_fetch(
                     total_candles: 0,
                     persist_failures: 0,
                     failed_instruments: vec![],
+                    failure_reasons: std::collections::HashMap::new(),
                 });
                 return;
             }
@@ -1218,6 +1220,7 @@ fn spawn_historical_candle_fetch(
                 total_candles: summary.total_candles,
                 persist_failures: summary.persist_failures,
                 failed_instruments: summary.failed_instruments.clone(),
+                failure_reasons: summary.failure_reasons.clone(),
             });
         } else {
             bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
@@ -1304,6 +1307,7 @@ fn spawn_historical_candle_fetch(
                 total_candles: pm_summary.total_candles,
                 persist_failures: pm_summary.persist_failures,
                 failed_instruments: pm_summary.failed_instruments.clone(),
+                failure_reasons: pm_summary.failure_reasons.clone(),
             });
         } else {
             bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {

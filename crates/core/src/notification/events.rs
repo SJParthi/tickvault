@@ -114,6 +114,8 @@ pub enum NotificationEvent {
         persist_failures: usize,
         /// Symbol names of failed instruments (up to 50).
         failed_instruments: Vec<String>,
+        /// Breakdown of failure reasons: "token_expired", "network_or_api", "persist".
+        failure_reasons: std::collections::HashMap<String, usize>,
     },
 
     /// Candle cross-verification passed — all timeframes have expected coverage.
@@ -283,12 +285,19 @@ impl NotificationEvent {
                 total_candles,
                 persist_failures,
                 failed_instruments,
+                failure_reasons,
             } => {
                 let mut msg = format!(
                     "<b>Historical candle fetch — partial failure</b>\nFetched: {instruments_fetched}\nFailed: {instruments_failed}\nCandles: {total_candles}"
                 );
                 if *persist_failures > 0 {
                     msg.push_str(&format!("\nPersist errors: {persist_failures}"));
+                }
+                if !failure_reasons.is_empty() {
+                    msg.push_str("\n\n<b>Failure breakdown:</b>");
+                    for (reason, count) in failure_reasons {
+                        msg.push_str(&format!("\n\u{2022} {reason}: {count}"));
+                    }
                 }
                 if !failed_instruments.is_empty() {
                     msg.push_str("\n\n<b>Failed instruments:</b>");
@@ -668,6 +677,7 @@ mod tests {
             total_candles: 180000,
             persist_failures: 0,
             failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("partial failure"));
@@ -684,6 +694,7 @@ mod tests {
             total_candles: 180000,
             persist_failures: 0,
             failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         };
         assert_eq!(event.severity(), Severity::High);
     }
@@ -700,6 +711,7 @@ mod tests {
                 "NIFTY50 (IDX_I)".to_string(),
                 "BANKNIFTY (IDX_I)".to_string(),
             ],
+            failure_reasons: std::collections::HashMap::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("Failed instruments:"));
@@ -717,6 +729,7 @@ mod tests {
             total_candles: 160000,
             persist_failures: 0,
             failed_instruments: names,
+            failure_reasons: std::collections::HashMap::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("INST_0 (NSE_EQ)"));
@@ -736,9 +749,29 @@ mod tests {
             total_candles: 180000,
             persist_failures: 42,
             failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("Persist errors: 42"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_shows_failure_reasons() {
+        let mut reasons = std::collections::HashMap::new();
+        reasons.insert("token_expired".to_string(), 5);
+        reasons.insert("network_or_api".to_string(), 3);
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 224,
+            instruments_failed: 8,
+            total_candles: 168000,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: reasons,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Failure breakdown:"));
+        assert!(msg.contains("token_expired: 5"));
+        assert!(msg.contains("network_or_api: 3"));
     }
 
     #[test]
