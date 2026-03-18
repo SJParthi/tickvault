@@ -409,6 +409,30 @@ mod tests {
     }
 
     #[test]
+    fn all_views_include_segment_in_select() {
+        // segment must be a non-aggregated SELECT column in every view.
+        // QuestDB SAMPLE BY groups by all non-aggregated columns, so this
+        // ensures candles are never mixed across segments (e.g., IDX_I vs NSE_EQ).
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("segment"),
+                "view {} must include segment in SELECT to prevent cross-segment aggregation",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn candles_1s_ddl_has_segment_column() {
+        // The base table must have segment as a column for views to reference it.
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("segment SYMBOL"),
+            "candles_1s DDL must have segment SYMBOL column"
+        );
+    }
+
+    #[test]
     fn test_candles_1s_dedup_key_includes_segment() {
         // Prevents cross-segment collision when IDX_I and NSE_EQ share a
         // security_id (e.g., NIFTY index vs NIFTY equity).
