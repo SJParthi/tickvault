@@ -137,9 +137,21 @@ if ! start_docker; then
     exit 1
 fi
 
-# ---- 3. Fetch SSM secrets and start infra ----
-log "Fetching SSM secrets..."
+# ---- 3. Pull latest code from main ----
 cd "${PROJECT_DIR}"
+log "Pulling latest code..."
+if git fetch origin main >> "${LOG_FILE}" 2>&1 && git merge origin/main >> "${LOG_FILE}" 2>&1; then
+    COMMIT=$(git rev-parse --short HEAD)
+    log "Code updated to ${COMMIT}"
+    notify_all "Code updated to ${COMMIT}" "Git pull"
+else
+    COMMIT=$(git rev-parse --short HEAD)
+    log "WARNING: git pull failed — running existing code (${COMMIT})"
+    notify_all "WARNING: git pull failed — running ${COMMIT}" "Git failed"
+fi
+
+# ---- 4. Fetch SSM secrets and start infra ----
+log "Fetching SSM secrets..."
 
 REGION="ap-south-1"
 SSM_ENV="${ENVIRONMENT:-dev}"
@@ -169,7 +181,7 @@ export DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id
 export DLT_VALKEY_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/valkey/password")
 log "SSM secrets loaded"
 
-# ---- 4. Start infrastructure containers ----
+# ---- 5. Start infrastructure containers ----
 start_infra() {
     log "Starting infrastructure containers..."
     docker compose -f deploy/docker/docker-compose.yml up -d >> "${LOG_FILE}" 2>&1
@@ -190,7 +202,7 @@ start_infra() {
 
 start_infra
 
-# ---- 5. Open IntelliJ IDEA ----
+# ---- 6. Open IntelliJ IDEA ----
 log "Opening IntelliJ IDEA..."
 if [ -d "/Applications/IntelliJ IDEA.app" ]; then
     open -a "IntelliJ IDEA" "${PROJECT_DIR}" 2>/dev/null || true
@@ -200,7 +212,14 @@ else
     log "WARNING: IntelliJ IDEA not found in /Applications"
 fi
 
-# ---- 6. Start trading system with crash recovery ----
+# ---- 7. Open monitoring dashboards ----
+log "Opening monitoring dashboards..."
+open "http://localhost:3000" 2>/dev/null || true   # Grafana
+open "http://localhost:9000" 2>/dev/null || true   # QuestDB
+open "http://localhost:16686" 2>/dev/null || true  # Jaeger
+open "http://localhost:9090" 2>/dev/null || true   # Prometheus
+
+# ---- 8. Start trading system with crash recovery ----
 notify_all "Starting dhan-live-trader..." "Building"
 
 RESTART_COUNT=0

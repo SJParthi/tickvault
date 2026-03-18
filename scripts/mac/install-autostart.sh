@@ -176,13 +176,18 @@ fi
 launchctl bootstrap "gui/$(id -u)" "${WATCHDOG_PLIST}"
 echo -e "  ${GREEN}com.dlt.watchdog${NC} — every 5 minutes (health monitor + auto-recovery)"
 
-# ---- 3. Schedule Mac wake ----
+# ---- 3. Schedule Mac wake (skip if already set) ----
 echo ""
 echo -e "${CYAN}[3/4] Scheduling Mac wake at 8:10 AM${NC}"
-echo -e "  ${YELLOW}This requires sudo (pmset repeating wakeorpoweron)${NC}"
-echo ""
-sudo pmset repeat wakeorpoweron MTWRFSU 08:10:00
-echo -e "  ${GREEN}Mac will wake at 8:10 AM every day${NC}"
+
+if pmset -g sched 2>/dev/null | grep -qi "wake.*8:10"; then
+    echo -e "  ${GREEN}Already scheduled — skipping (no password needed)${NC}"
+else
+    echo -e "  ${YELLOW}This requires sudo (one-time only)${NC}"
+    echo ""
+    sudo pmset repeat wakeorpoweron MTWRFSU 08:10:00
+    echo -e "  ${GREEN}Mac will wake at 8:10 AM every day${NC}"
+fi
 
 # ---- 4. Run self-test ----
 echo ""
