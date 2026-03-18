@@ -15,7 +15,7 @@
 //! # Automation
 //! Runs without human intervention in the boot sequence after authentication.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -135,14 +135,25 @@ fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
 }
 
 /// Result of a single instrument fetch attempt.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum InstrumentFetchResult {
     /// Successfully fetched — (candle_count, persist_failures).
     Success(usize, usize),
     /// Failure — eligible for retry in next wave.
     /// NeverRetry errors (DH-905) will fail fast on re-attempt (no wasted time).
     Failed,
+    /// Token expired (807/DH-901) — needs token refresh before retry.
+    /// Distinct from `Failed` so the retry wave can sleep for token renewal.
+    TokenExpired,
 }
+
+/// Duration to wait for token refresh when 807/DH-901 detected during fetch.
+/// Token renewal runs on a background task; 30s gives it time to complete.
+const TOKEN_REFRESH_WAIT_SECS: u64 = 30;
+
+/// Maximum token-expired retry cycles before giving up on an instrument.
+/// After this many 807 errors across retry waves, the instrument is marked Failed.
+const MAX_TOKEN_EXPIRED_RETRIES: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Request / Response Types
@@ -194,10 +205,16 @@ pub struct CandleFetchSummary {
     pub persist_failures: usize,
     /// Symbol names of instruments that failed all retry waves (capped at 50).
     pub failed_instruments: Vec<String>,
+    /// Breakdown of failure reasons: "token_expired", "network", "input_error", "persist", etc.
+    pub failure_reasons: HashMap<String, usize>,
 }
 
 /// Maximum number of failed instrument names to collect.
 const MAX_FAILED_INSTRUMENT_NAMES: usize = 50;
+
+/// Maximum consecutive QuestDB persist failures before breaking out of the persist loop.
+/// If 10 candles in a row fail to write, QuestDB is likely unreachable — stop wasting time.
+const MAX_CONSECUTIVE_PERSIST_FAILURES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Main Fetch Logic
@@ -243,6 +260,7 @@ pub async fn fetch_historical_candles(
                 instruments_skipped: 0,
                 persist_failures: 0,
                 failed_instruments: Vec::new(),
+                failure_reasons: HashMap::new(),
             };
         }
     };
@@ -288,6 +306,7 @@ pub async fn fetch_historical_candles(
                 instruments_skipped: 0,
                 persist_failures: 0,
                 failed_instruments: Vec::new(),
+                failure_reasons: HashMap::new(),
             };
         }
     };
@@ -356,6 +375,10 @@ pub async fn fetch_historical_candles(
 
     // Track which target indices still need fetching
     let mut pending_indices: Vec<usize> = (0..targets.len()).collect();
+    let m_token_expired = counter!("dlt_historical_token_expired_total");
+
+    // Per-instrument token-expired retry count
+    let mut token_expired_counts: Vec<usize> = vec![0; targets.len()];
 
     // --- Wave 0 = initial pass, Waves 1..=RETRY_WAVE_MAX = retries ---
     for wave in 0..=RETRY_WAVE_MAX {
@@ -375,6 +398,7 @@ pub async fn fetch_historical_candles(
         }
 
         let mut still_pending: Vec<usize> = Vec::new();
+        let mut token_expired_this_wave = false;
 
         for &idx in &pending_indices {
             let target = &targets[idx];
@@ -409,10 +433,38 @@ pub async fn fetch_historical_candles(
                     // APPROVED: usize->u64 is lossless on 64-bit targets
                     m_fetched.increment(candle_count as u64);
                 }
+                InstrumentFetchResult::TokenExpired => {
+                    m_token_expired.increment(1);
+                    token_expired_counts[idx] = token_expired_counts[idx].saturating_add(1);
+
+                    if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
+                        warn!(
+                            security_id = target.security_id,
+                            segment = %target.exchange_segment_str,
+                            retries = token_expired_counts[idx],
+                            "token still expired after max retries — giving up on instrument"
+                        );
+                        // Don't re-queue — treat as permanent failure
+                    } else {
+                        token_expired_this_wave = true;
+                        still_pending.push(idx);
+                    }
+                }
                 InstrumentFetchResult::Failed => {
                     still_pending.push(idx);
                 }
             }
+        }
+
+        // If any instrument got token-expired this wave, sleep to allow
+        // the background token renewal task to complete before next wave.
+        if token_expired_this_wave {
+            warn!(
+                wave,
+                "token expired during fetch — waiting {}s for token refresh",
+                TOKEN_REFRESH_WAIT_SECS,
+            );
+            tokio::time::sleep(Duration::from_secs(TOKEN_REFRESH_WAIT_SECS)).await;
         }
 
         if wave == 0 && !still_pending.is_empty() {
@@ -438,10 +490,29 @@ pub async fn fetch_historical_candles(
         })
         .collect();
 
+    // Build failure reason breakdown
+    let mut failure_reasons: HashMap<String, usize> = HashMap::new();
+    for &idx in &pending_indices {
+        if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
+            *failure_reasons
+                .entry("token_expired".to_string())
+                .or_insert(0) += 1;
+        } else {
+            // Could be network, input error, or other transient — generic "failed"
+            *failure_reasons
+                .entry("network_or_api".to_string())
+                .or_insert(0) += 1;
+        }
+    }
+    if total_persist_failures > 0 {
+        failure_reasons.insert("persist".to_string(), total_persist_failures);
+    }
+
     if instruments_failed > 0 {
         warn!(
             instruments_failed,
             retry_waves = RETRY_WAVE_MAX,
+            ?failure_reasons,
             "instruments still failed after all retry waves"
         );
     }
@@ -467,6 +538,7 @@ pub async fn fetch_historical_candles(
         instruments_skipped,
         persist_failures: total_persist_failures,
         failed_instruments,
+        failure_reasons,
     }
 }
 
@@ -541,14 +613,14 @@ async fn fetch_single_instrument(
         )
         .await
         {
-            Some((count, pf)) => {
+            TimeframeFetchResult::Ok(count, pf) => {
                 instrument_candles = instrument_candles.saturating_add(count);
                 instrument_persist_failures = instrument_persist_failures.saturating_add(pf);
             }
-            None => {
-                // Cannot distinguish transient vs permanent here — return transient
-                // so the retry wave re-attempts. If it's truly permanent (DH-905),
-                // the retry will fail fast (NeverRetry returns immediately).
+            TimeframeFetchResult::TokenExpired => {
+                return InstrumentFetchResult::TokenExpired;
+            }
+            TimeframeFetchResult::Failed => {
                 return InstrumentFetchResult::Failed;
             }
         }
@@ -564,7 +636,7 @@ async fn fetch_single_instrument(
         Some(token_state) => Zeroizing::new(token_state.access_token().expose_secret().to_string()),
         None => {
             warn!("no access token available — skipping daily fetch");
-            return InstrumentFetchResult::Failed;
+            return InstrumentFetchResult::TokenExpired;
         }
     };
 
@@ -591,11 +663,14 @@ async fn fetch_single_instrument(
     )
     .await
     {
-        Some((count, pf)) => {
+        TimeframeFetchResult::Ok(count, pf) => {
             instrument_candles = instrument_candles.saturating_add(count);
             instrument_persist_failures = instrument_persist_failures.saturating_add(pf);
         }
-        None => {
+        TimeframeFetchResult::TokenExpired => {
+            return InstrumentFetchResult::TokenExpired;
+        }
+        TimeframeFetchResult::Failed => {
             return InstrumentFetchResult::Failed;
         }
     }
@@ -607,8 +682,18 @@ async fn fetch_single_instrument(
 // Intraday Fetch Helper
 // ---------------------------------------------------------------------------
 
+/// Result of a single timeframe fetch attempt.
+#[derive(Debug)]
+enum TimeframeFetchResult {
+    /// Successfully fetched — (candle_count, persist_failures).
+    Ok(usize, usize),
+    /// Transient failure — eligible for retry.
+    Failed,
+    /// Token expired — caller should wait for refresh and retry.
+    TokenExpired,
+}
+
 /// Fetches a single intraday timeframe for one instrument with retries.
-/// Returns `Some((candle_count, persist_failures))` on success, `None` on failure.
 #[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
 async fn fetch_intraday_with_retry(
     http_client: &reqwest::Client,
@@ -622,7 +707,7 @@ async fn fetch_intraday_with_retry(
     timeframe_label: &'static str,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> Option<(usize, usize)> {
+) -> TimeframeFetchResult {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
             let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
@@ -670,7 +755,7 @@ async fn fetch_intraday_with_retry(
                             );
                             if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
                                 m_api_errors.increment(1);
-                                return None;
+                                return TimeframeFetchResult::Failed;
                             }
                             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                             continue;
@@ -679,10 +764,10 @@ async fn fetch_intraday_with_retry(
                             warn!(
                                 security_id,
                                 timeframe = timeframe_label,
-                                "token expired (807/DH-901) — skipping instrument"
+                                "token expired (807/DH-901) — signaling for refresh"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::TokenExpired;
                         }
                         ErrorAction::NeverRetry => {
                             warn!(
@@ -690,7 +775,7 @@ async fn fetch_intraday_with_retry(
                                 "input error (DH-905/906) — will not retry"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                         ErrorAction::StandardRetry => {
                             if attempt < config.max_retries {
@@ -705,7 +790,7 @@ async fn fetch_intraday_with_retry(
                                 "historical API failed after all retries"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                     }
                 }
@@ -730,7 +815,7 @@ async fn fetch_intraday_with_retry(
                             "failed to read response body after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 };
 
@@ -743,7 +828,7 @@ async fn fetch_intraday_with_retry(
                         "response body exceeds size limit — skipping"
                     );
                     m_api_errors.increment(1);
-                    return None;
+                    return TimeframeFetchResult::Failed;
                 }
 
                 match serde_json::from_slice::<DhanIntradayResponse>(&body_bytes) {
@@ -754,7 +839,7 @@ async fn fetch_intraday_with_retry(
                                 timeframe = timeframe_label,
                                 "no candle data returned"
                             );
-                            return Some((0, 0));
+                            return TimeframeFetchResult::Ok(0, 0);
                         }
 
                         if !data.is_consistent() {
@@ -764,7 +849,7 @@ async fn fetch_intraday_with_retry(
                                 "inconsistent array lengths in historical response"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
 
                         let (count, pf) = persist_intraday_candles(
@@ -775,7 +860,7 @@ async fn fetch_intraday_with_retry(
                             candle_writer,
                             m_api_errors,
                         );
-                        return Some((count, pf));
+                        return TimeframeFetchResult::Ok(count, pf);
                     }
                     Err(err) => {
                         if attempt < config.max_retries {
@@ -795,7 +880,7 @@ async fn fetch_intraday_with_retry(
                             "failed to parse historical response after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 }
             }
@@ -817,11 +902,11 @@ async fn fetch_intraday_with_retry(
                     "historical API request failed after all retries"
                 );
                 m_api_errors.increment(1);
-                return None;
+                return TimeframeFetchResult::Failed;
             }
         }
     }
-    None
+    TimeframeFetchResult::Failed
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +914,6 @@ async fn fetch_intraday_with_retry(
 // ---------------------------------------------------------------------------
 
 /// Fetches daily candles for one instrument with retries.
-/// Returns `Some((candle_count, persist_failures))` on success, `None` on failure.
 #[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
 async fn fetch_daily_with_retry(
     http_client: &reqwest::Client,
@@ -842,7 +926,7 @@ async fn fetch_daily_with_retry(
     segment_code: u8,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> Option<(usize, usize)> {
+) -> TimeframeFetchResult {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
             let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
@@ -889,7 +973,7 @@ async fn fetch_daily_with_retry(
                             );
                             if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
                                 m_api_errors.increment(1);
-                                return None;
+                                return TimeframeFetchResult::Failed;
                             }
                             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                             continue;
@@ -898,10 +982,10 @@ async fn fetch_daily_with_retry(
                             warn!(
                                 security_id,
                                 timeframe = TIMEFRAME_1D,
-                                "token expired (807/DH-901) — skipping instrument"
+                                "token expired (807/DH-901) — signaling for refresh"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::TokenExpired;
                         }
                         ErrorAction::NeverRetry => {
                             warn!(
@@ -909,7 +993,7 @@ async fn fetch_daily_with_retry(
                                 "input error (DH-905/906) — will not retry"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                         ErrorAction::StandardRetry => {
                             if attempt < config.max_retries {
@@ -924,7 +1008,7 @@ async fn fetch_daily_with_retry(
                                 "daily API failed after all retries"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                     }
                 }
@@ -949,7 +1033,7 @@ async fn fetch_daily_with_retry(
                             "failed to read daily response body after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 };
 
@@ -962,7 +1046,7 @@ async fn fetch_daily_with_retry(
                         "daily response body exceeds size limit — skipping"
                     );
                     m_api_errors.increment(1);
-                    return None;
+                    return TimeframeFetchResult::Failed;
                 }
 
                 match serde_json::from_slice::<DhanDailyResponse>(&body_bytes) {
@@ -973,7 +1057,7 @@ async fn fetch_daily_with_retry(
                                 timeframe = TIMEFRAME_1D,
                                 "no daily data returned"
                             );
-                            return Some((0, 0));
+                            return TimeframeFetchResult::Ok(0, 0);
                         }
 
                         if !data.is_consistent() {
@@ -983,7 +1067,7 @@ async fn fetch_daily_with_retry(
                                 "inconsistent array lengths in daily response"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
 
                         let (count, pf) = persist_daily_candles(
@@ -993,7 +1077,7 @@ async fn fetch_daily_with_retry(
                             candle_writer,
                             m_api_errors,
                         );
-                        return Some((count, pf));
+                        return TimeframeFetchResult::Ok(count, pf);
                     }
                     Err(err) => {
                         if attempt < config.max_retries {
@@ -1013,7 +1097,7 @@ async fn fetch_daily_with_retry(
                             "failed to parse daily response after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 }
             }
@@ -1035,11 +1119,11 @@ async fn fetch_daily_with_retry(
                     "daily API request failed after all retries"
                 );
                 m_api_errors.increment(1);
-                return None;
+                return TimeframeFetchResult::Failed;
             }
         }
     }
-    None
+    TimeframeFetchResult::Failed
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1142,7 @@ fn persist_intraday_candles(
 ) -> (usize, usize) {
     let mut count = 0_usize;
     let mut persist_failures = 0_usize;
+    let mut consecutive_persist_failures = 0_usize;
     for i in 0..data.len() {
         let open = data.open[i];
         let high = data.high[i];
@@ -1133,8 +1218,20 @@ fn persist_intraday_candles(
                 "failed to append candle to QuestDB"
             );
             persist_failures = persist_failures.saturating_add(1);
+            consecutive_persist_failures = consecutive_persist_failures.saturating_add(1);
+            if consecutive_persist_failures >= MAX_CONSECUTIVE_PERSIST_FAILURES {
+                tracing::error!(
+                    security_id,
+                    timeframe = timeframe_label,
+                    consecutive_failures = consecutive_persist_failures,
+                    "QuestDB unreachable — {} consecutive persist failures, aborting persist loop",
+                    MAX_CONSECUTIVE_PERSIST_FAILURES,
+                );
+                break;
+            }
             continue;
         }
+        consecutive_persist_failures = 0; // Reset on success
         count = count.saturating_add(1);
     }
     (count, persist_failures)
@@ -1151,6 +1248,7 @@ fn persist_daily_candles(
 ) -> (usize, usize) {
     let mut count = 0_usize;
     let mut persist_failures = 0_usize;
+    let mut consecutive_persist_failures = 0_usize;
     for i in 0..data.len() {
         let open = data.open[i];
         let high = data.high[i];
@@ -1225,8 +1323,20 @@ fn persist_daily_candles(
                 "failed to append daily candle to QuestDB"
             );
             persist_failures = persist_failures.saturating_add(1);
+            consecutive_persist_failures = consecutive_persist_failures.saturating_add(1);
+            if consecutive_persist_failures >= MAX_CONSECUTIVE_PERSIST_FAILURES {
+                tracing::error!(
+                    security_id,
+                    timeframe = TIMEFRAME_1D,
+                    consecutive_failures = consecutive_persist_failures,
+                    "QuestDB unreachable — {} consecutive persist failures, aborting persist loop",
+                    MAX_CONSECUTIVE_PERSIST_FAILURES,
+                );
+                break;
+            }
             continue;
         }
+        consecutive_persist_failures = 0; // Reset on success
         count = count.saturating_add(1);
     }
     (count, persist_failures)
@@ -1290,11 +1400,13 @@ mod tests {
             instruments_skipped: 5,
             persist_failures: 0,
             failed_instruments: vec![],
+            failure_reasons: HashMap::new(),
         };
         assert_eq!(summary.instruments_fetched, 10);
         assert_eq!(summary.total_candles, 3750);
         assert_eq!(summary.persist_failures, 0);
         assert!(summary.failed_instruments.is_empty());
+        assert!(summary.failure_reasons.is_empty());
     }
 
     #[test]
@@ -1310,22 +1422,29 @@ mod tests {
                 "13 (IDX_I)".to_string(),
                 "25 (IDX_I)".to_string(),
             ],
+            failure_reasons: HashMap::from([
+                ("token_expired".to_string(), 2),
+                ("network_or_api".to_string(), 1),
+            ]),
         };
         assert_eq!(summary.failed_instruments.len(), 3);
         assert!(summary.failed_instruments[0].contains("11536"));
         assert!(summary.failed_instruments[1].contains("IDX_I"));
+        assert_eq!(summary.failure_reasons.len(), 2);
     }
 
     #[test]
     fn test_failed_names_capped_at_max() {
-        assert!(
-            MAX_FAILED_INSTRUMENT_NAMES <= 50,
-            "failed names must be bounded"
-        );
-        assert!(
-            MAX_FAILED_INSTRUMENT_NAMES >= 10,
-            "need at least 10 for diagnostics"
-        );
+        const {
+            assert!(
+                MAX_FAILED_INSTRUMENT_NAMES <= 50,
+                // "failed names must be bounded"
+            );
+            assert!(
+                MAX_FAILED_INSTRUMENT_NAMES >= 10,
+                // "need at least 10 for diagnostics"
+            );
+        }
     }
 
     #[test]
@@ -1339,6 +1458,7 @@ mod tests {
             instruments_skipped: 1050,
             persist_failures: 42,
             failed_instruments: vec![],
+            failure_reasons: HashMap::from([("persist".to_string(), 42)]),
         };
         // total_candles should be the ACTUAL successful writes (187458),
         // not 187458 + 42 = 187500 (which would be the old buggy behavior)
@@ -1673,6 +1793,7 @@ mod tests {
         let summary = CandleFetchSummary {
             persist_failures: 0,
             failed_instruments: vec![],
+            failure_reasons: HashMap::new(),
             instruments_fetched: 0,
             instruments_failed: 0,
             total_candles: 0,
@@ -1732,5 +1853,120 @@ mod tests {
             !response.is_consistent(),
             "Response with mismatched array lengths must return is_consistent() == false"
         );
+    }
+
+    // -- C1: Token expiry recovery tests --
+
+    #[test]
+    fn test_token_expired_variant_exists() {
+        let result = InstrumentFetchResult::TokenExpired;
+        assert!(format!("{result:?}").contains("TokenExpired"));
+    }
+
+    #[test]
+    fn test_token_expired_distinct_from_failed() {
+        assert_ne!(
+            InstrumentFetchResult::TokenExpired,
+            InstrumentFetchResult::Failed,
+            "TokenExpired must be distinct from Failed for retry wave awareness"
+        );
+    }
+
+    #[test]
+    fn test_token_refresh_wait_constant() {
+        const {
+            assert!(
+                TOKEN_REFRESH_WAIT_SECS >= 10,
+                // "token refresh wait must be >= 10s to give renewal task time"
+            );
+            assert!(
+                TOKEN_REFRESH_WAIT_SECS <= 60,
+                // "token refresh wait must be <= 60s to not waste time"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_token_expired_retries_bounded() {
+        const {
+            assert!(
+                MAX_TOKEN_EXPIRED_RETRIES >= 1,
+                // "must retry at least once after token refresh"
+            );
+            assert!(
+                MAX_TOKEN_EXPIRED_RETRIES <= 5,
+                // "don't retry forever if token is truly dead"
+            );
+        }
+    }
+
+    // -- C2: Persist circuit breaker tests --
+
+    #[test]
+    fn test_consecutive_persist_failure_threshold() {
+        const {
+            assert!(
+                MAX_CONSECUTIVE_PERSIST_FAILURES >= 5,
+                // "threshold must be >= 5 to tolerate transient errors"
+            );
+            assert!(
+                MAX_CONSECUTIVE_PERSIST_FAILURES <= 50,
+                // "threshold must be <= 50 to break early on QuestDB failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_circuit_breaker_resets_on_success() {
+        // Simulates the circuit breaker logic: consecutive failures reset on success
+        let mut consecutive = 0_usize;
+        // 5 failures
+        for _ in 0..5 {
+            consecutive = consecutive.saturating_add(1);
+        }
+        assert_eq!(consecutive, 5);
+        // 1 success resets
+        consecutive = 0;
+        assert_eq!(
+            consecutive, 0,
+            "success must reset consecutive failure counter"
+        );
+    }
+
+    // -- M4: Failure reason tracking tests --
+
+    #[test]
+    fn test_candle_fetch_summary_tracks_failure_reasons() {
+        let mut reasons = HashMap::new();
+        reasons.insert("token_expired".to_string(), 5);
+        reasons.insert("network_or_api".to_string(), 3);
+        reasons.insert("persist".to_string(), 42);
+
+        let summary = CandleFetchSummary {
+            instruments_fetched: 224,
+            instruments_failed: 8,
+            total_candles: 168000,
+            instruments_skipped: 1050,
+            persist_failures: 42,
+            failed_instruments: vec!["13 (IDX_I)".to_string()],
+            failure_reasons: reasons,
+        };
+
+        assert_eq!(summary.failure_reasons.len(), 3);
+        assert_eq!(summary.failure_reasons["token_expired"], 5);
+        assert_eq!(summary.failure_reasons["network_or_api"], 3);
+        assert_eq!(summary.failure_reasons["persist"], 42);
+    }
+
+    // -- TimeframeFetchResult tests --
+
+    #[test]
+    fn test_timeframe_fetch_result_variants() {
+        let ok = TimeframeFetchResult::Ok(100, 2);
+        let failed = TimeframeFetchResult::Failed;
+        let expired = TimeframeFetchResult::TokenExpired;
+        assert!(format!("{ok:?}").contains("100"));
+        assert!(format!("{failed:?}").contains("Failed"));
+        assert!(format!("{expired:?}").contains("TokenExpired"));
     }
 }

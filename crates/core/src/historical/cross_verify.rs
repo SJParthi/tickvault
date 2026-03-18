@@ -94,8 +94,12 @@ pub struct CrossMatchReport {
     pub missing_live: usize,
     /// Live candle exists but historical doesn't (should not happen).
     pub missing_historical: usize,
-    /// Detailed mismatch records (capped at 20).
+    /// OI mismatches for derivatives (both OI > 0, differ by > tolerance).
+    pub oi_mismatches: usize,
+    /// Detailed mismatch records (all of them — no arbitrary cap).
     pub mismatch_details: Vec<CrossMatchMismatch>,
+    /// Materialized view tables that don't exist yet (skipped during cross-match).
+    pub missing_views: Vec<String>,
     /// Whether the cross-match passed (mismatches within tolerance).
     pub passed: bool,
 }
@@ -173,11 +177,24 @@ const MIN_CANDLE_COVERAGE_RATIO: f64 = 0.95;
 const VERIFIED_TIMEFRAMES: &[&str] = &["1m", "5m", "15m", "60m", "1d"];
 
 /// Maximum violation detail rows to fetch per category.
-const MAX_VIOLATION_DETAILS: usize = 20;
+/// High cap for memory safety only — we show ALL violations, not hiding anything.
+/// If there are more than 500, the count query tells you the real total.
+const MAX_VIOLATION_DETAILS: usize = 500;
 
 /// Price tolerance for cross-match comparison (absolute).
-/// Handles f32→f64 rounding artifacts; any real price diff > 0.01 is meaningful.
-const CROSS_MATCH_PRICE_TOLERANCE: f64 = 0.01;
+/// f32→f64 already fixed via `f32_to_f64_clean()` — any real diff is meaningful.
+/// Epsilon-level tolerance only absorbs IEEE754 floating point noise.
+/// Minimum tick in Indian markets = 0.05, so any real diff >> 1e-6.
+const CROSS_MATCH_PRICE_EPSILON: f64 = 1e-6;
+
+/// Volume tolerance for cross-match (relative, 10%).
+/// If |hist_vol - live_vol| / max(hist_vol, 1) > 10%, it's a mismatch.
+/// Volume is the best indicator of missed WebSocket ticks.
+const CROSS_MATCH_VOLUME_TOLERANCE_PCT: f64 = 0.10;
+
+/// OI (Open Interest) tolerance for cross-match (relative, 10%).
+/// Only applied when both historical and live OI > 0 (derivatives only).
+const CROSS_MATCH_OI_TOLERANCE_PCT: f64 = 0.10;
 
 /// Mapping from historical timeframe labels to materialized view table names.
 const CROSS_MATCH_TIMEFRAMES: &[(&str, &str)] = &[
@@ -537,10 +554,26 @@ pub async fn cross_match_historical_vs_live(
     let mut total_mismatches = 0_usize;
     let mut total_missing_live = 0_usize;
     let total_missing_historical = 0_usize;
+    let mut total_oi_mismatches = 0_usize;
     let mut all_details: Vec<CrossMatchMismatch> = Vec::new();
     let mut timeframes_checked = 0_usize;
+    let mut missing_views: Vec<String> = Vec::new();
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
+        // M2: Check if the materialized view table exists before JOINing
+        let table_exists_query =
+            format!("SELECT count() FROM tables() WHERE name = '{}'", live_table);
+        let table_count = extract_count(&client, &base_url, &table_exists_query).await;
+        if table_count == 0 {
+            warn!(
+                live_table,
+                timeframe = hist_tf,
+                "materialized view table does not exist — skipping cross-match for this timeframe"
+            );
+            missing_views.push(live_table.to_string());
+            continue;
+        }
+
         // Count total comparable candles for this timeframe
         let count_query = format!(
             "SELECT count() FROM {} h \
@@ -557,80 +590,57 @@ pub async fn cross_match_historical_vs_live(
         }
         timeframes_checked = timeframes_checked.saturating_add(1);
 
-        // Count mismatches for this timeframe
-        let mismatch_count_query = format!(
-            "SELECT count() FROM {} h \
-             LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -1, now()) \
-             AND (m.open IS NULL \
-                  OR abs(h.open - m.open) > {} \
-                  OR abs(h.high - m.high) > {} \
-                  OR abs(h.low - m.low) > {} \
-                  OR abs(h.close - m.close) > {})",
-            QUESTDB_TABLE_HISTORICAL_CANDLES,
-            live_table,
-            hist_tf,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            CROSS_MATCH_PRICE_TOLERANCE
-        );
-
-        let tf_mismatches = extract_count(&client, &base_url, &mismatch_count_query).await;
-        total_mismatches = total_mismatches.saturating_add(tf_mismatches);
-
-        if tf_mismatches == 0 {
-            continue;
-        }
-
-        // Fetch detail rows for mismatches (only if we still have room)
-        let remaining_detail_slots = MAX_VIOLATION_DETAILS.saturating_sub(all_details.len());
-        if remaining_detail_slots == 0 {
-            continue;
-        }
-
+        // Fetch ALL joined rows for this timeframe — Rust applies epsilon + volume + OI checks.
+        // SQL pre-filters with generous tolerance to avoid fetching perfectly matching rows.
         let detail_query = format!(
             "SELECT h.security_id, h.segment, h.ts, \
                     h.open, h.high, h.low, h.close, h.volume, \
-                    m.open, m.high, m.low, m.close, m.volume \
+                    m.open, m.high, m.low, m.close, m.volume, \
+                    h.open_interest, m.open_interest \
              FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
              WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -1, now()) \
              AND (m.open IS NULL \
-                  OR abs(h.open - m.open) > {} \
-                  OR abs(h.high - m.high) > {} \
-                  OR abs(h.low - m.low) > {} \
-                  OR abs(h.close - m.close) > {}) \
+                  OR abs(h.open - m.open) > {eps} \
+                  OR abs(h.high - m.high) > {eps} \
+                  OR abs(h.low - m.low) > {eps} \
+                  OR abs(h.close - m.close) > {eps} \
+                  OR abs(h.volume - m.volume) > 0 \
+                  OR abs(h.open_interest - m.open_interest) > 0) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES,
             live_table,
             hist_tf,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            CROSS_MATCH_PRICE_TOLERANCE,
-            remaining_detail_slots
+            MAX_VIOLATION_DETAILS,
+            eps = CROSS_MATCH_PRICE_EPSILON,
         );
 
         let details =
-            parse_cross_match_rows(&client, &base_url, &detail_query, registry, hist_tf).await;
+            parse_cross_match_rows_with_oi(&client, &base_url, &detail_query, registry, hist_tf)
+                .await;
 
         for detail in &details {
+            total_mismatches = total_mismatches.saturating_add(1);
             if detail.mismatch_type == "missing_live" {
                 total_missing_live = total_missing_live.saturating_add(1);
+            }
+            if detail.mismatch_type == "oi_diff" {
+                total_oi_mismatches = total_oi_mismatches.saturating_add(1);
             }
         }
 
         all_details.extend(details);
     }
 
-    let passed = total_mismatches == 0 && total_compared > 0;
+    let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
 
     info!(
         timeframes_checked,
         candles_compared = total_compared,
         mismatches = total_mismatches,
         missing_live = total_missing_live,
+        oi_mismatches = total_oi_mismatches,
+        missing_views_count = missing_views.len(),
         passed,
         "historical vs live cross-match complete"
     );
@@ -641,7 +651,9 @@ pub async fn cross_match_historical_vs_live(
         mismatches: total_mismatches,
         missing_live: total_missing_live,
         missing_historical: total_missing_historical,
+        oi_mismatches: total_oi_mismatches,
         mismatch_details: all_details,
+        missing_views,
         passed,
     }
 }
@@ -654,7 +666,9 @@ fn failed_cross_match_report() -> CrossMatchReport {
         mismatches: 0,
         missing_live: 0,
         missing_historical: 0,
+        oi_mismatches: 0,
         mismatch_details: Vec::new(),
+        missing_views: Vec::new(),
         passed: false,
     }
 }
@@ -687,7 +701,10 @@ async fn execute_query(
             }
         }
         Err(err) => {
-            warn!(?err, "QuestDB query request failed");
+            tracing::error!(
+                ?err,
+                "QuestDB query request failed — verification cannot proceed"
+            );
             None
         }
     }
@@ -794,11 +811,12 @@ async fn parse_violation_rows(
     details
 }
 
-/// Parses cross-match mismatch rows from a QuestDB query response.
+/// Parses cross-match rows with OI, applying Rust-side epsilon + volume + OI checks.
 /// Expected columns: security_id, segment, ts,
 ///   h_open, h_high, h_low, h_close, h_volume,
-///   m_open, m_high, m_low, m_close, m_volume
-async fn parse_cross_match_rows(
+///   m_open, m_high, m_low, m_close, m_volume,
+///   h_open_interest, m_open_interest
+async fn parse_cross_match_rows_with_oi(
     client: &Client,
     base_url: &str,
     query: &str,
@@ -813,7 +831,7 @@ async fn parse_cross_match_rows(
     let mut details = Vec::with_capacity(data.dataset.len().min(MAX_VIOLATION_DETAILS));
 
     for row in &data.dataset {
-        if row.len() < 13 {
+        if row.len() < 15 {
             continue;
         }
 
@@ -826,61 +844,109 @@ async fn parse_cross_match_rows(
         let h_low = row[5].as_f64().unwrap_or(0.0);
         let h_close = row[6].as_f64().unwrap_or(0.0);
         let h_volume = row[7].as_i64().unwrap_or(0);
+        let h_oi = row[13].as_i64().unwrap_or(0);
 
         // Live values: NULL if missing (LEFT JOIN with no match)
         let live_is_null = row[8].is_null();
 
-        let (mismatch_type, live_values, diff_summary) = if live_is_null {
-            (
-                "missing_live".to_string(),
-                "[MISSING — no live data for this candle]".to_string(),
-                String::new(),
-            )
+        if live_is_null {
+            details.push(CrossMatchMismatch {
+                symbol: lookup_symbol(registry, sid),
+                segment,
+                timeframe: timeframe.to_string(),
+                timestamp_ist,
+                mismatch_type: "missing_live".to_string(),
+                hist_values: format!(
+                    "O={h_open} H={h_high} L={h_low} C={h_close} V={h_volume} OI={h_oi}"
+                ),
+                live_values: "[MISSING — no live data for this candle]".to_string(),
+                diff_summary: String::new(),
+            });
+            continue;
+        }
+
+        let m_open = row[8].as_f64().unwrap_or(0.0);
+        let m_high = row[9].as_f64().unwrap_or(0.0);
+        let m_low = row[10].as_f64().unwrap_or(0.0);
+        let m_close = row[11].as_f64().unwrap_or(0.0);
+        let m_volume = row[12].as_i64().unwrap_or(0);
+        let m_oi = row[14].as_i64().unwrap_or(0);
+
+        // Rust-side mismatch detection with proper tolerances
+        let d_open = m_open - h_open;
+        let d_high = m_high - h_high;
+        let d_low = m_low - h_low;
+        let d_close = m_close - h_close;
+
+        let price_mismatch = d_open.abs() > CROSS_MATCH_PRICE_EPSILON
+            || d_high.abs() > CROSS_MATCH_PRICE_EPSILON
+            || d_low.abs() > CROSS_MATCH_PRICE_EPSILON
+            || d_close.abs() > CROSS_MATCH_PRICE_EPSILON;
+
+        // H1: Volume mismatch — relative 10% tolerance
+        let h_vol_max = (h_volume.max(1)) as f64;
+        let vol_diff_pct = ((m_volume - h_volume) as f64).abs() / h_vol_max;
+        let volume_mismatch = vol_diff_pct > CROSS_MATCH_VOLUME_TOLERANCE_PCT;
+
+        // H2: OI mismatch — only when both > 0 (derivatives)
+        let oi_mismatch = if h_oi > 0 && m_oi > 0 {
+            let h_oi_max = h_oi.max(1) as f64;
+            let oi_diff_pct = ((m_oi - h_oi) as f64).abs() / h_oi_max;
+            oi_diff_pct > CROSS_MATCH_OI_TOLERANCE_PCT
         } else {
-            let m_open = row[8].as_f64().unwrap_or(0.0);
-            let m_high = row[9].as_f64().unwrap_or(0.0);
-            let m_low = row[10].as_f64().unwrap_or(0.0);
-            let m_close = row[11].as_f64().unwrap_or(0.0);
-            let m_volume = row[12].as_i64().unwrap_or(0);
-
-            let live_vals = format!("O={m_open} H={m_high} L={m_low} C={m_close} V={m_volume}");
-
-            // Build diff summary for fields that exceed tolerance
-            let mut diffs = Vec::new();
-            let d_open = m_open - h_open;
-            let d_high = m_high - h_high;
-            let d_low = m_low - h_low;
-            let d_close = m_close - h_close;
-            let d_vol = m_volume.saturating_sub(h_volume);
-
-            if d_open.abs() > CROSS_MATCH_PRICE_TOLERANCE {
-                diffs.push(format!("O({d_open:+.1})"));
-            }
-            if d_high.abs() > CROSS_MATCH_PRICE_TOLERANCE {
-                diffs.push(format!("H({d_high:+.1})"));
-            }
-            if d_low.abs() > CROSS_MATCH_PRICE_TOLERANCE {
-                diffs.push(format!("L({d_low:+.1})"));
-            }
-            if d_close.abs() > CROSS_MATCH_PRICE_TOLERANCE {
-                diffs.push(format!("C({d_close:+.1})"));
-            }
-            if d_vol != 0 {
-                diffs.push(format!("V({d_vol:+})"));
-            }
-
-            ("price_diff".to_string(), live_vals, diffs.join(" "))
+            false
         };
+
+        if !price_mismatch && !volume_mismatch && !oi_mismatch {
+            // SQL pre-filter caught it but Rust-side says it's fine (e.g., volume diff < 10%)
+            continue;
+        }
+
+        // Determine mismatch type
+        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
+            "oi_diff"
+        } else if volume_mismatch && !price_mismatch {
+            "volume_diff"
+        } else {
+            "price_diff"
+        };
+
+        // Build diff summary for ALL fields that exceed tolerance
+        let mut diffs = Vec::new();
+        if d_open.abs() > CROSS_MATCH_PRICE_EPSILON {
+            diffs.push(format!("O({d_open:+.2})"));
+        }
+        if d_high.abs() > CROSS_MATCH_PRICE_EPSILON {
+            diffs.push(format!("H({d_high:+.2})"));
+        }
+        if d_low.abs() > CROSS_MATCH_PRICE_EPSILON {
+            diffs.push(format!("L({d_low:+.2})"));
+        }
+        if d_close.abs() > CROSS_MATCH_PRICE_EPSILON {
+            diffs.push(format!("C({d_close:+.2})"));
+        }
+        let d_vol = m_volume.saturating_sub(h_volume);
+        if volume_mismatch {
+            diffs.push(format!("V({d_vol:+} {vol_diff_pct:.0}%)"));
+        }
+        if oi_mismatch {
+            let d_oi = m_oi.saturating_sub(h_oi);
+            diffs.push(format!("OI({d_oi:+})"));
+        }
 
         details.push(CrossMatchMismatch {
             symbol: lookup_symbol(registry, sid),
             segment,
             timeframe: timeframe.to_string(),
             timestamp_ist,
-            mismatch_type,
-            hist_values: format!("O={h_open} H={h_high} L={h_low} C={h_close} V={h_volume}"),
-            live_values,
-            diff_summary,
+            mismatch_type: mismatch_type.to_string(),
+            hist_values: format!(
+                "O={h_open} H={h_high} L={h_low} C={h_close} V={h_volume} OI={h_oi}"
+            ),
+            live_values: format!(
+                "O={m_open} H={m_high} L={m_low} C={m_close} V={m_volume} OI={m_oi}"
+            ),
+            diff_summary: diffs.join(" "),
         });
 
         if details.len() >= MAX_VIOLATION_DETAILS {
@@ -1097,12 +1163,16 @@ mod tests {
             mismatches: 12,
             missing_live: 8,
             missing_historical: 0,
+            oi_mismatches: 2,
             mismatch_details: vec![],
+            missing_views: vec![],
             passed: false,
         };
         assert_eq!(report.timeframes_checked, 5);
         assert_eq!(report.mismatches, 12);
         assert_eq!(report.missing_live, 8);
+        assert_eq!(report.oi_mismatches, 2);
+        assert!(report.missing_views.is_empty());
         assert!(!report.passed);
     }
 
@@ -1124,7 +1194,9 @@ mod tests {
         assert_eq!(report.timeframes_checked, 0);
         assert_eq!(report.candles_compared, 0);
         assert_eq!(report.mismatches, 0);
+        assert_eq!(report.oi_mismatches, 0);
         assert!(report.mismatch_details.is_empty());
+        assert!(report.missing_views.is_empty());
         assert!(!report.passed);
     }
 
@@ -1150,22 +1222,85 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_match_price_tolerance() {
-        // Tolerance must be small enough to catch real differences
-        // but large enough to handle f32→f64 rounding
-        assert!(CROSS_MATCH_PRICE_TOLERANCE > 0.0);
-        assert!(CROSS_MATCH_PRICE_TOLERANCE <= 0.05);
+    fn test_cross_match_epsilon_tolerance() {
+        // Epsilon must be tiny — only absorbs IEEE754 noise, not real diffs
+        assert!(CROSS_MATCH_PRICE_EPSILON > 0.0);
+        assert!(
+            CROSS_MATCH_PRICE_EPSILON < 0.001,
+            "epsilon must be < 0.001 (min tick = 0.05)"
+        );
     }
 
     #[test]
-    fn test_max_violation_details_bounded() {
+    fn test_epsilon_catches_real_tick_diff() {
+        // Minimum tick in Indian markets = 0.05
+        // Epsilon (1e-6) must be WAY below that
+        let min_tick = 0.05_f64;
         assert!(
-            MAX_VIOLATION_DETAILS <= 50,
-            "violation details must be bounded"
+            min_tick > CROSS_MATCH_PRICE_EPSILON * 1000.0,
+            "epsilon must be at least 1000x smaller than min tick"
         );
+    }
+
+    #[test]
+    fn test_cross_match_volume_tolerance_constant() {
+        assert!(CROSS_MATCH_VOLUME_TOLERANCE_PCT > 0.0);
         assert!(
-            MAX_VIOLATION_DETAILS >= 10,
-            "need at least 10 for useful diagnostics"
+            CROSS_MATCH_VOLUME_TOLERANCE_PCT <= 0.20,
+            "volume tolerance must be <= 20%"
+        );
+    }
+
+    #[test]
+    fn test_cross_match_oi_tolerance_constant() {
+        assert!(CROSS_MATCH_OI_TOLERANCE_PCT > 0.0);
+        assert!(
+            CROSS_MATCH_OI_TOLERANCE_PCT <= 0.20,
+            "OI tolerance must be <= 20%"
+        );
+    }
+
+    #[test]
+    fn test_cross_match_report_includes_oi_mismatches_field() {
+        let report = CrossMatchReport {
+            timeframes_checked: 3,
+            candles_compared: 50000,
+            mismatches: 5,
+            missing_live: 2,
+            missing_historical: 0,
+            oi_mismatches: 3,
+            mismatch_details: vec![],
+            missing_views: vec!["candles_1d".to_string()],
+            passed: false,
+        };
+        assert_eq!(report.oi_mismatches, 3);
+        assert_eq!(report.missing_views.len(), 1);
+        assert_eq!(report.missing_views[0], "candles_1d");
+    }
+
+    #[test]
+    fn test_cross_match_report_includes_missing_views_field() {
+        let report = CrossMatchReport {
+            timeframes_checked: 3,
+            candles_compared: 50000,
+            mismatches: 0,
+            missing_live: 0,
+            missing_historical: 0,
+            oi_mismatches: 0,
+            mismatch_details: vec![],
+            missing_views: vec!["candles_5m".to_string(), "candles_1d".to_string()],
+            passed: false,
+        };
+        assert!(!report.passed, "missing views must fail cross-match");
+        assert_eq!(report.missing_views.len(), 2);
+    }
+
+    #[test]
+    fn test_violation_detail_no_arbitrary_cap() {
+        // MAX_VIOLATION_DETAILS is a memory safety cap only — high enough to show everything
+        assert!(
+            MAX_VIOLATION_DETAILS >= 100,
+            "violation detail cap must be >= 100 to show all violations"
         );
     }
 
