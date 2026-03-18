@@ -180,7 +180,7 @@ echo -e "  ${GREEN}com.dlt.watchdog${NC} — every 5 minutes (health monitor + a
 echo ""
 echo -e "${CYAN}[3/4] Scheduling Mac wake at 8:10 AM${NC}"
 
-if pmset -g sched 2>/dev/null | grep -qi "wake.*08:10"; then
+if pmset -g sched 2>/dev/null | grep -qi "wake.*8:10"; then
     echo -e "  ${GREEN}Already scheduled — skipping (no password needed)${NC}"
 else
     echo -e "  ${YELLOW}This requires sudo (one-time only)${NC}"
