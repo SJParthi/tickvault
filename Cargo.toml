@@ -15,7 +15,7 @@ license = "MIT"
 tokio = { version = "1.49.0", features = ["full"] }
 
 # ---- Section 2: Backend Core — WebSocket ----
-tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3.31"
 
 # ---- Section 2: Backend Core — Zero-Copy Parsing ----
