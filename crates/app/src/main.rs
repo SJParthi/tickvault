@@ -46,9 +46,7 @@ use dhan_live_trader_common::trading_calendar::TradingCalendar;
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
-use dhan_live_trader_core::historical::candle_fetcher::{
-    duration_until_post_market_fetch, fetch_historical_candles,
-};
+use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
 use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
 use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
 use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
@@ -1243,29 +1241,10 @@ fn spawn_historical_candle_fetch(
             "background historical candle fetch complete"
         );
 
-        // --- Post-market re-fetch: wait for disconnect signal OR 15:35 IST timer ---
-        let wait_duration = duration_until_post_market_fetch();
-        if wait_duration > std::time::Duration::ZERO {
-            info!(
-                wait_secs = wait_duration.as_secs(),
-                "waiting for post-market signal or 15:35 IST for re-fetch"
-            );
-            // Wait for either the post-market disconnect signal or the timer
-            tokio::select! {
-                () = post_market_signal.notified() => {
-                    // Add buffer after disconnect for Dhan to finalize data
-                    info!("post-market disconnect signal received — waiting for data finalization");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        dhan_live_trader_common::constants::POST_MARKET_DATA_FINALIZATION_SECS,
-                    )).await;
-                }
-                () = tokio::time::sleep(wait_duration) => {
-                    info!("15:35 IST reached — starting post-market re-fetch");
-                }
-            }
-        } else {
-            info!("past 15:35 IST — running post-market re-fetch immediately");
-        }
+        // --- Post-market re-fetch: wait for disconnect signal, then fetch immediately ---
+        info!("waiting for post-market WebSocket disconnect signal to start re-fetch");
+        post_market_signal.notified().await;
+        info!("post-market disconnect signal received — starting historical re-fetch immediately");
 
         // Re-create writer for post-market fetch (previous may have been consumed)
         let mut pm_candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
@@ -1649,12 +1628,32 @@ async fn run_shutdown_fast(
         // Signal historical fetch task to start post-market re-fetch
         post_market_signal.notify_one();
 
-        info!("post-market: real-time pipeline stopped, API/dashboard still running");
-        info!("press Ctrl+C for full shutdown");
+        info!(
+            "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
+        );
 
-        // Phase 2: Wait for Ctrl+C for full shutdown
-        let _ = tokio::signal::ctrl_c().await;
-        info!("shutdown signal received — stopping remaining services");
+        // Phase 2: Auto-shutdown at APP_SHUTDOWN_TIME (16:00 IST) or Ctrl+C
+        let shutdown_sleep =
+            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
+        if shutdown_sleep > std::time::Duration::ZERO {
+            info!(
+                wait_secs = shutdown_sleep.as_secs(),
+                "auto-shutdown scheduled at 16:00 IST (Ctrl+C for immediate)"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(shutdown_sleep) => {
+                    info!("16:00 IST reached — initiating full auto-shutdown");
+                }
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(err) = result {
+                        warn!(?err, "failed to listen for shutdown signal");
+                    }
+                    info!("shutdown signal received — stopping remaining services");
+                }
+            }
+        } else {
+            info!("past 16:00 IST — initiating full shutdown immediately");
+        }
     } else {
         info!("shutdown signal received — stopping gracefully");
     }

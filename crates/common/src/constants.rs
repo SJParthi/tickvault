@@ -965,9 +965,10 @@ pub const POST_MARKET_FETCH_TIME_IST_HOUR: u32 = 15;
 /// Post-market fetch minute component (15:35 IST).
 pub const POST_MARKET_FETCH_TIME_IST_MINUTE: u32 = 35;
 
-/// Buffer time (seconds) after post-market WebSocket disconnect before re-fetching
-/// historical data. Allows Dhan to finalize end-of-day data.
-pub const POST_MARKET_DATA_FINALIZATION_SECS: u64 = 300;
+/// Full application auto-shutdown time (IST). After market close at 15:30,
+/// historical re-fetch + cross-verification runs. At 16:00 IST the entire
+/// application shuts down — matching the target AWS instance lifecycle.
+pub const APP_SHUTDOWN_TIME_IST: &str = "16:00:00";
 
 /// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
 /// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
