@@ -680,6 +680,7 @@ mod tests {
             total_candles: 180000,
             persist_failures: 0,
             failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         });
         service.notify(NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
@@ -844,6 +845,7 @@ mod tests {
             total_candles: 0,
             persist_failures: 0,
             failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         });
         service.notify(NotificationEvent::CandleVerificationFailed {
             instruments_checked: 0,
