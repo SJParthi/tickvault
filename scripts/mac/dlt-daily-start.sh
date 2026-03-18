@@ -212,7 +212,14 @@ else
     log "WARNING: IntelliJ IDEA not found in /Applications"
 fi
 
-# ---- 7. Start trading system with crash recovery ----
+# ---- 7. Open monitoring dashboards ----
+log "Opening monitoring dashboards..."
+open "http://localhost:3000" 2>/dev/null || true   # Grafana
+open "http://localhost:9000" 2>/dev/null || true   # QuestDB
+open "http://localhost:16686" 2>/dev/null || true  # Jaeger
+open "http://localhost:9090" 2>/dev/null || true   # Prometheus
+
+# ---- 8. Start trading system with crash recovery ----
 notify_all "Starting dhan-live-trader..." "Building"
 
 RESTART_COUNT=0
