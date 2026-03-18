@@ -959,12 +959,6 @@ pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 /// meaning the last candle returned starts at 15:29.
 pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 
-/// Post-market historical data fetch trigger time — 5 minutes after market close.
-/// At 15:35 IST, all market data for the day is finalized and available via REST API.
-pub const POST_MARKET_FETCH_TIME_IST_HOUR: u32 = 15;
-/// Post-market fetch minute component (15:35 IST).
-pub const POST_MARKET_FETCH_TIME_IST_MINUTE: u32 = 35;
-
 /// Full application auto-shutdown time (IST). After market close at 15:30,
 /// historical re-fetch + cross-verification runs. At 16:00 IST the entire
 /// application shuts down — matching the target AWS instance lifecycle.

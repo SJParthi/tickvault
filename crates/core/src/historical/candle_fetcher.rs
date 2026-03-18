@@ -28,8 +28,7 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
-    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST,
-    POST_MARKET_FETCH_TIME_IST_HOUR, POST_MARKET_FETCH_TIME_IST_MINUTE, TIMEFRAME_1D,
+    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{
@@ -1193,51 +1192,6 @@ fn persist_daily_candles(
 }
 
 // ---------------------------------------------------------------------------
-// Post-Market Scheduling
-// ---------------------------------------------------------------------------
-
-/// Computes how long to wait until the post-market fetch time (15:35 IST).
-///
-/// Returns `Duration::ZERO` if the current time is already past 15:35 IST today
-/// (fetch should run immediately).
-///
-/// Returns `Some(duration)` to wait, or `None` if not a trading day
-/// (weekends are skipped — caller should handle).
-// TEST-EXEMPT: tested by test_post_market_time_calculation and test_post_market_constants
-pub fn duration_until_post_market_fetch() -> Duration {
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => return Duration::ZERO,
-    };
-    let now_ist = Utc::now().with_timezone(&ist_offset);
-
-    let target_time = now_ist.date_naive().and_hms_opt(
-        POST_MARKET_FETCH_TIME_IST_HOUR,
-        POST_MARKET_FETCH_TIME_IST_MINUTE,
-        0,
-    );
-
-    let target = match target_time {
-        Some(t) => t.and_local_timezone(ist_offset).single(),
-        None => None,
-    };
-
-    match target {
-        Some(target_dt) => {
-            if now_ist >= target_dt {
-                // Already past 15:35 IST — run immediately
-                Duration::ZERO
-            } else {
-                let diff = target_dt.signed_duration_since(now_ist);
-                // Convert chrono::Duration to std::time::Duration
-                diff.to_std().unwrap_or(Duration::ZERO)
-            }
-        }
-        None => Duration::ZERO,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1495,25 +1449,6 @@ mod tests {
             _ => "SKIP",
         };
         assert_eq!(instrument_type, "INDEX");
-    }
-
-    // -- Post-market scheduling tests --
-
-    #[test]
-    fn test_post_market_time_calculation() {
-        // duration_until_post_market_fetch returns a Duration (possibly zero)
-        let duration = duration_until_post_market_fetch();
-        // Should be <= 24 hours (one day in seconds)
-        assert!(
-            duration.as_secs() <= 86_400,
-            "post-market wait should not exceed 24 hours"
-        );
-    }
-
-    #[test]
-    fn test_post_market_constants() {
-        assert_eq!(POST_MARKET_FETCH_TIME_IST_HOUR, 15);
-        assert_eq!(POST_MARKET_FETCH_TIME_IST_MINUTE, 35);
     }
 
     // -- Retry wave tests --

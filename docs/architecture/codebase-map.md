@@ -315,7 +315,7 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 10. Order update WebSocket connection (separate feed)
 11. axum API server on 0.0.0.0:3001 (health, stats, portal, top-movers, instruments)
 12. Token renewal background task
-13. Await Ctrl+C → graceful shutdown
+13. Market close (15:30) → WS disconnect → historical re-fetch → cross-verify → auto-shutdown at 16:00 IST
 ```
 
 ## Completed Blocks
