@@ -1224,11 +1224,13 @@ mod tests {
     #[test]
     fn test_cross_match_epsilon_tolerance() {
         // Epsilon must be tiny — only absorbs IEEE754 noise, not real diffs
-        assert!(CROSS_MATCH_PRICE_EPSILON > 0.0);
-        assert!(
-            CROSS_MATCH_PRICE_EPSILON < 0.001,
-            "epsilon must be < 0.001 (min tick = 0.05)"
-        );
+        const {
+            assert!(CROSS_MATCH_PRICE_EPSILON > 0.0);
+            assert!(
+                CROSS_MATCH_PRICE_EPSILON < 0.001,
+                "epsilon must be < 0.001 (min tick = 0.05)"
+            );
+        }
     }
 
     #[test]
@@ -1244,20 +1246,24 @@ mod tests {
 
     #[test]
     fn test_cross_match_volume_tolerance_constant() {
-        assert!(CROSS_MATCH_VOLUME_TOLERANCE_PCT > 0.0);
-        assert!(
-            CROSS_MATCH_VOLUME_TOLERANCE_PCT <= 0.20,
-            "volume tolerance must be <= 20%"
-        );
+        const {
+            assert!(CROSS_MATCH_VOLUME_TOLERANCE_PCT > 0.0);
+            assert!(
+                CROSS_MATCH_VOLUME_TOLERANCE_PCT <= 0.20,
+                "volume tolerance must be <= 20%"
+            );
+        }
     }
 
     #[test]
     fn test_cross_match_oi_tolerance_constant() {
-        assert!(CROSS_MATCH_OI_TOLERANCE_PCT > 0.0);
-        assert!(
-            CROSS_MATCH_OI_TOLERANCE_PCT <= 0.20,
-            "OI tolerance must be <= 20%"
-        );
+        const {
+            assert!(CROSS_MATCH_OI_TOLERANCE_PCT > 0.0);
+            assert!(
+                CROSS_MATCH_OI_TOLERANCE_PCT <= 0.20,
+                "OI tolerance must be <= 20%"
+            );
+        }
     }
 
     #[test]
@@ -1298,10 +1304,12 @@ mod tests {
     #[test]
     fn test_violation_detail_no_arbitrary_cap() {
         // MAX_VIOLATION_DETAILS is a memory safety cap only — high enough to show everything
-        assert!(
-            MAX_VIOLATION_DETAILS >= 100,
-            "violation detail cap must be >= 100 to show all violations"
-        );
+        const {
+            assert!(
+                MAX_VIOLATION_DETAILS >= 100,
+                "violation detail cap must be >= 100 to show all violations"
+            );
+        }
     }
 
     #[tokio::test]
