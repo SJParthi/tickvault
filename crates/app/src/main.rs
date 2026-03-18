@@ -47,7 +47,9 @@ use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
 use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
-use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
+use dhan_live_trader_core::historical::cross_verify::{
+    CrossMatchMismatch, ViolationDetail, cross_match_historical_vs_live, verify_candle_integrity,
+};
 use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
 use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
 use dhan_live_trader_core::instrument::{
@@ -1175,6 +1177,8 @@ fn spawn_historical_candle_fetch(
                     instruments_fetched: 0,
                     instruments_failed: 0,
                     total_candles: 0,
+                    persist_failures: 0,
+                    failed_instruments: vec![],
                 });
                 return;
             }
@@ -1188,6 +1192,8 @@ fn spawn_historical_candle_fetch(
                     instruments_fetched: 0,
                     instruments_failed: 0,
                     total_candles: 0,
+                    persist_failures: 0,
+                    failed_instruments: vec![],
                 });
                 return;
             }
@@ -1210,17 +1216,20 @@ fn spawn_historical_candle_fetch(
                 instruments_fetched: summary.instruments_fetched,
                 instruments_failed: summary.instruments_failed,
                 total_candles: summary.total_candles,
+                persist_failures: summary.persist_failures,
+                failed_instruments: summary.failed_instruments.clone(),
             });
         } else {
             bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
                 instruments_fetched: summary.instruments_fetched,
                 instruments_skipped: summary.instruments_skipped,
                 total_candles: summary.total_candles,
+                persist_failures: summary.persist_failures,
             });
         }
 
         // Cross-verify candle integrity in QuestDB
-        let verify_report = verify_candle_integrity(&bg_questdb_config).await;
+        let verify_report = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
         let timeframe_details = format_timeframe_details(&verify_report);
         if verify_report.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
@@ -1228,6 +1237,8 @@ fn spawn_historical_candle_fetch(
                 total_candles: verify_report.total_candles_in_db,
                 timeframe_details,
                 ohlc_violations: verify_report.ohlc_violations,
+                data_violations: verify_report.data_violations,
+                timestamp_violations: verify_report.timestamp_violations,
             });
         } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
@@ -1235,6 +1246,11 @@ fn spawn_historical_candle_fetch(
                 instruments_with_gaps: verify_report.instruments_with_gaps,
                 timeframe_details,
                 ohlc_violations: verify_report.ohlc_violations,
+                data_violations: verify_report.data_violations,
+                timestamp_violations: verify_report.timestamp_violations,
+                ohlc_details: format_violation_details(&verify_report.ohlc_details),
+                data_details: format_violation_details(&verify_report.data_details),
+                timestamp_details: format_violation_details(&verify_report.timestamp_details),
             });
         }
 
@@ -1286,17 +1302,20 @@ fn spawn_historical_candle_fetch(
                 instruments_fetched: pm_summary.instruments_fetched,
                 instruments_failed: pm_summary.instruments_failed,
                 total_candles: pm_summary.total_candles,
+                persist_failures: pm_summary.persist_failures,
+                failed_instruments: pm_summary.failed_instruments.clone(),
             });
         } else {
             bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
                 instruments_fetched: pm_summary.instruments_fetched,
                 instruments_skipped: pm_summary.instruments_skipped,
                 total_candles: pm_summary.total_candles,
+                persist_failures: pm_summary.persist_failures,
             });
         }
 
         // Re-verify after post-market fetch
-        let pm_verify = verify_candle_integrity(&bg_questdb_config).await;
+        let pm_verify = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
         let pm_timeframe_details = format_timeframe_details(&pm_verify);
         if pm_verify.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
@@ -1304,6 +1323,8 @@ fn spawn_historical_candle_fetch(
                 total_candles: pm_verify.total_candles_in_db,
                 timeframe_details: pm_timeframe_details,
                 ohlc_violations: pm_verify.ohlc_violations,
+                data_violations: pm_verify.data_violations,
+                timestamp_violations: pm_verify.timestamp_violations,
             });
         } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
@@ -1311,6 +1332,27 @@ fn spawn_historical_candle_fetch(
                 instruments_with_gaps: pm_verify.instruments_with_gaps,
                 timeframe_details: pm_timeframe_details,
                 ohlc_violations: pm_verify.ohlc_violations,
+                data_violations: pm_verify.data_violations,
+                timestamp_violations: pm_verify.timestamp_violations,
+                ohlc_details: format_violation_details(&pm_verify.ohlc_details),
+                data_details: format_violation_details(&pm_verify.data_details),
+                timestamp_details: format_violation_details(&pm_verify.timestamp_details),
+            });
+        }
+
+        // Cross-match historical vs live candle data (post-market only)
+        let cross_match = cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
+        if cross_match.passed {
+            bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
+                timeframes_checked: cross_match.timeframes_checked,
+                candles_compared: cross_match.candles_compared,
+            });
+        } else {
+            bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
+                candles_compared: cross_match.candles_compared,
+                mismatches: cross_match.mismatches,
+                missing_live: cross_match.missing_live,
+                mismatch_details: format_cross_match_details(&cross_match.mismatch_details),
             });
         }
 
@@ -1319,6 +1361,7 @@ fn spawn_historical_candle_fetch(
             instruments_failed = pm_summary.instruments_failed,
             total_candles = pm_summary.total_candles,
             verification_passed = pm_verify.passed,
+            cross_match_passed = cross_match.passed,
             "post-market historical candle re-fetch complete"
         );
     });
@@ -1351,6 +1394,59 @@ fn format_timeframe_details(
         ));
     }
     lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Format violation details for Telegram notification
+// ---------------------------------------------------------------------------
+
+/// Formats `ViolationDetail` records into pre-formatted Telegram lines.
+///
+/// Example output:
+/// ```text
+/// • RELIANCE (NSE_EQ) 1m @ 2026-03-18 10:15 IST
+///   H=2440.0 < L=2450.0
+/// ```
+fn format_violation_details(details: &[ViolationDetail]) -> Vec<String> {
+    details
+        .iter()
+        .map(|d| {
+            format!(
+                "\u{2022} {} ({}) {} @ {}\n  {}",
+                d.symbol, d.segment, d.timeframe, d.timestamp_ist, d.values
+            )
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Format cross-match mismatch details for Telegram notification
+// ---------------------------------------------------------------------------
+
+/// Formats `CrossMatchMismatch` records into pre-formatted Telegram lines.
+///
+/// Example output:
+/// ```text
+/// • RELIANCE (NSE_EQ) 1m @ 2026-03-18 10:15 IST
+///   Hist: O=2450.0 H=2465.0 L=2448.0 C=2460.0 V=125000
+///   Live: O=2450.0 H=2463.5 L=2448.0 C=2460.0 V=118500
+///   Diff: H(-1.5) V(-6500)
+/// ```
+fn format_cross_match_details(details: &[CrossMatchMismatch]) -> Vec<String> {
+    details
+        .iter()
+        .map(|d| {
+            let mut line = format!(
+                "\u{2022} {} ({}) {} @ {}\n  Hist: {}",
+                d.symbol, d.segment, d.timeframe, d.timestamp_ist, d.hist_values
+            );
+            line.push_str(&format!("\n  Live: {}", d.live_values));
+            if !d.diff_summary.is_empty() {
+                line.push_str(&format!("\n  Diff: {}", d.diff_summary));
+            }
+            line
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -137,8 +137,8 @@ fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
 /// Result of a single instrument fetch attempt.
 #[derive(Debug)]
 enum InstrumentFetchResult {
-    /// Successfully fetched — candle count.
-    Success(usize),
+    /// Successfully fetched — (candle_count, persist_failures).
+    Success(usize, usize),
     /// Failure — eligible for retry in next wave.
     /// NeverRetry errors (DH-905) will fail fast on re-attempt (no wasted time).
     Failed,
@@ -190,7 +190,14 @@ pub struct CandleFetchSummary {
     pub total_candles: usize,
     /// Number of instruments skipped (no data or not applicable).
     pub instruments_skipped: usize,
+    /// Number of QuestDB write failures (candles fetched but lost during persist).
+    pub persist_failures: usize,
+    /// Symbol names of instruments that failed all retry waves (capped at 50).
+    pub failed_instruments: Vec<String>,
 }
+
+/// Maximum number of failed instrument names to collect.
+const MAX_FAILED_INSTRUMENT_NAMES: usize = 50;
 
 // ---------------------------------------------------------------------------
 // Main Fetch Logic
@@ -234,6 +241,8 @@ pub async fn fetch_historical_candles(
                 instruments_failed: 0,
                 total_candles: 0,
                 instruments_skipped: 0,
+                persist_failures: 0,
+                failed_instruments: Vec::new(),
             };
         }
     };
@@ -277,6 +286,8 @@ pub async fn fetch_historical_candles(
                 instruments_failed: 0,
                 total_candles: 0,
                 instruments_skipped: 0,
+                persist_failures: 0,
+                failed_instruments: Vec::new(),
             };
         }
     };
@@ -296,6 +307,7 @@ pub async fn fetch_historical_candles(
     let mut instruments_fetched: usize = 0;
     let mut instruments_skipped: usize = 0;
     let mut total_candles: usize = 0;
+    let mut total_persist_failures: usize = 0;
 
     // Build the list of fetchable instruments (skip derivatives, dedup)
     struct FetchTarget {
@@ -389,9 +401,10 @@ pub async fn fetch_historical_candles(
             .await;
 
             match result {
-                InstrumentFetchResult::Success(candle_count) => {
+                InstrumentFetchResult::Success(candle_count, persist_fails) => {
                     instruments_fetched = instruments_fetched.saturating_add(1);
                     total_candles = total_candles.saturating_add(candle_count);
+                    total_persist_failures = total_persist_failures.saturating_add(persist_fails);
                     #[allow(clippy::cast_possible_truncation)]
                     // APPROVED: usize->u64 is lossless on 64-bit targets
                     m_fetched.increment(candle_count as u64);
@@ -414,6 +427,17 @@ pub async fn fetch_historical_candles(
     }
 
     let instruments_failed = pending_indices.len();
+
+    // Collect failed instrument names for Telegram notification
+    let failed_instruments: Vec<String> = pending_indices
+        .iter()
+        .take(MAX_FAILED_INSTRUMENT_NAMES)
+        .map(|&idx| {
+            let target = &targets[idx];
+            format!("{} ({})", target.security_id, target.exchange_segment_str)
+        })
+        .collect();
+
     if instruments_failed > 0 {
         warn!(
             instruments_failed,
@@ -429,7 +453,11 @@ pub async fn fetch_historical_candles(
 
     info!(
         instruments_fetched,
-        instruments_failed, instruments_skipped, total_candles, "historical candle fetch complete"
+        instruments_failed,
+        instruments_skipped,
+        total_candles,
+        persist_failures = total_persist_failures,
+        "historical candle fetch complete"
     );
 
     CandleFetchSummary {
@@ -437,6 +465,8 @@ pub async fn fetch_historical_candles(
         instruments_failed,
         total_candles,
         instruments_skipped,
+        persist_failures: total_persist_failures,
+        failed_instruments,
     }
 }
 
@@ -467,6 +497,7 @@ async fn fetch_single_instrument(
     m_api_errors: &metrics::Counter,
 ) -> InstrumentFetchResult {
     let mut instrument_candles = 0_usize;
+    let mut instrument_persist_failures = 0_usize;
 
     // --- Fetch all 4 intraday timeframes ---
     for &(interval, timeframe_label) in INTRADAY_TIMEFRAMES {
@@ -510,8 +541,9 @@ async fn fetch_single_instrument(
         )
         .await
         {
-            Some(count) => {
+            Some((count, pf)) => {
                 instrument_candles = instrument_candles.saturating_add(count);
+                instrument_persist_failures = instrument_persist_failures.saturating_add(pf);
             }
             None => {
                 // Cannot distinguish transient vs permanent here — return transient
@@ -559,15 +591,16 @@ async fn fetch_single_instrument(
     )
     .await
     {
-        Some(count) => {
+        Some((count, pf)) => {
             instrument_candles = instrument_candles.saturating_add(count);
+            instrument_persist_failures = instrument_persist_failures.saturating_add(pf);
         }
         None => {
             return InstrumentFetchResult::Failed;
         }
     }
 
-    InstrumentFetchResult::Success(instrument_candles)
+    InstrumentFetchResult::Success(instrument_candles, instrument_persist_failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +608,7 @@ async fn fetch_single_instrument(
 // ---------------------------------------------------------------------------
 
 /// Fetches a single intraday timeframe for one instrument with retries.
-/// Returns `Some(candle_count)` on success, `None` on failure.
+/// Returns `Some((candle_count, persist_failures))` on success, `None` on failure.
 #[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
 async fn fetch_intraday_with_retry(
     http_client: &reqwest::Client,
@@ -589,7 +622,7 @@ async fn fetch_intraday_with_retry(
     timeframe_label: &'static str,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> Option<usize> {
+) -> Option<(usize, usize)> {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
             let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
@@ -721,7 +754,7 @@ async fn fetch_intraday_with_retry(
                                 timeframe = timeframe_label,
                                 "no candle data returned"
                             );
-                            return Some(0);
+                            return Some((0, 0));
                         }
 
                         if !data.is_consistent() {
@@ -734,7 +767,7 @@ async fn fetch_intraday_with_retry(
                             return None;
                         }
 
-                        let count = persist_intraday_candles(
+                        let (count, pf) = persist_intraday_candles(
                             &data,
                             security_id,
                             segment_code,
@@ -742,7 +775,7 @@ async fn fetch_intraday_with_retry(
                             candle_writer,
                             m_api_errors,
                         );
-                        return Some(count);
+                        return Some((count, pf));
                     }
                     Err(err) => {
                         if attempt < config.max_retries {
@@ -796,7 +829,7 @@ async fn fetch_intraday_with_retry(
 // ---------------------------------------------------------------------------
 
 /// Fetches daily candles for one instrument with retries.
-/// Returns `Some(candle_count)` on success, `None` on failure.
+/// Returns `Some((candle_count, persist_failures))` on success, `None` on failure.
 #[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
 async fn fetch_daily_with_retry(
     http_client: &reqwest::Client,
@@ -809,7 +842,7 @@ async fn fetch_daily_with_retry(
     segment_code: u8,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> Option<usize> {
+) -> Option<(usize, usize)> {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
             let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
@@ -940,7 +973,7 @@ async fn fetch_daily_with_retry(
                                 timeframe = TIMEFRAME_1D,
                                 "no daily data returned"
                             );
-                            return Some(0);
+                            return Some((0, 0));
                         }
 
                         if !data.is_consistent() {
@@ -953,14 +986,14 @@ async fn fetch_daily_with_retry(
                             return None;
                         }
 
-                        let count = persist_daily_candles(
+                        let (count, pf) = persist_daily_candles(
                             &data,
                             security_id,
                             segment_code,
                             candle_writer,
                             m_api_errors,
                         );
-                        return Some(count);
+                        return Some((count, pf));
                     }
                     Err(err) => {
                         if attempt < config.max_retries {
@@ -1014,6 +1047,7 @@ async fn fetch_daily_with_retry(
 // ---------------------------------------------------------------------------
 
 /// Converts intraday response to HistoricalCandle structs and persists them.
+/// Returns `(candles_written, persist_failures)`.
 fn persist_intraday_candles(
     data: &DhanIntradayResponse,
     security_id: u32,
@@ -1021,8 +1055,9 @@ fn persist_intraday_candles(
     timeframe_label: &'static str,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> usize {
+) -> (usize, usize) {
     let mut count = 0_usize;
+    let mut persist_failures = 0_usize;
     for i in 0..data.len() {
         let open = data.open[i];
         let high = data.high[i];
@@ -1097,21 +1132,25 @@ fn persist_intraday_candles(
                 timeframe = timeframe_label,
                 "failed to append candle to QuestDB"
             );
+            persist_failures = persist_failures.saturating_add(1);
+            continue;
         }
         count = count.saturating_add(1);
     }
-    count
+    (count, persist_failures)
 }
 
 /// Converts daily response to HistoricalCandle structs and persists them.
+/// Returns `(candles_written, persist_failures)`.
 fn persist_daily_candles(
     data: &DhanDailyResponse,
     security_id: u32,
     segment_code: u8,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> usize {
+) -> (usize, usize) {
     let mut count = 0_usize;
+    let mut persist_failures = 0_usize;
     for i in 0..data.len() {
         let open = data.open[i];
         let high = data.high[i];
@@ -1185,10 +1224,12 @@ fn persist_daily_candles(
                 timeframe = TIMEFRAME_1D,
                 "failed to append daily candle to QuestDB"
             );
+            persist_failures = persist_failures.saturating_add(1);
+            continue;
         }
         count = count.saturating_add(1);
     }
-    count
+    (count, persist_failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,9 +1288,62 @@ mod tests {
             instruments_failed: 2,
             total_candles: 3750,
             instruments_skipped: 5,
+            persist_failures: 0,
+            failed_instruments: vec![],
         };
         assert_eq!(summary.instruments_fetched, 10);
         assert_eq!(summary.total_candles, 3750);
+        assert_eq!(summary.persist_failures, 0);
+        assert!(summary.failed_instruments.is_empty());
+    }
+
+    #[test]
+    fn test_candle_fetch_summary_includes_failed_names() {
+        let summary = CandleFetchSummary {
+            instruments_fetched: 229,
+            instruments_failed: 3,
+            total_candles: 172125,
+            instruments_skipped: 1050,
+            persist_failures: 0,
+            failed_instruments: vec![
+                "11536 (NSE_EQ)".to_string(),
+                "13 (IDX_I)".to_string(),
+                "25 (IDX_I)".to_string(),
+            ],
+        };
+        assert_eq!(summary.failed_instruments.len(), 3);
+        assert!(summary.failed_instruments[0].contains("11536"));
+        assert!(summary.failed_instruments[1].contains("IDX_I"));
+    }
+
+    #[test]
+    fn test_failed_names_capped_at_max() {
+        assert!(
+            MAX_FAILED_INSTRUMENT_NAMES <= 50,
+            "failed names must be bounded"
+        );
+        assert!(
+            MAX_FAILED_INSTRUMENT_NAMES >= 10,
+            "need at least 10 for diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_persist_failure_not_counted_as_success() {
+        // Verify the persist functions return (count, persist_failures) tuple
+        // where count does NOT include failed writes.
+        let summary = CandleFetchSummary {
+            instruments_fetched: 232,
+            instruments_failed: 0,
+            total_candles: 187458,
+            instruments_skipped: 1050,
+            persist_failures: 42,
+            failed_instruments: vec![],
+        };
+        // total_candles should be the ACTUAL successful writes (187458),
+        // not 187458 + 42 = 187500 (which would be the old buggy behavior)
+        assert_eq!(summary.total_candles, 187458);
+        assert_eq!(summary.persist_failures, 42);
     }
 
     /// IST offset in seconds (5h30m) for UTC→IST conversion in tests.
@@ -1483,7 +1577,7 @@ mod tests {
     #[test]
     fn test_instrument_fetch_result_variants() {
         // Verify enum variants exist and Debug works
-        let success = InstrumentFetchResult::Success(100);
+        let success = InstrumentFetchResult::Success(100, 0);
         let failed = InstrumentFetchResult::Failed;
         assert!(format!("{success:?}").contains("100"));
         assert!(format!("{failed:?}").contains("Failed"));
@@ -1577,6 +1671,8 @@ mod tests {
     #[test]
     fn test_candle_fetch_summary_all_zeroes() {
         let summary = CandleFetchSummary {
+            persist_failures: 0,
+            failed_instruments: vec![],
             instruments_fetched: 0,
             instruments_failed: 0,
             total_candles: 0,
