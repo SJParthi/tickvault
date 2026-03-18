@@ -10,7 +10,8 @@
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
-        audit coverage bench geiger typos quality doc bootstrap
+        audit coverage bench geiger typos quality doc bootstrap \
+        install-autostart uninstall-autostart autostart-status
 
 # ---- Configuration ----
 APP_NAME       := dhan-live-trader
@@ -35,6 +36,9 @@ help: ## Show this help
 	@echo ""
 	@echo "  OBSERVABILITY:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(obs)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "  AUTOSTART (macOS):"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(autostart)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  MONITORING:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(grafana|questdb|jaeger|prometheus|traefik|alloy|loki)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -256,3 +260,16 @@ alloy: ## Open Alloy UI (localhost:12345)
 
 loki: ## Open Loki status (localhost:3100/ready)
 	@open http://localhost:3100/ready 2>/dev/null || xdg-open http://localhost:3100/ready 2>/dev/null || echo "  Open: http://localhost:3100/ready"
+
+# =============================================================================
+# AUTOSTART — macOS launchd automation (zero-touch daily trading)
+# =============================================================================
+
+install-autostart: ## Install auto-start + watchdog (macOS, zero-touch)
+	@bash scripts/mac/install-autostart.sh
+
+uninstall-autostart: ## Uninstall auto-start + watchdog (clean removal)
+	@bash scripts/mac/install-autostart.sh --uninstall
+
+autostart-status: ## Show auto-start self-test dashboard
+	@bash scripts/mac/dlt-selftest.sh --quick 2>/dev/null || bash "$(HOME)/.dlt/dlt-selftest.sh" --quick
