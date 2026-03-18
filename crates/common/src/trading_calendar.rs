@@ -148,7 +148,7 @@ impl TradingCalendar {
     /// Sorted by date ascending.
     pub fn all_entries(&self) -> Vec<HolidayInfo> {
         let mut entries: Vec<HolidayInfo> =
-            Vec::with_capacity(self.holidays.len() + self.muhurat_dates.len());
+            Vec::with_capacity(self.holidays.len().saturating_add(self.muhurat_dates.len()));
 
         for (&date, name) in &self.holiday_names {
             entries.push(HolidayInfo {

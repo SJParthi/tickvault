@@ -1569,14 +1569,14 @@ mod market_hours_tests {
 
     #[test]
     fn test_market_close_drain_buffer_constant() {
-        assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS >= 1);
-        assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS <= 5);
+        const { assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS >= 1) };
+        const { assert!(MARKET_CLOSE_DRAIN_BUFFER_SECS <= 5) };
     }
 
     #[test]
     fn test_persist_window_is_subset_of_day() {
-        assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
-        assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+        const { assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST) };
+        const { assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY) };
     }
 }
 
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[test]
     fn test_indicator_warmup_ticks_positive() {
-        assert!(MAX_INDICATOR_WARMUP_TICKS > 0);
+        const { assert!(MAX_INDICATOR_WARMUP_TICKS > 0) };
     }
 
     #[test]
