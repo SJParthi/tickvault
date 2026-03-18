@@ -17,7 +17,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveTime, Utc};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig, SubscriptionConfig};
 use dhan_live_trader_common::constants::{
@@ -128,16 +128,17 @@ pub async fn load_or_build_instruments(
     questdb_config: &QuestDbConfig,
     subscription_config: &SubscriptionConfig,
 ) -> Result<InstrumentLoadResult> {
-    let cache_dir = &instrument_config.csv_cache_directory;
-
     if is_within_build_window(
         &instrument_config.build_window_start,
         &instrument_config.build_window_end,
     ) {
-        // ----- MARKET HOURS: cache only, NEVER download -----
-        return load_from_cache_only(
-            cache_dir,
-            &instrument_config.csv_cache_filename,
+        // ----- MARKET HOURS: cache first, emergency download if both miss -----
+        // I-P0-06: Emergency Download Override
+        return load_from_cache_or_emergency_download(
+            dhan_csv_url,
+            dhan_csv_fallback_url,
+            instrument_config,
+            questdb_config,
             subscription_config,
         )
         .await;
@@ -205,12 +206,18 @@ pub async fn try_rebuild_instruments(
 // Internal: Market Hours Cache Loading
 // ---------------------------------------------------------------------------
 
-/// Market hours path: zero-copy rkyv → CSV fallback → Unavailable. NEVER downloads.
-async fn load_from_cache_only(
-    cache_dir: &str,
-    csv_filename: &str,
+/// Market hours path: zero-copy rkyv → CSV fallback → emergency download → Unavailable.
+///
+/// I-P0-06: When all caches miss during market hours, force-download as last resort.
+/// Never silently run with zero instruments.
+async fn load_from_cache_or_emergency_download(
+    dhan_csv_url: &str,
+    dhan_csv_fallback_url: &str,
+    instrument_config: &InstrumentConfig,
+    questdb_config: &QuestDbConfig,
     subscription_config: &SubscriptionConfig,
 ) -> Result<InstrumentLoadResult> {
+    let cache_dir = &instrument_config.csv_cache_directory;
     let ist =
         FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset constant")?;
     let today = Utc::now().with_timezone(&ist).date_naive();
@@ -240,7 +247,7 @@ async fn load_from_cache_only(
     }
 
     // Try 2: CSV file cache (~400ms) — build plan from owned universe
-    match load_cached_csv(cache_dir, csv_filename).await {
+    match load_cached_csv(cache_dir, &instrument_config.csv_cache_filename).await {
         Ok(download_result) => {
             let universe =
                 build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
@@ -262,8 +269,52 @@ async fn load_from_cache_only(
         }
     }
 
-    // No cache available
-    info!("market hours: no instrument cache available (rkyv + CSV both missing)");
+    // I-P0-06: Emergency Download Override — all caches missing during market hours
+    error!(
+        "CRITICAL: no instrument cache available during market hours — triggering emergency download"
+    );
+
+    match download_instrument_csv(
+        dhan_csv_url,
+        dhan_csv_fallback_url,
+        cache_dir,
+        &instrument_config.csv_cache_filename,
+        instrument_config.csv_download_timeout_secs,
+    )
+    .await
+    {
+        Ok(download_result) => {
+            let universe =
+                build_fno_universe_from_csv(&download_result.csv_text, &download_result.source)
+                    .context("emergency download: universe build failed")?;
+
+            // Persist to QuestDB (best-effort)
+            if let Err(err) = persist_instrument_snapshot(&universe, questdb_config).await {
+                warn!(%err, "emergency download: persistence failed (non-fatal)");
+            }
+
+            // Write rkyv binary cache for subsequent restarts
+            if let Err(err) = write_binary_cache(&universe, cache_dir) {
+                warn!(%err, "emergency download: rkyv cache write failed (non-fatal)");
+            }
+
+            write_freshness_marker(cache_dir);
+
+            error!(
+                derivatives = universe.derivative_contracts.len(),
+                "emergency download succeeded — instruments loaded (investigate why cache was missing)"
+            );
+            return Ok(InstrumentLoadResult::FreshBuild(universe));
+        }
+        Err(err) => {
+            error!(
+                %err,
+                "CRITICAL: emergency download ALSO failed — system will have ZERO instruments"
+            );
+        }
+    }
+
+    // All sources exhausted — truly unavailable
     Ok(InstrumentLoadResult::Unavailable)
 }
 
@@ -686,19 +737,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Market hours: NEVER downloads (proves download is unreachable)
+    // Market hours: emergency download when cache missing (I-P0-06)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_market_hours_never_downloads() {
-        let dir = unique_temp_dir("mh-never-downloads");
+    async fn test_market_hours_emergency_download_on_cache_miss() {
+        let dir = unique_temp_dir("mh-emergency-download");
         let _ = std::fs::remove_dir_all(&dir);
         let cache_dir = dir.to_str().unwrap();
 
         // Window = always inside, fake URLs, no cache
-        // If download was attempted, it would timeout. Instead, returns Unavailable instantly.
+        // I-P0-06: emergency download is attempted (and fails with fake URLs),
+        // so result is still Unavailable but download WAS attempted.
         let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
-        let start = std::time::Instant::now();
         let result = load_or_build_instruments(
             "http://127.0.0.1:1/fake",
             "http://127.0.0.1:1/fake",
@@ -707,14 +758,10 @@ mod tests {
             &test_subscription_config(),
         )
         .await;
-        let elapsed = start.elapsed();
 
-        assert!(matches!(result.unwrap(), InstrumentLoadResult::Unavailable));
-        // If download was attempted with 2s timeout, this would take >2s
         assert!(
-            elapsed.as_millis() < 500,
-            "should return instantly (no download), took {}ms",
-            elapsed.as_millis()
+            matches!(result.unwrap(), InstrumentLoadResult::Unavailable),
+            "emergency download with fake URLs should still return Unavailable"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

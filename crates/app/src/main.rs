@@ -1013,7 +1013,10 @@ async fn load_instruments(
             (Some(plan), universe)
         }
         Ok(InstrumentLoadResult::Unavailable) => {
-            info!("instruments: no cache available during market hours");
+            // I-P0-06: This should only trigger if emergency download also failed
+            error!(
+                "CRITICAL: instruments unavailable — emergency download failed, system has ZERO instruments"
+            );
             (None, None)
         }
         Err(err) => {
