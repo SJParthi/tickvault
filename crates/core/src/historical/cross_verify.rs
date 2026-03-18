@@ -77,7 +77,9 @@ struct QuestDbQueryResponse {
 const VERIFY_QUERY_TIMEOUT_SECS: u64 = 30;
 
 /// Minimum candle coverage ratio to consider an instrument "complete".
-/// 95% of 375 = 356 candles minimum for a full trading day.
+/// 95% of 375 = 356 candles minimum for the cross-verification window
+/// (09:15–15:29 continuous trading session; pre-market 09:00–09:14 excluded
+/// because Dhan historical API has no data for that window).
 const MIN_CANDLE_COVERAGE_RATIO: f64 = 0.95;
 
 /// All timeframes we verify.

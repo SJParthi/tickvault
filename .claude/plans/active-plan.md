@@ -1,8 +1,8 @@
 # Implementation Plan: Align market_open config to 09:00 + clarify dual-window docs
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-03-18
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Context
 
@@ -24,46 +24,46 @@ The cross-verification already works correctly:
 
 ## Plan Items
 
-- [ ] **Item 1: Update config/base.toml — market_open_time to 09:00**
+- [x] **Item 1: Update config/base.toml — market_open_time to 09:00**
   - `market_open_time`: "09:15:00" → "09:00:00"
   - Files: `config/base.toml`
 
-- [ ] **Item 2: Update config.rs — doc comment and test default**
+- [x] **Item 2: Update config.rs — doc comment and test default**
   - Doc comment on `market_open_time` field: "09:15:00" → "09:00:00"
   - `make_valid_config()` default: "09:15:00" → "09:00:00"
   - Files: `crates/common/src/config.rs`
 
-- [ ] **Item 3: Update trading_calendar.rs — test default**
+- [x] **Item 3: Update trading_calendar.rs — test default**
   - `make_test_config()`: "09:15:00" → "09:00:00"
   - Files: `crates/common/src/trading_calendar.rs`
 
-- [ ] **Item 4: Update test defaults in config_round_trip.rs, pipeline_smoke.rs**
+- [x] **Item 4: Update test defaults in config_round_trip.rs, pipeline_smoke.rs**
   - `config_round_trip.rs`: TOML string and struct default "09:15:00" → "09:00:00"
   - `pipeline_smoke.rs`: test default "09:15:00" → "09:00:00"
   - Files: `crates/common/tests/config_round_trip.rs`, `crates/app/tests/pipeline_smoke.rs`
 
-- [ ] **Item 5: Clarify constants.rs doc comments — dual window explanation**
+- [x] **Item 5: Clarify constants.rs doc comments — dual window explanation**
   - `MARKET_OPEN_TIME_IST`: add doc explaining this is for Dhan historical API fetch start (09:15), NOT data collection start (09:00)
   - `CANDLES_PER_TRADING_DAY`: clarify this is for cross-verification window (09:15→15:29 = 375), NOT total stored candles
   - Files: `crates/common/src/constants.rs`
 
-- [ ] **Item 6: Clarify historical/mod.rs doc comment — dual window**
+- [x] **Item 6: Clarify historical/mod.rs doc comment — dual window**
   - Update to explain: data storage from 09:00, historical API from 09:15, cross-verify uses 09:15–15:29
   - Files: `crates/core/src/historical/mod.rs`
 
-- [ ] **Item 7: Clarify cross_verify.rs doc comment**
+- [x] **Item 7: Clarify cross_verify.rs doc comment**
   - Update "95% of 375 = 356" comment to explain WHY 375 (cross-verify window = 09:15–15:29)
   - Files: `crates/core/src/historical/cross_verify.rs`
 
-- [ ] **Item 8: Clarify tick_persistence.rs test comments**
+- [x] **Item 8: Clarify tick_persistence.rs test comments**
   - Comment "09:15 - 15:30" → "09:00 - 15:30 (storage)" and note cross-verify is 09:15–15:30
   - Files: `crates/storage/src/tick_persistence.rs`
 
-- [ ] **Item 9: Clarify candle_persistence.rs doc comment**
+- [x] **Item 9: Clarify candle_persistence.rs doc comment**
   - "09:15" → "09:00" in data storage context
   - Files: `crates/storage/src/candle_persistence.rs`
 
-- [ ] **Item 10: Build & test — verify all pass**
+- [x] **Item 10: Build & test — verify all pass**
   - `cargo build --workspace`
   - `cargo test --workspace`
   - Files: N/A

@@ -101,7 +101,7 @@ impl CandlePersistenceWriter {
     ///
     /// Converts `candle.timestamp_utc_secs` (UTC epoch from Dhan V2 API) to
     /// IST-as-UTC by adding `IST_UTC_OFFSET_SECONDS_I64`, so QuestDB displays
-    /// IST wall-clock time directly (e.g., 09:15 instead of 03:45).
+    /// IST wall-clock time directly (e.g., 09:00 instead of 03:30).
     ///
     /// Writes to the unified `historical_candles` table with a `timeframe` column.
     ///

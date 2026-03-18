@@ -947,7 +947,14 @@ pub const DHAN_CANDLE_INTERVAL_60MIN: &str = "60";
 /// Maximum days of intraday data per API request (Dhan limit: 90 days).
 pub const DHAN_INTRADAY_MAX_DAYS_PER_REQUEST: u32 = 90;
 
-/// NSE F&O market open time as HH:MM:SS in IST.
+/// NSE continuous trading session start time as HH:MM:SS in IST.
+///
+/// Used for Dhan historical API `fromDate` and cross-verification baseline.
+/// Dhan's historical intraday API returns candles starting from 09:15 (continuous
+/// trading). Pre-market data (09:00–09:14) is only available via live WebSocket.
+///
+/// For live data collection start, see `data_collection_start` in config (09:00).
+/// For tick/candle persistence window, see `TICK_PERSIST_START_SECS_OF_DAY_IST` (09:00).
 pub const MARKET_OPEN_TIME_IST: &str = "09:15:00";
 
 /// NSE F&O last 1-minute candle start time as HH:MM:SS in IST.
@@ -964,7 +971,14 @@ pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 /// application shuts down — matching the target AWS instance lifecycle.
 pub const APP_SHUTDOWN_TIME_IST: &str = "16:00:00";
 
-/// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
+/// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
+///
+/// Used by `cross_verify.rs` to validate historical vs live candle coverage.
+/// This covers only the continuous trading session (09:15–15:29) because Dhan's
+/// historical intraday API returns data starting from 09:15.
+///
+/// Live WebSocket data is collected and stored from 09:00 (pre-market), but
+/// pre-market candles (09:00–09:14) have no historical counterpart for comparison.
 /// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
 pub const CANDLES_PER_TRADING_DAY: usize = 375;
 

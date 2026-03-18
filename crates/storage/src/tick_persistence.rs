@@ -2433,7 +2433,8 @@ mod tests {
     // to IST for display.
     //
     // These tests verify the FULL pipeline with known UTC epoch values
-    // corresponding to NSE market hours (09:15 - 15:30 IST).
+    // corresponding to NSE market hours (09:00 - 15:30 IST for live data storage;
+    // 09:15 - 15:30 IST for historical API / cross-verification).
     // -----------------------------------------------------------------------
 
     /// Helper: compute UTC epoch for a given IST time on 2026-03-10.

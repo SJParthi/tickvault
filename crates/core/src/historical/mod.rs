@@ -11,9 +11,11 @@
 //! - Timestamps: standard UNIX epoch seconds (UTC)
 //! - Limit: 90 days per request, 1-minute candle resolution
 //!
-//! # Trading Day
-//! NSE F&O: 09:15:00 IST to 15:29:00 IST (375 one-minute candles per day)
-//! Data collection starts at 09:00:00 IST (pre-market) per config.
+//! # Trading Day — Dual Window
+//! - **Live data (WebSocket):** 09:00:00 IST to 15:29:59 IST (stored from 09:00)
+//! - **Historical API (Dhan REST):** 09:15:00 IST to 15:29:00 IST (375 candles)
+//! - **Cross-verification:** compares historical vs live for 09:15–15:29 only,
+//!   because Dhan historical API has no pre-market data (09:00–09:14).
 
 pub mod candle_fetcher;
 pub mod cross_verify;

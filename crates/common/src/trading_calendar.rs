@@ -190,7 +190,7 @@ mod tests {
 
     fn make_test_config() -> TradingConfig {
         TradingConfig {
-            market_open_time: "09:15:00".to_string(),
+            market_open_time: "09:00:00".to_string(),
             market_close_time: "15:30:00".to_string(),
             order_cutoff_time: "15:29:00".to_string(),
             data_collection_start: "09:00:00".to_string(),

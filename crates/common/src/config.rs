@@ -77,7 +77,7 @@ const fn default_dry_run() -> bool {
 /// Trading session timing configuration.
 #[derive(Debug, Deserialize)]
 pub struct TradingConfig {
-    /// Market open time in IST (e.g., "09:15:00").
+    /// Market open time in IST (e.g., "09:00:00").
     pub market_open_time: String,
     /// Market close time in IST (e.g., "15:30:00").
     pub market_close_time: String,
@@ -664,7 +664,7 @@ mod tests {
     fn make_valid_config() -> ApplicationConfig {
         ApplicationConfig {
             trading: TradingConfig {
-                market_open_time: "09:15:00".to_string(),
+                market_open_time: "09:00:00".to_string(),
                 market_close_time: "15:30:00".to_string(),
                 order_cutoff_time: "15:29:00".to_string(),
                 data_collection_start: "09:00:00".to_string(),
