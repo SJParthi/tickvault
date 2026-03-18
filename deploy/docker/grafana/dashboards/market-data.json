@@ -745,6 +745,9 @@
       },
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 112 },
       "id": 80,
+      "timeFrom": "1y",
+      "timeShift": null,
+      "hideTimeOverride": true,
       "options": {
         "showHeader": true,
         "cellHeight": "sm",
