@@ -682,6 +682,8 @@ mod tests {
         service.notify(NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
             instruments_with_gaps: 3,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
         });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -837,6 +839,8 @@ mod tests {
         service.notify(NotificationEvent::CandleVerificationFailed {
             instruments_checked: 0,
             instruments_with_gaps: 100,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
         });
     }
 

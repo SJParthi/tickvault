@@ -1221,15 +1221,20 @@ fn spawn_historical_candle_fetch(
 
         // Cross-verify candle integrity in QuestDB
         let verify_report = verify_candle_integrity(&bg_questdb_config).await;
+        let timeframe_details = format_timeframe_details(&verify_report);
         if verify_report.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
                 instruments_checked: verify_report.instruments_checked,
                 total_candles: verify_report.total_candles_in_db,
+                timeframe_details,
+                ohlc_violations: verify_report.ohlc_violations,
             });
         } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
                 instruments_checked: verify_report.instruments_checked,
                 instruments_with_gaps: verify_report.instruments_with_gaps,
+                timeframe_details,
+                ohlc_violations: verify_report.ohlc_violations,
             });
         }
 
@@ -1292,15 +1297,20 @@ fn spawn_historical_candle_fetch(
 
         // Re-verify after post-market fetch
         let pm_verify = verify_candle_integrity(&bg_questdb_config).await;
+        let pm_timeframe_details = format_timeframe_details(&pm_verify);
         if pm_verify.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
                 instruments_checked: pm_verify.instruments_checked,
                 total_candles: pm_verify.total_candles_in_db,
+                timeframe_details: pm_timeframe_details,
+                ohlc_violations: pm_verify.ohlc_violations,
             });
         } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
                 instruments_checked: pm_verify.instruments_checked,
                 instruments_with_gaps: pm_verify.instruments_with_gaps,
+                timeframe_details: pm_timeframe_details,
+                ohlc_violations: pm_verify.ohlc_violations,
             });
         }
 
@@ -1314,6 +1324,33 @@ fn spawn_historical_candle_fetch(
     });
 
     info!("background historical candle fetch spawned (non-blocking)");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Format per-timeframe details for Telegram notification
+// ---------------------------------------------------------------------------
+
+/// Builds a human-readable per-timeframe summary from a cross-verification report.
+///
+/// Example output:
+/// ```text
+/// 1m: 86,250 (232 inst)
+/// 5m: 17,250 (232 inst)
+/// 15m: 5,750 (232 inst)
+/// 60m: 1,437 (232 inst)
+/// 1d: 232 (232 inst)
+/// ```
+fn format_timeframe_details(
+    report: &dhan_live_trader_core::historical::cross_verify::CrossVerificationReport,
+) -> String {
+    let mut lines = Vec::with_capacity(report.timeframe_counts.len());
+    for tc in &report.timeframe_counts {
+        lines.push(format!(
+            "{}: {} ({} inst)",
+            tc.timeframe, tc.candle_count, tc.instrument_count,
+        ));
+    }
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------

@@ -116,6 +116,10 @@ pub enum NotificationEvent {
         instruments_checked: usize,
         /// Total candles in QuestDB.
         total_candles: usize,
+        /// Per-timeframe breakdown (pre-formatted lines).
+        timeframe_details: String,
+        /// OHLC violations found (high < low).
+        ohlc_violations: usize,
     },
 
     /// Candle cross-verification found gaps in stored data.
@@ -124,6 +128,10 @@ pub enum NotificationEvent {
         instruments_checked: usize,
         /// Instruments with gaps.
         instruments_with_gaps: usize,
+        /// Per-timeframe breakdown (pre-formatted lines).
+        timeframe_details: String,
+        /// OHLC violations found (high < low).
+        ohlc_violations: usize,
     },
 
     /// Public IP verification failed — static IP mismatch or detection failure.
@@ -236,18 +244,38 @@ impl NotificationEvent {
             Self::CandleVerificationPassed {
                 instruments_checked,
                 total_candles,
+                timeframe_details,
+                ohlc_violations,
             } => {
-                format!(
+                let mut msg = format!(
                     "<b>Candle verification OK</b>\nInstruments: {instruments_checked}\nTotal candles: {total_candles}"
-                )
+                );
+                if !timeframe_details.is_empty() {
+                    msg.push_str("\n\n<b>Timeframes:</b>\n");
+                    msg.push_str(timeframe_details);
+                }
+                if *ohlc_violations > 0 {
+                    msg.push_str(&format!("\nOHLC violations: {ohlc_violations}"));
+                }
+                msg
             }
             Self::CandleVerificationFailed {
                 instruments_checked,
                 instruments_with_gaps,
+                timeframe_details,
+                ohlc_violations,
             } => {
-                format!(
+                let mut msg = format!(
                     "<b>Candle verification FAILED</b>\nChecked: {instruments_checked}\nWith gaps: {instruments_with_gaps}"
-                )
+                );
+                if !timeframe_details.is_empty() {
+                    msg.push_str("\n\n<b>Timeframes:</b>\n");
+                    msg.push_str(timeframe_details);
+                }
+                if *ohlc_violations > 0 {
+                    msg.push_str(&format!("\nOHLC violations: {ohlc_violations}"));
+                }
+                msg
             }
             Self::IpVerificationFailed { reason } => {
                 format!(
@@ -505,11 +533,16 @@ mod tests {
         let event = NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
             instruments_with_gaps: 3,
+            timeframe_details: "1m: 78,000 (207 instruments)\n5m: 15,600 (209 instruments)"
+                .to_string(),
+            ohlc_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("verification FAILED"));
         assert!(msg.contains("209"));
         assert!(msg.contains("3"));
+        assert!(msg.contains("Timeframes:"));
+        assert!(msg.contains("1m: 78,000"));
     }
 
     #[test]
@@ -517,6 +550,8 @@ mod tests {
         let event = NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
             instruments_with_gaps: 3,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
         };
         assert_eq!(event.severity(), Severity::High);
     }
@@ -638,11 +673,16 @@ mod tests {
         let event = NotificationEvent::CandleVerificationPassed {
             instruments_checked: 50,
             total_candles: 187500,
+            timeframe_details: "1m: 18,750 (50 inst)\n5m: 3,750 (50 inst)\n15m: 1,250 (50 inst)\n60m: 312 (50 inst)\n1d: 50 (50 inst)".to_string(),
+            ohlc_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("Candle verification OK"));
         assert!(msg.contains("50"));
         assert!(msg.contains("187500"));
+        assert!(msg.contains("Timeframes:"));
+        assert!(msg.contains("1m: 18,750"));
+        assert!(msg.contains("1d: 50"));
     }
 
     #[test]
@@ -650,6 +690,8 @@ mod tests {
         let event = NotificationEvent::CandleVerificationPassed {
             instruments_checked: 50,
             total_candles: 187500,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
         };
         assert_eq!(event.severity(), Severity::Low);
     }
