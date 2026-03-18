@@ -2251,7 +2251,7 @@ mod tests {
     fn test_persist_window_mid_session() {
         // 12:00:00 IST = mid-session
         assert!(is_within_persist_window(ist_hms_to_utc_epoch(12, 0, 0)));
-        // 09:15:00 IST = actual market open
+        // 09:15:00 IST = continuous trading start (within persist window [09:00, 15:30))
         assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 15, 0)));
         // 15:15:00 IST = near close
         assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 15, 0)));
