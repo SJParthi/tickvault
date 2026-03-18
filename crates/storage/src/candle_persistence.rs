@@ -27,8 +27,7 @@ use dhan_live_trader_common::constants::{
     CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
     EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
     EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1M, QUESTDB_TABLE_CANDLES_1S,
-    QUESTDB_TABLE_HISTORICAL_CANDLES,
+    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1S, QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
@@ -308,27 +307,9 @@ const HISTORICAL_CANDLES_CREATE_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
 
-/// SQL to create the legacy `historical_candles_1m` table.
-/// Kept for backward compatibility with existing data.
-const CANDLES_1M_CREATE_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS historical_candles_1m (\
-        segment SYMBOL,\
-        security_id LONG,\
-        open DOUBLE,\
-        high DOUBLE,\
-        low DOUBLE,\
-        close DOUBLE,\
-        volume LONG,\
-        oi LONG,\
-        ts TIMESTAMP\
-    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
-";
-
-/// Creates candle tables (if not exist) and enables DEDUP UPSERT KEYS.
+/// Creates the `historical_candles` table (if not exists) and enables DEDUP UPSERT KEYS.
 ///
-/// Creates both the new `historical_candles` table (multi-timeframe) and the
-/// legacy `historical_candles_1m` table. Best-effort: if QuestDB is unreachable,
-/// logs a warning and continues.
+/// Best-effort: if QuestDB is unreachable, logs a warning and continues.
 pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -413,37 +394,6 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Step 3: Create legacy table (backward compatibility).
-    match client
-        .get(&base_url)
-        .query(&[("query", CANDLES_1M_CREATE_DDL)])
-        .send()
-        .await
-    {
-        Ok(response) => {
-            if response.status().is_success() {
-                debug!(
-                    table = QUESTDB_TABLE_CANDLES_1M,
-                    "legacy historical_candles_1m table ensured"
-                );
-            } else {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                warn!(
-                    %status,
-                    body = body.chars().take(200).collect::<String>(),
-                    "legacy historical_candles_1m CREATE DDL returned non-success"
-                );
-            }
-        }
-        Err(err) => {
-            warn!(
-                ?err,
-                "legacy historical_candles_1m CREATE DDL request failed"
-            );
-        }
-    }
-
     info!("historical candle tables setup complete (DDL + DEDUP UPSERT KEYS)");
 }
 
@@ -498,13 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_candles_1m_ddl_contains_table_name() {
-        assert!(CANDLES_1M_CREATE_DDL.contains("historical_candles_1m"));
-        assert!(CANDLES_1M_CREATE_DDL.contains("TIMESTAMP(ts)"));
-        assert!(CANDLES_1M_CREATE_DDL.contains("PARTITION BY DAY"));
-    }
-
-    #[test]
     fn test_dedup_key_includes_timeframe_and_segment() {
         assert!(DEDUP_KEY_CANDLES.contains("security_id"));
         assert!(DEDUP_KEY_CANDLES.contains("timeframe"));
@@ -533,25 +476,6 @@ mod tests {
     #[test]
     fn test_dedup_key_candles_includes_all_components() {
         assert_eq!(DEDUP_KEY_CANDLES, "security_id, timeframe, segment");
-    }
-
-    #[test]
-    fn test_candles_1m_ddl_has_segment_column() {
-        assert!(CANDLES_1M_CREATE_DDL.contains("segment"));
-    }
-
-    #[test]
-    fn test_candles_1m_ddl_has_security_id() {
-        assert!(CANDLES_1M_CREATE_DDL.contains("security_id"));
-    }
-
-    #[test]
-    fn test_candles_1m_ddl_has_ohlcv_columns() {
-        assert!(CANDLES_1M_CREATE_DDL.contains("open"));
-        assert!(CANDLES_1M_CREATE_DDL.contains("high"));
-        assert!(CANDLES_1M_CREATE_DDL.contains("low"));
-        assert!(CANDLES_1M_CREATE_DDL.contains("close"));
-        assert!(CANDLES_1M_CREATE_DDL.contains("volume"));
     }
 
     #[test]

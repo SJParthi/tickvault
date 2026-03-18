@@ -152,9 +152,9 @@ pub fn persist_calendar(calendar: &TradingCalendar, questdb_config: &QuestDbConf
             Ok(())
         }
         Err(err) => {
-            warn!(
+            tracing::error!(
                 ?err,
-                "QuestDB calendar persistence failed — trading continues"
+                "QuestDB calendar persistence failed — nse_holidays table will be empty in Grafana"
             );
             Ok(())
         }
