@@ -784,15 +784,18 @@ async fn main() -> Result<()> {
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let token_handle = token_manager.token_handle();
+
+    // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
+    // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
+    let ws_client_id = {
+        let credentials = secret_manager::fetch_dhan_credentials()
+            .await
+            .context("failed to fetch Dhan client ID for WebSocket + trading")?;
+        credentials.client_id.expose_secret().to_string()
+    };
+
     let (frame_receiver, ws_handles) = if subscription_plan.is_some() {
         info!("building WebSocket connection pool");
-
-        let ws_client_id = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for WebSocket")?;
-            credentials.client_id.expose_secret().to_string()
-        };
 
         build_websocket_pool(
             &token_handle,
@@ -880,17 +883,12 @@ async fn main() -> Result<()> {
 
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
-        let ws_client_id = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for order update WebSocket")?;
-            credentials.client_id.expose_secret().to_string()
-        };
+        let order_ws_client_id = ws_client_id.clone();
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
         tokio::spawn(async move {
-            run_order_update_connection(url, ws_client_id, token, sender, cal).await;
+            run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
         })
     };
     info!("order update WebSocket started");
@@ -899,20 +897,13 @@ async fn main() -> Result<()> {
     // Step 10.5: Spawn trading pipeline (indicators → strategies → OMS)
     // -----------------------------------------------------------------------
     let trading_handle = {
-        let ws_client_id_for_trading = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for trading pipeline")?;
-            credentials.client_id.expose_secret().to_string()
-        };
-
         let tick_rx = tick_broadcast_sender.subscribe();
         let order_rx = order_update_sender.subscribe();
 
         match trading_pipeline::init_trading_pipeline(
             &config,
             &token_manager.token_handle(),
-            &ws_client_id_for_trading,
+            &ws_client_id,
         ) {
             Some((pipeline_config, hot_reloader)) => {
                 let handle = trading_pipeline::spawn_trading_pipeline(

@@ -726,4 +726,55 @@ mod tests {
         let packets = split_stacked_depth_packets(&buf).unwrap();
         assert_eq!(packets.len(), 1);
     }
+
+    // --- Mutant-killing tests for split_stacked_depth_packets boundary conditions ---
+
+    #[test]
+    fn test_split_stacked_zero_msg_length_stops_splitting() {
+        // A packet with message_length=0 in header must stop the splitter.
+        // Kills mutant: `msg_len == 0` → `msg_len == 1`.
+        let mut buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        // Append a 12-byte "header" with message_length = 0
+        let mut zero_header = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        zero_header[2] = DEEP_DEPTH_FEED_CODE_BID;
+        buf.extend_from_slice(&zero_header);
+        let packets = split_stacked_depth_packets(&buf).unwrap();
+        assert_eq!(
+            packets.len(),
+            1,
+            "zero msg_length header must stop splitting"
+        );
+    }
+
+    #[test]
+    fn test_split_stacked_exact_fit_packet_included() {
+        // A packet whose message_length exactly matches remaining bytes must be included.
+        // Kills mutant: `remaining.len() < msg_len` → `remaining.len() <= msg_len`.
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_ASK, 42, TWENTY_DEPTH_LEVELS);
+        // The single packet's message_length == buf.len(), so remaining.len() == msg_len exactly.
+        let packets = split_stacked_depth_packets(&buf).unwrap();
+        assert_eq!(packets.len(), 1, "exact-fit packet must be included");
+        assert_eq!(packets[0].len(), buf.len());
+    }
+
+    #[test]
+    fn test_split_stacked_exactly_header_size_trailing_parsed() {
+        // Exactly DEEP_DEPTH_HEADER_SIZE trailing bytes form a valid header
+        // but with msg_len=12 (header only, no depth levels). The splitter should
+        // include it as a packet since remaining.len() >= msg_len.
+        // Kills mutant: `remaining.len() < DEEP_DEPTH_HEADER_SIZE` → `... <= ...`.
+        let bid = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        let mut stacked = bid.clone();
+        // Build a 12-byte header-only packet with msg_len = 12
+        let mut tiny_header = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        tiny_header[0..2].copy_from_slice(&(DEEP_DEPTH_HEADER_SIZE as u16).to_le_bytes());
+        tiny_header[2] = DEEP_DEPTH_FEED_CODE_BID;
+        stacked.extend_from_slice(&tiny_header);
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(
+            packets.len(),
+            2,
+            "12-byte header-only packet with msg_len=12 should be included"
+        );
+    }
 }

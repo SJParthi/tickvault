@@ -331,7 +331,18 @@ mod tests {
     /// Cargo runs tests in the same binary in parallel threads; without
     /// serialization, one test's `save` can be overwritten by another before
     /// the matching `load`, causing spurious failures.
+    ///
+    /// Uses `unwrap_or_else(|e| e.into_inner())` to recover from poisoned
+    /// mutex (if a prior test panicked while holding the lock). Safe in tests —
+    /// the lock only protects a cache file, not critical invariants.
     static CACHE_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquires the cache file lock, recovering from poison if a prior test panicked.
+    fn acquire_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_FILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn test_hash_client_id_deterministic() {
@@ -349,8 +360,7 @@ mod tests {
 
     #[test]
     fn test_load_token_cache_missing_file() {
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
         let id = SecretString::from("test-client".to_string());
         let result = load_token_cache(&id);
@@ -361,8 +371,7 @@ mod tests {
     fn test_save_and_load_roundtrip() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();
@@ -391,8 +400,7 @@ mod tests {
     fn test_load_rejects_wrong_client_id() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();
@@ -419,8 +427,7 @@ mod tests {
     fn test_load_rejects_expired_token() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();
@@ -445,8 +452,7 @@ mod tests {
     fn test_load_rejects_nearly_expired_token() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();
@@ -473,8 +479,7 @@ mod tests {
 
     #[test]
     fn test_corrupt_cache_file_returns_none() {
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         std::fs::write(TOKEN_CACHE_FILE_PATH, "not valid json {{{").ok();
@@ -516,8 +521,7 @@ mod tests {
     fn test_load_token_cache_fast_roundtrip() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();
@@ -543,8 +547,7 @@ mod tests {
 
     #[test]
     fn test_load_token_cache_fast_missing_file() {
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let result = load_token_cache_fast();
@@ -558,8 +561,7 @@ mod tests {
     fn test_load_token_cache_fast_old_format_without_client_id() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();
@@ -587,8 +589,7 @@ mod tests {
     fn test_load_token_cache_fast_expired_token() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let ist = ist_offset();

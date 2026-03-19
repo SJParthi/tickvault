@@ -491,36 +491,37 @@ impl ApplicationConfig {
         }
 
         // Validate time string formats.
-        let time_fields = [
-            ("trading.market_open_time", &self.trading.market_open_time),
-            ("trading.market_close_time", &self.trading.market_close_time),
-            ("trading.order_cutoff_time", &self.trading.order_cutoff_time),
-            (
-                "trading.data_collection_start",
-                &self.trading.data_collection_start,
-            ),
-            (
-                "trading.data_collection_end",
-                &self.trading.data_collection_end,
-            ),
-            (
-                "instrument.daily_download_time",
-                &self.instrument.daily_download_time,
-            ),
-            (
-                "instrument.build_window_start",
-                &self.instrument.build_window_start,
-            ),
-            (
-                "instrument.build_window_end",
-                &self.instrument.build_window_end,
-            ),
-        ];
-        for (field_name, value) in &time_fields {
+        // Helper: parse and validate a single time field.
+        let parse_time = |field_name: &str, value: &str| -> Result<NaiveTime> {
             NaiveTime::parse_from_str(value, "%H:%M:%S").map_err(|_| {
                 anyhow::anyhow!("{} is not a valid HH:MM:SS time: '{}'", field_name, value)
-            })?;
-        }
+            })
+        };
+
+        parse_time("trading.market_open_time", &self.trading.market_open_time)?;
+        parse_time("trading.market_close_time", &self.trading.market_close_time)?;
+        parse_time("trading.order_cutoff_time", &self.trading.order_cutoff_time)?;
+        parse_time(
+            "trading.data_collection_start",
+            &self.trading.data_collection_start,
+        )?;
+        parse_time(
+            "trading.data_collection_end",
+            &self.trading.data_collection_end,
+        )?;
+        parse_time(
+            "instrument.daily_download_time",
+            &self.instrument.daily_download_time,
+        )?;
+        // Parse and retain build window times for the comparison below.
+        let window_start = parse_time(
+            "instrument.build_window_start",
+            &self.instrument.build_window_start,
+        )?;
+        let window_end = parse_time(
+            "instrument.build_window_end",
+            &self.instrument.build_window_end,
+        )?;
 
         // SEBI: max_orders_per_second must not exceed the SEBI limit.
         if self.trading.max_orders_per_second > SEBI_MAX_ORDERS_PER_SECOND {
@@ -567,18 +568,7 @@ impl ApplicationConfig {
         }
 
         // Instrument: build window start must be before end.
-        let window_start =
-            NaiveTime::parse_from_str(&self.instrument.build_window_start, "%H:%M:%S").map_err(
-                |_| {
-                    anyhow::anyhow!(
-                        "instrument.build_window_start already validated above but failed again"
-                    )
-                },
-            )?;
-        let window_end = NaiveTime::parse_from_str(&self.instrument.build_window_end, "%H:%M:%S")
-            .map_err(|_| {
-            anyhow::anyhow!("instrument.build_window_end already validated above but failed again")
-        })?;
+        // `window_start` and `window_end` already parsed above — no redundant re-parse.
         if window_start >= window_end {
             bail!(
                 "instrument.build_window_start ({}) must be before build_window_end ({})",

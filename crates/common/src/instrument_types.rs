@@ -866,8 +866,10 @@ impl FnoUniverse {
             .map(|u| u.price_feed_security_id)
     }
 
-    /// O(1) lookup: symbol → all derivative contracts for that underlying.
+    /// O(N) scan: symbol → all derivative contracts for that underlying.
     /// Returns futures + options contracts as security IDs.
+    /// N = total derivative contracts in the universe.
+    /// Cold path only — called during subscription planning, not on tick path.
     pub fn derivative_security_ids_for_symbol(&self, symbol: &str) -> Vec<SecurityId> {
         self.derivative_contracts
             .values()
@@ -895,8 +897,9 @@ impl FnoUniverse {
             })
     }
 
-    /// O(1) lookup: index symbol → index security ID from subscribed_indices.
+    /// O(N) scan: index symbol → index security ID from subscribed_indices.
     /// "NIFTY" → 13, "BANKNIFTY" → 29.
+    /// N = subscribed index count (31 max). Cold path only.
     pub fn index_symbol_to_security_id(&self, symbol: &str) -> Option<SecurityId> {
         self.subscribed_indices
             .iter()

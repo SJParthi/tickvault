@@ -37,7 +37,7 @@ use super::types::{
 /// Trait for providing access tokens to the OMS engine.
 ///
 /// Implemented at the binary level where `TokenHandle` (core crate) is available.
-/// Uses dynamic dispatch (cold path — orders are infrequent).
+/// Uses dynamic dispatch via `Box<dyn TokenProvider>` (cold path — orders are ~1-100/day).
 /// Returns `SecretString` to ensure zeroize-on-drop for the access token.
 pub trait TokenProvider: Send + Sync {
     /// Returns the current valid access token, or an error.
