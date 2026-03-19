@@ -307,4 +307,112 @@ mod tests {
         let status = pool.pool.status();
         assert_eq!(status.waiting, 0, "no waiters initially");
     }
+
+    #[test]
+    fn url_format_with_ipv4_host() {
+        let config = ValkeyConfig {
+            host: "192.168.1.100".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        assert_eq!(url, "redis://192.168.1.100:6379");
+    }
+
+    #[test]
+    fn url_format_with_docker_hostname() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        // Docker DNS hostname must be used, not localhost
+        assert!(
+            !url.contains("localhost"),
+            "production URLs must use Docker DNS, not localhost"
+        );
+        assert_eq!(url, "redis://dlt-valkey:6379");
+    }
+
+    #[test]
+    fn pool_creation_is_lazy_no_immediate_connection() {
+        // Pool must not attempt to connect during construction.
+        // Using a deliberately unreachable host proves this — if it tried
+        // to connect, pool creation would fail or hang.
+        let config = ValkeyConfig {
+            host: "unreachable-host-that-does-not-exist".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::new(&config);
+        assert!(
+            pool.is_ok(),
+            "pool creation must succeed even with unreachable host (lazy connections)"
+        );
+    }
+
+    #[test]
+    fn pool_max_size_boundary_min() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).expect("min pool size must succeed");
+        assert_eq!(pool.pool.status().max_size, 1);
+    }
+
+    #[test]
+    fn pool_max_size_boundary_typical_prod() {
+        // Production config uses max_connections = 16
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let pool = ValkeyPool::new(&config).expect("typical prod pool size must succeed");
+        assert_eq!(pool.pool.status().max_size, 16);
+    }
+
+    #[test]
+    fn pool_checkout_timeout_constant_is_500ms() {
+        // Verify the exact value — changes to this constant affect trading latency
+        assert_eq!(
+            POOL_CHECKOUT_TIMEOUT_MS, 500,
+            "pool checkout timeout must be exactly 500ms"
+        );
+    }
+
+    #[test]
+    fn multiple_pools_can_coexist() {
+        // Different configs should produce independent pools
+        let config_a = ValkeyConfig {
+            host: "host-a".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let config_b = ValkeyConfig {
+            host: "host-b".to_string(),
+            port: 6380,
+            max_connections: 8,
+        };
+        let pool_a = ValkeyPool::new(&config_a).expect("pool A must succeed");
+        let pool_b = ValkeyPool::new(&config_b).expect("pool B must succeed");
+        assert_eq!(pool_a.pool.status().max_size, 4);
+        assert_eq!(pool_b.pool.status().max_size, 8);
+    }
+
+    #[test]
+    fn url_never_contains_password_in_basic_config() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        // Basic config URL must not accidentally include auth credentials
+        assert!(!url.contains('@'), "URL must not contain auth separator");
+        assert!(!url.contains("password"), "URL must not contain password");
+    }
 }

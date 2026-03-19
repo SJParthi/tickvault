@@ -2317,12 +2317,8 @@ mod tests {
 
     /// Helper: creates a `TokenState` for testing using `from_cached`.
     fn make_test_token_state(token_value: &str) -> TokenState {
-        let now_ist = chrono::Utc::now().with_timezone(
-            &chrono::FixedOffset::east_opt(
-                dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS,
-            )
-            .expect("IST offset always valid"), // APPROVED: test-only, compile-time constant
-        );
+        let now_ist = chrono::Utc::now()
+            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset());
         let expires_at = now_ist + chrono::Duration::hours(24);
         TokenState::from_cached(
             secrecy::SecretString::from(token_value.to_string()),

@@ -31,7 +31,7 @@ mod trading_pipeline;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, Timelike, Utc};
+use chrono::{Timelike, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
@@ -40,9 +40,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
@@ -398,6 +397,9 @@ async fn main() -> Result<()> {
                     ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
                     calendar_persistence::ensure_calendar_table(&config.questdb),
+                    dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+                        &config.questdb
+                    ),
                     dhan_live_trader_storage::materialized_views::ensure_candle_views(
                         &config.questdb
                     ),
@@ -532,6 +534,16 @@ async fn main() -> Result<()> {
             )
             .await;
 
+        // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+        // Enrich with security_ids from instrument master for news-based trading.
+        if let Some(ref map) = bg_constituency {
+            let _ = dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                map,
+                &config.questdb,
+                fresh_universe.as_ref(),
+            );
+        }
+
         let bg_shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
             std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
 
@@ -544,7 +556,11 @@ async fn main() -> Result<()> {
             bg_shared_constituency,
         );
 
-        let router = build_router(api_state);
+        let router = build_router(
+            api_state,
+            &config.api.allowed_origins,
+            config.strategy.dry_run,
+        );
         let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
             .parse()
             .context("invalid API bind address")?;
@@ -575,6 +591,7 @@ async fn main() -> Result<()> {
                 tm,
                 &notifier,
                 std::sync::Arc::clone(&post_market_signal),
+                is_trading,
             );
         }
 
@@ -699,6 +716,9 @@ async fn main() -> Result<()> {
         ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
         calendar_persistence::ensure_calendar_table(&config.questdb),
+        dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+            &config.questdb
+        ),
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
     );
 
@@ -839,6 +859,7 @@ async fn main() -> Result<()> {
         &token_manager,
         &notifier,
         std::sync::Arc::clone(&post_market_signal),
+        is_trading,
     );
 
     // -----------------------------------------------------------------------
@@ -910,6 +931,16 @@ async fn main() -> Result<()> {
         )
         .await;
 
+    // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+    // Enrich with security_ids from instrument master for news-based trading.
+    if let Some(ref map) = constituency_map {
+        let _ = dhan_live_trader_storage::constituency_persistence::persist_constituency(
+            map,
+            &config.questdb,
+            slow_boot_universe.as_ref(),
+        );
+    }
+
     let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
         std::sync::Arc::new(std::sync::RwLock::new(constituency_map));
 
@@ -924,7 +955,11 @@ async fn main() -> Result<()> {
         shared_constituency.clone(),
     );
 
-    let router = build_router(api_state);
+    let router = build_router(
+        api_state,
+        &config.api.allowed_origins,
+        config.strategy.dry_run,
+    );
 
     let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
         .parse()
@@ -990,14 +1025,7 @@ async fn load_instruments(
     .await
     {
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
-            let ist = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-                Some(tz) => tz,
-                None => {
-                    error!("invalid IST offset constant");
-                    return (None, None);
-                }
-            };
-            let today = Utc::now().with_timezone(&ist).date_naive();
+            let today = Utc::now().with_timezone(&ist_offset()).date_naive();
             let plan = build_subscription_plan(&universe, &config.subscription, today);
 
             info!(
@@ -1172,6 +1200,7 @@ fn spawn_historical_candle_fetch(
     token_manager: &std::sync::Arc<TokenManager>,
     notifier: &std::sync::Arc<NotificationService>,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
+    is_trading_day: bool,
 ) {
     let plan = match subscription_plan
         .as_ref()
@@ -1209,7 +1238,7 @@ fn spawn_historical_candle_fetch(
             }
         };
 
-        let mut candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
+        let candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
             Ok(writer) => writer,
             Err(err) => {
                 warn!(?err, "failed to create candle writer for background fetch");
@@ -1225,15 +1254,62 @@ fn spawn_historical_candle_fetch(
             }
         };
 
-        info!("starting background historical candle fetch");
+        // -----------------------------------------------------------------
+        // Trading day: skip initial fetch — wait for post-market signal
+        //   (after 15:30 IST, WS disconnected, live data fully ingested)
+        // Non-trading day: fetch immediately at boot (no live data to wait for)
+        // -----------------------------------------------------------------
+
+        if is_trading_day {
+            info!(
+                "trading day — skipping initial historical fetch, waiting for post-market signal"
+            );
+            post_market_signal.notified().await;
+            info!("post-market signal received — WebSockets disconnected, live data ingested");
+        } else {
+            info!("non-trading day — starting historical candle fetch immediately");
+        }
+
+        // -----------------------------------------------------------------
+        // Fetch historical candles (runs immediately on non-trading days,
+        // or after post-market signal on trading days)
+        // -----------------------------------------------------------------
+
+        // Re-fetch credentials if we waited (token may have been refreshed)
+        let fetch_client_id = if is_trading_day {
+            match secret_manager::fetch_dhan_credentials().await {
+                Ok(creds) => creds.client_id,
+                Err(err) => {
+                    warn!(?err, "failed to fetch credentials for post-market fetch");
+                    return;
+                }
+            }
+        } else {
+            client_id
+        };
+
+        // Re-create writer if we waited (previous may have timed out)
+        let mut fetch_writer = if is_trading_day {
+            match CandlePersistenceWriter::new(&bg_questdb_config) {
+                Ok(writer) => writer,
+                Err(err) => {
+                    warn!(?err, "failed to create candle writer for post-market fetch");
+                    return;
+                }
+            }
+        } else {
+            candle_writer
+        };
+
+        info!("starting historical candle fetch");
 
         let summary = fetch_historical_candles(
             &bg_registry,
             &bg_dhan_config,
             &bg_historical_config,
             &bg_token_handle,
-            &client_id,
-            &mut candle_writer,
+            &fetch_client_id,
+            &mut fetch_writer,
         )
         .await;
 
@@ -1255,7 +1331,9 @@ fn spawn_historical_candle_fetch(
             });
         }
 
+        // -----------------------------------------------------------------
         // Cross-verify candle integrity in QuestDB
+        // -----------------------------------------------------------------
         let verify_report = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
         let timeframe_details = format_timeframe_details(&verify_report);
         if verify_report.passed {
@@ -1281,117 +1359,44 @@ fn spawn_historical_candle_fetch(
             });
         }
 
-        info!(
-            instruments_fetched = summary.instruments_fetched,
-            instruments_failed = summary.instruments_failed,
-            total_candles = summary.total_candles,
-            verification_passed = verify_report.passed,
-            "background historical candle fetch complete"
-        );
-
-        // --- Post-market re-fetch: wait for disconnect signal, then fetch immediately ---
-        info!("waiting for post-market WebSocket disconnect signal to start re-fetch");
-        post_market_signal.notified().await;
-        info!("post-market disconnect signal received — starting historical re-fetch immediately");
-
-        // Re-create writer for post-market fetch (previous may have been consumed)
-        let mut pm_candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
-            Ok(writer) => writer,
-            Err(err) => {
-                warn!(?err, "failed to create candle writer for post-market fetch");
-                return;
+        // -----------------------------------------------------------------
+        // Cross-match historical vs live candle data (trading day only —
+        // on non-trading days there's no live data to compare against)
+        // -----------------------------------------------------------------
+        if is_trading_day {
+            let cross_match =
+                cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
+            if cross_match.passed {
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
+                    timeframes_checked: cross_match.timeframes_checked,
+                    candles_compared: cross_match.candles_compared,
+                });
+            } else {
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
+                    candles_compared: cross_match.candles_compared,
+                    mismatches: cross_match.mismatches,
+                    missing_live: cross_match.missing_live,
+                    mismatch_details: format_cross_match_details(&cross_match.mismatch_details),
+                });
             }
-        };
 
-        // Re-fetch credentials (token may have been refreshed)
-        let pm_client_id = match secret_manager::fetch_dhan_credentials().await {
-            Ok(creds) => creds.client_id,
-            Err(err) => {
-                warn!(?err, "failed to fetch credentials for post-market re-fetch");
-                return;
-            }
-        };
-
-        info!("starting post-market historical candle re-fetch");
-
-        let pm_summary = fetch_historical_candles(
-            &bg_registry,
-            &bg_dhan_config,
-            &bg_historical_config,
-            &bg_token_handle,
-            &pm_client_id,
-            &mut pm_candle_writer,
-        )
-        .await;
-
-        if pm_summary.instruments_failed > 0 {
-            bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
-                instruments_fetched: pm_summary.instruments_fetched,
-                instruments_failed: pm_summary.instruments_failed,
-                total_candles: pm_summary.total_candles,
-                persist_failures: pm_summary.persist_failures,
-                failed_instruments: pm_summary.failed_instruments.clone(),
-                failure_reasons: pm_summary.failure_reasons.clone(),
-            });
+            info!(
+                instruments_fetched = summary.instruments_fetched,
+                instruments_failed = summary.instruments_failed,
+                total_candles = summary.total_candles,
+                verification_passed = verify_report.passed,
+                cross_match_passed = cross_match.passed,
+                "post-market historical fetch + cross-verification complete"
+            );
         } else {
-            bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
-                instruments_fetched: pm_summary.instruments_fetched,
-                instruments_skipped: pm_summary.instruments_skipped,
-                total_candles: pm_summary.total_candles,
-                persist_failures: pm_summary.persist_failures,
-            });
+            info!(
+                instruments_fetched = summary.instruments_fetched,
+                instruments_failed = summary.instruments_failed,
+                total_candles = summary.total_candles,
+                verification_passed = verify_report.passed,
+                "non-trading day historical fetch complete"
+            );
         }
-
-        // Re-verify after post-market fetch
-        let pm_verify = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
-        let pm_timeframe_details = format_timeframe_details(&pm_verify);
-        if pm_verify.passed {
-            bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
-                instruments_checked: pm_verify.instruments_checked,
-                total_candles: pm_verify.total_candles_in_db,
-                timeframe_details: pm_timeframe_details,
-                ohlc_violations: pm_verify.ohlc_violations,
-                data_violations: pm_verify.data_violations,
-                timestamp_violations: pm_verify.timestamp_violations,
-            });
-        } else {
-            bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
-                instruments_checked: pm_verify.instruments_checked,
-                instruments_with_gaps: pm_verify.instruments_with_gaps,
-                timeframe_details: pm_timeframe_details,
-                ohlc_violations: pm_verify.ohlc_violations,
-                data_violations: pm_verify.data_violations,
-                timestamp_violations: pm_verify.timestamp_violations,
-                ohlc_details: format_violation_details(&pm_verify.ohlc_details),
-                data_details: format_violation_details(&pm_verify.data_details),
-                timestamp_details: format_violation_details(&pm_verify.timestamp_details),
-            });
-        }
-
-        // Cross-match historical vs live candle data (post-market only)
-        let cross_match = cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
-        if cross_match.passed {
-            bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
-                timeframes_checked: cross_match.timeframes_checked,
-                candles_compared: cross_match.candles_compared,
-            });
-        } else {
-            bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
-                candles_compared: cross_match.candles_compared,
-                mismatches: cross_match.mismatches,
-                missing_live: cross_match.missing_live,
-                mismatch_details: format_cross_match_details(&cross_match.mismatch_details),
-            });
-        }
-
-        info!(
-            instruments_fetched = pm_summary.instruments_fetched,
-            instruments_failed = pm_summary.instruments_failed,
-            total_candles = pm_summary.total_candles,
-            verification_passed = pm_verify.passed,
-            cross_match_passed = cross_match.passed,
-            "post-market historical candle re-fetch complete"
-        );
     });
 
     info!("background historical candle fetch spawned (non-blocking)");
@@ -1682,12 +1687,7 @@ fn compute_market_close_sleep(market_close_time_str: &str) -> std::time::Duratio
         }
     };
 
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => return std::time::Duration::ZERO,
-    };
-
-    let now_ist = Utc::now().with_timezone(&ist_offset);
+    let now_ist = Utc::now().with_timezone(&ist_offset());
     let now_time = now_ist.time();
 
     if now_time >= close_time {

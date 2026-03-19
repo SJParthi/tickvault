@@ -19,5 +19,17 @@ tracing = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "calendar"
+harness = false
+
+[[bench]]
+name = "config"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid"]

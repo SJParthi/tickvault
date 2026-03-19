@@ -64,8 +64,9 @@
 12. **Data API Errors — exact codes.**
     - `800`=Internal Server Error, `804`=Instruments exceed limit, `805`=Too many requests/connections (STOP ALL 60s), `806`=Data APIs not subscribed, `807`=Access token expired (trigger token refresh), `808`=Auth failed, `809`=Token invalid, `810`=Client ID invalid, `811`=Invalid expiry date, `812`=Invalid date format, `813`=Invalid SecurityId, `814`=Invalid request
 
-13. **Timestamps — standard UNIX epoch (seconds since 1970-01-01 UTC).**
-    - Add +5:30 (19800 seconds) for IST display.
+13. **Timestamps — two conventions depending on data source.**
+    - **Historical REST API** (`/v2/charts/historical`, `/v2/charts/intraday`): standard UNIX epoch (seconds since 1970-01-01 00:00 UTC). Add +5:30 (19800 seconds) for IST display.
+    - **WebSocket Live Market Feed** (LTT fields in binary packets): IST epoch seconds. Do NOT add +5:30 — the raw value already represents IST wall-clock time. To convert to UTC, subtract 19800 seconds.
     - NOT milliseconds, NOT microseconds, NOT custom epoch.
 
 14. **Error response structure — exactly 3 string fields.**

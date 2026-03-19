@@ -1,28 +1,30 @@
-# Implementation Plan: Expand Index Constituency to All NSE Indices
+# Implementation Plan: Gate Historical Fetch by Trading Day + Market Close
 
 **Status:** VERIFIED
-**Date:** 2026-03-18
-**Approved by:** Parthiban
+**Date:** 2026-03-19
+**Approved by:** Parthiban (explicit "yes correct go ahead")
 
-## Summary
+## Context
 
-Expand `INDEX_CONSTITUENCY_SLUGS` from 6 indices to 49 NSE indices covering all broad-based, sectoral, and thematic categories.
+Historical candle fetch currently runs immediately at boot regardless of trading day or time.
+Correct behavior:
+- **Non-trading day**: fetch immediately at boot
+- **Trading day**: ONLY after 15:30 IST, after WS disconnect + live data fully ingested
 
 ## Plan Items
 
-- [x] 1. Expand `INDEX_CONSTITUENCY_SLUGS` from 6 to 49 indices
-  - Files: `crates/common/src/constants.rs`
-  - Categories: 16 broad-based + 15 sectoral + 18 thematic/strategy
+- [x] Pass `is_trading_day` to `spawn_historical_candle_fetch()`
+  - Files: crates/app/src/main.rs (lines 575, 839, 1169)
+  - Tests: existing boot tests pass
 
-- [x] 2. Update `INDEX_CONSTITUENCY_MIN_INDICES` from 3 to 15
-  - Files: `crates/common/src/constants.rs`
+- [x] Restructure async task: skip initial fetch on trading days, only wait for post-market signal
+  - Files: crates/app/src/main.rs (lines 1230-1394 rewritten)
+  - Tests: existing pipeline tests pass
 
-- [x] 3. Update `IndexConstituencyConfig` defaults: `inter_batch_delay_ms` 0→200
-  - Files: `crates/common/src/config.rs`
+- [x] On non-trading days: run initial fetch, skip post-market wait and cross-match
+  - Files: crates/app/src/main.rs
+  - Tests: existing pipeline tests pass
 
-- [x] 4. Add slug validation tests: no duplicates, no empty names, URL-safe chars
-  - Files: `crates/core/tests/index_constituency.rs`
-  - Tests: `test_all_slugs_valid_format`, `test_no_duplicate_slugs`, `test_no_duplicate_index_names`, `test_slug_count_covers_all_categories`
-
-- [x] 5. Build & test pass (2439+ tests, fmt, clippy)
-  - Files: N/A
+- [x] Run full test suite and verify
+  - Files: none
+  - Tests: cargo test --workspace — all pass, 0 failures

@@ -5,7 +5,13 @@
 //!
 //! # Token Source
 //! The API bearer token is read from the environment variable `DLT_API_TOKEN`
-//! at startup. If not set, authentication is disabled (development mode).
+//! at startup.
+//!
+//! # Auth Behavior
+//! - Token set: auth enabled with configured token.
+//! - Token unset + dry_run: auth disabled (development passthrough).
+//! - Token unset + live mode: fail-closed — auto-generates a random token,
+//!   logs it at WARN level, and still requires auth for mutating endpoints.
 //!
 //! # Authenticated Endpoints
 //! - `POST /api/instruments/rebuild` — triggers instrument reload
@@ -15,7 +21,7 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -25,7 +31,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub struct ApiAuthConfig {
     /// Bearer token for authenticating mutating API requests.
-    /// Empty string = auth disabled (development mode).
+    /// Empty string = auth disabled (development mode only).
     pub bearer_token: String,
     /// Whether authentication is enabled.
     pub enabled: bool,
@@ -41,7 +47,7 @@ impl ApiAuthConfig {
         }
     }
 
-    /// Creates a disabled auth config (development mode).
+    /// Creates a disabled auth config (development/dry-run mode only).
     pub fn disabled() -> Self {
         Self {
             bearer_token: String::new(),
@@ -51,17 +57,37 @@ impl ApiAuthConfig {
 
     /// Loads the API token from the `DLT_API_TOKEN` environment variable.
     ///
-    /// Returns disabled config if the variable is not set or empty.
+    /// # Behavior
+    /// - Token set and non-empty: auth enabled with that token.
+    /// - Token unset/empty + `dry_run = true`: auth disabled (dev passthrough).
+    /// - Token unset/empty + `dry_run = false`: fail-closed — generates a
+    ///   random UUID v4 token, logs it at WARN, and enforces auth. This
+    ///   prevents accidentally running live with unprotected mutating endpoints.
     // O(1) EXEMPT: begin — cold path, called once at boot
-    pub fn from_env() -> Self {
+    pub fn from_env(dry_run: bool) -> Self {
         match std::env::var("DLT_API_TOKEN") {
             Ok(token) if !token.is_empty() => {
                 info!("GAP-SEC-01: API bearer token authentication enabled");
                 Self::new(token)
             }
             _ => {
-                warn!("GAP-SEC-01: DLT_API_TOKEN not set — API authentication disabled (dev mode)");
-                Self::disabled()
+                if dry_run {
+                    warn!(
+                        "GAP-SEC-01: DLT_API_TOKEN not set — API authentication disabled (dry-run mode)"
+                    );
+                    Self::disabled()
+                } else {
+                    // Fail-closed: generate a random token so auth is still enforced.
+                    let generated_token = uuid::Uuid::new_v4().to_string();
+                    error!(
+                        "GAP-SEC-01 CRITICAL: DLT_API_TOKEN not set in LIVE mode — \
+                         auto-generated bearer token for this session: {generated_token}"
+                    );
+                    warn!(
+                        "GAP-SEC-01: Set DLT_API_TOKEN environment variable to suppress this warning"
+                    );
+                    Self::new(generated_token)
+                }
             }
         }
     }
@@ -627,5 +653,59 @@ mod tests {
             debug_output.contains("enabled"),
             "Debug output must contain 'enabled' field name"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // from_env: dry_run vs live mode fail-closed behavior
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_from_env_dry_run_no_token_disables_auth() {
+        // Remove DLT_API_TOKEN to simulate unset
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        let config = ApiAuthConfig::from_env(true);
+        assert!(!config.enabled, "dry_run + no token = auth disabled");
+        assert!(config.bearer_token.is_empty());
+    }
+
+    #[test]
+    fn test_from_env_live_mode_no_token_generates_token() {
+        // Remove DLT_API_TOKEN to simulate unset
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        let config = ApiAuthConfig::from_env(false);
+        assert!(
+            config.enabled,
+            "live mode + no token = auth enabled with generated token"
+        );
+        assert!(
+            !config.bearer_token.is_empty(),
+            "generated token must not be empty"
+        );
+        // Verify it looks like a UUID v4
+        assert_eq!(config.bearer_token.len(), 36, "UUID v4 is 36 chars");
+    }
+
+    #[test]
+    fn test_from_env_live_mode_no_token_generates_unique_tokens() {
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        let config1 = ApiAuthConfig::from_env(false);
+        let config2 = ApiAuthConfig::from_env(false);
+        assert_ne!(
+            config1.bearer_token, config2.bearer_token,
+            "each call must generate a unique token"
+        );
+    }
+
+    #[test]
+    fn test_from_env_with_token_ignores_dry_run() {
+        unsafe { std::env::set_var("DLT_API_TOKEN", "explicit-token") };
+        let config_dry = ApiAuthConfig::from_env(true);
+        let config_live = ApiAuthConfig::from_env(false);
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+
+        assert!(config_dry.enabled);
+        assert_eq!(config_dry.bearer_token, "explicit-token");
+        assert!(config_live.enabled);
+        assert_eq!(config_live.bearer_token, "explicit-token");
     }
 }

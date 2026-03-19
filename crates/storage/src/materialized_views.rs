@@ -1,9 +1,10 @@
 //! QuestDB materialized views for multi-timeframe candle aggregation.
 //!
 //! Creates the `candles_1s` base table and 18 materialized views covering
-//! timeframes from 5 seconds to 1 month. Dhan V2 sends standard UTC epoch
-//! seconds. Views use `OFFSET '05:30'` so candle boundaries align to IST
-//! wall-clock time (IST = UTC + 5:30).
+//! timeframes from 5 seconds to 1 month. Live WebSocket data arrives as IST
+//! epoch seconds (stored directly). Historical REST data arrives as UTC epoch
+//! seconds (+19800s offset applied at persistence). Both result in IST-based
+//! timestamps. Views use `OFFSET '00:00'` since stored data is already IST.
 //!
 //! Timeframes 20-21 (3 months, 1 year) are computed in Rust from monthly data.
 //!

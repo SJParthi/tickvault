@@ -238,6 +238,16 @@ pub struct ApiConfig {
     pub host: String,
     /// HTTP server port.
     pub port: u16,
+    /// Allowed CORS origins. Defaults to localhost dev origins.
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    vec![
+        "http://localhost:3000".to_string(),
+        "http://localhost:3001".to_string(),
+    ]
 }
 
 /// Instrument CSV download and universe build configuration.
@@ -760,6 +770,7 @@ mod tests {
             api: ApiConfig {
                 host: "0.0.0.0".to_string(),
                 port: 3001,
+                allowed_origins: default_allowed_origins(),
             },
             subscription: SubscriptionConfig::default(),
             notification: NotificationConfig::default(),

@@ -44,7 +44,7 @@ fn test_state() -> SharedAppState {
 
 #[tokio::test]
 async fn health_endpoint_returns_200() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/health")
         .body(Body::empty())
@@ -55,7 +55,7 @@ async fn health_endpoint_returns_200() {
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/nonexistent")
         .body(Body::empty())
@@ -66,7 +66,7 @@ async fn unknown_route_returns_404() {
 
 #[tokio::test]
 async fn portal_endpoint_returns_200() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/portal")
         .body(Body::empty())

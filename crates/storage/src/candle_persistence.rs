@@ -5,7 +5,7 @@
 //! Supports multiple timeframes: 1m, 5m, 15m, 60m, and daily.
 //!
 //! # Table Schema
-//! - `ts` TIMESTAMP (designated) — candle open time (IST-as-UTC: UTC epoch + 19800s)
+//! - `ts` TIMESTAMP (designated) — candle open time (IST epoch for live, UTC+19800s for historical)
 //! - `security_id` LONG — Dhan security identifier
 //! - `segment` SYMBOL — exchange segment (NSE_FNO, NSE_EQ, etc.)
 //! - `timeframe` SYMBOL — candle interval: 1m, 5m, 15m, 60m, 1d
@@ -24,11 +24,10 @@ use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
-    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
-    EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1S, QUESTDB_TABLE_HISTORICAL_CANDLES,
+    CANDLE_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1S,
+    QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
+use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
 use crate::tick_persistence::f32_to_f64_clean;
@@ -45,24 +44,6 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// `segment` is required because security IDs 13 (NIFTY) and 25 (BANKNIFTY) exist
 /// in both `IDX_I` and `NSE_EQ` segments with different data.
 const DEDUP_KEY_CANDLES: &str = "security_id, timeframe, segment";
-
-/// Maps the binary exchange_segment_code to a human-readable symbol name.
-///
-/// Uses the same mapping as the Dhan Python SDK.
-/// Note: code 6 is unused/skipped in Dhan's protocol.
-fn segment_code_to_str(code: u8) -> &'static str {
-    match code {
-        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
-        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
-        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
-        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
-        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
-        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
-        _ => "UNKNOWN",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Candle Persistence Writer
@@ -222,9 +203,9 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
-        let ist_epoch_secs = i64::from(timestamp_secs).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+        // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
+        // Store directly — no offset needed.
+        let ts_nanos = TimestampNanos::new(i64::from(timestamp_secs).saturating_mul(1_000_000_000));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1S)
@@ -404,6 +385,11 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dhan_live_trader_common::constants::{
+        EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
+        EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
+        EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
+    };
 
     #[test]
     fn test_segment_code_to_str_all_valid_codes() {

@@ -250,7 +250,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
     use dhan_live_trader_common::types::{Exchange, ExchangeSegment};
 
@@ -355,7 +355,7 @@ mod tests {
             },
         );
 
-        let ist_offset = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let ist_offset = dhan_live_trader_common::trading_calendar::ist_offset();
         let naive_dt = NaiveDateTime::new(
             NaiveDate::from_ymd_opt(2026, 2, 25).unwrap(),
             NaiveTime::from_hms_opt(8, 45, 0).unwrap(),

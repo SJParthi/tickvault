@@ -30,21 +30,82 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    ILP_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS, QUESTDB_TABLE_BUILD_METADATA,
-    QUESTDB_TABLE_DERIVATIVE_CONTRACTS, QUESTDB_TABLE_FNO_UNDERLYINGS,
-    QUESTDB_TABLE_SUBSCRIBED_INDICES,
+    ILP_FLUSH_BATCH_SIZE, QUESTDB_TABLE_BUILD_METADATA, QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+    QUESTDB_TABLE_FNO_UNDERLYINGS, QUESTDB_TABLE_SUBSCRIBED_INDICES,
 };
 use dhan_live_trader_common::instrument_types::{
     DerivativeContract, FnoUnderlying, FnoUniverse, SubscribedIndex, UniverseBuildMetadata,
 };
+use dhan_live_trader_common::trading_calendar::ist_offset;
 use dhan_live_trader_common::types::SecurityId;
+
+// ---------------------------------------------------------------------------
+// Instrument Lifecycle Event Types
+// ---------------------------------------------------------------------------
+
+/// Type of day-over-day instrument lifecycle event detected by delta detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleEventType {
+    /// A new derivative contract appeared in today's universe.
+    ContractAdded,
+    /// A contract present yesterday is absent today (expired or delisted).
+    ContractExpired,
+    /// Lot size changed for a contract or underlying.
+    LotSizeChanged,
+    /// Tick size changed for a contract.
+    TickSizeChanged,
+    /// A generic field changed (strike_price, option_type, segment, display_name, symbol_name).
+    FieldChanged,
+    /// A new underlying symbol appeared.
+    UnderlyingAdded,
+    /// An underlying symbol was removed.
+    UnderlyingRemoved,
+    /// I-P1-03: Same security_id now maps to a different underlying.
+    SecurityIdReused,
+    /// I-P1-04: Same contract identity got a different security_id.
+    SecurityIdReassigned,
+}
+
+impl LifecycleEventType {
+    /// Returns a snake_case string representation for QuestDB SYMBOL columns.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ContractAdded => "contract_added",
+            Self::ContractExpired => "contract_expired",
+            Self::LotSizeChanged => "lot_size_changed",
+            Self::TickSizeChanged => "tick_size_changed",
+            Self::FieldChanged => "field_changed",
+            Self::UnderlyingAdded => "underlying_added",
+            Self::UnderlyingRemoved => "underlying_removed",
+            Self::SecurityIdReused => "security_id_reused",
+            Self::SecurityIdReassigned => "security_id_reassigned",
+        }
+    }
+}
+
+/// A single lifecycle event from day-over-day delta detection.
+#[derive(Debug, Clone)]
+pub struct LifecycleEvent {
+    /// The security_id involved (0 for underlying-level events).
+    pub security_id: u32,
+    /// The underlying symbol this event relates to.
+    pub underlying_symbol: String,
+    /// The type of change detected.
+    pub event_type: LifecycleEventType,
+    /// Which field changed (empty for add/remove events).
+    pub field_changed: String,
+    /// Previous value (empty for add events).
+    pub old_value: String,
+    /// New value (empty for remove events).
+    pub new_value: String,
+}
 
 // ---------------------------------------------------------------------------
 // Constants — QuestDB DDL
@@ -404,9 +465,7 @@ async fn ensure_table_dedup_keys(questdb_config: &QuestDbConfig) {
 /// All rows for a single day share the same designated timestamp, making
 /// date-based queries clean (e.g., `WHERE snapshot_date = '2026-03-15'`).
 fn build_snapshot_timestamp() -> Result<TimestampNanos> {
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
-    let today_ist = Utc::now().with_timezone(&ist).date_naive();
+    let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
     naive_date_to_timestamp_nanos(today_ist)
 }
 
@@ -702,7 +761,7 @@ fn write_single_subscribed_index(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, NaiveDate};
+    use chrono::NaiveDate;
     use dhan_live_trader_common::instrument_types::{
         DhanInstrumentKind, IndexCategory, IndexSubcategory, UnderlyingKind, UniverseBuildMetadata,
     };
@@ -816,8 +875,7 @@ mod tests {
 
     /// Helper: create a minimal UniverseBuildMetadata for testing.
     fn make_test_metadata() -> UniverseBuildMetadata {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+        let ist = ist_offset();
         UniverseBuildMetadata {
             csv_source: "primary".to_string(),
             csv_row_count: 276_018,
@@ -1408,8 +1466,7 @@ mod tests {
 
     #[test]
     fn test_write_single_build_metadata_with_zero_counts() {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+        let ist = ist_offset();
         let metadata = UniverseBuildMetadata {
             csv_source: "fallback".to_string(),
             csv_row_count: 0,
@@ -1436,8 +1493,7 @@ mod tests {
 
     #[test]
     fn test_write_single_build_metadata_with_large_counts() {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+        let ist = ist_offset();
         let metadata = UniverseBuildMetadata {
             csv_source: "primary".to_string(),
             csv_row_count: 1_000_000,

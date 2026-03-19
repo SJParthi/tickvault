@@ -767,6 +767,60 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "weight" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.width", "value": 100 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "index_name" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "symbol" },
+            "properties": [
+              { "id": "custom.width", "value": 150 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 124 },
+      "id": 81,
+      "timeFrom": "1y",
+      "timeShift": null,
+      "hideTimeOverride": true,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "index_name" }]
+      },
+      "title": "NSE Index Constituents",
+      "description": "Index constituency data from niftyindices.com. Shows which stocks belong to each NSE index (Nifty 50, Bank Nifty, etc.) with weights and sectors. Updated daily at boot.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  index_name,\n  symbol,\n  isin,\n  weight,\n  sector,\n  security_id\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nORDER BY index_name, weight DESC;",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "5s",

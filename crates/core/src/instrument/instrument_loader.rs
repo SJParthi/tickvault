@@ -18,14 +18,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, NaiveTime, Utc};
+use chrono::{NaiveTime, Utc};
 use tracing::{error, info, warn};
 
 use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig, SubscriptionConfig};
-use dhan_live_trader_common::constants::{
-    INSTRUMENT_FRESHNESS_MARKER_FILENAME, IST_UTC_OFFSET_SECONDS,
-};
+use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
 use dhan_live_trader_common::instrument_types::FnoUniverse;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 use super::binary_cache::{MappedUniverse, read_binary_cache, write_binary_cache};
 use super::csv_downloader::{download_instrument_csv, load_cached_csv};
@@ -220,9 +219,7 @@ async fn load_from_cache_or_emergency_download(
     subscription_config: &SubscriptionConfig,
 ) -> Result<InstrumentLoadResult> {
     let cache_dir = &instrument_config.csv_cache_directory;
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset constant")?;
-    let today = Utc::now().with_timezone(&ist).date_naive();
+    let today = Utc::now().with_timezone(&ist_offset()).date_naive();
 
     // Try 1: Zero-copy rkyv binary cache (sub-0.5ms)
     match MappedUniverse::load(cache_dir) {
@@ -407,17 +404,16 @@ async fn load_with_download(
 // ---------------------------------------------------------------------------
 
 /// Returns the current IST time.
-#[allow(clippy::expect_used)] // APPROVED: Compile-time constant — IST_UTC_OFFSET_SECONDS is always valid
 fn now_ist_time() -> NaiveTime {
-    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset constant is valid"); // APPROVED: compile-time constant
-    Utc::now().with_timezone(&ist).time()
+    Utc::now().with_timezone(&ist_offset()).time()
 }
 
 /// Returns today's IST date as `YYYY-MM-DD`.
-#[allow(clippy::expect_used)] // APPROVED: Compile-time constant — IST_UTC_OFFSET_SECONDS is always valid
 fn now_ist_date_string() -> String {
-    let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset constant is valid"); // APPROVED: compile-time constant
-    Utc::now().with_timezone(&ist).date_naive().to_string()
+    Utc::now()
+        .with_timezone(&ist_offset())
+        .date_naive()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -442,8 +438,8 @@ mod tests {
     }
 
     fn test_universe() -> FnoUniverse {
-        use chrono::{FixedOffset, Utc};
-        let ist = FixedOffset::east_opt(19_800).unwrap(); // APPROVED: test constant
+        use chrono::Utc;
+        let ist = ist_offset();
         FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),

@@ -52,7 +52,7 @@ fn test_state() -> SharedAppState {
 }
 
 fn test_app() -> axum::Router {
-    build_router(test_state())
+    build_router(test_state(), &[], true)
 }
 
 // ---------------------------------------------------------------------------

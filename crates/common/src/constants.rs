@@ -784,6 +784,9 @@ pub const QUESTDB_TABLE_SUBSCRIBED_INDICES: &str = "subscribed_indices";
 /// QuestDB table: NSE trading calendar (holidays + Muhurat sessions).
 pub const QUESTDB_TABLE_NSE_HOLIDAYS: &str = "nse_holidays";
 
+/// QuestDB table: NSE index constituency (daily snapshot from niftyindices.com).
+pub const QUESTDB_TABLE_INDEX_CONSTITUENTS: &str = "index_constituents";
+
 // ---------------------------------------------------------------------------
 // QuestDB ILP — Ingestion Configuration
 // ---------------------------------------------------------------------------
@@ -1178,9 +1181,9 @@ pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
 /// Calendar alignment offset for QuestDB materialized views.
 ///
-/// All timestamps are stored as IST-as-UTC (UTC epoch + 19800s), so QuestDB
-/// displays IST wall-clock time directly. No offset needed — midnight "UTC"
-/// in our convention IS midnight IST.
+/// All timestamps are stored as IST epoch values. Live WebSocket data arrives
+/// as IST epoch seconds (stored directly). Historical REST data has +19800s
+/// applied. No offset needed — midnight "UTC" in our convention IS midnight IST.
 pub const QUESTDB_IST_ALIGN_OFFSET: &str = "00:00";
 
 // ---------------------------------------------------------------------------
@@ -1210,11 +1213,14 @@ pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 // IST Timezone Offset (i64)
 // ---------------------------------------------------------------------------
 
-/// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for tick timestamp conversion.
+/// IST offset from UTC in seconds (5 hours 30 minutes) as i64.
+/// Used for: (1) converting Historical REST API UTC timestamps to IST,
+/// (2) converting `received_at_nanos` (system clock UTC) to IST basis.
+/// NOT needed for WebSocket `exchange_timestamp` which is already IST.
 pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 
 /// IST offset from UTC in nanoseconds (5h 30m = 19,800,000,000,000 ns).
-/// Used for converting `received_at_nanos` (system clock UTC) to IST-as-UTC.
+/// Used for converting `received_at_nanos` (system clock UTC) to IST basis.
 pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 
 // ---------------------------------------------------------------------------
@@ -1513,7 +1519,7 @@ const _: () = assert!(DISCONNECT_PACKET_SIZE == 10, "disconnect total = 10");
 
 /// Base URL for NSE index constituent CSV downloads.
 // O(1) EXEMPT: compile-time constant, not runtime allocation
-pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://niftyindices.com/IndexConstituent/";
+pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://www.niftyindices.com/IndexConstituent/";
 
 /// Cache filename for the serialized constituency map.
 pub const INDEX_CONSTITUENCY_CSV_CACHE_FILENAME: &str = "constituency-map.json";
@@ -1530,6 +1536,10 @@ pub const INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS: u64 = 10;
 
 /// Retry: maximum number of retry attempts per CSV download.
 pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
+
+/// User-Agent header for niftyindices.com requests.
+/// niftyindices.com returns 403 Forbidden without a browser-like User-Agent.
+pub const INDEX_CONSTITUENCY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// NSE index slugs: `(display_name, csv_slug)`.
 /// URL = `{INDEX_CONSTITUENCY_BASE_URL}{slug}.csv`

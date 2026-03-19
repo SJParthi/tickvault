@@ -243,8 +243,8 @@ mod tests {
 
     /// Build a minimal FnoUniverse for testing.
     fn test_universe() -> FnoUniverse {
-        use chrono::{FixedOffset, Utc};
-        let ist = FixedOffset::east_opt(19_800).unwrap(); // APPROVED: test constant
+        use chrono::Utc;
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),

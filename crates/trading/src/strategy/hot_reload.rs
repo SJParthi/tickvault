@@ -177,3 +177,237 @@ fn handle_file_change(config_path: &Path, sender: &mpsc::Sender<ReloadEvent>) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal valid strategy TOML that `load_strategy_config_file` accepts.
+    const VALID_STRATEGY_TOML: &str = r#"
+[[strategy]]
+name = "test_strategy"
+security_ids = [1333]
+position_size_fraction = 0.1
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+
+    /// Creates a temporary TOML file with valid strategy content.
+    /// Returns the directory path and file path (both must be kept alive).
+    /// Uses a unique counter to avoid conflicts between parallel tests.
+    fn write_temp_strategy_file(content: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let dir = std::env::temp_dir().join(format!(
+            "dlt_hot_reload_test_{}_{}",
+            std::process::id(),
+            unique_id,
+        ));
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let file_path = dir.join("test_strategies.toml");
+        std::fs::write(&file_path, content).expect("failed to write temp strategy file");
+        (dir, file_path)
+    }
+
+    /// Cleans up test temp directory.
+    fn cleanup_temp_dir(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_creates_valid_reloader_with_initial_strategies() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let result = StrategyHotReloader::new(&file_path);
+        assert!(
+            result.is_ok(),
+            "hot reloader creation must succeed with valid TOML"
+        );
+
+        let (reloader, strategies, _params) = result.unwrap();
+        assert_eq!(strategies.len(), 1);
+        assert_eq!(strategies[0].name, "test_strategy");
+        assert_eq!(reloader.watched_path(), file_path);
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn watched_path_returns_correct_path() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (reloader, _strategies, _params) = StrategyHotReloader::new(&file_path).unwrap();
+        assert_eq!(reloader.watched_path(), file_path.as_path());
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn try_recv_returns_none_when_no_changes() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (reloader, _strategies, _params) = StrategyHotReloader::new(&file_path).unwrap();
+
+        // No file changes have occurred — try_recv should return None
+        let event = reloader.try_recv();
+        assert!(
+            event.is_none(),
+            "try_recv must return None when no file changes occurred"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn new_fails_with_invalid_toml() {
+        let (dir, file_path) = write_temp_strategy_file("this is not valid TOML [[[");
+
+        let result = StrategyHotReloader::new(&file_path);
+        assert!(
+            result.is_err(),
+            "hot reloader must fail with invalid TOML content"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn new_fails_with_nonexistent_file() {
+        let nonexistent = Path::new("/tmp/dlt_hot_reload_nonexistent_file_12345.toml");
+
+        let result = StrategyHotReloader::new(nonexistent);
+        assert!(
+            result.is_err(),
+            "hot reloader must fail when config file does not exist"
+        );
+    }
+
+    #[test]
+    fn new_returns_correct_initial_indicator_params() {
+        let toml_with_params = r#"
+[indicator_params]
+ema_fast_period = 10
+ema_slow_period = 21
+rsi_period = 7
+
+[[strategy]]
+name = "param_test"
+security_ids = [42]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 25.0
+"#;
+        let (dir, file_path) = write_temp_strategy_file(toml_with_params);
+
+        let (_reloader, _strategies, params) = StrategyHotReloader::new(&file_path).unwrap();
+        assert_eq!(params.ema_fast_period, 10);
+        assert_eq!(params.ema_slow_period, 21);
+        assert_eq!(params.rsi_period, 7);
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn new_returns_multiple_strategies() {
+        let multi_strategy_toml = r#"
+[[strategy]]
+name = "strategy_a"
+security_ids = [100]
+position_size_fraction = 0.1
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy]]
+name = "strategy_b"
+security_ids = [200, 300]
+position_size_fraction = 0.2
+stop_loss_atr_multiplier = 1.5
+target_atr_multiplier = 2.5
+
+[[strategy.entry_short]]
+field = "macd_histogram"
+operator = "lt"
+threshold = 0.0
+"#;
+        let (dir, file_path) = write_temp_strategy_file(multi_strategy_toml);
+
+        let (_reloader, strategies, _params) = StrategyHotReloader::new(&file_path).unwrap();
+        assert_eq!(strategies.len(), 2);
+        assert_eq!(strategies[0].name, "strategy_a");
+        assert_eq!(strategies[1].name, "strategy_b");
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn try_recv_is_nonblocking() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (reloader, _strategies, _params) = StrategyHotReloader::new(&file_path).unwrap();
+
+        // Call try_recv multiple times rapidly — must not block
+        for _ in 0..100 {
+            let _ = reloader.try_recv();
+        }
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn reload_event_has_debug_impl() {
+        // ReloadEvent must implement Debug for logging/diagnostics
+        let event = ReloadEvent {
+            strategies: vec![],
+            indicator_params: IndicatorParams::default(),
+        };
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("ReloadEvent"));
+    }
+
+    #[test]
+    fn hot_reload_error_display_watcher_init() {
+        let err = HotReloadError::WatcherInit(notify::Error::generic("test error"));
+        let display = format!("{err}");
+        assert!(
+            display.contains("file watcher"),
+            "WatcherInit error display must mention file watcher"
+        );
+    }
+
+    #[test]
+    fn new_fails_with_empty_toml() {
+        // Empty TOML has no strategies, which means no entry conditions
+        // load_strategy_config_file will succeed (zero strategies is valid TOML)
+        // but the reloader should still create successfully
+        let (dir, file_path) = write_temp_strategy_file("");
+
+        let result = StrategyHotReloader::new(&file_path);
+        assert!(
+            result.is_ok(),
+            "empty TOML (zero strategies) should create reloader"
+        );
+
+        let (_reloader, strategies, _params) = result.unwrap();
+        assert!(strategies.is_empty());
+
+        cleanup_temp_dir(&dir);
+    }
+}
