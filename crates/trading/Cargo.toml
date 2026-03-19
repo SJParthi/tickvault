@@ -22,6 +22,10 @@ governor = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 metrics = { workspace = true }
+loom = { workspace = true, optional = true }
+
+[features]
+loom = ["dep:loom"]
 
 [dev-dependencies]
 dhan-live-trader-core = { path = "../core" }
@@ -34,4 +38,4 @@ name = "oms"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
+ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]

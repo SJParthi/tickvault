@@ -256,7 +256,11 @@ pub async fn fetch_historical_candles(
     let today = now_ist.date_naive();
 
     // Compute date range: today - lookback_days to today
-    let from_date = today - chrono::Duration::days(i64::from(historical_config.lookback_days));
+    let from_date = today
+        .checked_sub_signed(chrono::Duration::days(i64::from(
+            historical_config.lookback_days,
+        )))
+        .unwrap_or(today);
     let to_date = today;
 
     // Intraday requests use datetime format with market hours
@@ -268,7 +272,9 @@ pub async fn fetch_historical_candles(
     let intraday_to = format!("{} {}", to_date_str, MARKET_CLOSE_TIME_IST_EXCLUSIVE);
 
     // Daily: date-only format, toDate is NON-INCLUSIVE so add 1 day
-    let daily_to_date = to_date + chrono::Duration::days(1);
+    let daily_to_date = to_date
+        .checked_add_signed(chrono::Duration::days(1))
+        .unwrap_or(to_date);
     let daily_to_str = daily_to_date.format("%Y-%m-%d").to_string();
 
     info!(
@@ -481,14 +487,16 @@ pub async fn fetch_historical_candles(
     let mut failure_reasons: HashMap<String, usize> = HashMap::new();
     for &idx in &pending_indices {
         if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
-            *failure_reasons
+            let count = failure_reasons
                 .entry("token_expired".to_string())
-                .or_insert(0) += 1;
+                .or_insert(0);
+            *count = count.saturating_add(1);
         } else {
             // Could be network, input error, or other transient — generic "failed"
-            *failure_reasons
+            let count = failure_reasons
                 .entry("network_or_api".to_string())
-                .or_insert(0) += 1;
+                .or_insert(0);
+            *count = count.saturating_add(1);
         }
     }
     if total_persist_failures > 0 {
@@ -1184,7 +1192,7 @@ fn persist_intraday_candles(
         {
             #[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
             let ist_secs_of_day =
-                ((data.timestamp[i] + IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+                (data.timestamp[i].saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
             if ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST {
                 continue; // silently skip — this is expected for 5m/15m/60m
             }
@@ -1470,7 +1478,7 @@ mod tests {
 
     /// Extracts IST hour and minute from a UTC epoch by adding IST offset.
     fn utc_epoch_to_ist_hm(utc_epoch: i64) -> (i64, i64) {
-        let ist_secs = (utc_epoch + IST_OFFSET) % 86_400;
+        let ist_secs = utc_epoch.saturating_add(IST_OFFSET) % 86_400;
         (ist_secs / 3600, (ist_secs % 3600) / 60)
     }
 

@@ -324,7 +324,7 @@ impl OrderManagementSystem {
         // Validate disclosed quantity if specified
         if request.disclosed_quantity > 0 {
             // Ceiling division: (qty * 3 + 9) / 10 to avoid floor-division undercount
-            let min_disclosed = (request.quantity * 3 + 9) / 10;
+            let min_disclosed = request.quantity.saturating_mul(3).saturating_add(9) / 10;
             if request.disclosed_quantity < min_disclosed {
                 return Err(OmsError::RiskRejected {
                     reason: format!(

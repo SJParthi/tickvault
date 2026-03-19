@@ -483,9 +483,11 @@ pub async fn run_tick_processor(
                 // PrevClose packets arrive on every subscription, even pre-market.
                 // APPROVED: i64→u32 truncation safe: secs-of-day fits u32
                 #[allow(clippy::cast_possible_truncation)]
-                let prev_close_ist_secs = ((received_at_nanos / 1_000_000_000
-                    + i64::from(IST_UTC_OFFSET_SECONDS))
-                    % i64::from(SECONDS_PER_DAY)) as u32;
+                let prev_close_ist_secs = received_at_nanos
+                    .saturating_div(1_000_000_000)
+                    .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+                    .rem_euclid(i64::from(SECONDS_PER_DAY))
+                    as u32;
                 if !((TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
                     .contains(&prev_close_ist_secs))
                 {
@@ -572,8 +574,10 @@ pub async fn run_tick_processor(
                 // Add IST offset to align received_at with exchange_timestamp basis.
                 // APPROVED: i64→u32 truncation is safe: epoch fits u32 until 2106
                 #[allow(clippy::cast_possible_truncation)]
-                let now_secs =
-                    (received_at_nanos / 1_000_000_000 + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
+                let now_secs = (received_at_nanos
+                    .saturating_div(1_000_000_000)
+                    .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)))
+                    as u32;
                 agg.sweep_stale(now_secs);
                 let completed = agg.completed_slice();
                 if !completed.is_empty() {

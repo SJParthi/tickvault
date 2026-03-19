@@ -84,14 +84,14 @@ pub fn compute_next_trigger_time(
     // I-P1-01: seconds from now until target, within the same day
     let now_secs = i64::from(now_time.num_seconds_from_midnight());
     let target_secs = i64::from(target_time.num_seconds_from_midnight());
-    let delta_secs = target_secs - now_secs;
+    let delta_secs = target_secs.saturating_sub(now_secs);
 
     let sleep_secs = if delta_secs > 0 {
         // Target is in the future today
         delta_secs
     } else {
         // Target has passed today (or is exactly now) → wrap to tomorrow
-        delta_secs + SECS_PER_DAY
+        delta_secs.saturating_add(SECS_PER_DAY)
     };
 
     // Safety: sleep_secs is always positive (1..=86400)

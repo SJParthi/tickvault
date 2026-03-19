@@ -210,7 +210,7 @@ fn persist_inner(calendar: &TradingCalendar, questdb_config: &QuestDbConfig) -> 
             .map(|dt| dt.and_utc().timestamp())
             .context("failed to compute timestamp for holiday")?;
 
-        let ts_nanos = TimestampNanos::new(midnight_epoch_secs * 1_000_000_000);
+        let ts_nanos = TimestampNanos::new(midnight_epoch_secs.saturating_mul(1_000_000_000));
 
         buffer
             .table(QUESTDB_TABLE_NSE_HOLIDAYS)

@@ -40,6 +40,10 @@ rkyv = { workspace = true }
 memmap2 = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
+loom = { workspace = true, optional = true }
+
+[features]
+loom = ["dep:loom"]
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -64,4 +68,4 @@ name = "token_handle"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "papaya", "rtrb", "zerocopy"]
+ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "papaya", "rtrb", "zerocopy"]

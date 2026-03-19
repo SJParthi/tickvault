@@ -159,7 +159,9 @@ async fn detect_public_ip() -> Result<String, String> {
                 );
                 if attempt < PUBLIC_IP_CHECK_MAX_RETRIES {
                     // Exponential backoff: 1s, 2s, 4s
-                    let delay = Duration::from_secs(1 << (attempt - 1));
+                    let delay = Duration::from_secs(
+                        1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(1),
+                    );
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -181,7 +183,9 @@ async fn detect_public_ip() -> Result<String, String> {
                     "fallback IP check failed"
                 );
                 if attempt < PUBLIC_IP_CHECK_MAX_RETRIES {
-                    let delay = Duration::from_secs(1 << (attempt - 1));
+                    let delay = Duration::from_secs(
+                        1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(1),
+                    );
                     tokio::time::sleep(delay).await;
                 }
             }

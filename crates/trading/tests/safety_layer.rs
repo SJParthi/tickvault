@@ -801,7 +801,7 @@ mod proptest_risk {
         ) {
             let mut engine = RiskEngine::new(2.0, 1000, 1_000_000.0);
             engine.record_fill(1001, lots, price1, 25);
-            engine.record_fill(1001, -lots, price2, 25);
+            engine.record_fill(1001, lots.saturating_neg(), price2, 25);
             let pnl = engine.total_realized_pnl();
             prop_assert!(pnl.is_finite(), "P&L must be finite: {}", pnl);
         }

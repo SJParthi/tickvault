@@ -75,7 +75,7 @@ pub struct CrossMatchMismatch {
     /// Historical OHLCV values (e.g., "O=2450.0 H=2465.0 L=2448.0 C=2460.0 V=125000").
     pub hist_values: String,
     /// Live OHLCV values (e.g., "O=2450.0 H=2463.5 L=2448.0 C=2460.0 V=118500"),
-    /// or "[MISSING]" if no live data.
+    /// or "\[MISSING\]" if no live data.
     pub live_values: String,
     /// Field-level diff summary (e.g., "H(-1.5) V(-6500)").
     pub diff_summary: String,
@@ -892,13 +892,13 @@ async fn parse_cross_match_rows_with_oi(
 
         // H1: Volume mismatch — relative 10% tolerance
         let h_vol_max = (h_volume.max(1)) as f64;
-        let vol_diff_pct = ((m_volume - h_volume) as f64).abs() / h_vol_max;
+        let vol_diff_pct = (m_volume.saturating_sub(h_volume) as f64).abs() / h_vol_max;
         let volume_mismatch = vol_diff_pct > CROSS_MATCH_VOLUME_TOLERANCE_PCT;
 
         // H2: OI mismatch — only when both > 0 (derivatives)
         let oi_mismatch = if h_oi > 0 && m_oi > 0 {
             let h_oi_max = h_oi.max(1) as f64;
-            let oi_diff_pct = ((m_oi - h_oi) as f64).abs() / h_oi_max;
+            let oi_diff_pct = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
             oi_diff_pct > CROSS_MATCH_OI_TOLERANCE_PCT
         } else {
             false
