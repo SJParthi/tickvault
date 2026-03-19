@@ -141,24 +141,46 @@ pub async fn ensure_calendar_table(questdb_config: &QuestDbConfig) {
 ///
 /// Best-effort: on failure, logs warning and returns `Ok(())`.
 /// Trading is never blocked by calendar persistence failures.
+/// Maximum retry attempts for calendar ILP persistence.
+const CALENDAR_PERSIST_MAX_RETRIES: u32 = 3;
+
+/// Delay between calendar persistence retries (seconds).
+const CALENDAR_PERSIST_RETRY_DELAY_SECS: u64 = 2;
+
 pub fn persist_calendar(calendar: &TradingCalendar, questdb_config: &QuestDbConfig) -> Result<()> {
-    match persist_inner(calendar, questdb_config) {
-        Ok(count) => {
-            info!(
-                entries = count,
-                table = QUESTDB_TABLE_NSE_HOLIDAYS,
-                "trading calendar persisted to QuestDB"
-            );
-            Ok(())
-        }
-        Err(err) => {
-            tracing::error!(
-                ?err,
-                "QuestDB calendar persistence failed — nse_holidays table will be empty in Grafana"
-            );
-            Ok(())
+    let mut last_err = None;
+    for attempt in 1..=CALENDAR_PERSIST_MAX_RETRIES {
+        match persist_inner(calendar, questdb_config) {
+            Ok(count) => {
+                info!(
+                    entries = count,
+                    table = QUESTDB_TABLE_NSE_HOLIDAYS,
+                    attempt,
+                    "trading calendar persisted to QuestDB"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    attempt,
+                    max_retries = CALENDAR_PERSIST_MAX_RETRIES,
+                    "calendar persistence attempt failed — retrying"
+                );
+                last_err = Some(err);
+                if attempt < CALENDAR_PERSIST_MAX_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        CALENDAR_PERSIST_RETRY_DELAY_SECS,
+                    ));
+                }
+            }
         }
     }
+    tracing::error!(
+        err = ?last_err,
+        "QuestDB calendar persistence failed after {CALENDAR_PERSIST_MAX_RETRIES} attempts — nse_holidays table will be empty in Grafana"
+    );
+    Ok(())
 }
 
 fn persist_inner(calendar: &TradingCalendar, questdb_config: &QuestDbConfig) -> Result<usize> {

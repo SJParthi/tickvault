@@ -397,6 +397,9 @@ async fn main() -> Result<()> {
                     ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
                     calendar_persistence::ensure_calendar_table(&config.questdb),
+                    dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+                        &config.questdb
+                    ),
                     dhan_live_trader_storage::materialized_views::ensure_candle_views(
                         &config.questdb
                     ),
@@ -530,6 +533,14 @@ async fn main() -> Result<()> {
                 &config.instrument.csv_cache_directory,
             )
             .await;
+
+        // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+        if let Some(ref map) = bg_constituency {
+            let _ = dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                map,
+                &config.questdb,
+            );
+        }
 
         let bg_shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
             std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
@@ -703,6 +714,9 @@ async fn main() -> Result<()> {
         ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
         calendar_persistence::ensure_calendar_table(&config.questdb),
+        dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+            &config.questdb
+        ),
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
     );
 
@@ -914,6 +928,14 @@ async fn main() -> Result<()> {
             &config.instrument.csv_cache_directory,
         )
         .await;
+
+    // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+    if let Some(ref map) = constituency_map {
+        let _ = dhan_live_trader_storage::constituency_persistence::persist_constituency(
+            map,
+            &config.questdb,
+        );
+    }
 
     let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
         std::sync::Arc::new(std::sync::RwLock::new(constituency_map));

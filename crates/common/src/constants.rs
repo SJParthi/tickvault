@@ -784,6 +784,9 @@ pub const QUESTDB_TABLE_SUBSCRIBED_INDICES: &str = "subscribed_indices";
 /// QuestDB table: NSE trading calendar (holidays + Muhurat sessions).
 pub const QUESTDB_TABLE_NSE_HOLIDAYS: &str = "nse_holidays";
 
+/// QuestDB table: NSE index constituency (daily snapshot from niftyindices.com).
+pub const QUESTDB_TABLE_INDEX_CONSTITUENTS: &str = "index_constituents";
+
 // ---------------------------------------------------------------------------
 // QuestDB ILP — Ingestion Configuration
 // ---------------------------------------------------------------------------
