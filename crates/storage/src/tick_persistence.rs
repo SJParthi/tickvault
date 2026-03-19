@@ -1039,8 +1039,8 @@ mod tests {
         let hour = ist_time_of_day / 3600;
         let minute = (ist_time_of_day % 3600) / 60;
         // Dhan IST epoch: time-of-day is already IST wall-clock.
-        assert!(hour >= 0 && hour < 24, "hour must be valid");
-        assert!(minute >= 0 && minute < 60, "minute must be valid");
+        assert!((0..24).contains(&hour), "hour must be valid");
+        assert!((0..60).contains(&minute), "minute must be valid");
     }
 
     // -----------------------------------------------------------------------
@@ -2605,8 +2605,8 @@ mod tests {
 
         let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(dhan_epoch);
         // IST epoch: time-of-day is IST wall-clock directly.
-        assert!(ist_hour >= 0 && ist_hour < 24, "hour must be valid");
-        assert!(ist_minute >= 0 && ist_minute < 60, "minute must be valid");
+        assert!((0..24).contains(&ist_hour), "hour must be valid");
+        assert!((0..60).contains(&ist_minute), "minute must be valid");
     }
 
     #[test]

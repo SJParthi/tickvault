@@ -333,8 +333,12 @@ mod tests {
     #[test]
     fn questdb_ddl_timeout_is_reasonable() {
         // 10s is long enough for DDL, short enough to not block boot
-        assert!(QUESTDB_DDL_TIMEOUT_SECS >= 5);
-        assert!(QUESTDB_DDL_TIMEOUT_SECS <= 30);
+        const {
+            assert!(QUESTDB_DDL_TIMEOUT_SECS >= 5);
+        }
+        const {
+            assert!(QUESTDB_DDL_TIMEOUT_SECS <= 30);
+        }
     }
 
     #[test]

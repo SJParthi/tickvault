@@ -223,20 +223,44 @@ fn test_smoke_all_constants_valid() {
     use dhan_live_trader_common::constants::*;
 
     // --- Packet sizes: positive and reasonable ---
-    assert!(TICKER_PACKET_SIZE > 0 && TICKER_PACKET_SIZE <= 256);
-    assert!(QUOTE_PACKET_SIZE > 0 && QUOTE_PACKET_SIZE <= 256);
-    assert!(FULL_QUOTE_PACKET_SIZE > 0 && FULL_QUOTE_PACKET_SIZE <= 1024);
-    assert!(DISCONNECT_PACKET_SIZE > 0 && DISCONNECT_PACKET_SIZE <= 256);
-    assert!(OI_PACKET_SIZE > 0 && OI_PACKET_SIZE <= 256);
-    assert!(PREVIOUS_CLOSE_PACKET_SIZE > 0 && PREVIOUS_CLOSE_PACKET_SIZE <= 256);
-    assert!(MARKET_STATUS_PACKET_SIZE > 0 && MARKET_STATUS_PACKET_SIZE <= 256);
-    assert!(MARKET_DEPTH_PACKET_SIZE > 0 && MARKET_DEPTH_PACKET_SIZE <= 256);
+    const {
+        assert!(TICKER_PACKET_SIZE > 0 && TICKER_PACKET_SIZE <= 256);
+    }
+    const {
+        assert!(QUOTE_PACKET_SIZE > 0 && QUOTE_PACKET_SIZE <= 256);
+    }
+    const {
+        assert!(FULL_QUOTE_PACKET_SIZE > 0 && FULL_QUOTE_PACKET_SIZE <= 1024);
+    }
+    const {
+        assert!(DISCONNECT_PACKET_SIZE > 0 && DISCONNECT_PACKET_SIZE <= 256);
+    }
+    const {
+        assert!(OI_PACKET_SIZE > 0 && OI_PACKET_SIZE <= 256);
+    }
+    const {
+        assert!(PREVIOUS_CLOSE_PACKET_SIZE > 0 && PREVIOUS_CLOSE_PACKET_SIZE <= 256);
+    }
+    const {
+        assert!(MARKET_STATUS_PACKET_SIZE > 0 && MARKET_STATUS_PACKET_SIZE <= 256);
+    }
+    const {
+        assert!(MARKET_DEPTH_PACKET_SIZE > 0 && MARKET_DEPTH_PACKET_SIZE <= 256);
+    }
 
     // --- Connection limits: positive and within Dhan spec ---
-    assert!(MAX_WEBSOCKET_CONNECTIONS >= 1 && MAX_WEBSOCKET_CONNECTIONS <= 10);
-    assert!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION >= 100);
-    assert!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION <= 10_000);
-    assert!(SUBSCRIPTION_BATCH_SIZE >= 1 && SUBSCRIPTION_BATCH_SIZE <= 100);
+    const {
+        assert!(MAX_WEBSOCKET_CONNECTIONS >= 1 && MAX_WEBSOCKET_CONNECTIONS <= 10);
+    }
+    const {
+        assert!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION >= 100);
+    }
+    const {
+        assert!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION <= 10_000);
+    }
+    const {
+        assert!(SUBSCRIPTION_BATCH_SIZE >= 1 && SUBSCRIPTION_BATCH_SIZE <= 100);
+    }
 
     // --- Ring buffer capacities: must be powers of 2 ---
     assert!(TICK_RING_BUFFER_CAPACITY.is_power_of_two());
@@ -244,12 +268,18 @@ fn test_smoke_all_constants_valid() {
     assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
 
     // --- Tick persist window: valid IST times ---
-    assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
-    assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+    const {
+        assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
+    }
+    const {
+        assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+    }
 
     // --- SEBI compliance ---
     assert_eq!(SEBI_MAX_ORDERS_PER_SECOND, 10);
-    assert!(SEBI_AUDIT_RETENTION_YEARS >= 5);
+    const {
+        assert!(SEBI_AUDIT_RETENTION_YEARS >= 5);
+    }
 
     // --- IST offset consistency ---
     assert_eq!(IST_UTC_OFFSET_SECONDS, 19_800);
@@ -261,15 +291,21 @@ fn test_smoke_all_constants_valid() {
 
     // --- Deep depth header differs from standard ---
     assert_ne!(DEEP_DEPTH_HEADER_SIZE, BINARY_HEADER_SIZE);
-    assert!(DEEP_DEPTH_HEADER_SIZE > BINARY_HEADER_SIZE);
+    const {
+        assert!(DEEP_DEPTH_HEADER_SIZE > BINARY_HEADER_SIZE);
+    }
 
     // --- TOTP config ---
     assert_eq!(TOTP_DIGITS, 6);
     assert_eq!(TOTP_PERIOD_SECS, 30);
 
     // --- OMS circuit breaker ---
-    assert!(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD >= 1);
-    assert!(OMS_CIRCUIT_BREAKER_RESET_SECS >= 1);
+    const {
+        assert!(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD >= 1);
+    }
+    const {
+        assert!(OMS_CIRCUIT_BREAKER_RESET_SECS >= 1);
+    }
 
     // --- Application identity ---
     assert!(!APPLICATION_NAME.is_empty());
