@@ -8,7 +8,7 @@
 //! # API Details
 //! - Endpoint: POST `{rest_api_base_url}/charts/intraday` and `/charts/historical`
 //! - Response: parallel arrays of open, high, low, close, volume, timestamp
-//! - Timestamps: standard UNIX epoch seconds (UTC)
+//! - Timestamps: standard UNIX epoch seconds (UTC from REST API; WebSocket uses IST)
 //! - Limit: 90 days per request for intraday, unlimited for daily
 //!
 //! # Trading Day — Dual Window

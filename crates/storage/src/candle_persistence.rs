@@ -5,7 +5,7 @@
 //! Supports multiple timeframes: 1m, 5m, 15m, 60m, and daily.
 //!
 //! # Table Schema
-//! - `ts` TIMESTAMP (designated) — candle open time (IST-as-UTC: UTC epoch + 19800s)
+//! - `ts` TIMESTAMP (designated) — candle open time (IST epoch for live, UTC+19800s for historical)
 //! - `security_id` LONG — Dhan security identifier
 //! - `segment` SYMBOL — exchange segment (NSE_FNO, NSE_EQ, etc.)
 //! - `timeframe` SYMBOL — candle interval: 1m, 5m, 15m, 60m, 1d
@@ -203,9 +203,9 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
-        let ist_epoch_secs = i64::from(timestamp_secs).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+        // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
+        // Store directly — no offset needed.
+        let ts_nanos = TimestampNanos::new(i64::from(timestamp_secs).saturating_mul(1_000_000_000));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1S)

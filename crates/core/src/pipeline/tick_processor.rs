@@ -50,17 +50,17 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
 /// post-market ticks still flow through broadcast and candle aggregation.
 ///
 /// # Algorithm (O(1), zero allocation)
-/// 1. Add IST offset to UTC epoch seconds.
-/// 2. Modulo 86,400 → seconds-of-day in IST.
+/// 1. Dhan WebSocket sends exchange_timestamp as IST epoch seconds (already adjusted).
+/// 2. Modulo 86,400 → seconds-of-day in IST directly.
 /// 3. Range check: `[TICK_PERSIST_START, TICK_PERSIST_END)`.
 ///
 /// # Performance
-/// 1 add + 1 modulo + 2 comparisons. No branching beyond the range check.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: IST_UTC_OFFSET is +19800 (fits u32); modulo by 86400 is safe
+/// 1 modulo + 2 comparisons. No branching beyond the range check.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: modulo by 86400 is safe
 #[inline(always)]
 fn is_within_persist_window(exchange_timestamp: u32) -> bool {
-    let ist_secs_of_day =
-        exchange_timestamp.wrapping_add(IST_UTC_OFFSET_SECONDS as u32) % SECONDS_PER_DAY;
+    // exchange_timestamp is already IST epoch seconds — no offset needed.
+    let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         .contains(&ist_secs_of_day)
 }
@@ -553,11 +553,12 @@ pub async fn run_tick_processor(
             // Sweep stale candles and persist completed 1s candles to QuestDB
             if let Some(ref mut agg) = candle_aggregator {
                 // Reuse received_at_nanos from line 179 instead of a second Utc::now() syscall.
-                // Dhan sends exchange_timestamp as standard UTC epoch seconds —
-                // same basis as received_at_nanos, so no offset conversion needed.
+                // received_at_nanos is UTC; exchange_timestamp is IST epoch seconds.
+                // Add IST offset to align received_at with exchange_timestamp basis.
                 // APPROVED: i64→u32 truncation is safe: epoch fits u32 until 2106
                 #[allow(clippy::cast_possible_truncation)]
-                let now_secs = (received_at_nanos / 1_000_000_000) as u32;
+                let now_secs =
+                    (received_at_nanos / 1_000_000_000 + i64::from(IST_UTC_OFFSET_SECONDS)) as u32;
                 agg.sweep_stale(now_secs);
                 let completed = agg.completed_slice();
                 if !completed.is_empty() {
@@ -2191,69 +2192,70 @@ mod tests {
     // is_within_persist_window tests
     // -----------------------------------------------------------------------
 
-    /// Helper: convert IST hours:minutes:seconds to a UTC epoch u32.
+    /// Helper: convert IST hours:minutes:seconds to an IST epoch u32.
     /// Uses a fixed reference date (2026-03-17) — the actual date doesn't
     /// matter because `is_within_persist_window` only checks seconds-of-day.
-    fn ist_hms_to_utc_epoch(hours: u32, minutes: u32, seconds: u32) -> u32 {
-        // 2026-03-17 00:00:00 IST = 2026-03-16 18:30:00 UTC = epoch 1773685800
-        let ist_midnight_utc: u32 = 1_773_685_800;
+    /// Dhan WebSocket sends timestamps as IST epoch seconds.
+    fn ist_hms_to_ist_epoch(hours: u32, minutes: u32, seconds: u32) -> u32 {
+        // IST midnight 2026-03-17 as IST epoch.
+        // UTC midnight 2026-03-17 = 1773705600. That is also IST midnight as IST epoch
+        // because IST epoch for midnight IST = UTC midnight epoch value.
+        let ist_midnight_ist_epoch: u32 = 1_773_705_600;
         let ist_secs_of_day = hours * 3600 + minutes * 60 + seconds;
-        // IST midnight is at UTC 18:30 of the previous day.
-        // Adding IST seconds-of-day gives the correct UTC epoch.
-        ist_midnight_utc + ist_secs_of_day
+        ist_midnight_ist_epoch + ist_secs_of_day
     }
 
     #[test]
     fn test_persist_window_market_open_boundary() {
         // 09:00:00 IST = first second of the window (inclusive)
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 0, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 0, 0)));
         // 09:00:01 IST = well within window
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 0, 1)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 0, 1)));
     }
 
     #[test]
     fn test_persist_window_market_close_boundary() {
         // 15:29:59 IST = last second of the window (inclusive)
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 29, 59)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 29, 59)));
         // 15:30:00 IST = first second outside the window (exclusive)
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(15, 30, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(15, 30, 0)));
         // 15:30:01 IST = outside
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(15, 30, 1)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(15, 30, 1)));
     }
 
     #[test]
     fn test_persist_window_pre_market_rejected() {
         // 08:59:59 IST = one second before window
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(8, 59, 59)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 59, 59)));
         // 08:00:00 IST = well before market
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(8, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 0, 0)));
         // 06:00:00 IST = early morning
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(6, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(6, 0, 0)));
     }
 
     #[test]
     fn test_persist_window_post_market_rejected() {
         // 16:00:00 IST = post-market
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(16, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(16, 0, 0)));
         // 20:00:00 IST = evening
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(20, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(20, 0, 0)));
     }
 
     #[test]
     fn test_persist_window_midnight_rejected() {
         // 00:00:00 IST = midnight
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(0, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(0, 0, 0)));
         // 23:59:59 IST = end of day
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(23, 59, 59)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(23, 59, 59)));
     }
 
     #[test]
     fn test_persist_window_mid_session() {
         // 12:00:00 IST = mid-session
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(12, 0, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(12, 0, 0)));
         // 09:15:00 IST = continuous trading start (within persist window [09:00, 15:30))
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 15, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 15, 0)));
         // 15:15:00 IST = near close
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 15, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 15, 0)));
     }
 }

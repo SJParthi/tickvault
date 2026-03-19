@@ -21,7 +21,8 @@ pub struct ParsedTick {
     pub last_traded_price: f32,
     /// Last trade quantity (from Quote/Full packets; 0 for Ticker).
     pub last_trade_quantity: u16,
-    /// Exchange timestamp as UTC epoch seconds from Dhan V2 API.
+    /// Exchange timestamp as IST epoch seconds from Dhan WebSocket.
+    /// Note: Historical REST API returns UTC epoch seconds (see `HistoricalCandle`).
     pub exchange_timestamp: u32,
     /// Local receive timestamp in nanoseconds since Unix epoch (for latency measurement).
     pub received_at_nanos: i64,

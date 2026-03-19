@@ -7,6 +7,7 @@
 //! # Timestamp Format
 //! Dhan V2 REST API returns standard UTC epoch seconds. The persistence layer
 //! converts to IST-as-UTC by adding +19800s before writing to QuestDB.
+//! Note: Dhan WebSocket sends IST epoch seconds (no offset needed for live data).
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
