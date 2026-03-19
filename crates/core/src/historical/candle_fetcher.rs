@@ -29,7 +29,8 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
-    MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST, TIMEFRAME_1D,
+    IST_UTC_OFFSET_SECONDS_I64, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{
@@ -1175,6 +1176,18 @@ fn persist_intraday_candles(
             );
             m_api_errors.increment(1);
             continue;
+        }
+
+        // Reject candles at or after 15:30 IST — market close is always exclusive.
+        // Dhan may return closing session candles (15:30+) for higher timeframes;
+        // we discard them to keep [09:15, 15:30) IST as the strict intraday window.
+        {
+            #[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
+            let ist_secs_of_day =
+                ((data.timestamp[i] + IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+            if ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST {
+                continue; // silently skip — this is expected for 5m/15m/60m
+            }
         }
 
         let oi_value = if i < data.open_interest.len() {

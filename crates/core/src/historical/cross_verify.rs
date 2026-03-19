@@ -427,18 +427,17 @@ pub async fn verify_candle_integrity(
 
     // --- Step 5: Timestamp bounds check (intraday outside market hours) ---
     // QuestDB stores IST-as-UTC: hours in DB ARE IST hours directly.
-    // 1m candles: valid range [09:15, 15:29] — last candle at 15:29.
-    // 5m/15m/60m candles: valid range [09:15, 15:30] — Dhan returns a candle
-    //   at 15:30 for higher timeframes (closing session / last partial candle).
+    // Valid range: [09:15, 15:30) IST — 15:30 is ALWAYS exclusive for ALL timeframes.
+    // Last valid candle: 15:29 for 1m, 15:25 for 5m, 15:15 for 15m, 15:00 for 60m.
     // Daily candles: no time check (stamped at IST midnight).
+    // Any candle at 15:30+ is a violation regardless of timeframe.
     let ts_count_query = format!(
         "SELECT count() FROM {} \
          WHERE ts > dateadd('d', -3, now()) \
          AND timeframe != '1d' \
          AND (hour(ts) < 9 OR hour(ts) > 15 \
               OR (hour(ts) = 9 AND minute(ts) < 15) \
-              OR (hour(ts) = 15 AND minute(ts) > 30) \
-              OR (hour(ts) = 15 AND minute(ts) = 30 AND timeframe = '1m'))",
+              OR (hour(ts) = 15 AND minute(ts) > 29))",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
 
