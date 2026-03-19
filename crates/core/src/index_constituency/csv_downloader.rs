@@ -17,7 +17,7 @@ use dhan_live_trader_common::config::IndexConstituencyConfig;
 use dhan_live_trader_common::constants::{
     INDEX_CONSTITUENCY_BASE_URL, INDEX_CONSTITUENCY_MIN_INDICES,
     INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS, INDEX_CONSTITUENCY_RETRY_MAX_TIMES,
-    INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS,
+    INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS, INDEX_CONSTITUENCY_USER_AGENT,
 };
 
 /// Download index constituency CSVs concurrently.
@@ -34,6 +34,7 @@ pub async fn download_constituency_csvs(
 
     let client = match Client::builder()
         .timeout(Duration::from_secs(config.download_timeout_secs))
+        .user_agent(INDEX_CONSTITUENCY_USER_AGENT)
         .build()
     {
         Ok(c) => c,
@@ -160,7 +161,7 @@ mod tests {
         let url = build_download_url("ind_nifty50list");
         assert_eq!(
             url,
-            "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv"
+            "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv"
         );
     }
 

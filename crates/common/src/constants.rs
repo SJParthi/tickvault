@@ -1519,7 +1519,7 @@ const _: () = assert!(DISCONNECT_PACKET_SIZE == 10, "disconnect total = 10");
 
 /// Base URL for NSE index constituent CSV downloads.
 // O(1) EXEMPT: compile-time constant, not runtime allocation
-pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://niftyindices.com/IndexConstituent/";
+pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://www.niftyindices.com/IndexConstituent/";
 
 /// Cache filename for the serialized constituency map.
 pub const INDEX_CONSTITUENCY_CSV_CACHE_FILENAME: &str = "constituency-map.json";
@@ -1536,6 +1536,10 @@ pub const INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS: u64 = 10;
 
 /// Retry: maximum number of retry attempts per CSV download.
 pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
+
+/// User-Agent header for niftyindices.com requests.
+/// niftyindices.com returns 403 Forbidden without a browser-like User-Agent.
+pub const INDEX_CONSTITUENCY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// NSE index slugs: `(display_name, csv_slug)`.
 /// URL = `{INDEX_CONSTITUENCY_BASE_URL}{slug}.csv`

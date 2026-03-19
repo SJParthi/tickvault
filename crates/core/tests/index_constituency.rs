@@ -377,7 +377,7 @@ fn download_url_construction_all_slugs() {
 
     for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
         let url = build_download_url(slug);
-        assert!(url.starts_with("https://niftyindices.com/IndexConstituent/"));
+        assert!(url.starts_with("https://www.niftyindices.com/IndexConstituent/"));
         assert!(url.ends_with(".csv"));
         assert!(
             !name.is_empty(),
@@ -650,5 +650,236 @@ mod proptest_constituency {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real HTTP integration tests (hit actual niftyindices.com)
+//
+// These tests are #[ignore] by default — they require network access to
+// niftyindices.com and are slow (~30s for all 49 indices).
+// Run manually: cargo test -p dhan-live-trader-core --test index_constituency real_fetch -- --ignored
+// ---------------------------------------------------------------------------
+
+mod real_fetch {
+    use dhan_live_trader_common::config::IndexConstituencyConfig;
+    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use dhan_live_trader_core::index_constituency::csv_downloader;
+    use dhan_live_trader_core::index_constituency::csv_parser;
+
+    fn default_config() -> IndexConstituencyConfig {
+        IndexConstituencyConfig {
+            enabled: true,
+            download_timeout_secs: 30,
+            max_concurrent_downloads: 3,
+            inter_batch_delay_ms: 200,
+        }
+    }
+
+    /// Fetch a single Nifty 50 CSV from niftyindices.com and verify it parses.
+    #[tokio::test]
+    #[ignore]
+    async fn real_fetch_nifty50_csv_downloads_and_parses() {
+        let config = default_config();
+        let slugs: &[(&str, &str)] = &[("Nifty 50", "ind_nifty50list")];
+
+        let results = csv_downloader::download_constituency_csvs(&config, slugs).await;
+
+        assert_eq!(results.len(), 1, "Nifty 50 CSV must download successfully");
+        let (name, csv_text) = &results[0];
+        assert_eq!(name, "Nifty 50");
+        assert!(!csv_text.is_empty(), "CSV body must not be empty");
+        assert!(
+            csv_text.contains("Symbol"),
+            "CSV must contain 'Symbol' header"
+        );
+
+        // Parse and verify
+        let today = chrono::Local::now().date_naive();
+        let constituents = csv_parser::parse_constituency_csv("Nifty 50", csv_text, today);
+        assert_eq!(
+            constituents.len(),
+            50,
+            "Nifty 50 must have exactly 50 constituents"
+        );
+
+        // Verify known stocks exist
+        let symbols: Vec<&str> = constituents.iter().map(|c| c.symbol.as_str()).collect();
+        assert!(
+            symbols.contains(&"RELIANCE") || symbols.contains(&"Reliance"),
+            "Nifty 50 must contain RELIANCE"
+        );
+        assert!(
+            symbols.contains(&"HDFCBANK") || symbols.contains(&"HdfcBank"),
+            "Nifty 50 must contain HDFCBANK"
+        );
+
+        // Verify weights sum to ~100%
+        let weight_sum: f64 = constituents.iter().map(|c| c.weight).sum();
+        if weight_sum > 0.0 {
+            assert!(
+                (90.0..=110.0).contains(&weight_sum),
+                "Nifty 50 weights must sum to ~100%, got {weight_sum}"
+            );
+        }
+
+        // Verify ISIN format (12 chars, starts with IN)
+        for c in &constituents {
+            if !c.isin.is_empty() {
+                assert!(
+                    c.isin.len() == 12 && c.isin.starts_with("IN"),
+                    "ISIN must be 12 chars starting with IN, got: {}",
+                    c.isin
+                );
+            }
+        }
+    }
+
+    /// Fetch Nifty Bank CSV and verify sector data is present.
+    #[tokio::test]
+    #[ignore]
+    async fn real_fetch_nifty_bank_csv_has_bank_stocks() {
+        let config = default_config();
+        let slugs: &[(&str, &str)] = &[("Nifty Bank", "ind_niftybanklist")];
+
+        let results = csv_downloader::download_constituency_csvs(&config, slugs).await;
+
+        assert_eq!(results.len(), 1, "Nifty Bank CSV must download");
+        let today = chrono::Local::now().date_naive();
+        let constituents = csv_parser::parse_constituency_csv("Nifty Bank", &results[0].1, today);
+
+        assert!(
+            constituents.len() >= 10,
+            "Nifty Bank must have at least 10 constituents, got {}",
+            constituents.len()
+        );
+
+        let symbols: Vec<&str> = constituents.iter().map(|c| c.symbol.as_str()).collect();
+        assert!(
+            symbols.contains(&"HDFCBANK"),
+            "Nifty Bank must contain HDFCBANK"
+        );
+        assert!(
+            symbols.contains(&"ICICIBANK"),
+            "Nifty Bank must contain ICICIBANK"
+        );
+    }
+
+    /// Fetch ALL 49 indices and verify minimum success rate.
+    #[tokio::test]
+    #[ignore]
+    async fn real_fetch_all_49_indices_minimum_success_rate() {
+        let config = default_config();
+
+        let results =
+            csv_downloader::download_constituency_csvs(&config, INDEX_CONSTITUENCY_SLUGS).await;
+
+        let total = INDEX_CONSTITUENCY_SLUGS.len();
+        let downloaded = results.len();
+        let failed = total - downloaded;
+
+        eprintln!("Downloaded {downloaded}/{total} indices ({failed} failed)");
+
+        // At least 80% must succeed (40 out of 49)
+        assert!(
+            downloaded >= 40,
+            "At least 40 of {total} indices must download, got {downloaded}"
+        );
+
+        // Parse all downloaded CSVs and verify they have data
+        let today = chrono::Local::now().date_naive();
+        let mut total_stocks = 0usize;
+        let mut empty_indices = Vec::new();
+
+        for (name, csv_text) in &results {
+            let constituents = csv_parser::parse_constituency_csv(name, csv_text, today);
+            if constituents.is_empty() {
+                empty_indices.push(name.as_str());
+            } else {
+                total_stocks += constituents.len();
+            }
+        }
+
+        assert!(
+            empty_indices.len() <= 5,
+            "At most 5 indices may parse as empty, got {}: {:?}",
+            empty_indices.len(),
+            empty_indices
+        );
+
+        eprintln!(
+            "Total stock-index mappings: {total_stocks}, empty indices: {:?}",
+            empty_indices
+        );
+
+        assert!(
+            total_stocks >= 500,
+            "Must have at least 500 total stock-index mappings, got {total_stocks}"
+        );
+    }
+
+    /// End-to-end: download → parse → build map → verify O(1) lookups.
+    #[tokio::test]
+    #[ignore]
+    async fn real_fetch_end_to_end_download_parse_build_lookup() {
+        use dhan_live_trader_common::instrument_types::ConstituencyBuildMetadata;
+        use dhan_live_trader_core::index_constituency::mapper;
+
+        let config = default_config();
+        let slugs: &[(&str, &str)] = &[
+            ("Nifty 50", "ind_nifty50list"),
+            ("Nifty Bank", "ind_niftybanklist"),
+            ("Nifty IT", "ind_niftyitlist"),
+        ];
+
+        let downloaded = csv_downloader::download_constituency_csvs(&config, slugs).await;
+
+        assert!(
+            downloaded.len() >= 2,
+            "At least 2 of 3 indices must download"
+        );
+
+        let today = chrono::Local::now().date_naive();
+        let parsed: Vec<_> = downloaded
+            .iter()
+            .map(|(name, csv)| {
+                let constituents = csv_parser::parse_constituency_csv(name, csv, today);
+                (name.clone(), constituents)
+            })
+            .collect();
+
+        let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+
+        // Forward lookup
+        if let Some(nifty50) = map.get_constituents("Nifty 50") {
+            assert_eq!(nifty50.len(), 50, "Nifty 50 must have 50 constituents");
+        }
+
+        // Reverse lookup — HDFCBANK should be in both Nifty 50 and Nifty Bank
+        if let Some(indices) = map.get_indices_for_stock("HDFCBANK") {
+            assert!(
+                indices.len() >= 2,
+                "HDFCBANK must be in at least 2 indices, got {:?}",
+                indices
+            );
+        }
+
+        // Verify map counts
+        assert!(map.index_count() >= 2, "Map must have at least 2 indices");
+        assert!(
+            map.stock_count() >= 50,
+            "Map must have at least 50 unique stocks"
+        );
+    }
+
+    /// Verify the URL format matches what niftyindices.com expects.
+    #[test]
+    fn real_fetch_url_has_www_prefix() {
+        let url = csv_downloader::build_download_url("ind_nifty50list");
+        assert!(
+            url.starts_with("https://www.niftyindices.com/"),
+            "URL must use www. prefix, got: {url}"
+        );
+        assert!(url.ends_with(".csv"), "URL must end with .csv, got: {url}");
     }
 }
