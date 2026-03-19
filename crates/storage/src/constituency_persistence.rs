@@ -251,9 +251,25 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_constituency_unreachable_host_returns_ok() {
+        // persist_constituency is best-effort — returns Ok even on failure.
+        let map = IndexConstituencyMap::default();
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            ilp_port: 19009,
+            http_port: 19000,
+            pg_port: 18812,
+        };
+        let result = persist_constituency(&map, &config);
+        assert!(
+            result.is_ok(),
+            "persist_constituency must be best-effort (Ok on failure)"
+        );
+    }
+
+    #[test]
     fn test_persist_empty_map_returns_ok() {
         // Empty map should return Ok(0) without connecting to QuestDB.
-        // Since we can't connect in tests, verify the count logic works.
         let map = IndexConstituencyMap::default();
         assert_eq!(map.index_count(), 0);
         assert_eq!(map.stock_count(), 0);
