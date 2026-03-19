@@ -763,7 +763,59 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date,\n  CASE day_of_week(ts)\n    WHEN 1 THEN 'Monday'\n    WHEN 2 THEN 'Tuesday'\n    WHEN 3 THEN 'Wednesday'\n    WHEN 4 THEN 'Thursday'\n    WHEN 5 THEN 'Friday'\n    WHEN 6 THEN 'Saturday'\n    WHEN 7 THEN 'Sunday'\n  END AS day_of_week\nFROM nse_holidays\nORDER BY ts;",
+          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date,\n  CASE day_of_week(ts)\n    WHEN 1 THEN 'Monday'\n    WHEN 2 THEN 'Tuesday'\n    WHEN 3 THEN 'Wednesday'\n    WHEN 4 THEN 'Thursday'\n    WHEN 5 THEN 'Friday'\n    WHEN 6 THEN 'Saturday'\n    WHEN 7 THEN 'Sunday'\n  END AS day_of_week\nFROM nse_holidays\nWHERE ts >= '2026-01-01' AND ts <= '2026-12-31'\nORDER BY ts;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "index_name" },
+            "properties": [
+              { "id": "custom.width", "value": 250 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "total_stocks" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "with_fno" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 124 },
+      "id": 82,
+      "timeFrom": "1y",
+      "timeShift": null,
+      "hideTimeOverride": true,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "total_stocks" }]
+      },
+      "title": "Index Summary — Stocks Per Index",
+      "description": "How many stocks are in each NSE index, and how many of those have F&O derivatives (security_id > 0). Indices with high F&O coverage are most actionable for trading.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  index_name,\n  count(*) AS total_stocks,\n  count(CASE WHEN security_id > 0 THEN 1 END) AS with_fno\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nGROUP BY index_name\nORDER BY total_stocks DESC;",
           "refId": "A"
         }
       ]
@@ -797,7 +849,7 @@
           }
         ]
       },
-      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 124 },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 134 },
       "id": 81,
       "timeFrom": "1y",
       "timeShift": null,
@@ -808,8 +860,8 @@
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
         "sortBy": [{ "desc": false, "displayName": "index_name" }]
       },
-      "title": "NSE Index Constituents",
-      "description": "Index constituency data from niftyindices.com. Shows which stocks belong to each NSE index (Nifty 50, Bank Nifty, etc.) with weights and sectors. Updated daily at boot.",
+      "title": "NSE Index Constituents — All Stocks Tagged To Their Indices",
+      "description": "Every stock tagged to its parent index with security_id. security_id > 0 means the stock has F&O derivatives. Sort by index_name to see stocks per index. Source: niftyindices.com, enriched with Dhan instrument master.",
       "type": "table",
       "targets": [
         {
