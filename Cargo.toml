@@ -19,7 +19,7 @@ tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"]
 futures-util = "0.3.31"
 
 # ---- Section 2: Backend Core — Zero-Copy Parsing ----
-zerocopy = { version = "0.8.42", features = ["derive"] }
+zerocopy = { version = "0.8.47", features = ["derive"] }
 
 # ---- Section 2: Backend Core — Dispatch ----
 enum_dispatch = "0.3.13"
