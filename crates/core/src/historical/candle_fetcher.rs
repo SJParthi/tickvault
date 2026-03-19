@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::{FixedOffset, Utc};
+use chrono::Utc;
 use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
@@ -28,12 +28,13 @@ use zeroize::Zeroizing;
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
-    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST, TIMEFRAME_1D,
+    MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{
     DhanDailyResponse, DhanIntradayResponse, HistoricalCandle,
 };
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 use dhan_live_trader_storage::candle_persistence::CandlePersistenceWriter;
 
@@ -249,23 +250,7 @@ pub async fn fetch_historical_candles(
     let m_fetched = counter!("dlt_historical_candles_fetched_total");
     let m_api_errors = counter!("dlt_historical_api_errors_total");
 
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => {
-            warn!("invalid IST offset constant — cannot compute date range");
-            return CandleFetchSummary {
-                instruments_fetched: 0,
-                instruments_failed: 0,
-                total_candles: 0,
-                instruments_skipped: 0,
-                persist_failures: 0,
-                failed_instruments: Vec::new(),
-                failure_reasons: HashMap::new(),
-            };
-        }
-    };
-
-    let now_ist = Utc::now().with_timezone(&ist_offset);
+    let now_ist = Utc::now().with_timezone(&ist_offset());
     let today = now_ist.date_naive();
 
     // Compute date range: today - lookback_days to today

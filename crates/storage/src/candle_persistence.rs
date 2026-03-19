@@ -24,11 +24,10 @@ use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    CANDLE_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
-    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
-    EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1S, QUESTDB_TABLE_HISTORICAL_CANDLES,
+    CANDLE_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1S,
+    QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
+use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::HistoricalCandle;
 
 use crate::tick_persistence::f32_to_f64_clean;
@@ -45,24 +44,6 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// `segment` is required because security IDs 13 (NIFTY) and 25 (BANKNIFTY) exist
 /// in both `IDX_I` and `NSE_EQ` segments with different data.
 const DEDUP_KEY_CANDLES: &str = "security_id, timeframe, segment";
-
-/// Maps the binary exchange_segment_code to a human-readable symbol name.
-///
-/// Uses the same mapping as the Dhan Python SDK.
-/// Note: code 6 is unused/skipped in Dhan's protocol.
-fn segment_code_to_str(code: u8) -> &'static str {
-    match code {
-        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
-        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
-        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
-        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
-        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
-        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
-        _ => "UNKNOWN",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Candle Persistence Writer
@@ -404,6 +385,11 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dhan_live_trader_common::constants::{
+        EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
+        EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
+        EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
+    };
 
     #[test]
     fn test_segment_code_to_str_all_valid_codes() {

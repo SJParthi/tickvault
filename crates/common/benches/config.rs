@@ -1,10 +1,18 @@
-# =============================================================================
-# dhan-live-trader — Base Configuration
-# =============================================================================
-# Non-secret runtime configuration. Same file on Mac and AWS.
-# Secrets come from real AWS SSM Parameter Store (ap-south-1) — dev and prod.
-# =============================================================================
+//! Benchmark: TOML config parsing latency.
+//!
+//! Measures `ApplicationConfig` deserialization from TOML string.
+//! Budget from quality/benchmark-budgets.toml: < 10ms per parse.
+//! This is cold-path (boot only) but budgeted to prevent regressions.
 
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+
+use dhan_live_trader_common::config::ApplicationConfig;
+
+/// Embedded copy of a realistic base.toml for deterministic benchmarking.
+/// Avoids file I/O in the benchmark loop.
+const BASE_TOML: &str = r#"
 [trading]
 market_open_time = "09:00:00"
 market_close_time = "15:30:00"
@@ -13,13 +21,6 @@ data_collection_start = "09:00:00"
 data_collection_end = "15:30:00"
 timezone = "Asia/Kolkata"
 max_orders_per_second = 10
-
-# ---------------------------------------------------------------------------
-# NSE Trading Holidays — Official NSE Circular NSE/CMTR/71775
-# ---------------------------------------------------------------------------
-# Update annually when NSE publishes the next calendar year's circular.
-# Format: { date = "YYYY-MM-DD", name = "..." }
-# Weekends are excluded automatically — only list weekday holidays.
 
 [[trading.nse_holidays]]
 date = "2026-01-26"
@@ -43,7 +44,7 @@ name = "Good Friday"
 
 [[trading.nse_holidays]]
 date = "2026-04-14"
-name = "Dr. Baba Saheb Ambedkar Jayanti"
+name = "Dr. Ambedkar Jayanti"
 
 [[trading.nse_holidays]]
 date = "2026-05-01"
@@ -51,7 +52,7 @@ name = "Maharashtra Day"
 
 [[trading.nse_holidays]]
 date = "2026-05-28"
-name = "Bakri Eid (Eid ul-Adha)"
+name = "Bakri Eid"
 
 [[trading.nse_holidays]]
 date = "2026-06-26"
@@ -63,7 +64,7 @@ name = "Ganesh Chaturthi"
 
 [[trading.nse_holidays]]
 date = "2026-10-02"
-name = "Mahatma Gandhi Jayanti"
+name = "Gandhi Jayanti"
 
 [[trading.nse_holidays]]
 date = "2026-10-20"
@@ -75,18 +76,15 @@ name = "Diwali Balipratipada"
 
 [[trading.nse_holidays]]
 date = "2026-11-24"
-name = "Prakash Gurpurb Sri Guru Nanak Dev"
+name = "Guru Nanak Jayanti"
 
 [[trading.nse_holidays]]
 date = "2026-12-25"
 name = "Christmas"
 
-# Special trading sessions (market normally closed but opens for limited hours).
-# Muhurat Trading: ~1 hour evening session on Diwali.
-
 [[trading.muhurat_trading_dates]]
 date = "2026-11-08"
-name = "Diwali 2026 (Sunday — special session)"
+name = "Diwali 2026"
 
 [dhan]
 websocket_url = "wss://api-feed.dhan.co"
@@ -141,7 +139,7 @@ max_position_size_lots = 50
 [strategy]
 config_path = "config/strategies.toml"
 capital = 1000000.0
-dry_run = true  # SAFETY: never place real orders — paper trading only
+dry_run = true
 
 [logging]
 level = "info"
@@ -158,7 +156,6 @@ build_window_end = "15:30:00"
 [api]
 host = "0.0.0.0"
 port = 3001
-allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 
 [subscription]
 feed_mode = "Full"
@@ -193,3 +190,29 @@ enabled = true
 download_timeout_secs = 30
 max_concurrent_downloads = 5
 inter_batch_delay_ms = 0
+"#;
+
+fn bench_toml_parse(c: &mut Criterion) {
+    // Verify the TOML is valid before benchmarking.
+    let _: ApplicationConfig = toml::from_str(BASE_TOML).unwrap();
+
+    c.bench_function("config/toml_load", |b| {
+        b.iter(|| {
+            let config: ApplicationConfig = toml::from_str(black_box(BASE_TOML)).unwrap();
+            black_box(&config);
+        });
+    });
+}
+
+fn bench_toml_parse_and_validate(c: &mut Criterion) {
+    c.bench_function("config/toml_load_and_validate", |b| {
+        b.iter(|| {
+            let config: ApplicationConfig = toml::from_str(black_box(BASE_TOML)).unwrap();
+            config.validate().unwrap();
+            black_box(&config);
+        });
+    });
+}
+
+criterion_group!(benches, bench_toml_parse, bench_toml_parse_and_validate);
+criterion_main!(benches);

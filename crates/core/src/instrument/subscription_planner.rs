@@ -732,14 +732,14 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use chrono::{FixedOffset, Utc};
+    use chrono::Utc;
 
     use dhan_live_trader_common::instrument_types::*;
     use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
     /// Builds a minimal FnoUniverse for testing.
     fn make_test_universe() -> FnoUniverse {
-        let ist = FixedOffset::east_opt(19_800).unwrap();
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
 
         let mut underlyings = HashMap::new();
@@ -1876,7 +1876,7 @@ mod tests {
     #[test]
     fn test_plan_empty_universe() {
         // Completely empty universe — no instruments
-        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let universe = FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),
@@ -1916,7 +1916,7 @@ mod tests {
     fn test_plan_exceeds_capacity_triggers_warning() {
         // Build a universe with > 25,000 stock derivative contracts to trigger
         // the capacity limit (line 316: break) and warning (lines 346-347).
-        let ist = FixedOffset::east_opt(19_800).unwrap();
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 

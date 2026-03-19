@@ -808,9 +808,7 @@ pub struct ConstituencyBuildMetadata {
 
 impl Default for ConstituencyBuildMetadata {
     fn default() -> Self {
-        #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
-        let ist = FixedOffset::east_opt(crate::constants::IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+        let ist = crate::trading_calendar::ist_offset();
         Self {
             download_duration: Duration::default(),
             indices_downloaded: 0,
@@ -1025,8 +1023,8 @@ mod tests {
 
     #[test]
     fn test_build_metadata_duration_serde_roundtrip() {
-        use chrono::{FixedOffset, Utc};
-        let ist = FixedOffset::east_opt(19_800).unwrap();
+        use chrono::Utc;
+        let ist = crate::trading_calendar::ist_offset();
         let metadata = UniverseBuildMetadata {
             csv_source: "primary".to_string(),
             csv_row_count: 100,

@@ -171,12 +171,18 @@ impl TradingCalendar {
     }
 }
 
+/// Returns the IST timezone offset (+05:30 / UTC+19800s).
+///
+/// Use this instead of `FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect(...)` everywhere.
+/// The offset value 19800 is within `FixedOffset`'s valid range (compile-time provable constant).
+#[allow(clippy::expect_used)] // APPROVED: compile-time provable — IST_UTC_OFFSET_SECONDS (19800) is always valid
+pub fn ist_offset() -> FixedOffset {
+    FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid") // APPROVED: compile-time provable constant
+}
+
 /// Returns today's date in IST.
-#[allow(clippy::expect_used)] // APPROVED: compile-time provable constant — IST_UTC_OFFSET_SECONDS (19800) is always valid
 fn today_ist() -> NaiveDate {
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time constant
-    Utc::now().with_timezone(&ist).date_naive()
+    Utc::now().with_timezone(&ist_offset()).date_naive()
 }
 
 // ---------------------------------------------------------------------------

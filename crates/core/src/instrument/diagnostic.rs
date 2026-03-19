@@ -13,6 +13,7 @@ use tracing::info;
 
 use dhan_live_trader_common::config::InstrumentConfig;
 use dhan_live_trader_common::constants::*;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 use super::csv_downloader::download_instrument_csv;
 use super::csv_parser::parse_instrument_csv;
@@ -322,16 +323,12 @@ fn check_time_gate(window_start: &str, window_end: &str) -> CheckResult {
     let start = Instant::now();
     let is_open = is_within_build_window(window_start, window_end);
 
-    // IST_UTC_OFFSET_SECONDS (19800) is always valid for FixedOffset::east_opt.
-    // Fall back to UTC if somehow invalid (impossible with our constant).
-    let ist_offset = chrono::FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-        .or_else(|| chrono::FixedOffset::east_opt(0));
-    let now_ist_str = match ist_offset {
-        Some(offset) => chrono::Utc::now()
+    let now_ist_str = {
+        let offset = ist_offset();
+        chrono::Utc::now()
             .with_timezone(&offset)
             .format("%H:%M:%S")
-            .to_string(),
-        None => "unknown".to_owned(),
+            .to_string()
     };
 
     CheckResult {

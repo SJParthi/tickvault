@@ -263,4 +263,52 @@ mod tests {
         assert_ne!(CircuitState::Open, CircuitState::HalfOpen);
         assert_ne!(CircuitState::Closed, CircuitState::HalfOpen);
     }
+
+    // --- Debug format tests ---
+
+    #[test]
+    fn circuit_state_debug_all_variants() {
+        let closed = format!("{:?}", CircuitState::Closed);
+        let open = format!("{:?}", CircuitState::Open);
+        let half_open = format!("{:?}", CircuitState::HalfOpen);
+
+        assert!(closed.contains("Closed"), "Debug for Closed: {closed}");
+        assert!(open.contains("Open"), "Debug for Open: {open}");
+        assert!(
+            half_open.contains("HalfOpen"),
+            "Debug for HalfOpen: {half_open}"
+        );
+
+        // All must be distinct strings
+        assert_ne!(closed, open);
+        assert_ne!(open, half_open);
+        assert_ne!(closed, half_open);
+    }
+
+    #[test]
+    fn circuit_state_debug_is_not_empty() {
+        let states = [
+            CircuitState::Closed,
+            CircuitState::Open,
+            CircuitState::HalfOpen,
+        ];
+        for state in &states {
+            let debug = format!("{state:?}");
+            assert!(!debug.is_empty(), "Debug for {state:?} must not be empty");
+        }
+    }
+
+    #[test]
+    fn circuit_state_clone_preserves_value() {
+        let original = CircuitState::HalfOpen;
+        let cloned = original;
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn circuit_state_copy_semantics() {
+        let a = CircuitState::Open;
+        let b = a; // Copy
+        assert_eq!(a, b); // Original still usable
+    }
 }

@@ -31,7 +31,7 @@ mod trading_pipeline;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, Timelike, Utc};
+use chrono::{Timelike, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
@@ -40,9 +40,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
@@ -544,7 +543,11 @@ async fn main() -> Result<()> {
             bg_shared_constituency,
         );
 
-        let router = build_router(api_state);
+        let router = build_router(
+            api_state,
+            &config.api.allowed_origins,
+            config.strategy.dry_run,
+        );
         let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
             .parse()
             .context("invalid API bind address")?;
@@ -924,7 +927,11 @@ async fn main() -> Result<()> {
         shared_constituency.clone(),
     );
 
-    let router = build_router(api_state);
+    let router = build_router(
+        api_state,
+        &config.api.allowed_origins,
+        config.strategy.dry_run,
+    );
 
     let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
         .parse()
@@ -990,14 +997,7 @@ async fn load_instruments(
     .await
     {
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
-            let ist = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-                Some(tz) => tz,
-                None => {
-                    error!("invalid IST offset constant");
-                    return (None, None);
-                }
-            };
-            let today = Utc::now().with_timezone(&ist).date_naive();
+            let today = Utc::now().with_timezone(&ist_offset()).date_naive();
             let plan = build_subscription_plan(&universe, &config.subscription, today);
 
             info!(
@@ -1682,12 +1682,7 @@ fn compute_market_close_sleep(market_close_time_str: &str) -> std::time::Duratio
         }
     };
 
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => return std::time::Duration::ZERO,
-    };
-
-    let now_ist = Utc::now().with_timezone(&ist_offset);
+    let now_ist = Utc::now().with_timezone(&ist_offset());
     let now_time = now_ist.time();
 
     if now_time >= close_time {

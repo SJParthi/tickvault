@@ -1200,6 +1200,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1242,7 +1243,9 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
+ "criterion",
  "figment",
+ "proptest",
  "rkyv",
  "secrecy",
  "serde",
@@ -1324,6 +1327,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
+ "criterion",
  "dhan-live-trader-common",
  "dhan-live-trader-core",
  "dhat",

@@ -159,3 +159,190 @@ fn test_trading_calendar_holiday_is_not_trading_day() {
     let republic_day = chrono::NaiveDate::from_ymd_opt(2026, 1, 26).expect("valid date"); // APPROVED: test-only
     assert!(!calendar.is_trading_day(republic_day));
 }
+
+// ---------------------------------------------------------------------------
+// Smoke: config/base.toml can be parsed into ApplicationConfig
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_smoke_config_loads_from_base_toml() {
+    use dhan_live_trader_common::config::ApplicationConfig;
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
+
+    // The base.toml file must exist and be parseable.
+    // Integration tests run with cwd = workspace root (Cargo convention).
+    // Fall back to relative-from-crate path if workspace root path fails.
+    let config_path = if std::path::Path::new("config/base.toml").exists() {
+        "config/base.toml"
+    } else if std::path::Path::new("../../config/base.toml").exists() {
+        "../../config/base.toml"
+    } else {
+        panic!("config/base.toml not found from workspace root or crate directory")
+    };
+
+    let result: Result<ApplicationConfig, _> =
+        Figment::new().merge(Toml::file(config_path)).extract();
+
+    assert!(
+        result.is_ok(),
+        "config/base.toml failed to parse: {:?}",
+        result.err()
+    );
+
+    let config = result.expect("already checked"); // APPROVED: test-only
+    // Sanity checks on parsed config.
+    assert!(
+        !config.trading.market_open_time.is_empty(),
+        "market_open_time must not be empty"
+    );
+    assert!(
+        !config.trading.market_close_time.is_empty(),
+        "market_close_time must not be empty"
+    );
+    assert!(
+        config.trading.max_orders_per_second > 0,
+        "max_orders_per_second must be positive"
+    );
+    assert!(
+        config.trading.max_orders_per_second <= 10,
+        "max_orders_per_second must not exceed SEBI limit of 10"
+    );
+    assert!(
+        !config.trading.nse_holidays.is_empty(),
+        "nse_holidays must not be empty"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Smoke: all critical constants are in valid ranges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_smoke_all_constants_valid() {
+    use dhan_live_trader_common::constants::*;
+
+    // --- Packet sizes: positive and reasonable ---
+    assert!(TICKER_PACKET_SIZE > 0 && TICKER_PACKET_SIZE <= 256);
+    assert!(QUOTE_PACKET_SIZE > 0 && QUOTE_PACKET_SIZE <= 256);
+    assert!(FULL_QUOTE_PACKET_SIZE > 0 && FULL_QUOTE_PACKET_SIZE <= 1024);
+    assert!(DISCONNECT_PACKET_SIZE > 0 && DISCONNECT_PACKET_SIZE <= 256);
+    assert!(OI_PACKET_SIZE > 0 && OI_PACKET_SIZE <= 256);
+    assert!(PREVIOUS_CLOSE_PACKET_SIZE > 0 && PREVIOUS_CLOSE_PACKET_SIZE <= 256);
+    assert!(MARKET_STATUS_PACKET_SIZE > 0 && MARKET_STATUS_PACKET_SIZE <= 256);
+    assert!(MARKET_DEPTH_PACKET_SIZE > 0 && MARKET_DEPTH_PACKET_SIZE <= 256);
+
+    // --- Connection limits: positive and within Dhan spec ---
+    assert!(MAX_WEBSOCKET_CONNECTIONS >= 1 && MAX_WEBSOCKET_CONNECTIONS <= 10);
+    assert!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION >= 100);
+    assert!(MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION <= 10_000);
+    assert!(SUBSCRIPTION_BATCH_SIZE >= 1 && SUBSCRIPTION_BATCH_SIZE <= 100);
+
+    // --- Ring buffer capacities: must be powers of 2 ---
+    assert!(TICK_RING_BUFFER_CAPACITY.is_power_of_two());
+    assert!(ORDER_EVENT_RING_BUFFER_CAPACITY.is_power_of_two());
+    assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
+
+    // --- Tick persist window: valid IST times ---
+    assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
+    assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+
+    // --- SEBI compliance ---
+    assert_eq!(SEBI_MAX_ORDERS_PER_SECOND, 10);
+    assert!(SEBI_AUDIT_RETENTION_YEARS >= 5);
+
+    // --- IST offset consistency ---
+    assert_eq!(IST_UTC_OFFSET_SECONDS, 19_800);
+    assert_eq!(IST_UTC_OFFSET_SECONDS_I64, 19_800);
+    assert_eq!(
+        IST_UTC_OFFSET_NANOS,
+        IST_UTC_OFFSET_SECONDS_I64 * 1_000_000_000
+    );
+
+    // --- Deep depth header differs from standard ---
+    assert_ne!(DEEP_DEPTH_HEADER_SIZE, BINARY_HEADER_SIZE);
+    assert!(DEEP_DEPTH_HEADER_SIZE > BINARY_HEADER_SIZE);
+
+    // --- TOTP config ---
+    assert_eq!(TOTP_DIGITS, 6);
+    assert_eq!(TOTP_PERIOD_SECS, 30);
+
+    // --- OMS circuit breaker ---
+    assert!(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD >= 1);
+    assert!(OMS_CIRCUIT_BREAKER_RESET_SECS >= 1);
+
+    // --- Application identity ---
+    assert!(!APPLICATION_NAME.is_empty());
+    assert!(!APPLICATION_VERSION.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Smoke: all error enum variants have Display impl
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_smoke_error_types_have_display() {
+    use dhan_live_trader_common::error::ApplicationError;
+
+    // Construct one instance of each variant and verify Display produces non-empty output.
+    let variants: Vec<Box<dyn std::fmt::Display>> = vec![
+        Box::new(ApplicationError::Configuration("test".to_string())),
+        Box::new(ApplicationError::SecretRetrieval {
+            path: "/dlt/dev/test".to_string(),
+            source: anyhow::anyhow!("test error"),
+        }),
+        Box::new(ApplicationError::MarketHourViolation("test".to_string())),
+        Box::new(ApplicationError::InfrastructureUnavailable {
+            service: "test".to_string(),
+            endpoint: "localhost".to_string(),
+        }),
+        Box::new(ApplicationError::InstrumentDownloadFailed {
+            reason: "test".to_string(),
+        }),
+        Box::new(ApplicationError::InstrumentParseFailed {
+            row: 1,
+            reason: "test".to_string(),
+        }),
+        Box::new(ApplicationError::UniverseValidationFailed {
+            check: "test".to_string(),
+        }),
+        Box::new(ApplicationError::CsvColumnMissing {
+            column: "TEST".to_string(),
+        }),
+        Box::new(ApplicationError::QuestDbWriteFailed {
+            table: "test".to_string(),
+            source: anyhow::anyhow!("test"),
+        }),
+        Box::new(ApplicationError::TotpGenerationFailed {
+            reason: "test".to_string(),
+        }),
+        Box::new(ApplicationError::AuthenticationFailed {
+            reason: "test".to_string(),
+        }),
+        Box::new(ApplicationError::TokenRenewalFailed {
+            attempts: 3,
+            reason: "test".to_string(),
+        }),
+        Box::new(ApplicationError::AuthCircuitBreakerTripped { failures: 3 }),
+        Box::new(ApplicationError::NotificationSendFailed {
+            reason: "test".to_string(),
+        }),
+        Box::new(ApplicationError::IpVerificationFailed {
+            reason: "test".to_string(),
+        }),
+    ];
+
+    for (idx, variant) in variants.iter().enumerate() {
+        let display = format!("{variant}");
+        assert!(
+            !display.is_empty(),
+            "ApplicationError variant {idx} has empty Display output"
+        );
+        // Every Display output should contain the word we passed in (case-insensitive).
+        let display_lower = display.to_lowercase();
+        assert!(
+            display_lower.contains("test") || display_lower.contains("3"),
+            "ApplicationError variant {idx} Display does not contain expected content: {display}"
+        );
+    }
+}

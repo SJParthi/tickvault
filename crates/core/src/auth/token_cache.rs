@@ -13,15 +13,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::DateTime;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use super::types::TokenState;
-use dhan_live_trader_common::constants::{
-    IST_UTC_OFFSET_SECONDS, TOKEN_CACHE_FILE_PATH, TOKEN_CACHE_MIN_REMAINING_HOURS,
-};
+use dhan_live_trader_common::constants::{TOKEN_CACHE_FILE_PATH, TOKEN_CACHE_MIN_REMAINING_HOURS};
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 // ---------------------------------------------------------------------------
 // Cache File Format
@@ -148,10 +147,7 @@ pub fn load_token_cache(client_id: &SecretString) -> Option<TokenState> {
     }
 
     // Parse timestamps back to IST DateTime
-    // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800), always valid
-    #[allow(clippy::expect_used)]
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+    let ist = ist_offset();
 
     let expires_at = match DateTime::from_timestamp(entry.expires_at_epoch_secs, 0) {
         Some(dt) => dt.with_timezone(&ist),
@@ -246,10 +242,7 @@ pub fn load_token_cache_fast() -> Option<FastCacheResult> {
     };
 
     // Parse timestamps back to IST DateTime
-    // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800), always valid
-    #[allow(clippy::expect_used)]
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+    let ist = ist_offset();
 
     let expires_at = match DateTime::from_timestamp(entry.expires_at_epoch_secs, 0) {
         Some(dt) => dt.with_timezone(&ist),
@@ -372,9 +365,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -404,9 +395,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -434,9 +423,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -462,9 +449,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         // Token expires in 30 minutes — less than MIN_REMAINING_HOURS (1h)
@@ -535,9 +520,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -579,9 +562,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         // Write old-format cache (no client_id field)
@@ -610,9 +591,7 @@ mod tests {
         let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(

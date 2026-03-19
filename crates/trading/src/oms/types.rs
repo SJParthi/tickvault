@@ -1164,4 +1164,150 @@ mod tests {
         // availabel_balance should default to 0.0 since the correct spelling doesn't match
         assert!((resp_correct.availabel_balance - 0.0).abs() < f64::EPSILON);
     }
+
+    // --- OmsError Display/Debug completeness ---
+
+    #[test]
+    fn oms_error_display_all_variants_non_empty() {
+        let all_errors: Vec<OmsError> = vec![
+            OmsError::RiskRejected {
+                reason: "test".to_owned(),
+            },
+            OmsError::RateLimited,
+            OmsError::CircuitBreakerOpen,
+            OmsError::OrderNotFound {
+                order_id: "O1".to_owned(),
+            },
+            OmsError::OrderTerminal {
+                order_id: "O2".to_owned(),
+                status: "TRADED".to_owned(),
+            },
+            OmsError::InvalidTransition {
+                order_id: "O3".to_owned(),
+                from: "PENDING".to_owned(),
+                to: "TRANSIT".to_owned(),
+            },
+            OmsError::DhanApiError {
+                status_code: 500,
+                message: "internal error".to_owned(),
+            },
+            OmsError::DhanRateLimited,
+            OmsError::NoToken,
+            OmsError::TokenExpired,
+            OmsError::HttpError("connection refused".to_owned()),
+            OmsError::JsonError("unexpected token".to_owned()),
+        ];
+
+        for err in &all_errors {
+            let display = err.to_string();
+            assert!(!display.is_empty(), "Display must not be empty for {err:?}");
+        }
+    }
+
+    #[test]
+    fn oms_error_debug_all_variants_contain_variant_name() {
+        let test_cases: Vec<(OmsError, &str)> = vec![
+            (
+                OmsError::RiskRejected {
+                    reason: "x".to_owned(),
+                },
+                "RiskRejected",
+            ),
+            (OmsError::RateLimited, "RateLimited"),
+            (OmsError::CircuitBreakerOpen, "CircuitBreakerOpen"),
+            (
+                OmsError::OrderNotFound {
+                    order_id: "x".to_owned(),
+                },
+                "OrderNotFound",
+            ),
+            (
+                OmsError::OrderTerminal {
+                    order_id: "x".to_owned(),
+                    status: "x".to_owned(),
+                },
+                "OrderTerminal",
+            ),
+            (
+                OmsError::InvalidTransition {
+                    order_id: "x".to_owned(),
+                    from: "x".to_owned(),
+                    to: "x".to_owned(),
+                },
+                "InvalidTransition",
+            ),
+            (
+                OmsError::DhanApiError {
+                    status_code: 0,
+                    message: "x".to_owned(),
+                },
+                "DhanApiError",
+            ),
+            (OmsError::DhanRateLimited, "DhanRateLimited"),
+            (OmsError::NoToken, "NoToken"),
+            (OmsError::TokenExpired, "TokenExpired"),
+            (OmsError::HttpError("x".to_owned()), "HttpError"),
+            (OmsError::JsonError("x".to_owned()), "JsonError"),
+        ];
+
+        for (err, expected_name) in &test_cases {
+            let debug = format!("{err:?}");
+            assert!(
+                debug.contains(expected_name),
+                "Debug for {expected_name} must contain variant name: got '{debug}'"
+            );
+        }
+    }
+
+    #[test]
+    fn oms_error_display_includes_context() {
+        let err = OmsError::OrderTerminal {
+            order_id: "ORD-42".to_owned(),
+            status: "TRADED".to_owned(),
+        };
+        let display = err.to_string();
+        assert!(display.contains("ORD-42"), "must include order_id");
+        assert!(display.contains("TRADED"), "must include status");
+
+        let err = OmsError::DhanApiError {
+            status_code: 429,
+            message: "too many requests".to_owned(),
+        };
+        let display = err.to_string();
+        assert!(display.contains("429"), "must include status code");
+        assert!(
+            display.contains("too many requests"),
+            "must include message"
+        );
+    }
+
+    // --- ManagedOrder Debug ---
+
+    #[test]
+    fn managed_order_debug_contains_key_fields() {
+        let order = ManagedOrder {
+            order_id: "ORD-123".to_owned(),
+            correlation_id: "COR-456".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Pending,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        let debug = format!("{order:?}");
+        assert!(debug.contains("ORD-123"), "Debug must include order_id");
+        assert!(debug.contains("52432"), "Debug must include security_id");
+        assert!(debug.contains("Pending"), "Debug must include status");
+    }
 }

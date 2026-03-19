@@ -25,13 +25,11 @@ use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    DEPTH_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
-    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
-    EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_MARKET_DEPTH,
-    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE,
-    TICK_FLUSH_INTERVAL_MS,
+    DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64,
+    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS,
+    TICK_FLUSH_BATCH_SIZE, TICK_FLUSH_INTERVAL_MS,
 };
+use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 
 // ---------------------------------------------------------------------------
@@ -45,27 +43,6 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// STORAGE-GAP-01: Must include segment to prevent cross-segment collision
 /// (same security_id can exist on NSE_EQ and BSE_EQ).
 const DEDUP_KEY_TICKS: &str = "security_id, segment";
-
-// ---------------------------------------------------------------------------
-// Exchange segment code → string mapping
-// ---------------------------------------------------------------------------
-
-/// Maps the binary exchange_segment_code to a human-readable symbol name.
-///
-/// Uses the same mapping as the Dhan Python SDK.
-fn segment_code_to_str(code: u8) -> &'static str {
-    match code {
-        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
-        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
-        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
-        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
-        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
-        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
-        _ => "UNKNOWN",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -711,7 +688,11 @@ fn current_time_ms() -> u64 {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
+    use dhan_live_trader_common::constants::{
+        EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
+        EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
+        EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO, IST_UTC_OFFSET_SECONDS_I64,
+    };
     use questdb::ingress::ProtocolVersion;
 
     fn make_test_tick(security_id: u32, ltp: f32) -> ParsedTick {

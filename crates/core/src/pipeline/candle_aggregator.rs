@@ -571,4 +571,207 @@ mod tests {
         assert_eq!(agg.total_completed(), 2000);
         assert_eq!(agg.active_count(), 1000);
     }
+
+    // -----------------------------------------------------------------------
+    // Functional: OHLCV correctness with known price sequence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_functional_candle_ohlcv_correctness() {
+        let mut agg = CandleAggregator::new();
+
+        // Feed a known sequence: O=100, H=120, L=90, C=105, V=5000, ticks=5
+        // Timestamp 1000 (second boundary).
+        agg.update(&make_tick(42, 2, 100.0, 1000, 1000)); // Open=100
+        agg.update(&make_tick(42, 2, 110.0, 1000, 2000)); // Mid
+        agg.update(&make_tick(42, 2, 120.0, 1000, 3000)); // High=120
+        agg.update(&make_tick(42, 2, 90.0, 1000, 4000)); // Low=90
+        agg.update(&make_tick(42, 2, 105.0, 1000, 5000)); // Close=105
+
+        // Trigger completion by advancing to next second.
+        agg.update(&make_tick(42, 2, 106.0, 1001, 5100));
+
+        let completed = agg.drain_completed();
+        assert_eq!(completed.len(), 1);
+        let c = &completed[0];
+
+        // Verify every OHLCV field exactly.
+        assert_eq!(c.security_id, 42);
+        assert_eq!(c.exchange_segment_code, 2);
+        assert_eq!(c.timestamp_secs, 1000);
+        assert_eq!(c.open, 100.0, "open must be the FIRST tick's price");
+        assert_eq!(c.high, 120.0, "high must be the maximum price");
+        assert_eq!(c.low, 90.0, "low must be the minimum price");
+        assert_eq!(c.close, 105.0, "close must be the LAST tick's price");
+        assert_eq!(c.volume, 5000, "volume must be the last snapshot");
+        assert_eq!(
+            c.tick_count, 5,
+            "tick_count must equal number of ticks in that second"
+        );
+
+        // Verify the new active candle started correctly.
+        let active = agg.candles.get(&(42, 2)).expect("active candle must exist");
+        assert_eq!(active.open, 106.0);
+        assert_eq!(active.timestamp_secs, 1001);
+        assert_eq!(active.tick_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Functional: sweep_stale emits correct candle data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_functional_candle_sweep_stale() {
+        let mut agg = CandleAggregator::new();
+
+        // Security 100: active candle at timestamp 1000 with known OHLCV.
+        agg.update(&make_tick(100, 2, 200.0, 1000, 500));
+        agg.update(&make_tick(100, 2, 210.0, 1000, 600)); // High
+        agg.update(&make_tick(100, 2, 195.0, 1000, 700)); // Low
+
+        // Security 200: active candle at timestamp 1008 (recent — should NOT be swept).
+        agg.update(&make_tick(200, 2, 300.0, 1008, 1000));
+
+        // Sweep at timestamp 1010 — candle at 1000 is stale (>5s), candle at 1008 is not.
+        agg.sweep_stale(1010);
+
+        // Only security 100 should be swept.
+        assert_eq!(
+            agg.active_count(),
+            1,
+            "only recent candle should remain active"
+        );
+        assert!(
+            agg.candles.contains_key(&(200, 2)),
+            "security 200 should still be active"
+        );
+
+        let completed = agg.drain_completed();
+        assert_eq!(completed.len(), 1);
+        let c = &completed[0];
+
+        // Verify the swept candle has correct OHLCV.
+        assert_eq!(c.security_id, 100);
+        assert_eq!(c.timestamp_secs, 1000);
+        assert_eq!(c.open, 200.0);
+        assert_eq!(c.high, 210.0);
+        assert_eq!(c.low, 195.0);
+        assert_eq!(c.close, 195.0); // Last tick was the low
+        assert_eq!(c.volume, 700);
+        assert_eq!(c.tick_count, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Functional: same ticks produce correct candles across multiple seconds
+    // (simulates what higher-timeframe rollup would consume)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_functional_multiple_timeframes() {
+        // This aggregator produces 1-second candles. Higher timeframes (1m, 5m)
+        // are QuestDB materialized views that consume these 1s candles.
+        // Verify that 60 consecutive 1s candles have correct per-second OHLCV
+        // that would correctly roll up to a 1-minute candle.
+        let mut agg = CandleAggregator::new();
+
+        let base_ts = 1_700_000_000_u32;
+        let security_id = 100_u32;
+        let segment = 2_u8;
+
+        // Simulate 60 seconds of ticks, each second has 3 ticks.
+        // Price pattern: starts at 100, rises to 160 linearly.
+        for second in 0..60_u32 {
+            let ts = base_ts + second;
+            let base_price = 100.0 + second as f32;
+            agg.update(&make_tick(
+                security_id,
+                segment,
+                base_price,
+                ts,
+                second * 100,
+            ));
+            agg.update(&make_tick(
+                security_id,
+                segment,
+                base_price + 0.5,
+                ts,
+                second * 100 + 50,
+            ));
+            agg.update(&make_tick(
+                security_id,
+                segment,
+                base_price - 0.25,
+                ts,
+                second * 100 + 75,
+            ));
+        }
+
+        // Flush to get all candles including the last active one.
+        agg.flush_all();
+        let candles = agg.drain_completed();
+
+        // 60 seconds: 59 completed by second transitions + 1 flushed = 60 total.
+        assert_eq!(
+            candles.len(),
+            60,
+            "must produce exactly 60 one-second candles"
+        );
+
+        // Verify first candle (second 0): O=100.0, H=100.5, L=99.75, C=99.75
+        let first = candles
+            .iter()
+            .find(|c| c.timestamp_secs == base_ts)
+            .expect("first candle");
+        assert_eq!(first.open, 100.0);
+        assert_eq!(first.high, 100.5);
+        assert_eq!(first.low, 99.75);
+        assert_eq!(first.close, 99.75);
+        assert_eq!(first.tick_count, 3);
+
+        // Verify last candle (second 59): O=159.0, H=159.5, L=158.75, C=158.75
+        let last = candles
+            .iter()
+            .find(|c| c.timestamp_secs == base_ts + 59)
+            .expect("last candle");
+        assert_eq!(last.open, 159.0);
+        assert_eq!(last.high, 159.5);
+        assert_eq!(last.low, 158.75);
+        assert_eq!(last.close, 158.75);
+        assert_eq!(last.tick_count, 3);
+
+        // Simulate 1-minute rollup: overall min/max across all 60 candles.
+        let minute_open = candles
+            .iter()
+            .min_by_key(|c| c.timestamp_secs)
+            .expect("non-empty")
+            .open;
+        let minute_close = candles
+            .iter()
+            .max_by_key(|c| c.timestamp_secs)
+            .expect("non-empty")
+            .close;
+        let minute_high = candles
+            .iter()
+            .map(|c| c.high)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let minute_low = candles.iter().map(|c| c.low).fold(f32::INFINITY, f32::min);
+
+        // 1-minute candle correctness (what QuestDB materialized view would compute).
+        assert_eq!(minute_open, 100.0, "1-minute open = first 1s open");
+        assert_eq!(minute_close, 158.75, "1-minute close = last 1s close");
+        assert_eq!(minute_high, 159.5, "1-minute high = max of all 1s highs");
+        assert_eq!(minute_low, 99.75, "1-minute low = min of all 1s lows");
+
+        // 5-minute rollup: first 300 seconds. We only have 60, so verify subset.
+        // All 60 candles are in the same 5-minute window.
+        let five_min_candles: Vec<_> = candles
+            .iter()
+            .filter(|c| c.timestamp_secs >= base_ts && c.timestamp_secs < base_ts + 300)
+            .collect();
+        assert_eq!(
+            five_min_candles.len(),
+            60,
+            "all 60 candles fit in one 5-minute window"
+        );
+    }
 }

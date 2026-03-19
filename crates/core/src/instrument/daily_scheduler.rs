@@ -18,17 +18,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
-
-// I-P1-01: IST offset for daily scheduling
-const IST_OFFSET_SECS: i32 = IST_UTC_OFFSET_SECONDS;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 
 // I-P1-01: Full day in seconds for next-day wrapping
 const SECS_PER_DAY: i64 = 86_400;
-
-// I-P1-01: Retry interval when IST offset construction fails (should never happen)
-const IST_OFFSET_RETRY_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // DailyRefreshConfig
@@ -162,16 +155,7 @@ pub fn spawn_daily_refresh_task(
 
         loop {
             // I-P1-01: Compute IST "now" for scheduling
-            let now_ist = match FixedOffset::east_opt(IST_OFFSET_SECS) {
-                Some(offset) => Utc::now().with_timezone(&offset),
-                None => {
-                    warn!("failed to construct IST offset — retrying in {IST_OFFSET_RETRY_SECS}s");
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(IST_OFFSET_RETRY_SECS)) => continue,
-                        _ = shutdown_rx.changed() => return,
-                    }
-                }
-            };
+            let now_ist = Utc::now().with_timezone(&ist_offset());
 
             let sleep_duration = compute_next_trigger_time(now_ist, config.download_time);
 
@@ -191,13 +175,7 @@ pub fn spawn_daily_refresh_task(
             }
 
             // I-P1-01: Check if today is a trading day
-            let today_ist = match FixedOffset::east_opt(IST_OFFSET_SECS) {
-                Some(offset) => Utc::now().with_timezone(&offset).date_naive(),
-                None => {
-                    warn!("failed to construct IST offset for trading day check");
-                    continue;
-                }
-            };
+            let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
 
             if !calendar.is_trading_day(today_ist) {
                 info!(
@@ -240,7 +218,7 @@ mod tests {
         min: u32,
         sec: u32,
     ) -> DateTime<FixedOffset> {
-        let offset = FixedOffset::east_opt(IST_OFFSET_SECS).expect("IST offset is valid"); // APPROVED: test helper — constant always valid
+        let offset = ist_offset();
         let naive_date = NaiveDate::from_ymd_opt(year, month, day).expect("valid test date"); // APPROVED: test helper
         let naive_time = NaiveTime::from_hms_opt(hour, min, sec).expect("valid test time"); // APPROVED: test helper
         let naive_dt = naive_date.and_time(naive_time);

@@ -17,12 +17,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::InstrumentConfig;
 use dhan_live_trader_common::constants::*;
 use dhan_live_trader_common::instrument_types::*;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
 use super::csv_downloader::download_instrument_csv;
@@ -766,9 +767,7 @@ pub fn build_fno_universe_from_csv(csv_text: &str, source: &str) -> Result<FnoUn
     let mut underlyings = link_price_ids(unlinked, &index_lookup, &equity_lookup);
 
     // Pass 5 — Build derivatives, option chains, expiry calendars
-    let ist_offset =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
-    let today = Utc::now().with_timezone(&ist_offset).date_naive();
+    let today = Utc::now().with_timezone(&ist_offset()).date_naive();
 
     let pass5_result = build_derivatives_and_chains(&parsed_rows, &mut underlyings, today);
 
@@ -777,7 +776,7 @@ pub fn build_fno_universe_from_csv(csv_text: &str, source: &str) -> Result<FnoUn
 
     // Assemble the universe
     let build_duration = build_start.elapsed();
-    let build_timestamp = Utc::now().with_timezone(&ist_offset);
+    let build_timestamp = Utc::now().with_timezone(&ist_offset());
 
     let universe = FnoUniverse {
         build_metadata: UniverseBuildMetadata {

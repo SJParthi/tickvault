@@ -17,14 +17,15 @@ pub mod mapper;
 
 use std::time::Instant;
 
-use chrono::{FixedOffset, Utc};
+use chrono::Utc;
 use tracing::{info, warn};
 
 use dhan_live_trader_common::config::IndexConstituencyConfig;
 use dhan_live_trader_common::constants::{
-    INDEX_CONSTITUENCY_CSV_CACHE_FILENAME, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS,
+    INDEX_CONSTITUENCY_CSV_CACHE_FILENAME, INDEX_CONSTITUENCY_SLUGS,
 };
 use dhan_live_trader_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituencyMap};
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 /// Download index constituency data and build the bidirectional map.
 ///
@@ -67,9 +68,7 @@ pub async fn download_and_build_constituency_map(
 
     let elapsed = start.elapsed();
 
-    #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+    let ist = ist_offset();
 
     let total_mappings: usize = parsed.iter().map(|(_, v)| v.len()).sum();
     let metadata = ConstituencyBuildMetadata {

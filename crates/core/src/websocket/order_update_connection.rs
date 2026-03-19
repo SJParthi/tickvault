@@ -23,15 +23,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
 
-use chrono::{FixedOffset, NaiveTime, Utc};
+use chrono::{NaiveTime, Utc};
 
 use dhan_live_trader_common::constants::{
-    IST_UTC_OFFSET_SECONDS, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS,
-    ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS, ORDER_UPDATE_READ_TIMEOUT_SECS,
-    ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
+    ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS,
+    ORDER_UPDATE_READ_TIMEOUT_SECS, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS,
+    ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
 };
 use dhan_live_trader_common::order_types::OrderUpdate;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
@@ -255,10 +255,7 @@ fn is_within_market_hours(calendar: &TradingCalendar) -> bool {
         return false;
     }
 
-    #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
-    let now_ist = Utc::now().with_timezone(&ist).time();
+    let now_ist = Utc::now().with_timezone(&ist_offset()).time();
 
     #[allow(clippy::expect_used)] // APPROVED: compile-time provable constants
     let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0)

@@ -12,12 +12,17 @@
 //! # Boot Sequence Position
 //! Pipeline → **API Server**
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+#![allow(missing_docs)]
+
 pub mod handlers;
 pub mod middleware;
 pub mod state;
 
 use axum::Router;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 use middleware::{ApiAuthConfig, require_bearer_auth};
 use state::SharedAppState;
@@ -26,15 +31,19 @@ use state::SharedAppState;
 ///
 /// GAP-SEC-01: Mutating endpoints (POST /api/instruments/rebuild) are protected
 /// by bearer token auth. Read-only GET endpoints remain unauthenticated.
-pub fn build_router(state: SharedAppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+///
+/// # Arguments
+/// * `state` — shared application state for handlers
+/// * `allowed_origins` — list of allowed CORS origin URLs (from config)
+/// * `dry_run` — whether the system is in dry-run mode (relaxed auth when token unset)
+// O(1) EXEMPT: begin — cold path, called once at boot
+pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: bool) -> Router {
+    let cors = build_cors_layer(allowed_origins);
 
     // GAP-SEC-01: Load auth config from DLT_API_TOKEN env var.
-    // Empty/unset = passthrough (dev mode).
-    let auth_config = ApiAuthConfig::from_env();
+    // In dry_run mode: missing token = passthrough (dev mode).
+    // In live mode: missing token = auto-generated token, auth still enforced.
+    let auth_config = ApiAuthConfig::from_env(dry_run);
 
     // Protected routes — mutating endpoints behind bearer token auth
     let protected_routes = Router::new()
@@ -85,3 +94,42 @@ pub fn build_router(state: SharedAppState) -> Router {
         .layer(cors)
         .with_state(state)
 }
+// O(1) EXEMPT: end
+
+/// Builds a CORS layer from configured allowed origins.
+///
+/// If the list is empty, falls back to permissive localhost defaults for dev safety.
+// O(1) EXEMPT: begin — cold path, called once at boot
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    use axum::http::HeaderValue;
+    use tower_http::cors::Any;
+
+    let origins: Vec<&str> = if allowed_origins.is_empty() {
+        vec!["http://localhost:3000", "http://localhost:3001"]
+    } else {
+        allowed_origins.iter().map(String::as_str).collect()
+    };
+
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| o.parse::<HeaderValue>().ok())
+        .collect();
+
+    if parsed.is_empty() {
+        // Fallback: if all origins failed to parse, allow localhost defaults.
+        // HeaderValue::from_static is infallible for string literals.
+        CorsLayer::new()
+            .allow_origin([
+                HeaderValue::from_static("http://localhost:3000"),
+                HeaderValue::from_static("http://localhost:3001"),
+            ])
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        CorsLayer::new()
+            .allow_origin(parsed)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    }
+}
+// O(1) EXEMPT: end

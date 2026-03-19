@@ -24,8 +24,13 @@ secrecy = { workspace = true }
 
 [dev-dependencies]
 dhan-live-trader-core = { path = "../core" }
+criterion = { workspace = true }
 dhat = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "oms"
+harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
