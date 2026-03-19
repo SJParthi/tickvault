@@ -9,8 +9,10 @@
 use chrono::NaiveDate;
 use dhan_live_trader_common::config::IndexConstituencyConfig;
 use dhan_live_trader_common::instrument_types::{
-    ConstituencyBuildMetadata, IndexConstituencyMap, IndexConstituent,
+    ConstituencyBuildMetadata, FnoUnderlying, FnoUniverse, IndexCategory, IndexConstituencyMap,
+    IndexConstituent, IndexSubcategory, SubscribedIndex, UnderlyingKind, UniverseBuildMetadata,
 };
+use dhan_live_trader_common::types::{Exchange, ExchangeSegment};
 use dhan_live_trader_core::index_constituency::{csv_parser, mapper};
 
 // ---------------------------------------------------------------------------
@@ -650,5 +652,240 @@ mod proptest_constituency {
                 );
             }
         }
+    }
+}
+
+// =========================================================================
+// Constituency ↔ Instrument mapping integration tests
+// =========================================================================
+
+fn make_test_build_metadata() -> UniverseBuildMetadata {
+    use chrono::{FixedOffset, Utc};
+    let ist = FixedOffset::east_opt(19_800).unwrap();
+    UniverseBuildMetadata {
+        csv_source: "test".to_string(),
+        csv_row_count: 0,
+        parsed_row_count: 0,
+        index_count: 0,
+        equity_count: 0,
+        underlying_count: 0,
+        derivative_count: 0,
+        option_chain_count: 0,
+        build_duration: std::time::Duration::ZERO,
+        build_timestamp: Utc::now().with_timezone(&ist),
+    }
+}
+
+fn make_mapping_test_universe() -> FnoUniverse {
+    use std::collections::HashMap;
+
+    let mut underlyings = HashMap::new();
+    underlyings.insert(
+        "RELIANCE".to_string(),
+        FnoUnderlying {
+            underlying_symbol: "RELIANCE".to_string(),
+            underlying_security_id: 26000,
+            price_feed_security_id: 2885,
+            price_feed_segment: ExchangeSegment::NseEquity,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: UnderlyingKind::Stock,
+            lot_size: 250,
+            contract_count: 0,
+        },
+    );
+    underlyings.insert(
+        "HDFCBANK".to_string(),
+        FnoUnderlying {
+            underlying_symbol: "HDFCBANK".to_string(),
+            underlying_security_id: 27000,
+            price_feed_security_id: 1333,
+            price_feed_segment: ExchangeSegment::NseEquity,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: UnderlyingKind::Stock,
+            lot_size: 550,
+            contract_count: 0,
+        },
+    );
+    underlyings.insert(
+        "NIFTY".to_string(),
+        FnoUnderlying {
+            underlying_symbol: "NIFTY".to_string(),
+            underlying_security_id: 26000,
+            price_feed_security_id: 13,
+            price_feed_segment: ExchangeSegment::IdxI,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: UnderlyingKind::NseIndex,
+            lot_size: 25,
+            contract_count: 0,
+        },
+    );
+
+    let subscribed_indices = vec![
+        SubscribedIndex {
+            symbol: "NIFTY".to_string(),
+            security_id: 13,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::FnoUnderlying,
+            subcategory: IndexSubcategory::Fno,
+        },
+        SubscribedIndex {
+            symbol: "BANKNIFTY".to_string(),
+            security_id: 29,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::FnoUnderlying,
+            subcategory: IndexSubcategory::Fno,
+        },
+    ];
+
+    FnoUniverse {
+        underlyings,
+        derivative_contracts: HashMap::new(),
+        instrument_info: HashMap::new(),
+        option_chains: HashMap::new(),
+        expiry_calendars: HashMap::new(),
+        subscribed_indices,
+        build_metadata: make_test_build_metadata(),
+    }
+}
+
+#[test]
+fn test_constituency_to_security_id_roundtrip() {
+    let csv = "\
+        Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+        Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n\
+        HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,8.2\n\
+        TCS,IT,TCS,EQ,INE467B01029,5.1\n";
+
+    let constituents = csv_parser::parse_constituency_csv("Nifty 50", csv, today());
+    assert_eq!(constituents.len(), 3);
+
+    let parsed = vec![("Nifty 50".to_string(), constituents)];
+    let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+    let universe = make_mapping_test_universe();
+
+    let nifty50 = map.get_constituents("Nifty 50").unwrap();
+    for c in nifty50 {
+        let sec_id = universe.symbol_to_security_id(&c.symbol);
+        match c.symbol.as_str() {
+            "RELIANCE" => assert_eq!(sec_id, Some(2885)),
+            "HDFCBANK" => assert_eq!(sec_id, Some(1333)),
+            "TCS" => assert_eq!(sec_id, None, "TCS not in F&O universe"),
+            _ => panic!("unexpected symbol: {}", c.symbol),
+        }
+    }
+}
+
+#[test]
+fn test_reverse_lookup_stock_to_indices_then_to_security_ids() {
+    let csv_n50 = "\
+        Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+        Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n\
+        HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,8.2\n";
+
+    let csv_bank = "\
+        Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+        HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,25.0\n\
+        ICICI Bank,Financial Services,ICICIBANK,EQ,INE090A01021,20.0\n";
+
+    let parsed = vec![
+        (
+            "Nifty 50".to_string(),
+            csv_parser::parse_constituency_csv("Nifty 50", csv_n50, today()),
+        ),
+        (
+            "Nifty Bank".to_string(),
+            csv_parser::parse_constituency_csv("Nifty Bank", csv_bank, today()),
+        ),
+    ];
+    let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+    let universe = make_mapping_test_universe();
+
+    // HDFCBANK in both indices
+    let hdfcbank_indices = map.get_indices_for_stock("HDFCBANK").unwrap();
+    assert!(hdfcbank_indices.contains(&"Nifty 50".to_string()));
+    assert!(hdfcbank_indices.contains(&"Nifty Bank".to_string()));
+
+    // Both have valid security_ids
+    assert_eq!(universe.symbol_to_security_id("RELIANCE"), Some(2885));
+    assert_eq!(universe.symbol_to_security_id("HDFCBANK"), Some(1333));
+    // ICICIBANK not in F&O universe test data
+    assert_eq!(universe.symbol_to_security_id("ICICIBANK"), None);
+}
+
+#[test]
+fn test_news_based_flow_symbol_to_all_data() {
+    // Simulate: "RELIANCE in news" → find everything
+    let csv = "\
+        Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+        Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n";
+    let parsed = vec![(
+        "Nifty 50".to_string(),
+        csv_parser::parse_constituency_csv("Nifty 50", csv, today()),
+    )];
+    let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+    let universe = make_mapping_test_universe();
+
+    // Step 1: Symbol → security_id
+    let sec_id = universe.symbol_to_security_id("RELIANCE").unwrap();
+    assert_eq!(sec_id, 2885);
+
+    // Step 2: Symbol → underlying details
+    let underlying = universe.get_underlying("RELIANCE").unwrap();
+    assert_eq!(underlying.lot_size, 250);
+    assert_eq!(underlying.price_feed_segment, ExchangeSegment::NseEquity);
+
+    // Step 3: Symbol → all indices
+    let indices = map.get_indices_for_stock("RELIANCE").unwrap();
+    assert!(indices.contains(&"Nifty 50".to_string()));
+
+    // Step 4: Index → index security_id
+    let nifty_sid = universe.index_symbol_to_security_id("NIFTY").unwrap();
+    assert_eq!(nifty_sid, 13);
+}
+
+#[test]
+fn test_constituency_enrichment_all_fno_stocks_have_security_id() {
+    // Build constituency from known F&O stocks
+    let csv = "\
+        Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+        Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n\
+        HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,8.2\n";
+    let parsed = vec![(
+        "Nifty 50".to_string(),
+        csv_parser::parse_constituency_csv("Nifty 50", csv, today()),
+    )];
+    let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+    let universe = make_mapping_test_universe();
+
+    // Count how many constituency stocks have security_ids
+    let nifty50 = map.get_constituents("Nifty 50").unwrap();
+    let mapped_count = nifty50
+        .iter()
+        .filter(|c| universe.symbol_to_security_id(&c.symbol).is_some())
+        .count();
+    assert_eq!(mapped_count, 2, "RELIANCE + HDFCBANK should map");
+}
+
+#[test]
+fn test_constituency_non_fno_stocks_return_none() {
+    // TCS and INFOSYS not in our test universe
+    let csv = "\
+        Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+        TCS,IT,TCS,EQ,INE467B01029,5.1\n\
+        Infosys,IT,INFY,EQ,INE009A01021,4.8\n";
+    let parsed = vec![(
+        "Nifty IT".to_string(),
+        csv_parser::parse_constituency_csv("Nifty IT", csv, today()),
+    )];
+    let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+    let universe = make_mapping_test_universe();
+
+    let nifty_it = map.get_constituents("Nifty IT").unwrap();
+    for c in nifty_it {
+        assert!(
+            universe.symbol_to_security_id(&c.symbol).is_none(),
+            "{} should not be in test universe",
+            c.symbol
+        );
     }
 }

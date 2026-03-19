@@ -858,6 +858,57 @@ pub struct FnoUniverse {
     pub build_metadata: UniverseBuildMetadata,
 }
 
+impl FnoUniverse {
+    /// O(1) lookup: symbol → equity/index price feed security ID.
+    ///
+    /// For stocks: "RELIANCE" → 2885 (NSE_EQ ID).
+    /// For indices: "NIFTY" → 13 (IDX_I ID).
+    /// Returns `None` if the symbol is not an F&O underlying.
+    pub fn symbol_to_security_id(&self, symbol: &str) -> Option<SecurityId> {
+        self.underlyings
+            .get(symbol)
+            .map(|u| u.price_feed_security_id)
+    }
+
+    /// O(1) lookup: symbol → underlying details (lot size, segment, kind, etc.).
+    pub fn get_underlying(&self, symbol: &str) -> Option<&FnoUnderlying> {
+        self.underlyings.get(symbol)
+    }
+
+    /// O(n) lookup: symbol → all derivative contract security IDs for that underlying.
+    /// Returns futures + options contracts. Empty vec if symbol not found.
+    pub fn derivative_security_ids_for_symbol(&self, symbol: &str) -> Vec<SecurityId> {
+        self.derivative_contracts
+            .values()
+            .filter(|c| c.underlying_symbol == symbol)
+            .map(|c| c.security_id)
+            .collect()
+    }
+
+    /// O(1) lookup: security_id → symbol string.
+    /// Works for indices, equities, and derivatives (returns underlying_symbol for derivatives).
+    pub fn security_id_to_symbol(&self, security_id: SecurityId) -> Option<&str> {
+        self.instrument_info
+            .get(&security_id)
+            .map(|info| match info {
+                InstrumentInfo::Index { symbol, .. } => symbol.as_str(),
+                InstrumentInfo::Equity { symbol, .. } => symbol.as_str(),
+                InstrumentInfo::Derivative {
+                    underlying_symbol, ..
+                } => underlying_symbol.as_str(),
+            })
+    }
+
+    /// O(1) lookup: index symbol → index security ID from subscribed_indices.
+    /// "NIFTY" → 13, "BANKNIFTY" → 29.
+    pub fn index_symbol_to_security_id(&self, symbol: &str) -> Option<SecurityId> {
+        self.subscribed_indices
+            .iter()
+            .find(|idx| idx.symbol == symbol)
+            .map(|idx| idx.security_id)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1049,5 +1100,510 @@ mod tests {
         );
         assert_eq!(deserialized.csv_source, "primary");
         assert_eq!(deserialized.csv_row_count, 100);
+    }
+
+    // =====================================================================
+    // FnoUniverse method tests — exhaustive coverage
+    // =====================================================================
+
+    fn make_test_build_metadata() -> UniverseBuildMetadata {
+        use chrono::{FixedOffset, Utc};
+        let ist = FixedOffset::east_opt(19_800).unwrap();
+        UniverseBuildMetadata {
+            csv_source: "test".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::ZERO,
+            build_timestamp: Utc::now().with_timezone(&ist),
+        }
+    }
+
+    fn make_test_fno_universe() -> FnoUniverse {
+        use crate::types::{Exchange, ExchangeSegment, OptionType};
+
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 250,
+                contract_count: 3,
+            },
+        );
+        underlyings.insert(
+            "NIFTY".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 25,
+                contract_count: 2,
+            },
+        );
+        underlyings.insert(
+            "HDFCBANK".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "HDFCBANK".to_string(),
+                underlying_security_id: 27000,
+                price_feed_security_id: 1333,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 550,
+                contract_count: 1,
+            },
+        );
+
+        let mut derivative_contracts = HashMap::new();
+        derivative_contracts.insert(
+            49001,
+            DerivativeContract {
+                security_id: 49001,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-Mar2026-FUT".to_string(),
+                display_name: "RELIANCE Mar2026 Future".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            49002,
+            DerivativeContract {
+                security_id: 49002,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 3000.0,
+                option_type: Some(OptionType::Call),
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-Mar2026-3000-CE".to_string(),
+                display_name: "RELIANCE Mar2026 3000 CE".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            49003,
+            DerivativeContract {
+                security_id: 49003,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 3000.0,
+                option_type: Some(OptionType::Put),
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-Mar2026-3000-PE".to_string(),
+                display_name: "RELIANCE Mar2026 3000 PE".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            50001,
+            DerivativeContract {
+                security_id: 50001,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 25,
+                tick_size: 0.05,
+                symbol_name: "NIFTY-Mar2026-FUT".to_string(),
+                display_name: "NIFTY Mar2026 Future".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            50002,
+            DerivativeContract {
+                security_id: 50002,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 25000.0,
+                option_type: Some(OptionType::Call),
+                lot_size: 25,
+                tick_size: 0.05,
+                symbol_name: "NIFTY-Mar2026-25000-CE".to_string(),
+                display_name: "NIFTY Mar2026 25000 CE".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            51001,
+            DerivativeContract {
+                security_id: 51001,
+                underlying_symbol: "HDFCBANK".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 550,
+                tick_size: 0.05,
+                symbol_name: "HDFCBANK-Mar2026-FUT".to_string(),
+                display_name: "HDFCBANK Mar2026 Future".to_string(),
+            },
+        );
+
+        let mut instrument_info = HashMap::new();
+        instrument_info.insert(
+            13,
+            InstrumentInfo::Index {
+                security_id: 13,
+                symbol: "NIFTY".to_string(),
+                exchange: Exchange::NationalStockExchange,
+            },
+        );
+        instrument_info.insert(
+            2885,
+            InstrumentInfo::Equity {
+                security_id: 2885,
+                symbol: "RELIANCE".to_string(),
+            },
+        );
+        instrument_info.insert(
+            1333,
+            InstrumentInfo::Equity {
+                security_id: 1333,
+                symbol: "HDFCBANK".to_string(),
+            },
+        );
+        instrument_info.insert(
+            49001,
+            InstrumentInfo::Derivative {
+                security_id: 49001,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+            },
+        );
+        instrument_info.insert(
+            50002,
+            InstrumentInfo::Derivative {
+                security_id: 50002,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 25000.0,
+                option_type: Some(OptionType::Call),
+            },
+        );
+
+        let subscribed_indices = vec![
+            SubscribedIndex {
+                symbol: "NIFTY".to_string(),
+                security_id: 13,
+                exchange: Exchange::NationalStockExchange,
+                category: IndexCategory::FnoUnderlying,
+                subcategory: IndexSubcategory::Fno,
+            },
+            SubscribedIndex {
+                symbol: "BANKNIFTY".to_string(),
+                security_id: 29,
+                exchange: Exchange::NationalStockExchange,
+                category: IndexCategory::FnoUnderlying,
+                subcategory: IndexSubcategory::Fno,
+            },
+            SubscribedIndex {
+                symbol: "INDIA VIX".to_string(),
+                security_id: 25,
+                exchange: Exchange::NationalStockExchange,
+                category: IndexCategory::DisplayIndex,
+                subcategory: IndexSubcategory::Volatility,
+            },
+        ];
+
+        FnoUniverse {
+            underlyings,
+            derivative_contracts,
+            instrument_info,
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices,
+            build_metadata: make_test_build_metadata(),
+        }
+    }
+
+    // --- symbol_to_security_id ---
+
+    #[test]
+    fn test_symbol_to_security_id_stock() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.symbol_to_security_id("RELIANCE"), Some(2885));
+        assert_eq!(universe.symbol_to_security_id("HDFCBANK"), Some(1333));
+    }
+
+    #[test]
+    fn test_symbol_to_security_id_index() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.symbol_to_security_id("NIFTY"), Some(13));
+    }
+
+    #[test]
+    fn test_symbol_to_security_id_unknown_returns_none() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.symbol_to_security_id("NONEXISTENT"), None);
+        assert_eq!(universe.symbol_to_security_id(""), None);
+    }
+
+    #[test]
+    fn test_symbol_to_security_id_case_sensitive() {
+        let universe = make_test_fno_universe();
+        assert!(universe.symbol_to_security_id("Reliance").is_none());
+        assert!(universe.symbol_to_security_id("nifty").is_none());
+        assert!(universe.symbol_to_security_id("RELIANCE").is_some());
+    }
+
+    #[test]
+    fn test_symbol_to_security_id_empty_universe() {
+        let universe = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: make_test_build_metadata(),
+        };
+        assert_eq!(universe.symbol_to_security_id("RELIANCE"), None);
+    }
+
+    // --- security_id_to_symbol ---
+
+    #[test]
+    fn test_security_id_to_symbol_equity() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.security_id_to_symbol(2885), Some("RELIANCE"));
+        assert_eq!(universe.security_id_to_symbol(1333), Some("HDFCBANK"));
+    }
+
+    #[test]
+    fn test_security_id_to_symbol_index() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.security_id_to_symbol(13), Some("NIFTY"));
+    }
+
+    #[test]
+    fn test_security_id_to_symbol_derivative_returns_underlying() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.security_id_to_symbol(49001), Some("RELIANCE"));
+        assert_eq!(universe.security_id_to_symbol(50002), Some("NIFTY"));
+    }
+
+    #[test]
+    fn test_security_id_to_symbol_unknown_returns_none() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.security_id_to_symbol(99999), None);
+        assert_eq!(universe.security_id_to_symbol(0), None);
+    }
+
+    // --- Roundtrip: symbol → security_id → symbol ---
+
+    #[test]
+    fn test_symbol_security_id_roundtrip() {
+        let universe = make_test_fno_universe();
+        for symbol in &["RELIANCE", "HDFCBANK", "NIFTY"] {
+            let sec_id = universe
+                .symbol_to_security_id(symbol)
+                .unwrap_or_else(|| panic!("{symbol} should have security_id"));
+            let back = universe
+                .security_id_to_symbol(sec_id)
+                .unwrap_or_else(|| panic!("security_id {sec_id} should resolve"));
+            assert_eq!(*symbol, back, "roundtrip failed for {symbol}");
+        }
+    }
+
+    // --- get_underlying ---
+
+    #[test]
+    fn test_get_underlying_returns_full_details() {
+        let universe = make_test_fno_universe();
+        let u = universe.get_underlying("RELIANCE").unwrap();
+        assert_eq!(u.underlying_symbol, "RELIANCE");
+        assert_eq!(u.price_feed_security_id, 2885);
+        assert_eq!(u.lot_size, 250);
+        assert_eq!(u.kind, UnderlyingKind::Stock);
+        assert_eq!(u.contract_count, 3);
+    }
+
+    #[test]
+    fn test_get_underlying_none_for_unknown() {
+        let universe = make_test_fno_universe();
+        assert!(universe.get_underlying("TCS").is_none());
+    }
+
+    // --- derivative_security_ids_for_symbol ---
+
+    #[test]
+    fn test_derivative_ids_for_stock() {
+        let universe = make_test_fno_universe();
+        let mut ids = universe.derivative_security_ids_for_symbol("RELIANCE");
+        ids.sort();
+        assert_eq!(ids, vec![49001, 49002, 49003]);
+    }
+
+    #[test]
+    fn test_derivative_ids_for_index() {
+        let universe = make_test_fno_universe();
+        let mut ids = universe.derivative_security_ids_for_symbol("NIFTY");
+        ids.sort();
+        assert_eq!(ids, vec![50001, 50002]);
+    }
+
+    #[test]
+    fn test_derivative_ids_unknown_symbol_empty() {
+        let universe = make_test_fno_universe();
+        assert!(
+            universe
+                .derivative_security_ids_for_symbol("NONEXISTENT")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_derivative_ids_no_cross_contamination() {
+        let universe = make_test_fno_universe();
+        let reliance_ids = universe.derivative_security_ids_for_symbol("RELIANCE");
+        assert!(!reliance_ids.contains(&50001)); // NIFTY future
+        assert!(!reliance_ids.contains(&51001)); // HDFCBANK future
+    }
+
+    // --- index_symbol_to_security_id ---
+
+    #[test]
+    fn test_index_symbol_to_security_id_known() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.index_symbol_to_security_id("NIFTY"), Some(13));
+        assert_eq!(universe.index_symbol_to_security_id("BANKNIFTY"), Some(29));
+        assert_eq!(universe.index_symbol_to_security_id("INDIA VIX"), Some(25));
+    }
+
+    #[test]
+    fn test_index_symbol_to_security_id_unknown() {
+        let universe = make_test_fno_universe();
+        assert_eq!(universe.index_symbol_to_security_id("NONEXISTENT"), None);
+    }
+
+    // --- Idempotency: repeated calls give same results ---
+
+    #[test]
+    fn test_idempotent_lookups_100_iterations() {
+        let universe = make_test_fno_universe();
+        for _ in 0..100 {
+            assert_eq!(universe.symbol_to_security_id("RELIANCE"), Some(2885));
+            assert_eq!(universe.security_id_to_symbol(2885), Some("RELIANCE"));
+            assert_eq!(universe.index_symbol_to_security_id("NIFTY"), Some(13));
+        }
+    }
+
+    // --- Cross-day security_id reuse scenario ---
+
+    #[test]
+    fn test_cross_day_security_id_reuse() {
+        // Day 1: 49001 = RELIANCE FUT
+        let day1 = make_test_fno_universe();
+        assert_eq!(day1.security_id_to_symbol(49001), Some("RELIANCE"));
+
+        // Day 2: 49001 reused for HDFCBANK FUT (post-expiry reassignment)
+        let mut day2 = make_test_fno_universe();
+        day2.instrument_info.insert(
+            49001,
+            InstrumentInfo::Derivative {
+                security_id: 49001,
+                underlying_symbol: "HDFCBANK".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+            },
+        );
+        // Same security_id, different symbol on different day
+        assert_eq!(day1.security_id_to_symbol(49001), Some("RELIANCE"));
+        assert_eq!(day2.security_id_to_symbol(49001), Some("HDFCBANK"));
+    }
+
+    // --- Structural invariants ---
+
+    #[test]
+    fn test_all_underlyings_have_nonzero_price_feed_id() {
+        let universe = make_test_fno_universe();
+        for (symbol, u) in &universe.underlyings {
+            assert!(
+                u.price_feed_security_id > 0,
+                "{symbol} has zero price_feed_security_id"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_derivatives_reference_valid_underlying() {
+        let universe = make_test_fno_universe();
+        for (sec_id, contract) in &universe.derivative_contracts {
+            assert!(
+                universe
+                    .underlyings
+                    .contains_key(&contract.underlying_symbol),
+                "derivative {sec_id} references unknown underlying: {}",
+                contract.underlying_symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_instrument_info_no_duplicate_security_ids() {
+        let universe = make_test_fno_universe();
+        let count = universe.instrument_info.len();
+        let unique: std::collections::HashSet<_> = universe.instrument_info.keys().collect();
+        assert_eq!(count, unique.len());
+    }
+
+    // --- Duplicate insertion into HashMap: last wins ---
+
+    #[test]
+    fn test_duplicate_security_id_in_instrument_info_last_wins() {
+        let mut info = HashMap::new();
+        info.insert(
+            2885_u32,
+            InstrumentInfo::Equity {
+                security_id: 2885,
+                symbol: "RELIANCE".to_string(),
+            },
+        );
+        info.insert(
+            2885_u32,
+            InstrumentInfo::Equity {
+                security_id: 2885,
+                symbol: "CHANGED".to_string(),
+            },
+        );
+        assert_eq!(info.len(), 1);
+        if let InstrumentInfo::Equity { symbol, .. } = &info[&2885] {
+            assert_eq!(symbol, "CHANGED");
+        }
     }
 }
