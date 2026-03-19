@@ -107,3 +107,4 @@ data/instrument-cache/
 *.tmp
 *.bak
 mutants.out/
+mutants.out.old/
