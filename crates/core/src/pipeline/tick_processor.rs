@@ -478,6 +478,19 @@ pub async fn run_tick_processor(
                     continue;
                 }
 
+                // Only persist previous close during market hours [09:00, 15:30) IST.
+                // PrevClose packets arrive on every subscription, even pre-market.
+                // APPROVED: i64→u32 truncation safe: secs-of-day fits u32
+                #[allow(clippy::cast_possible_truncation)]
+                let prev_close_ist_secs = ((received_at_nanos / 1_000_000_000
+                    + i64::from(IST_UTC_OFFSET_SECONDS))
+                    % i64::from(SECONDS_PER_DAY)) as u32;
+                if !((TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                    .contains(&prev_close_ist_secs))
+                {
+                    continue;
+                }
+
                 // Persist previous close to QuestDB
                 if let Some(ref mut writer) = tick_writer
                     && let Err(err) = build_previous_close_row(
