@@ -883,3 +883,232 @@ mod real_fetch {
         assert!(url.ends_with(".csv"), "URL must end with .csv, got: {url}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Constituency ↔ Instrument mapping tests
+// ---------------------------------------------------------------------------
+
+mod instrument_mapping {
+    use super::*;
+    use dhan_live_trader_common::instrument_types::{
+        FnoUnderlying, FnoUniverse, UnderlyingKind, UniverseBuildMetadata,
+    };
+    use dhan_live_trader_common::types::ExchangeSegment;
+    use std::collections::HashMap;
+
+    fn empty_build_metadata() -> UniverseBuildMetadata {
+        use chrono::{FixedOffset, Utc};
+        let ist = FixedOffset::east_opt(19_800).expect("valid");
+        UniverseBuildMetadata {
+            csv_source: String::new(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::ZERO,
+            build_timestamp: Utc::now().with_timezone(&ist),
+        }
+    }
+
+    /// Build a minimal FnoUniverse with known underlyings for testing.
+    fn make_test_universe() -> FnoUniverse {
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 250,
+                contract_count: 0,
+            },
+        );
+        underlyings.insert(
+            "HDFCBANK".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "HDFCBANK".to_string(),
+                underlying_security_id: 27000,
+                price_feed_security_id: 1333,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 550,
+                contract_count: 0,
+            },
+        );
+        underlyings.insert(
+            "NIFTY".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 25,
+                contract_count: 0,
+            },
+        );
+
+        FnoUniverse {
+            underlyings,
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: empty_build_metadata(),
+        }
+    }
+
+    #[test]
+    fn symbol_to_security_id_known_stocks() {
+        let universe = make_test_universe();
+
+        assert_eq!(
+            universe.symbol_to_security_id("RELIANCE"),
+            Some(2885),
+            "RELIANCE → 2885"
+        );
+        assert_eq!(
+            universe.symbol_to_security_id("HDFCBANK"),
+            Some(1333),
+            "HDFCBANK → 1333"
+        );
+        assert_eq!(
+            universe.symbol_to_security_id("NIFTY"),
+            Some(13),
+            "NIFTY → 13"
+        );
+    }
+
+    #[test]
+    fn symbol_to_security_id_unknown_returns_none() {
+        let universe = make_test_universe();
+        assert_eq!(universe.symbol_to_security_id("UNKNOWN_STOCK_XYZ"), None);
+    }
+
+    #[test]
+    fn constituency_to_security_id_roundtrip() {
+        // Build a constituency map with known symbols
+        let csv = "\
+            Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+            Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n\
+            HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,8.2\n\
+            TCS,IT,TCS,EQ,INE467B01029,5.1\n";
+
+        let constituents = csv_parser::parse_constituency_csv("Nifty 50", csv, today());
+        assert_eq!(constituents.len(), 3);
+
+        let parsed = vec![("Nifty 50".to_string(), constituents)];
+        let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+
+        // Now bridge to instrument universe
+        let universe = make_test_universe();
+
+        // Verify each constituent can be mapped to a security_id
+        let nifty50 = map
+            .get_constituents("Nifty 50")
+            .expect("Nifty 50 must exist");
+        for constituent in nifty50 {
+            let sec_id = universe.symbol_to_security_id(&constituent.symbol);
+            match constituent.symbol.as_str() {
+                "RELIANCE" => assert_eq!(sec_id, Some(2885)),
+                "HDFCBANK" => assert_eq!(sec_id, Some(1333)),
+                "TCS" => assert_eq!(sec_id, None, "TCS not in test universe"),
+                _ => panic!("unexpected symbol: {}", constituent.symbol),
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_lookup_indices_for_stock() {
+        let csv_nifty50 = "\
+            Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+            Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n\
+            HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,8.2\n";
+
+        let csv_bank = "\
+            Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+            HDFC Bank,Financial Services,HDFCBANK,EQ,INE040A01034,25.0\n\
+            ICICI Bank,Financial Services,ICICIBANK,EQ,INE090A01021,20.0\n";
+
+        let parsed = vec![
+            (
+                "Nifty 50".to_string(),
+                csv_parser::parse_constituency_csv("Nifty 50", csv_nifty50, today()),
+            ),
+            (
+                "Nifty Bank".to_string(),
+                csv_parser::parse_constituency_csv("Nifty Bank", csv_bank, today()),
+            ),
+        ];
+
+        let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+
+        // HDFCBANK is in both indices
+        let hdfcbank_indices = map.get_indices_for_stock("HDFCBANK").expect("HDFCBANK");
+        assert!(hdfcbank_indices.contains(&"Nifty 50".to_string()));
+        assert!(hdfcbank_indices.contains(&"Nifty Bank".to_string()));
+
+        // RELIANCE is only in Nifty 50
+        let reliance_indices = map.get_indices_for_stock("RELIANCE").expect("RELIANCE");
+        assert_eq!(reliance_indices.len(), 1);
+        assert!(reliance_indices.contains(&"Nifty 50".to_string()));
+
+        // Bridge to security_ids
+        let universe = make_test_universe();
+        for symbol in &["RELIANCE", "HDFCBANK"] {
+            let sec_id = universe.symbol_to_security_id(symbol);
+            assert!(sec_id.is_some(), "{symbol} must have a security_id");
+        }
+    }
+
+    #[test]
+    fn news_based_trading_flow_symbol_to_all_data() {
+        // Simulate: "RELIANCE in news" → find all relevant data
+        let csv = "\
+            Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+            Reliance Industries,Oil Gas,RELIANCE,EQ,INE002A01018,10.5\n";
+
+        let parsed = vec![(
+            "Nifty 50".to_string(),
+            csv_parser::parse_constituency_csv("Nifty 50", csv, today()),
+        )];
+
+        let map = mapper::build_constituency_map(parsed, ConstituencyBuildMetadata::default());
+        let universe = make_test_universe();
+
+        // Step 1: Symbol → security_id
+        let sec_id = universe
+            .symbol_to_security_id("RELIANCE")
+            .expect("RELIANCE security_id");
+        assert_eq!(sec_id, 2885);
+
+        // Step 2: Symbol → underlying details
+        let underlying = universe
+            .get_underlying("RELIANCE")
+            .expect("RELIANCE underlying");
+        assert_eq!(underlying.lot_size, 250);
+        assert_eq!(underlying.price_feed_segment, ExchangeSegment::NseEquity);
+
+        // Step 3: Symbol → all indices
+        let indices = map
+            .get_indices_for_stock("RELIANCE")
+            .expect("RELIANCE indices");
+        assert!(indices.contains(&"Nifty 50".to_string()));
+
+        // Step 4: Symbol → derivative contracts (empty in test, but API works)
+        let derivatives = universe.derivative_security_ids_for_symbol("RELIANCE");
+        assert!(
+            derivatives.is_empty(),
+            "test universe has no contracts loaded"
+        );
+    }
+}

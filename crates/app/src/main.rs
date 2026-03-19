@@ -535,10 +535,12 @@ async fn main() -> Result<()> {
             .await;
 
         // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+        // Enrich with security_ids from instrument master for news-based trading.
         if let Some(ref map) = bg_constituency {
             let _ = dhan_live_trader_storage::constituency_persistence::persist_constituency(
                 map,
                 &config.questdb,
+                fresh_universe.as_ref(),
             );
         }
 
@@ -930,10 +932,12 @@ async fn main() -> Result<()> {
         .await;
 
     // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+    // Enrich with security_ids from instrument master for news-based trading.
     if let Some(ref map) = constituency_map {
         let _ = dhan_live_trader_storage::constituency_persistence::persist_constituency(
             map,
             &config.questdb,
+            slow_boot_universe.as_ref(),
         );
     }
 

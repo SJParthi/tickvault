@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::QUESTDB_TABLE_INDEX_CONSTITUENTS;
-use dhan_live_trader_common::instrument_types::IndexConstituencyMap;
+use dhan_live_trader_common::instrument_types::{FnoUniverse, IndexConstituencyMap};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,6 +35,7 @@ const INDEX_CONSTITUENTS_CREATE_DDL: &str = "\
         isin STRING,\
         weight DOUBLE,\
         sector STRING,\
+        security_id LONG,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY MONTH WAL\
 ";
@@ -134,13 +135,18 @@ pub async fn ensure_constituency_table(questdb_config: &QuestDbConfig) {
 // ---------------------------------------------------------------------------
 
 /// Persists constituency data to QuestDB with retry logic. Best-effort.
+///
+/// When `fno_universe` is provided, each constituent is enriched with the
+/// Dhan `security_id` from the instrument master (symbol → security_id mapping).
+/// This enables news-based trading: symbol → security_id → F&O contracts.
 pub fn persist_constituency(
     constituency_map: &IndexConstituencyMap,
     questdb_config: &QuestDbConfig,
+    fno_universe: Option<&FnoUniverse>,
 ) -> Result<()> {
     let mut last_err = None;
     for attempt in 1..=CONSTITUENCY_PERSIST_MAX_RETRIES {
-        match persist_constituency_inner(constituency_map, questdb_config) {
+        match persist_constituency_inner(constituency_map, questdb_config, fno_universe) {
             Ok(count) => {
                 info!(
                     entries = count,
@@ -176,6 +182,7 @@ pub fn persist_constituency(
 fn persist_constituency_inner(
     constituency_map: &IndexConstituencyMap,
     questdb_config: &QuestDbConfig,
+    fno_universe: Option<&FnoUniverse>,
 ) -> Result<usize> {
     let conf_string = format!(
         "tcp::addr={}:{};",
@@ -197,6 +204,11 @@ fn persist_constituency_inner(
 
     for (index_name, constituents) in &constituency_map.index_to_constituents {
         for constituent in constituents {
+            // Enrich with security_id from instrument master (0 if not found).
+            let security_id = fno_universe
+                .and_then(|u| u.symbol_to_security_id(&constituent.symbol))
+                .unwrap_or(0);
+
             buffer
                 .table(QUESTDB_TABLE_INDEX_CONSTITUENTS)
                 .context("table name")?
@@ -210,6 +222,8 @@ fn persist_constituency_inner(
                 .context("weight")?
                 .column_str("sector", &constituent.sector)
                 .context("sector")?
+                .column_i64("security_id", i64::from(security_id))
+                .context("security_id")?
                 .at(snapshot_ts)
                 .context("designated timestamp")?;
 
@@ -260,7 +274,7 @@ mod tests {
             http_port: 19000,
             pg_port: 18812,
         };
-        let result = persist_constituency(&map, &config);
+        let result = persist_constituency(&map, &config, None);
         assert!(
             result.is_ok(),
             "persist_constituency must be best-effort (Ok on failure)"

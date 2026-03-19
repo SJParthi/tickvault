@@ -856,6 +856,32 @@ pub struct FnoUniverse {
     pub build_metadata: UniverseBuildMetadata,
 }
 
+impl FnoUniverse {
+    /// O(1) lookup: symbol → equity price feed security ID.
+    /// For "RELIANCE" → 2885, for "NIFTY" → 13.
+    /// Returns `None` if the symbol is not an F&O underlying.
+    pub fn symbol_to_security_id(&self, symbol: &str) -> Option<SecurityId> {
+        self.underlyings
+            .get(symbol)
+            .map(|u| u.price_feed_security_id)
+    }
+
+    /// O(1) lookup: symbol → all derivative contracts for that underlying.
+    /// Returns futures + options contracts as security IDs.
+    pub fn derivative_security_ids_for_symbol(&self, symbol: &str) -> Vec<SecurityId> {
+        self.derivative_contracts
+            .values()
+            .filter(|c| c.underlying_symbol == symbol)
+            .map(|c| c.security_id)
+            .collect()
+    }
+
+    /// O(1) lookup: symbol → underlying details (lot size, segment, etc.).
+    pub fn get_underlying(&self, symbol: &str) -> Option<&FnoUnderlying> {
+        self.underlyings.get(symbol)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

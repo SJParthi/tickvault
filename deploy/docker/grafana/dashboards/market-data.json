@@ -817,7 +817,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  index_name,\n  symbol,\n  isin,\n  weight,\n  sector\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nORDER BY index_name, weight DESC;",
+          "rawSql": "SELECT\n  index_name,\n  symbol,\n  isin,\n  weight,\n  sector,\n  security_id\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nORDER BY index_name, weight DESC;",
           "refId": "A"
         }
       ]
