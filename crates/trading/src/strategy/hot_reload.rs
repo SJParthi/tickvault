@@ -326,6 +326,9 @@ threshold = 25.0
 [[strategy]]
 name = "strategy_a"
 security_ids = [100]
+position_size_fraction = 0.1
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
 
 [[strategy.entry_long]]
 field = "rsi"
@@ -335,6 +338,9 @@ threshold = 30.0
 [[strategy]]
 name = "strategy_b"
 security_ids = [200, 300]
+position_size_fraction = 0.2
+stop_loss_atr_multiplier = 1.5
+target_atr_multiplier = 2.5
 
 [[strategy.entry_short]]
 field = "macd_histogram"
