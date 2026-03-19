@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 use dhan_live_trader_common::constants::{WEBSOCKET_AUTH_TYPE, WEBSOCKET_PROTOCOL_VERSION};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use dhan_live_trader_common::config::{DhanConfig, WebSocketConfig};
 use dhan_live_trader_common::types::FeedMode;
@@ -153,6 +153,7 @@ impl WebSocketConnection {
     ///
     /// On disconnect, attempts reconnection with exponential backoff.
     /// Returns only on non-reconnectable errors or exhausted retries.
+    #[instrument(skip_all, fields(conn_id = self.connection_id))]
     pub async fn run(&self) -> Result<(), WebSocketError> {
         // O(1) EXEMPT: begin — metric handles grabbed once before loop, not per-message
         let m_conn_active = metrics::gauge!("dlt_websocket_connections_active", "connection_id" => self.connection_id.to_string());

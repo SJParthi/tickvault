@@ -204,6 +204,49 @@ pub enum NotificationEvent {
         step: String,
     },
 
+    /// Order rejected by Dhan API or OMS validation.
+    OrderRejected {
+        /// Correlation ID of the rejected order.
+        correlation_id: String,
+        /// Reason for rejection.
+        reason: String,
+    },
+
+    /// OMS circuit breaker opened — order API calls halted.
+    CircuitBreakerOpened {
+        /// Number of consecutive failures that triggered the open.
+        consecutive_failures: u64,
+    },
+
+    /// OMS circuit breaker closed — order API calls resumed.
+    CircuitBreakerClosed,
+
+    /// OMS rate limit exhausted — order rejected due to SEBI limits.
+    RateLimitExhausted {
+        /// Which limit was hit (e.g., "per_second", "daily").
+        limit_type: String,
+    },
+
+    /// Risk engine halted trading — daily loss breach or position limit.
+    RiskHalt {
+        /// Reason for the halt (e.g., "daily_loss_breach", "position_limit").
+        reason: String,
+    },
+
+    /// WebSocket reconnection exhausted — all retry attempts failed.
+    WebSocketReconnectionExhausted {
+        /// Connection index that failed.
+        connection_index: usize,
+        /// Total reconnection attempts made.
+        attempts: u64,
+    },
+
+    /// Token renewal deadline missed — renewal failed past safe window.
+    TokenRenewalDeadlineMissed {
+        /// IST hour when the deadline was crossed.
+        deadline_hour_ist: u32,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -448,6 +491,41 @@ impl NotificationEvent {
             }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
+            Self::OrderRejected {
+                correlation_id,
+                reason,
+            } => {
+                format!("<b>Order REJECTED</b>\nCorrelation: {correlation_id}\n{reason}")
+            }
+            Self::CircuitBreakerOpened {
+                consecutive_failures,
+            } => {
+                format!(
+                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted"
+                )
+            }
+            Self::CircuitBreakerClosed => {
+                "<b>Circuit breaker CLOSED</b>\nOrder API calls resumed".to_string()
+            }
+            Self::RateLimitExhausted { limit_type } => {
+                format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
+            }
+            Self::RiskHalt { reason } => {
+                format!("<b>RISK HALT</b>\nTrading stopped: {reason}")
+            }
+            Self::WebSocketReconnectionExhausted {
+                connection_index,
+                attempts,
+            } => {
+                format!(
+                    "<b>WebSocket #{connection_index} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data"
+                )
+            }
+            Self::TokenRenewalDeadlineMissed { deadline_hour_ist } => {
+                format!(
+                    "<b>TOKEN RENEWAL DEADLINE MISSED</b>\nPast {deadline_hour_ist}:00 IST — token not renewed"
+                )
+            }
             Self::Custom { message } => message.clone(),
         }
     }
@@ -472,8 +550,15 @@ impl NotificationEvent {
             Self::CandleVerificationPassed { .. } => Severity::Low,
             Self::CandleCrossMatchPassed { .. } => Severity::Low,
             Self::Custom { .. } => Severity::High,
+            Self::RiskHalt { .. } => Severity::Critical,
+            Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
+            Self::TokenRenewalDeadlineMissed { .. } => Severity::Critical,
+            Self::CircuitBreakerOpened { .. } => Severity::High,
+            Self::OrderRejected { .. } => Severity::High,
+            Self::RateLimitExhausted { .. } => Severity::High,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::ShutdownInitiated => Severity::Medium,
+            Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
@@ -1118,5 +1203,104 @@ mod tests {
         assert!(Severity::High > Severity::Medium);
         assert!(Severity::Medium > Severity::Low);
         assert!(Severity::Low > Severity::Info);
+    }
+
+    // -- OMS notification event tests --
+
+    #[test]
+    fn test_order_rejected_message() {
+        let event = NotificationEvent::OrderRejected {
+            correlation_id: "ORD-12345".to_string(),
+            reason: "DH-906: Invalid order quantity".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Order REJECTED"));
+        assert!(msg.contains("ORD-12345"));
+        assert!(msg.contains("DH-906"));
+    }
+
+    #[test]
+    fn test_oms_event_severity() {
+        let rejected = NotificationEvent::OrderRejected {
+            correlation_id: "X".to_string(),
+            reason: "bad".to_string(),
+        };
+        assert_eq!(rejected.severity(), Severity::High);
+
+        let cb_open = NotificationEvent::CircuitBreakerOpened {
+            consecutive_failures: 5,
+        };
+        assert_eq!(cb_open.severity(), Severity::High);
+
+        let cb_close = NotificationEvent::CircuitBreakerClosed;
+        assert_eq!(cb_close.severity(), Severity::Medium);
+
+        let rate_limit = NotificationEvent::RateLimitExhausted {
+            limit_type: "per_second".to_string(),
+        };
+        assert_eq!(rate_limit.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_oms_event_formatting() {
+        let cb = NotificationEvent::CircuitBreakerOpened {
+            consecutive_failures: 3,
+        };
+        let msg = cb.to_message();
+        assert!(msg.contains("Circuit breaker OPENED"));
+        assert!(msg.contains("3"));
+
+        let rl = NotificationEvent::RateLimitExhausted {
+            limit_type: "daily".to_string(),
+        };
+        let msg = rl.to_message();
+        assert!(msg.contains("Rate limit EXHAUSTED"));
+        assert!(msg.contains("daily"));
+    }
+
+    #[test]
+    fn test_circuit_breaker_notify_on_open() {
+        let event = NotificationEvent::CircuitBreakerOpened {
+            consecutive_failures: 5,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("OPENED"));
+        assert!(msg.contains("halted"));
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_risk_halt_notification() {
+        let event = NotificationEvent::RiskHalt {
+            reason: "daily_loss_breach: -25000.00 exceeds threshold".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("RISK HALT"));
+        assert!(msg.contains("daily_loss_breach"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_ws_reconnection_exhausted_notification() {
+        let event = NotificationEvent::WebSocketReconnectionExhausted {
+            connection_index: 2,
+            attempts: 10,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("RECONNECTION EXHAUSTED"));
+        assert!(msg.contains("#2"));
+        assert!(msg.contains("10"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_token_renewal_deadline_missed_notification() {
+        let event = NotificationEvent::TokenRenewalDeadlineMissed {
+            deadline_hour_ist: 14,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("DEADLINE MISSED"));
+        assert!(msg.contains("14:00 IST"));
+        assert_eq!(event.severity(), Severity::Critical);
     }
 }

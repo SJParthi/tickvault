@@ -1,42 +1,221 @@
-//! Health check endpoint.
+//! Health check endpoint with subsystem status.
 
 use axum::Json;
+use axum::extract::State;
 use serde::Serialize;
 
-/// Health check response.
+use crate::state::SharedAppState;
+
+/// Health check response with subsystem status.
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
+    pub subsystems: SubsystemStatus,
 }
 
-/// GET /health — returns 200 OK with status.
-pub async fn health_check() -> Json<HealthResponse> {
+/// Per-subsystem health status.
+#[derive(Serialize)]
+pub struct SubsystemStatus {
+    pub websocket: SubsystemInfo,
+    pub questdb: SubsystemInfo,
+    pub token: SubsystemInfo,
+    pub pipeline: SubsystemInfo,
+}
+
+/// Individual subsystem status info.
+#[derive(Serialize)]
+pub struct SubsystemInfo {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// GET /health — returns 200 OK with subsystem status.
+pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthResponse> {
+    let health = state.health_status();
+
+    let ws_count = health.websocket_connections();
+    let websocket = SubsystemInfo {
+        status: if ws_count > 0 {
+            "connected"
+        } else {
+            "disconnected"
+        },
+        detail: Some(format!("{ws_count} connections")),
+    };
+
+    let questdb = SubsystemInfo {
+        status: if health.questdb_reachable() {
+            "reachable"
+        } else {
+            "unreachable"
+        },
+        detail: None,
+    };
+
+    let token = SubsystemInfo {
+        status: if health.token_valid() {
+            "valid"
+        } else {
+            "invalid"
+        },
+        detail: None,
+    };
+
+    let pipeline = SubsystemInfo {
+        status: if health.pipeline_active() {
+            "active"
+        } else {
+            "inactive"
+        },
+        detail: None,
+    };
+
+    let overall = health.overall_status();
+
     Json(HealthResponse {
-        status: "ok",
+        status: overall,
         version: env!("CARGO_PKG_VERSION"),
+        subsystems: SubsystemStatus {
+            websocket,
+            questdb,
+            token,
+            pipeline,
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{SharedHealthStatus, SystemHealthStatus};
+    use std::sync::Arc;
+
+    use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+
+    fn make_test_state(health: SharedHealthStatus) -> SharedAppState {
+        SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp".to_string(),
+                csv_cache_filename: "test.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::new(std::sync::RwLock::new(None)),
+            health,
+        )
+    }
 
     #[tokio::test]
-    async fn test_health_check_returns_ok() {
-        let Json(response) = health_check().await;
-        assert_eq!(response.status, "ok");
+    async fn test_health_check_returns_subsystem_status() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_websocket_connections(3);
+        health.set_questdb_reachable(true);
+        health.set_token_valid(true);
+        health.set_pipeline_active(true);
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.status, "healthy");
         assert!(!response.version.is_empty());
+        assert_eq!(response.subsystems.websocket.status, "connected");
+        assert_eq!(response.subsystems.questdb.status, "reachable");
+        assert_eq!(response.subsystems.token.status, "valid");
+        assert_eq!(response.subsystems.pipeline.status, "active");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_degraded_when_ws_disconnected() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_questdb_reachable(true);
+        health.set_token_valid(true);
+        // websocket stays at 0
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.status, "degraded");
+        assert_eq!(response.subsystems.websocket.status, "disconnected");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_healthy() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_websocket_connections(5);
+        health.set_questdb_reachable(true);
+        health.set_token_valid(true);
+        health.set_pipeline_active(true);
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_degraded() {
+        let health = Arc::new(SystemHealthStatus::new());
+        // All subsystems down (default)
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.status, "degraded");
+        assert_eq!(response.subsystems.websocket.status, "disconnected");
+        assert_eq!(response.subsystems.questdb.status, "unreachable");
+        assert_eq!(response.subsystems.token.status, "invalid");
+        assert_eq!(response.subsystems.pipeline.status, "inactive");
     }
 
     #[test]
     fn test_health_response_serialization() {
         let resp = HealthResponse {
-            status: "ok",
+            status: "healthy",
             version: "0.1.0",
+            subsystems: SubsystemStatus {
+                websocket: SubsystemInfo {
+                    status: "connected",
+                    detail: Some("3 connections".to_string()),
+                },
+                questdb: SubsystemInfo {
+                    status: "reachable",
+                    detail: None,
+                },
+                token: SubsystemInfo {
+                    status: "valid",
+                    detail: None,
+                },
+                pipeline: SubsystemInfo {
+                    status: "active",
+                    detail: None,
+                },
+            },
         };
         let json = serde_json::to_string(&resp).expect("serialization should succeed");
-        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"status\":\"healthy\""));
         assert!(json.contains("\"version\":\"0.1.0\""));
+        assert!(json.contains("\"websocket\""));
+        assert!(json.contains("\"questdb\""));
     }
 }

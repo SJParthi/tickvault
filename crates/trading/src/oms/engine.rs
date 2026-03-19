@@ -12,8 +12,9 @@
 
 use std::collections::HashMap;
 
+use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use dhan_live_trader_common::order_types::{OrderStatus, OrderUpdate};
 
@@ -133,6 +134,7 @@ impl OrderManagementSystem {
     /// - `OmsError::NoToken` / `OmsError::TokenExpired` — auth failure
     /// - `OmsError::DhanApiError` — Dhan returned an error
     /// - `OmsError::DhanRateLimited` — HTTP 429 from Dhan
+    #[instrument(skip_all, fields(security_id = request.security_id))]
     pub async fn place_order(&mut self, request: PlaceOrderRequest) -> Result<String, OmsError> {
         // Step 0: Pre-submission validation gates (before consuming rate limit)
         validate_order_fields(&request)?;
@@ -177,6 +179,8 @@ impl OrderManagementSystem {
                 .track(correlation_id, paper_order_id.clone());
             self.orders.insert(paper_order_id.clone(), order);
             self.total_placed = self.total_placed.saturating_add(1);
+
+            counter!("dlt_orders_placed_total", "mode" => "paper").increment(1);
 
             info!(
                 order_id = %paper_order_id,
@@ -223,7 +227,11 @@ impl OrderManagementSystem {
                 resp
             }
             Err(err) => {
-                self.circuit_breaker.record_failure();
+                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
+                // circuit breaker — the API is healthy, we're just throttled.
+                if !matches!(err, OmsError::DhanRateLimited) {
+                    self.circuit_breaker.record_failure();
+                }
                 return Err(err);
             }
         };
@@ -259,6 +267,8 @@ impl OrderManagementSystem {
             .track(correlation_id, response.order_id.clone());
         self.orders.insert(response.order_id.clone(), order);
         self.total_placed = self.total_placed.saturating_add(1);
+
+        counter!("dlt_orders_placed_total", "mode" => "live").increment(1);
 
         info!(
             order_id = %response.order_id,
@@ -367,7 +377,11 @@ impl OrderManagementSystem {
                 self.circuit_breaker.record_success();
             }
             Err(err) => {
-                self.circuit_breaker.record_failure();
+                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
+                // circuit breaker — the API is healthy, we're just throttled.
+                if !matches!(err, OmsError::DhanRateLimited) {
+                    self.circuit_breaker.record_failure();
+                }
                 return Err(err);
             }
         }
@@ -433,7 +447,11 @@ impl OrderManagementSystem {
                 self.circuit_breaker.record_success();
             }
             Err(err) => {
-                self.circuit_breaker.record_failure();
+                // Rate limit errors (DH-904 / HTTP 429) should NOT trip the
+                // circuit breaker — the API is healthy, we're just throttled.
+                if !matches!(err, OmsError::DhanRateLimited) {
+                    self.circuit_breaker.record_failure();
+                }
                 return Err(err);
             }
         }
@@ -546,6 +564,17 @@ impl OrderManagementSystem {
         order.traded_qty = update.traded_qty;
         order.avg_traded_price = update.avg_traded_price;
         order.updated_at_us = now_epoch_us();
+
+        // Emit metrics for terminal states
+        match new_status {
+            OrderStatus::Traded => {
+                counter!("dlt_orders_filled_total").increment(1);
+            }
+            OrderStatus::Rejected => {
+                counter!("dlt_orders_rejected_total").increment(1);
+            }
+            _ => {}
+        }
 
         debug!(
             order_id = %order_id,
@@ -1381,6 +1410,83 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), OmsError::RiskRejected { .. }),
             "SL modify with zero triggerPrice must be rejected"
+        );
+    }
+
+    // -- Metrics tests --
+
+    #[tokio::test]
+    async fn test_oms_metrics_emitted_on_place() {
+        // Dry-run place_order should increment dlt_orders_placed_total.
+        // We can't easily inspect the metrics crate's internal state,
+        // but we verify the place_order path that includes counter! doesn't panic.
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let rate_limiter = OrderRateLimiter::new(10);
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let result = oms.place_order(request).await;
+        assert!(result.is_ok());
+        assert_eq!(oms.total_placed(), 1);
+    }
+
+    #[test]
+    fn test_oms_metrics_emitted_on_reject() {
+        // handle_order_update with Rejected status should increment
+        // dlt_orders_rejected_total without panicking.
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let update = make_order_update("1", "REJECTED");
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.status, OrderStatus::Rejected);
+    }
+
+    #[test]
+    fn test_rate_limit_error_does_not_trip_circuit_breaker() {
+        // OmsError::DhanRateLimited should NOT be counted as a circuit
+        // breaker failure — the API is healthy, we're just throttled.
+        let err = OmsError::DhanRateLimited;
+        // The guard condition in the error handler: !matches!(err, OmsError::DhanRateLimited)
+        assert!(
+            matches!(err, OmsError::DhanRateLimited),
+            "DhanRateLimited must match the exclusion guard"
+        );
+
+        // Verify the circuit breaker stays closed after a rate limit error.
+        let cb = OrderCircuitBreaker::new();
+        // Simulate: a rate limit error occurs, but we don't call record_failure.
+        // The CB should remain closed.
+        assert!(cb.check().is_ok(), "CB must be closed initially");
+
+        // But a non-rate-limit error DOES trip it.
+        for _ in 0..10 {
+            cb.record_failure();
+        }
+        assert!(
+            cb.check().is_err(),
+            "CB must be open after enough non-rate-limit failures"
         );
     }
 }

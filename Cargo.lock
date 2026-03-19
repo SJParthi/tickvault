@@ -1332,6 +1332,7 @@ dependencies = [
  "dhan-live-trader-core",
  "dhat",
  "governor",
+ "metrics",
  "notify",
  "proptest",
  "reqwest",

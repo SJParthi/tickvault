@@ -75,7 +75,7 @@ use dhan_live_trader_storage::tick_persistence::{
 };
 
 use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::SharedAppState;
+use dhan_live_trader_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -556,12 +556,14 @@ async fn main() -> Result<()> {
             std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
 
         // --- Background: API server ---
+        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
         let api_state = SharedAppState::new(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
             shared_movers.clone(),
             bg_shared_constituency,
+            health_status,
         );
 
         let router = build_router(
@@ -963,12 +965,14 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
+    let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
     let api_state = SharedAppState::new(
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
         shared_movers.clone(),
         shared_constituency.clone(),
+        health_status,
     );
 
     let router = build_router(

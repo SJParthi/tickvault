@@ -34,6 +34,8 @@ services:
     container_name: dlt-questdb
     hostname: dlt-questdb
     restart: unless-stopped
+    mem_limit: 4g
+    cpus: 2.0
     ports:
       - "9000:9000"    # HTTP API + Web Console
       - "8812:8812"    # PostgreSQL wire protocol
@@ -48,6 +50,11 @@ services:
       QDB_METRICS_ENABLED: "TRUE"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9000' || exit 1"]
       interval: 10s
@@ -66,6 +73,8 @@ services:
     container_name: dlt-valkey
     hostname: dlt-valkey
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: 0.5
     ports:
       - "6379:6379"
     volumes:
@@ -77,6 +86,11 @@ services:
       --save 60 1000
       --appendonly yes
       --appendfsync everysec
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
@@ -95,6 +109,8 @@ services:
     container_name: dlt-prometheus
     hostname: dlt-prometheus
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: 1.0
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -110,6 +126,11 @@ services:
       - "--web.enable-lifecycle"
       # NOTE: --web.console.libraries and --web.console.templates removed.
       # Prometheus v3.x no longer bundles console templates (we use Grafana).
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
       interval: 10s
@@ -128,6 +149,8 @@ services:
     container_name: dlt-loki
     hostname: dlt-loki
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: 0.5
     ports:
       - "3100:3100"
     volumes:
@@ -143,6 +166,11 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     networks:
       - dlt-network
 
@@ -155,6 +183,8 @@ services:
     container_name: dlt-alloy
     hostname: dlt-alloy
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
     ports:
       - "12345:12345"  # Alloy UI
     volumes:
@@ -167,7 +197,12 @@ services:
     command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
     depends_on:
       dlt-loki:
-        condition: service_started
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:12345/-/ready || exit 1"]
       interval: 15s
@@ -186,6 +221,8 @@ services:
     container_name: dlt-jaeger
     hostname: dlt-jaeger
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: 1.0
     ports:
       - "16686:16686"  # Jaeger UI
       - "4317:4317"    # OTLP gRPC
@@ -195,6 +232,11 @@ services:
     volumes:
       - ./jaeger/jaeger-config.yml:/etc/jaeger/config.yml:ro
     command: ["--config", "/etc/jaeger/config.yml"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:13133/health/status || exit 1"]
       interval: 10s
@@ -213,6 +255,8 @@ services:
     container_name: dlt-grafana
     hostname: dlt-grafana
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: 0.5
     ports:
       - "3000:3000"
     volumes:
@@ -236,6 +280,11 @@ services:
         condition: service_healthy
       dlt-loki:
         condition: service_started
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       # Use wget (always available in Grafana Alpine image; curl may not exist)
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
@@ -255,6 +304,8 @@ services:
     container_name: dlt-traefik
     hostname: dlt-traefik
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -266,6 +317,11 @@ services:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
       interval: 10s

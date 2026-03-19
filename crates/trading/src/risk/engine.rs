@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use super::types::{PositionInfo, RiskBreach, RiskCheck};
 
@@ -84,6 +84,7 @@ impl RiskEngine {
     ///
     /// # Performance
     /// O(1) — HashMap lookup + arithmetic comparison.
+    #[instrument(skip_all, fields(security_id))]
     pub fn check_order(&mut self, security_id: u32, order_lots: i32) -> RiskCheck {
         self.total_checks = self.total_checks.saturating_add(1);
 

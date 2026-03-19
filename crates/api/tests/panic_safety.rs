@@ -10,7 +10,7 @@ use axum::extract::State;
 use dhan_live_trader_api::handlers::health::{HealthResponse, health_check};
 use dhan_live_trader_api::handlers::stats::{StatsResponse, get_stats};
 use dhan_live_trader_api::handlers::top_movers::{TopMoversResponse, get_top_movers};
-use dhan_live_trader_api::state::SharedAppState;
+use dhan_live_trader_api::state::{SharedAppState, SystemHealthStatus};
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,7 @@ fn make_test_state(questdb: QuestDbConfig) -> SharedAppState {
         test_instrument_config(),
         empty_snapshot(),
         empty_constituency(),
+        Arc::new(SystemHealthStatus::new()),
     )
 }
 
@@ -76,19 +77,40 @@ fn make_test_state(questdb: QuestDbConfig) -> SharedAppState {
 
 #[tokio::test]
 async fn no_panic_health_check_returns_ok() {
-    let Json(response) = health_check().await;
-    assert_eq!(response.status, "ok");
+    let state = make_test_state(test_questdb_config_unreachable());
+    let Json(response) = health_check(State(state)).await;
     assert!(!response.version.is_empty());
+    // Default health status has no token/WS → degraded
+    assert_eq!(response.status, "degraded");
 }
 
 #[test]
 fn no_panic_health_response_serialization() {
+    use dhan_live_trader_api::handlers::health::{SubsystemInfo, SubsystemStatus};
     let resp = HealthResponse {
-        status: "ok",
+        status: "healthy",
         version: "0.1.0",
+        subsystems: SubsystemStatus {
+            websocket: SubsystemInfo {
+                status: "connected",
+                detail: Some("3 connections".to_string()),
+            },
+            questdb: SubsystemInfo {
+                status: "reachable",
+                detail: None,
+            },
+            token: SubsystemInfo {
+                status: "valid",
+                detail: None,
+            },
+            pipeline: SubsystemInfo {
+                status: "active",
+                detail: None,
+            },
+        },
     };
     let json = serde_json::to_string(&resp).unwrap();
-    assert!(json.contains("ok"));
+    assert!(json.contains("healthy"));
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +164,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
         test_instrument_config(),
         shared,
         empty_constituency(),
+        Arc::new(SystemHealthStatus::new()),
     );
 
     let Json(result) = get_top_movers(State(state)).await;

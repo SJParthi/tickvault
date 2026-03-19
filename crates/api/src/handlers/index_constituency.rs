@@ -295,6 +295,7 @@ mod tests {
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             constituency,
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         )
     }
 

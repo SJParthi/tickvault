@@ -407,6 +407,7 @@ impl TokenManager {
     /// Sleeps until the refresh window (token_validity - refresh_before_expiry),
     /// then renews the token. Retries with exponential backoff on failure.
     /// Runs indefinitely until the task is cancelled.
+    #[instrument(skip_all)]
     pub fn spawn_renewal_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {

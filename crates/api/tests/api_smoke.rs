@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::SharedAppState;
+use dhan_live_trader_api::state::{SharedAppState, SystemHealthStatus};
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
 fn test_state() -> SharedAppState {
@@ -39,6 +39,7 @@ fn test_state() -> SharedAppState {
         },
         std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(std::sync::RwLock::new(None)),
+        std::sync::Arc::new(SystemHealthStatus::new()),
     )
 }
 

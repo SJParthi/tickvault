@@ -583,10 +583,13 @@ const PREVIOUS_CLOSE_CREATE_DDL: &str = "\
 ";
 
 /// DEDUP UPSERT KEY for the `market_depth` table.
-const DEDUP_KEY_MARKET_DEPTH: &str = "security_id, level";
+/// STORAGE-GAP-01: Includes segment to prevent cross-segment collision
+/// (same security_id can exist on NSE_EQ and BSE_EQ).
+const DEDUP_KEY_MARKET_DEPTH: &str = "security_id, segment, level";
 
 /// DEDUP UPSERT KEY for the `previous_close` table.
-const DEDUP_KEY_PREVIOUS_CLOSE: &str = "security_id";
+/// STORAGE-GAP-01: Includes segment to prevent cross-segment collision.
+const DEDUP_KEY_PREVIOUS_CLOSE: &str = "security_id, segment";
 
 /// Creates the `market_depth` and `previous_close` tables and enables DEDUP UPSERT KEYS.
 ///
@@ -2621,6 +2624,82 @@ mod tests {
         assert_eq!(
             diff_secs, IST_UTC_OFFSET_SECONDS_I64,
             "exchange_timestamp (IST) minus received_at (UTC) ≈ IST offset"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // STORAGE-GAP-01: DEDUP key includes segment for previous_close + market_depth
+    // -----------------------------------------------------------------------
+
+    /// STORAGE-GAP-01: previous_close DEDUP key must include segment
+    /// to prevent cross-segment collision (same security_id on NSE_EQ vs BSE_EQ).
+    #[test]
+    fn test_previous_close_dedup_key_includes_segment() {
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("security_id"),
+            "DEDUP_KEY_PREVIOUS_CLOSE must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("segment"),
+            "DEDUP_KEY_PREVIOUS_CLOSE must include segment (STORAGE-GAP-01)"
+        );
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    /// STORAGE-GAP-01: market_depth DEDUP key must include segment
+    /// to prevent cross-segment collision.
+    #[test]
+    fn test_market_depth_dedup_key_includes_segment() {
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("security_id"),
+            "DEDUP_KEY_MARKET_DEPTH must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("segment"),
+            "DEDUP_KEY_MARKET_DEPTH must include segment (STORAGE-GAP-01)"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("level"),
+            "DEDUP_KEY_MARKET_DEPTH must include level"
+        );
+        assert_eq!(DEDUP_KEY_MARKET_DEPTH, "security_id, segment, level");
+    }
+
+    /// Verify that previous_close rows with same security_id but different
+    /// segments produce distinct ILP rows with different segment symbols.
+    #[test]
+    fn test_previous_close_row_includes_segment() {
+        let mut buf_nse = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buf_nse,
+            1333,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            2500.0,
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        let nse_content = String::from_utf8_lossy(buf_nse.as_bytes());
+
+        let mut buf_bse = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buf_bse,
+            1333,
+            EXCHANGE_SEGMENT_BSE_EQ,
+            2500.0,
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        let bse_content = String::from_utf8_lossy(buf_bse.as_bytes());
+
+        assert!(nse_content.contains("segment=NSE_EQ"));
+        assert!(bse_content.contains("segment=BSE_EQ"));
+        // Same security_id but different segment → different rows in QuestDB
+        assert_ne!(
+            nse_content.as_ref(),
+            bse_content.as_ref(),
+            "same security_id on different segments must produce different ILP rows"
         );
     }
 }

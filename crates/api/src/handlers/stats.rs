@@ -161,6 +161,7 @@ mod tests {
             },
             empty_snapshot(),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
         let result = get_stats(State(state)).await;
         assert!(!result.questdb_reachable);
@@ -527,6 +528,7 @@ mod tests {
             },
             empty_snapshot(),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
         let result = get_stats(axum::extract::State(state)).await;
         assert!(result.questdb_reachable);

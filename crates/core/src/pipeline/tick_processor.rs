@@ -179,6 +179,7 @@ pub async fn run_tick_processor(
     let m_market_status_updates = counter!("dlt_market_status_updates_total");
     let m_disconnects = counter!("dlt_disconnect_frames_total");
     let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
+    let m_wire_to_done = histogram!("dlt_wire_to_done_duration_ns");
     let m_pipeline_active = gauge!("dlt_pipeline_active");
     let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
     let m_crossed_market = counter!("dlt_crossed_market_total");
@@ -549,6 +550,7 @@ pub async fn run_tick_processor(
         }
 
         m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
+        m_wire_to_done.record(tick_start.elapsed().as_nanos() as f64);
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
