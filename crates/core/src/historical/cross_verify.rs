@@ -1346,4 +1346,506 @@ mod tests {
         assert!(!report.passed);
         assert_eq!(report.candles_compared, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Pure helper function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_symbol_not_found_returns_id_string() {
+        let registry = InstrumentRegistry::empty();
+        assert_eq!(lookup_symbol(&registry, 99999), "99999");
+    }
+
+    #[test]
+    fn test_lookup_symbol_zero() {
+        let registry = InstrumentRegistry::empty();
+        assert_eq!(lookup_symbol(&registry, 0), "0");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_no_t_separator() {
+        let ts = serde_json::Value::String("2026-01-01 10:00:00".to_string());
+        assert_eq!(format_timestamp_ist(&ts), "2026-01-01 10:00:00");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_null_value() {
+        assert_eq!(format_timestamp_ist(&serde_json::Value::Null), "null");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_bool_value() {
+        assert_eq!(format_timestamp_ist(&serde_json::Value::Bool(true)), "true");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_short_time() {
+        let ts = serde_json::Value::String("2026-01-01T9:5Z".to_string());
+        let result = format_timestamp_ist(&ts);
+        assert!(result.contains("2026-01-01"));
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_float_epoch() {
+        let ts = serde_json::json!(1773050340.5);
+        assert!(format_timestamp_ist(&ts).contains("1773050340"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock HTTP server for async function tests
+    // -----------------------------------------------------------------------
+
+    async fn mock_http_server(body: &'static str) -> (tokio::task::JoinHandle<()>, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for _ in 0..20 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        (handle, port)
+    }
+
+    async fn mock_http_error_server() -> (tokio::task::JoinHandle<()>, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for _ in 0..5 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        (handle, port)
+    }
+
+    async fn mock_http_bad_json_server() -> (tokio::task::JoinHandle<()>, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for _ in 0..5 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = "not json";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        (handle, port)
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_query tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_execute_query_success() {
+        let (handle, port) = mock_http_server(r#"{"dataset": [[1, 2, 3]], "count": 1}"#).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let result = execute_query(&client, &url, "SELECT 1").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().dataset.len(), 1);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_unreachable() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        assert!(
+            execute_query(&client, "http://127.0.0.1:1", "SELECT 1")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_non_success_status() {
+        let (handle, port) = mock_http_error_server().await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        assert!(execute_query(&client, &url, "SELECT 1").await.is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_invalid_json() {
+        let (handle, port) = mock_http_bad_json_server().await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        assert!(execute_query(&client, &url, "SELECT 1").await.is_none());
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_count tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_extract_count_success() {
+        let (handle, port) = mock_http_server(r#"{"dataset": [[42]], "count": 1}"#).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        assert_eq!(extract_count(&client, &url, "SELECT count()").await, 42);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_extract_count_empty_dataset() {
+        let (handle, port) = mock_http_server(r#"{"dataset": [], "count": 0}"#).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        assert_eq!(extract_count(&client, &url, "SELECT count()").await, 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_extract_count_unreachable() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        assert_eq!(extract_count(&client, "http://127.0.0.1:1", "q").await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_violation_rows tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_parse_violation_rows_success() {
+        let body = r#"{"dataset": [[11536, "NSE_EQ", "1m", "2026-03-18T09:15:00.000000Z", 100.0, 99.0, 100.5, 100.2, 5000]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_violation_rows(&client, &url, "q", &registry, "high < low").await;
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].violation, "high < low");
+        assert_eq!(details[0].segment, "NSE_EQ");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_parse_violation_rows_short_row_skipped() {
+        let body = r#"{"dataset": [[11536, "NSE_EQ"]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_violation_rows(&client, &url, "q", &registry, "test").await;
+        assert!(details.is_empty());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_parse_violation_rows_unreachable() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let registry = InstrumentRegistry::empty();
+        let details =
+            parse_violation_rows(&client, "http://127.0.0.1:1", "q", &registry, "t").await;
+        assert!(details.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_cross_match_rows_with_oi tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cross_match_rows_missing_live() {
+        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, null, null, null, null, null, 0, 0]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].mismatch_type, "missing_live");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cross_match_rows_price_diff() {
+        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.5, 105.0, 99.0, 102.0, 5000, 0, 0]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].mismatch_type, "price_diff");
+        assert!(details[0].diff_summary.contains("O("));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cross_match_rows_volume_diff() {
+        // Prices match, volume differs > 10%
+        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 10000, 100.0, 105.0, 99.0, 102.0, 8000, 0, 0]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].mismatch_type, "volume_diff");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cross_match_rows_oi_diff() {
+        // Prices+volume match, OI differs > 10%
+        let body = r#"{"dataset": [[49081, "NSE_FNO", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.0, 105.0, 99.0, 102.0, 5000, 100000, 80000]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].mismatch_type, "oi_diff");
+        assert!(details[0].diff_summary.contains("OI("));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cross_match_rows_no_mismatch() {
+        // Everything matches within tolerance
+        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.0, 105.0, 99.0, 102.0, 5000, 0, 0]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
+        assert!(details.is_empty());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cross_match_rows_short_row_skipped() {
+        let body = r#"{"dataset": [[11536, "NSE_EQ"]], "count": 1}"#;
+        let (handle, port) = mock_http_server(body).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port);
+        let registry = InstrumentRegistry::empty();
+        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
+        assert!(details.is_empty());
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_candle_integrity with mock — empty DB
+    // -----------------------------------------------------------------------
+
+    async fn mock_empty_db_server() -> (tokio::task::JoinHandle<()>, u16) {
+        mock_http_server(r#"{"dataset": [], "count": 0}"#).await
+    }
+
+    #[tokio::test]
+    async fn test_verify_candle_integrity_empty_db() {
+        let (handle, port) = mock_empty_db_server().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let registry = InstrumentRegistry::empty();
+        let report = verify_candle_integrity(&config, &registry).await;
+        assert!(!report.passed);
+        assert_eq!(report.instruments_checked, 0);
+        assert_eq!(report.ohlc_violations, 0);
+        assert_eq!(report.data_violations, 0);
+        assert_eq!(report.timestamp_violations, 0);
+        assert_eq!(report.timeframe_counts.len(), 5);
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_candle_integrity with mock — good data (375 1m candles)
+    // -----------------------------------------------------------------------
+
+    async fn mock_good_data_server() -> (tokio::task::JoinHandle<()>, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut query_idx = 0_usize;
+            for _ in 0..20 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = if query_idx == 0 {
+                        r#"{"dataset": [["1m", 11536, 375]], "count": 1}"#.to_string()
+                    } else {
+                        r#"{"dataset": [[0]], "count": 1}"#.to_string()
+                    };
+                    query_idx += 1;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        (handle, port)
+    }
+
+    #[tokio::test]
+    async fn test_verify_candle_integrity_with_data() {
+        let (handle, port) = mock_good_data_server().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let registry = InstrumentRegistry::empty();
+        let report = verify_candle_integrity(&config, &registry).await;
+        assert!(report.passed);
+        assert_eq!(report.instruments_checked, 1);
+        assert_eq!(report.instruments_complete, 1);
+        assert_eq!(report.instruments_with_gaps, 0);
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // cross_match_historical_vs_live with mock — empty tables
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cross_match_empty_tables() {
+        let (handle, port) = mock_empty_db_server().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let registry = InstrumentRegistry::empty();
+        let report = cross_match_historical_vs_live(&config, &registry).await;
+        assert!(!report.passed);
+        assert_eq!(report.candles_compared, 0);
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // OI / volume mismatch logic unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oi_mismatch_both_zero_no_mismatch() {
+        let h_oi = 0_i64;
+        let m_oi = 0_i64;
+        let mismatch = h_oi > 0 && m_oi > 0;
+        assert!(!mismatch);
+    }
+
+    #[test]
+    fn test_oi_mismatch_exceeds_tolerance() {
+        let h_oi = 100000_i64;
+        let m_oi = 80000_i64;
+        let h_oi_max = h_oi.max(1) as f64;
+        let diff = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
+        assert!(diff > CROSS_MATCH_OI_TOLERANCE_PCT);
+    }
+
+    #[test]
+    fn test_volume_mismatch_within_tolerance() {
+        let h_vol = 10000_i64;
+        let m_vol = 9500_i64;
+        let h_vol_max = h_vol.max(1) as f64;
+        let diff = (m_vol.saturating_sub(h_vol) as f64).abs() / h_vol_max;
+        assert!(diff <= CROSS_MATCH_VOLUME_TOLERANCE_PCT);
+    }
+
+    #[test]
+    fn test_volume_mismatch_exceeds_tolerance() {
+        let h_vol = 10000_i64;
+        let m_vol = 8000_i64;
+        let h_vol_max = h_vol.max(1) as f64;
+        let diff = (m_vol.saturating_sub(h_vol) as f64).abs() / h_vol_max;
+        assert!(diff > CROSS_MATCH_VOLUME_TOLERANCE_PCT);
+    }
+
+    #[test]
+    fn test_cross_match_pass_requires_data_and_no_missing() {
+        let total_mismatches = 0_usize;
+        let total_compared = 100_usize;
+        let missing_views: Vec<String> = vec!["candles_1m".to_string()];
+        let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
+        assert!(!passed, "missing views must fail");
+    }
 }
