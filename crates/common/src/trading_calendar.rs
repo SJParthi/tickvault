@@ -371,4 +371,92 @@ mod tests {
         assert_eq!(entries[3].name, "Diwali 2026");
         assert!(entries[3].is_muhurat);
     }
+
+    // =====================================================================
+    // Additional coverage: invalid muhurat date, is_trading_day_today,
+    // is_muhurat_trading_today, next_trading_day across holiday+weekend,
+    // ist_offset, today_ist
+    // =====================================================================
+
+    #[test]
+    fn test_invalid_muhurat_date_string_rejected() {
+        let mut config = make_test_config();
+        config.muhurat_trading_dates.push(NseHolidayEntry {
+            date: "garbage".to_string(),
+            name: "Bad Muhurat".to_string(),
+        });
+        let err = TradingCalendar::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("invalid Muhurat trading date"));
+    }
+
+    #[test]
+    fn test_next_trading_day_skips_holiday_then_weekend() {
+        // Set up: Friday 2026-10-16 normal, Mon 2026-10-19 normal
+        // 2026-10-20 Tue = Dussehra (holiday in make_test_config)
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // From Dussehra (Tue), next should be Wed 2026-10-21
+        let dussehra = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert!(!cal.is_trading_day(dussehra));
+        let next = cal.next_trading_day(dussehra);
+        assert_eq!(next, NaiveDate::from_ymd_opt(2026, 10, 21).unwrap());
+    }
+
+    #[test]
+    fn test_muhurat_day_not_a_regular_holiday_check() {
+        // Muhurat day 2026-11-08 is a Sunday actually - check it
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let muhurat = NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        // It's a Sunday, so is_trading_day is false (weekend)
+        assert!(!cal.is_trading_day(muhurat));
+        // But it IS a muhurat trading day
+        assert!(cal.is_muhurat_trading_day(muhurat));
+    }
+
+    #[test]
+    fn test_non_muhurat_day_returns_false() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let normal_day = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        assert!(!cal.is_muhurat_trading_day(normal_day));
+    }
+
+    #[test]
+    fn test_ist_offset_returns_5h30m() {
+        let offset = super::ist_offset();
+        assert_eq!(offset.local_minus_utc(), 19_800);
+    }
+
+    #[test]
+    fn test_today_ist_returns_a_date() {
+        // Just verify it doesn't panic and returns a reasonable date
+        let today = super::today_ist();
+        assert!(today.year() >= 2026);
+    }
+
+    #[test]
+    fn test_is_trading_day_today_returns_bool() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // Just verify it doesn't panic
+        let _is_trading = cal.is_trading_day_today();
+    }
+
+    #[test]
+    fn test_is_muhurat_trading_today_returns_bool() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // Just verify it doesn't panic
+        let _is_muhurat = cal.is_muhurat_trading_today();
+    }
+
+    #[test]
+    fn test_all_entries_empty_calendar() {
+        let mut config = make_test_config();
+        config.nse_holidays.clear();
+        config.muhurat_trading_dates.clear();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        assert!(cal.all_entries().is_empty());
+    }
 }

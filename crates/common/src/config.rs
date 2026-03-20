@@ -1159,4 +1159,138 @@ mod tests {
             "feed_mode is case-sensitive — 'ticker' should fail"
         );
     }
+
+    // =====================================================================
+    // Additional coverage: default impls, edge cases, more validation paths
+    // =====================================================================
+
+    #[test]
+    fn test_strategy_config_default() {
+        let config = StrategyConfig::default();
+        assert_eq!(config.config_path, "config/strategies.toml");
+        assert!((config.capital - 1_000_000.0).abs() < f64::EPSILON);
+        assert!(config.dry_run, "dry_run must default to true");
+    }
+
+    #[test]
+    fn test_notification_config_default() {
+        let config = NotificationConfig::default();
+        assert_eq!(config.telegram_api_base_url, "https://api.telegram.org");
+        assert_eq!(config.send_timeout_ms, 10_000);
+        assert!(!config.sns_enabled);
+    }
+
+    #[test]
+    fn test_observability_config_default() {
+        let config = ObservabilityConfig::default();
+        assert_eq!(config.metrics_port, 9091);
+        assert!(config.metrics_enabled);
+        assert!(config.tracing_enabled);
+        assert!(config.otlp_endpoint.contains("4317"));
+    }
+
+    #[test]
+    fn test_historical_data_config_default() {
+        let config = HistoricalDataConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.lookback_days, 90);
+        assert_eq!(config.request_timeout_secs, 30);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.request_delay_ms, 500);
+    }
+
+    #[test]
+    fn test_index_constituency_config_default() {
+        let config = IndexConstituencyConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.download_timeout_secs, 30);
+        assert_eq!(config.max_concurrent_downloads, 5);
+        assert_eq!(config.inter_batch_delay_ms, 200);
+    }
+
+    #[test]
+    fn test_subscription_config_default() {
+        let config = SubscriptionConfig::default();
+        assert_eq!(config.feed_mode, "Ticker");
+        assert!(config.subscribe_index_derivatives);
+        assert!(config.subscribe_stock_derivatives);
+        assert!(config.subscribe_display_indices);
+        assert!(config.subscribe_stock_equities);
+        assert_eq!(config.stock_atm_strikes_above, 10);
+        assert_eq!(config.stock_atm_strikes_below, 10);
+        assert!(config.stock_default_atm_fallback_enabled);
+    }
+
+    #[test]
+    fn test_default_allowed_origins() {
+        let origins = default_allowed_origins();
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains(&"http://localhost:3000".to_string()));
+        assert!(origins.contains(&"http://localhost:3001".to_string()));
+    }
+
+    #[test]
+    fn test_feed_mode_empty_string_fails() {
+        let config = SubscriptionConfig {
+            feed_mode: String::new(),
+            ..SubscriptionConfig::default()
+        };
+        assert!(config.parsed_feed_mode().is_err());
+    }
+
+    #[test]
+    fn test_invalid_market_close_time_fails() {
+        let mut config = make_valid_config();
+        config.trading.market_close_time = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("market_close_time"));
+    }
+
+    #[test]
+    fn test_invalid_order_cutoff_time_fails() {
+        let mut config = make_valid_config();
+        config.trading.order_cutoff_time = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("order_cutoff_time"));
+    }
+
+    #[test]
+    fn test_invalid_data_collection_start_fails() {
+        let mut config = make_valid_config();
+        config.trading.data_collection_start = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("data_collection_start"));
+    }
+
+    #[test]
+    fn test_invalid_data_collection_end_fails() {
+        let mut config = make_valid_config();
+        config.trading.data_collection_end = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("data_collection_end"));
+    }
+
+    #[test]
+    fn test_invalid_build_window_end_format_fails() {
+        let mut config = make_valid_config();
+        config.instrument.build_window_end = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("build_window_end"));
+    }
+
+    #[test]
+    fn test_invalid_holiday_date_fails_validation() {
+        // Exercises the TradingCalendar::from_config error propagation (line 638)
+        let mut config = make_valid_config();
+        config.trading.nse_holidays = vec![NseHolidayEntry {
+            date: "not-a-date".to_string(),
+            name: "Bad Holiday".to_string(),
+        }];
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not-a-date"),
+            "error should mention the bad date: {}",
+            err
+        );
+    }
 }

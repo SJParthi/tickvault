@@ -527,4 +527,119 @@ mod tests {
         let s2 = tracker.compute_snapshot();
         assert!(s2.gainers.is_empty(), "should reflect updated price");
     }
+
+    // -----------------------------------------------------------------------
+    // NaN change_pct is filtered from snapshot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nan_change_pct_excluded_from_snapshot() {
+        let mut tracker = TopMoversTracker::new();
+        // LTP = NaN results in NaN change_pct which should be filtered
+        tracker.update(&make_tick(100, 2, f32::NAN, 100.0, 1000));
+
+        // NaN day_close is rejected (tracked_count = 0)
+        // Let's instead produce a NaN change_pct via valid inputs:
+        // day_close=f32::MIN_POSITIVE → change_pct=(NaN-close)/close but LTP must be NaN
+        // Actually, day_close <= 0.0 is already skipped. So we need day_close > 0 and
+        // LTP that produces NaN change_pct. But (ltp - close) / close for finite values is finite.
+        // So NaN change_pct only comes from NaN LTP. But NaN LTP is finite? No: NaN.is_finite()=false.
+        // Actually the update() function does NOT check LTP for finiteness — only day_close.
+        // So NaN LTP with valid day_close will produce NaN change_pct.
+        let mut tracker2 = TopMoversTracker::new();
+        // This tick has NaN LTP but valid close → change_pct = NaN
+        let tick = ParsedTick {
+            security_id: 200,
+            exchange_segment_code: 2,
+            last_traded_price: f32::NAN,
+            day_close: 100.0,
+            volume: 500,
+            exchange_timestamp: 1000,
+            ..Default::default()
+        };
+        tracker2.update(&tick);
+        assert_eq!(tracker2.tracked_count(), 1, "tick should be tracked");
+
+        let snapshot = tracker2.compute_snapshot();
+        // NaN change_pct entries are filtered out of gainers/losers
+        assert!(
+            snapshot.gainers.is_empty(),
+            "NaN change_pct should not appear in gainers"
+        );
+        assert!(
+            snapshot.losers.is_empty(),
+            "NaN change_pct should not appear in losers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Update existing vs new security
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_existing_security_replaces_state() {
+        let mut tracker = TopMoversTracker::new();
+
+        // First update: LTP=110, volume=1000
+        tracker.update(&make_tick(42, 2, 110.0, 100.0, 1000));
+        assert_eq!(tracker.tracked_count(), 1);
+
+        // Second update same security: LTP=120, volume=2000
+        tracker.update(&make_tick(42, 2, 120.0, 100.0, 2000));
+        assert_eq!(
+            tracker.tracked_count(),
+            1,
+            "same security — count unchanged"
+        );
+
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(snapshot.gainers.len(), 1);
+        // Should use the latest values
+        let entry = &snapshot.gainers[0];
+        assert!((entry.change_pct - 20.0).abs() < 0.01);
+        assert_eq!(entry.volume, 2000);
+        assert!((entry.last_traded_price - 120.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn new_security_inserted() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000));
+        tracker.update(&make_tick(2, 2, 120.0, 100.0, 2000));
+        assert_eq!(tracker.tracked_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // MoverEntry serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mover_entry_serializes_to_json() {
+        let entry = MoverEntry {
+            security_id: 42,
+            exchange_segment_code: 2,
+            last_traded_price: 100.5,
+            change_pct: 5.25,
+            volume: 1000,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("42"));
+        assert!(json.contains("5.25"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TopMoversSnapshot serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_serializes_to_json() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000));
+        let snapshot = tracker.compute_snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("gainers"));
+        assert!(json.contains("losers"));
+        assert!(json.contains("most_active"));
+        assert!(json.contains("total_tracked"));
+    }
 }

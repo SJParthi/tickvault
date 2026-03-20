@@ -592,4 +592,103 @@ mod tests {
         let header = parse_deep_depth_header(&buf).unwrap();
         assert_eq!(header.seq_or_row_count, u32::MAX);
     }
+
+    // =====================================================================
+    // Additional coverage: DepthSide Debug/PartialEq, 200-level edge cases,
+    // header message_length, feed_code_to_side boundary
+    // =====================================================================
+
+    #[test]
+    fn test_depth_side_debug_and_eq() {
+        assert_eq!(DepthSide::Bid, DepthSide::Bid);
+        assert_eq!(DepthSide::Ask, DepthSide::Ask);
+        assert_ne!(DepthSide::Bid, DepthSide::Ask);
+        let debug_bid = format!("{:?}", DepthSide::Bid);
+        assert_eq!(debug_bid, "Bid");
+        let debug_ask = format!("{:?}", DepthSide::Ask);
+        assert_eq!(debug_ask, "Ask");
+    }
+
+    #[test]
+    fn test_depth_side_clone_copy() {
+        let side = DepthSide::Bid;
+        let cloned = side;
+        assert_eq!(side, cloned);
+    }
+
+    #[test]
+    fn test_feed_code_to_side_zero() {
+        let err = feed_code_to_side(0).unwrap_err();
+        assert!(matches!(err, ParseError::UnknownResponseCode(0)));
+    }
+
+    #[test]
+    fn test_feed_code_to_side_adjacent_codes() {
+        // 40 and 42 are NOT valid feed codes (only 41 and 51)
+        assert!(feed_code_to_side(40).is_err());
+        assert!(feed_code_to_side(42).is_err());
+        assert!(feed_code_to_side(50).is_err());
+        assert!(feed_code_to_side(52).is_err());
+    }
+
+    #[test]
+    fn test_parse_two_hundred_depth_exactly_200_levels() {
+        let buf = make_deep_depth_packet(41, 2, 13, 200, 200, None);
+        let result = parse_two_hundred_depth_packet(&buf, 0).unwrap();
+        assert_eq!(result.levels.len(), 200);
+        assert_eq!(result.header.seq_or_row_count, 200);
+    }
+
+    #[test]
+    fn test_parse_two_hundred_depth_single_level() {
+        let level_data = [(24500.05, 500_u32, 42_u32)];
+        let buf = make_deep_depth_packet(51, 1, 2885, 1, 1, Some(&level_data));
+        let result = parse_two_hundred_depth_packet(&buf, 123).unwrap();
+        assert_eq!(result.levels.len(), 1);
+        assert!((result.levels[0].price - 24500.05).abs() < 1e-9);
+        assert_eq!(result.levels[0].quantity, 500);
+        assert_eq!(result.levels[0].orders, 42);
+        assert_eq!(result.received_at_nanos, 123);
+    }
+
+    #[test]
+    fn test_parse_deep_depth_header_exactly_12_bytes() {
+        let mut buf = vec![0u8; 12];
+        buf[0..2].copy_from_slice(&332u16.to_le_bytes());
+        buf[2] = DEEP_DEPTH_FEED_CODE_BID;
+        buf[3] = 2;
+        buf[4..8].copy_from_slice(&12345u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&99u32.to_le_bytes());
+        let header = parse_deep_depth_header(&buf).unwrap();
+        assert_eq!(header.message_length, 332);
+        assert_eq!(header.feed_code, DEEP_DEPTH_FEED_CODE_BID);
+        assert_eq!(header.security_id, 12345);
+        assert_eq!(header.seq_or_row_count, 99);
+    }
+
+    #[test]
+    fn test_deep_depth_header_debug_format() {
+        let buf = make_deep_depth_packet(41, 1, 2885, 5, 20, None);
+        let header = parse_deep_depth_header(&buf).unwrap();
+        let debug = format!("{header:?}");
+        assert!(debug.contains("DeepDepthHeader"));
+        assert!(debug.contains("2885"));
+    }
+
+    #[test]
+    fn test_parse_two_hundred_depth_row_count_max_valid() {
+        // row_count = 200 (maximum valid)
+        let buf = make_deep_depth_packet(41, 2, 13, 200, 200, None);
+        let result = parse_two_hundred_depth_packet(&buf, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parsed_deep_depth_debug_format() {
+        let buf = make_deep_depth_packet(41, 2, 13, 1, 20, None);
+        let result = parse_twenty_depth_packet(&buf, 999).unwrap();
+        let debug = format!("{result:?}");
+        assert!(debug.contains("ParsedDeepDepth"));
+        assert!(debug.contains("Bid"));
+    }
 }

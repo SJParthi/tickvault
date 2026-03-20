@@ -777,4 +777,85 @@ mod tests {
             "12-byte header-only packet with msg_len=12 should be included"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Additional dispatcher coverage: deep depth received_at propagation,
+    // split_stacked truncated mid-packet, market depth variant fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dispatch_deep_depth_received_at_nanos_propagated() {
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 42, TWENTY_DEPTH_LEVELS);
+        let nanos = 1_234_567_890_123_456_789_i64;
+        let frame = dispatch_deep_depth_frame(&buf, nanos).unwrap();
+        match frame {
+            ParsedFrame::DeepDepth {
+                received_at_nanos, ..
+            } => {
+                assert_eq!(received_at_nanos, nanos);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_deep_depth_message_sequence_propagated() {
+        let mut buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_ASK, 42, TWENTY_DEPTH_LEVELS);
+        // Set sequence number in header bytes 8-11
+        buf[8..12].copy_from_slice(&777u32.to_le_bytes());
+        let frame = dispatch_deep_depth_frame(&buf, 0).unwrap();
+        match frame {
+            ParsedFrame::DeepDepth {
+                message_sequence, ..
+            } => {
+                assert_eq!(message_sequence, 777);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_split_stacked_truncated_mid_packet_stops() {
+        // First packet is valid, second packet has msg_len > remaining bytes
+        let valid_bid = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        let valid_len = valid_bid.len();
+        let mut stacked = valid_bid;
+        // Append a header claiming 500 bytes but only provide 12
+        let mut truncated = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        truncated[0..2].copy_from_slice(&500u16.to_le_bytes());
+        truncated[2] = DEEP_DEPTH_FEED_CODE_ASK;
+        stacked.extend_from_slice(&truncated);
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(
+            packets.len(),
+            1,
+            "truncated second packet should be ignored"
+        );
+        assert_eq!(packets[0].len(), valid_len);
+    }
+
+    #[test]
+    fn test_dispatch_market_depth_has_correct_tick_fields() {
+        let mut buf = make_minimal_packet(RESPONSE_CODE_MARKET_DEPTH, MARKET_DEPTH_PACKET_SIZE);
+        // Set LTP at offset 8-11
+        buf[8..12].copy_from_slice(&1500.5_f32.to_le_bytes());
+        let (tick, depth) = unwrap_tick_with_depth(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.security_id, 42);
+        assert_eq!(tick.exchange_segment_code, 2);
+        // Depth should have 5 levels
+        assert_eq!(depth.len(), 5);
+    }
+
+    #[test]
+    fn test_dispatch_all_unknown_response_codes() {
+        // Test several codes that are not valid response codes
+        for code in [9, 10, 11, 12, 13, 14, 15, 20, 30, 40, 100, 255] {
+            let buf = make_minimal_packet(code, 8);
+            let err = dispatch_frame(&buf, 0).unwrap_err();
+            assert!(
+                matches!(err, ParseError::UnknownResponseCode(c) if c == code),
+                "code {code} should be unknown"
+            );
+        }
+    }
 }

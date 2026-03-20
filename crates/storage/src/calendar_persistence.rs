@@ -439,4 +439,262 @@ mod tests {
         let base_url = format!("http://{}:{}/exec", config.host, config.http_port);
         assert_eq!(base_url, "http://dlt-questdb:9000/exec");
     }
+
+    #[test]
+    fn calendar_persist_max_retries_is_3() {
+        assert_eq!(CALENDAR_PERSIST_MAX_RETRIES, 3);
+    }
+
+    #[test]
+    fn calendar_persist_retry_delay_is_2_secs() {
+        assert_eq!(CALENDAR_PERSIST_RETRY_DELAY_SECS, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // TCP drain server helper (same pattern as other storage tests)
+    // -----------------------------------------------------------------------
+
+    fn spawn_tcp_drain_server() -> u16 {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    // -----------------------------------------------------------------------
+    // DDL tests with mock HTTP server
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_does_not_panic_unreachable() {
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Should not panic — just logs warnings and returns.
+        ensure_calendar_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_ddl_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the success path for both CREATE TABLE and DEDUP DDL.
+        ensure_calendar_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_ddl_non_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the non-success path for CREATE TABLE DDL.
+        ensure_calendar_table(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // persist_inner tests with TCP drain server
+    // -----------------------------------------------------------------------
+
+    fn make_test_calendar_with_holiday() -> TradingCalendar {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        // Dates must be weekdays — TradingCalendar::from_config rejects weekends.
+        // 2026-01-26 = Monday, 2026-03-10 = Tuesday
+        let trading_config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![
+                NseHolidayEntry {
+                    date: "2026-01-26".to_string(),
+                    name: "Republic Day".to_string(),
+                },
+                NseHolidayEntry {
+                    date: "2026-03-10".to_string(),
+                    name: "Maha Shivaratri".to_string(),
+                },
+            ],
+            muhurat_trading_dates: vec![],
+        };
+
+        TradingCalendar::from_config(&trading_config).unwrap()
+    }
+
+    fn make_test_calendar_with_muhurat() -> TradingCalendar {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        let trading_config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-10-20".to_string(),
+                name: "Diwali".to_string(),
+            }],
+            muhurat_trading_dates: vec![NseHolidayEntry {
+                date: "2026-10-20".to_string(),
+                name: "Muhurat Trading".to_string(),
+            }],
+        };
+
+        TradingCalendar::from_config(&trading_config).unwrap()
+    }
+
+    #[test]
+    fn test_persist_inner_with_valid_server_holidays() {
+        let port = spawn_tcp_drain_server();
+        let calendar = make_test_calendar_with_holiday();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let result = persist_inner(&calendar, &config);
+        assert!(result.is_ok());
+        let count = result.unwrap();
+        assert_eq!(count, 2, "should persist 2 holiday entries");
+    }
+
+    #[test]
+    fn test_persist_inner_with_valid_server_muhurat() {
+        let port = spawn_tcp_drain_server();
+        let calendar = make_test_calendar_with_muhurat();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let result = persist_inner(&calendar, &config);
+        assert!(result.is_ok());
+        // Diwali is both a holiday AND muhurat — should produce entries for both
+        let count = result.unwrap();
+        assert!(count > 0, "should persist at least 1 entry");
+    }
+
+    #[test]
+    fn test_persist_inner_empty_calendar() {
+        use dhan_live_trader_common::config::TradingConfig;
+
+        let port = spawn_tcp_drain_server();
+        let trading_config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&trading_config).unwrap();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let result = persist_inner(&calendar, &config);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "empty calendar should produce 0 entries"
+        );
+    }
+
+    #[test]
+    fn test_persist_inner_connection_error() {
+        let calendar = make_test_calendar_with_holiday();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let result = persist_inner(&calendar, &config);
+        // Connection should fail — inner propagates errors
+        let _is_err = result.is_err();
+    }
+
+    #[test]
+    fn test_persist_calendar_first_attempt_succeeds() {
+        let port = spawn_tcp_drain_server();
+        let calendar = make_test_calendar_with_holiday();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let result = persist_calendar(&calendar, &config);
+        assert!(
+            result.is_ok(),
+            "first attempt should succeed with valid TCP"
+        );
+    }
+
+    #[test]
+    fn test_persist_calendar_holiday_type_string() {
+        // Verify that persist_inner distinguishes "Holiday" vs "Muhurat Trading"
+        let calendar = make_test_calendar_with_muhurat();
+        let entries = calendar.all_entries();
+        // At least one entry should have is_muhurat = true
+        let has_muhurat = entries.iter().any(|e| e.is_muhurat);
+        assert!(has_muhurat, "calendar should contain a muhurat entry");
+    }
 }

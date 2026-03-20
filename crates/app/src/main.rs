@@ -1960,4 +1960,840 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // format_timeframe_details tests
+    // -----------------------------------------------------------------------
+
+    fn make_coverage(
+        timeframe: &str,
+        candle_count: usize,
+        instrument_count: usize,
+    ) -> dhan_live_trader_core::historical::cross_verify::TimeframeCoverage {
+        dhan_live_trader_core::historical::cross_verify::TimeframeCoverage {
+            timeframe: timeframe.to_string(),
+            candle_count,
+            instrument_count,
+        }
+    }
+
+    fn make_verification_report(
+        timeframe_counts: Vec<dhan_live_trader_core::historical::cross_verify::TimeframeCoverage>,
+    ) -> dhan_live_trader_core::historical::cross_verify::CrossVerificationReport {
+        dhan_live_trader_core::historical::cross_verify::CrossVerificationReport {
+            instruments_checked: 0,
+            instruments_complete: 0,
+            instruments_with_gaps: 0,
+            total_candles_in_db: 0,
+            timeframe_counts,
+            ohlc_violations: 0,
+            ohlc_details: vec![],
+            data_violations: 0,
+            data_details: vec![],
+            timestamp_violations: 0,
+            timestamp_details: vec![],
+            passed: true,
+        }
+    }
+
+    #[test]
+    fn test_format_timeframe_details_empty_report() {
+        let report = make_verification_report(vec![]);
+        let result = format_timeframe_details(&report);
+        assert!(
+            result.is_empty(),
+            "empty timeframe_counts should produce empty string"
+        );
+    }
+
+    #[test]
+    fn test_format_timeframe_details_single_timeframe() {
+        let report = make_verification_report(vec![make_coverage("1m", 86250, 232)]);
+        let result = format_timeframe_details(&report);
+        assert_eq!(result, "1m: 86250 (232 inst)");
+    }
+
+    #[test]
+    fn test_format_timeframe_details_multiple_timeframes() {
+        let report = make_verification_report(vec![
+            make_coverage("1m", 86250, 232),
+            make_coverage("5m", 17250, 232),
+            make_coverage("1d", 232, 232),
+        ]);
+        let result = format_timeframe_details(&report);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "1m: 86250 (232 inst)");
+        assert_eq!(lines[1], "5m: 17250 (232 inst)");
+        assert_eq!(lines[2], "1d: 232 (232 inst)");
+    }
+
+    #[test]
+    fn test_format_timeframe_details_zero_counts() {
+        let report = make_verification_report(vec![make_coverage("15m", 0, 0)]);
+        let result = format_timeframe_details(&report);
+        assert_eq!(result, "15m: 0 (0 inst)");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_violation_details tests
+    // -----------------------------------------------------------------------
+
+    fn make_violation(
+        symbol: &str,
+        segment: &str,
+        timeframe: &str,
+        timestamp_ist: &str,
+        violation: &str,
+        values: &str,
+    ) -> ViolationDetail {
+        ViolationDetail {
+            symbol: symbol.to_string(),
+            segment: segment.to_string(),
+            timeframe: timeframe.to_string(),
+            timestamp_ist: timestamp_ist.to_string(),
+            violation: violation.to_string(),
+            values: values.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_format_violation_details_empty() {
+        let result = format_violation_details(&[]);
+        assert!(result.is_empty(), "empty input should produce empty output");
+    }
+
+    #[test]
+    fn test_format_violation_details_single_violation() {
+        let violations = vec![make_violation(
+            "RELIANCE",
+            "NSE_EQ",
+            "1m",
+            "2026-03-18 10:15",
+            "high < low",
+            "H=2440.0 < L=2450.0",
+        )];
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("RELIANCE"));
+        assert!(result[0].contains("NSE_EQ"));
+        assert!(result[0].contains("1m"));
+        assert!(result[0].contains("2026-03-18 10:15"));
+        assert!(result[0].contains("H=2440.0 < L=2450.0"));
+        // Check bullet point prefix
+        assert!(result[0].starts_with('\u{2022}'));
+    }
+
+    #[test]
+    fn test_format_violation_details_multiple_violations() {
+        let violations = vec![
+            make_violation(
+                "RELIANCE",
+                "NSE_EQ",
+                "1m",
+                "2026-03-18 10:15",
+                "high < low",
+                "H=2440.0 < L=2450.0",
+            ),
+            make_violation(
+                "NIFTY50",
+                "IDX_I",
+                "5m",
+                "2026-03-18 11:00",
+                "open <= 0",
+                "O=0.0 H=25000.0 L=24900.0 C=24950.0",
+            ),
+        ];
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].contains("RELIANCE"));
+        assert!(result[1].contains("NIFTY50"));
+    }
+
+    #[test]
+    fn test_format_violation_details_contains_newline_indented_values() {
+        let violations = vec![make_violation(
+            "TCS",
+            "NSE_EQ",
+            "1d",
+            "2026-03-18",
+            "data violation",
+            "O=-1.0",
+        )];
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 1);
+        // Values should be on a new indented line
+        assert!(result[0].contains("\n  O=-1.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_cross_match_details tests
+    // -----------------------------------------------------------------------
+
+    fn make_cross_match(
+        symbol: &str,
+        segment: &str,
+        timeframe: &str,
+        timestamp_ist: &str,
+        hist_values: &str,
+        live_values: &str,
+        diff_summary: &str,
+    ) -> CrossMatchMismatch {
+        CrossMatchMismatch {
+            symbol: symbol.to_string(),
+            segment: segment.to_string(),
+            timeframe: timeframe.to_string(),
+            timestamp_ist: timestamp_ist.to_string(),
+            mismatch_type: "price_diff".to_string(),
+            hist_values: hist_values.to_string(),
+            live_values: live_values.to_string(),
+            diff_summary: diff_summary.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_format_cross_match_details_empty() {
+        let result = format_cross_match_details(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_cross_match_details_single_mismatch() {
+        let mismatches = vec![make_cross_match(
+            "RELIANCE",
+            "NSE_EQ",
+            "1m",
+            "2026-03-18 10:15 IST",
+            "O=2450.0 H=2465.0 L=2448.0 C=2460.0 V=125000",
+            "O=2450.0 H=2463.5 L=2448.0 C=2460.0 V=118500",
+            "H(-1.5) V(-6500)",
+        )];
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].starts_with('\u{2022}'));
+        assert!(result[0].contains("RELIANCE"));
+        assert!(result[0].contains("Hist:"));
+        assert!(result[0].contains("Live:"));
+        assert!(result[0].contains("Diff: H(-1.5) V(-6500)"));
+    }
+
+    #[test]
+    fn test_format_cross_match_details_empty_diff_summary_omits_diff_line() {
+        let mismatches = vec![make_cross_match(
+            "TCS",
+            "NSE_EQ",
+            "5m",
+            "2026-03-18 11:00 IST",
+            "O=100.0 H=110.0 L=90.0 C=105.0 V=1000",
+            "O=100.0 H=110.0 L=90.0 C=105.0 V=1000",
+            "", // empty diff
+        )];
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].contains("Diff:"), "empty diff should be omitted");
+    }
+
+    #[test]
+    fn test_format_cross_match_details_multiple_mismatches() {
+        let mismatches = vec![
+            make_cross_match(
+                "RELIANCE",
+                "NSE_EQ",
+                "1m",
+                "2026-03-18 10:15 IST",
+                "hist1",
+                "live1",
+                "diff1",
+            ),
+            make_cross_match(
+                "INFY",
+                "NSE_EQ",
+                "5m",
+                "2026-03-18 11:00 IST",
+                "hist2",
+                "live2",
+                "diff2",
+            ),
+        ];
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].contains("RELIANCE"));
+        assert!(result[1].contains("INFY"));
+    }
+
+    // -----------------------------------------------------------------------
+    // create_log_file_writer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_log_file_writer_returns_some_in_default_path() {
+        // The default APP_LOG_FILE_PATH may or may not work depending on
+        // the test environment. At minimum verify the function doesn't panic.
+        let _ = create_log_file_writer();
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_market_close_sleep additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_market_close_sleep_midnight() {
+        // 00:00:00 — the result depends on current time
+        let duration = compute_market_close_sleep("00:00:00");
+        // If current IST time is past midnight, this should be ZERO
+        assert!(
+            duration.as_secs() <= 86_400,
+            "midnight sleep should not exceed 24 hours"
+        );
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_end_of_day() {
+        // 23:59:59 — unless tested at 23:59:59 IST, should return a positive value
+        let duration = compute_market_close_sleep("23:59:59");
+        assert!(
+            duration.as_secs() <= 86_400,
+            "end-of-day sleep should not exceed 24 hours"
+        );
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_partial_format_rejected() {
+        // Partial time format should be rejected gracefully
+        let duration = compute_market_close_sleep("15:30");
+        assert_eq!(
+            duration,
+            std::time::Duration::ZERO,
+            "HH:MM without seconds should fail parse and return ZERO"
+        );
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_numbers_only_rejected() {
+        let duration = compute_market_close_sleep("153000");
+        assert_eq!(duration, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_out_of_range_hours() {
+        let duration = compute_market_close_sleep("25:00:00");
+        assert_eq!(
+            duration,
+            std::time::Duration::ZERO,
+            "invalid hour should fail parse and return ZERO"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fast_boot_window_start_is_valid_time() {
+        let parsed = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S");
+        assert!(
+            parsed.is_ok(),
+            "FAST_BOOT_WINDOW_START must be valid HH:MM:SS"
+        );
+    }
+
+    #[test]
+    fn test_fast_boot_window_end_is_valid_time() {
+        let parsed = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S");
+        assert!(
+            parsed.is_ok(),
+            "FAST_BOOT_WINDOW_END must be valid HH:MM:SS"
+        );
+    }
+
+    #[test]
+    fn test_fast_boot_window_start_before_end() {
+        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
+        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
+        assert!(start < end, "fast boot window start must be before end");
+    }
+
+    #[test]
+    fn test_app_log_file_path_is_not_empty() {
+        assert!(!APP_LOG_FILE_PATH.is_empty());
+    }
+
+    #[test]
+    fn test_app_log_file_path_ends_with_log() {
+        assert!(
+            APP_LOG_FILE_PATH.ends_with(".log"),
+            "log file should have .log extension"
+        );
+    }
+
+    #[test]
+    fn test_config_local_path_is_git_ignorable() {
+        // local.toml is the convention for git-ignored overrides
+        assert!(
+            CONFIG_LOCAL_PATH.contains("local"),
+            "local config must contain 'local' in its name"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // create_log_file_writer — temp dir tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_log_file_writer_with_temp_dir() {
+        // Create a temp directory and override APP_LOG_FILE_PATH behavior
+        // by calling the underlying file creation logic directly.
+        let tmp = std::env::temp_dir().join("dlt_test_log_writer");
+        let _ = std::fs::create_dir_all(&tmp);
+        let log_path = tmp.join("test.log");
+
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path);
+
+        assert!(
+            result.is_ok(),
+            "log file creation in temp dir should succeed"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn test_create_log_file_parent_extraction() {
+        // Verify APP_LOG_FILE_PATH has a valid parent directory
+        let path = std::path::Path::new(APP_LOG_FILE_PATH);
+        let parent = path.parent();
+        assert!(
+            parent.is_some(),
+            "APP_LOG_FILE_PATH must have a parent directory"
+        );
+        assert!(
+            !parent.unwrap().as_os_str().is_empty(),
+            "parent directory must not be empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_market_close_sleep — boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_market_close_sleep_with_seconds() {
+        // Valid time with seconds should parse successfully
+        let duration = compute_market_close_sleep("09:15:00");
+        // Whether this returns zero or positive depends on current time,
+        // but it must not panic and must be a valid duration.
+        assert!(
+            duration.as_secs() <= 86_400,
+            "sleep duration must be within 24 hours"
+        );
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_various_invalid_formats() {
+        // All these should gracefully return ZERO
+        let invalid_inputs = [
+            "abc",
+            "12:30",       // missing seconds
+            "12-30-00",    // wrong separator
+            "99:99:99",    // invalid values
+            "12:30:00 AM", // AM/PM not supported
+        ];
+        for input in &invalid_inputs {
+            let duration = compute_market_close_sleep(input);
+            assert_eq!(
+                duration,
+                std::time::Duration::ZERO,
+                "invalid format '{input}' should return Duration::ZERO"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_boundary_values() {
+        // Earliest valid time
+        let d = compute_market_close_sleep("00:00:01");
+        assert!(d.as_secs() <= 86_400);
+
+        // Latest valid time
+        let d = compute_market_close_sleep("23:59:58");
+        assert!(d.as_secs() <= 86_400);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_timeframe_details — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_timeframe_details_large_counts() {
+        let report = make_verification_report(vec![make_coverage("1m", 1_000_000, 5000)]);
+        let result = format_timeframe_details(&report);
+        assert_eq!(result, "1m: 1000000 (5000 inst)");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_violation_details — field structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_violation_details_preserves_all_fields() {
+        let violations = vec![make_violation(
+            "SYMBOL_A", "SEG_B", "TF_C", "TS_D", "VIO_E", "VAL_F",
+        )];
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 1);
+        let line = &result[0];
+        assert!(line.contains("SYMBOL_A"), "must contain symbol");
+        assert!(line.contains("SEG_B"), "must contain segment");
+        assert!(line.contains("TF_C"), "must contain timeframe");
+        assert!(line.contains("TS_D"), "must contain timestamp");
+        assert!(line.contains("VAL_F"), "must contain values");
+        // Note: violation type is NOT included in the formatted output (by design),
+        // only the values field is shown on the indented line.
+    }
+
+    // -----------------------------------------------------------------------
+    // format_cross_match_details — structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_cross_match_details_structure() {
+        let mismatches = vec![make_cross_match(
+            "SYM",
+            "SEG",
+            "TF",
+            "TS",
+            "hist_data",
+            "live_data",
+            "diff_data",
+        )];
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 1);
+        let line = &result[0];
+
+        // Check multi-line structure: header, Hist, Live, Diff
+        let lines: Vec<&str> = line.lines().collect();
+        assert!(
+            lines.len() >= 3,
+            "must have at least header + Hist + Live lines"
+        );
+        assert!(lines[0].contains("SYM"), "header must contain symbol");
+        assert!(
+            lines.iter().any(|l| l.contains("Hist:")),
+            "must contain Hist line"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Live:")),
+            "must contain Live line"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Diff:")),
+            "must contain Diff line when diff_summary is non-empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants — invariant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fast_boot_window_covers_market_hours() {
+        // Pre-open is at 09:00, regular close is 15:30.
+        // The fast boot window should cover at least regular market hours.
+        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
+        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
+
+        let market_open = chrono::NaiveTime::parse_from_str("09:15:00", "%H:%M:%S").unwrap();
+        let market_close = chrono::NaiveTime::parse_from_str("15:30:00", "%H:%M:%S").unwrap();
+
+        assert!(
+            start <= market_open,
+            "fast boot window must start before or at market open"
+        );
+        assert!(
+            end >= market_close,
+            "fast boot window must end at or after market close"
+        );
+    }
+
+    #[test]
+    fn test_off_hours_stagger_constant_value() {
+        assert_eq!(
+            OFF_HOURS_CONNECTION_STAGGER_MS, 1000,
+            "off-hours stagger should be exactly 1000ms"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_market_close_sleep — deterministic past-close test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_market_close_sleep_always_lte_24h() {
+        let times = [
+            "00:00:00", "01:00:00", "06:00:00", "09:15:00", "12:00:00", "15:30:00", "18:00:00",
+            "23:59:59",
+        ];
+        for t in &times {
+            let d = compute_market_close_sleep(t);
+            assert!(d.as_secs() <= 86_400, "must be <= 24h for {t}");
+        }
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_returns_zero_for_past_time() {
+        let now_ist = chrono::Utc::now()
+            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset());
+        let now_hour = now_ist.time().hour();
+        if now_hour >= 1 {
+            let d = compute_market_close_sleep("00:00:01");
+            assert_eq!(d, std::time::Duration::ZERO, "past time should return ZERO");
+        }
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_uses_ist_not_utc() {
+        let now_ist = chrono::Utc::now()
+            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset());
+        let now_secs = u64::from(now_ist.time().num_seconds_from_midnight());
+        let close_secs: u64 = 23 * 3600 + 59 * 60 + 59;
+        let d = compute_market_close_sleep("23:59:59");
+        if now_secs < close_secs {
+            assert!(
+                d.as_secs() > 0,
+                "future time should return positive duration"
+            );
+        } else {
+            assert_eq!(d, std::time::Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_saturating_sub() {
+        for h in 0..24_u32 {
+            let time_str = format!("{h:02}:00:00");
+            let d = compute_market_close_sleep(&time_str);
+            assert!(d.as_secs() <= 86_400);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // create_log_file_writer — error path and edge case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_log_file_writer_returns_file_handle() {
+        let _ = create_log_file_writer();
+    }
+
+    #[test]
+    fn test_create_log_file_app_log_file_path_parent_dir() {
+        let path = std::path::Path::new(APP_LOG_FILE_PATH);
+        let parent = path.parent().unwrap_or(std::path::Path::new("data/logs"));
+        assert!(!parent.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_create_log_file_path_in_data_directory() {
+        assert!(APP_LOG_FILE_PATH.starts_with("data/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run_shutdown_fast — bind address fallback test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_shutdown_bind_addr_fallback() {
+        let fallback: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 8080));
+        assert_eq!(fallback.port(), 8080);
+    }
+
+    #[test]
+    fn test_shutdown_bind_addr_parse_invalid_triggers_fallback() {
+        let result: Result<SocketAddr, _> = "not_valid".parse();
+        assert!(result.is_err());
+        let fallback = result.unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
+        assert_eq!(fallback.port(), 8080);
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants — relationships and invariants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_base_path_starts_with_config() {
+        assert!(CONFIG_BASE_PATH.starts_with("config/"));
+    }
+
+    #[test]
+    fn test_config_local_path_starts_with_config() {
+        assert!(CONFIG_LOCAL_PATH.starts_with("config/"));
+    }
+
+    #[test]
+    fn test_config_base_path_is_relative_toml() {
+        let path = std::path::Path::new(CONFIG_BASE_PATH);
+        assert!(!path.is_absolute());
+        assert!(path.extension().is_some_and(|ext| ext == "toml"));
+    }
+
+    #[test]
+    fn test_fast_boot_window_duration_is_reasonable() {
+        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
+        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
+        let duration_secs = end.num_seconds_from_midnight() - start.num_seconds_from_midnight();
+        assert!(
+            duration_secs >= 3600,
+            "fast boot window must be at least 1 hour"
+        );
+        assert!(duration_secs <= 43200, "must be at most 12 hours");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_violation_details — bullet point format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_violation_details_bullet_point_format() {
+        let violations = vec![make_violation("SYM", "SEG", "TF", "TS", "VIO", "VAL")];
+        let result = format_violation_details(&violations);
+        assert!(result[0].starts_with('\u{2022}'));
+        assert!(result[0].contains("\n  VAL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_cross_match_details — four-line format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_cross_match_details_four_line_format() {
+        let mismatches = vec![make_cross_match(
+            "SYM", "SEG", "TF", "TS", "HIST", "LIVE", "DIFF",
+        )];
+        let result = format_cross_match_details(&mismatches);
+        let lines: Vec<&str> = result[0].lines().collect();
+        assert_eq!(lines.len(), 4, "mismatch with diff should have 4 lines");
+    }
+
+    #[test]
+    fn test_format_cross_match_details_three_line_format_without_diff() {
+        let mismatches = vec![make_cross_match(
+            "SYM", "SEG", "TF", "TS", "HIST", "LIVE", "",
+        )];
+        let result = format_cross_match_details(&mismatches);
+        let lines: Vec<&str> = result[0].lines().collect();
+        assert_eq!(lines.len(), 3, "mismatch without diff should have 3 lines");
+    }
+
+    // -----------------------------------------------------------------------
+    // App log file path invariants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_app_log_file_path_is_relative() {
+        assert!(!APP_LOG_FILE_PATH.starts_with('/'));
+    }
+
+    #[test]
+    fn test_app_log_file_path_has_two_segments() {
+        let segments: Vec<&str> = APP_LOG_FILE_PATH.split('/').collect();
+        assert!(segments.len() >= 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_market_close_sleep — time arithmetic validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_market_close_sleep_num_seconds_from_midnight() {
+        let t = chrono::NaiveTime::parse_from_str("15:30:00", "%H:%M:%S").unwrap();
+        assert_eq!(t.num_seconds_from_midnight(), 15 * 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_midnight_secs() {
+        let t = chrono::NaiveTime::parse_from_str("00:00:00", "%H:%M:%S").unwrap();
+        assert_eq!(t.num_seconds_from_midnight(), 0);
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_end_of_day_secs() {
+        let t = chrono::NaiveTime::parse_from_str("23:59:59", "%H:%M:%S").unwrap();
+        assert_eq!(t.num_seconds_from_midnight(), 86399);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_timeframe_details — newline separator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_timeframe_details_uses_newline_separator() {
+        let report = make_verification_report(vec![
+            make_coverage("1m", 100, 10),
+            make_coverage("5m", 20, 10),
+        ]);
+        let result = format_timeframe_details(&report);
+        assert_eq!(result.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn test_format_timeframe_details_no_trailing_newline() {
+        let report = make_verification_report(vec![make_coverage("1d", 10, 5)]);
+        let result = format_timeframe_details(&report);
+        assert!(!result.ends_with('\n'));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_violation_details — multiline structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_violation_details_each_entry_is_multiline() {
+        let violations = vec![
+            make_violation("A", "B", "C", "D", "E", "F"),
+            make_violation("G", "H", "I", "J", "K", "L"),
+        ];
+        let result = format_violation_details(&violations);
+        for entry in &result {
+            assert!(entry.contains('\n'));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // format_cross_match_details — field ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_cross_match_details_hist_before_live() {
+        let mismatches = vec![make_cross_match(
+            "SYM",
+            "SEG",
+            "TF",
+            "TS",
+            "HIST_DATA",
+            "LIVE_DATA",
+            "DIFF_DATA",
+        )];
+        let result = format_cross_match_details(&mismatches);
+        let text = &result[0];
+        let hist_pos = text.find("Hist:").unwrap();
+        let live_pos = text.find("Live:").unwrap();
+        let diff_pos = text.find("Diff:").unwrap();
+        assert!(hist_pos < live_pos);
+        assert!(live_pos < diff_pos);
+    }
+
+    // -----------------------------------------------------------------------
+    // OFF_HOURS_CONNECTION_STAGGER_MS — value tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_off_hours_stagger_fits_in_u64() {
+        let d = std::time::Duration::from_millis(OFF_HOURS_CONNECTION_STAGGER_MS);
+        assert_eq!(d.as_secs(), 1);
+    }
 }

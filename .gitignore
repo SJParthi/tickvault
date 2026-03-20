@@ -108,3 +108,5 @@ data/instrument-cache/
 *.bak
 mutants.out/
 mutants.out.old/
+target/llvm-cov-target/
+.claude/worktrees/

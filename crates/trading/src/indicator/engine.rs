@@ -754,4 +754,94 @@ mod tests {
             snap.adx
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Out-of-bounds security_id returns default snapshot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_out_of_bounds_security_id_preserves_id_in_snapshot() {
+        let mut engine = default_engine();
+        // Use a security_id that is >= MAX_INDICATOR_INSTRUMENTS
+        let large_id = MAX_INDICATOR_INSTRUMENTS as u32;
+        let tick = ParsedTick {
+            security_id: large_id,
+            last_traded_price: 500.0,
+            day_high: 510.0,
+            day_low: 490.0,
+            volume: 10000,
+            ..Default::default()
+        };
+
+        let snap = engine.update(&tick);
+        assert_eq!(snap.security_id, large_id);
+        assert!(!snap.is_warm, "OOB security_id must not be warm");
+        assert_eq!(snap.ema_fast, 0.0, "OOB must return default ema_fast");
+        assert_eq!(snap.rsi, 0.0, "OOB must return default rsi");
+        assert_eq!(snap.atr, 0.0, "OOB must return default atr");
+        assert_eq!(snap.macd_line, 0.0, "OOB must return default macd_line");
+        assert_eq!(snap.sma, 0.0, "OOB must return default sma");
+        assert_eq!(snap.vwap, 0.0, "OOB must return default vwap");
+    }
+
+    #[test]
+    fn test_security_id_zero_is_valid() {
+        let mut engine = default_engine();
+        let tick = make_tick(0, 100.0, 105.0, 95.0, 1000);
+        let snap = engine.update(&tick);
+        // security_id 0 is within bounds and should work normally
+        assert_eq!(snap.security_id, 0);
+        assert!((snap.ema_fast - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_max_valid_security_id() {
+        let mut engine = default_engine();
+        let max_valid = (MAX_INDICATOR_INSTRUMENTS - 1) as u32;
+        let tick = make_tick(max_valid, 200.0, 210.0, 190.0, 500);
+        let snap = engine.update(&tick);
+        assert_eq!(snap.security_id, max_valid);
+        assert!((snap.ema_fast - 200.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Warmup counter saturation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_warmup_counter_saturates_at_u16_max() {
+        let mut engine = default_engine();
+        let sid = 100_usize;
+
+        // Manually set warmup_count close to u16::MAX
+        engine.states[sid].warmup_count = u16::MAX - 1;
+
+        // One more tick should bring it to u16::MAX
+        let tick = make_tick(100, 100.0, 105.0, 95.0, 1000);
+        engine.update(&tick);
+        assert_eq!(engine.states[sid].warmup_count, u16::MAX);
+
+        // Another tick should remain at u16::MAX (saturating)
+        engine.update(&tick);
+        assert_eq!(
+            engine.states[sid].warmup_count,
+            u16::MAX,
+            "warmup_count must saturate at u16::MAX, not overflow"
+        );
+    }
+
+    #[test]
+    fn test_warmup_counter_at_max_still_produces_valid_indicators() {
+        let mut engine = default_engine();
+        let sid = 100_usize;
+
+        // Set warmup to max — is_warm should be true
+        engine.states[sid].warmup_count = u16::MAX;
+
+        let tick = make_tick(100, 100.0, 105.0, 95.0, 1000);
+        let snap = engine.update(&tick);
+        assert!(snap.is_warm, "u16::MAX warmup_count must be warm");
+        // EMA should still update correctly
+        assert!(snap.ema_fast > 0.0);
+    }
 }

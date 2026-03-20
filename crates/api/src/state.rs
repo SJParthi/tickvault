@@ -332,4 +332,174 @@ mod tests {
         // questdb_reachable stays false
         assert_eq!(health.overall_status(), "degraded");
     }
+
+    // -------------------------------------------------------------------
+    // Default impl — must behave identically to new()
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_default_matches_new() {
+        let from_new = SystemHealthStatus::new();
+        let from_default = SystemHealthStatus::default();
+
+        assert_eq!(
+            from_new.websocket_connections(),
+            from_default.websocket_connections()
+        );
+        assert_eq!(from_new.pipeline_active(), from_default.pipeline_active());
+        assert_eq!(
+            from_new.questdb_reachable(),
+            from_default.questdb_reachable()
+        );
+        assert_eq!(from_new.token_valid(), from_default.token_valid());
+        assert_eq!(from_new.boot_epoch_secs(), from_default.boot_epoch_secs());
+        assert_eq!(from_new.overall_status(), from_default.overall_status());
+    }
+
+    // -------------------------------------------------------------------
+    // SharedAppState accessor coverage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_shared_app_state_dhan_config_accessor() {
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+            empty_constituency(),
+            test_health_status(),
+        );
+        assert_eq!(state.dhan_config().websocket_url, "wss://api-feed.dhan.co");
+        assert_eq!(state.dhan_config().max_websocket_connections, 5);
+    }
+
+    #[test]
+    fn test_shared_app_state_instrument_config_accessor() {
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+            empty_constituency(),
+            test_health_status(),
+        );
+        assert_eq!(state.instrument_config().csv_download_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_shared_app_state_rebuild_in_progress_accessor() {
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+            empty_constituency(),
+            test_health_status(),
+        );
+        // Initially false
+        assert!(!state.rebuild_in_progress().load(Ordering::SeqCst));
+        // Can set
+        state.rebuild_in_progress().store(true, Ordering::SeqCst);
+        assert!(state.rebuild_in_progress().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_shared_app_state_health_status_accessor() {
+        let health = test_health_status();
+        health.set_token_valid(true);
+        health.set_websocket_connections(2);
+        health.set_questdb_reachable(true);
+
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+            empty_constituency(),
+            health,
+        );
+        assert_eq!(state.health_status().overall_status(), "healthy");
+        assert_eq!(state.health_status().websocket_connections(), 2);
+    }
+
+    #[test]
+    fn test_shared_app_state_top_movers_snapshot_accessor() {
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+            empty_constituency(),
+            test_health_status(),
+        );
+        let snapshot = state.top_movers_snapshot();
+        assert!(snapshot.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_shared_app_state_constituency_map_accessor() {
+        let state = SharedAppState::new(
+            QuestDbConfig {
+                host: "test".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            empty_snapshot(),
+            empty_constituency(),
+            test_health_status(),
+        );
+        let map = state.constituency_map();
+        assert!(map.read().unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus: toggle operations
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_toggle_pipeline_active() {
+        let health = SystemHealthStatus::new();
+        assert!(!health.pipeline_active());
+        health.set_pipeline_active(true);
+        assert!(health.pipeline_active());
+        health.set_pipeline_active(false);
+        assert!(!health.pipeline_active());
+    }
+
+    #[test]
+    fn test_system_health_status_boot_epoch_secs_set_and_get() {
+        let health = SystemHealthStatus::default();
+        assert_eq!(health.boot_epoch_secs(), 0);
+        health.set_boot_epoch_secs(1_700_000_000);
+        assert_eq!(health.boot_epoch_secs(), 1_700_000_000);
+    }
 }

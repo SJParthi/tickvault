@@ -2419,4 +2419,141 @@ mod tests {
             .expect("original handle should see clone's update");
         assert_eq!(loaded.access_token().expose_secret(), "shared-jwt-v2");
     }
+
+    // -----------------------------------------------------------------------
+    // make_test_manager — struct field validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_test_manager_has_correct_urls() {
+        let manager = make_test_manager(None);
+        assert_eq!(manager.rest_api_base_url, "https://api.example.com");
+        assert_eq!(manager.auth_base_url, "https://auth.example.com");
+    }
+
+    #[test]
+    fn test_make_test_manager_has_correct_config() {
+        let manager = make_test_manager(None);
+        assert_eq!(manager.token_config.refresh_before_expiry_hours, 1);
+        assert_eq!(manager.token_config.token_validity_hours, 24);
+        assert_eq!(manager.network_config.request_timeout_ms, 5000);
+        assert_eq!(manager.network_config.retry_max_attempts, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // token_handle() — verify it returns the inner handle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_method_returns_shared_reference() {
+        let data = DhanAuthResponseData {
+            access_token: "method-test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        let handle = manager.token_handle();
+
+        let guard = handle.load();
+        let state = guard.as_ref().as_ref().expect("should have token");
+        assert_eq!(state.access_token().expose_secret(), "method-test-jwt");
+    }
+
+    // -----------------------------------------------------------------------
+    // time_until_next_refresh — expired token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_until_next_refresh_expired_token_returns_zero() {
+        // Create a token with 0 expiry (already expired)
+        let data = DhanAuthResponseData {
+            access_token: "expired-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0, // already expired
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+        let duration = manager.time_until_next_refresh();
+        assert_eq!(duration, Duration::ZERO, "expired token should return ZERO");
+    }
+
+    // -----------------------------------------------------------------------
+    // current_expiry_display — various token states
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_current_expiry_display_short_lived_token() {
+        let data = DhanAuthResponseData {
+            access_token: "short-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 60, // 1 minute
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+        let display = manager.current_expiry_display();
+        assert_ne!(display, "no token");
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — both HTTPS checks
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_both_http_urls_rejected() {
+        let dhan_config = DhanConfig {
+            websocket_url: "wss://example.com".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
+            rest_api_base_url: "http://api.dhan.co".to_string(),
+            auth_base_url: "http://auth.dhan.co".to_string(),
+            instrument_csv_url: "https://example.com/instruments.csv".to_string(),
+            instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
+            max_instruments_per_connection: 100,
+            max_websocket_connections: 5,
+        };
+        let token_config = TokenConfig {
+            refresh_before_expiry_hours: 1,
+            token_validity_hours: 24,
+        };
+        let network_config = NetworkConfig {
+            request_timeout_ms: 5000,
+            websocket_connect_timeout_ms: 5000,
+            retry_initial_delay_ms: 100,
+            retry_max_delay_ms: 1000,
+            retry_max_attempts: 3,
+        };
+
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
+        // Should fail on the first check (rest_api_base_url)
+        assert!(result.is_err());
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err_msg.contains("rest_api_base_url"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Token handle — store None after having a token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_store_none_clears_state() {
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+        let data = DhanAuthResponseData {
+            access_token: "will-be-cleared".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle.store(Arc::new(Some(TokenState::from_response(&data))));
+        assert!(handle.load().as_ref().is_some());
+
+        handle.store(Arc::new(None));
+        assert!(handle.load().as_ref().is_none(), "None store must clear");
+    }
 }

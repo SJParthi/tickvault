@@ -570,4 +570,172 @@ mod tests {
         assert_eq!(map.get(&ExchangeSegment::BseFno), Some(&"bse_fno"));
         assert_eq!(map.get(&ExchangeSegment::IdxI), None);
     }
+
+    // --- InstrumentType::dhan_api_instrument_type ---
+
+    #[test]
+    fn test_dhan_api_instrument_type_index() {
+        assert_eq!(
+            InstrumentType::Index.dhan_api_instrument_type(true),
+            "INDEX"
+        );
+        assert_eq!(
+            InstrumentType::Index.dhan_api_instrument_type(false),
+            "INDEX"
+        );
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_equity() {
+        assert_eq!(
+            InstrumentType::Equity.dhan_api_instrument_type(true),
+            "EQUITY"
+        );
+        assert_eq!(
+            InstrumentType::Equity.dhan_api_instrument_type(false),
+            "EQUITY"
+        );
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_futidx() {
+        assert_eq!(
+            InstrumentType::Future.dhan_api_instrument_type(true),
+            "FUTIDX"
+        );
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_futstk() {
+        assert_eq!(
+            InstrumentType::Future.dhan_api_instrument_type(false),
+            "FUTSTK"
+        );
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_optidx() {
+        assert_eq!(
+            InstrumentType::Option.dhan_api_instrument_type(true),
+            "OPTIDX"
+        );
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_optstk() {
+        assert_eq!(
+            InstrumentType::Option.dhan_api_instrument_type(false),
+            "OPTSTK"
+        );
+    }
+
+    // --- Archived From conversions ---
+
+    #[test]
+    fn test_archived_exchange_from_roundtrip() {
+        use crate::instrument_types::{FnoUnderlying, UnderlyingKind};
+        // Use a struct that contains Exchange to get ArchivedExchange
+        let underlying = FnoUnderlying {
+            underlying_symbol: "TEST".to_string(),
+            underlying_security_id: 1,
+            price_feed_security_id: 2,
+            price_feed_segment: ExchangeSegment::NseEquity,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: UnderlyingKind::Stock,
+            lot_size: 100,
+            contract_count: 0,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&underlying).unwrap();
+        let archived = rkyv::access::<
+            crate::instrument_types::ArchivedFnoUnderlying,
+            rkyv::rancor::Error,
+        >(&bytes)
+        .unwrap();
+        assert_eq!(
+            ExchangeSegment::from(&archived.price_feed_segment),
+            ExchangeSegment::NseEquity
+        );
+        assert_eq!(
+            ExchangeSegment::from(&archived.derivative_segment),
+            ExchangeSegment::NseFno
+        );
+    }
+
+    #[test]
+    fn test_archived_exchange_segment_from_all_variants() {
+        use crate::instrument_types::{FnoUnderlying, UnderlyingKind};
+        let segments = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        for seg in segments {
+            let underlying = FnoUnderlying {
+                underlying_symbol: "T".to_string(),
+                underlying_security_id: 1,
+                price_feed_security_id: 2,
+                price_feed_segment: seg,
+                derivative_segment: seg,
+                kind: UnderlyingKind::Stock,
+                lot_size: 1,
+                contract_count: 0,
+            };
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&underlying).unwrap();
+            let archived = rkyv::access::<
+                crate::instrument_types::ArchivedFnoUnderlying,
+                rkyv::rancor::Error,
+            >(&bytes)
+            .unwrap();
+            assert_eq!(ExchangeSegment::from(&archived.price_feed_segment), seg);
+        }
+    }
+
+    #[test]
+    fn test_archived_option_type_from_roundtrip() {
+        use crate::instrument_types::{DerivativeContract, DhanInstrumentKind};
+        for opt_type in [OptionType::Call, OptionType::Put] {
+            let contract = DerivativeContract {
+                security_id: 1,
+                underlying_symbol: "T".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                strike_price: 18000.0,
+                option_type: Some(opt_type),
+                lot_size: 25,
+                tick_size: 0.05,
+                symbol_name: "T".to_string(),
+                display_name: "T".to_string(),
+            };
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+            let archived = rkyv::access::<
+                crate::instrument_types::ArchivedDerivativeContract,
+                rkyv::rancor::Error,
+            >(&bytes)
+            .unwrap();
+            let recovered = archived.option_type.as_ref().map(OptionType::from);
+            assert_eq!(recovered, Some(opt_type));
+        }
+    }
+
+    // --- From<&ArchivedExchange> for Exchange ---
+
+    #[test]
+    fn test_archived_exchange_to_exchange_roundtrip() {
+        // Exercises From<&ArchivedExchange> for Exchange (lines 282-288)
+        for exchange in [
+            Exchange::NationalStockExchange,
+            Exchange::BombayStockExchange,
+        ] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&exchange).unwrap();
+            let archived = rkyv::access::<ArchivedExchange, rkyv::rancor::Error>(&bytes).unwrap();
+            let recovered = Exchange::from(archived);
+            assert_eq!(recovered, exchange);
+        }
+    }
 }

@@ -357,4 +357,223 @@ mod tests {
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.tracked_securities(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Warmup boundary: exact threshold tick
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn warmup_boundary_exact_threshold_tick_still_suppressed() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Feed exactly TICK_GAP_MIN_TICKS_BEFORE_ACTIVE ticks with large gaps.
+        // The tick_count goes from 1..=threshold; tick at threshold should still be suppressed.
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            let result = tracker.record_tick(1001, base_ts + i * 1000); // 1000s gaps
+            assert_eq!(
+                result,
+                TickGapResult::Ok,
+                "warmup tick {} must be Ok",
+                i + 1
+            );
+        }
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+    }
+
+    #[test]
+    fn warmup_boundary_first_post_warmup_tick_can_detect_gap() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Fill warmup with 1-sec intervals
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        // The next tick (TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1) is the first
+        // post-warmup tick that CAN detect a gap.
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        assert!(
+            matches!(result, TickGapResult::Warning { .. }),
+            "first post-warmup tick must detect warning gap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter saturation at u64::MAX
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn warning_counter_saturates_at_u64_max() {
+        let mut tracker = TickGapTracker::new(10);
+        // Pre-set counter to near max
+        tracker.total_warnings = u64::MAX - 1;
+
+        let base_ts = 1_700_000_000;
+        // Fill warmup
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        // Trigger warning
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts);
+        assert_eq!(tracker.total_warnings(), u64::MAX);
+
+        // Another warning should saturate at MAX, not overflow
+        let gap_ts2 = gap_ts + TICK_GAP_ALERT_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts2);
+        assert_eq!(tracker.total_warnings(), u64::MAX);
+    }
+
+    #[test]
+    fn error_counter_saturates_at_u64_max() {
+        let mut tracker = TickGapTracker::new(10);
+        tracker.total_errors = u64::MAX - 1;
+
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts);
+        assert_eq!(tracker.total_errors(), u64::MAX);
+
+        let gap_ts2 = gap_ts + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts2);
+        assert_eq!(tracker.total_errors(), u64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tick count saturation at u32::MAX
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tick_count_saturates_at_u32_max() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Insert first tick to create the entry
+        tracker.record_tick(1001, base_ts);
+
+        // Set tick_count to near max
+        tracker.states.get_mut(&1001).unwrap().tick_count = u32::MAX - 1;
+
+        // Two more ticks should saturate at MAX, not overflow
+        tracker.record_tick(1001, base_ts + 1);
+        assert_eq!(tracker.states.get(&1001).unwrap().tick_count, u32::MAX);
+
+        tracker.record_tick(1001, base_ts + 2);
+        assert_eq!(tracker.states.get(&1001).unwrap().tick_count, u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: TickGapResult variants, gap between warning and error
+    // thresholds, many securities tracking, reset after gaps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gap_between_warning_and_error_threshold_is_warning() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Gap exactly at (alert + error) / 2 — should be Warning not Error
+        let mid_gap = (TICK_GAP_ALERT_THRESHOLD_SECS + TICK_GAP_ERROR_THRESHOLD_SECS) / 2;
+        if mid_gap >= TICK_GAP_ALERT_THRESHOLD_SECS && mid_gap < TICK_GAP_ERROR_THRESHOLD_SECS {
+            let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + mid_gap;
+            let result = tracker.record_tick(1001, gap_ts);
+            assert!(
+                matches!(result, TickGapResult::Warning { .. }),
+                "gap between alert and error threshold must be Warning"
+            );
+        }
+    }
+
+    #[test]
+    fn gap_one_below_error_threshold_is_warning() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS - 1;
+        let result = tracker.record_tick(1001, gap_ts);
+        // If error - 1 >= alert, it should be Warning
+        if TICK_GAP_ERROR_THRESHOLD_SECS - 1 >= TICK_GAP_ALERT_THRESHOLD_SECS {
+            assert!(matches!(result, TickGapResult::Warning { .. }));
+        }
+    }
+
+    #[test]
+    fn many_securities_all_tracked() {
+        let mut tracker = TickGapTracker::new(100);
+        let base_ts = 1_700_000_000;
+        for sid in 1..=50 {
+            tracker.record_tick(sid, base_ts);
+        }
+        assert_eq!(tracker.tracked_securities(), 50);
+    }
+
+    #[test]
+    fn reset_after_warnings_clears_counters() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Generate a warning
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts);
+        assert_eq!(tracker.total_warnings(), 1);
+
+        tracker.reset();
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+        assert_eq!(tracker.tracked_securities(), 0);
+    }
+
+    #[test]
+    fn tick_gap_result_equality() {
+        assert_eq!(TickGapResult::Ok, TickGapResult::Ok);
+        assert_eq!(
+            TickGapResult::Warning { gap_secs: 10 },
+            TickGapResult::Warning { gap_secs: 10 }
+        );
+        assert_eq!(
+            TickGapResult::Error { gap_secs: 60 },
+            TickGapResult::Error { gap_secs: 60 }
+        );
+        assert_ne!(TickGapResult::Ok, TickGapResult::Warning { gap_secs: 10 });
+        assert_ne!(
+            TickGapResult::Warning { gap_secs: 10 },
+            TickGapResult::Error { gap_secs: 10 }
+        );
+    }
+
+    #[test]
+    fn tick_gap_result_debug() {
+        let ok = format!("{:?}", TickGapResult::Ok);
+        assert_eq!(ok, "Ok");
+        let warn = format!("{:?}", TickGapResult::Warning { gap_secs: 15 });
+        assert!(warn.contains("Warning"));
+        assert!(warn.contains("15"));
+    }
+
+    #[test]
+    fn same_timestamp_after_warmup_is_ok() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Same timestamp as last → gap_secs = 0 → Ok
+        let result = tracker.record_tick(1001, base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE);
+        assert_eq!(result, TickGapResult::Ok);
+    }
 }
