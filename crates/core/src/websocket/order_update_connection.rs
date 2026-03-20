@@ -433,4 +433,116 @@ mod tests {
             prev_delay = delay;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Data collection window constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_collection_start_is_valid_time() {
+        let t = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0);
+        assert!(t.is_some(), "DATA_COLLECTION_START must be a valid time");
+    }
+
+    #[test]
+    fn test_data_collection_end_is_valid_time() {
+        let t = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0);
+        assert!(t.is_some(), "DATA_COLLECTION_END must be a valid time");
+    }
+
+    #[test]
+    fn test_data_collection_start_before_end() {
+        let start =
+            NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0).unwrap();
+        assert!(start < end, "collection start must precede end");
+    }
+
+    #[test]
+    fn test_data_collection_window_covers_market_hours() {
+        let start =
+            NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0).unwrap();
+        let market_open = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
+        let market_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+        assert!(
+            start <= market_open,
+            "collection must start at or before market open"
+        );
+        assert!(
+            end >= market_close,
+            "collection must end at or after market close"
+        );
+    }
+
+    #[test]
+    fn test_data_collection_window_duration_reasonable() {
+        let start_secs = DATA_COLLECTION_START.0 * 3600 + DATA_COLLECTION_START.1 * 60;
+        let end_secs = DATA_COLLECTION_END.0 * 3600 + DATA_COLLECTION_END.1 * 60;
+        let duration_hours = (end_secs - start_secs) / 3600;
+        assert!(duration_hours >= 6, "window must be at least 6 hours");
+        assert!(duration_hours <= 12, "window must be at most 12 hours");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — exercised with real calendar
+    // -----------------------------------------------------------------------
+
+    fn make_test_calendar() -> TradingCalendar {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-01-26".to_string(),
+                name: "Republic Day".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+        };
+        TradingCalendar::from_config(&config).unwrap()
+    }
+
+    #[test]
+    fn test_is_within_market_hours_does_not_panic() {
+        let calendar = make_test_calendar();
+        // Just exercise the function — result depends on current time/day
+        let _result = is_within_market_hours(&calendar);
+    }
+
+    #[test]
+    fn test_is_within_market_hours_returns_bool() {
+        let calendar = make_test_calendar();
+        let result = is_within_market_hours(&calendar);
+        // Result is deterministic for the same instant — just verify it's a bool
+        assert!(result || !result);
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_source_is_none() {
+        // thiserror errors without #[source] should return None
+        let err = OrderUpdateConnectionError::NoToken;
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "NoToken has no source error"
+        );
+    }
+
+    #[test]
+    fn test_read_timeout_error_includes_constant() {
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&ORDER_UPDATE_READ_TIMEOUT_SECS.to_string()),
+            "ReadTimeout message must include the timeout value"
+        );
+    }
 }

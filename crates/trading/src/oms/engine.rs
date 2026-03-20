@@ -1489,4 +1489,145 @@ mod tests {
             "CB must be open after enough non-rate-limit failures"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // validate_order_fields tests
+    // -----------------------------------------------------------------------
+
+    fn make_place_order(
+        order_type: OrderType,
+        price: f64,
+        trigger_price: f64,
+    ) -> PlaceOrderRequest {
+        PlaceOrderRequest {
+            security_id: 49081,
+            transaction_type: TransactionType::Buy,
+            order_type,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price,
+            trigger_price,
+            lot_size: 50,
+        }
+    }
+
+    #[test]
+    fn test_validate_order_fields_market_price_zero_ok() {
+        let req = make_place_order(OrderType::Market, 0.0, 0.0);
+        assert!(validate_order_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_fields_market_price_nonzero_rejected() {
+        let req = make_place_order(OrderType::Market, 100.0, 0.0);
+        let err = validate_order_fields(&req).unwrap_err();
+        assert!(
+            matches!(err, OmsError::RiskRejected { .. }),
+            "MARKET with price != 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_order_fields_limit_price_nonzero_ok() {
+        let req = make_place_order(OrderType::Limit, 250.50, 0.0);
+        assert!(validate_order_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_fields_stop_loss_trigger_zero_rejected() {
+        let req = make_place_order(OrderType::StopLoss, 100.0, 0.0);
+        let err = validate_order_fields(&req).unwrap_err();
+        assert!(matches!(err, OmsError::RiskRejected { .. }));
+    }
+
+    #[test]
+    fn test_validate_order_fields_stop_loss_market_trigger_zero_rejected() {
+        let req = make_place_order(OrderType::StopLossMarket, 0.0, 0.0);
+        let err = validate_order_fields(&req).unwrap_err();
+        assert!(matches!(err, OmsError::RiskRejected { .. }));
+    }
+
+    #[test]
+    fn test_validate_order_fields_stop_loss_with_trigger_ok() {
+        let req = make_place_order(OrderType::StopLoss, 100.0, 99.0);
+        assert!(validate_order_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_fields_stop_loss_market_with_trigger_ok() {
+        let req = make_place_order(OrderType::StopLossMarket, 0.0, 99.0);
+        assert!(validate_order_fields(&req).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_modify_fields tests
+    // -----------------------------------------------------------------------
+
+    fn make_modify_order(
+        order_type: OrderType,
+        price: f64,
+        trigger_price: f64,
+    ) -> ModifyOrderRequest {
+        ModifyOrderRequest {
+            order_type,
+            quantity: 50,
+            price,
+            trigger_price,
+            disclosed_quantity: 0,
+            validity: OrderValidity::Day,
+        }
+    }
+
+    #[test]
+    fn test_validate_modify_fields_market_price_zero_ok() {
+        let req = make_modify_order(OrderType::Market, 0.0, 0.0);
+        assert!(validate_modify_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_market_price_nonzero_rejected() {
+        let req = make_modify_order(OrderType::Market, 100.0, 0.0);
+        assert!(validate_modify_fields(&req).is_err());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_stop_loss_trigger_zero_rejected() {
+        let req = make_modify_order(OrderType::StopLoss, 100.0, 0.0);
+        assert!(validate_modify_fields(&req).is_err());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_limit_ok() {
+        let req = make_modify_order(OrderType::Limit, 250.50, 0.0);
+        assert!(validate_modify_fields(&req).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // now_epoch_us tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_now_epoch_us_returns_positive() {
+        let ts = now_epoch_us();
+        assert!(ts > 0, "epoch microseconds must be positive");
+    }
+
+    #[test]
+    fn test_now_epoch_us_is_reasonable() {
+        let ts = now_epoch_us();
+        // After 2025-01-01 in microseconds
+        let min_expected = 1_735_689_600_000_000_i64;
+        assert!(
+            ts > min_expected,
+            "epoch must be after 2025-01-01, got {ts}"
+        );
+    }
+
+    #[test]
+    fn test_now_epoch_us_monotonic() {
+        let t1 = now_epoch_us();
+        let t2 = now_epoch_us();
+        assert!(t2 >= t1, "timestamps must be non-decreasing");
+    }
 }

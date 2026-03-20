@@ -420,4 +420,86 @@ mod tests {
     fn test_docker_desktop_app_name_is_not_empty() {
         assert!(!DOCKER_DESKTOP_APP_NAME.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // is_service_reachable — additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unreachable_service_invalid_host() {
+        assert!(
+            !is_service_reachable("unreachable-host-99999.invalid", 9999),
+            "invalid host should not be reachable"
+        );
+    }
+
+    #[test]
+    fn test_unreachable_service_port_zero() {
+        // Port 0 is reserved — should fail
+        assert!(!is_service_reachable("127.0.0.1", 0));
+    }
+
+    #[test]
+    fn test_service_reachable_loopback_format() {
+        // Exercise the fallback path with a valid numeric address
+        assert!(!is_service_reachable("127.0.0.1", 2));
+    }
+
+    #[test]
+    fn test_service_reachable_hostname_fallback() {
+        // Non-numeric hostname exercises the unwrap_or_else fallback
+        assert!(!is_service_reachable("not-a-valid-ip", 12345));
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants — relationships
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grafana_constants_match() {
+        assert_eq!(GRAFANA_PORT, 3000);
+        assert_eq!(GRAFANA_HOST, "127.0.0.1");
+        assert!(GRAFANA_DASHBOARD_URL.contains(&GRAFANA_PORT.to_string()));
+    }
+
+    #[test]
+    fn test_docker_compose_path_is_relative() {
+        assert!(!DOCKER_COMPOSE_PATH.starts_with('/'));
+    }
+
+    #[test]
+    fn test_docker_compose_path_in_deploy_directory() {
+        assert!(DOCKER_COMPOSE_PATH.starts_with("deploy/"));
+    }
+
+    #[test]
+    fn test_poll_interval_divides_timeout() {
+        // Health poll should tick at least 5 times within the timeout
+        let polls = INFRA_HEALTH_TIMEOUT.as_secs() / INFRA_HEALTH_POLL_INTERVAL.as_secs();
+        assert!(polls >= 5, "should poll at least 5 times, got {polls}");
+    }
+
+    #[test]
+    fn test_docker_daemon_timeout_greater_than_health_timeout() {
+        assert!(
+            DOCKER_DAEMON_TIMEOUT >= INFRA_HEALTH_TIMEOUT,
+            "daemon startup needs more time than service health check"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Async function tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_is_docker_daemon_running_no_panic() {
+        // Just exercise the function — result depends on whether Docker is installed
+        let _result = is_docker_daemon_running().await;
+    }
+
+    #[tokio::test]
+    async fn test_open_grafana_if_reachable_no_panic() {
+        // Exercises the function — Grafana likely not running in test env
+        open_grafana_if_reachable().await;
+    }
 }
