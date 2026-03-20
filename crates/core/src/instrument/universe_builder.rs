@@ -4401,4 +4401,167 @@ mod tests {
         let result = build_fno_universe_from_csv(csv, "test-wrong-headers");
         assert!(result.is_err(), "wrong column names should fail parsing");
     }
+
+    // -----------------------------------------------------------------------
+    // Pass 2: build_equity_lookup — commodity and currency segments filtered
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_equity_lookup_skips_commodity_segment() {
+        let mut row = make_equity_row(100, "COMMODITYROW");
+        row.segment = 'M'; // Commodity
+        let lookup = build_equity_lookup(&[row]);
+        assert!(
+            lookup.is_empty(),
+            "M segment should be skipped in equity lookup"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 3: discover_fno_underlyings — multiple exchanges combined
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_three_exchanges_together() {
+        let rows = vec![
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            make_futidx_row(
+                60000,
+                1,
+                "SENSEX",
+                "2026-03-30",
+                20,
+                Exchange::BombayStockExchange,
+            ),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+        ];
+        let result = discover_fno_underlyings(&rows);
+        assert_eq!(result.len(), 3);
+        let kinds: Vec<_> = result.iter().map(|u| u.kind).collect();
+        assert!(kinds.contains(&UnderlyingKind::NseIndex));
+        assert!(kinds.contains(&UnderlyingKind::BseIndex));
+        assert!(kinds.contains(&UnderlyingKind::Stock));
+    }
+
+    // -----------------------------------------------------------------------
+    // link_price_ids — verify derivative_segment assignment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_link_price_ids_nse_stock_has_nse_fno_derivative_segment() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "TESTSTOCK".to_string(),
+            underlying_security_id: 5555,
+            kind: UnderlyingKind::Stock,
+            lot_size: 100,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let mut equity_lookup = HashMap::new();
+        equity_lookup.insert("TESTSTOCK".to_string(), 5555_u32);
+
+        let result = link_price_ids(unlinked, &HashMap::new(), &equity_lookup);
+        let underlying = result.get("TESTSTOCK").unwrap();
+        assert_eq!(underlying.derivative_segment, ExchangeSegment::NseFno);
+    }
+
+    #[test]
+    fn test_link_price_ids_bse_index_has_bse_fno_derivative_segment() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "BANKEX".to_string(),
+            underlying_security_id: 2,
+            kind: UnderlyingKind::BseIndex,
+            lot_size: 30,
+            derivative_exchange: Exchange::BombayStockExchange,
+        }];
+        let mut index_lookup = HashMap::new();
+        index_lookup.insert(
+            "BANKEX".to_string(),
+            IndexEntry {
+                security_id: 69,
+                exchange: Exchange::BombayStockExchange,
+            },
+        );
+
+        let result = link_price_ids(unlinked, &index_lookup, &HashMap::new());
+        let underlying = result.get("BANKEX").unwrap();
+        assert_eq!(underlying.derivative_segment, ExchangeSegment::BseFno);
+    }
+
+    #[test]
+    fn test_link_price_ids_stock_found_in_equity_lookup() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "RELIANCE".to_string(),
+            underlying_security_id: 2885,
+            kind: UnderlyingKind::Stock,
+            lot_size: 500,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let index_lookup = HashMap::new();
+        let mut equity_lookup = HashMap::new();
+        equity_lookup.insert("RELIANCE".to_string(), 2885_u32);
+
+        let result = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+        assert_eq!(result.len(), 1);
+        let underlying = result.get("RELIANCE").unwrap();
+        assert_eq!(underlying.price_feed_security_id, 2885);
+        assert_eq!(underlying.price_feed_segment, ExchangeSegment::NseEquity);
+    }
+
+    #[test]
+    fn test_link_price_ids_stock_not_in_equity_lookup_falls_back() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "UNKNOWN_STOCK".to_string(),
+            underlying_security_id: 9999,
+            kind: UnderlyingKind::Stock,
+            lot_size: 100,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let index_lookup = HashMap::new();
+        let equity_lookup = HashMap::new();
+
+        let result = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+        assert_eq!(result.len(), 1);
+        let underlying = result.get("UNKNOWN_STOCK").unwrap();
+        // Should fall back to underlying_security_id
+        assert_eq!(underlying.price_feed_security_id, 9999);
+    }
+
+    #[test]
+    fn test_link_price_ids_index_found_in_index_lookup() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "NIFTY".to_string(),
+            underlying_security_id: 26000,
+            kind: UnderlyingKind::NseIndex,
+            lot_size: 75,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let mut index_lookup = HashMap::new();
+        index_lookup.insert(
+            "NIFTY".to_string(),
+            IndexEntry {
+                security_id: 13,
+                exchange: Exchange::NationalStockExchange,
+            },
+        );
+        let equity_lookup = HashMap::new();
+
+        let result = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+        assert_eq!(result.len(), 1);
+        let underlying = result.get("NIFTY").unwrap();
+        assert_eq!(underlying.price_feed_security_id, 13);
+        assert_eq!(underlying.price_feed_segment, ExchangeSegment::IdxI);
+    }
+
+    #[test]
+    fn test_link_price_ids_empty_input() {
+        let result = link_price_ids(vec![], &HashMap::new(), &HashMap::new());
+        assert!(result.is_empty());
+    }
 }

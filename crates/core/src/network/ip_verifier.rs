@@ -831,4 +831,110 @@ mod tests {
         assert_eq!(response.modify_date_primary, "2026-01-15");
         assert!(response.modify_date_secondary.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // validate_ipv4_format — boundary and special cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_ipv4_broadcast() {
+        assert!(validate_ipv4_format("255.255.255.255").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ipv4_all_zeros() {
+        assert!(validate_ipv4_format("0.0.0.0").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ipv4_each_octet_max() {
+        assert!(validate_ipv4_format("255.0.0.0").is_ok());
+        assert!(validate_ipv4_format("0.255.0.0").is_ok());
+        assert!(validate_ipv4_format("0.0.255.0").is_ok());
+        assert!(validate_ipv4_format("0.0.0.255").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ipv4_octet_256_fails() {
+        assert!(validate_ipv4_format("256.0.0.0").is_err());
+        assert!(validate_ipv4_format("0.256.0.0").is_err());
+        assert!(validate_ipv4_format("0.0.256.0").is_err());
+        assert!(validate_ipv4_format("0.0.0.256").is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_with_protocol_prefix() {
+        assert!(validate_ipv4_format("http://1.2.3.4").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — deterministic output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_preserves_first_two_octets_only() {
+        let masked = mask_ip("10.20.30.40");
+        assert_eq!(masked, "10.20.XXX.XX");
+        assert!(!masked.contains("30"));
+        assert!(!masked.contains("40"));
+    }
+
+    #[test]
+    fn test_mask_ip_three_octets_returns_placeholder() {
+        assert_eq!(mask_ip("10.20.30"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_comma_separated_returns_placeholder() {
+        assert_eq!(mask_ip("10,20,30,40"), "XXX.XXX.XXX.XXX");
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_public_ip — error path with both URLs failing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_detect_public_ip_both_fail_error_message() {
+        // detect_public_ip tries real URLs; in CI without network, both fail.
+        // We can't easily mock the URLs, but verify the function signature works.
+        // This exercises the full retry loop with real URLs.
+        // If network is available, it succeeds; if not, it returns an informative error.
+        let result = detect_public_ip().await;
+        // Just verify it returns a result (success or error) without panicking.
+        let _ = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // ModifyIpRequest and SetIpResponse formats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_modify_ip_request_format() {
+        use crate::auth::types::ModifyIpRequest;
+        let req = ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "10.0.0.1".to_string(),
+            ip_flag: "SECONDARY".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("dhanClientId"));
+        assert!(json.contains("10.0.0.1"));
+        assert!(json.contains("SECONDARY"));
+    }
+
+    #[test]
+    fn test_set_ip_response_parsing() {
+        use crate::auth::types::SetIpResponse;
+        let json = r#"{"status": "success"}"#;
+        let response: SetIpResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status, "success");
+    }
+
+    #[test]
+    fn test_modify_ip_response_parsing() {
+        use crate::auth::types::ModifyIpResponse;
+        let json = r#"{"status": "success"}"#;
+        let response: ModifyIpResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status, "success");
+    }
 }

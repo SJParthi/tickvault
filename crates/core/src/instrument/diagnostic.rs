@@ -814,4 +814,110 @@ mod tests {
         let result = check_url_reachability("http://127.0.0.1:1/x", "custom_label").await;
         assert_eq!(result.name, "url_reachability_custom_label");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DiagnosticReport healthy logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diagnostic_report_healthy_matches_all_checks_passed() {
+        let one_fail = DiagnosticReport {
+            healthy: false,
+            checks: vec![
+                CheckResult {
+                    name: "a".to_owned(),
+                    passed: true,
+                    detail: "ok".to_owned(),
+                    duration_ms: 1,
+                },
+                CheckResult {
+                    name: "b".to_owned(),
+                    passed: false,
+                    detail: "fail".to_owned(),
+                    duration_ms: 2,
+                },
+                CheckResult {
+                    name: "c".to_owned(),
+                    passed: true,
+                    detail: "ok".to_owned(),
+                    duration_ms: 3,
+                },
+            ],
+        };
+        assert!(!one_fail.healthy);
+        assert!(!one_fail.checks.iter().all(|c| c.passed));
+    }
+
+    #[test]
+    fn test_check_csv_headers_isin_is_extra_not_required() {
+        let header = "ISIN,EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG";
+        let result = check_csv_headers(header);
+        assert!(
+            result.passed,
+            "ISIN is extra, not required: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("ISIN"),
+            "should list ISIN as extra: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_check_cache_status_dir_exists_but_no_csv_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dlt-test-diag-nocsvfile-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let result = check_cache_status(temp_dir.to_str().unwrap(), "nonexistent.csv");
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("dir_exists=true"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csv_exists=false"),
+            "{}",
+            result.detail
+        );
+        assert!(result.detail.contains("csv_bytes=0"), "{}", result.detail);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_diagnostic_report_many_checks_serialization() {
+        let checks: Vec<CheckResult> = (0..10)
+            .map(|i| CheckResult {
+                name: format!("check_{i}"),
+                passed: i % 2 == 0,
+                detail: format!("detail_{i}"),
+                duration_ms: i as u64 * 100,
+            })
+            .collect();
+        let report = DiagnosticReport {
+            healthy: false,
+            checks,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("check_0"));
+        assert!(json.contains("check_9"));
+        assert!(json.contains("\"healthy\":false"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_only_bom_no_columns() {
+        let result = check_csv_headers("\u{FEFF}");
+        assert!(!result.passed, "BOM-only input should fail");
+    }
+
+    #[test]
+    fn test_check_time_gate_narrow_window_format() {
+        let result = check_time_gate("00:00:00", "00:00:01");
+        assert!(result.passed, "informational check always passes");
+        assert!(result.detail.contains("00:00:00"));
+        assert!(result.detail.contains("00:00:01"));
+    }
 }

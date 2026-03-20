@@ -683,4 +683,280 @@ rsi_period = 7
             StrategyConfigError::TomlParse(_)
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: all indicator fields, all operators, default values,
+    // multiple conditions, full config round-trip, error display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_all_indicator_fields_accepted() {
+        let fields = [
+            "rsi",
+            "macd_line",
+            "macd_signal",
+            "macd_histogram",
+            "ema_fast",
+            "ema_slow",
+            "sma",
+            "vwap",
+            "bollinger_upper",
+            "bollinger_middle",
+            "bollinger_lower",
+            "atr",
+            "supertrend",
+            "adx",
+            "obv",
+            "last_traded_price",
+            "ltp",
+            "volume",
+            "day_high",
+            "day_low",
+        ];
+        for field in fields {
+            let result = parse_indicator_field(field, "test");
+            assert!(result.is_ok(), "field '{}' must be accepted", field);
+        }
+    }
+
+    #[test]
+    fn test_all_comparison_operators_accepted() {
+        let ops = [
+            "gt",
+            ">",
+            "gte",
+            ">=",
+            "lt",
+            "<",
+            "lte",
+            "<=",
+            "cross_above",
+            "cross_below",
+        ];
+        for op in ops {
+            let result = parse_comparison_op(op, "test");
+            assert!(result.is_ok(), "operator '{}' must be accepted", op);
+        }
+    }
+
+    #[test]
+    fn test_indicator_params_defaults_when_absent() {
+        let toml = r#"
+[[strategy]]
+name = "no_params"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (_, params) = parse_strategy_config(toml).unwrap();
+        // When indicator_params section is absent, defaults are used
+        assert_eq!(params.ema_fast_period, 12);
+        assert_eq!(params.ema_slow_period, 26);
+        assert_eq!(params.macd_signal_period, 9);
+        assert_eq!(params.rsi_period, 14);
+        assert_eq!(params.sma_period, 20);
+        assert_eq!(params.atr_period, 14);
+        assert_eq!(params.adx_period, 14);
+        assert!((params.supertrend_multiplier - 3.0).abs() < f64::EPSILON);
+        assert!((params.bollinger_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_strategyegy_defaults_when_optional_fields_absent() {
+        let toml = r#"
+[[strategy]]
+name = "minimal"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs.len(), 1);
+        let def = &defs[0];
+        // Verify defaults
+        assert!((def.position_size_fraction - 0.1).abs() < f64::EPSILON);
+        assert!((def.stop_loss_atr_multiplier - 2.0).abs() < f64::EPSILON);
+        assert!((def.target_atr_multiplier - 3.0).abs() < f64::EPSILON);
+        assert_eq!(def.confirmation_ticks, 0);
+        assert!(!def.trailing_stop_enabled);
+        assert!((def.trailing_stop_atr_multiplier - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_multiple_entry_conditions_parsed() {
+        let toml = r#"
+[[strategy]]
+name = "multi_cond"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.entry_long]]
+field = "macd_histogram"
+operator = "gt"
+threshold = 0.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs[0].entry_long_conditions.len(), 2);
+        assert_eq!(defs[0].exit_conditions.len(), 1);
+    }
+
+    #[test]
+    fn test_error_display_unknown_field() {
+        let err = StrategyConfigError::UnknownField {
+            strategy: "test_strategy".to_string(),
+            field: "bogus".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("bogus"));
+        assert!(display.contains("test_strategy"));
+    }
+
+    #[test]
+    fn test_error_display_unknown_operator() {
+        let err = StrategyConfigError::UnknownOperator {
+            strategy: "test_strategy".to_string(),
+            operator: "neq".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("neq"));
+        assert!(display.contains("test_strategy"));
+    }
+
+    #[test]
+    fn test_error_display_validation() {
+        let err = StrategyConfigError::Validation {
+            strategy: "test_strategy".to_string(),
+            message: "bad value".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("bad value"));
+        assert!(display.contains("test_strategy"));
+    }
+
+    #[test]
+    fn test_load_strategy_config_file_nonexistent() {
+        let result = load_strategy_config_file(std::path::Path::new("/nonexistent/file.toml"));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StrategyConfigError::Io(_)));
+    }
+
+    #[test]
+    fn test_negative_stop_loss_atr_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "neg_sl"
+security_ids = [1]
+stop_loss_atr_multiplier = -0.5
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_target_atr_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "zero_target"
+security_ids = [1]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 0.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_full_indicator_params_override() {
+        let toml = r#"
+[indicator_params]
+ema_fast_period = 5
+ema_slow_period = 13
+macd_signal_period = 5
+rsi_period = 7
+sma_period = 10
+atr_period = 7
+adx_period = 7
+supertrend_multiplier = 2.0
+bollinger_multiplier = 1.5
+"#;
+        let (_, params) = parse_strategy_config(toml).unwrap();
+        assert_eq!(params.ema_fast_period, 5);
+        assert_eq!(params.ema_slow_period, 13);
+        assert_eq!(params.macd_signal_period, 5);
+        assert_eq!(params.rsi_period, 7);
+        assert_eq!(params.sma_period, 10);
+        assert_eq!(params.atr_period, 7);
+        assert_eq!(params.adx_period, 7);
+        assert!((params.supertrend_multiplier - 2.0).abs() < f64::EPSILON);
+        assert!((params.bollinger_multiplier - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ltp_alias_accepted() {
+        // "ltp" should be accepted as alias for "last_traded_price"
+        let toml = r#"
+[[strategy]]
+name = "ltp_alias"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "ltp"
+operator = "gt"
+threshold = 100.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(
+            defs[0].entry_long_conditions[0].field,
+            IndicatorField::LastTradedPrice
+        );
+    }
+
+    #[test]
+    fn test_symbol_operators_accepted() {
+        // ">" and ">=" should work as operators alongside "gt"/"gte"
+        let toml = r#"
+[[strategy]]
+name = "symbol_ops"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "<"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = ">="
+threshold = 70.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs[0].entry_long_conditions[0].operator, ComparisonOp::Lt);
+        assert_eq!(defs[0].exit_conditions[0].operator, ComparisonOp::Gte);
+    }
 }

@@ -1610,4 +1610,154 @@ mod tests {
         // The check 9 is warn-only and does not fail validation.
         // Just verify the format of the check by looking at the code.
     }
+
+    // -----------------------------------------------------------------------
+    // Check 6: exactly one orphan derivative
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_single_orphan_derivative_fails() {
+        let mut universe = build_valid_universe();
+        universe.derivative_contracts.insert(
+            90099,
+            DerivativeContract {
+                security_id: 90099,
+                underlying_symbol: "DOESNOTEXIST".to_owned(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 100,
+                tick_size: 0.05,
+                symbol_name: "DOESNOTEXIST-FUT".to_owned(),
+                display_name: "DOESNOTEXIST FUT".to_owned(),
+            },
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("1 derivative contracts"),
+            "should report count 1: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 7: option chain with valid future_security_id passes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_chain_with_valid_future_passes() {
+        let mut universe = build_valid_universe();
+        use dhan_live_trader_common::instrument_types::OptionChain;
+        // Use the existing derivative contract's security_id (90001)
+        let key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_owned(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        universe.option_chains.insert(
+            key,
+            OptionChain {
+                underlying_symbol: "NIFTY".to_owned(),
+                expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                future_security_id: Some(90001), // exists in derivative_contracts
+                calls: vec![],
+                puts: vec![],
+            },
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "valid future ref should pass: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 8: single orphan expiry calendar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_single_orphan_expiry_calendar_fails() {
+        let mut universe = build_valid_universe();
+        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        universe.expiry_calendars.insert(
+            "SINGLEORPHAN".to_owned(),
+            ExpiryCalendar {
+                underlying_symbol: "SINGLEORPHAN".to_owned(),
+                expiry_dates: vec![NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()],
+            },
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("1 expiry calendars"),
+            "should report 1 orphan: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 9: warn-only missing price feeds — still passes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_missing_price_feed_for_stock_underlying_still_passes() {
+        let mut universe = build_valid_universe();
+        // Add a stock underlying with price_feed_security_id not in instrument_info
+        // but DON'T modify must-exist indices (which would fail check 1).
+        universe.underlyings.insert(
+            "TESTMISSINGPF".to_owned(),
+            FnoUnderlying {
+                underlying_symbol: "TESTMISSINGPF".to_owned(),
+                underlying_security_id: 99998,
+                price_feed_security_id: 99998, // not in instrument_info
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 100,
+                contract_count: 1,
+            },
+        );
+        // Check 9 is warn-only, so validation should still pass.
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "missing price feed is warn-only: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Build helpers — verify test infrastructure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_valid_universe_has_all_must_exist_indices() {
+        let universe = build_valid_universe();
+        for (symbol, _) in VALIDATION_MUST_EXIST_INDICES {
+            assert!(
+                universe.underlyings.contains_key(*symbol),
+                "must-exist index '{}' missing from valid universe",
+                symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_valid_universe_derivative_is_linked_to_underlying() {
+        let universe = build_valid_universe();
+        for contract in universe.derivative_contracts.values() {
+            assert!(
+                universe
+                    .underlyings
+                    .contains_key(&contract.underlying_symbol),
+                "derivative {} should reference a valid underlying",
+                contract.security_id
+            );
+        }
+    }
 }

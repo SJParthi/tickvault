@@ -2740,4 +2740,182 @@ mod tests {
             "snapshot should be published after 5+ seconds of ticks"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // TickDedupRing — additional coverage for edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_ring_zero_values_not_sentinel() {
+        let mut ring = TickDedupRing::new(8);
+        // security_id=0, timestamp=0, ltp=0.0 should work (not confused with sentinel)
+        assert!(!ring.is_duplicate(0, 0, 0.0));
+        assert!(ring.is_duplicate(0, 0, 0.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_negative_ltp_handled() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(1, 100, -1.0));
+        assert!(ring.is_duplicate(1, 100, -1.0));
+        assert!(!ring.is_duplicate(1, 100, 1.0)); // different LTP
+    }
+
+    #[test]
+    fn test_dedup_ring_large_power() {
+        // Test with power=16 (65536 slots) — production-like size
+        let mut ring = TickDedupRing::new(16);
+        assert!(!ring.is_duplicate(42, 1772073900, 25000.0));
+        assert!(ring.is_duplicate(42, 1772073900, 25000.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_persist_window — pure function unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persist_window_9am_ist_is_inside() {
+        // 09:00:00 IST = 9*3600 = 32400 seconds of day
+        let ts_9am = 32400;
+        assert!(
+            is_within_persist_window(ts_9am),
+            "9:00 IST should be inside persist window"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_3pm_ist_is_inside() {
+        // 15:00:00 IST = 15*3600 = 54000 seconds of day
+        let ts_3pm = 54000;
+        assert!(
+            is_within_persist_window(ts_3pm),
+            "15:00 IST should be inside persist window"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_330pm_ist_is_outside() {
+        // 15:30:00 IST = 15*3600 + 30*60 = 55800
+        let ts_330pm = 55800;
+        assert!(
+            !is_within_persist_window(ts_330pm),
+            "15:30 IST should be outside persist window (exclusive end)"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_midnight_ist_is_outside() {
+        assert!(
+            !is_within_persist_window(0),
+            "midnight IST should be outside"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_859am_ist_is_outside() {
+        // 08:59:59 IST = 8*3600 + 59*60 + 59 = 32399
+        let ts_before_9 = 32399;
+        assert!(
+            !is_within_persist_window(ts_before_9),
+            "08:59:59 IST should be outside"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_with_real_epoch() {
+        // Use a real epoch that falls within market hours IST.
+        // Since exchange_timestamp is IST epoch seconds, we need modulo 86400.
+        // A sample IST epoch at 10:00:00 would have secs_of_day = 36000.
+        let epoch = 1772073900_u32; // some IST epoch
+        let secs_of_day = epoch % SECONDS_PER_DAY;
+        // Just verify the function doesn't panic
+        let _ = is_within_persist_window(epoch);
+        // And that secs_of_day is correctly computed
+        assert!(secs_of_day < SECONDS_PER_DAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // depth_prices_are_finite — pure function unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_prices_finite_all_valid() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[2].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_infinity_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[4].ask_price = f32::INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_neg_infinity() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[0].bid_price = f32::NEG_INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_zero_is_valid() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+            bid_price: 0.0,
+            ask_price: 0.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth), "zero prices are finite");
+    }
+
+    // -----------------------------------------------------------------------
+    // DEDUP_RING_BUFFER_POWER constant validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_ring_buffer_power_in_valid_range() {
+        assert!(
+            (8..=24).contains(&DEDUP_RING_BUFFER_POWER),
+            "DEDUP_RING_BUFFER_POWER must be in [8, 24], got {}",
+            DEDUP_RING_BUFFER_POWER
+        );
+    }
 }

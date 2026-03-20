@@ -748,4 +748,102 @@ mod tests {
         let large_value = "v".repeat(10_000);
         assert!(pool.set("key", &large_value).await.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: ValkeyPool::new error propagation, edge cases
+    // for set_nx_ex semantics, pool status checks, various key patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_creation_url_includes_host_and_port() {
+        let config = ValkeyConfig {
+            host: "my-cache-host".to_string(),
+            port: 7777,
+            max_connections: 4,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        assert_eq!(url, "redis://my-cache-host:7777");
+        // Also verify pool creation succeeds
+        let pool = ValkeyPool::new(&config);
+        assert!(pool.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_set_nx_ex_with_large_ttl_fails_unreachable() {
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        // Large TTL to verify no overflow
+        let result = pool.set_nx_ex("lock", "val", u64::MAX).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_set_ex_with_large_ttl_fails_unreachable() {
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_ex("key", "val", u64::MAX).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_with_key_containing_special_chars() {
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        // Keys with colons and slashes (common in cache key patterns)
+        assert!(pool.get("dlt:token:primary").await.is_err());
+        assert!(pool.get("dlt/instruments/2026-03-20").await.is_err());
+    }
+
+    #[test]
+    fn pool_status_max_size_matches_various_configs() {
+        for count in [1_u32, 4, 16, 64, 128] {
+            let config = ValkeyConfig {
+                host: "localhost".to_string(),
+                port: 6379,
+                max_connections: count,
+            };
+            let pool = ValkeyPool::new(&config).unwrap();
+            assert_eq!(
+                pool.pool.status().max_size,
+                count as usize,
+                "max_size must match config for count={}",
+                count
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_del_with_key_containing_spaces() {
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        // Should fail on connection, not on key content
+        assert!(pool.del("key with spaces").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exists_with_key_containing_special_chars() {
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        assert!(pool.exists("dlt:cache:instruments").await.is_err());
+    }
 }

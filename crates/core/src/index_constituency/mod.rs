@@ -311,4 +311,100 @@ mod tests {
         let _ = result;
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
+
+    // -----------------------------------------------------------------------
+    // try_load_cache — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_load_cache_empty_file_returns_none() {
+        let cache_dir = test_cache_dir("empty-cache-file");
+        let cache_path =
+            std::path::Path::new(&cache_dir).join(INDEX_CONSTITUENCY_CSV_CACHE_FILENAME);
+        tokio::fs::write(&cache_path, b"").await.unwrap();
+        let result = try_load_cache(&cache_dir).await;
+        assert!(result.is_none(), "empty file should return None");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn test_try_load_cache_valid_map_preserves_stock_to_indices() {
+        let cache_dir = test_cache_dir("stock-to-indices");
+        let mut map = IndexConstituencyMap::default();
+        map.index_to_constituents.insert(
+            "Nifty Bank".to_string(),
+            vec![IndexConstituent {
+                index_name: "Nifty Bank".to_string(),
+                symbol: "HDFCBANK".to_string(),
+                isin: "INE040A01034".to_string(),
+                weight: 25.0,
+                sector: "Banking".to_string(),
+                last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            }],
+        );
+        map.stock_to_indices
+            .insert("HDFCBANK".to_string(), vec!["Nifty Bank".to_string()]);
+
+        cache::save_constituency_cache(&map, &cache_dir, INDEX_CONSTITUENCY_CSV_CACHE_FILENAME)
+            .await
+            .unwrap();
+
+        let loaded = try_load_cache(&cache_dir).await.unwrap();
+        assert!(loaded.contains_stock("HDFCBANK"));
+        let indices = loaded.get_indices_for_stock("HDFCBANK");
+        assert!(indices.is_some());
+        assert!(indices.unwrap().contains(&"Nifty Bank".to_string()));
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_config helper validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_disabled_has_expected_fields() {
+        let config = test_config(false);
+        assert!(!config.enabled);
+        assert_eq!(config.download_timeout_secs, 1);
+        assert_eq!(config.max_concurrent_downloads, 2);
+    }
+
+    #[test]
+    fn test_config_enabled_has_expected_fields() {
+        let config = test_config(true);
+        assert!(config.enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // download_and_build_constituency_map: disabled config with pre-existing cache
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_disabled_config_ignores_cache() {
+        let cache_dir = test_cache_dir("disabled-with-cache");
+        let mut map = IndexConstituencyMap::default();
+        map.index_to_constituents.insert(
+            "Test".to_string(),
+            vec![IndexConstituent {
+                index_name: "Test".to_string(),
+                symbol: "TEST".to_string(),
+                isin: "TEST123".to_string(),
+                weight: 100.0,
+                sector: "Test".to_string(),
+                last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            }],
+        );
+        cache::save_constituency_cache(&map, &cache_dir, INDEX_CONSTITUENCY_CSV_CACHE_FILENAME)
+            .await
+            .unwrap();
+
+        let config = test_config(false);
+        let result = download_and_build_constituency_map(&config, &cache_dir).await;
+        assert!(
+            result.is_none(),
+            "disabled config should return None even with cache"
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 }

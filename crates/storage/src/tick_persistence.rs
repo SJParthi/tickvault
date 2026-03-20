@@ -3361,4 +3361,285 @@ mod tests {
         };
         ensure_depth_and_prev_close_tables(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: f32_to_f64_clean edge cases, build_tick_row with
+    // extreme values, DDL constants validation, writer lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_f32_to_f64_clean_subnormal_value() {
+        // Smallest positive subnormal f32 — may be treated as near-zero
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        let result = f32_to_f64_clean(subnormal);
+        // Must not panic; result should be finite and non-negative
+        assert!(result >= 0.0);
+        assert!(result.is_finite());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_max_f32() {
+        let max = f32::MAX;
+        let result = f32_to_f64_clean(max);
+        assert!(result.is_finite());
+        assert!(result > 0.0);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_min_positive() {
+        // f32::MIN_POSITIVE is very small (1.17549435e-38); the display string
+        // may parse back as 0.0 depending on float representation.
+        let min_pos = f32::MIN_POSITIVE;
+        let result = f32_to_f64_clean(min_pos);
+        assert!(result >= 0.0, "must be non-negative");
+        assert!(result.is_finite());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_typical_nifty_prices() {
+        // Test a range of typical Nifty option prices
+        let prices: &[f32] = &[0.05, 0.10, 1.50, 25.75, 100.00, 245.50, 18000.0, 25000.0];
+        for &price in prices {
+            let result = f32_to_f64_clean(price);
+            // The f64 result must match the original f32 decimal exactly
+            let expected = format!("{price}").parse::<f64>().unwrap();
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "f32_to_f64_clean({}) = {}, expected {}",
+                price,
+                result,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_tick_row_with_zero_exchange_timestamp() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let mut tick = make_test_tick(1, 100.0);
+        tick.exchange_timestamp = 0;
+        let result = build_tick_row(&mut buffer, &tick);
+        assert!(result.is_ok(), "zero timestamp must not cause errors");
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_tick_row_with_max_exchange_timestamp() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let mut tick = make_test_tick(1, 100.0);
+        tick.exchange_timestamp = u32::MAX;
+        let result = build_tick_row(&mut buffer, &tick);
+        assert!(result.is_ok(), "max u32 timestamp must not cause errors");
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_depth_rows_all_zero_depth_produces_five_rows() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let depth = [MarketDepthLevel {
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+            bid_price: 0.0,
+            ask_price: 0.0,
+        }; 5];
+        let result = build_depth_rows(&mut buffer, 1, EXCHANGE_SEGMENT_NSE_FNO, 0, &depth);
+        assert!(result.is_ok());
+        assert_eq!(buffer.row_count(), 5, "5 depth levels = 5 ILP rows");
+    }
+
+    #[test]
+    fn test_build_previous_close_row_with_zero_price() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let result = build_previous_close_row(&mut buffer, 42, EXCHANGE_SEGMENT_NSE_EQ, 0.0, 0, 0);
+        assert!(result.is_ok());
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_previous_close_row_with_large_oi() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let result = build_previous_close_row(
+            &mut buffer,
+            42,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            18500.25,
+            u32::MAX,
+            1_700_000_000_000_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_dedup_key_ticks_exact_format() {
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+    }
+
+    #[test]
+    fn test_dedup_key_market_depth_exact_format() {
+        assert_eq!(DEDUP_KEY_MARKET_DEPTH, "security_id, segment, level");
+    }
+
+    #[test]
+    fn test_dedup_key_previous_close_exact_format() {
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    #[test]
+    fn test_all_ddl_contain_create_table_if_not_exists() {
+        for ddl in [
+            TICKS_CREATE_DDL,
+            MARKET_DEPTH_CREATE_DDL,
+            PREVIOUS_CLOSE_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("CREATE TABLE IF NOT EXISTS"),
+                "DDL must be idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_ddl_use_wal_mode() {
+        for ddl in [
+            TICKS_CREATE_DDL,
+            MARKET_DEPTH_CREATE_DDL,
+            PREVIOUS_CLOSE_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("WAL"),
+                "DDL must use WAL mode for dedup support"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ticks_ddl_partitioned_by_hour() {
+        assert!(
+            TICKS_CREATE_DDL.contains("PARTITION BY HOUR"),
+            "ticks table must be partitioned by hour for performance"
+        );
+    }
+
+    #[test]
+    fn test_market_depth_ddl_partitioned_by_hour() {
+        assert!(
+            MARKET_DEPTH_CREATE_DDL.contains("PARTITION BY HOUR"),
+            "market_depth table must be partitioned by hour"
+        );
+    }
+
+    #[test]
+    fn test_previous_close_ddl_partitioned_by_day() {
+        assert!(
+            PREVIOUS_CLOSE_CREATE_DDL.contains("PARTITION BY DAY"),
+            "previous_close table must be partitioned by day"
+        );
+    }
+
+    #[test]
+    fn test_f32_decimal_buf_size_holds_typical_prices() {
+        // The buffer is designed for typical Dhan prices (up to ~100,000 range).
+        // For extreme values (f32::MAX), the write truncates and the function
+        // falls back to f64::from(f32). Verify typical price strings fit.
+        let typical_prices: &[f32] = &[0.05, 100.0, 18000.0, 50000.0, 99999.99, -99999.99];
+        for &p in typical_prices {
+            let s = format!("{p}");
+            assert!(
+                s.len() <= F32_DECIMAL_BUF_SIZE,
+                "typical price {p} string (len={}) must fit in F32_DECIMAL_BUF_SIZE ({F32_DECIMAL_BUF_SIZE})",
+                s.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_extreme_values_use_fallback() {
+        // f32::MAX and f32::MIN have Display strings longer than the buffer.
+        // The function must still return a valid f64 via the f64::from fallback.
+        let result = f32_to_f64_clean(f32::MAX);
+        assert!(result.is_finite());
+        assert!(result > 0.0);
+
+        let result = f32_to_f64_clean(f32::MIN);
+        assert!(result.is_finite());
+        assert!(result < 0.0);
+    }
+
+    #[test]
+    fn test_current_time_ms_returns_positive() {
+        let ms = current_time_ms();
+        assert!(ms > 0, "current_time_ms must return positive value");
+    }
+
+    #[test]
+    fn test_build_tick_row_all_segments_produce_valid_rows() {
+        let segments = [
+            EXCHANGE_SEGMENT_IDX_I,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            EXCHANGE_SEGMENT_NSE_CURRENCY,
+            EXCHANGE_SEGMENT_BSE_EQ,
+            EXCHANGE_SEGMENT_MCX_COMM,
+            EXCHANGE_SEGMENT_BSE_CURRENCY,
+            EXCHANGE_SEGMENT_BSE_FNO,
+        ];
+        for seg in segments {
+            let mut buffer = Buffer::new(ProtocolVersion::V1);
+            let mut tick = make_test_tick(1, 100.0);
+            tick.exchange_segment_code = seg;
+            let result = build_tick_row(&mut buffer, &tick);
+            assert!(
+                result.is_ok(),
+                "build_tick_row must succeed for segment code {}",
+                seg
+            );
+            assert_eq!(buffer.row_count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_build_depth_rows_all_segments_produce_valid_rows() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 100.0,
+            ask_price: 100.5,
+        }; 5];
+        for seg in [
+            EXCHANGE_SEGMENT_NSE_EQ,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            EXCHANGE_SEGMENT_BSE_EQ,
+        ] {
+            let mut buffer = Buffer::new(ProtocolVersion::V1);
+            let result = build_depth_rows(&mut buffer, 42, seg, 1_700_000_000_000_000_000, &depth);
+            assert!(
+                result.is_ok(),
+                "depth rows must succeed for segment {}",
+                seg
+            );
+            assert_eq!(buffer.row_count(), 5);
+        }
+    }
+
+    #[test]
+    fn test_questdb_ddl_timeout_constant() {
+        assert_eq!(QUESTDB_DDL_TIMEOUT_SECS, 10);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_with_zero_port_returns_without_panic() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 0,
+            pg_port: 0,
+            ilp_port: 0,
+        };
+        // Must not panic, just logs warnings
+        ensure_tick_table_dedup_keys(&config).await;
+    }
 }

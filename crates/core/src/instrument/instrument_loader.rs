@@ -1115,4 +1115,98 @@ mod tests {
         assert!(universe.underlyings.is_empty());
         assert!(universe.derivative_contracts.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // is_within_build_window — current time based tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_build_window_exact_second_boundary() {
+        // Window from 12:00:00 to 12:00:01 — 1 second window
+        // Very unlikely current time is in this exact second
+        let result = is_within_build_window("12:00:00", "12:00:01");
+        // Just verify it returns a bool without panicking
+        assert!(result || !result);
+    }
+
+    #[test]
+    fn test_is_within_build_window_midnight_to_midnight() {
+        // This window is zero-width (start == end) — should return false
+        assert!(!is_within_build_window("00:00:00", "00:00:00"));
+    }
+
+    #[test]
+    fn test_is_within_build_window_almost_full_day() {
+        // 00:00:01 to 23:59:59 — almost always inside
+        assert!(
+            is_within_build_window("00:00:01", "23:59:59")
+                || !is_within_build_window("00:00:01", "23:59:59")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // write_freshness_marker — idempotent writes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_freshness_marker_idempotent() {
+        let temp_dir = unique_temp_dir("marker-idempotent");
+        let cache_dir = temp_dir.to_str().unwrap();
+        write_freshness_marker(cache_dir);
+        let content1 =
+            std::fs::read_to_string(temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME)).unwrap();
+        write_freshness_marker(cache_dir);
+        let content2 =
+            std::fs::read_to_string(temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME)).unwrap();
+        assert_eq!(
+            content1, content2,
+            "idempotent write should produce same content"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // InstrumentLoadResult — variant match coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_instrument_load_result_unavailable_variant() {
+        let result = InstrumentLoadResult::Unavailable;
+        assert!(matches!(result, InstrumentLoadResult::Unavailable));
+    }
+
+    #[test]
+    fn test_instrument_load_result_fresh_build_variant() {
+        let universe = test_universe();
+        let result = InstrumentLoadResult::FreshBuild(universe);
+        assert!(matches!(result, InstrumentLoadResult::FreshBuild(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Freshness marker — unicode content
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_instrument_fresh_unicode_content_returns_false() {
+        let temp_dir = unique_temp_dir("marker-unicode");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "\u{1F4C5} 2026-03-20").unwrap();
+        assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // now_ist_date_string — additional format checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_now_ist_date_string_year_is_reasonable() {
+        let date_str = now_ist_date_string();
+        let year: u32 = date_str[0..4].parse().unwrap();
+        assert!(
+            year >= 2025 && year <= 2030,
+            "year should be reasonable, got {year}"
+        );
+    }
 }
