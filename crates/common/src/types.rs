@@ -722,4 +722,20 @@ mod tests {
             assert_eq!(recovered, Some(opt_type));
         }
     }
+
+    // --- From<&ArchivedExchange> for Exchange ---
+
+    #[test]
+    fn test_archived_exchange_to_exchange_roundtrip() {
+        // Exercises From<&ArchivedExchange> for Exchange (lines 282-288)
+        for exchange in [
+            Exchange::NationalStockExchange,
+            Exchange::BombayStockExchange,
+        ] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&exchange).unwrap();
+            let archived = rkyv::access::<ArchivedExchange, rkyv::rancor::Error>(&bytes).unwrap();
+            let recovered = Exchange::from(archived);
+            assert_eq!(recovered, exchange);
+        }
+    }
 }

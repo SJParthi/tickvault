@@ -725,4 +725,295 @@ mod tests {
         assert!(dedup_ddl.contains("ALTER TABLE index_constituents"));
         assert!(dedup_ddl.contains("DEDUP ENABLE UPSERT KEYS(ts, index_name, symbol)"));
     }
+
+    // -----------------------------------------------------------------------
+    // Additional DDL coverage: two-phase mock server returning different
+    // responses for CREATE TABLE and DEDUP requests.
+    // -----------------------------------------------------------------------
+
+    /// Spawns an HTTP mock that returns `first_response` for the first request
+    /// and `second_response` for all subsequent requests.
+    async fn spawn_two_phase_http_server(
+        first_response: &'static str,
+        second_response: &'static str,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let counter = counter.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let resp = if idx == 0 {
+                            first_response
+                        } else {
+                            second_response
+                        };
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        port
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_create_ok_dedup_fail() {
+        // CREATE TABLE succeeds (200), DEDUP fails (400 without "already enabled")
+        let port = spawn_two_phase_http_server(MOCK_HTTP_200, MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Should not panic — exercises success branch for CREATE, warn for DEDUP
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_create_fail_dedup_ok() {
+        // CREATE TABLE fails (400), DEDUP succeeds (200)
+        let port = spawn_two_phase_http_server(MOCK_HTTP_400, MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Should not panic — exercises warn for CREATE, success for DEDUP
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_create_ok_dedup_already_enabled() {
+        // CREATE TABLE succeeds (200), DEDUP returns "already enabled" (400)
+        let dedup_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 37\r\n\r\n{\"error\":\"dedup already enabled foo\"}";
+        // Use a static-lifetime response for the second phase
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let counter = counter.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let resp = if idx == 0 { MOCK_HTTP_200 } else { dedup_resp };
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // CREATE succeeds, DEDUP "already enabled" = silently OK
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_dedup_network_error() {
+        // First request (CREATE) succeeds, then the server drops for DEDUP.
+        // This exercises the Err branch for the DEDUP send.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept first connection, respond with 200, then stop accepting
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Accept second connection but drop it immediately to cause error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_constituency_table(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // persist_constituency: exercise the retry-then-succeed path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persist_constituency_inner_unreachable_is_err() {
+        // Verify that persist_constituency_inner returns Err (not Ok) on
+        // connection failure — this drives the retry loop in persist_constituency.
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            ilp_port: 19009,
+            http_port: 19000,
+            pg_port: 18812,
+        };
+        let map = make_test_constituency_map();
+        let result = persist_constituency_inner(&map, &config, None);
+        assert!(
+            result.is_err(),
+            "persist_constituency_inner must propagate connection errors"
+        );
+    }
+
+    #[test]
+    fn test_persist_constituency_retries_on_failure_then_ok() {
+        // persist_constituency must return Ok even after all retries fail.
+        // This specifically tests that the error log + Ok(()) on line 175-179
+        // is reached when persist_constituency_inner fails 3 times.
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            ilp_port: 19009,
+            http_port: 19000,
+            pg_port: 18812,
+        };
+        let map = make_test_constituency_map();
+        let result = persist_constituency(&map, &config, None);
+        assert!(
+            result.is_ok(),
+            "persist_constituency must be best-effort — Ok even after all retries fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_ddl_non_success_with_tracing() {
+        // Same as the existing non-success test but with a tracing subscriber
+        // installed to ensure warn! macro body (line 89, 121) is evaluated.
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_test_writer())
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_create_send_error() {
+        // Server accepts connection for CREATE TABLE then immediately closes,
+        // causing a transport error on send. This exercises the Err(err) branch
+        // at line 94 (CREATE TABLE send error).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept first connection and drop immediately — causes send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+            // Accept second connection and drop — DEDUP also gets send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_send_error_with_tracing() {
+        // Same as above but with tracing subscriber to cover warn! body
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_test_writer())
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+        ensure_constituency_table(&config).await;
+    }
+
+    #[test]
+    fn test_persist_constituency_inner_with_fno_universe_missing_symbol() {
+        // FnoUniverse present but does not contain the symbol — exercises
+        // the `unwrap_or(0)` default security_id path.
+        use dhan_live_trader_common::instrument_types::{FnoUniverse, UniverseBuildMetadata};
+        use dhan_live_trader_common::trading_calendar::ist_offset;
+
+        let port = spawn_tcp_drain_server();
+        let map = make_test_constituency_map();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+
+        let ist = ist_offset();
+        let universe = FnoUniverse {
+            underlyings: std::collections::HashMap::new(), // Empty = no symbol matches
+            derivative_contracts: std::collections::HashMap::new(),
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "primary".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: std::time::Duration::from_millis(1),
+                build_timestamp: chrono::Utc::now().with_timezone(&ist),
+            },
+        };
+
+        let result = persist_constituency_inner(&map, &config, Some(&universe));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "should persist 2 entries with security_id=0 for missing symbols"
+        );
+    }
 }

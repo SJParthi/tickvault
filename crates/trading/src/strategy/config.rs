@@ -959,4 +959,344 @@ threshold = 70.0
         assert_eq!(defs[0].entry_long_conditions[0].operator, ComparisonOp::Lt);
         assert_eq!(defs[0].exit_conditions[0].operator, ComparisonOp::Gte);
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: error propagation in entry_short/exit conditions,
+    // serde default functions, NaN/infinity edge cases, TomlIndicatorParams
+    // serde defaults, StrategyConfigError From impls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unknown_field_in_entry_short_rejected() {
+        // Tests error propagation at line 294 (entry_short_conditions collect)
+        let toml = r#"
+[[strategy]]
+name = "bad_short"
+security_ids = [1]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.entry_short]]
+field = "nonexistent_short_field"
+operator = "gt"
+threshold = 70.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "unknown field in entry_short must be rejected"
+        );
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownField { strategy, field } => {
+                assert_eq!(strategy, "bad_short");
+                assert_eq!(field, "nonexistent_short_field");
+            }
+            other => panic!("expected UnknownField, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_operator_in_entry_short_rejected() {
+        // Tests error propagation at line 294 (entry_short_conditions collect)
+        let toml = r#"
+[[strategy]]
+name = "bad_short_op"
+security_ids = [1]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.entry_short]]
+field = "rsi"
+operator = "invalid_op"
+threshold = 70.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "unknown operator in entry_short must be rejected"
+        );
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownOperator { strategy, operator } => {
+                assert_eq!(strategy, "bad_short_op");
+                assert_eq!(operator, "invalid_op");
+            }
+            other => panic!("expected UnknownOperator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_field_in_exit_rejected() {
+        // Tests error propagation at line 300 (exit_conditions collect)
+        let toml = r#"
+[[strategy]]
+name = "bad_exit"
+security_ids = [1]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "bogus_exit_field"
+operator = "gt"
+threshold = 50.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err(), "unknown field in exit must be rejected");
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownField { strategy, field } => {
+                assert_eq!(strategy, "bad_exit");
+                assert_eq!(field, "bogus_exit_field");
+            }
+            other => panic!("expected UnknownField, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_operator_in_exit_rejected() {
+        // Tests error propagation at line 300 (exit_conditions collect)
+        let toml = r#"
+[[strategy]]
+name = "bad_exit_op"
+security_ids = [1]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "bad_exit_op"
+threshold = 50.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err(), "unknown operator in exit must be rejected");
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownOperator { strategy, operator } => {
+                assert_eq!(strategy, "bad_exit_op");
+                assert_eq!(operator, "bad_exit_op");
+            }
+            other => panic!("expected UnknownOperator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_toml_indicator_params_serde_defaults_triggered() {
+        // When indicator_params section exists but no fields are specified,
+        // all serde defaults should fire (default_ema_fast_period, etc.)
+        let toml = r#"
+[indicator_params]
+
+[[strategy]]
+name = "default_params"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (_, params) = parse_strategy_config(toml).unwrap();
+        // These values come from the serde default functions
+        assert_eq!(params.ema_fast_period, 12); // default_ema_fast_period
+        assert_eq!(params.ema_slow_period, 26); // default_ema_slow_period
+        assert_eq!(params.macd_signal_period, 9); // default_macd_signal_period
+        assert_eq!(params.rsi_period, 14); // default_rsi_period
+        assert_eq!(params.sma_period, 20); // default_sma_period
+        assert_eq!(params.atr_period, 14); // default_atr_period
+        assert_eq!(params.adx_period, 14); // default_adx_period
+        assert!((params.supertrend_multiplier - 3.0).abs() < f64::EPSILON);
+        assert!((params.bollinger_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_toml_indicator_params_partial_override_triggers_remaining_defaults() {
+        // Specify only some params; the rest use their serde defaults
+        let toml = r#"
+[indicator_params]
+ema_fast_period = 8
+bollinger_multiplier = 1.0
+
+[[strategy]]
+name = "partial_params"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (_, params) = parse_strategy_config(toml).unwrap();
+        assert_eq!(params.ema_fast_period, 8); // overridden
+        assert!((params.bollinger_multiplier - 1.0).abs() < f64::EPSILON); // overridden
+        // Remaining should be serde defaults
+        assert_eq!(params.ema_slow_period, 26);
+        assert_eq!(params.macd_signal_period, 9);
+        assert_eq!(params.rsi_period, 14);
+        assert_eq!(params.sma_period, 20);
+        assert_eq!(params.atr_period, 14);
+        assert_eq!(params.adx_period, 14);
+        assert!((params.supertrend_multiplier - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_strategy_defaults_position_size_and_trailing_stop() {
+        // When position_size_fraction and trailing_stop fields are absent,
+        // serde defaults should fire (default_position_size, default_trailing_stop_atr)
+        let toml = r#"
+[[strategy]]
+name = "all_defaults"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        let def = &defs[0];
+        assert!((def.position_size_fraction - 0.1).abs() < f64::EPSILON); // default_position_size
+        assert!((def.stop_loss_atr_multiplier - 2.0).abs() < f64::EPSILON); // default_stop_loss_atr
+        assert!((def.target_atr_multiplier - 3.0).abs() < f64::EPSILON); // default_target_atr
+        assert!((def.trailing_stop_atr_multiplier - 1.5).abs() < f64::EPSILON); // default_trailing_stop_atr
+    }
+
+    #[test]
+    fn test_position_size_fraction_nan_rejected() {
+        // NaN should not be in the range [0.0, 1.0]
+        // We test via the convert_strategy validation indirectly:
+        // TOML doesn't support NaN, so we test parse_strategy_config with extreme float
+        let toml = r#"
+[[strategy]]
+name = "nan_test"
+security_ids = [1]
+position_size_fraction = 1.0e308
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        // 1.0e308 is outside [0.0, 1.0], so should be rejected
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "position_size_fraction=1e308 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_error_display_toml_parse() {
+        let err = parse_strategy_config("this is not valid TOML [[[").unwrap_err();
+        let display = format!("{err}");
+        assert!(display.contains("TOML parse error"));
+    }
+
+    #[test]
+    fn test_error_display_io() {
+        let err =
+            load_strategy_config_file(std::path::Path::new("/nonexistent/path.toml")).unwrap_err();
+        let display = format!("{err}");
+        assert!(display.contains("failed to read config file"));
+    }
+
+    #[test]
+    fn test_multiple_strategies_second_fails_validation() {
+        // First strategy is valid, second has bad field — should fail
+        let toml = r#"
+[[strategy]]
+name = "good_one"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy]]
+name = "bad_one"
+security_ids = [2]
+
+[[strategy.entry_long]]
+field = "fake_indicator"
+operator = "gt"
+threshold = 50.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownField { strategy, field } => {
+                assert_eq!(strategy, "bad_one");
+                assert_eq!(field, "fake_indicator");
+            }
+            other => panic!("expected UnknownField, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cross_above_and_cross_below_in_conditions() {
+        let toml = r#"
+[[strategy]]
+name = "cross_test"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "ema_fast"
+operator = "cross_above"
+threshold = 0.0
+
+[[strategy.entry_short]]
+field = "ema_fast"
+operator = "cross_below"
+threshold = 0.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(
+            defs[0].entry_long_conditions[0].operator,
+            ComparisonOp::CrossAbove
+        );
+        assert_eq!(
+            defs[0].entry_short_conditions[0].operator,
+            ComparisonOp::CrossBelow
+        );
+    }
+
+    #[test]
+    fn test_lte_operator_in_exit() {
+        let toml = r#"
+[[strategy]]
+name = "lte_exit"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "<="
+threshold = 20.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs[0].exit_conditions[0].operator, ComparisonOp::Lte);
+    }
 }

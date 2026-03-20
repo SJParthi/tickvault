@@ -749,4 +749,139 @@ mod tests {
         assert_ne!(match_result, failed);
         assert_ne!(mismatch, failed);
     }
+
+    // -----------------------------------------------------------------------
+    // check_current_ip — primary succeeds path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_current_ip_primary_succeeds_returns_match() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // Start a mock server that returns a valid IP
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "10.20.30.40";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        // fetch_ip with our mock server
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        let actual = result.unwrap();
+        let check = compare_ips("10.20.30.40", &actual);
+        assert_eq!(check, IpCheckResult::Match);
+    }
+
+    #[tokio::test]
+    async fn test_check_current_ip_primary_succeeds_mismatch() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "10.20.30.40";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        let actual = result.unwrap();
+        let check = compare_ips("99.99.99.99", &actual);
+        assert!(matches!(check, IpCheckResult::Mismatch { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — body read error (connection drops mid-response)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_timeout_returns_error() {
+        let result = fetch_ip("http://192.0.2.1:1/ip", Duration::from_millis(50)).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_ip_monitor — enabled with valid IP, immediate shutdown
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_ip_monitor_enabled_then_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = IpMonitorConfig::new("10.20.30.40".to_string(), 1);
+        let (_rx, handle) = spawn_ip_monitor(config, shutdown_rx);
+
+        // Let it run for a tiny bit then shutdown
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(true);
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("monitor should exit within 5s after shutdown") // APPROVED: test
+            .expect("task should not panic"); // APPROVED: test
+    }
+
+    // -----------------------------------------------------------------------
+    // IpMonitorConfig — custom check interval
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_monitor_config_custom_interval() {
+        let config = IpMonitorConfig::new("1.2.3.4".to_string(), 60);
+        assert_eq!(config.check_interval_secs, 60);
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_ip_monitor_config_zero_interval() {
+        let config = IpMonitorConfig::new("1.2.3.4".to_string(), 0);
+        assert_eq!(config.check_interval_secs, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — two-octet IPs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_two_octets() {
+        assert_eq!(mask_ip("1.2"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_five_parts() {
+        assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
+    }
 }

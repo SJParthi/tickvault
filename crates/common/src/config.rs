@@ -1277,4 +1277,20 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("build_window_end"));
     }
+
+    #[test]
+    fn test_invalid_holiday_date_fails_validation() {
+        // Exercises the TradingCalendar::from_config error propagation (line 638)
+        let mut config = make_valid_config();
+        config.trading.nse_holidays = vec![NseHolidayEntry {
+            date: "not-a-date".to_string(),
+            name: "Bad Holiday".to_string(),
+        }];
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not-a-date"),
+            "error should mention the bad date: {}",
+            err
+        );
+    }
 }

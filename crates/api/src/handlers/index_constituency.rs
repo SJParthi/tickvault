@@ -454,4 +454,105 @@ mod tests {
         assert_eq!(entry.isin, "INE467B01029");
         assert!((entry.weight - 5.20).abs() < f64::EPSILON);
     }
+
+    // -------------------------------------------------------------------
+    // Poisoned RwLock: all three handlers must not panic
+    // -------------------------------------------------------------------
+
+    fn poisoned_constituency_map() -> SharedConstituencyMap {
+        let map: SharedConstituencyMap = Arc::new(RwLock::new(None));
+        let map_clone = map.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = map_clone.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err(), "should have panicked");
+        assert!(map.read().is_err(), "lock should be poisoned");
+        map
+    }
+
+    #[tokio::test]
+    async fn test_summary_poisoned_rwlock_returns_unavailable() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_constituency_summary(State(state)).await;
+        assert!(!resp.available);
+        assert_eq!(resp.index_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_constituents_poisoned_rwlock_returns_not_found() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_index_constituents(State(state), Path("Nifty 50".to_string())).await;
+        assert!(!resp.found);
+        assert!(resp.constituents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_stock_indices_poisoned_rwlock_returns_not_found() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_stock_indices(State(state), Path("RELIANCE".to_string())).await;
+        assert!(!resp.found);
+        assert!(resp.indices.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Debug impl coverage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituency_summary_debug_impl() {
+        let resp = ConstituencySummaryResponse {
+            available: true,
+            index_count: 5,
+            stock_count: 200,
+            indices: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("ConstituencySummaryResponse"));
+    }
+
+    #[test]
+    fn test_index_constituents_response_debug_impl() {
+        let resp = IndexConstituentsResponse {
+            found: true,
+            index_name: "Nifty 50".to_string(),
+            constituents: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("IndexConstituentsResponse"));
+    }
+
+    #[test]
+    fn test_stock_indices_response_debug_impl() {
+        let resp = StockIndicesResponse {
+            found: false,
+            symbol: "TEST".to_string(),
+            indices: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("StockIndicesResponse"));
+    }
+
+    #[test]
+    fn test_index_summary_entry_debug_impl() {
+        let entry = IndexSummaryEntry {
+            name: "Nifty 50".to_string(),
+            constituent_count: 50,
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("IndexSummaryEntry"));
+    }
+
+    #[test]
+    fn test_constituent_entry_debug_impl() {
+        let entry = ConstituentEntry {
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.25,
+            sector: "Oil Gas".to_string(),
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("ConstituentEntry"));
+        assert!(debug.contains("RELIANCE"));
+    }
 }

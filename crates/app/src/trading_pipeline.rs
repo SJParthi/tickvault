@@ -1973,4 +1973,366 @@ threshold = 70.0
             "pipeline should stop after processing ticks"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — full integration with ApplicationConfig
+    // -----------------------------------------------------------------------
+
+    /// Builds a minimal ApplicationConfig for testing by loading config/base.toml
+    /// and overriding the strategy config path.
+    fn build_test_application_config(strategy_path: &str) -> ApplicationConfig {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let mut config: ApplicationConfig = Figment::new()
+            .merge(Toml::file("config/base.toml"))
+            .extract()
+            .expect("config/base.toml must parse for tests");
+
+        config.strategy.config_path = strategy_path.to_string();
+        config
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_nonexistent_strategy_file() {
+        let config = build_test_application_config("/tmp/dlt_nonexistent_strategy_99999.toml");
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "test_client");
+        assert!(
+            result.is_none(),
+            "nonexistent strategy file should return None"
+        );
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_valid_strategy_file() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_valid");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("test_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "init_test_strategy"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "test_client");
+        assert!(result.is_some(), "valid strategy file should return Some");
+
+        let (pipeline_config, _hot_reloader) = result.unwrap();
+        assert!(pipeline_config.dry_run, "dry_run must default to true");
+        assert_eq!(pipeline_config.strategies.len(), 1);
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_empty_strategy_file() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_empty2");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("empty_strategies.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "test_client");
+        assert!(
+            result.is_some(),
+            "empty strategy file should still return Some (0 strategies)"
+        );
+
+        let (pipeline_config, _) = result.unwrap();
+        assert!(
+            pipeline_config.strategies.is_empty(),
+            "empty TOML should produce 0 strategies"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_invalid_strategy_file() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_invalid2");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("invalid_strategies.toml");
+        std::fs::write(&config_path, "{{{{invalid toml").unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "test_client");
+        assert!(
+            result.is_some(),
+            "invalid TOML should still return Some (with defaults)"
+        );
+
+        let (pipeline_config, hot_reloader) = result.unwrap();
+        assert!(
+            pipeline_config.strategies.is_empty(),
+            "invalid TOML should produce 0 strategies"
+        );
+        assert!(
+            hot_reloader.is_none(),
+            "invalid TOML should disable hot-reload"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — order update lagged path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_handles_order_update_lag() {
+        let handle = make_token_handle_with_value("jwt");
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(16);
+        let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(2);
+
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+
+        let mut update = make_order_update();
+        update.order_no = "ORD-LAG-1".to_string();
+        let _ = order_tx.send(update.clone());
+        let _ = order_tx.send(update.clone());
+        let _ = order_tx.send(update);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        drop(tick_tx);
+        drop(order_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(
+            result.is_ok(),
+            "pipeline should handle order update lag gracefully"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — tick lag path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_handles_tick_lag() {
+        let handle = make_token_handle_with_value("jwt");
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(2);
+        let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+
+        let tick = ParsedTick::default();
+        let _ = tick_tx.send(tick);
+        let _ = tick_tx.send(tick);
+        let _ = tick_tx.send(tick);
+        let _ = tick_tx.send(tick);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(tick_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(result.is_ok(), "pipeline should handle tick lag gracefully");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — OMS handle_order_update error handling
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_handles_unknown_order_update() {
+        let handle = make_token_handle_with_value("jwt");
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(16);
+        let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+
+        let mut update = make_order_update();
+        update.order_no = "NONEXISTENT-ORDER-123".to_string();
+        update.status = "TRADED".to_string();
+        update.traded_qty = 1;
+        update.source = "P".to_string();
+        let _ = order_tx.send(update);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        drop(tick_tx);
+        drop(order_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(
+            result.is_ok(),
+            "pipeline should handle unknown order updates gracefully"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // OMS — cancel_order error path (non-existent order)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_oms_cancel_nonexistent_order() {
+        let handle = make_token_handle_with_value("jwt");
+        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "test".to_owned(),
+        );
+        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let bridge = Box::new(TokenHandleBridge { handle });
+        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            bridge,
+            "test".to_owned(),
+        );
+
+        let result = oms.cancel_order("NONEXISTENT-ORDER-999").await;
+        assert!(result.is_err(), "cancelling non-existent order should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // OMS — total_updates starts at 0
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oms_total_updates_starts_at_zero() {
+        let handle = make_token_handle_with_value("jwt");
+        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "test".to_owned(),
+        );
+        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let bridge = Box::new(TokenHandleBridge { handle });
+        let oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            bridge,
+            "test".to_owned(),
+        );
+
+        assert_eq!(oms.total_updates(), 0, "fresh OMS should have 0 updates");
+        assert_eq!(oms.total_placed(), 0, "fresh OMS should have 0 placed");
+        assert!(
+            oms.active_orders().is_empty(),
+            "fresh OMS should have no active orders"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — dry_run flag logging paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pipeline_dry_run_true_logs_paper_trading() {
+        let handle = make_token_handle_with_value("jwt");
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(16);
+        let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        assert!(config.dry_run, "must be paper trading mode");
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+        drop(tick_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_dry_run_false_mode() {
+        let handle = make_token_handle_with_value("jwt");
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(16);
+        let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: false,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        assert!(!config.dry_run, "must be live mode");
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+        drop(tick_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(result.is_ok());
+    }
 }

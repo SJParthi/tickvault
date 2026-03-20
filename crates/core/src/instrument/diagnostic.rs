@@ -920,4 +920,143 @@ mod tests {
         assert!(result.detail.contains("00:00:00"));
         assert!(result.detail.contains("00:00:01"));
     }
+
+    #[tokio::test]
+    async fn test_run_diagnostic_unreachable_urls() {
+        let cfg = InstrumentConfig {
+            daily_download_time: "08:30:00".to_string(),
+            csv_cache_directory: "/tmp/dlt-diag-nonexist-99".to_string(),
+            csv_cache_filename: "nonexistent.csv".to_string(),
+            csv_download_timeout_secs: 2,
+            build_window_start: "08:25:00".to_string(),
+            build_window_end: "08:55:00".to_string(),
+        };
+        let report =
+            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
+        assert!(!report.healthy);
+        assert!(report.checks.len() >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_run_diagnostic_cached_csv_exercises_all_checks() {
+        let dir = std::env::temp_dir().join(format!("dlt-diag-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       ASM_GSM_FLAG,ASM_GSM_CATEGORY,BUY_SELL_INDICATOR,MTF_LEVERAGE";
+        // Generate enough rows to exceed INSTRUMENT_CSV_MIN_BYTES (1 MB)
+        let rows: Vec<String> = (0..10000)
+            .map(|i| {
+                format!(
+                    "NSE,I,{i},INE{i:09}01,INDEX,{i},NIFTY,NIFTY 50 INDEX,Nifty 50 Index Display Name Long,INDEX,EQ,1,\
+                     0001-01-01,0,XX,0.05,0,N,NA,1,0"
+                )
+            })
+            .collect();
+        let csv_content = format!("{header}\n{}", rows.join("\n"));
+        std::fs::write(dir.join("inst.csv"), &csv_content).unwrap();
+        let cfg = InstrumentConfig {
+            daily_download_time: "08:30:00".to_string(),
+            csv_cache_directory: dir.to_str().unwrap().to_string(),
+            csv_cache_filename: "inst.csv".to_string(),
+            csv_download_timeout_secs: 2,
+            build_window_start: "00:00:00".to_string(),
+            build_window_end: "23:59:59".to_string(),
+        };
+        let report =
+            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
+        // With cached CSV available, we expect: 2 URL + time_gate + cache + csv_download
+        // + csv_headers + csv_parse + universe_build_and_validate = 8 checks
+        assert!(
+            report.checks.len() >= 5,
+            "expected at least 5 checks, got: {} ({:?})",
+            report.checks.len(),
+            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        // Verify csv_download check exists (from cache)
+        let dl = report.checks.iter().find(|c| c.name == "csv_download");
+        if let Some(dl_check) = dl {
+            assert!(
+                dl_check.passed,
+                "csv_download should pass: {}",
+                dl_check.detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_url_reachability_success_path() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let r = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(r.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let result = check_url_reachability(&url, "ok").await;
+        assert!(result.passed);
+        assert!(result.detail.contains("200"));
+    }
+
+    #[tokio::test]
+    async fn test_url_reachability_404_path() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let r = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(r.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let result = check_url_reachability(&url, "nf").await;
+        assert!(!result.passed);
+        assert!(result.detail.contains("404"));
+    }
+
+    #[test]
+    fn test_csv_headers_dup_cols_still_pass() {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       EXCH_ID";
+        let result = check_csv_headers(header);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_diagnostic_report_debug() {
+        let report = DiagnosticReport {
+            healthy: true,
+            checks: vec![],
+        };
+        let d = format!("{:?}", report);
+        assert!(d.contains("healthy: true"));
+    }
+
+    #[test]
+    fn test_check_result_debug() {
+        let check = CheckResult {
+            name: "t".to_owned(),
+            passed: true,
+            detail: "ok".to_owned(),
+            duration_ms: 0,
+        };
+        let d = format!("{:?}", check);
+        assert!(d.contains("\"t\""));
+    }
 }

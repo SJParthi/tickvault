@@ -937,4 +937,342 @@ mod tests {
         let response: ModifyIpResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.status, "success");
     }
+
+    // -----------------------------------------------------------------------
+    // set_ip — error paths via mock HTTP servers
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_set_ip_non_success_status_returns_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = r#"{"errorCode":"DH-905","errorType":"INPUT_EXCEPTION","errorMessage":"invalid"}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let req = crate::auth::types::SetIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "203.0.113.42".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+        let result = set_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("400") || err_str.contains("set_ip"),
+            "error should mention status or function: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_ip_invalid_json_response_returns_parse_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "not-json-at-all";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let req = crate::auth::types::SetIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "203.0.113.42".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+        let result = set_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("parse error") || err_str.contains("set_ip"),
+            "error should mention parse: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_ip_connection_refused_returns_error() {
+        let req = crate::auth::types::SetIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "203.0.113.42".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+        let result = set_ip("http://127.0.0.1:1", "fake-token", &req).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // modify_ip — error paths via mock HTTP servers
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_modify_ip_non_success_status_returns_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "Forbidden";
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let req = crate::auth::types::ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "10.0.0.1".to_string(),
+            ip_flag: "SECONDARY".to_string(),
+        };
+        let result = modify_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("403") || err_str.contains("modify_ip"),
+            "error should mention status: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_ip_invalid_json_response_returns_parse_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "not-json";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let req = crate::auth::types::ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "10.0.0.1".to_string(),
+            ip_flag: "SECONDARY".to_string(),
+        };
+        let result = modify_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_modify_ip_connection_refused_returns_error() {
+        let req = crate::auth::types::ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "10.0.0.1".to_string(),
+            ip_flag: "SECONDARY".to_string(),
+        };
+        let result = modify_ip("http://127.0.0.1:1", "fake-token", &req).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_ip — error paths via mock HTTP servers
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_ip_non_success_status_returns_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = get_ip(&format!("http://127.0.0.1:{port}"), "fake-token").await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("500") || err_str.contains("get_ip"),
+            "error should mention status: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_ip_invalid_json_response_returns_parse_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "{invalid";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = get_ip(&format!("http://127.0.0.1:{port}"), "fake-token").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_ip_connection_refused_returns_error() {
+        let result = get_ip("http://127.0.0.1:1", "fake-token").await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // set_ip / modify_ip / get_ip — success paths via mock HTTP servers
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_set_ip_success_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = r#"{"status": "success"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let req = crate::auth::types::SetIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "203.0.113.42".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+        let result = set_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().status, "success");
+    }
+
+    #[tokio::test]
+    async fn test_modify_ip_success_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = r#"{"status": "success"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let req = crate::auth::types::ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "10.0.0.1".to_string(),
+            ip_flag: "SECONDARY".to_string(),
+        };
+        let result = modify_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().status, "success");
+    }
+
+    #[tokio::test]
+    async fn test_get_ip_success_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = r#"{"ip":"203.0.113.42","ipFlag":"PRIMARY","modifyDatePrimary":"2026-01-15","modifyDateSecondary":""}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = get_ip(&format!("http://127.0.0.1:{port}"), "fake-token").await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert_eq!(resp.ip, "203.0.113.42");
+        assert_eq!(resp.ip_flag, "PRIMARY");
+    }
 }

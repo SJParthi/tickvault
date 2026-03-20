@@ -2347,4 +2347,313 @@ mod tests {
         }
         handle.abort();
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: truncated body tests (body-read error paths),
+    // HTTP status edge cases, error variant assertions
+    // -----------------------------------------------------------------------
+
+    /// Starts a mock server that sends headers with mismatched Content-Length
+    /// then closes the connection, causing response.text() to fail.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only content-length arithmetic
+    async fn start_truncated_body_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                // Claim 10000 bytes but send nothing, then close
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                // Close connection immediately — body read will fail
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    #[tokio::test]
+    async fn test_place_order_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        // Should fail with either HttpError (body read) or JsonError
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_orders_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_all_orders("fake-token").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_positions_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_positions("fake-token").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_holdings("fake-token").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_margin_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let request = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+        let result = client.calculate_margin("fake-token", &request).await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_fund_limit_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_fund_limit("fake-token").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exit_all_positions_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.exit_all_positions("fake-token").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_order_body_read_error() {
+        let (base_url, handle) = start_truncated_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_order("fake-token", "ORD-1").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    /// Starts a mock that sends a truncated body for non-2xx responses,
+    /// to trigger the body-read error path in modify/cancel error branches.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only content-length arithmetic
+    async fn start_truncated_error_body_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                // Send 400 status with mismatched Content-Length, then close
+                let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 10000\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_error_body_read_failure() {
+        let (base_url, handle) = start_truncated_error_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        // Should fail — either HttpError from body read or DhanApiError
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_error_body_read_failure() {
+        let (base_url, handle) = start_truncated_error_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_convert_position_error_body_read_failure() {
+        let (base_url, handle) = start_truncated_error_body_server().await;
+        let client = make_test_client(&base_url);
+
+        let request = DhanConvertPositionRequest {
+            dhan_client_id: "100".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            to_product_type: "CNC".to_owned(),
+            exchange_segment: "NSE_EQ".to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "2885".to_owned(),
+            convert_qty: "10".to_owned(),
+            trading_symbol: "RELIANCE".to_owned(),
+        };
+        let result = client.convert_position("fake-token", &request).await;
+
+        assert!(result.is_err());
+        handle.abort();
+    }
+
+    // -- HTTP status code boundary tests ---
+
+    #[tokio::test]
+    async fn test_place_order_status_299_is_success() {
+        // 299 is within 200..300, should be treated as success
+        let body = r#"{"orderId":"ORD-299","orderStatus":"TRANSIT","correlationId":"uuid-299"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+        assert!(result.is_ok());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_place_order_status_300_is_error() {
+        // 300 is NOT within 200..300 (exclusive upper bound)
+        let body = r#"{"errorCode":"DH-910","errorMessage":"redirect"}"#;
+        let (base_url, handle) = start_mock_server(300, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 300,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_place_order_status_503_is_error() {
+        // 503 Service Unavailable — non-2xx, not rate limited
+        let body = r#"{"errorCode":"DH-908","errorMessage":"service unavailable"}"#;
+        let (base_url, handle) = start_mock_server(503, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 503,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    // -- OmsError variant inspections ---
+
+    #[test]
+    fn test_oms_error_http_error_contains_message() {
+        let err = OmsError::HttpError("connection refused".to_owned());
+        let debug = format!("{err:?}");
+        assert!(debug.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_oms_error_json_error_contains_message() {
+        let err = OmsError::JsonError("unexpected token".to_owned());
+        let debug = format!("{err:?}");
+        assert!(debug.contains("unexpected token"));
+    }
+
+    #[test]
+    fn test_oms_error_dhan_api_error_contains_details() {
+        let err = OmsError::DhanApiError {
+            status_code: 500,
+            message: "internal server error".to_owned(),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("500"));
+        assert!(debug.contains("internal server error"));
+    }
+
+    #[test]
+    fn test_oms_error_rate_limited_debug() {
+        let err = OmsError::DhanRateLimited;
+        let debug = format!("{err:?}");
+        assert!(debug.contains("DhanRateLimited"));
+    }
 }

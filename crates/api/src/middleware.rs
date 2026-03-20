@@ -821,4 +821,55 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // -------------------------------------------------------------------
+    // from_env: DLT_API_TOKEN set with a non-empty value
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_from_env_with_explicit_token_set() {
+        // Set DLT_API_TOKEN so from_env() takes the Ok(token) path
+        unsafe { std::env::set_var("DLT_API_TOKEN", "test-explicit-token-12345") };
+        let config = ApiAuthConfig::from_env(true);
+        assert!(config.enabled);
+        assert_eq!(config.bearer_token, "test-explicit-token-12345");
+
+        // Also works in live mode
+        let config_live = ApiAuthConfig::from_env(false);
+        assert!(config_live.enabled);
+        assert_eq!(config_live.bearer_token, "test-explicit-token-12345");
+
+        // Clean up
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+    }
+
+    // -------------------------------------------------------------------
+    // from_env: DLT_API_TOKEN set to empty string
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_from_env_empty_token_string_dry_run_disables_auth() {
+        unsafe { std::env::set_var("DLT_API_TOKEN", "") };
+        let config = ApiAuthConfig::from_env(true);
+        assert!(!config.enabled, "empty token + dry_run = disabled");
+        assert!(config.bearer_token.is_empty());
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+    }
+
+    #[test]
+    fn test_from_env_empty_token_string_live_generates_token() {
+        unsafe { std::env::set_var("DLT_API_TOKEN", "") };
+        let config = ApiAuthConfig::from_env(false);
+        assert!(
+            config.enabled,
+            "empty token + live = enabled with generated"
+        );
+        assert!(!config.bearer_token.is_empty());
+        assert_eq!(
+            config.bearer_token.len(),
+            36,
+            "generated UUID v4 is 36 chars"
+        );
+        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+    }
 }

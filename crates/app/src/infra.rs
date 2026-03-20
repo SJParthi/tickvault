@@ -1567,4 +1567,123 @@ mod tests {
 
         drop(listener);
     }
+
+    // -----------------------------------------------------------------------
+    // open_in_browser — additional async tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_open_in_browser_does_not_panic() {
+        // Call with a valid URL — should not panic even if command fails.
+        open_in_browser("http://localhost:99999/nonexistent").await;
+    }
+
+    #[tokio::test]
+    async fn test_open_in_browser_with_empty_url() {
+        // Even with empty URL, should not panic (best-effort).
+        open_in_browser("").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // open_grafana_if_reachable — tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_open_grafana_if_reachable_does_not_panic() {
+        // Grafana is probably not running in the test env. Should return gracefully.
+        open_grafana_if_reachable().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_service_healthy — short-circuit with already-healthy service
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_service_healthy_already_reachable() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let start = std::time::Instant::now();
+        wait_for_service_healthy("TestService", "127.0.0.1", port).await;
+        let elapsed = start.elapsed();
+
+        // Should return on first probe (< poll interval)
+        assert!(
+            elapsed < INFRA_HEALTH_POLL_INTERVAL + Duration::from_secs(1),
+            "already-healthy service should return quickly, took {:?}",
+            elapsed
+        );
+
+        drop(listener);
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_docker_daemon_running — full async test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_docker_daemon_running_completes() {
+        // On Linux without Docker Desktop, should return relatively quickly.
+        let start = std::time::Instant::now();
+        let result = ensure_docker_daemon_running().await;
+        let elapsed = start.elapsed();
+
+        let _is_available: bool = result;
+
+        assert!(
+            elapsed.as_secs() < DOCKER_DAEMON_TIMEOUT.as_secs() + 5,
+            "ensure_docker_daemon_running should complete within timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_docker_compose_up — error messages are descriptive
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_docker_compose_up_error_contains_context() {
+        let env_vars: &[(&str, String)] = &[];
+        let result = run_docker_compose_up(env_vars).await;
+        if let Err(err) = result {
+            let err_msg = format!("{err:?}");
+            assert!(!err_msg.is_empty(), "error message should not be empty");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_service_reachable — timing characteristics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reachable_probe_completes_within_timeout_for_listener() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let start = std::time::Instant::now();
+        let result = is_service_reachable("127.0.0.1", port);
+        let elapsed = start.elapsed();
+
+        assert!(result, "listener must be reachable");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "connecting to local listener should be very fast"
+        );
+
+        drop(listener);
+    }
+
+    #[test]
+    fn test_reachable_probe_for_nonroutable_completes_within_timeout() {
+        let start = std::time::Instant::now();
+        let _result = is_service_reachable("192.0.2.1", 9999);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < INFRA_PROBE_TIMEOUT + Duration::from_secs(2),
+            "unreachable probe must respect timeout, took {:?}",
+            elapsed
+        );
+    }
 }

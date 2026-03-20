@@ -846,4 +846,277 @@ mod tests {
         let pool = ValkeyPool::new(&config).unwrap();
         assert!(pool.exists("dlt:cache:instruments").await.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Mock RESP server tests — exercise success paths and branch coverage
+    // for all methods by running a minimal Redis-protocol mock server.
+    //
+    // The redis crate performs RESP protocol negotiation on connection init.
+    // Our mock must respond with "+OK\r\n" to any incoming data chunk
+    // (handling CLIENT SETNAME, HELLO, etc.) and then respond with the
+    // desired response for the actual command.
+    //
+    // Strategy: Count RESP commands by looking for '*' (RESP array start)
+    // delimiters. Respond to each one. The `command_response` is used for
+    // the N-th command (where N = `skip_init_commands + 1`).
+    // -----------------------------------------------------------------------
+
+    /// Spawns a mock RESP server that responds to the first `skip` commands
+    /// with "+OK\r\n" and then responds with `command_response` for
+    /// subsequent commands. This handles redis client init handshake.
+    async fn spawn_resp_mock_server(command_response: &'static [u8]) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        // Track how many RESP commands we've seen.
+                        // The redis crate sends init commands before the real one.
+                        let mut commands_seen: usize = 0;
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    // Count RESP array headers (* at start of line)
+                                    let data = &buf[..n];
+                                    let mut cmd_count = 0;
+                                    for window in data.windows(1) {
+                                        if window[0] == b'*' {
+                                            cmd_count += 1;
+                                        }
+                                    }
+                                    // For each command, send a response
+                                    for _ in 0..cmd_count.max(1) {
+                                        commands_seen += 1;
+                                        // First command is init; respond with OK
+                                        // Second+ commands get the configured response
+                                        let resp = if commands_seen <= 1 {
+                                            b"+OK\r\n".as_slice()
+                                        } else {
+                                            command_response
+                                        };
+                                        if stream.write_all(resp).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        // Allow the listener to start accepting
+        tokio::task::yield_now().await;
+        port
+    }
+
+    /// RESP simple string: "+PONG\r\n"
+    const RESP_PONG: &[u8] = b"+PONG\r\n";
+    /// RESP simple string: "+OK\r\n"
+    const RESP_OK: &[u8] = b"+OK\r\n";
+    /// RESP bulk string nil: "$-1\r\n" (represents None/nil)
+    const RESP_NIL: &[u8] = b"$-1\r\n";
+    /// RESP integer 1: ":1\r\n" (true for EXISTS)
+    const RESP_INT_ONE: &[u8] = b":1\r\n";
+    /// RESP integer 0: ":0\r\n" (false for EXISTS)
+    const RESP_INT_ZERO: &[u8] = b":0\r\n";
+    /// RESP bulk string with value: "$5\r\nhello\r\n"
+    const RESP_BULK_HELLO: &[u8] = b"$5\r\nhello\r\n";
+
+    #[tokio::test]
+    async fn test_health_check_success_with_mock_resp() {
+        let port = spawn_resp_mock_server(RESP_PONG).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.health_check().await;
+        assert!(
+            result.is_ok(),
+            "health_check should succeed when PONG is returned: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_non_pong_response() {
+        // The mock responds with "+OK\r\n" for all commands including PING,
+        // which triggers the `pong != "PONG"` branch.
+        let port = spawn_resp_mock_server(RESP_OK).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.health_check().await;
+        assert!(
+            result.is_err(),
+            "health_check should fail when response is not PONG"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected PING response"),
+            "error should mention unexpected PING response, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_some_with_mock_resp() {
+        let port = spawn_resp_mock_server(RESP_BULK_HELLO).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.get("test_key").await;
+        assert!(result.is_ok(), "get should succeed with mock: {:?}", result);
+        assert_eq!(result.unwrap(), Some("hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_none_with_nil_resp() {
+        let port = spawn_resp_mock_server(RESP_NIL).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.get("missing_key").await;
+        assert!(result.is_ok(), "get should succeed with nil: {:?}", result);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_set_success_with_mock_resp() {
+        let port = spawn_resp_mock_server(RESP_OK).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set("test_key", "test_value").await;
+        assert!(result.is_ok(), "set should succeed with mock: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_set_ex_success_with_mock_resp() {
+        let port = spawn_resp_mock_server(RESP_OK).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_ex("test_key", "test_value", 300).await;
+        assert!(
+            result.is_ok(),
+            "set_ex should succeed with mock: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_del_success_with_mock_resp() {
+        // DEL returns an integer (number of keys deleted)
+        let port = spawn_resp_mock_server(RESP_INT_ONE).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.del("test_key").await;
+        assert!(result.is_ok(), "del should succeed with mock: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_exists_returns_true_with_mock_resp() {
+        let port = spawn_resp_mock_server(RESP_INT_ONE).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.exists("test_key").await;
+        assert!(
+            result.is_ok(),
+            "exists should succeed with mock: {:?}",
+            result
+        );
+        assert!(result.unwrap(), "exists should return true for :1");
+    }
+
+    #[tokio::test]
+    async fn test_exists_returns_false_with_mock_resp() {
+        let port = spawn_resp_mock_server(RESP_INT_ZERO).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.exists("missing_key").await;
+        assert!(
+            result.is_ok(),
+            "exists should succeed with mock: {:?}",
+            result
+        );
+        assert!(!result.unwrap(), "exists should return false for :0");
+    }
+
+    #[tokio::test]
+    async fn test_set_nx_ex_returns_true_when_key_set() {
+        // SET NX EX returns "+OK\r\n" when key was set (did not exist)
+        let port = spawn_resp_mock_server(RESP_OK).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
+        assert!(
+            result.is_ok(),
+            "set_nx_ex should succeed with mock: {:?}",
+            result
+        );
+        assert!(
+            result.unwrap(),
+            "set_nx_ex should return true when key was set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_nx_ex_returns_false_when_key_exists() {
+        // SET NX EX returns "$-1\r\n" (nil) when key already existed
+        let port = spawn_resp_mock_server(RESP_NIL).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_nx_ex("existing_lock", "lock_value", 30).await;
+        assert!(
+            result.is_ok(),
+            "set_nx_ex should succeed with mock: {:?}",
+            result
+        );
+        assert!(
+            !result.unwrap(),
+            "set_nx_ex should return false when key already exists"
+        );
+    }
 }

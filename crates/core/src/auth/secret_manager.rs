@@ -688,4 +688,62 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "dev");
     }
+
+    #[test]
+    fn test_validate_environment_error_contains_input_value() {
+        let result = validate_environment("bad/value");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bad/value"),
+            "error should contain the invalid input, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_environment_dot_returns_error() {
+        let result = validate_environment(".");
+        assert!(result.is_err(), "dot must be rejected");
+    }
+
+    #[test]
+    fn test_validate_environment_double_dot_returns_error() {
+        let result = validate_environment("..");
+        assert!(result.is_err(), "double dot must be rejected");
+    }
+
+    #[test]
+    fn test_build_ssm_path_with_hyphenated_env() {
+        let path = build_ssm_path("dev-us-east-1", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
+        assert_eq!(path, "/dlt/dev-us-east-1/dhan/client-id");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_questdb_credentials_returns_error_without_real_ssm() {
+        let result = fetch_questdb_credentials().await;
+        if crate::test_support::has_aws_credentials() {
+            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
+        } else {
+            assert!(result.is_err(), "must fail without real SSM");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_grafana_credentials_returns_error_without_real_ssm() {
+        let result = fetch_grafana_credentials().await;
+        if crate::test_support::has_aws_credentials() {
+            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
+        } else {
+            assert!(result.is_err(), "must fail without real SSM");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_telegram_credentials_returns_error_without_real_ssm() {
+        let result = fetch_telegram_credentials().await;
+        if crate::test_support::has_aws_credentials() {
+            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
+        } else {
+            assert!(result.is_err(), "must fail without real SSM");
+        }
+    }
 }

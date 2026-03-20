@@ -296,4 +296,41 @@ mod tests {
         assert!(!output.contains("772509"));
         assert!(output.contains("Dhan authentication failed"));
     }
+
+    #[test]
+    fn test_both_http_and_https_urls_in_same_string() {
+        // Exercises the (Some(h), Some(hs)) branch at line 64 where
+        // both http:// and https:// are found in the remaining string.
+        let input =
+            "tried http://example.com/api?secret=abc then https://auth.dhan.co/app?token=xyz";
+        let output = redact_url_params(input);
+        assert!(
+            !output.contains("secret=abc"),
+            "http params leaked: {output}"
+        );
+        assert!(
+            !output.contains("token=xyz"),
+            "https params leaked: {output}"
+        );
+        assert!(output.contains("tried"), "prefix lost: {output}");
+        assert!(output.contains("then"), "middle text lost: {output}");
+    }
+
+    #[test]
+    fn test_http_before_https_redacts_both() {
+        // http:// appears first — the min(h, hs) path picks it
+        let input = "see http://a.com?k=v and https://b.com?s=t end";
+        let output = redact_url_params(input);
+        assert!(!output.contains("k=v"), "http param leaked: {output}");
+        assert!(!output.contains("s=t"), "https param leaked: {output}");
+    }
+
+    #[test]
+    fn test_https_before_http_redacts_both() {
+        // https:// appears first — the min(h, hs) path picks it
+        let input = "see https://b.com?s=t and http://a.com?k=v end";
+        let output = redact_url_params(input);
+        assert!(!output.contains("s=t"), "https param leaked: {output}");
+        assert!(!output.contains("k=v"), "http param leaked: {output}");
+    }
 }

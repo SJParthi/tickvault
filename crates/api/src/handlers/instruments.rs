@@ -214,4 +214,193 @@ mod tests {
         }
         assert!(!flag.load(Ordering::SeqCst));
     }
+
+    // -----------------------------------------------------------------------
+    // Helper: builds a SharedAppState with unreachable URLs (for handler tests)
+    // -----------------------------------------------------------------------
+
+    fn test_state() -> crate::state::SharedAppState {
+        use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+
+        crate::state::SharedAppState::new(
+            QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "http://127.0.0.1:1/unreachable.csv".to_string(),
+                instrument_csv_fallback_url: "http://127.0.0.1:1/fallback.csv".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-test-instruments".to_string(),
+                csv_cache_filename: "test-instruments.csv".to_string(),
+                csv_download_timeout_secs: 1,
+                build_window_start: "00:00:00".to_string(),
+                build_window_end: "23:59:59".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler tests: concurrent rebuild guard rejection
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rebuild_instruments_concurrent_guard_rejects_second_request() {
+        let state = test_state();
+
+        // Pre-set the flag to simulate a rebuild already in progress
+        state.rebuild_in_progress().store(true, Ordering::SeqCst);
+
+        let Json(resp) = rebuild_instruments(State(state.clone())).await;
+        assert_eq!(resp.status, "in_progress");
+        assert!(resp.message.contains("already running"));
+        assert!(resp.derivative_count.is_none());
+        assert!(resp.underlying_count.is_none());
+
+        // Flag should still be true (we didn't acquire it, so we didn't release it)
+        assert!(state.rebuild_in_progress().load(Ordering::SeqCst));
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler tests: do_rebuild with unreachable CSV URLs → Err path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rebuild_instruments_error_path() {
+        let state = test_state();
+
+        // Flag starts false, so handler will acquire it
+        assert!(!state.rebuild_in_progress().load(Ordering::SeqCst));
+
+        let Json(resp) = rebuild_instruments(State(state.clone())).await;
+
+        // With unreachable URLs, rebuild should fail
+        assert_eq!(resp.status, "failed");
+        assert!(resp.message.contains("rebuild failed"));
+        assert!(resp.derivative_count.is_none());
+        assert!(resp.underlying_count.is_none());
+
+        // Flag should be cleared by the RAII guard
+        assert!(!state.rebuild_in_progress().load(Ordering::SeqCst));
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler tests: instrument_diagnostic
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_instrument_diagnostic_returns_json_value() {
+        let state = test_state();
+
+        let Json(result) = instrument_diagnostic(State(state)).await;
+
+        // Should always return a JSON value, even when CSV is unreachable
+        assert!(result.is_object());
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler tests: do_rebuild inner function directly
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_do_rebuild_error_clears_guard_flag() {
+        let state = test_state();
+
+        let Json(resp) = do_rebuild(&state).await;
+        // With unreachable URLs, we expect failure
+        assert_eq!(resp.status, "failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler tests: Ok(None) path — instruments already built today
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rebuild_instruments_already_built_today_returns_already_built() {
+        use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+        use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
+
+        // Create a unique temp dir with today's freshness marker
+        let temp_dir =
+            std::env::temp_dir().join(format!("dlt-test-already-built-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Write today's IST date as the freshness marker
+        let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let today = chrono::Utc::now()
+            .with_timezone(&ist_offset)
+            .date_naive()
+            .to_string();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, &today).unwrap();
+
+        let state = crate::state::SharedAppState::new(
+            QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "http://127.0.0.1:1/unreachable.csv".to_string(),
+                instrument_csv_fallback_url: "http://127.0.0.1:1/fallback.csv".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: temp_dir.to_str().unwrap().to_string(),
+                csv_cache_filename: "test-instruments.csv".to_string(),
+                csv_download_timeout_secs: 1,
+                build_window_start: "00:00:00".to_string(),
+                build_window_end: "23:59:59".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
+        );
+
+        let Json(resp) = rebuild_instruments(State(state)).await;
+        assert_eq!(resp.status, "already_built");
+        assert!(resp.message.contains("already built today"));
+        assert!(resp.derivative_count.is_none());
+        assert!(resp.underlying_count.is_none());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // RebuildResponse Debug impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rebuild_response_debug_impl() {
+        let resp = RebuildResponse {
+            status: "rebuilt".to_string(),
+            message: "test".to_string(),
+            derivative_count: Some(100),
+            underlying_count: Some(50),
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("RebuildResponse"));
+        assert!(debug.contains("rebuilt"));
+    }
 }

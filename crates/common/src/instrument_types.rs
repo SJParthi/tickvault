@@ -2039,4 +2039,191 @@ mod tests {
         assert_eq!(deserialized.symbol, "INDIA VIX");
         assert_eq!(deserialized.security_id, 26017);
     }
+
+    // =====================================================================
+    // Coverage: duration_serde::deserialize (line 532)
+    // =====================================================================
+
+    #[test]
+    fn test_duration_serde_deserialize_roundtrip() {
+        // Exercises duration_serde::deserialize by round-tripping through JSON
+        let ist = crate::trading_calendar::ist_offset();
+        let original = UniverseBuildMetadata {
+            csv_source: "test".to_string(),
+            csv_row_count: 1,
+            parsed_row_count: 1,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::from_millis(4567),
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: UniverseBuildMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.build_duration,
+            std::time::Duration::from_millis(4567)
+        );
+    }
+
+    #[test]
+    fn test_duration_serde_deserialize_invalid_type_fails() {
+        // Exercises the error path of duration_serde::deserialize (line 532 `?`)
+        // by providing a string instead of a u64 for build_duration.
+        let json = r#"{
+            "csv_source": "test",
+            "csv_row_count": 0,
+            "parsed_row_count": 0,
+            "index_count": 0,
+            "equity_count": 0,
+            "underlying_count": 0,
+            "derivative_count": 0,
+            "option_chain_count": 0,
+            "build_duration": "not_a_number",
+            "build_timestamp": "2026-01-01T00:00:00+05:30"
+        }"#;
+        let result: Result<UniverseBuildMetadata, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // =====================================================================
+    // Coverage: NaiveDateAsI32 deserialization error path (line 578)
+    // =====================================================================
+
+    #[test]
+    fn test_naive_date_as_i32_invalid_days_from_ce() {
+        // Forge an rkyv buffer with an invalid days-from-CE value that
+        // NaiveDate::from_num_days_from_ce_opt rejects (i32::MIN).
+        let original = DerivativeContract {
+            security_id: 1,
+            underlying_symbol: "X".to_string(),
+            instrument_kind: DhanInstrumentKind::FutureIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 0.0,
+            option_type: None,
+            lot_size: 1,
+            tick_size: 0.05,
+            symbol_name: "X".to_string(),
+            display_name: "X".to_string(),
+        };
+        let mut bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original)
+            .unwrap()
+            .to_vec();
+
+        // The expiry_date field is archived as an i32_le.
+        // Corrupt it with i32::MIN which is invalid for NaiveDate.
+        let valid_days = chrono::NaiveDate::from_ymd_opt(2026, 3, 27)
+            .unwrap()
+            .num_days_from_ce();
+        let valid_bytes = valid_days.to_le_bytes();
+
+        let mut found = false;
+        for i in 0..bytes.len().saturating_sub(3) {
+            if bytes[i..i + 4] == valid_bytes {
+                let invalid_bytes = i32::MIN.to_le_bytes();
+                bytes[i..i + 4].copy_from_slice(&invalid_bytes);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not find date bytes in archive");
+
+        let archived =
+            rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+        let result = rkyv::deserialize::<DerivativeContract, rkyv::rancor::Error>(archived);
+        assert!(
+            result.is_err(),
+            "expected error for invalid NaiveDate days-from-CE"
+        );
+    }
+
+    // =====================================================================
+    // Coverage: DateTimeFixedOffsetAsI64 error paths (lines 653-658)
+    // =====================================================================
+
+    #[test]
+    fn test_datetime_fixed_offset_as_i64_invalid_offset() {
+        // Forge bytes with an invalid UTC offset (> 86400 seconds) to trigger
+        // FixedOffset::east_opt returning None (line 655).
+        let ist = crate::trading_calendar::ist_offset();
+        let original = UniverseBuildMetadata {
+            csv_source: "t".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::from_millis(0),
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let mut bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original)
+            .unwrap()
+            .to_vec();
+
+        // The offset is 19800 (IST = +5:30). Corrupt to invalid value.
+        let valid_offset = 19800_i32.to_le_bytes();
+        let invalid_offset = 999_999_i32.to_le_bytes();
+
+        let mut found = false;
+        for i in 0..bytes.len().saturating_sub(3) {
+            if bytes[i..i + 4] == valid_offset {
+                bytes[i..i + 4].copy_from_slice(&invalid_offset);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not find offset bytes in archive");
+
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let result = rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived);
+        assert!(result.is_err(), "expected error for invalid UTC offset");
+    }
+
+    #[test]
+    fn test_datetime_fixed_offset_as_i64_invalid_timestamp() {
+        // Forge bytes with an invalid timestamp to trigger
+        // DateTime::from_timestamp returning None (line 657-658).
+        let ist = crate::trading_calendar::ist_offset();
+        let original = UniverseBuildMetadata {
+            csv_source: "t".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::from_millis(0),
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let mut bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original)
+            .unwrap()
+            .to_vec();
+
+        // The timestamp_secs is an i64. Replace with i64::MAX.
+        let ts = original.build_timestamp.timestamp();
+        let ts_bytes = ts.to_le_bytes();
+        let invalid_ts = i64::MAX.to_le_bytes();
+
+        let mut found = false;
+        for i in 0..bytes.len().saturating_sub(7) {
+            if bytes[i..i + 8] == ts_bytes {
+                bytes[i..i + 8].copy_from_slice(&invalid_ts);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not find timestamp bytes in archive");
+
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let result = rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived);
+        assert!(result.is_err(), "expected error for invalid timestamp");
+    }
 }

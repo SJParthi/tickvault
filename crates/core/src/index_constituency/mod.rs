@@ -407,4 +407,142 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
+
+    // -----------------------------------------------------------------------
+    // try_load_cache — directory exists but file is missing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_load_cache_dir_exists_no_file_returns_none() {
+        let cache_dir = test_cache_dir("dir-exists-no-file");
+        // Directory exists but no cache file inside
+        let result = try_load_cache(&cache_dir).await;
+        assert!(result.is_none(), "no cache file should return None");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_load_cache — valid map with multiple indices
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_load_cache_multiple_indices() {
+        let cache_dir = test_cache_dir("multi-index");
+        let mut map = IndexConstituencyMap::default();
+
+        map.index_to_constituents.insert(
+            "Nifty 50".to_string(),
+            vec![IndexConstituent {
+                index_name: "Nifty 50".to_string(),
+                symbol: "RELIANCE".to_string(),
+                isin: "INE002A01018".to_string(),
+                weight: 10.0,
+                sector: "Energy".to_string(),
+                last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            }],
+        );
+        map.index_to_constituents.insert(
+            "Nifty IT".to_string(),
+            vec![IndexConstituent {
+                index_name: "Nifty IT".to_string(),
+                symbol: "INFY".to_string(),
+                isin: "INE009A01021".to_string(),
+                weight: 15.0,
+                sector: "IT".to_string(),
+                last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            }],
+        );
+        map.stock_to_indices
+            .insert("RELIANCE".to_string(), vec!["Nifty 50".to_string()]);
+        map.stock_to_indices
+            .insert("INFY".to_string(), vec!["Nifty IT".to_string()]);
+
+        cache::save_constituency_cache(&map, &cache_dir, INDEX_CONSTITUENCY_CSV_CACHE_FILENAME)
+            .await
+            .unwrap();
+
+        let loaded = try_load_cache(&cache_dir).await;
+        assert!(
+            loaded.is_some(),
+            "valid multi-index cache should return Some"
+        );
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.index_count(), 2);
+        assert!(loaded.contains_index("Nifty 50"));
+        assert!(loaded.contains_index("Nifty IT"));
+        assert!(loaded.contains_stock("RELIANCE"));
+        assert!(loaded.contains_stock("INFY"));
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_load_cache — truncated JSON returns None
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_load_cache_truncated_json_returns_none() {
+        let cache_dir = test_cache_dir("truncated-json");
+        let cache_path =
+            std::path::Path::new(&cache_dir).join(INDEX_CONSTITUENCY_CSV_CACHE_FILENAME);
+        // Write valid-looking but truncated JSON
+        tokio::fs::write(&cache_path, r##"{"index_to_constituents": {"Nifty 50":#}"##)
+            .await
+            .unwrap();
+
+        let result = try_load_cache(&cache_dir).await;
+        assert!(result.is_none(), "truncated JSON should return None");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // download_and_build — cache save error path (read-only dir)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cache_save_to_readonly_dir_does_not_panic() {
+        // Saving to a non-writable path should log a warning but not panic
+        let result = cache::save_constituency_cache(
+            &IndexConstituencyMap::default(),
+            "/proc/non-writable-path",
+            INDEX_CONSTITUENCY_CSV_CACHE_FILENAME,
+        )
+        .await;
+        // Should fail but not panic
+        assert!(result.is_err(), "saving to /proc should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // IndexConstituencyConfig — default values validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_helper_inter_batch_delay_zero() {
+        let config = test_config(true);
+        assert_eq!(config.inter_batch_delay_ms, 0);
+    }
+
+    #[test]
+    fn test_config_helper_download_timeout_is_one() {
+        let config = test_config(true);
+        assert_eq!(config.download_timeout_secs, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_load_cache — binary garbage returns None
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_load_cache_binary_garbage_returns_none() {
+        let cache_dir = test_cache_dir("binary-garbage");
+        let cache_path =
+            std::path::Path::new(&cache_dir).join(INDEX_CONSTITUENCY_CSV_CACHE_FILENAME);
+        tokio::fs::write(&cache_path, &[0xFF, 0xFE, 0x00, 0x01, 0x02])
+            .await
+            .unwrap();
+
+        let result = try_load_cache(&cache_dir).await;
+        assert!(result.is_none(), "binary garbage should return None");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 }
