@@ -279,4 +279,52 @@ mod tests {
         let result = query_latest_tick(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
+
+    #[tokio::test]
+    async fn test_check_questdb_reachable_returns_true() {
+        let body = r#"{"columns":["tableName"],"dataset":[["ticks"]]}"#;
+        let base_url = start_mock_server(body).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+
+        let result = check_questdb_reachable(&client, &base_url).await;
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_fields() {
+        // Row with too few fields — should return None via bounds check
+        let body = r#"{"dataset":[[12345]]}"#;
+        let base_url = start_mock_server(body).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+
+        let result = query_latest_tick(&client, &base_url, 12345).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_with_default_fallback_values() {
+        // Row with some null fields — tests unwrap_or fallback paths (ltq, volume, OHLC)
+        let body = r#"{"dataset":[[12345,2,1500.5,null,null,null,null,null,null,"2026-03-08T10:30:00.000000Z"]]}"#;
+        let base_url = start_mock_server(body).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+
+        let result = query_latest_tick(&client, &base_url, 12345).await;
+        assert!(result.is_some());
+        let quote = result.unwrap();
+        assert_eq!(quote.last_traded_quantity, 0); // unwrap_or(0)
+        assert_eq!(quote.volume, 0);
+        assert!((quote.day_open - 0.0).abs() < f64::EPSILON); // unwrap_or(0.0)
+    }
 }

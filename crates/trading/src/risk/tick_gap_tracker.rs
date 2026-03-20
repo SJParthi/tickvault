@@ -357,4 +357,117 @@ mod tests {
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.tracked_securities(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Warmup boundary: exact threshold tick
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn warmup_boundary_exact_threshold_tick_still_suppressed() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Feed exactly TICK_GAP_MIN_TICKS_BEFORE_ACTIVE ticks with large gaps.
+        // The tick_count goes from 1..=threshold; tick at threshold should still be suppressed.
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            let result = tracker.record_tick(1001, base_ts + i * 1000); // 1000s gaps
+            assert_eq!(
+                result,
+                TickGapResult::Ok,
+                "warmup tick {} must be Ok",
+                i + 1
+            );
+        }
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+    }
+
+    #[test]
+    fn warmup_boundary_first_post_warmup_tick_can_detect_gap() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Fill warmup with 1-sec intervals
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        // The next tick (TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1) is the first
+        // post-warmup tick that CAN detect a gap.
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        assert!(
+            matches!(result, TickGapResult::Warning { .. }),
+            "first post-warmup tick must detect warning gap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter saturation at u64::MAX
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn warning_counter_saturates_at_u64_max() {
+        let mut tracker = TickGapTracker::new(10);
+        // Pre-set counter to near max
+        tracker.total_warnings = u64::MAX - 1;
+
+        let base_ts = 1_700_000_000;
+        // Fill warmup
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        // Trigger warning
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts);
+        assert_eq!(tracker.total_warnings(), u64::MAX);
+
+        // Another warning should saturate at MAX, not overflow
+        let gap_ts2 = gap_ts + TICK_GAP_ALERT_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts2);
+        assert_eq!(tracker.total_warnings(), u64::MAX);
+    }
+
+    #[test]
+    fn error_counter_saturates_at_u64_max() {
+        let mut tracker = TickGapTracker::new(10);
+        tracker.total_errors = u64::MAX - 1;
+
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts);
+        assert_eq!(tracker.total_errors(), u64::MAX);
+
+        let gap_ts2 = gap_ts + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts2);
+        assert_eq!(tracker.total_errors(), u64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tick count saturation at u32::MAX
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tick_count_saturates_at_u32_max() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Insert first tick to create the entry
+        tracker.record_tick(1001, base_ts);
+
+        // Set tick_count to near max
+        tracker.states.get_mut(&1001).unwrap().tick_count = u32::MAX - 1;
+
+        // Two more ticks should saturate at MAX, not overflow
+        tracker.record_tick(1001, base_ts + 1);
+        assert_eq!(tracker.states.get(&1001).unwrap().tick_count, u32::MAX);
+
+        tracker.record_tick(1001, base_ts + 2);
+        assert_eq!(tracker.states.get(&1001).unwrap().tick_count, u32::MAX);
+    }
 }

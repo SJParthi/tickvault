@@ -132,4 +132,75 @@ mod tests {
             assert_eq!(hdr.exchange_segment_code, seg);
         }
     }
+
+    #[test]
+    fn test_parse_header_unknown_segment_byte_6() {
+        // Segment byte 6 does NOT exist in Dhan's enum (gap between 5 and 7).
+        // parse_header still reads the byte — it doesn't validate the segment.
+        // The caller (ExchangeSegment::from_byte) returns None for unknown values.
+        let buf = make_header(RESPONSE_CODE_TICKER, 16, 6, 1);
+        let hdr = parse_header(&buf).unwrap();
+        assert_eq!(hdr.exchange_segment_code, 6);
+        // Verify ExchangeSegment::from_byte rejects 6
+        use dhan_live_trader_common::types::ExchangeSegment;
+        assert!(
+            ExchangeSegment::from_byte(6).is_none(),
+            "segment byte 6 must return None (gap in Dhan enum)"
+        );
+    }
+
+    #[test]
+    fn test_parse_header_unknown_segment_bytes_beyond_range() {
+        // Bytes 9-255 are all unknown segments
+        for seg in [9u8, 10, 100, 200, 255] {
+            let buf = make_header(RESPONSE_CODE_TICKER, 16, seg, 1);
+            let hdr = parse_header(&buf).unwrap();
+            assert_eq!(hdr.exchange_segment_code, seg);
+        }
+    }
+
+    #[test]
+    fn test_parse_header_extra_bytes_ok() {
+        // More than 8 bytes is fine — only first 8 are read
+        let mut buf = make_header(RESPONSE_CODE_TICKER, 16, 2, 13);
+        buf.extend_from_slice(&[0xFF; 100]);
+        let hdr = parse_header(&buf).unwrap();
+        assert_eq!(hdr.security_id, 13);
+    }
+
+    #[test]
+    fn test_parse_header_message_length_zero() {
+        let buf = make_header(RESPONSE_CODE_TICKER, 0, 2, 1);
+        let hdr = parse_header(&buf).unwrap();
+        assert_eq!(hdr.message_length, 0);
+    }
+
+    #[test]
+    fn test_parse_header_message_length_max() {
+        let buf = make_header(RESPONSE_CODE_TICKER, u16::MAX, 2, 1);
+        let hdr = parse_header(&buf).unwrap();
+        assert_eq!(hdr.message_length, u16::MAX);
+    }
+
+    #[test]
+    fn test_parse_header_all_response_codes() {
+        // Every valid response code should parse without error
+        for code in [1u8, 2, 3, 4, 5, 6, 7, 8, 50] {
+            let buf = make_header(code, 16, 2, 42);
+            let hdr = parse_header(&buf).unwrap();
+            assert_eq!(hdr.response_code, code);
+        }
+    }
+
+    #[test]
+    fn test_parse_header_single_byte_fails() {
+        let err = parse_header(&[0xFF]).unwrap_err();
+        match err {
+            ParseError::InsufficientBytes { expected, actual } => {
+                assert_eq!(expected, 8);
+                assert_eq!(actual, 1);
+            }
+            _ => panic!("wrong error variant"),
+        }
+    }
 }

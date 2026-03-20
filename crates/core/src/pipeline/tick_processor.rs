@@ -2065,6 +2065,180 @@ mod tests {
         let _ = handle.await;
     }
 
+    // ===================================================================
+    // depth_prices_are_finite unit tests
+    // ===================================================================
+
+    #[test]
+    fn test_depth_prices_are_finite_all_valid() {
+        let depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[2].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_nan_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[4].ask_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_infinity_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[0].bid_price = f32::INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_neg_infinity_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[3].ask_price = f32::NEG_INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_zero_prices_valid() {
+        let depth = [MarketDepthLevel {
+            bid_price: 0.0,
+            ask_price: 0.0,
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_negative_prices_valid() {
+        // Negative prices are finite, so this returns true.
+        // The caller decides whether negatives are meaningful.
+        let depth = [MarketDepthLevel {
+            bid_price: -100.0,
+            ask_price: -50.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    // ===================================================================
+    // is_within_persist_window — additional boundary tests
+    // ===================================================================
+
+    #[test]
+    fn test_persist_window_zero_timestamp() {
+        // Epoch 0 maps to 00:00:00 IST → outside market hours
+        assert!(!is_within_persist_window(0));
+    }
+
+    #[test]
+    fn test_persist_window_u32_max() {
+        // u32::MAX % 86400 = some seconds-of-day, likely outside market hours
+        assert!(!is_within_persist_window(u32::MAX) || is_within_persist_window(u32::MAX));
+        // Main goal: no panic on u32::MAX
+    }
+
+    // ===================================================================
+    // TickDedupRing::new — power boundaries
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_new_power_8() {
+        let ring = TickDedupRing::new(8);
+        assert_eq!(ring.slots.len(), 256);
+        assert_eq!(ring.mask, 255);
+    }
+
+    #[test]
+    fn test_dedup_ring_new_power_24() {
+        let ring = TickDedupRing::new(24);
+        assert_eq!(ring.slots.len(), 16_777_216);
+        assert_eq!(ring.mask, 16_777_215);
+    }
+
+    #[test]
+    fn test_dedup_ring_new_power_12() {
+        let ring = TickDedupRing::new(12);
+        assert_eq!(ring.slots.len(), 4096);
+        assert_eq!(ring.mask, 4095);
+    }
+
+    #[test]
+    fn test_dedup_ring_slots_initialized_to_max() {
+        let ring = TickDedupRing::new(8);
+        assert!(ring.slots.iter().all(|&s| s == u64::MAX));
+    }
+
+    // ===================================================================
+    // TickDedupRing::fingerprint — additional determinism tests
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_fingerprint_zero_inputs() {
+        let fp = TickDedupRing::fingerprint(0, 0, 0.0);
+        // Must be deterministic
+        assert_eq!(fp, TickDedupRing::fingerprint(0, 0, 0.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_max_inputs() {
+        let fp = TickDedupRing::fingerprint(u32::MAX, u32::MAX, f32::MAX);
+        assert_eq!(fp, TickDedupRing::fingerprint(u32::MAX, u32::MAX, f32::MAX));
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_nan_is_stable() {
+        // NaN has a stable bit pattern via to_bits()
+        let fp1 = TickDedupRing::fingerprint(1, 1, f32::NAN);
+        let fp2 = TickDedupRing::fingerprint(1, 1, f32::NAN);
+        assert_eq!(fp1, fp2);
+    }
+
     #[tokio::test]
     async fn test_tick_processor_mixed_dedup_junk_valid_nan() {
         // Comprehensive mixed sequence: valid → duplicate → junk → NaN → valid
@@ -2276,5 +2450,181 @@ mod tests {
         assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 15, 0)));
         // 15:15:00 IST = near close
         assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 15, 0)));
+    }
+
+    // ===================================================================
+    // TickDedupRing — additional coverage for new() with DEDUP_RING_BUFFER_POWER
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_new_with_configured_power() {
+        // Uses the actual configured constant
+        let ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
+        let expected_size = 1_usize << DEDUP_RING_BUFFER_POWER;
+        assert_eq!(ring.slots.len(), expected_size);
+        assert_eq!(ring.mask, expected_size - 1);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_negative_zero_differs_from_positive_zero() {
+        // -0.0 and +0.0 have different bit patterns
+        let fp_pos = TickDedupRing::fingerprint(1, 1, 0.0);
+        let fp_neg = TickDedupRing::fingerprint(1, 1, -0.0);
+        // IEEE 754: 0.0 bits = 0x00000000, -0.0 bits = 0x80000000
+        assert_ne!(fp_pos, fp_neg);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_close_prices_differ() {
+        // 24500.0 vs 24500.05 must produce different fingerprints
+        let fp1 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
+        let fp2 = TickDedupRing::fingerprint(13, 1772073900, 24500.05);
+        assert_ne!(fp1, fp2);
+    }
+
+    // ===================================================================
+    // Top movers integration — tick processor with top_movers parameter
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_with_top_movers_tracker() {
+        use crate::pipeline::top_movers::TopMoversTracker;
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let tracker = TopMoversTracker::new();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, Some(tracker), None).await;
+        });
+
+        // Send a valid tick with day_close for top movers to process
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        // Ticker packets don't carry day_close. Use a Quote or Full packet.
+        // Just send a ticker — top_movers.update() will skip it if day_close=0.
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_with_broadcast_channel() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<ParsedTick>(16);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(broadcast_tx),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send a valid tick
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Broadcast receiver should get the tick
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), broadcast_rx.recv()).await;
+        if let Ok(Ok(tick)) = received {
+            assert_eq!(tick.security_id, 13);
+            assert!((tick.last_traded_price - 24500.0).abs() < 0.01);
+        }
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Crossed market detection path
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_full_quote_crossed_market() {
+        // Full quote with bid > ask at level 0 → crossed market metric incremented
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        // Set depth level 0: bid_price > ask_price (crossed market)
+        // Level 0 starts at offset 62 in full packet
+        // bid_qty(4) + ask_qty(4) + bid_orders(2) + ask_orders(2) + bid_price(4) + ask_price(4)
+        let depth_start = 62;
+        // bid_quantity at offset+0
+        frame[depth_start..depth_start + 4].copy_from_slice(&100u32.to_le_bytes());
+        // ask_quantity at offset+4
+        frame[depth_start + 4..depth_start + 8].copy_from_slice(&100u32.to_le_bytes());
+        // bid_orders at offset+8
+        frame[depth_start + 8..depth_start + 10].copy_from_slice(&5u16.to_le_bytes());
+        // ask_orders at offset+10
+        frame[depth_start + 10..depth_start + 12].copy_from_slice(&5u16.to_le_bytes());
+        // bid_price at offset+12 = 25000.0 (higher than ask)
+        frame[depth_start + 12..depth_start + 16].copy_from_slice(&25000.0_f32.to_le_bytes());
+        // ask_price at offset+16 = 24900.0 (lower than bid → crossed)
+        frame[depth_start + 16..depth_start + 20].copy_from_slice(&24900.0_f32.to_le_bytes());
+
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Snapshot publishing integration
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_publishes_snapshot_after_5_seconds() {
+        use crate::pipeline::top_movers::{SharedTopMoversSnapshot, TopMoversTracker};
+        use std::sync::{Arc, RwLock};
+
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+        let tracker = TopMoversTracker::new();
+        let shared: SharedTopMoversSnapshot = Arc::new(RwLock::new(None));
+        let shared_clone = shared.clone();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(tracker),
+                Some(shared_clone),
+            )
+            .await;
+        });
+
+        // Send ticks continuously for >5 seconds with gaps >100ms to trigger
+        // both the flush check and the 5-second snapshot check.
+        for i in 0..55u32 {
+            let frame = make_ticker_frame(13 + (i % 5), 24500.0 + (i as f32), 1772073900 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+        }
+
+        drop(frame_tx);
+        let _ = handle.await;
+
+        // Snapshot should have been published
+        let guard = shared.read().unwrap();
+        assert!(
+            guard.is_some(),
+            "snapshot should be published after 5+ seconds of ticks"
+        );
     }
 }

@@ -127,4 +127,88 @@ mod tests {
             "disabled tracing should return None"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Config field validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn disabled_config_has_zeroed_port() {
+        let config = disabled_config();
+        assert_eq!(config.metrics_port, 0, "disabled config should have port 0");
+    }
+
+    #[test]
+    fn disabled_config_has_empty_endpoint() {
+        let config = disabled_config();
+        assert!(
+            config.otlp_endpoint.is_empty(),
+            "disabled config should have empty OTLP endpoint"
+        );
+    }
+
+    #[test]
+    fn disabled_config_flags_are_both_false() {
+        let config = disabled_config();
+        assert!(!config.metrics_enabled, "metrics must be disabled");
+        assert!(!config.tracing_enabled, "tracing must be disabled");
+    }
+
+    // -----------------------------------------------------------------------
+    // Default ObservabilityConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_observability_config_has_metrics_enabled() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.metrics_enabled,
+            "default config should have metrics enabled"
+        );
+    }
+
+    #[test]
+    fn default_observability_config_has_tracing_enabled() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.tracing_enabled,
+            "default config should have tracing enabled"
+        );
+    }
+
+    #[test]
+    fn default_observability_config_has_valid_port() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.metrics_port > 0,
+            "default metrics port must be positive"
+        );
+    }
+
+    #[test]
+    fn default_observability_config_has_nonempty_endpoint() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            !config.otlp_endpoint.is_empty(),
+            "default OTLP endpoint must not be empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Enabled config validation (doesn't actually start — just verify config shape)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enabled_config_can_be_constructed() {
+        let config = ObservabilityConfig {
+            metrics_port: 9091,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            metrics_enabled: true,
+            tracing_enabled: true,
+        };
+        assert!(config.metrics_enabled);
+        assert!(config.tracing_enabled);
+        assert_eq!(config.metrics_port, 9091);
+        assert!(!config.otlp_endpoint.is_empty());
+    }
 }

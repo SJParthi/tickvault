@@ -410,4 +410,76 @@ threshold = 0.0
 
         cleanup_temp_dir(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // Invalid TOML reload keeps old config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_invalid_toml_does_not_send_event() {
+        // Simulate handle_file_change with an invalid TOML file.
+        // The sender should NOT receive a ReloadEvent.
+        let (dir, file_path) = write_temp_strategy_file("this is [[[ invalid TOML");
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        // No event should be sent because parsing failed
+        let event = receiver.try_recv();
+        assert!(
+            event.is_err(),
+            "invalid TOML reload must NOT send a ReloadEvent"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn handle_file_change_valid_toml_sends_event() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        let event = receiver.try_recv();
+        assert!(event.is_ok(), "valid TOML reload must send a ReloadEvent");
+        let event = event.unwrap();
+        assert_eq!(event.strategies.len(), 1);
+        assert_eq!(event.strategies[0].name, "test_strategy");
+
+        cleanup_temp_dir(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // File deleted during watch — handle_file_change with missing file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_missing_file_does_not_send_event() {
+        let nonexistent = Path::new("/tmp/dlt_hot_reload_deleted_file_99999.toml");
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(nonexistent, &sender);
+
+        // No event should be sent because file does not exist
+        let event = receiver.try_recv();
+        assert!(
+            event.is_err(),
+            "missing file reload must NOT send a ReloadEvent"
+        );
+    }
+
+    #[test]
+    fn handle_file_change_dropped_receiver_does_not_panic() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        // Drop receiver before sending
+        drop(receiver);
+
+        // Should not panic even though receiver is dropped
+        handle_file_change(&file_path, &sender);
+
+        cleanup_temp_dir(&dir);
+    }
 }

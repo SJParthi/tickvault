@@ -376,3 +376,365 @@ impl StrategyInstance {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::types::{ComparisonOp, Condition, IndicatorField};
+
+    /// Builds a minimal strategy definition with long entry on RSI < threshold.
+    fn make_long_only_definition(rsi_threshold: f64) -> StrategyDefinition {
+        StrategyDefinition {
+            name: "test_long".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Lt,
+                threshold: rsi_threshold,
+            }],
+            entry_short_conditions: vec![],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        }
+    }
+
+    fn make_warm_snapshot(security_id: u32, ltp: f64, rsi: f64, atr: f64) -> IndicatorSnapshot {
+        IndicatorSnapshot {
+            security_id,
+            last_traded_price: ltp,
+            rsi,
+            atr,
+            is_warm: true,
+            ..Default::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-bounds security_id returns Hold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_out_of_bounds_security_id_returns_hold() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 10); // max_security_id = 10
+
+        // security_id=100 is way beyond the pre-allocated state array
+        let snap = make_warm_snapshot(100, 250.0, 25.0, 5.0);
+        let signal = instance.evaluate(&snap);
+        assert_eq!(signal, Signal::Hold, "OOB security_id must return Hold");
+    }
+
+    #[test]
+    fn test_cold_snapshot_returns_hold() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // is_warm = false
+        let snap = IndicatorSnapshot {
+            security_id: 100,
+            last_traded_price: 250.0,
+            rsi: 25.0,
+            atr: 5.0,
+            is_warm: false,
+            ..Default::default()
+        };
+        let signal = instance.evaluate(&snap);
+        assert_eq!(
+            signal,
+            Signal::Hold,
+            "cold snapshot must return Hold regardless of conditions"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trailing stop crossing SL edge case
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trailing_stop_long_triggers_exit() {
+        let mut def = make_long_only_definition(30.0);
+        def.trailing_stop_enabled = true;
+        def.trailing_stop_atr_multiplier = 1.0;
+        def.stop_loss_atr_multiplier = 2.0;
+        def.target_atr_multiplier = 5.0;
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long: RSI=25 < 30
+        let entry_snap = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let signal = instance.evaluate(&entry_snap);
+        assert!(
+            matches!(signal, Signal::EnterLong { .. }),
+            "should enter long"
+        );
+
+        // Price rises to 120, new high = 120
+        let high_snap = make_warm_snapshot(100, 120.0, 50.0, 5.0);
+        let signal = instance.evaluate(&high_snap);
+        assert_eq!(signal, Signal::Hold, "should hold while price rises");
+
+        // Price drops to 114: trailing_stop = 120 - 1.0*5.0 = 115 > stop_loss (100 - 2*5 = 90)
+        // price=114 <= 115 → trailing stop fires
+        let drop_snap = make_warm_snapshot(100, 114.0, 50.0, 5.0);
+        let signal = instance.evaluate(&drop_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::TrailingStop
+                }
+            ),
+            "trailing stop must fire when price drops below trail"
+        );
+    }
+
+    #[test]
+    fn test_trailing_stop_not_triggered_when_below_stop_loss() {
+        let mut def = make_long_only_definition(30.0);
+        def.trailing_stop_enabled = true;
+        def.trailing_stop_atr_multiplier = 3.0; // Wide trail
+        def.stop_loss_atr_multiplier = 1.0; // Tight SL
+        def.target_atr_multiplier = 10.0;
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long at 100 with ATR=5
+        // SL = 100 - 1*5 = 95, target = 100 + 10*5 = 150
+        let entry_snap = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry_snap);
+
+        // Price at 101, highest=101, trailing = 101 - 3*5 = 86 < SL(95)
+        // So trailing stop condition (trailing_stop > stop_loss) is NOT met.
+        // But regular SL hasn't hit either (101 > 95).
+        let snap = make_warm_snapshot(100, 101.0, 50.0, 5.0);
+        let signal = instance.evaluate(&snap);
+        assert_eq!(signal, Signal::Hold, "trailing stop below SL must not fire");
+    }
+
+    // -----------------------------------------------------------------------
+    // Zero ATR disables trailing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_atr_disables_trailing_stop() {
+        let mut def = make_long_only_definition(30.0);
+        def.trailing_stop_enabled = true;
+        def.trailing_stop_atr_multiplier = 1.0;
+        def.stop_loss_atr_multiplier = 2.0;
+        def.target_atr_multiplier = 5.0;
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long with ATR=5
+        let entry_snap = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry_snap);
+
+        // Now ATR drops to 0 — trailing stop should be disabled
+        // Price at 105 (in position, no exit conditions)
+        let snap = make_warm_snapshot(100, 105.0, 50.0, 0.0);
+        let signal = instance.evaluate(&snap);
+        assert_eq!(signal, Signal::Hold, "zero ATR must disable trailing stop");
+    }
+
+    // -----------------------------------------------------------------------
+    // Dual entry conditions (both long+short true) — long takes priority
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dual_entry_both_true_long_takes_priority() {
+        let def = StrategyDefinition {
+            name: "dual_entry".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Lt,
+                threshold: 50.0, // RSI < 50
+            }],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::MacdHistogram,
+                operator: ComparisonOp::Lt,
+                threshold: 0.0, // MACD hist < 0
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Both conditions true: RSI=40 < 50 AND MACD hist = -1.0 < 0
+        let snap = IndicatorSnapshot {
+            security_id: 100,
+            last_traded_price: 250.0,
+            rsi: 40.0,
+            macd_histogram: -1.0,
+            atr: 5.0,
+            is_warm: true,
+            ..Default::default()
+        };
+
+        let signal = instance.evaluate(&snap);
+        // Long is checked first in evaluate_idle, so it should win
+        assert!(
+            matches!(signal, Signal::EnterLong { .. }),
+            "when both long and short conditions are true, long must take priority"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Short entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_entry_signal() {
+        let def = StrategyDefinition {
+            name: "short_only".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.2,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        let snap = make_warm_snapshot(100, 300.0, 80.0, 10.0);
+        let signal = instance.evaluate(&snap);
+
+        match signal {
+            Signal::EnterShort {
+                size_fraction,
+                stop_loss,
+                target,
+            } => {
+                assert!((size_fraction - 0.2).abs() < f64::EPSILON);
+                // SL = 300 + 2*10 = 320 (short SL is above entry)
+                assert!((stop_loss - 320.0).abs() < f64::EPSILON);
+                // Target = 300 - 3*10 = 270 (short target is below entry)
+                assert!((target - 270.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected EnterShort, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ExitPending state returns Hold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exit_pending_returns_hold() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Manually set state to ExitPending
+        instance.states[100] = StrategyState::ExitPending {
+            reason: ExitReason::TargetHit,
+        };
+
+        let snap = make_warm_snapshot(100, 250.0, 25.0, 5.0);
+        let signal = instance.evaluate(&snap);
+        assert_eq!(signal, Signal::Hold, "ExitPending must return Hold");
+    }
+
+    // -----------------------------------------------------------------------
+    // reset_state sets to Idle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_state_sets_idle() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        instance.states[100] = StrategyState::InPosition {
+            entry_price: 250.0,
+            stop_loss: 240.0,
+            target: 270.0,
+            is_long: true,
+            highest_since_entry: 260.0,
+            lowest_since_entry: 245.0,
+        };
+
+        instance.reset_state(100);
+        assert_eq!(instance.states[100], StrategyState::Idle);
+    }
+
+    #[test]
+    fn test_reset_state_out_of_bounds_noop() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 10);
+        // Should not panic
+        instance.reset_state(999);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stop loss and target hit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_long_stop_loss_hit() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long
+        let entry = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry);
+
+        // Price drops to stop_loss level (100 - 2*5 = 90)
+        let sl_snap = make_warm_snapshot(100, 90.0, 50.0, 5.0);
+        let signal = instance.evaluate(&sl_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::StopLossHit
+                }
+            ),
+            "must exit on stop loss hit"
+        );
+    }
+
+    #[test]
+    fn test_long_target_hit() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long at 100 with ATR=5 → target = 100 + 3*5 = 115
+        let entry = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry);
+
+        // Price rises to target
+        let target_snap = make_warm_snapshot(100, 115.0, 50.0, 5.0);
+        let signal = instance.evaluate(&target_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::TargetHit
+                }
+            ),
+            "must exit on target hit"
+        );
+    }
+}

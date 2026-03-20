@@ -311,4 +311,156 @@ mod tests {
         let b = a; // Copy
         assert_eq!(a, b); // Original still usable
     }
+
+    // -----------------------------------------------------------------------
+    // Recovery log emission: record_success after threshold failures
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_success_after_threshold_failures_resets_to_closed() {
+        let cb = OrderCircuitBreaker::new();
+
+        // Trip the circuit breaker open
+        for _ in 0..OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // record_success resets the failure count and clears opened_at
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(cb.opened_at_secs.load(Ordering::Relaxed), 0);
+        assert!(!cb.half_open_probe_sent.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn record_success_below_threshold_is_noop_on_state() {
+        let cb = OrderCircuitBreaker::new();
+
+        // A couple of failures, still closed
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // record_success should reset counter to 0
+        cb.record_success();
+        assert_eq!(cb.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Half-open probe gate: CAS semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn half_open_allows_exactly_one_probe() {
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            // Set opened_at far enough in the past to transition to HalfOpen
+            opened_at_secs: AtomicU64::new(1),
+            reset_timeout: Duration::from_secs(0), // Immediate transition
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // First check in HalfOpen: probe allowed
+        let first = cb.check();
+        assert!(first.is_ok(), "first probe must be allowed");
+
+        // Second check in HalfOpen: probe already in flight
+        let second = cb.check();
+        assert!(
+            second.is_err(),
+            "second probe must be rejected while first is in flight"
+        );
+        assert!(matches!(second.unwrap_err(), OmsError::CircuitBreakerOpen));
+    }
+
+    #[test]
+    fn half_open_probe_reset_after_success() {
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(1),
+            reset_timeout: Duration::from_secs(0),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Send probe
+        assert!(cb.check().is_ok());
+        assert!(cb.half_open_probe_sent.load(Ordering::Relaxed));
+
+        // Probe succeeds — record_success resets everything
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(!cb.half_open_probe_sent.load(Ordering::Relaxed));
+
+        // Now can send requests normally
+        assert!(cb.check().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // State timing: Open → HalfOpen transition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_transitions_to_half_open_after_timeout() {
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            // Set opened_at to current time — should be Open initially
+            opened_at_secs: AtomicU64::new(now_epoch_secs()),
+            reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        // Should be Open (not enough time elapsed)
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn open_with_expired_timeout_is_half_open() {
+        let past = now_epoch_secs().saturating_sub(OMS_CIRCUIT_BREAKER_RESET_SECS + 1);
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(past),
+            reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn half_open_failure_reopens_circuit() {
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(1),
+            reset_timeout: Duration::from_secs(0),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Probe allowed
+        assert!(cb.check().is_ok());
+
+        // Probe fails — record_failure increments counter, keeps circuit open
+        cb.record_failure();
+
+        // opened_at_secs gets updated, so state depends on timing.
+        // But consecutive_failures is now > threshold, so it's at least Open.
+        let state = cb.state();
+        assert!(
+            state == CircuitState::Open || state == CircuitState::HalfOpen,
+            "after half-open failure, circuit must be Open or HalfOpen (not Closed)"
+        );
+    }
 }

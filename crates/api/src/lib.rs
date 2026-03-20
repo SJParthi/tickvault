@@ -133,3 +133,39 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
     }
 }
 // O(1) EXEMPT: end
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_cors_layer_empty_origins_uses_defaults() {
+        // Should not panic — falls back to localhost defaults
+        let _cors = build_cors_layer(&[]);
+    }
+
+    #[test]
+    fn test_build_cors_layer_valid_origins() {
+        let origins = vec![
+            "http://localhost:3000".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let _cors = build_cors_layer(&origins);
+    }
+
+    #[test]
+    fn test_build_cors_layer_all_invalid_origins_falls_back() {
+        // Invalid origins that can't parse to HeaderValue — should fall back to defaults
+        let origins = vec!["\x00invalid".to_string(), "\x01bad".to_string()];
+        let _cors = build_cors_layer(&origins);
+    }
+
+    #[test]
+    fn test_build_cors_layer_mixed_valid_invalid_origins() {
+        let origins = vec![
+            "http://localhost:3000".to_string(),
+            "\x00invalid".to_string(),
+        ];
+        let _cors = build_cors_layer(&origins);
+    }
+}

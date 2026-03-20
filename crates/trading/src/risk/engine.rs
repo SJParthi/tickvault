@@ -803,4 +803,168 @@ mod tests {
         let pos3 = engine.position(3003).unwrap();
         assert!((pos3.realized_pnl - (-1000.0)).abs() < 0.01);
     }
+
+    // -----------------------------------------------------------------------
+    // trigger_halt idempotency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trigger_halt_idempotent() {
+        let mut engine = make_engine();
+
+        // First halt
+        engine.manual_halt();
+        assert!(engine.is_halted());
+        assert_eq!(engine.halt_reason(), Some(RiskBreach::ManualHalt));
+
+        // Second halt — should not change the reason or state
+        engine.trigger_halt(RiskBreach::MaxDailyLossExceeded);
+        assert!(engine.is_halted());
+        // Reason stays as ManualHalt (first halt wins)
+        assert_eq!(engine.halt_reason(), Some(RiskBreach::ManualHalt));
+    }
+
+    #[test]
+    fn test_daily_loss_halt_then_manual_halt_keeps_first_reason() {
+        let mut engine = make_engine();
+
+        // Trigger daily loss breach first
+        engine.record_fill(1001, 100, 100.0, 25);
+        engine.record_fill(1001, -100, 92.0, 25); // -20,000 loss
+        let _ = engine.check_order(1002, 1); // This triggers halt
+
+        assert!(engine.is_halted());
+        assert_eq!(engine.halt_reason(), Some(RiskBreach::MaxDailyLossExceeded));
+
+        // Manual halt on top — first reason should persist
+        engine.manual_halt();
+        assert_eq!(engine.halt_reason(), Some(RiskBreach::MaxDailyLossExceeded));
+    }
+
+    // -----------------------------------------------------------------------
+    // NaN price rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_nan_price_rejected() {
+        let mut engine = make_engine();
+        engine.update_market_price(1001, f64::NAN);
+        // NaN should NOT be stored
+        assert!(engine.market_prices.get(&1001).is_none());
+    }
+
+    #[test]
+    fn test_infinity_price_rejected() {
+        let mut engine = make_engine();
+        engine.update_market_price(1001, f64::INFINITY);
+        assert!(engine.market_prices.get(&1001).is_none());
+    }
+
+    #[test]
+    fn test_negative_infinity_price_rejected() {
+        let mut engine = make_engine();
+        engine.update_market_price(1001, f64::NEG_INFINITY);
+        assert!(engine.market_prices.get(&1001).is_none());
+    }
+
+    #[test]
+    fn test_zero_price_rejected() {
+        let mut engine = make_engine();
+        engine.update_market_price(1001, 0.0);
+        assert!(engine.market_prices.get(&1001).is_none());
+    }
+
+    #[test]
+    fn test_negative_price_rejected() {
+        let mut engine = make_engine();
+        engine.update_market_price(1001, -1.0);
+        assert!(engine.market_prices.get(&1001).is_none());
+    }
+
+    #[test]
+    fn test_valid_price_accepted() {
+        let mut engine = make_engine();
+        engine.update_market_price(1001, 100.0);
+        assert_eq!(*engine.market_prices.get(&1001).unwrap(), 100.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Position reversal at exact zero boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_position_reversal_through_exact_zero() {
+        let mut engine = make_engine();
+
+        // Buy 10 lots at 100
+        engine.record_fill(1001, 10, 100.0, 25);
+        assert_eq!(engine.position(1001).unwrap().net_lots, 10);
+
+        // Sell exactly 10 lots at 110 → position goes to zero
+        engine.record_fill(1001, -10, 110.0, 25);
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 0);
+        assert!((pos.avg_entry_price - 0.0).abs() < f64::EPSILON);
+        assert!((pos.realized_pnl - 2500.0).abs() < 0.01); // (110-100)*10*25
+
+        // Immediately re-enter in opposite direction
+        engine.record_fill(1001, -5, 115.0, 25);
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, -5);
+        assert!((pos.avg_entry_price - 115.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_position_reversal_through_zero_short_to_long() {
+        let mut engine = make_engine();
+
+        // Short 10 lots at 200
+        engine.record_fill(1001, -10, 200.0, 50);
+
+        // Buy 10 to close → net_lots = 0
+        engine.record_fill(1001, 10, 190.0, 50);
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 0);
+        assert!((pos.avg_entry_price - 0.0).abs() < f64::EPSILON);
+
+        // Buy 3 more → new long position
+        engine.record_fill(1001, 3, 180.0, 50);
+        let pos = engine.position(1001).unwrap();
+        assert_eq!(pos.net_lots, 3);
+        assert!((pos.avg_entry_price - 180.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unrealized P&L calculation edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unrealized_pnl_with_no_market_price() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 10, 100.0, 25);
+        // No market price set → conservative: unrealized = 0
+        assert!((engine.total_unrealized_pnl() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_unrealized_pnl_with_market_price() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 10, 100.0, 25);
+        engine.update_market_price(1001, 110.0);
+        // unrealized = 10 * (110 - 100) = 100 (per-lot, not multiplied by lot_size here)
+        assert!((engine.total_unrealized_pnl() - 100.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // reset_halt when not halted is a no-op
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_halt_when_not_halted_is_noop() {
+        let mut engine = make_engine();
+        assert!(!engine.is_halted());
+        engine.reset_halt();
+        assert!(!engine.is_halted());
+        assert!(engine.halt_reason().is_none());
+    }
 }

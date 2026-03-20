@@ -583,6 +583,125 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_ipv4_format — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_whitespace_only_ip_fails() {
+        assert!(validate_ipv4_format("   ").is_err());
+        assert!(validate_ipv4_format("\t").is_err());
+        assert!(validate_ipv4_format("\n\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_error_contains_ip() {
+        let err = validate_ipv4_format("garbage").unwrap_err();
+        assert!(
+            err.contains("garbage"),
+            "error should contain the invalid IP"
+        );
+    }
+
+    #[test]
+    fn test_validate_ipv4_leading_zeros_rejected() {
+        // Leading zeros in octets: Rust's Ipv4Addr::parse rejects them (since Rust 1.76)
+        assert!(validate_ipv4_format("192.168.001.001").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — additional cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_loopback() {
+        assert_eq!(mask_ip("127.0.0.1"), "127.0.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_five_octets() {
+        assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip_from_url — error path coverage (no real network needed)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_from_url_invalid_url() {
+        let result = fetch_ip_from_url("not-a-url", Duration::from_millis(100)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ip_from_url_connection_refused() {
+        // Port 1 is unlikely to be listening
+        let result = fetch_ip_from_url("http://127.0.0.1:1/ip", Duration::from_millis(200)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("127.0.0.1:1"), "error should mention the URL");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ip_from_url_non_success_status() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip_from_url(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("HTTP 500"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ip_from_url_invalid_ip_in_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "not-an-ip-address";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip_from_url(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not a valid IPv4"), "error: {err}");
+    }
+
+    // -----------------------------------------------------------------------
     // Dhan IP API — request/response format tests
     // -----------------------------------------------------------------------
 

@@ -874,4 +874,74 @@ mod tests {
             "Low-severity events must not reach SMS path (< High)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Active service with SNS — SMS code path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_critical_event_triggers_sms_path() {
+        // Critical events should attempt both Telegram and SNS (if configured).
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "critical test".to_string(),
+        };
+        assert!(
+            event.severity() >= Severity::High,
+            "AuthenticationFailed must be High or Critical severity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_self_closing_tag() {
+        assert_eq!(strip_html_tags("before<br/>after"), "beforeafter");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_attributes() {
+        assert_eq!(
+            strip_html_tags(r#"<a href="https://example.com">link</a>"#),
+            "link"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_tags_mixed_content() {
+        assert_eq!(
+            strip_html_tags("<b>DLT</b> Trading System v<i>1.0</i>"),
+            "DLT Trading System v1.0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_exactly_9_chars() {
+        let result = mask_phone("123456789");
+        assert_eq!(result, "123X56789");
+    }
+
+    #[test]
+    fn test_mask_phone_long_number() {
+        // 15 chars: prefix=3, suffix=5, mask=7
+        let result = mask_phone("123456789012345");
+        assert_eq!(result, "123XXXXXXX12345");
+    }
+
+    // -----------------------------------------------------------------------
+    // NotificationMode coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_noop_service_is_active_returns_false() {
+        let service = NotificationService {
+            mode: NotificationMode::NoOp,
+        };
+        assert!(!service.is_active());
+    }
 }

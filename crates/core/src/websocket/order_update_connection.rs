@@ -433,4 +433,74 @@ mod tests {
             prev_delay = delay;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_collection_time_constants() {
+        // Verify the data collection constants are reasonable
+        assert_eq!(DATA_COLLECTION_START, (9, 0));
+        assert_eq!(DATA_COLLECTION_END, (16, 0));
+        assert!(DATA_COLLECTION_START.0 < DATA_COLLECTION_END.0);
+    }
+
+    #[test]
+    fn test_is_within_market_hours_does_not_panic() {
+        // The function checks calendar.is_trading_day_today() first.
+        // We verify it runs without panicking with a minimal TradingCalendar.
+        use dhan_live_trader_common::config::TradingConfig;
+
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "16:00:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+        // Just verify it runs without panic — the result depends on the
+        // current IST time and day of week.
+        let _ = is_within_market_hours(&calendar);
+    }
+
+    #[test]
+    fn test_off_hours_read_timeout_longer_than_market_hours() {
+        assert!(
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS >= ORDER_UPDATE_READ_TIMEOUT_SECS,
+            "off-hours timeout should be >= market hours timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — additional error variant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_token_expired_display() {
+        let err = OrderUpdateConnectionError::TokenExpired;
+        let msg = err.to_string();
+        assert!(msg.contains("expired"));
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_error_no_token_is_distinct_from_token_expired() {
+        let no_token = OrderUpdateConnectionError::NoToken.to_string();
+        let expired = OrderUpdateConnectionError::TokenExpired.to_string();
+        assert_ne!(no_token, expired);
+    }
+
+    #[test]
+    fn test_error_read_timeout_mentions_constant() {
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        let msg = err.to_string();
+        // The display mentions the timeout constant
+        assert!(msg.contains("read timeout"));
+    }
 }

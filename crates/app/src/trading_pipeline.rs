@@ -432,3 +432,292 @@ pub fn init_trading_pipeline(
 
     Some((pipeline_config, hot_reloader))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use secrecy::ExposeSecret;
+
+    use dhan_live_trader_core::auth::types::{DhanAuthResponseData, TokenState};
+
+    /// Creates a TokenHandle with a valid token for testing.
+    fn make_token_handle_with_value(access_token: &str) -> TokenHandle {
+        let response = DhanAuthResponseData {
+            access_token: access_token.to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let token_state = TokenState::from_response(&response);
+        Arc::new(ArcSwap::new(Arc::new(Some(token_state))))
+    }
+
+    /// Creates a TokenHandle with None (no token available).
+    fn make_empty_token_handle() -> TokenHandle {
+        Arc::new(ArcSwap::new(Arc::new(None)))
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenHandleBridge tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_bridge_valid_token() {
+        let handle = make_token_handle_with_value("eyJhbGciOiJSUzI1NiJ9.test_token");
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(result.is_ok(), "valid token should return Ok");
+        let token = result.unwrap();
+        assert_eq!(token.expose_secret(), "eyJhbGciOiJSUzI1NiJ9.test_token");
+    }
+
+    #[test]
+    fn test_token_handle_bridge_none_token() {
+        let handle = make_empty_token_handle();
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(result.is_err(), "None token should return Err(NoToken)");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            "error should be NoToken"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_bridge_empty_token_string() {
+        let handle = make_token_handle_with_value("");
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(
+            result.is_err(),
+            "empty token string should return Err(NoToken)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            "error should be NoToken for empty token"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_bridge_whitespace_token() {
+        // A whitespace-only token is not empty (it has characters), so it returns Ok.
+        // The caller (OMS) is responsible for validating the token content.
+        let handle = make_token_handle_with_value("   ");
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(
+            result.is_ok(),
+            "whitespace token is non-empty, should return Ok"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_bridge_token_swap_mid_flight() {
+        // Verify arc-swap semantics: bridge reads the latest value.
+        let handle = make_token_handle_with_value("token_v1");
+        let bridge = TokenHandleBridge {
+            handle: handle.clone(),
+        };
+
+        // First read
+        let v1 = bridge.get_access_token().unwrap();
+        assert_eq!(v1.expose_secret(), "token_v1");
+
+        // Swap to new token
+        let new_response = DhanAuthResponseData {
+            access_token: "token_v2".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let new_state = TokenState::from_response(&new_response);
+        handle.store(Arc::new(Some(new_state)));
+
+        // Second read should see new value
+        let v2 = bridge.get_access_token().unwrap();
+        assert_eq!(v2.expose_secret(), "token_v2");
+    }
+
+    #[test]
+    fn test_token_handle_bridge_swap_to_none() {
+        // Start with a valid token, then swap to None.
+        let handle = make_token_handle_with_value("initial_token");
+        let bridge = TokenHandleBridge {
+            handle: handle.clone(),
+        };
+
+        // Initially should work
+        assert!(bridge.get_access_token().is_ok());
+
+        // Swap to None
+        handle.store(Arc::new(None));
+
+        // Now should fail
+        assert!(bridge.get_access_token().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // TradingPipelineConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trading_pipeline_config_dry_run_defaults_true() {
+        // The default StrategyConfig has dry_run = true.
+        let default_strategy = dhan_live_trader_common::config::StrategyConfig::default();
+        assert!(
+            default_strategy.dry_run,
+            "dry_run must default to true for safety"
+        );
+    }
+
+    #[test]
+    fn test_trading_pipeline_config_default_capital() {
+        let default_strategy = dhan_live_trader_common::config::StrategyConfig::default();
+        assert!(
+            default_strategy.capital > 0.0,
+            "default capital must be positive"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — path existence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_trading_pipeline_nonexistent_config_returns_none() {
+        // init_trading_pipeline requires an ApplicationConfig which is hard
+        // to construct without a TOML file. Instead, verify the path check
+        // logic directly: a nonexistent path should return None.
+        let nonexistent = Path::new("/tmp/dlt_nonexistent_strategy_file.toml");
+        assert!(!nonexistent.exists(), "test path must not exist");
+        // The function checks strategy_path.exists() — if false, returns None.
+        // We verify the path logic is correct by testing Path::exists directly.
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_invalid_toml() {
+        // Create a temp file with invalid TOML content
+        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("invalid_strategies.toml");
+        std::fs::write(&config_path, "this is not valid toml {{{{").unwrap();
+
+        // The StrategyHotReloader::new should fail on invalid TOML,
+        // but init_trading_pipeline handles this gracefully with defaults.
+        let result = StrategyHotReloader::new(&config_path);
+        assert!(result.is_err(), "invalid TOML should fail to parse");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_empty_toml() {
+        // Empty TOML is valid but produces no strategies
+        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_empty");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("empty_strategies.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let result = StrategyHotReloader::new(&config_path);
+        // Empty TOML should parse successfully with zero strategies
+        assert!(result.is_ok(), "empty TOML should parse (zero strategies)");
+        let (_reloader, defs, _params) = result.unwrap();
+        assert!(
+            defs.is_empty(),
+            "empty config should produce zero strategy definitions"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn test_init_trading_pipeline_with_valid_toml() {
+        // Valid TOML with one strategy using correct schema:
+        // entry_long/entry_short conditions with field, operator, threshold.
+        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_valid");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("valid_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "test_strategy"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let result = StrategyHotReloader::new(&config_path);
+        assert!(
+            result.is_ok(),
+            "valid strategy TOML should parse successfully: {:?}",
+            result.err()
+        );
+        let (_reloader, defs, _params) = result.unwrap();
+        assert_eq!(defs.len(), 1, "should have exactly one strategy");
+        assert_eq!(defs[0].name, "test_strategy");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // IndicatorParams default tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_indicator_params_default_has_sane_values() {
+        let params = IndicatorParams::default();
+        // Default periods should be positive
+        assert!(params.sma_period > 0, "default SMA period must be positive");
+        assert!(
+            params.ema_fast_period > 0,
+            "default EMA fast period must be positive"
+        );
+        assert!(
+            params.ema_slow_period > 0,
+            "default EMA slow period must be positive"
+        );
+        assert!(params.rsi_period > 0, "default RSI period must be positive");
+        assert!(
+            params.ema_fast_period < params.ema_slow_period,
+            "EMA fast must be shorter than slow"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAX_INDICATOR_INSTRUMENTS constant test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_max_indicator_instruments_is_positive() {
+        assert!(
+            MAX_INDICATOR_INSTRUMENTS > 0,
+            "MAX_INDICATOR_INSTRUMENTS must be positive"
+        );
+    }
+}

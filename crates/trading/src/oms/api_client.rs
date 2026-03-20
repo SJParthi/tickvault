@@ -1255,7 +1255,314 @@ mod tests {
         handle.abort();
     }
 
-    // -- 25. auth headers set correctly ---------------------------------------
+    // -- 25. place_order HTTP 400 bad request ----------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"invalid input"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(message.contains("DH-905"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 26. place_order HTTP 401 unauthorized --------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"auth failed"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 27. modify_order HTTP 400 bad request --------------------------------
+
+    #[tokio::test]
+    async fn test_modify_order_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"bad field"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(message.contains("DH-905"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 28. modify_order HTTP 401 unauthorized -------------------------------
+
+    #[tokio::test]
+    async fn test_modify_order_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"auth failed"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 29. modify_order HTTP 500 internal server error ----------------------
+
+    #[tokio::test]
+    async fn test_modify_order_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"internal error"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 500);
+                assert!(message.contains("DH-908"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 30. cancel_order HTTP 400 bad request --------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error_400() {
+        let body = r#"{"errorCode":"DH-906","errorMessage":"order error"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(message.contains("DH-906"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 31. cancel_order HTTP 401 unauthorized -------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"unauthorized"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 32. cancel_order rate limited 429 ------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+
+        handle.abort();
+    }
+
+    // -- 33. cancel_order HTTP 500 internal server error ----------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"server down"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 500);
+                assert!(message.contains("DH-908"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    // -- 34. place_order malformed JSON on 200 — alternative body ------------
+
+    #[tokio::test]
+    async fn test_place_order_malformed_json_empty_body() {
+        let (base_url, handle) = start_mock_server(200, "").await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+
+        handle.abort();
+    }
+
+    // -- 35. transport/network error — connection refused ---------------------
+
+    #[tokio::test]
+    async fn test_place_order_transport_error_connection_refused() {
+        // Point at a port where nobody is listening
+        let client = make_test_client("http://127.0.0.1:1");
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        assert!(
+            matches!(result.unwrap_err(), OmsError::HttpError(_)),
+            "connection refused must return HttpError"
+        );
+    }
+
+    // -- 36. modify_order transport error — connection refused ----------------
+
+    #[tokio::test]
+    async fn test_modify_order_transport_error_connection_refused() {
+        let client = make_test_client("http://127.0.0.1:1");
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        assert!(
+            matches!(result.unwrap_err(), OmsError::HttpError(_)),
+            "connection refused must return HttpError"
+        );
+    }
+
+    // -- 37. cancel_order transport error — connection refused ----------------
+
+    #[tokio::test]
+    async fn test_cancel_order_transport_error_connection_refused() {
+        let client = make_test_client("http://127.0.0.1:1");
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        assert!(
+            matches!(result.unwrap_err(), OmsError::HttpError(_)),
+            "connection refused must return HttpError"
+        );
+    }
+
+    // -- 38. get_all_orders malformed JSON on 200 ----------------------------
+
+    #[tokio::test]
+    async fn test_get_all_orders_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "not-json").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_all_orders("fake-token").await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+
+        handle.abort();
+    }
+
+    // -- 39. get_positions malformed JSON on 200 -----------------------------
+
+    #[tokio::test]
+    async fn test_get_positions_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "{invalid}").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_positions("fake-token").await;
+
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+
+        handle.abort();
+    }
+
+    // -- 40. auth headers set correctly ---------------------------------------
 
     #[test]
     fn test_auth_headers_set_correctly() {
