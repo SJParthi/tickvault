@@ -302,4 +302,88 @@ mod tests {
         assert_eq!(hdr.exchange_segment_code, cloned.exchange_segment_code);
         assert_eq!(hdr.security_id, cloned.security_id);
     }
+
+    // =====================================================================
+    // Additional coverage: ParsedFrame TickWithDepth, edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_parsed_frame_tick_with_depth_variant() {
+        let tick = ParsedTick {
+            security_id: 2885,
+            exchange_segment_code: 2,
+            last_traded_price: 2450.50,
+            exchange_timestamp: 1772073900,
+            ..Default::default()
+        };
+        let depth = [
+            MarketDepthLevel {
+                bid_quantity: 100,
+                ask_quantity: 200,
+                bid_orders: 5,
+                ask_orders: 8,
+                bid_price: 2450.0,
+                ask_price: 2451.0,
+            },
+            MarketDepthLevel::default(),
+            MarketDepthLevel::default(),
+            MarketDepthLevel::default(),
+            MarketDepthLevel::default(),
+        ];
+        let frame = ParsedFrame::TickWithDepth(tick, depth);
+        match frame {
+            ParsedFrame::TickWithDepth(t, d) => {
+                assert_eq!(t.security_id, 2885);
+                assert!((t.last_traded_price - 2450.50).abs() < f32::EPSILON);
+                assert_eq!(d[0].bid_quantity, 100);
+                assert_eq!(d[0].ask_quantity, 200);
+            }
+            other => panic!("expected TickWithDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ParseError>();
+    }
+
+    #[test]
+    fn test_parse_error_source_is_none() {
+        let err = ParseError::UnknownResponseCode(42);
+        // thiserror-generated errors with no #[source] return None
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_packet_header_all_exchange_segments() {
+        // Verify header can hold all valid exchange segment codes
+        for seg in 0_u8..=8 {
+            let hdr = PacketHeader {
+                response_code: 2,
+                message_length: 16,
+                exchange_segment_code: seg,
+                security_id: 1,
+            };
+            assert_eq!(hdr.exchange_segment_code, seg);
+        }
+    }
+
+    #[test]
+    fn test_parsed_frame_deep_depth_empty_levels() {
+        let frame = ParsedFrame::DeepDepth {
+            security_id: 1,
+            exchange_segment_code: 1,
+            side: DepthSide::Ask,
+            levels: vec![],
+            message_sequence: 0,
+            received_at_nanos: 0,
+        };
+        match frame {
+            ParsedFrame::DeepDepth { levels, .. } => {
+                assert!(levels.is_empty());
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
 }

@@ -884,4 +884,235 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    // -----------------------------------------------------------------------
+    // is_within_build_window — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_build_window_with_seconds_precision() {
+        // Very narrow window that likely excludes current time
+        assert!(!is_within_build_window("03:00:00", "03:00:01"));
+    }
+
+    #[test]
+    fn test_is_within_build_window_hour_boundary() {
+        // Window from midnight to 1am
+        let now = now_ist_time();
+        if now.hour() == 0 && now.minute() < 59 {
+            assert!(is_within_build_window("00:00:00", "01:00:00"));
+        }
+        // Always test that invalid formats return false
+        assert!(!is_within_build_window("25:00:00", "26:00:00"));
+    }
+
+    #[test]
+    fn test_is_within_build_window_missing_seconds() {
+        // Format without seconds should fail to parse
+        assert!(!is_within_build_window("08:25", "08:55"));
+    }
+
+    #[test]
+    fn test_is_within_build_window_with_extra_chars() {
+        assert!(!is_within_build_window("08:25:00am", "08:55:00pm"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Freshness marker — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_instrument_fresh_garbage_content_returns_false() {
+        let temp_dir = unique_temp_dir("marker-garbage");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "not-a-date-string").unwrap();
+        assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_future_date_returns_false() {
+        let temp_dir = unique_temp_dir("marker-future");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "2099-12-31").unwrap();
+        assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_yesterday_returns_false() {
+        let temp_dir = unique_temp_dir("marker-yesterday");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        let yesterday = (Utc::now().with_timezone(&ist_offset()).date_naive()
+            - chrono::Duration::days(1))
+        .to_string();
+        std::fs::write(&marker_path, &yesterday).unwrap();
+        assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_instrument_fresh_whitespace_only_returns_false() {
+        let temp_dir = unique_temp_dir("marker-whitespace");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "   \n  ").unwrap();
+        assert!(!is_instrument_fresh(temp_dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_write_freshness_marker_overwrites_old_marker() {
+        let temp_dir = unique_temp_dir("marker-overwrite");
+        let cache_dir = temp_dir.to_str().unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "2020-01-01").unwrap();
+        assert!(!is_instrument_fresh(cache_dir));
+
+        write_freshness_marker(cache_dir);
+        assert!(is_instrument_fresh(cache_dir));
+
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(content, now_ist_date_string());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // now_ist_date_string / now_ist_time — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_now_ist_date_string_is_valid_date() {
+        let date_str = now_ist_date_string();
+        let parsed = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d");
+        assert!(parsed.is_ok(), "date string should parse: {}", date_str);
+    }
+
+    #[test]
+    fn test_now_ist_date_string_not_empty() {
+        assert!(!now_ist_date_string().is_empty());
+    }
+
+    #[test]
+    fn test_now_ist_time_consistency() {
+        // Two calls should return times within 1 second of each other
+        let t1 = now_ist_time();
+        let t2 = now_ist_time();
+        let diff = if t2 >= t1 { t2 - t1 } else { t1 - t2 };
+        assert!(
+            diff < chrono::TimeDelta::seconds(2),
+            "consecutive calls should be within 2 seconds"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // InstrumentLoadResult discriminant coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_instrument_load_result_variants() {
+        let fresh = InstrumentLoadResult::FreshBuild(test_universe());
+        assert!(matches!(fresh, InstrumentLoadResult::FreshBuild(_)));
+
+        let unavailable = InstrumentLoadResult::Unavailable;
+        assert!(matches!(unavailable, InstrumentLoadResult::Unavailable));
+    }
+
+    // -----------------------------------------------------------------------
+    // Outside hours: download fails → corrupt rkyv → CSV fallback
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_outside_hours_download_fails_corrupt_rkyv_no_csv_returns_error() {
+        let dir = unique_temp_dir("oh-corrupt-rkyv-no-csv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.to_str().unwrap();
+
+        // Write corrupt rkyv cache
+        let rkyv_path = dir.join(BINARY_CACHE_FILENAME);
+        std::fs::write(&rkyv_path, b"not valid rkyv data").unwrap();
+
+        // Window = always outside, fake URLs, corrupt rkyv, no CSV
+        let config = test_instrument_config(cache_dir, "00:00:00", "00:00:00");
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+        )
+        .await;
+
+        // Should error because download fails, rkyv is corrupt, and no CSV
+        assert!(
+            result.is_err(),
+            "corrupt rkyv + no CSV + failed download should error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Market hours: rkyv corrupt → no CSV → emergency download fails → Unavailable
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_market_hours_corrupt_rkyv_then_emergency_download_fails() {
+        let dir = unique_temp_dir("mh-corrupt-emergency-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.to_str().unwrap();
+
+        // Write corrupt rkyv
+        let rkyv_path = dir.join(BINARY_CACHE_FILENAME);
+        std::fs::write(&rkyv_path, b"corrupt bytes").unwrap();
+
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+        )
+        .await;
+
+        // All caches miss + emergency download fails → Unavailable
+        assert!(
+            matches!(result.unwrap(), InstrumentLoadResult::Unavailable),
+            "all sources exhausted should return Unavailable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test config helpers produce valid configs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_test_instrument_config_has_expected_fields() {
+        let config = test_instrument_config("/tmp/test", "08:00:00", "16:00:00");
+        assert_eq!(config.csv_cache_directory, "/tmp/test");
+        assert_eq!(config.build_window_start, "08:00:00");
+        assert_eq!(config.build_window_end, "16:00:00");
+        assert_eq!(config.csv_cache_filename, "test.csv");
+    }
+
+    #[test]
+    fn test_test_universe_has_valid_metadata() {
+        let universe = test_universe();
+        assert_eq!(universe.build_metadata.csv_source, "test");
+        assert_eq!(universe.build_metadata.csv_row_count, 100);
+        assert_eq!(universe.build_metadata.parsed_row_count, 50);
+        assert!(universe.underlyings.is_empty());
+        assert!(universe.derivative_contracts.is_empty());
+    }
 }

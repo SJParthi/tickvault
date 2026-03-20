@@ -491,6 +491,120 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // IpMonitorConfig — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_monitor_config_debug_format() {
+        let config = IpMonitorConfig::new("1.2.3.4".to_string(), 60);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("1.2.3.4"));
+        assert!(debug.contains("60"));
+        assert!(debug.contains("enabled"));
+    }
+
+    #[test]
+    fn test_ip_monitor_config_disabled_has_default_interval() {
+        let config = IpMonitorConfig::disabled();
+        assert_eq!(config.check_interval_secs, 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_ips — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_ips_identical_long_string() {
+        let ip = "192.168.100.200";
+        assert_eq!(compare_ips(ip, ip), IpCheckResult::Match);
+    }
+
+    #[test]
+    fn test_compare_ips_case_sensitive() {
+        // IPs are numeric, but let's verify compare_ips is case-sensitive for any input
+        assert!(matches!(
+            compare_ips("abc", "ABC"),
+            IpCheckResult::Mismatch { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_ipv4 — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_ipv4_leading_zeros_rejected() {
+        assert!(!is_valid_ipv4("192.168.001.001"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_single_octet() {
+        assert!(!is_valid_ipv4("192"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_negative_value() {
+        assert!(!is_valid_ipv4("-1.0.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IpCheckResult — additional variant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_check_result_match_eq() {
+        assert_eq!(IpCheckResult::Match, IpCheckResult::Match);
+    }
+
+    #[test]
+    fn test_ip_check_result_mismatch_ne_check_failed() {
+        let mismatch = IpCheckResult::Mismatch {
+            expected: "a".to_string(),
+            actual: "b".to_string(),
+        };
+        let failed = IpCheckResult::CheckFailed {
+            reason: "err".to_string(),
+        };
+        assert_ne!(mismatch, failed);
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — valid response
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_valid_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "10.0.0.1";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "10.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
     // spawn_ip_monitor — empty expected IP
     // -----------------------------------------------------------------------
 

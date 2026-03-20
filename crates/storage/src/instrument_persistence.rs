@@ -3035,4 +3035,316 @@ mod tests {
         let ts2 = naive_date_to_timestamp_nanos(today_ist).unwrap();
         assert_eq!(ts1.as_i64(), ts2.as_i64());
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LifecycleEvent construction, DDL constants,
+    // write helpers, naive_date edge cases, ensure_instrument_tables
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_type_clone_roundtrip() {
+        let original = LifecycleEventType::SecurityIdReused;
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_lifecycle_event_construction_and_fields() {
+        let event = LifecycleEvent {
+            security_id: 12345,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::LotSizeChanged,
+            field_changed: "lot_size".to_string(),
+            old_value: "75".to_string(),
+            new_value: "50".to_string(),
+        };
+        assert_eq!(event.security_id, 12345);
+        assert_eq!(event.underlying_symbol, "NIFTY");
+        assert_eq!(event.event_type, LifecycleEventType::LotSizeChanged);
+        assert_eq!(event.field_changed, "lot_size");
+        assert_eq!(event.old_value, "75");
+        assert_eq!(event.new_value, "50");
+    }
+
+    #[test]
+    fn test_lifecycle_event_add_has_empty_old_value() {
+        let event = LifecycleEvent {
+            security_id: 99999,
+            underlying_symbol: "RELIANCE".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: "added".to_string(),
+        };
+        assert!(event.old_value.is_empty());
+        assert!(event.field_changed.is_empty());
+    }
+
+    #[test]
+    fn test_lifecycle_event_remove_has_empty_new_value() {
+        let event = LifecycleEvent {
+            security_id: 0,
+            underlying_symbol: "BANKNIFTY".to_string(),
+            event_type: LifecycleEventType::UnderlyingRemoved,
+            field_changed: String::new(),
+            old_value: "present".to_string(),
+            new_value: String::new(),
+        };
+        assert_eq!(event.security_id, 0);
+        assert!(event.new_value.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_key_build_metadata_value() {
+        assert_eq!(DEDUP_KEY_BUILD_METADATA, "csv_source");
+    }
+
+    #[test]
+    fn test_dedup_key_fno_underlyings_value() {
+        assert_eq!(DEDUP_KEY_FNO_UNDERLYINGS, "underlying_symbol");
+    }
+
+    #[test]
+    fn test_dedup_key_derivative_contracts_includes_underlying() {
+        // I-P1-05: Must include underlying_symbol to prevent security_id reuse collision
+        assert!(DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("security_id"));
+        assert!(DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("underlying_symbol"));
+    }
+
+    #[test]
+    fn test_dedup_key_subscribed_indices_value() {
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+    }
+
+    #[test]
+    fn test_build_metadata_ddl_contains_all_columns() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("instrument_build_metadata"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_source SYMBOL"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_row_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("parsed_row_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("index_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("equity_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("underlying_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("derivative_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("option_chain_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_duration_ms LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_timestamp TIMESTAMP"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_fno_underlyings_ddl_contains_all_columns() {
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("fno_underlyings"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("price_feed_segment SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("derivative_segment SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("kind SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("contract_count LONG"));
+    }
+
+    #[test]
+    fn test_derivative_contracts_ddl_contains_all_columns() {
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("derivative_contracts"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("instrument_kind SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("exchange_segment SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("option_type SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("security_id LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("expiry_date STRING"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("strike_price DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("tick_size DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("display_name STRING"));
+    }
+
+    #[test]
+    fn test_subscribed_indices_ddl_contains_all_columns() {
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subscribed_indices"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("symbol SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("exchange SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("category SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subcategory SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("security_id LONG"));
+    }
+
+    #[test]
+    fn test_naive_date_to_timestamp_nanos_different_dates_are_distinct() {
+        let date1 = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let date2 = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let ts1 = naive_date_to_timestamp_nanos(date1).unwrap();
+        let ts2 = naive_date_to_timestamp_nanos(date2).unwrap();
+        assert_ne!(ts1.as_i64(), ts2.as_i64());
+        // One day = 86400 * 1e9 nanos
+        let one_day_nanos: i64 = 86_400 * 1_000_000_000;
+        assert_eq!(ts2.as_i64() - ts1.as_i64(), one_day_nanos);
+    }
+
+    #[test]
+    fn test_naive_date_to_timestamp_nanos_always_at_midnight() {
+        let dates = [
+            NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(), // leap year
+        ];
+        let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+        for date in dates {
+            let ts = naive_date_to_timestamp_nanos(date).unwrap();
+            assert_eq!(
+                ts.as_i64() % nanos_per_day,
+                0,
+                "timestamp for {:?} must be at midnight",
+                date
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_single_build_metadata_produces_one_row() {
+        let metadata = make_test_metadata();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_build_metadata(&mut buffer, &metadata, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_write_single_underlying_produces_one_row() {
+        let underlying = make_test_underlying("FINNIFTY", 26037);
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("FINNIFTY"));
+    }
+
+    #[test]
+    fn test_write_single_contract_with_put_option() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(55555);
+        contract.option_type = Some(OptionType::Put);
+        contract.strike_price = 22000.0;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("PE"));
+    }
+
+    #[test]
+    fn test_write_single_contract_future_no_option_type() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(66666);
+        contract.option_type = None; // Future — no option type
+        contract.instrument_kind = DhanInstrumentKind::FutureIndex;
+        contract.strike_price = 0.0;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        // Empty option_type should not cause issues
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("FutureIndex"));
+    }
+
+    #[test]
+    fn test_write_single_subscribed_index_produces_one_row() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let index = make_test_display_index("NIFTY IT", 19, IndexSubcategory::Sectoral);
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_write_multiple_underlyings_batch() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "TCS"];
+        for (i, sym) in symbols.iter().enumerate() {
+            let underlying = make_test_underlying(sym, 26000 + i as u32);
+            write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        }
+        assert_eq!(buffer.row_count(), 5);
+    }
+
+    #[test]
+    fn test_write_multiple_contracts_batch() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        for id in 10000..10020_u32 {
+            let contract = make_test_contract(id);
+            write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        }
+        assert_eq!(buffer.row_count(), 20);
+    }
+
+    #[test]
+    fn test_underlying_with_stock_kind() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut underlying = make_test_underlying("RELIANCE", 2885);
+        underlying.kind = UnderlyingKind::Stock;
+        underlying.price_feed_segment = ExchangeSegment::NseEquity;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("Stock"));
+        assert!(content.contains("NSE_EQ"));
+    }
+
+    #[test]
+    fn test_contract_with_bse_segment() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(77777);
+        contract.exchange_segment = ExchangeSegment::BseFno;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("BSE_FNO"));
+    }
+
+    #[test]
+    fn test_build_snapshot_timestamp_is_positive() {
+        let ts = build_snapshot_timestamp().unwrap();
+        assert!(ts.as_i64() > 0, "snapshot timestamp must be positive");
+    }
+
+    #[test]
+    fn test_naive_date_far_future() {
+        let date = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        let ts = naive_date_to_timestamp_nanos(date).unwrap();
+        assert!(ts.as_i64() > 0);
+    }
+
+    #[test]
+    fn test_naive_date_past_date() {
+        let date = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let ts = naive_date_to_timestamp_nanos(date).unwrap();
+        assert!(ts.as_i64() > 0);
+        // 2020-01-01 midnight UTC = 1577836800 seconds = 1577836800000000000 nanos
+        assert_eq!(ts.as_i64(), 1_577_836_800_000_000_000);
+    }
 }

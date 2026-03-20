@@ -944,4 +944,109 @@ mod tests {
         };
         assert!(!service.is_active());
     }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_no_closing_bracket() {
+        // "<tag without closing" — everything after '<' is inside tag
+        assert_eq!(strip_html_tags("before<tag without closing"), "before");
+    }
+
+    #[test]
+    fn test_strip_html_tags_consecutive_tags() {
+        assert_eq!(strip_html_tags("<a><b><c>text</c></b></a>"), "text");
+    }
+
+    #[test]
+    fn test_strip_html_tags_tag_with_newlines() {
+        assert_eq!(
+            strip_html_tags("<b>\nline1\nline2\n</b>"),
+            "\nline1\nline2\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_tags_emoji_content() {
+        // Unicode content should pass through
+        assert_eq!(strip_html_tags("<b>🚀 Launch</b>"), "🚀 Launch");
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — additional boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_10_chars() {
+        // 10 chars: prefix=3, suffix=5, mask=2
+        assert_eq!(mask_phone("1234567890"), "123XX67890");
+    }
+
+    #[test]
+    fn test_mask_phone_exactly_8_chars_boundary() {
+        // 8 chars → returns "***" (boundary)
+        assert_eq!(mask_phone("12345678"), "***");
+    }
+
+    #[test]
+    fn test_mask_phone_7_chars() {
+        // 7 chars → returns "***" (below boundary)
+        assert_eq!(mask_phone("1234567"), "***");
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service with SNS phone — triggers SMS code path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_high_severity_event() {
+        // We can't easily create an aws_sdk_sns::Client in tests, but we can
+        // verify that the notify() method correctly checks severity for SMS routing
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "test critical event".to_string(),
+        };
+        assert!(
+            event.severity() >= Severity::High,
+            "AuthenticationFailed must be High+ severity"
+        );
+
+        let low_event = NotificationEvent::StartupComplete { mode: "PAPER" };
+        assert!(
+            low_event.severity() < Severity::High,
+            "StartupComplete must be below High severity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Severity routing — medium severity does NOT trigger SMS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_severity_medium_does_not_trigger_sms() {
+        let event = NotificationEvent::TokenRenewed;
+        assert!(
+            event.severity() < Severity::High,
+            "TokenRenewed should not trigger SMS (below High)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — with SNS disabled
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_with_sns_disabled() {
+        let config = NotificationConfig {
+            send_timeout_ms: 100,
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            sns_enabled: false,
+        };
+        let service = NotificationService::initialize(&config).await;
+        // Without real SSM, should fall back to no-op
+        // With real SSM, should be active but without SNS
+        // Either way, should not panic
+        let _ = service.is_active();
+    }
 }

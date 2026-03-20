@@ -2081,4 +2081,582 @@ mod tests {
         let result = oms.place_order(request).await;
         assert!(matches!(result.unwrap_err(), OmsError::NoToken));
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: validate_order_fields, validate_modify_fields,
+    // now_epoch_us, dry-run modify/cancel, reconcile dry-run, order lookup,
+    // more transition coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_order_fields_limit_order_passes() {
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        assert!(validate_order_fields(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_fields_market_zero_price_passes() {
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        assert!(validate_order_fields(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_fields_market_nonzero_price_fails() {
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 100.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        assert!(validate_order_fields(&request).is_err());
+    }
+
+    #[test]
+    fn test_validate_order_fields_sl_with_trigger_passes() {
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::StopLoss,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 240.0,
+            lot_size: 25,
+        };
+        assert!(validate_order_fields(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_fields_sl_zero_trigger_fails() {
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::StopLoss,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        assert!(validate_order_fields(&request).is_err());
+    }
+
+    #[test]
+    fn test_validate_order_fields_slm_zero_trigger_fails() {
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::StopLossMarket,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        assert!(validate_order_fields(&request).is_err());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_limit_passes() {
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        assert!(validate_modify_fields(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_market_nonzero_price_fails() {
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Market,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        assert!(validate_modify_fields(&request).is_err());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_sl_zero_trigger_fails() {
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLoss,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        assert!(validate_modify_fields(&request).is_err());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_slm_zero_trigger_fails() {
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLossMarket,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        assert!(validate_modify_fields(&request).is_err());
+    }
+
+    #[test]
+    fn test_validate_modify_fields_sl_with_trigger_passes() {
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLoss,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 240.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        assert!(validate_modify_fields(&request).is_ok());
+    }
+
+    #[test]
+    fn test_now_epoch_us_is_positive() {
+        let us = now_epoch_us();
+        assert!(us > 0, "epoch microseconds must be positive");
+    }
+
+    #[test]
+    fn test_now_epoch_us_is_reasonable() {
+        let us = now_epoch_us();
+        // Must be after 2020-01-01 in microseconds
+        let min_2020 = 1_577_836_800_000_000_i64;
+        assert!(us > min_2020, "epoch microseconds too small");
+    }
+
+    #[tokio::test]
+    async fn dry_run_modify_order_updates_fields() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        // Place order first
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let order_id = oms.place_order(request).await.unwrap();
+
+        // Modify
+        let modify_request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order(&order_id, modify_request).await;
+        assert!(result.is_ok());
+
+        let order = oms.order(&order_id).unwrap();
+        assert_eq!(order.quantity, 75);
+        assert!((order.price - 250.0).abs() < f64::EPSILON);
+        assert_eq!(order.modification_count, 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancel_order_sets_cancelled() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let order_id = oms.place_order(request).await.unwrap();
+
+        let result = oms.cancel_order(&order_id).await;
+        assert!(result.is_ok());
+
+        let order = oms.order(&order_id).unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert!(order.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancel_nonexistent_order_returns_error() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let result = oms.cancel_order("NONEXISTENT").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancel_terminal_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Traded);
+        let result = oms.cancel_order("1").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderTerminal { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dry_run_modify_nonexistent_order_returns_error() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("NONEXISTENT", request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dry_run_modify_terminal_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Rejected);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderTerminal { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dry_run_reconcile_returns_default_report() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let result = oms.reconcile().await;
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.total_checked, 0);
+    }
+
+    #[test]
+    fn test_handle_transit_to_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Transit);
+        let update = make_order_update("1", "REJECTED");
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Rejected);
+        assert!(oms.order("1").unwrap().is_terminal());
+    }
+
+    #[test]
+    fn test_handle_pending_to_cancelled() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let update = make_order_update("1", "CANCELLED");
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_handle_confirmed_to_part_traded() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let mut update = make_order_update("1", "PART_TRADED");
+        update.traded_qty = 25;
+        update.avg_traded_price = 245.0;
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::PartTraded);
+    }
+
+    #[test]
+    fn test_handle_confirmed_to_pending_is_invalid() {
+        // Confirmed -> Pending is NOT a valid transition in the DAG
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let update = make_order_update("1", "PENDING");
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::InvalidTransition { .. }
+        ));
+    }
+
+    #[test]
+    fn test_handle_part_traded_to_traded() {
+        let mut oms = make_oms_with_order("1", OrderStatus::PartTraded);
+        let mut update = make_order_update("1", "TRADED");
+        update.traded_qty = 50;
+        update.avg_traded_price = 245.0;
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Traded);
+    }
+
+    #[test]
+    fn test_handle_part_traded_to_cancelled() {
+        let mut oms = make_oms_with_order("1", OrderStatus::PartTraded);
+        let update = make_order_update("1", "CANCELLED");
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_order_lookup_returns_none_for_missing() {
+        let oms = make_oms_with_order("1", OrderStatus::Transit);
+        assert!(oms.order("999").is_none());
+        assert!(oms.order("").is_none());
+    }
+
+    #[test]
+    fn test_all_orders_returns_reference_to_map() {
+        let oms = make_oms_with_order("1", OrderStatus::Transit);
+        let all = oms.all_orders();
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn test_live_mode_modify_no_token_returns_error() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let rate_limiter = OrderRateLimiter::new(10);
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            Box::new(FailingTokenProvider),
+            "100".to_owned(),
+        );
+        oms.dry_run = false;
+
+        // Seed an order
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("ORD-1", request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::NoToken));
+    }
+
+    #[tokio::test]
+    async fn test_live_mode_cancel_no_token_returns_error() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let rate_limiter = OrderRateLimiter::new(10);
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            Box::new(FailingTokenProvider),
+            "100".to_owned(),
+        );
+        oms.dry_run = false;
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let result = oms.cancel_order("ORD-1").await;
+        assert!(matches!(result.unwrap_err(), OmsError::NoToken));
+    }
+
+    #[tokio::test]
+    async fn test_live_mode_reconcile_no_token_returns_error() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let rate_limiter = OrderRateLimiter::new(10);
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            Box::new(FailingTokenProvider),
+            "100".to_owned(),
+        );
+        oms.dry_run = false;
+
+        let result = oms.reconcile().await;
+        assert!(matches!(result.unwrap_err(), OmsError::NoToken));
+    }
+
+    #[test]
+    fn test_handle_update_unknown_order_no_with_empty_correlation() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Transit);
+        let update = make_order_update("UNKNOWN-99", "TRADED");
+        // Empty correlation_id, unknown order_no → ignored
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        // Order "1" unchanged
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Transit);
+    }
+
+    #[test]
+    fn test_handle_expired_transition_from_pending() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let update = make_order_update("1", "EXPIRED");
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Expired);
+        assert!(oms.order("1").unwrap().is_terminal());
+    }
 }

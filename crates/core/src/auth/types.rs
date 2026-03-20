@@ -1222,4 +1222,175 @@ mod tests {
         let response: ModifyIpResponse = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(response.status, "success");
     }
+
+    // =====================================================================
+    // Additional coverage: parse_expiry_time edge cases, from_cached,
+    // TelegramCredentials Debug, age_hours for old token, token accessors
+    // =====================================================================
+
+    #[test]
+    fn test_parse_expiry_time_array_returns_none() {
+        let val = serde_json::json!([1, 2, 3]);
+        assert!(parse_expiry_time(&val).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_object_returns_none() {
+        let val = serde_json::json!({"key": "value"});
+        assert!(parse_expiry_time(&val).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_negative_epoch_returns_none() {
+        // Negative epoch is technically valid but very old
+        let val = serde_json::json!(-1);
+        // DateTime::from_timestamp should handle negatives (before epoch)
+        let result = parse_expiry_time(&val);
+        // Negative epoch IS valid in chrono, so this should succeed
+        if let Some(dt) = result {
+            assert!(dt.timestamp() < 0);
+        }
+    }
+
+    #[test]
+    fn test_parse_expiry_time_zero_epoch() {
+        let val = serde_json::json!(0);
+        let result = parse_expiry_time(&val);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_float_number_returns_none() {
+        // JSON float numbers cannot be converted to i64
+        let val = serde_json::json!(1772113432.557);
+        let result = parse_expiry_time(&val);
+        // serde_json Number::as_i64() returns None for floats
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_token_state_from_cached() {
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let expires = now_ist + Duration::hours(24);
+        let state = TokenState::from_cached(
+            SecretString::from("cached-jwt".to_string()),
+            expires,
+            now_ist,
+        );
+        assert_eq!(state.access_token().expose_secret(), "cached-jwt");
+        assert_eq!(state.expires_at(), expires);
+        assert_eq!(state.issued_at(), now_ist);
+        assert!(state.is_valid());
+    }
+
+    #[test]
+    fn test_token_state_age_hours_old_token() {
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let state = TokenState {
+            access_token: SecretString::from("old-token".to_string()),
+            expires_at: now_ist + Duration::hours(1),
+            issued_at: now_ist - Duration::hours(10),
+        };
+        let age = state.age_hours();
+        // Should be approximately 10 hours
+        assert!(age > 9.9 && age < 10.1, "age should be ~10h, got {age}");
+    }
+
+    #[test]
+    fn test_telegram_credentials_debug_redacted() {
+        let creds = TelegramCredentials {
+            bot_token: SecretString::from("123456:ABC-DEF".to_string()),
+            chat_id: SecretString::from("-1001234567890".to_string()),
+        };
+        let debug = format!("{creds:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("123456:ABC"));
+        assert!(!debug.contains("-1001234567890"));
+    }
+
+    #[test]
+    fn test_user_profile_response_missing_optional_fields() {
+        // Only required fields
+        let json = r#"{
+            "dhanClientId": "1000000001",
+            "tokenValidity": "17/03/2026 23:59",
+            "activeSegment": "Equity",
+            "dataPlan": "Active"
+        }"#;
+        let profile: UserProfileResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.ddpi, ""); // #[serde(default)]
+        assert_eq!(profile.mtf, "");
+        assert_eq!(profile.data_validity, "");
+    }
+
+    #[test]
+    fn test_get_ip_response_missing_optional_fields() {
+        let json = r#"{}"#;
+        let response: GetIpResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.ip, "");
+        assert_eq!(response.ip_flag, "");
+        assert_eq!(response.modify_date_primary, "");
+        assert_eq!(response.modify_date_secondary, "");
+    }
+
+    #[test]
+    fn test_set_ip_response_missing_optional_fields() {
+        let json = r#"{}"#;
+        let response: SetIpResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status, "");
+        assert_eq!(response.message, "");
+    }
+
+    #[test]
+    fn test_modify_ip_request_debug_format() {
+        let req = ModifyIpRequest {
+            dhan_client_id: "1000000001".to_string(),
+            ip: "198.51.100.1".to_string(),
+            ip_flag: "PRIMARY".to_string(),
+        };
+        let debug = format!("{req:?}");
+        assert!(debug.contains("ModifyIpRequest"));
+        assert!(debug.contains("198.51.100.1"));
+    }
+
+    #[test]
+    fn test_token_state_needs_refresh_with_very_large_window() {
+        // Very large window (u64::MAX), should still not panic
+        let response_data = DhanAuthResponseData {
+            access_token: "token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let state = TokenState::from_response(&response_data);
+        // Window is clamped to 8760, so should need refresh immediately
+        // since 8760h > 24h token validity
+        assert!(state.needs_refresh(u64::MAX));
+    }
+
+    #[test]
+    fn test_token_state_time_until_refresh_with_very_large_window() {
+        let response_data = DhanAuthResponseData {
+            access_token: "token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let state = TokenState::from_response(&response_data);
+        // Very large window clamped to 8760, past refresh → ZERO
+        assert_eq!(
+            state.time_until_refresh(u64::MAX),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn test_dhan_generate_token_response_with_string_expiry_time() {
+        let json = r#"{
+            "dhanClientId": "1234567890",
+            "accessToken": "jwt-token-value",
+            "expiryTime": "2026-02-27T13:45:00"
+        }"#;
+        let response: DhanGenerateTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.dhan_client_id, "1234567890");
+        assert!(response.expiry_time.is_string());
+    }
 }

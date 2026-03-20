@@ -1193,6 +1193,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Check 6: multiple orphan derivatives — warn log capping at 5
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_more_than_five_orphan_derivatives_only_warns_first_five() {
+        let mut universe = build_valid_universe();
+
+        // Add 7 orphan derivatives to test the <= 5 warning cap
+        for i in 0..7u32 {
+            universe.derivative_contracts.insert(
+                90020 + i,
+                DerivativeContract {
+                    security_id: 90020 + i,
+                    underlying_symbol: format!("ORPHAN{}", i),
+                    instrument_kind: DhanInstrumentKind::FutureStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                    strike_price: 0.0,
+                    option_type: None,
+                    lot_size: 100,
+                    tick_size: 0.05,
+                    symbol_name: format!("ORPHAN{}-FUT", i),
+                    display_name: format!("ORPHAN{} FUT", i),
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("7 derivative contracts"),
+            "error should report exact count 7: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 7: multiple orphan futures in option chains
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_orphan_futures_in_option_chains() {
+        let mut universe = build_valid_universe();
+
+        use dhan_live_trader_common::instrument_types::OptionChain;
+        // Add 3 option chains with non-existent future IDs
+        for i in 0..3u32 {
+            let key = OptionChainKey {
+                underlying_symbol: "NIFTY".to_owned(),
+                expiry_date: NaiveDate::from_ymd_opt(2026, 4, i + 1).unwrap(),
+            };
+            universe.option_chains.insert(
+                key,
+                OptionChain {
+                    underlying_symbol: "NIFTY".to_owned(),
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 4, i + 1).unwrap(),
+                    future_security_id: Some(99990 + i),
+                    calls: vec![],
+                    puts: vec![],
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("3 option chains"),
+            "error should report 3 orphan chains: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 8: multiple orphan expiry calendars
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_orphan_expiry_calendars() {
+        let mut universe = build_valid_universe();
+
+        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        for i in 0..4u32 {
+            universe.expiry_calendars.insert(
+                format!("GHOST_SYMBOL_{}", i),
+                ExpiryCalendar {
+                    underlying_symbol: format!("GHOST_SYMBOL_{}", i),
+                    expiry_dates: vec![],
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("4 expiry calendars"),
+            "error should report 4 orphan calendars: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Coverage: Unconditional tests for 2nd/3rd must-exist entries
     // (Replacing guarded `if len >= N` tests with direct asserts)
     // -----------------------------------------------------------------------

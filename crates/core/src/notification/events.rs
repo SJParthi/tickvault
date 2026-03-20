@@ -1303,4 +1303,245 @@ mod tests {
         assert!(msg.contains("14:00 IST"));
         assert_eq!(event.severity(), Severity::Critical);
     }
+
+    // =====================================================================
+    // Additional coverage: severity for all remaining variants, boot events,
+    // append_detail_lines helper, edge cases in message formatting
+    // =====================================================================
+
+    #[test]
+    fn test_boot_health_check_message_and_severity() {
+        let event = NotificationEvent::BootHealthCheck {
+            services_healthy: 7,
+            services_total: 8,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Boot health check"));
+        assert!(msg.contains("7/8"));
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_boot_deadline_missed_message_and_severity() {
+        let event = NotificationEvent::BootDeadlineMissed {
+            deadline_secs: 120,
+            step: "QuestDB DDL".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("BOOT DEADLINE MISSED"));
+        assert!(msg.contains("120s"));
+        assert!(msg.contains("QuestDB DDL"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_instrument_build_success_severity() {
+        let event = NotificationEvent::InstrumentBuildSuccess {
+            source: "primary".to_string(),
+            derivative_count: 100,
+            underlying_count: 10,
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_instrument_build_failed_severity() {
+        let event = NotificationEvent::InstrumentBuildFailed {
+            reason: "test".to_string(),
+            manual_trigger_url: "http://test".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_ws_connected_severity() {
+        let event = NotificationEvent::WebSocketConnected {
+            connection_index: 0,
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_ws_reconnected_severity() {
+        let event = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+        };
+        assert_eq!(event.severity(), Severity::Medium);
+    }
+
+    #[test]
+    fn test_shutdown_initiated_severity() {
+        assert_eq!(
+            NotificationEvent::ShutdownInitiated.severity(),
+            Severity::Medium
+        );
+    }
+
+    #[test]
+    fn test_token_renewed_severity() {
+        assert_eq!(NotificationEvent::TokenRenewed.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_auth_success_severity() {
+        assert_eq!(
+            NotificationEvent::AuthenticationSuccess.severity(),
+            Severity::Low
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_closed_message() {
+        let event = NotificationEvent::CircuitBreakerClosed;
+        let msg = event.to_message();
+        assert!(msg.contains("Circuit breaker CLOSED"));
+        assert!(msg.contains("resumed"));
+    }
+
+    #[test]
+    fn test_historical_fetch_complete_no_persist_failures() {
+        let event = NotificationEvent::HistoricalFetchComplete {
+            instruments_fetched: 232,
+            instruments_skipped: 1050,
+            total_candles: 187458,
+            persist_failures: 0,
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("Persist errors"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_empty_reasons_and_instruments() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 0,
+            instruments_failed: 0,
+            total_candles: 0,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("partial failure"));
+        assert!(!msg.contains("Failure breakdown"));
+        assert!(!msg.contains("Failed instruments"));
+    }
+
+    #[test]
+    fn test_cross_match_failed_no_missing_live() {
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 1000,
+            mismatches: 5,
+            missing_live: 0,
+            mismatch_details: vec![],
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("Missing live"));
+    }
+
+    #[test]
+    fn test_cross_match_failed_no_mismatch_details_section() {
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 1000,
+            mismatches: 0,
+            missing_live: 0,
+            mismatch_details: vec![],
+        };
+        let msg = event.to_message();
+        // The header always contains "Mismatches: N", but the details section should be absent
+        assert!(!msg.contains("<b>Mismatches:</b>"));
+    }
+
+    #[test]
+    fn test_candle_verification_passed_empty_timeframe_details() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 10,
+            total_candles: 1000,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("Timeframes:"));
+    }
+
+    #[test]
+    fn test_candle_verification_passed_ohlc_violations_only() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 10,
+            total_candles: 1000,
+            timeframe_details: String::new(),
+            ohlc_violations: 3,
+            data_violations: 0,
+            timestamp_violations: 0,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("OHLC violations: 3"));
+        assert!(!msg.contains("Data violations"));
+        assert!(!msg.contains("Timestamp violations"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_truncation() {
+        let details: Vec<String> = (0..15).map(|i| format!("line {i}")).collect();
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 15);
+        // Should show first 10 and "+5 more"
+        assert!(msg.contains("line 0"));
+        assert!(msg.contains("line 9"));
+        assert!(!msg.contains("line 10"));
+        assert!(msg.contains("+5 more"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_no_truncation() {
+        let details: Vec<String> = (0..5).map(|i| format!("line {i}")).collect();
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 5);
+        assert!(msg.contains("line 0"));
+        assert!(msg.contains("line 4"));
+        assert!(!msg.contains("more"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_empty() {
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &[], 0);
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn test_severity_equality() {
+        assert_eq!(Severity::Critical, Severity::Critical);
+        assert_ne!(Severity::Critical, Severity::High);
+    }
+
+    #[test]
+    fn test_severity_debug() {
+        let debug = format!("{:?}", Severity::Critical);
+        assert_eq!(debug, "Critical");
+    }
+
+    #[test]
+    fn test_notification_event_clone() {
+        let event = NotificationEvent::TokenRenewed;
+        let cloned = event.clone();
+        assert_eq!(cloned.to_message(), event.to_message());
+    }
+
+    #[test]
+    fn test_cross_match_failed_truncates_long_mismatch_details() {
+        let details: Vec<String> = (0..20).map(|i| format!("mismatch {i}")).collect();
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 100,
+            mismatches: 20,
+            missing_live: 0,
+            mismatch_details: details,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("mismatch 0"));
+        assert!(msg.contains("mismatch 9"));
+        assert!(!msg.contains("mismatch 10"));
+        assert!(msg.contains("+10 more"));
+    }
 }

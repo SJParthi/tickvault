@@ -472,6 +472,54 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_header_too_small() {
+        let data = vec![0u8; 5]; // Less than HEADER_LEN (8)
+        let path = std::path::Path::new("/tmp/test.bin");
+        let err = validate_header(&data, path).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn test_validate_header_correct_returns_payload() {
+        let mut data = vec![0u8; 20];
+        data[..4].copy_from_slice(CACHE_MAGIC);
+        data[4] = CACHE_VERSION;
+        // Bytes 5-7 are padding
+        // Bytes 8-19 are "rkyv payload"
+        data[8..20].copy_from_slice(b"test_payload");
+        let path = std::path::Path::new("/tmp/test.bin");
+        let payload = validate_header(&data, path).unwrap();
+        assert_eq!(payload, b"test_payload");
+    }
+
+    #[test]
+    fn test_validate_header_exactly_header_len() {
+        let mut data = vec![0u8; HEADER_LEN];
+        data[..4].copy_from_slice(CACHE_MAGIC);
+        data[4] = CACHE_VERSION;
+        let path = std::path::Path::new("/tmp/test.bin");
+        let payload = validate_header(&data, path).unwrap();
+        assert!(payload.is_empty(), "empty rkyv payload after header");
+    }
+
+    #[test]
+    fn test_mapped_universe_load_bad_magic() {
+        let dir = unique_temp_dir("mapped-bad-magic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join(BINARY_CACHE_FILENAME);
+        let mut data = vec![0u8; 200];
+        data[..4].copy_from_slice(b"BAAD");
+        data[4] = CACHE_VERSION;
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MappedUniverse::load(dir.to_str().unwrap());
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_mapped_universe_sub_500_micros() {
         let dir = unique_temp_dir("mapped-latency");
         let cache_dir = dir.to_str().unwrap();

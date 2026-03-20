@@ -989,4 +989,185 @@ mod tests {
         assert_eq!(writer.pending_count(), 5);
         writer.force_flush().unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: DDL constants, IST offset, edge cases, LiveCandleWriter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_historical_candles_ddl_contains_all_columns() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("security_id LONG"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("open DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("high DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("low DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("close DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("volume LONG"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("oi LONG"));
+    }
+
+    #[test]
+    fn test_candle_append_ist_offset_arithmetic() {
+        // Verify that UTC + IST offset doesn't overflow or produce negative values
+        let candle = HistoricalCandle {
+            security_id: 13,
+            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
+            timestamp_utc_secs: 0, // epoch zero
+            timeframe: "1m",
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 105.0,
+            volume: 0,
+            open_interest: 0,
+        };
+        let ist_epoch = candle
+            .timestamp_utc_secs
+            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+        // IST offset = 19800 seconds (5h30m)
+        assert_eq!(ist_epoch, 19800);
+    }
+
+    #[test]
+    fn test_candle_append_large_timestamp() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Year ~2040 timestamp
+        let candle = HistoricalCandle {
+            security_id: 13,
+            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
+            timestamp_utc_secs: 2_208_988_800, // ~2040
+            timeframe: "1d",
+            open: 50000.0,
+            high: 51000.0,
+            low: 49000.0,
+            close: 50500.0,
+            volume: 1_000_000,
+            open_interest: 500_000,
+        };
+        writer.append_candle(&candle).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+        writer.force_flush().unwrap();
+    }
+
+    #[test]
+    fn test_candle_append_zero_volume_and_oi() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        let candle = HistoricalCandle {
+            security_id: 13,
+            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
+            timestamp_utc_secs: 1_772_073_900,
+            timeframe: "1m",
+            open: 24500.0,
+            high: 24500.0,
+            low: 24500.0,
+            close: 24500.0,
+            volume: 0,
+            open_interest: 0,
+        };
+        writer.append_candle(&candle).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_live_candle_writer_multiple_append_reuse() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Append, flush, append again
+        writer
+            .append_candle(13, 2, 1_773_100_800, 100.0, 110.0, 90.0, 105.0, 5000, 3)
+            .unwrap();
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+
+        writer
+            .append_candle(25, 2, 1_773_100_801, 200.0, 210.0, 190.0, 205.0, 3000, 2)
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_live_candle_writer_all_segments() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        let segments = [
+            EXCHANGE_SEGMENT_IDX_I,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            EXCHANGE_SEGMENT_BSE_EQ,
+        ];
+        for (i, seg) in segments.iter().enumerate() {
+            writer
+                .append_candle(
+                    100 + i as u32,
+                    *seg,
+                    1_773_100_800 + i as u32,
+                    100.0,
+                    110.0,
+                    90.0,
+                    105.0,
+                    1000,
+                    5,
+                )
+                .unwrap();
+        }
+        assert_eq!(writer.pending_count, 4);
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_live_candle_flush_batch_size_is_128() {
+        assert_eq!(LIVE_CANDLE_FLUSH_BATCH_SIZE, 128);
+    }
+
+    #[test]
+    fn test_candle_flush_batch_size_from_constants() {
+        // CANDLE_FLUSH_BATCH_SIZE must be positive
+        assert!(CANDLE_FLUSH_BATCH_SIZE > 0);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_ddl_with_mock_http_success_exercises_dedup() {
+        // This test exercises both the CREATE TABLE success path and DEDUP success path.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_candle_table_dedup_keys(&config).await;
+    }
 }

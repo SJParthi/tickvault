@@ -1601,4 +1601,475 @@ mod tests {
             "application/json"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: URL construction, check_rate_limit edge cases,
+    // error paths for get_order/get_positions/get_holdings/exit_all/margin,
+    // transport errors for all methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_rate_limit_ok_on_all_success_codes() {
+        let client = make_test_client("http://unused");
+        for code in 200..300_u16 {
+            assert!(
+                client.check_rate_limit(code, "test").is_ok(),
+                "status {} must be OK",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn check_rate_limit_ok_on_non_429_errors() {
+        let client = make_test_client("http://unused");
+        for code in [400_u16, 401, 403, 404, 500, 502, 503] {
+            assert!(
+                client.check_rate_limit(code, "test").is_ok(),
+                "status {} must not trigger rate limit error",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn url_construction_place_order() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let url = format!("{}/orders", client.base_url);
+        assert_eq!(url, "https://api.dhan.co/v2/orders");
+    }
+
+    #[test]
+    fn url_construction_modify_order() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let url = format!("{}/orders/{}", client.base_url, "ORD-1");
+        assert_eq!(url, "https://api.dhan.co/v2/orders/ORD-1");
+    }
+
+    #[test]
+    fn url_construction_positions() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let url = format!("{}/positions", client.base_url);
+        assert_eq!(url, "https://api.dhan.co/v2/positions");
+    }
+
+    #[test]
+    fn url_construction_holdings() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let url = format!("{}{}", client.base_url, constants::DHAN_HOLDINGS_PATH);
+        assert!(url.contains("/holdings"));
+    }
+
+    #[test]
+    fn url_construction_margin_calculator() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let url = format!(
+            "{}{}",
+            client.base_url,
+            constants::DHAN_MARGIN_CALCULATOR_PATH
+        );
+        assert!(url.contains("margincalculator"));
+    }
+
+    #[test]
+    fn url_construction_fund_limit() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let url = format!("{}{}", client.base_url, constants::DHAN_FUND_LIMIT_PATH);
+        assert!(url.contains("fundlimit"));
+    }
+
+    // -- Transport error tests for remaining methods ---
+
+    #[tokio::test]
+    async fn test_get_order_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let result = client.get_order("fake-token", "ORD-1").await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_all_orders_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let result = client.get_all_orders("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_positions_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let result = client.get_positions("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let result = client.get_holdings("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_convert_position_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let request = DhanConvertPositionRequest {
+            dhan_client_id: "100".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            to_product_type: "CNC".to_owned(),
+            exchange_segment: "NSE_EQ".to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "2885".to_owned(),
+            convert_qty: "10".to_owned(),
+            trading_symbol: "RELIANCE".to_owned(),
+        };
+        let result = client.convert_position("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_exit_all_positions_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let result = client.exit_all_positions("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_calculate_margin_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let request = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+        let result = client.calculate_margin("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_fund_limit_transport_error() {
+        let client = make_test_client("http://127.0.0.1:1");
+        let result = client.get_fund_limit("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::HttpError(_)));
+    }
+
+    // -- Rate limited tests for remaining methods ---
+
+    #[tokio::test]
+    async fn test_get_order_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_order("fake-token", "ORD-1").await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_orders_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_all_orders("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_positions_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_positions("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_holdings("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exit_all_positions_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let result = client.exit_all_positions("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_margin_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let request = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+        let result = client.calculate_margin("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_rate_limited_429() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&base_url);
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        handle.abort();
+    }
+
+    // -- API error tests for remaining methods ---
+
+    #[tokio::test]
+    async fn test_get_order_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"internal"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+        let result = client.get_order("fake-token", "ORD-1").await;
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 500);
+                assert!(message.contains("DH-908"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_orders_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"auth"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+        let result = client.get_all_orders("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 401,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_positions_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"server error"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+        let result = client.get_positions("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 500,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exit_all_positions_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+        let result = client.exit_all_positions("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 403,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_convert_position_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"invalid"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let client = make_test_client(&base_url);
+        let request = DhanConvertPositionRequest {
+            dhan_client_id: "100".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            to_product_type: "CNC".to_owned(),
+            exchange_segment: "NSE_EQ".to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "2885".to_owned(),
+            convert_qty: "10".to_owned(),
+            trading_symbol: "RELIANCE".to_owned(),
+        };
+        let result = client.convert_position("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 400,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_order_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "not-json").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_order("fake-token", "ORD-1").await;
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "{invalid}").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_holdings("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exit_all_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "not-json").await;
+        let client = make_test_client(&base_url);
+        let result = client.exit_all_positions("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_margin_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "garbage").await;
+        let client = make_test_client(&base_url);
+        let request = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+        let result = client.calculate_margin("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "garbage").await;
+        let client = make_test_client(&base_url);
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_fund_limit_malformed_json() {
+        let (base_url, handle) = start_mock_server(200, "garbage").await;
+        let client = make_test_client(&base_url);
+        let result = client.get_fund_limit("fake-token").await;
+        assert!(matches!(result.unwrap_err(), OmsError::JsonError(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_fund_limit_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"server error"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+        let result = client.get_fund_limit("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 500,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"bad input"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let client = make_test_client(&base_url);
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 400,
+                ..
+            }
+        ));
+        handle.abort();
+    }
 }

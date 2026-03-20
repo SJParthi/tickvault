@@ -705,6 +705,99 @@ mod tests {
     // Dhan IP API — request/response format tests
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // validate_ipv4_format — additional edge cases for coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_ipv4_negative_octet() {
+        assert!(validate_ipv4_format("-1.0.0.0").is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_empty_octets() {
+        assert!(validate_ipv4_format("...").is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_ipv6_mapped() {
+        // IPv4-mapped IPv6 should fail
+        assert!(validate_ipv4_format("::ffff:192.168.1.1").is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_with_cidr() {
+        assert!(validate_ipv4_format("192.168.1.0/24").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_single_digit_octets() {
+        assert_eq!(mask_ip("1.2.3.4"), "1.2.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_max_octets() {
+        assert_eq!(mask_ip("255.255.255.255"), "255.255.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_with_extra_dots() {
+        // "1.2.3.4.5" has 5 parts → not 4 → masked
+        assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
+    }
+
+    // -----------------------------------------------------------------------
+    // IpVerificationResult — field access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_verification_result_verified_ip_field() {
+        let result = IpVerificationResult {
+            verified_ip: "192.168.0.1".to_string(),
+        };
+        assert_eq!(result.verified_ip, "192.168.0.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip_from_url — valid response test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_from_url_valid_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "203.0.113.42";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip_from_url(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "203.0.113.42");
+    }
+
     #[test]
     fn test_set_ip_request_format() {
         use crate::auth::types::SetIpRequest;

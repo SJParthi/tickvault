@@ -517,4 +517,301 @@ mod tests {
         assert!(!result.passed, "unreachable URL should fail");
         assert!(result.detail.contains("request failed"));
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: check_csv_headers edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_csv_headers_extra_columns_reported() {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       EXTRA_COL1,EXTRA_COL2";
+        let result = check_csv_headers(header);
+        assert!(result.passed, "all required columns present");
+        assert!(
+            result.detail.contains("extra columns"),
+            "should mention extra columns: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("EXTRA_COL1"),
+            "should list EXTRA_COL1: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_check_csv_headers_only_some_missing() {
+        // Missing both EXPIRY_FLAG and TICK_SIZE
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,";
+        let result = check_csv_headers(header);
+        assert!(!result.passed);
+        assert!(result.detail.contains("TICK_SIZE"));
+        assert!(result.detail.contains("EXPIRY_FLAG"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_garbage_input() {
+        let result = check_csv_headers("THIS,IS,NOT,A,VALID,HEADER");
+        assert!(!result.passed, "garbage headers should fail");
+        assert!(result.detail.contains("MISSING"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_multiline_only_checks_first() {
+        // First line has valid headers; second line is data
+        let csv = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                    UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                    LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG\n\
+                    NSE,I,13,INDEX,13,NIFTY,NIFTY 50,Nifty 50,EQ,1,0001-01-01,0,XX,0.05,0";
+        let result = check_csv_headers(csv);
+        assert!(
+            result.passed,
+            "should check only first line: {}",
+            result.detail
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: DiagnosticReport / CheckResult
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diagnostic_report_unhealthy_when_any_check_fails() {
+        let report = DiagnosticReport {
+            healthy: false,
+            checks: vec![
+                CheckResult {
+                    name: "good".to_owned(),
+                    passed: true,
+                    detail: "ok".to_owned(),
+                    duration_ms: 1,
+                },
+                CheckResult {
+                    name: "bad".to_owned(),
+                    passed: false,
+                    detail: "failed".to_owned(),
+                    duration_ms: 2,
+                },
+            ],
+        };
+        assert!(!report.healthy);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"healthy\":false"));
+        assert!(json.contains("\"bad\""));
+    }
+
+    #[test]
+    fn test_diagnostic_report_empty_checks_is_healthy() {
+        let report = DiagnosticReport {
+            healthy: true,
+            checks: vec![],
+        };
+        assert!(report.healthy);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"checks\":[]"));
+    }
+
+    #[test]
+    fn test_check_result_serialization_all_fields() {
+        let result = CheckResult {
+            name: "test_check".to_owned(),
+            passed: false,
+            detail: "something went wrong".to_owned(),
+            duration_ms: 12345,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"name\":\"test_check\""));
+        assert!(json.contains("\"passed\":false"));
+        assert!(json.contains("\"detail\":\"something went wrong\""));
+        assert!(json.contains("\"duration_ms\":12345"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: check_time_gate detail content
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_time_gate_detail_contains_window_params() {
+        let result = check_time_gate("09:00:00", "15:30:00");
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("09:00:00"),
+            "detail should contain window_start"
+        );
+        assert!(
+            result.detail.contains("15:30:00"),
+            "detail should contain window_end"
+        );
+        assert!(
+            result.detail.contains("ist_time="),
+            "detail should contain IST time"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: check_cache_status with existing files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_cache_status_with_existing_csv_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dlt-test-diag-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let csv_path = temp_dir.join("instruments.csv");
+        std::fs::write(&csv_path, "header\ndata\nmore data").unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), "instruments.csv");
+        assert!(result.passed, "cache status is informational");
+        assert!(
+            result.detail.contains("dir_exists=true"),
+            "dir should exist: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csv_exists=true"),
+            "csv should exist: {}",
+            result.detail
+        );
+        // File has some bytes
+        assert!(
+            !result.detail.contains("csv_bytes=0"),
+            "csv bytes should be non-zero: {}",
+            result.detail
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_check_cache_status_with_fresh_marker() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dlt-test-diag-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Write a freshness marker with today's date
+        let today = chrono::Utc::now()
+            .with_timezone(&ist_offset())
+            .date_naive()
+            .to_string();
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, &today).unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), "instruments.csv");
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("fresh=true"),
+            "should be fresh: {}",
+            result.detail
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_check_cache_status_stale_marker() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dlt-test-diag-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
+        std::fs::write(&marker_path, "2020-01-01").unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), "instruments.csv");
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("fresh=false"),
+            "should be stale: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("2020-01-01"),
+            "should show marker content: {}",
+            result.detail
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: EXPECTED_COLUMNS constant validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expected_columns_includes_key_columns() {
+        assert!(
+            EXPECTED_COLUMNS.contains(&"EXCH_ID"),
+            "must include EXCH_ID"
+        );
+        assert!(
+            EXPECTED_COLUMNS.contains(&"SECURITY_ID"),
+            "must include SECURITY_ID"
+        );
+        assert!(
+            EXPECTED_COLUMNS.contains(&"INSTRUMENT"),
+            "must include INSTRUMENT"
+        );
+        assert!(
+            EXPECTED_COLUMNS.contains(&"UNDERLYING_SYMBOL"),
+            "must include UNDERLYING_SYMBOL"
+        );
+        assert!(
+            EXPECTED_COLUMNS.contains(&"STRIKE_PRICE"),
+            "must include STRIKE_PRICE"
+        );
+        assert!(
+            EXPECTED_COLUMNS.contains(&"OPTION_TYPE"),
+            "must include OPTION_TYPE"
+        );
+    }
+
+    #[test]
+    fn test_expected_columns_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for col in EXPECTED_COLUMNS {
+            assert!(
+                seen.insert(col),
+                "duplicate column in EXPECTED_COLUMNS: {}",
+                col
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: check_csv_headers with whitespace variations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_csv_headers_with_whitespace_around_columns() {
+        // Columns with spaces — the trim in split should handle this
+        let header = " EXCH_ID , SEGMENT , SECURITY_ID , INSTRUMENT , UNDERLYING_SECURITY_ID ,\
+                        UNDERLYING_SYMBOL , SYMBOL_NAME , DISPLAY_NAME , SERIES ,\
+                        LOT_SIZE , SM_EXPIRY_DATE , STRIKE_PRICE , OPTION_TYPE , TICK_SIZE , EXPIRY_FLAG ";
+        let result = check_csv_headers(header);
+        assert!(
+            result.passed,
+            "whitespace-padded columns should still be found: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_check_csv_headers_all_missing_reports_all() {
+        let result = check_csv_headers("ONLY_ONE_COLUMN");
+        assert!(!result.passed);
+        // Should report all 15 expected columns as missing
+        assert!(result.detail.contains("EXCH_ID"));
+        assert!(result.detail.contains("SEGMENT"));
+        assert!(result.detail.contains("SECURITY_ID"));
+    }
+
+    #[tokio::test]
+    async fn test_check_url_reachability_label_in_name() {
+        let result = check_url_reachability("http://127.0.0.1:1/x", "custom_label").await;
+        assert_eq!(result.name, "url_reachability_custom_label");
+    }
 }

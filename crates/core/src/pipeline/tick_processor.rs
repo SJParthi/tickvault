@@ -2483,6 +2483,119 @@ mod tests {
     }
 
     // ===================================================================
+    // is_within_persist_window — edge cases for IST secs_of_day boundaries
+    // ===================================================================
+
+    #[test]
+    fn test_persist_window_exact_start_and_end_constants() {
+        // Verify window boundaries match constants
+        assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
+        // 09:00 = 32400, 15:30 = 55800
+        assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 9 * 3600);
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_persist_window_one_second_before_start() {
+        // 08:59:59 IST secs_of_day = 32399 — should be outside
+        let ts = ist_hms_to_ist_epoch(8, 59, 59);
+        assert!(!is_within_persist_window(ts));
+    }
+
+    #[test]
+    fn test_persist_window_exact_start() {
+        // 09:00:00 IST secs_of_day = 32400 — should be inside (inclusive start)
+        let ts = ist_hms_to_ist_epoch(9, 0, 0);
+        assert!(is_within_persist_window(ts));
+    }
+
+    #[test]
+    fn test_persist_window_one_second_before_end() {
+        // 15:29:59 IST secs_of_day = 55799 — should be inside
+        let ts = ist_hms_to_ist_epoch(15, 29, 59);
+        assert!(is_within_persist_window(ts));
+    }
+
+    #[test]
+    fn test_persist_window_exact_end() {
+        // 15:30:00 IST secs_of_day = 55800 — should be outside (exclusive end)
+        let ts = ist_hms_to_ist_epoch(15, 30, 0);
+        assert!(!is_within_persist_window(ts));
+    }
+
+    // ===================================================================
+    // TickDedupRing — collision/eviction behavior
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_insert_then_evict_then_reinsert() {
+        // Use smallest ring (power=8, 256 slots)
+        let mut ring = TickDedupRing::new(8);
+        // Insert original
+        assert!(!ring.is_duplicate(1, 100, 50.0));
+        // Overwrite the same slot by inserting a key that hashes to the same index
+        // After 256+ distinct inserts, the original slot should be overwritten
+        for i in 0..300u32 {
+            ring.is_duplicate(1000 + i, 100, 50.0);
+        }
+        // Original may have been evicted — just verify no panic
+        let _ = ring.is_duplicate(1, 100, 50.0);
+    }
+
+    #[test]
+    fn test_dedup_ring_large_power_creates_correct_size() {
+        let ring = TickDedupRing::new(16);
+        assert_eq!(ring.slots.len(), 65536);
+        assert_eq!(ring.mask, 65535);
+    }
+
+    // ===================================================================
+    // depth_prices_are_finite — additional boundary checks
+    // ===================================================================
+
+    #[test]
+    fn test_depth_prices_are_finite_first_level_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[0].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_last_level_nan_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[4].ask_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_subnormal_is_finite() {
+        // Subnormal values are finite
+        let depth = [MarketDepthLevel {
+            bid_price: f32::MIN_POSITIVE / 2.0,
+            ask_price: f32::MIN_POSITIVE / 2.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    // ===================================================================
     // Top movers integration — tick processor with top_movers parameter
     // ===================================================================
 

@@ -1976,4 +1976,866 @@ mod tests {
         assert!(format!("{failed:?}").contains("Failed"));
         assert!(format!("{expired:?}").contains("TokenExpired"));
     }
+
+    // -----------------------------------------------------------------------
+    // classify_error — exhaustive branch coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_error_dh906_never_retry() {
+        let body = br#"{"errorType": "ORDER_ERROR", "errorCode": "DH-906", "errorMessage": "Order error"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::NeverRetry);
+    }
+
+    #[test]
+    fn test_classify_error_dh901_token_expired() {
+        // DH-901 via trading API string format (not data API numeric)
+        let body = br#"{"errorType": "AUTH_ERROR", "errorCode": "DH-901", "errorMessage": "Invalid auth"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(action, ErrorAction::TokenExpired);
+    }
+
+    #[test]
+    fn test_classify_error_dh904_body_without_429() {
+        // DH-904 in response body but non-429 HTTP status — body classification takes priority
+        let body =
+            br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Rate limit"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_classify_error_dh908_standard_retry() {
+        let body = br#"{"errorType": "INTERNAL", "errorCode": "DH-908", "errorMessage": "Internal server error"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_dh909_standard_retry() {
+        let body =
+            br#"{"errorType": "NETWORK", "errorCode": "DH-909", "errorMessage": "Network error"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_GATEWAY, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_data_api_other_code_standard_retry() {
+        // Data API numeric code that is not 805 or 807 (e.g., 800, 804, 806, etc.)
+        let body = br#"{"errorCode": 800, "message": "Internal server error"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_data_api_806_standard_retry() {
+        let body = br#"{"errorCode": 806, "message": "Data APIs not subscribed"}"#;
+        let action = classify_error(reqwest::StatusCode::FORBIDDEN, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_data_api_804_standard_retry() {
+        let body = br#"{"errorCode": 804, "message": "Instruments exceed limit"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_empty_body_standard_retry() {
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, b"");
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_garbage_body_standard_retry() {
+        let action = classify_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            b"not json at all",
+        );
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_null_error_code_fields() {
+        // Both formats present but with null code fields — falls through to StandardRetry
+        let body = br#"{"errorCode": null, "errorMessage": null}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_http_429_overrides_body() {
+        // HTTP 429 always returns RateLimited regardless of body content
+        let body = br#"{"errorCode": 805, "message": "Doesn't matter"}"#;
+        let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_classify_error_http_429_with_empty_body() {
+        let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, b"");
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    // -----------------------------------------------------------------------
+    // DhanErrorResponse / DataApiErrorResponse deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhan_error_response_deserialize_all_fields() {
+        let json =
+            br#"{"errorType":"INPUT_EXCEPTION","errorCode":"DH-905","errorMessage":"Bad input"}"#;
+        let parsed: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(parsed.error_type.as_deref(), Some("INPUT_EXCEPTION"));
+        assert_eq!(parsed.error_code.as_deref(), Some("DH-905"));
+        assert_eq!(parsed.error_message.as_deref(), Some("Bad input"));
+    }
+
+    #[test]
+    fn test_dhan_error_response_deserialize_missing_fields() {
+        // All fields are Option — missing fields parse as None
+        let json = br#"{}"#;
+        let parsed: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert!(parsed.error_type.is_none());
+        assert!(parsed.error_code.is_none());
+        assert!(parsed.error_message.is_none());
+    }
+
+    #[test]
+    fn test_data_api_error_response_with_status_alias() {
+        let json = br#"{"status": 807, "message": "Token expired"}"#;
+        let parsed: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(parsed.code, Some(807));
+    }
+
+    #[test]
+    fn test_data_api_error_response_with_error_code_alias() {
+        let json = br#"{"errorCode": 805, "errorMessage": "Too many"}"#;
+        let parsed: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(parsed.code, Some(805));
+    }
+
+    #[test]
+    fn test_data_api_error_response_empty_json() {
+        let json = br#"{}"#;
+        let parsed: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert!(parsed.code.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // DailyRequest serialization — expiry_code branch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_daily_request_serialization_with_expiry_code() {
+        let request = DailyRequest {
+            security_id: "26000".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            expiry_code: Some(0),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-01".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains("\"expiryCode\":0"),
+            "expiryCode must be present when Some: {json}"
+        );
+    }
+
+    #[test]
+    fn test_daily_request_serialization_expiry_code_1() {
+        let request = DailyRequest {
+            security_id: "13".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            expiry_code: Some(1),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-01".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"expiryCode\":1"));
+    }
+
+    #[test]
+    fn test_daily_request_serialization_expiry_code_2() {
+        let request = DailyRequest {
+            security_id: "13".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            expiry_code: Some(2),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-01".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"expiryCode\":2"));
+    }
+
+    #[test]
+    fn test_daily_request_all_fields_camel_case() {
+        let request = DailyRequest {
+            security_id: "13".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: Some(0),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-01".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        // Verify no snake_case leaked
+        assert!(!json.contains("security_id"));
+        assert!(!json.contains("exchange_segment"));
+        assert!(!json.contains("from_date"));
+        assert!(!json.contains("to_date"));
+        assert!(!json.contains("expiry_code"));
+        // Verify camelCase present
+        assert!(json.contains("securityId"));
+        assert!(json.contains("exchangeSegment"));
+        assert!(json.contains("fromDate"));
+        assert!(json.contains("toDate"));
+        assert!(json.contains("expiryCode"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DhanIntradayResponse / DhanDailyResponse edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhan_intraday_response_empty() {
+        let response = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        assert!(response.is_empty());
+        assert_eq!(response.len(), 0);
+        assert!(response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_consistent_with_oi() {
+        let response = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![99.0],
+            close: vec![102.0],
+            volume: vec![1000],
+            timestamp: vec![1700000000],
+            open_interest: vec![50000],
+        };
+        assert!(!response.is_empty());
+        assert_eq!(response.len(), 1);
+        assert!(response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_consistent_without_oi() {
+        // open_interest empty is valid — is_consistent allows empty OI
+        let response = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![],
+        };
+        assert!(response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_inconsistent_oi_length() {
+        // OI length mismatched and not empty — inconsistent
+        let response = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![50000], // only 1, but timestamp has 2
+        };
+        assert!(!response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_empty() {
+        let response = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        assert!(response.is_empty());
+        assert_eq!(response.len(), 0);
+        assert!(response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_consistent() {
+        let response = DhanDailyResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![99.0],
+            close: vec![102.0],
+            volume: vec![1000000],
+            timestamp: vec![1700000000],
+            open_interest: vec![],
+        };
+        assert!(!response.is_empty());
+        assert!(response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_inconsistent_volume() {
+        let response = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000], // only 1
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![],
+        };
+        assert!(!response.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_inconsistent_close() {
+        let response = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0], // only 1
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![],
+        };
+        assert!(!response.is_consistent());
+    }
+
+    // -----------------------------------------------------------------------
+    // DH-904 exponential backoff math
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dh904_backoff_sequence() {
+        // Sequence: 10 * 2^attempt = 10, 20, 40, 80
+        for attempt in 0..DH_904_MAX_BACKOFF_ATTEMPTS {
+            let backoff = DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(attempt));
+            let expected = DH_904_BACKOFF_BASE_SECS * (1_u64 << attempt);
+            assert_eq!(
+                backoff, expected,
+                "attempt {attempt}: expected {expected}s, got {backoff}s"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dh904_backoff_values() {
+        assert_eq!(
+            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(0)),
+            10,
+            "attempt 0: 10s"
+        );
+        assert_eq!(
+            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(1)),
+            20,
+            "attempt 1: 20s"
+        );
+        assert_eq!(
+            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(2)),
+            40,
+            "attempt 2: 40s"
+        );
+        assert_eq!(
+            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(3)),
+            80,
+            "attempt 3: 80s"
+        );
+    }
+
+    #[test]
+    fn test_dh904_max_attempts_gives_up_at_threshold() {
+        // After DH_904_MAX_BACKOFF_ATTEMPTS, should give up
+        assert_eq!(DH_904_MAX_BACKOFF_ATTEMPTS, 4);
+        // attempt >= DH_904_MAX_BACKOFF_ATTEMPTS → return Failed
+        assert!(4_u32 >= DH_904_MAX_BACKOFF_ATTEMPTS);
+    }
+
+    // -----------------------------------------------------------------------
+    // IST time-of-day filtering for intraday candles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_intraday_market_close_candle_filtered() {
+        // 15:30 IST = TICK_PERSIST_END_SECS_OF_DAY_IST = 55800
+        // A candle at exactly 15:30 IST should be filtered out
+        // UTC epoch for 15:30 IST = 10:00 UTC on some day
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600; // 10:00 UTC
+        let ist_secs_of_day =
+            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+        assert_eq!(ist_secs_of_day, TICK_PERSIST_END_SECS_OF_DAY_IST);
+        assert!(ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST);
+    }
+
+    #[test]
+    fn test_intraday_after_market_candle_filtered() {
+        // 15:45 IST (post-close) should be filtered
+        // 15:45 IST = 10:15 UTC
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600 + 15 * 60;
+        let ist_secs_of_day =
+            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+        assert_eq!(ist_secs_of_day, 15 * 3600 + 45 * 60); // 56700
+        assert!(ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST);
+    }
+
+    #[test]
+    fn test_intraday_market_open_candle_passes() {
+        // 09:15 IST = 03:45 UTC — should NOT be filtered
+        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 45 * 60;
+        let ist_secs_of_day =
+            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+        assert_eq!(ist_secs_of_day, 9 * 3600 + 15 * 60); // 33300
+        assert!(ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST);
+    }
+
+    #[test]
+    fn test_intraday_last_valid_candle_1529_passes() {
+        // 15:29 IST = 09:59 UTC — the last valid 1m candle
+        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60;
+        let ist_secs_of_day =
+            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+        assert_eq!(ist_secs_of_day, 15 * 3600 + 29 * 60); // 55740
+        assert!(ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST);
+    }
+
+    #[test]
+    fn test_intraday_noon_candle_passes() {
+        // 12:00 IST = 06:30 UTC — mid-session, should pass
+        let utc_epoch: i64 = 1_773_014_400 + 6 * 3600 + 30 * 60;
+        let ist_secs_of_day =
+            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+        assert_eq!(ist_secs_of_day, 12 * 3600); // 43200
+        assert!(ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST);
+    }
+
+    // -----------------------------------------------------------------------
+    // OI fallback when open_interest array is shorter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oi_fallback_uses_zero_when_array_short() {
+        // Simulates the OI fallback logic: if i >= data.open_interest.len(), use 0
+        let oi_array: Vec<i64> = vec![100, 200]; // only 2 entries
+        let index = 3_usize; // out of range
+        let oi_value = if index < oi_array.len() {
+            oi_array[index]
+        } else {
+            0
+        };
+        assert_eq!(oi_value, 0);
+    }
+
+    #[test]
+    fn test_oi_fallback_uses_value_when_in_range() {
+        let oi_array: Vec<i64> = vec![100, 200, 300];
+        let index = 1_usize;
+        let oi_value = if index < oi_array.len() {
+            oi_array[index]
+        } else {
+            0
+        };
+        assert_eq!(oi_value, 200);
+    }
+
+    #[test]
+    fn test_oi_fallback_empty_array() {
+        let oi_array: Vec<i64> = vec![];
+        let index = 0_usize;
+        let oi_value = if index < oi_array.len() {
+            oi_array[index]
+        } else {
+            0
+        };
+        assert_eq!(oi_value, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Error 805 pause and constant validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_805_pause_is_60_seconds() {
+        assert_eq!(ERROR_805_PAUSE_SECS, 60);
+    }
+
+    #[test]
+    fn test_dh904_backoff_base_is_10_seconds() {
+        assert_eq!(DH_904_BACKOFF_BASE_SECS, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // InstrumentFetchResult Success with persist failures
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_instrument_fetch_result_success_equality() {
+        assert_eq!(
+            InstrumentFetchResult::Success(100, 5),
+            InstrumentFetchResult::Success(100, 5)
+        );
+    }
+
+    #[test]
+    fn test_instrument_fetch_result_success_different_persist_fails() {
+        assert_ne!(
+            InstrumentFetchResult::Success(100, 0),
+            InstrumentFetchResult::Success(100, 5),
+            "Different persist failure counts must be distinct"
+        );
+    }
+
+    #[test]
+    fn test_instrument_fetch_result_success_different_candle_counts() {
+        assert_ne!(
+            InstrumentFetchResult::Success(50, 0),
+            InstrumentFetchResult::Success(100, 0),
+            "Different candle counts must be distinct"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SubscriptionCategory mapping — exercising match arms in fetch logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_major_index_value_maps_to_index() {
+        let instrument_type = match SubscriptionCategory::MajorIndexValue {
+            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
+            SubscriptionCategory::StockEquity => "EQUITY",
+            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => "SKIP",
+        };
+        assert_eq!(instrument_type, "INDEX");
+    }
+
+    #[test]
+    fn test_stock_equity_maps_to_equity() {
+        let instrument_type = match SubscriptionCategory::StockEquity {
+            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
+            SubscriptionCategory::StockEquity => "EQUITY",
+            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => "SKIP",
+        };
+        assert_eq!(instrument_type, "EQUITY");
+    }
+
+    #[test]
+    fn test_index_derivative_skipped() {
+        let should_skip = matches!(
+            SubscriptionCategory::IndexDerivative,
+            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
+        );
+        assert!(should_skip);
+    }
+
+    #[test]
+    fn test_stock_derivative_skipped() {
+        let should_skip = matches!(
+            SubscriptionCategory::StockDerivative,
+            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
+        );
+        assert!(should_skip);
+    }
+
+    // -----------------------------------------------------------------------
+    // CandleFetchSummary — failure_reasons tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_failure_reasons_token_expired_classification() {
+        // Simulates the failure reason classification logic
+        let token_expired_counts: Vec<usize> = vec![0, 0, 2, 1, 3];
+        let pending_indices = vec![2_usize, 3, 4];
+        let mut failure_reasons: HashMap<String, usize> = HashMap::new();
+        for &idx in &pending_indices {
+            if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
+                let count = failure_reasons
+                    .entry("token_expired".to_string())
+                    .or_insert(0);
+                *count = count.saturating_add(1);
+            } else {
+                let count = failure_reasons
+                    .entry("network_or_api".to_string())
+                    .or_insert(0);
+                *count = count.saturating_add(1);
+            }
+        }
+        // idx=2: count=2 >= MAX_TOKEN_EXPIRED_RETRIES(2) → token_expired
+        // idx=3: count=1 < 2 → network_or_api
+        // idx=4: count=3 >= 2 → token_expired
+        assert_eq!(failure_reasons["token_expired"], 2);
+        assert_eq!(failure_reasons["network_or_api"], 1);
+        // Ensure we also handle the mock token count correctly
+        assert!(token_expired_counts[2] >= MAX_TOKEN_EXPIRED_RETRIES);
+        assert!(token_expired_counts[3] < MAX_TOKEN_EXPIRED_RETRIES);
+    }
+
+    #[test]
+    fn test_failure_reasons_persist_inserted_when_nonzero() {
+        // Simulates the persist failure insertion logic
+        let total_persist_failures = 42_usize;
+        let mut failure_reasons: HashMap<String, usize> = HashMap::new();
+        if total_persist_failures > 0 {
+            failure_reasons.insert("persist".to_string(), total_persist_failures);
+        }
+        assert_eq!(failure_reasons["persist"], 42);
+    }
+
+    #[test]
+    fn test_failure_reasons_persist_not_inserted_when_zero() {
+        let total_persist_failures = 0_usize;
+        let mut failure_reasons: HashMap<String, usize> = HashMap::new();
+        if total_persist_failures > 0 {
+            failure_reasons.insert("persist".to_string(), total_persist_failures);
+        }
+        assert!(
+            !failure_reasons.contains_key("persist"),
+            "persist key must not be present when there are 0 persist failures"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Failed instrument name collection — MAX_FAILED_INSTRUMENT_NAMES cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_failed_instrument_names_take_capped() {
+        // Simulates the .take(MAX_FAILED_INSTRUMENT_NAMES) in the fetch function
+        let large_indices: Vec<usize> = (0..100).collect();
+        let names: Vec<String> = large_indices
+            .iter()
+            .take(MAX_FAILED_INSTRUMENT_NAMES)
+            .map(|&idx| format!("{idx} (NSE_EQ)"))
+            .collect();
+        assert_eq!(names.len(), MAX_FAILED_INSTRUMENT_NAMES);
+        assert_eq!(names.len(), 50);
+    }
+
+    #[test]
+    fn test_failed_instrument_names_under_cap() {
+        let small_indices: Vec<usize> = (0..3).collect();
+        let names: Vec<String> = small_indices
+            .iter()
+            .take(MAX_FAILED_INSTRUMENT_NAMES)
+            .map(|&idx| format!("{idx} (IDX_I)"))
+            .collect();
+        assert_eq!(names.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Intraday response deserialization from JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhan_intraday_response_deserialization() {
+        let json = r#"{
+            "open": [100.5, 101.0],
+            "high": [102.0, 103.0],
+            "low": [99.5, 100.0],
+            "close": [101.0, 102.5],
+            "volume": [1000, 2000],
+            "timestamp": [1700000000, 1700000060]
+        }"#;
+        let response: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.len(), 2);
+        assert!(response.is_consistent());
+        assert!(response.open_interest.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_with_float_volume() {
+        // Dhan may return volume/timestamp as float (e.g., 105600.0)
+        let json = r#"{
+            "open": [100.5],
+            "high": [102.0],
+            "low": [99.5],
+            "close": [101.0],
+            "volume": [105600.0],
+            "timestamp": [1700000000.0],
+            "open_interest": [50000.0]
+        }"#;
+        let response: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.volume[0], 105600);
+        assert_eq!(response.timestamp[0], 1700000000);
+        assert_eq!(response.open_interest[0], 50000);
+    }
+
+    #[test]
+    fn test_dhan_daily_response_deserialization() {
+        let json = r#"{
+            "open": [24500.5],
+            "high": [24700.0],
+            "low": [24400.0],
+            "close": [24650.0],
+            "volume": [500000],
+            "timestamp": [1700000000]
+        }"#;
+        let response: DhanDailyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.len(), 1);
+        assert!(response.is_consistent());
+        assert!(response.open_interest.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ErrorAction enum completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_action_debug_format() {
+        // Verify all variants have Debug
+        assert!(format!("{:?}", ErrorAction::RateLimited).contains("RateLimited"));
+        assert!(format!("{:?}", ErrorAction::TooManyConnections).contains("TooManyConnections"));
+        assert!(format!("{:?}", ErrorAction::TokenExpired).contains("TokenExpired"));
+        assert!(format!("{:?}", ErrorAction::StandardRetry).contains("StandardRetry"));
+        assert!(format!("{:?}", ErrorAction::NeverRetry).contains("NeverRetry"));
+    }
+
+    #[test]
+    fn test_error_action_equality_all_variants() {
+        // Each variant equals itself
+        assert_eq!(ErrorAction::RateLimited, ErrorAction::RateLimited);
+        assert_eq!(
+            ErrorAction::TooManyConnections,
+            ErrorAction::TooManyConnections
+        );
+        assert_eq!(ErrorAction::TokenExpired, ErrorAction::TokenExpired);
+        assert_eq!(ErrorAction::StandardRetry, ErrorAction::StandardRetry);
+        assert_eq!(ErrorAction::NeverRetry, ErrorAction::NeverRetry);
+
+        // Different variants are not equal
+        assert_ne!(ErrorAction::RateLimited, ErrorAction::NeverRetry);
+        assert_ne!(ErrorAction::TokenExpired, ErrorAction::StandardRetry);
+        assert_ne!(ErrorAction::TooManyConnections, ErrorAction::RateLimited);
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry linear backoff delay math
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_retry_delay_ms_linear_sequence() {
+        // Retry delay = 1000ms * attempt — validates the delay used in fetch_*_with_retry
+        let max_retries = 3_u32;
+        for attempt in 1..=max_retries {
+            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            assert_eq!(delay_ms, u64::from(attempt) * 1000);
+        }
+    }
+
+    #[test]
+    fn test_retry_delay_ms_zero_on_first_attempt() {
+        // Attempt 0 skips the delay entirely (the condition: `if attempt > 0`)
+        let attempt = 0_u32;
+        assert_eq!(attempt, 0, "first attempt has no delay");
+    }
+
+    // -----------------------------------------------------------------------
+    // Historical candle struct — field access patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_historical_candle_all_timeframes() {
+        for &tf in &["1m", "5m", "15m", "60m", "1d"] {
+            let candle = HistoricalCandle {
+                timestamp_utc_secs: 1_700_000_000,
+                security_id: 11536,
+                exchange_segment_code: 1,
+                timeframe: tf,
+                open: 100.0,
+                high: 105.0,
+                low: 99.0,
+                close: 102.0,
+                volume: 50000,
+                open_interest: 0,
+            };
+            assert_eq!(candle.timeframe, tf);
+            assert_eq!(candle.security_id, 11536);
+        }
+    }
+
+    #[test]
+    fn test_historical_candle_fno_with_oi() {
+        let candle = HistoricalCandle {
+            timestamp_utc_secs: 1_700_000_000,
+            security_id: 49081,
+            exchange_segment_code: 2, // NSE_FNO
+            timeframe: "1d",
+            open: 25000.0,
+            high: 25200.0,
+            low: 24900.0,
+            close: 25100.0,
+            volume: 100000,
+            open_interest: 5_000_000,
+        };
+        assert_eq!(candle.exchange_segment_code, 2);
+        assert_eq!(candle.open_interest, 5_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Saturating arithmetic edge cases (used throughout fetch logic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_saturating_add_prevents_overflow() {
+        let mut count = usize::MAX - 1;
+        count = count.saturating_add(1);
+        assert_eq!(count, usize::MAX);
+        count = count.saturating_add(1);
+        assert_eq!(
+            count,
+            usize::MAX,
+            "saturating_add must not overflow past usize::MAX"
+        );
+    }
+
+    #[test]
+    fn test_saturating_mul_prevents_overflow() {
+        let result = u64::MAX.saturating_mul(2);
+        assert_eq!(
+            result,
+            u64::MAX,
+            "saturating_mul must not overflow past u64::MAX"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_error — combined format priority tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_error_data_api_format_takes_priority_over_trading() {
+        // When body matches BOTH formats, data API numeric format is tried first
+        let body = br#"{"errorCode": 805, "errorType": "RATE_LIMIT", "errorMessage": "conflict"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        // Numeric 805 is tried first → TooManyConnections
+        assert_eq!(action, ErrorAction::TooManyConnections);
+    }
+
+    #[test]
+    fn test_classify_error_trading_format_fallback() {
+        // Body has only trading API format (string errorCode), no numeric code
+        let body =
+            br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "limit"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
 }

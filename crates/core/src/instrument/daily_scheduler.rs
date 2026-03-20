@@ -320,4 +320,154 @@ mod tests {
         assert!(!config.enabled, "scheduler must be disabled by default");
         assert_eq!(config.download_time, hms(8, 55, 0));
     }
+
+    // I-P1-01: Target time 00:00, now is 23:59:59 → 1 second
+    #[test]
+    fn test_compute_next_trigger_one_second_before_midnight() {
+        let now = ist_datetime(2026, 3, 11, 23, 59, 59);
+        let target = hms(0, 0, 0);
+        let duration = compute_next_trigger_time(now, target);
+        // 00:00 tomorrow - 23:59:59 today = 1 second
+        assert_eq!(duration.as_secs(), 1);
+    }
+
+    // I-P1-01: Target time 23:59:59, now is 00:00:00 → ~23h59m59s
+    #[test]
+    fn test_compute_next_trigger_near_end_of_day() {
+        let now = ist_datetime(2026, 3, 11, 0, 0, 0);
+        let target = hms(23, 59, 59);
+        let duration = compute_next_trigger_time(now, target);
+        let expected = 23 * 3600 + 59 * 60 + 59;
+        assert_eq!(duration.as_secs(), expected);
+    }
+
+    // I-P1-01: Target 1 second in the future
+    #[test]
+    fn test_compute_next_trigger_one_second_ahead() {
+        let now = ist_datetime(2026, 3, 11, 12, 0, 0);
+        let target = hms(12, 0, 1);
+        let duration = compute_next_trigger_time(now, target);
+        assert_eq!(duration.as_secs(), 1);
+    }
+
+    // I-P1-01: Target 1 second in the past → wraps to next day
+    #[test]
+    fn test_compute_next_trigger_one_second_past() {
+        let now = ist_datetime(2026, 3, 11, 12, 0, 1);
+        let target = hms(12, 0, 0);
+        let duration = compute_next_trigger_time(now, target);
+        // Wraps to next day: 86400 - 1 = 86399
+        assert_eq!(duration.as_secs(), 86_399);
+    }
+
+    // I-P1-01: Result is always positive (1..=86400)
+    #[test]
+    fn test_compute_next_trigger_always_positive() {
+        // Test multiple combinations
+        for hour in [0, 6, 9, 12, 15, 20, 23] {
+            for target_hour in [0, 6, 9, 12, 15, 20, 23] {
+                let now = ist_datetime(2026, 3, 11, hour, 30, 0);
+                let target = hms(target_hour, 15, 0);
+                let duration = compute_next_trigger_time(now, target);
+                assert!(
+                    duration.as_secs() >= 1 && duration.as_secs() <= 86_400,
+                    "duration must be 1..=86400, got {} for now={}:30 target={}:15",
+                    duration.as_secs(),
+                    hour,
+                    target_hour
+                );
+            }
+        }
+    }
+
+    // GAP-CFG-01: Parse various valid time strings
+    #[test]
+    fn test_parse_daily_download_time_midnight() {
+        let result = parse_daily_download_time("00:00:00");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), hms(0, 0, 0));
+    }
+
+    #[test]
+    fn test_parse_daily_download_time_end_of_day() {
+        let result = parse_daily_download_time("23:59:59");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), hms(23, 59, 59));
+    }
+
+    // GAP-CFG-01: Invalid formats
+    #[test]
+    fn test_parse_daily_download_time_invalid_hour() {
+        assert!(parse_daily_download_time("25:00:00").is_err());
+    }
+
+    #[test]
+    fn test_parse_daily_download_time_empty_string() {
+        assert!(parse_daily_download_time("").is_err());
+    }
+
+    #[test]
+    fn test_parse_daily_download_time_extra_fields() {
+        // "08:55:00:00" has an extra field
+        assert!(parse_daily_download_time("08:55:00:00").is_err());
+    }
+
+    // I-P1-01: spawn_daily_refresh_task — disabled config exits on shutdown
+    #[tokio::test]
+    async fn test_spawn_daily_refresh_task_disabled_exits_on_shutdown() {
+        let config = DailyRefreshConfig::default(); // disabled
+        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
+            &dhan_live_trader_common::config::TradingConfig {
+                market_open_time: "09:00:00".to_string(),
+                market_close_time: "15:30:00".to_string(),
+                order_cutoff_time: "15:29:00".to_string(),
+                data_collection_start: "09:00:00".to_string(),
+                data_collection_end: "16:00:00".to_string(),
+                timezone: "Asia/Kolkata".to_string(),
+                max_orders_per_second: 10,
+                nse_holidays: vec![],
+                muhurat_trading_dates: vec![],
+            },
+        )
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_trigger_tx, _trigger_rx) = mpsc::channel::<()>(1);
+        let handle = spawn_daily_refresh_task(config, calendar, shutdown_rx, _trigger_tx);
+
+        // Send shutdown
+        let _ = shutdown_tx.send(true);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("disabled task should exit within 2s")
+            .expect("task should not panic");
+    }
+
+    // I-P1-01: SECS_PER_DAY constant is correct
+    #[test]
+    fn test_secs_per_day_constant() {
+        assert_eq!(SECS_PER_DAY, 86_400);
+    }
+
+    // GAP-CFG-01: DailyRefreshConfig debug
+    #[test]
+    fn test_daily_refresh_config_debug() {
+        let config = DailyRefreshConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("download_time"));
+        assert!(debug.contains("enabled"));
+    }
+
+    // GAP-CFG-01: DailyRefreshConfig clone
+    #[test]
+    fn test_daily_refresh_config_clone() {
+        let config = DailyRefreshConfig {
+            download_time: hms(7, 30, 0),
+            enabled: true,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.download_time, hms(7, 30, 0));
+        assert!(cloned.enabled);
+    }
 }
