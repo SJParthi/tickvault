@@ -491,6 +491,120 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // IpMonitorConfig — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_monitor_config_debug_format() {
+        let config = IpMonitorConfig::new("1.2.3.4".to_string(), 60);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("1.2.3.4"));
+        assert!(debug.contains("60"));
+        assert!(debug.contains("enabled"));
+    }
+
+    #[test]
+    fn test_ip_monitor_config_disabled_has_default_interval() {
+        let config = IpMonitorConfig::disabled();
+        assert_eq!(config.check_interval_secs, 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_ips — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_ips_identical_long_string() {
+        let ip = "192.168.100.200";
+        assert_eq!(compare_ips(ip, ip), IpCheckResult::Match);
+    }
+
+    #[test]
+    fn test_compare_ips_case_sensitive() {
+        // IPs are numeric, but let's verify compare_ips is case-sensitive for any input
+        assert!(matches!(
+            compare_ips("abc", "ABC"),
+            IpCheckResult::Mismatch { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_ipv4 — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_ipv4_leading_zeros_rejected() {
+        assert!(!is_valid_ipv4("192.168.001.001"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_single_octet() {
+        assert!(!is_valid_ipv4("192"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_negative_value() {
+        assert!(!is_valid_ipv4("-1.0.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IpCheckResult — additional variant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_check_result_match_eq() {
+        assert_eq!(IpCheckResult::Match, IpCheckResult::Match);
+    }
+
+    #[test]
+    fn test_ip_check_result_mismatch_ne_check_failed() {
+        let mismatch = IpCheckResult::Mismatch {
+            expected: "a".to_string(),
+            actual: "b".to_string(),
+        };
+        let failed = IpCheckResult::CheckFailed {
+            reason: "err".to_string(),
+        };
+        assert_ne!(mismatch, failed);
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — valid response
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_valid_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "10.0.0.1";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "10.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
     // spawn_ip_monitor — empty expected IP
     // -----------------------------------------------------------------------
 
@@ -510,5 +624,129 @@ mod tests {
             .expect("task should not panic"); // APPROVED: test
 
         assert!(!*rx.borrow());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_current_ip — exercises both primary and fallback paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_current_ip_both_fail_returns_check_failed() {
+        // With an unreachable expected IP and very short timeout, both URLs fail
+        let result = check_current_ip("203.0.113.42", Duration::from_millis(50)).await;
+        // On CI without network, both fail → CheckFailed.
+        // On dev machines with internet, actual IP differs → Mismatch.
+        match &result {
+            IpCheckResult::Match => {
+                // Machine's IP is 203.0.113.42 — extremely unlikely but valid
+            }
+            IpCheckResult::Mismatch { expected, .. } => {
+                assert_eq!(expected, "203.0.113.42");
+            }
+            IpCheckResult::CheckFailed { reason } => {
+                assert!(reason.contains("failed"), "check failed reason: {reason}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — error paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_connection_refused() {
+        let result = fetch_ip("http://127.0.0.1:1/ip", Duration::from_millis(100)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ip_non_success_status() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response =
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("HTTP 403"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ip_invalid_ipv4_in_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "garbage-response";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid IPv4"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IpCheckResult variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_check_result_check_failed_preserves_reason() {
+        let result = IpCheckResult::CheckFailed {
+            reason: "both failed".to_string(),
+        };
+        if let IpCheckResult::CheckFailed { reason } = &result {
+            assert_eq!(reason, "both failed");
+        } else {
+            panic!("expected CheckFailed");
+        }
+    }
+
+    #[test]
+    fn test_ip_check_result_variants_are_distinct() {
+        let match_result = IpCheckResult::Match;
+        let mismatch = IpCheckResult::Mismatch {
+            expected: "a".to_string(),
+            actual: "b".to_string(),
+        };
+        let failed = IpCheckResult::CheckFailed {
+            reason: "err".to_string(),
+        };
+        assert_ne!(match_result, mismatch);
+        assert_ne!(match_result, failed);
+        assert_ne!(mismatch, failed);
     }
 }

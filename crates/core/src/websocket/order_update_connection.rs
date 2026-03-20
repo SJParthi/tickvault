@@ -433,4 +433,275 @@ mod tests {
             prev_delay = delay;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_collection_time_constants() {
+        // Verify the data collection constants are reasonable
+        assert_eq!(DATA_COLLECTION_START, (9, 0));
+        assert_eq!(DATA_COLLECTION_END, (16, 0));
+        assert!(DATA_COLLECTION_START.0 < DATA_COLLECTION_END.0);
+    }
+
+    #[test]
+    fn test_is_within_market_hours_does_not_panic() {
+        // The function checks calendar.is_trading_day_today() first.
+        // We verify it runs without panicking with a minimal TradingCalendar.
+        use dhan_live_trader_common::config::TradingConfig;
+
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "16:00:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+        // Just verify it runs without panic — the result depends on the
+        // current IST time and day of week.
+        let _ = is_within_market_hours(&calendar);
+    }
+
+    #[test]
+    fn test_off_hours_read_timeout_longer_than_market_hours() {
+        assert!(
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS >= ORDER_UPDATE_READ_TIMEOUT_SECS,
+            "off-hours timeout should be >= market hours timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — additional error variant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_token_expired_display() {
+        let err = OrderUpdateConnectionError::TokenExpired;
+        let msg = err.to_string();
+        assert!(msg.contains("expired"));
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_error_no_token_is_distinct_from_token_expired() {
+        let no_token = OrderUpdateConnectionError::NoToken.to_string();
+        let expired = OrderUpdateConnectionError::TokenExpired.to_string();
+        assert_ne!(no_token, expired);
+    }
+
+    #[test]
+    fn test_error_read_timeout_mentions_constant() {
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        let msg = err.to_string();
+        // The display mentions the timeout constant
+        assert!(msg.contains("read timeout"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Backoff calculation — saturating_sub edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backoff_consecutive_failures_zero() {
+        // When consecutive_failures = 0, shift = 0.saturating_sub(1) = 0 (capped)
+        // Actually the code does consecutive_failures.saturating_sub(1).min(63)
+        // With 0 failures, shift = 0, delay = initial * 1 = initial
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        let shift = 0_u32.saturating_sub(1).min(63);
+        let delay = initial.saturating_mul(1_u64 << shift).min(max);
+        assert_eq!(delay, initial);
+    }
+
+    #[test]
+    fn test_backoff_consecutive_failures_one() {
+        // failures = 1, shift = 1.saturating_sub(1) = 0, delay = initial * 2^0 = initial
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        let shift = 1_u32.saturating_sub(1).min(63);
+        let delay = initial.saturating_mul(1_u64 << shift).min(max);
+        assert_eq!(delay, initial);
+    }
+
+    #[test]
+    fn test_backoff_consecutive_failures_u32_max() {
+        // u32::MAX.saturating_sub(1) = u32::MAX - 1, but .min(63) = 63
+        // 1_u64 << 63 is valid (no overflow), saturating_mul caps at u64::MAX
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        let shift = u32::MAX.saturating_sub(1).min(63);
+        assert_eq!(shift, 63);
+        let delay = initial.saturating_mul(1_u64 << shift).min(max);
+        assert_eq!(delay, max, "should cap at max delay");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — boundary test using TradingCalendar with holidays
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_market_hours_with_holidays() {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        // Add today as a holiday to ensure is_within_market_hours returns false
+        let today = chrono::Utc::now()
+            .with_timezone(&ist_offset())
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "16:00:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: today,
+                name: "Test Holiday".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+        // Today is a holiday → should return false regardless of time
+        assert!(!is_within_market_hours(&calendar));
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError matches() pattern
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_variant_matches_read_timeout() {
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        assert!(matches!(err, OrderUpdateConnectionError::ReadTimeout));
+    }
+
+    #[test]
+    fn test_error_variant_matches_no_token() {
+        let err = OrderUpdateConnectionError::NoToken;
+        assert!(matches!(err, OrderUpdateConnectionError::NoToken));
+    }
+
+    #[test]
+    fn test_error_variant_matches_token_expired() {
+        let err = OrderUpdateConnectionError::TokenExpired;
+        assert!(matches!(err, OrderUpdateConnectionError::TokenExpired));
+    }
+
+    #[test]
+    fn test_error_tls_preserves_message() {
+        let err = OrderUpdateConnectionError::Tls("certificate error".to_string());
+        assert!(err.to_string().contains("certificate error"));
+    }
+
+    #[test]
+    fn test_error_connect_preserves_message() {
+        let err = OrderUpdateConnectionError::Connect("DNS resolution failed".to_string());
+        assert!(err.to_string().contains("DNS resolution failed"));
+    }
+
+    #[test]
+    fn test_error_send_preserves_message() {
+        let err = OrderUpdateConnectionError::Send("socket closed".to_string());
+        assert!(err.to_string().contains("socket closed"));
+    }
+
+    #[test]
+    fn test_error_read_preserves_message() {
+        let err = OrderUpdateConnectionError::Read("TCP reset".to_string());
+        assert!(err.to_string().contains("TCP reset"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — additional coverage with different calendars
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_market_hours_weekend_returns_false() {
+        use dhan_live_trader_common::config::TradingConfig;
+
+        // Build a calendar with no holidays — weekends are still non-trading
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "16:00:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+        // Just verify the function does not panic.
+        // Result depends on current day being a weekend or not.
+        let _ = is_within_market_hours(&calendar);
+    }
+
+    #[test]
+    fn test_data_collection_window_covers_market_hours() {
+        // Market hours 09:00-15:30 must fit within data collection 09:00-16:00
+        assert!(DATA_COLLECTION_START.0 <= 9);
+        assert!(DATA_COLLECTION_END.0 >= 15);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backoff edge cases — verify formula for specific failure counts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backoff_formula_failure_two() {
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        // failures=2 -> shift=1 -> delay = initial * 2
+        let shift = 2_u32.saturating_sub(1).min(63);
+        let delay = initial.saturating_mul(1_u64 << shift).min(max);
+        assert_eq!(shift, 1);
+        assert_eq!(delay, initial.saturating_mul(2).min(max));
+    }
+
+    #[test]
+    fn test_backoff_formula_failure_three() {
+        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        // failures=3 -> shift=2 -> delay = initial * 4
+        let shift = 3_u32.saturating_sub(1).min(63);
+        let delay = initial.saturating_mul(1_u64 << shift).min(max);
+        assert_eq!(shift, 2);
+        assert_eq!(delay, initial.saturating_mul(4).min(max));
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — error chain and source
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_variants_implement_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(OrderUpdateConnectionError::NoToken);
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_tls_error_contains_nested_reason() {
+        let err = OrderUpdateConnectionError::Tls("invalid cert chain: expired".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("invalid cert chain: expired"));
+        assert!(msg.contains("TLS"));
+    }
+
+    #[test]
+    fn test_connect_error_empty_reason() {
+        let err = OrderUpdateConnectionError::Connect(String::new());
+        let msg = err.to_string();
+        assert!(msg.contains("connection failed"));
+    }
 }

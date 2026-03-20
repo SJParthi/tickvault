@@ -609,4 +609,206 @@ mod tests {
 
         delete_cache_file();
     }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — empty client_id field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_empty_client_id_field() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+
+        // Write cache with client_id = "" (empty string)
+        let entry = serde_json::json!({
+            "access_token": "empty-cid-jwt",
+            "expires_at_epoch_secs": (now_ist + Duration::hours(23)).timestamp(),
+            "issued_at_epoch_secs": now_ist.timestamp(),
+            "client_id_hash": 12345u64,
+            "client_id": "",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "fast cache should return None for empty client_id field"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — nearly expired token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_nearly_expired_token() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+
+        // Token expires in 30 min — less than TOKEN_CACHE_MIN_REMAINING_HOURS
+        let token = TokenState::from_cached(
+            SecretString::from("nearly-expired-fast-jwt".to_string()),
+            now_ist + Duration::minutes(30),
+            now_ist - Duration::hours(23) - Duration::minutes(30),
+        );
+
+        let client_id = SecretString::from("nearly-expired-fast-client".to_string());
+        save_token_cache(&token, &client_id);
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "fast cache should reject nearly expired token"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — corrupt JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_corrupt_json() {
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        std::fs::write(TOKEN_CACHE_FILE_PATH, "{{invalid json").ok();
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "fast cache should return None for corrupt JSON"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache — invalid expires_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_invalid_expires_at_timestamp() {
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let client_id = SecretString::from("test-invalid-ts".to_string());
+        let entry = serde_json::json!({
+            "access_token": "test-jwt",
+            "expires_at_epoch_secs": i64::MAX,
+            "issued_at_epoch_secs": 0i64,
+            "client_id_hash": hash_client_id(&client_id),
+            "client_id": "test-invalid-ts",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache(&client_id);
+        // i64::MAX may fail DateTime::from_timestamp or the token may be expired
+        // Either way, it should not panic
+        let _ = result;
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — invalid issued_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_invalid_issued_at_timestamp() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+
+        // Valid expires_at but invalid issued_at (i64::MAX overflows DateTime)
+        let entry = serde_json::json!({
+            "access_token": "test-jwt",
+            "expires_at_epoch_secs": (now_ist + Duration::hours(23)).timestamp(),
+            "issued_at_epoch_secs": i64::MAX,
+            "client_id_hash": 0u64,
+            "client_id": "test-invalid-issued",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache_fast();
+        // Either None (invalid timestamp) or valid — must not panic
+        let _ = result;
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_client_id — empty string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_client_id_empty_string() {
+        let id1 = SecretString::from(String::new());
+        let id2 = SecretString::from(String::new());
+        assert_eq!(hash_client_id(&id1), hash_client_id(&id2));
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_cache_file — idempotent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_cache_file_idempotent() {
+        let _guard = acquire_cache_lock();
+        // Delete twice — second call should not panic
+        delete_cache_file();
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenCacheEntry serde — backward compatibility (missing client_id)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_cache_entry_deserialize_without_client_id() {
+        let json = r#"{
+            "access_token": "test-jwt",
+            "expires_at_epoch_secs": 1700000000,
+            "issued_at_epoch_secs": 1699900000,
+            "client_id_hash": 12345
+        }"#;
+        let entry: TokenCacheEntry = serde_json::from_str(json).expect("should deserialize"); // APPROVED: test
+        assert!(
+            entry.client_id.is_none(),
+            "missing client_id should default to None"
+        );
+    }
+
+    #[test]
+    fn test_token_cache_entry_serialize_roundtrip() {
+        let entry = TokenCacheEntry {
+            access_token: "roundtrip-jwt".to_string(),
+            expires_at_epoch_secs: 1_700_000_000,
+            issued_at_epoch_secs: 1_699_900_000,
+            client_id_hash: 42,
+            client_id: Some("test-client".to_string()),
+        };
+        let json = serde_json::to_string(&entry).expect("should serialize"); // APPROVED: test
+        let parsed: TokenCacheEntry = serde_json::from_str(&json).expect("should deserialize"); // APPROVED: test
+        assert_eq!(parsed.access_token, "roundtrip-jwt");
+        assert_eq!(parsed.client_id_hash, 42);
+        assert_eq!(parsed.client_id.as_deref(), Some("test-client"));
+    }
 }

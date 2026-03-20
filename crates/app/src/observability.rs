@@ -127,4 +127,181 @@ mod tests {
             "disabled tracing should return None"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Config field validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn disabled_config_has_zeroed_port() {
+        let config = disabled_config();
+        assert_eq!(config.metrics_port, 0, "disabled config should have port 0");
+    }
+
+    #[test]
+    fn disabled_config_has_empty_endpoint() {
+        let config = disabled_config();
+        assert!(
+            config.otlp_endpoint.is_empty(),
+            "disabled config should have empty OTLP endpoint"
+        );
+    }
+
+    #[test]
+    fn disabled_config_flags_are_both_false() {
+        let config = disabled_config();
+        assert!(!config.metrics_enabled, "metrics must be disabled");
+        assert!(!config.tracing_enabled, "tracing must be disabled");
+    }
+
+    // -----------------------------------------------------------------------
+    // Default ObservabilityConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_observability_config_has_metrics_enabled() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.metrics_enabled,
+            "default config should have metrics enabled"
+        );
+    }
+
+    #[test]
+    fn default_observability_config_has_tracing_enabled() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.tracing_enabled,
+            "default config should have tracing enabled"
+        );
+    }
+
+    #[test]
+    fn default_observability_config_has_valid_port() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.metrics_port > 0,
+            "default metrics port must be positive"
+        );
+    }
+
+    #[test]
+    fn default_observability_config_has_nonempty_endpoint() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            !config.otlp_endpoint.is_empty(),
+            "default OTLP endpoint must not be empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Enabled config validation (doesn't actually start — just verify config shape)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enabled_config_can_be_constructed() {
+        let config = ObservabilityConfig {
+            metrics_port: 9091,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            metrics_enabled: true,
+            tracing_enabled: true,
+        };
+        assert!(config.metrics_enabled);
+        assert!(config.tracing_enabled);
+        assert_eq!(config.metrics_port, 9091);
+        assert!(!config.otlp_endpoint.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: metrics-only disabled, tracing-only disabled,
+    // various config combinations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn init_metrics_disabled_tracing_enabled_only_metrics_returns_ok() {
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            metrics_enabled: false,
+            tracing_enabled: true,
+        };
+        // init_metrics should return Ok immediately when disabled
+        let result = init_metrics(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn init_tracing_disabled_metrics_enabled_returns_none() {
+        let config = ObservabilityConfig {
+            metrics_port: 9091,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            metrics_enabled: true,
+            tracing_enabled: false,
+        };
+        let result = init_tracing::<tracing_subscriber::Registry>(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn init_tracing_enabled_with_unreachable_endpoint_builds_ok() {
+        // Even with an unreachable endpoint, build should succeed
+        // (tonic/OTLP connects lazily, not at build time).
+        // Requires tokio runtime because tonic::Channel::new needs it.
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: "http://nonexistent-host:99999".to_string(),
+            metrics_enabled: false,
+            tracing_enabled: true,
+        };
+        let result = init_tracing::<tracing_subscriber::Registry>(&config);
+        // Should succeed (lazy connection)
+        assert!(result.is_ok());
+        if let Ok(Some((_layer, provider))) = result {
+            // Clean up to avoid background exporter leaks
+            drop(provider);
+        }
+    }
+
+    #[test]
+    fn observability_config_clone() {
+        let config = ObservabilityConfig {
+            metrics_port: 9091,
+            otlp_endpoint: "http://test:4317".to_string(),
+            metrics_enabled: true,
+            tracing_enabled: false,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.metrics_port, 9091);
+        assert_eq!(cloned.otlp_endpoint, "http://test:4317");
+        assert!(cloned.metrics_enabled);
+        assert!(!cloned.tracing_enabled);
+    }
+
+    #[test]
+    fn observability_config_debug() {
+        let config = ObservabilityConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("ObservabilityConfig"));
+        assert!(debug.contains("metrics_port"));
+    }
+
+    #[test]
+    fn init_metrics_disabled_is_idempotent() {
+        let config = disabled_config();
+        // Multiple calls should all succeed
+        assert!(init_metrics(&config).is_ok());
+        assert!(init_metrics(&config).is_ok());
+    }
+
+    #[test]
+    fn init_tracing_disabled_is_idempotent() {
+        let config = disabled_config();
+        let r1 = init_tracing::<tracing_subscriber::Registry>(&config);
+        let r2 = init_tracing::<tracing_subscriber::Registry>(&config);
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert!(r1.unwrap().is_none());
+        assert!(r2.unwrap().is_none());
+    }
 }

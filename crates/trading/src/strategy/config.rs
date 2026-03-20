@@ -379,3 +379,584 @@ fn parse_comparison_op(op: &str, strategy_name: &str) -> Result<ComparisonOp, St
     }
 }
 // O(1) EXEMPT: end
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // position_size_fraction boundary values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_position_size_fraction_zero_accepted() {
+        let toml = r#"
+[[strategy]]
+name = "zero_size"
+security_ids = [1333]
+position_size_fraction = 0.0
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_ok(),
+            "position_size_fraction=0.0 must be accepted"
+        );
+        let (defs, _) = result.unwrap();
+        assert!((defs[0].position_size_fraction - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_position_size_fraction_one_accepted() {
+        let toml = r#"
+[[strategy]]
+name = "full_size"
+security_ids = [1333]
+position_size_fraction = 1.0
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_ok(),
+            "position_size_fraction=1.0 must be accepted"
+        );
+        let (defs, _) = result.unwrap();
+        assert!((defs[0].position_size_fraction - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_position_size_fraction_above_one_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "too_large"
+security_ids = [1333]
+position_size_fraction = 1.01
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "position_size_fraction=1.01 must be rejected"
+        );
+        match result.unwrap_err() {
+            StrategyConfigError::Validation { strategy, message } => {
+                assert_eq!(strategy, "too_large");
+                assert!(message.contains("position_size_fraction"));
+            }
+            other => panic!("expected Validation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_position_size_fraction_negative_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "negative"
+security_ids = [1333]
+position_size_fraction = -0.1
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "position_size_fraction=-0.1 must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty entry conditions error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_entry_conditions_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "no_entries"
+security_ids = [1333]
+position_size_fraction = 0.1
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "strategy with no entry conditions must be rejected"
+        );
+        match result.unwrap_err() {
+            StrategyConfigError::Validation { strategy, message } => {
+                assert_eq!(strategy, "no_entries");
+                assert!(message.contains("entry_long"));
+            }
+            other => panic!("expected Validation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_only_short_entry_accepted() {
+        let toml = r#"
+[[strategy]]
+name = "short_only"
+security_ids = [1333]
+position_size_fraction = 0.1
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_short]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_ok(),
+            "strategy with only entry_short must be accepted"
+        );
+        let (defs, _) = result.unwrap();
+        assert!(defs[0].entry_long_conditions.is_empty());
+        assert_eq!(defs[0].entry_short_conditions.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ATR multiplier validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_stop_loss_atr_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "bad_sl"
+security_ids = [1333]
+stop_loss_atr_multiplier = 0.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "stop_loss_atr_multiplier=0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_negative_target_atr_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "bad_target"
+security_ids = [1333]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = -1.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_err(),
+            "target_atr_multiplier=-1.0 must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unknown fields and operators
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unknown_field_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "bad_field"
+security_ids = [1333]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "nonexistent_indicator"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownField { strategy, field } => {
+                assert_eq!(strategy, "bad_field");
+                assert_eq!(field, "nonexistent_indicator");
+            }
+            other => panic!("expected UnknownField, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_operator_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "bad_op"
+security_ids = [1333]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "equals"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StrategyConfigError::UnknownOperator {
+                strategy, operator, ..
+            } => {
+                assert_eq!(strategy, "bad_op");
+                assert_eq!(operator, "equals");
+            }
+            other => panic!("expected UnknownOperator, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty TOML is valid (zero strategies)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_toml_valid() {
+        let result = parse_strategy_config("");
+        assert!(result.is_ok());
+        let (defs, _) = result.unwrap();
+        assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn test_indicator_params_override() {
+        let toml = r#"
+[indicator_params]
+ema_fast_period = 8
+rsi_period = 7
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_ok());
+        let (_, params) = result.unwrap();
+        assert_eq!(params.ema_fast_period, 8);
+        assert_eq!(params.rsi_period, 7);
+        // Defaults for unspecified
+        assert_eq!(params.ema_slow_period, 26);
+    }
+
+    #[test]
+    fn test_invalid_toml_syntax_error() {
+        let result = parse_strategy_config("this is [[[ invalid");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            StrategyConfigError::TomlParse(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: all indicator fields, all operators, default values,
+    // multiple conditions, full config round-trip, error display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_all_indicator_fields_accepted() {
+        let fields = [
+            "rsi",
+            "macd_line",
+            "macd_signal",
+            "macd_histogram",
+            "ema_fast",
+            "ema_slow",
+            "sma",
+            "vwap",
+            "bollinger_upper",
+            "bollinger_middle",
+            "bollinger_lower",
+            "atr",
+            "supertrend",
+            "adx",
+            "obv",
+            "last_traded_price",
+            "ltp",
+            "volume",
+            "day_high",
+            "day_low",
+        ];
+        for field in fields {
+            let result = parse_indicator_field(field, "test");
+            assert!(result.is_ok(), "field '{}' must be accepted", field);
+        }
+    }
+
+    #[test]
+    fn test_all_comparison_operators_accepted() {
+        let ops = [
+            "gt",
+            ">",
+            "gte",
+            ">=",
+            "lt",
+            "<",
+            "lte",
+            "<=",
+            "cross_above",
+            "cross_below",
+        ];
+        for op in ops {
+            let result = parse_comparison_op(op, "test");
+            assert!(result.is_ok(), "operator '{}' must be accepted", op);
+        }
+    }
+
+    #[test]
+    fn test_indicator_params_defaults_when_absent() {
+        let toml = r#"
+[[strategy]]
+name = "no_params"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (_, params) = parse_strategy_config(toml).unwrap();
+        // When indicator_params section is absent, defaults are used
+        assert_eq!(params.ema_fast_period, 12);
+        assert_eq!(params.ema_slow_period, 26);
+        assert_eq!(params.macd_signal_period, 9);
+        assert_eq!(params.rsi_period, 14);
+        assert_eq!(params.sma_period, 20);
+        assert_eq!(params.atr_period, 14);
+        assert_eq!(params.adx_period, 14);
+        assert!((params.supertrend_multiplier - 3.0).abs() < f64::EPSILON);
+        assert!((params.bollinger_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_strategyegy_defaults_when_optional_fields_absent() {
+        let toml = r#"
+[[strategy]]
+name = "minimal"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs.len(), 1);
+        let def = &defs[0];
+        // Verify defaults
+        assert!((def.position_size_fraction - 0.1).abs() < f64::EPSILON);
+        assert!((def.stop_loss_atr_multiplier - 2.0).abs() < f64::EPSILON);
+        assert!((def.target_atr_multiplier - 3.0).abs() < f64::EPSILON);
+        assert_eq!(def.confirmation_ticks, 0);
+        assert!(!def.trailing_stop_enabled);
+        assert!((def.trailing_stop_atr_multiplier - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_multiple_entry_conditions_parsed() {
+        let toml = r#"
+[[strategy]]
+name = "multi_cond"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.entry_long]]
+field = "macd_histogram"
+operator = "gt"
+threshold = 0.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs[0].entry_long_conditions.len(), 2);
+        assert_eq!(defs[0].exit_conditions.len(), 1);
+    }
+
+    #[test]
+    fn test_error_display_unknown_field() {
+        let err = StrategyConfigError::UnknownField {
+            strategy: "test_strategy".to_string(),
+            field: "bogus".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("bogus"));
+        assert!(display.contains("test_strategy"));
+    }
+
+    #[test]
+    fn test_error_display_unknown_operator() {
+        let err = StrategyConfigError::UnknownOperator {
+            strategy: "test_strategy".to_string(),
+            operator: "neq".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("neq"));
+        assert!(display.contains("test_strategy"));
+    }
+
+    #[test]
+    fn test_error_display_validation() {
+        let err = StrategyConfigError::Validation {
+            strategy: "test_strategy".to_string(),
+            message: "bad value".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(display.contains("bad value"));
+        assert!(display.contains("test_strategy"));
+    }
+
+    #[test]
+    fn test_load_strategy_config_file_nonexistent() {
+        let result = load_strategy_config_file(std::path::Path::new("/nonexistent/file.toml"));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StrategyConfigError::Io(_)));
+    }
+
+    #[test]
+    fn test_negative_stop_loss_atr_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "neg_sl"
+security_ids = [1]
+stop_loss_atr_multiplier = -0.5
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_target_atr_rejected() {
+        let toml = r#"
+[[strategy]]
+name = "zero_target"
+security_ids = [1]
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 0.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_full_indicator_params_override() {
+        let toml = r#"
+[indicator_params]
+ema_fast_period = 5
+ema_slow_period = 13
+macd_signal_period = 5
+rsi_period = 7
+sma_period = 10
+atr_period = 7
+adx_period = 7
+supertrend_multiplier = 2.0
+bollinger_multiplier = 1.5
+"#;
+        let (_, params) = parse_strategy_config(toml).unwrap();
+        assert_eq!(params.ema_fast_period, 5);
+        assert_eq!(params.ema_slow_period, 13);
+        assert_eq!(params.macd_signal_period, 5);
+        assert_eq!(params.rsi_period, 7);
+        assert_eq!(params.sma_period, 10);
+        assert_eq!(params.atr_period, 7);
+        assert_eq!(params.adx_period, 7);
+        assert!((params.supertrend_multiplier - 2.0).abs() < f64::EPSILON);
+        assert!((params.bollinger_multiplier - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ltp_alias_accepted() {
+        // "ltp" should be accepted as alias for "last_traded_price"
+        let toml = r#"
+[[strategy]]
+name = "ltp_alias"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "ltp"
+operator = "gt"
+threshold = 100.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(
+            defs[0].entry_long_conditions[0].field,
+            IndicatorField::LastTradedPrice
+        );
+    }
+
+    #[test]
+    fn test_symbol_operators_accepted() {
+        // ">" and ">=" should work as operators alongside "gt"/"gte"
+        let toml = r#"
+[[strategy]]
+name = "symbol_ops"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "<"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = ">="
+threshold = 70.0
+"#;
+        let (defs, _) = parse_strategy_config(toml).unwrap();
+        assert_eq!(defs[0].entry_long_conditions[0].operator, ComparisonOp::Lt);
+        assert_eq!(defs[0].exit_conditions[0].operator, ComparisonOp::Gte);
+    }
+}

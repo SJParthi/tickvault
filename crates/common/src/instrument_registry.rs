@@ -637,4 +637,94 @@ mod tests {
         );
         assert_eq!(*counts.get(&SubscriptionCategory::StockEquity).unwrap(), 1);
     }
+
+    // --- Archived instrument builder tests ---
+
+    #[test]
+    fn test_make_stock_equity_from_archived() {
+        let underlying = FnoUnderlying {
+            underlying_symbol: "RELIANCE".to_string(),
+            underlying_security_id: 26000,
+            price_feed_security_id: 2885,
+            price_feed_segment: ExchangeSegment::NseEquity,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: crate::instrument_types::UnderlyingKind::Stock,
+            lot_size: 250,
+            contract_count: 100,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&underlying).unwrap();
+        let archived = rkyv::access::<ArchivedFnoUnderlying, rkyv::rancor::Error>(&bytes).unwrap();
+        let inst = make_stock_equity_instrument_from_archived(archived, FeedMode::Ticker);
+        assert_eq!(inst.security_id, 2885);
+        assert_eq!(inst.exchange_segment, ExchangeSegment::NseEquity);
+        assert_eq!(inst.category, SubscriptionCategory::StockEquity);
+        assert_eq!(inst.underlying_symbol, "RELIANCE");
+        assert!(inst.instrument_kind.is_none());
+        assert!(inst.expiry_date.is_none());
+        assert!(inst.strike_price.is_none());
+    }
+
+    #[test]
+    fn test_make_derivative_from_archived_option_with_strike() {
+        let contract = DerivativeContract {
+            security_id: 52432,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 18000.0,
+            option_type: Some(OptionType::Call),
+            lot_size: 50,
+            tick_size: 0.05,
+            symbol_name: "NIFTY-27MAR26-18000-CE".to_string(),
+            display_name: "NIFTY 18000 CE Mar26".to_string(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+        let archived =
+            rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+        let inst = make_derivative_instrument_from_archived(
+            archived,
+            SubscriptionCategory::IndexDerivative,
+            FeedMode::Ticker,
+        );
+        assert_eq!(inst.security_id, 52432);
+        assert_eq!(inst.exchange_segment, ExchangeSegment::NseFno);
+        assert_eq!(inst.category, SubscriptionCategory::IndexDerivative);
+        assert_eq!(inst.underlying_symbol, "NIFTY");
+        assert_eq!(inst.instrument_kind, Some(DhanInstrumentKind::OptionIndex));
+        assert_eq!(
+            inst.expiry_date,
+            Some(NaiveDate::from_ymd_opt(2026, 3, 27).unwrap())
+        );
+        assert_eq!(inst.strike_price, Some(18000.0));
+        assert_eq!(inst.option_type, Some(OptionType::Call));
+    }
+
+    #[test]
+    fn test_make_derivative_from_archived_future_zero_strike() {
+        let contract = DerivativeContract {
+            security_id: 99999,
+            underlying_symbol: "RELIANCE".to_string(),
+            instrument_kind: DhanInstrumentKind::FutureStock,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 0.0,
+            option_type: None,
+            lot_size: 250,
+            tick_size: 0.05,
+            symbol_name: "RELIANCE-27MAR26-FUT".to_string(),
+            display_name: "RELIANCE FUT Mar26".to_string(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+        let archived =
+            rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+        let inst = make_derivative_instrument_from_archived(
+            archived,
+            SubscriptionCategory::StockDerivative,
+            FeedMode::Ticker,
+        );
+        assert!(inst.strike_price.is_none()); // 0.0 → None
+        assert!(inst.option_type.is_none());
+        assert_eq!(inst.instrument_kind, Some(DhanInstrumentKind::FutureStock));
+    }
 }

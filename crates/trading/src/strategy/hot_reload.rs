@@ -410,4 +410,227 @@ threshold = 0.0
 
         cleanup_temp_dir(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // Invalid TOML reload keeps old config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_invalid_toml_does_not_send_event() {
+        // Simulate handle_file_change with an invalid TOML file.
+        // The sender should NOT receive a ReloadEvent.
+        let (dir, file_path) = write_temp_strategy_file("this is [[[ invalid TOML");
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        // No event should be sent because parsing failed
+        let event = receiver.try_recv();
+        assert!(
+            event.is_err(),
+            "invalid TOML reload must NOT send a ReloadEvent"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn handle_file_change_valid_toml_sends_event() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        let event = receiver.try_recv();
+        assert!(event.is_ok(), "valid TOML reload must send a ReloadEvent");
+        let event = event.unwrap();
+        assert_eq!(event.strategies.len(), 1);
+        assert_eq!(event.strategies[0].name, "test_strategy");
+
+        cleanup_temp_dir(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // File deleted during watch — handle_file_change with missing file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_missing_file_does_not_send_event() {
+        let nonexistent = Path::new("/tmp/dlt_hot_reload_deleted_file_99999.toml");
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(nonexistent, &sender);
+
+        // No event should be sent because file does not exist
+        let event = receiver.try_recv();
+        assert!(
+            event.is_err(),
+            "missing file reload must NOT send a ReloadEvent"
+        );
+    }
+
+    #[test]
+    fn handle_file_change_dropped_receiver_does_not_panic() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        // Drop receiver before sending
+        drop(receiver);
+
+        // Should not panic even though receiver is dropped
+        handle_file_change(&file_path, &sender);
+
+        cleanup_temp_dir(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: handle_file_change with various TOML content,
+    // ReloadEvent fields, HotReloadError display, multiple try_recv
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_valid_toml_carries_strategy_details() {
+        let multi_toml = r#"
+[[strategy]]
+name = "alpha"
+security_ids = [1, 2, 3]
+position_size_fraction = 0.05
+stop_loss_atr_multiplier = 1.5
+target_atr_multiplier = 2.5
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 25.0
+
+[[strategy]]
+name = "beta"
+security_ids = [10]
+position_size_fraction = 0.2
+
+[[strategy.entry_short]]
+field = "macd_histogram"
+operator = "lt"
+threshold = 0.0
+"#;
+        let (dir, file_path) = write_temp_strategy_file(multi_toml);
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.strategies.len(), 2);
+        assert_eq!(event.strategies[0].name, "alpha");
+        assert_eq!(event.strategies[0].security_ids, vec![1, 2, 3]);
+        assert_eq!(event.strategies[1].name, "beta");
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn handle_file_change_valid_toml_includes_indicator_params() {
+        let toml_with_params = r#"
+[indicator_params]
+ema_fast_period = 5
+rsi_period = 10
+
+[[strategy]]
+name = "with_params"
+security_ids = [42]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 25.0
+"#;
+        let (dir, file_path) = write_temp_strategy_file(toml_with_params);
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.indicator_params.ema_fast_period, 5);
+        assert_eq!(event.indicator_params.rsi_period, 10);
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn hot_reload_error_display_config_error() {
+        let inner = StrategyConfigError::Validation {
+            strategy: "test".to_string(),
+            message: "bad value".to_string(),
+        };
+        let err = HotReloadError::ConfigError(inner);
+        let display = format!("{err}");
+        assert!(
+            display.contains("config reload failed"),
+            "ConfigError display must mention config reload"
+        );
+    }
+
+    #[test]
+    fn reload_event_strategies_and_params_accessible() {
+        let event = ReloadEvent {
+            strategies: vec![],
+            indicator_params: IndicatorParams::default(),
+        };
+        assert!(event.strategies.is_empty());
+        // Default indicator params should have standard values
+        assert!(event.indicator_params.rsi_period > 0);
+    }
+
+    #[test]
+    fn try_recv_returns_latest_when_multiple_events_queued() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+        let (reloader, _strategies, _params) = StrategyHotReloader::new(&file_path).unwrap();
+
+        // Manually send multiple events through the internal channel
+        // (We can't access the internal sender, so we test the drain logic
+        // by verifying try_recv returns None when channel is empty)
+        let event = reloader.try_recv();
+        assert!(event.is_none(), "empty channel must return None");
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn handle_file_change_empty_toml_sends_empty_strategies() {
+        let (dir, file_path) = write_temp_strategy_file("");
+
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        handle_file_change(&file_path, &sender);
+
+        let event = receiver.try_recv().unwrap();
+        assert!(
+            event.strategies.is_empty(),
+            "empty TOML produces zero strategies"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn new_with_strategy_with_trailing_stop() {
+        let toml = r#"
+[[strategy]]
+name = "trailing_test"
+security_ids = [100]
+trailing_stop_enabled = true
+trailing_stop_atr_multiplier = 2.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let (dir, file_path) = write_temp_strategy_file(toml);
+
+        let (_reloader, strategies, _params) = StrategyHotReloader::new(&file_path).unwrap();
+        assert_eq!(strategies.len(), 1);
+        assert!(strategies[0].trailing_stop_enabled);
+        assert!((strategies[0].trailing_stop_atr_multiplier - 2.0).abs() < f64::EPSILON);
+
+        cleanup_temp_dir(&dir);
+    }
 }

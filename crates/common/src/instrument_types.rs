@@ -1476,4 +1476,567 @@ mod tests {
         let unique: std::collections::HashSet<_> = u.instrument_info.keys().collect();
         assert_eq!(count, unique.len());
     }
+
+    // =====================================================================
+    // rkyv roundtrip tests — NaiveDateAsI32, DateTimeFixedOffsetAsI64, DurationAsMillis
+    // =====================================================================
+
+    #[test]
+    fn test_rkyv_naive_date_roundtrip() {
+        // Create a struct that uses NaiveDateAsI32
+        let original = DerivativeContract {
+            security_id: 49001,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::FutureIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 0.0,
+            option_type: None,
+            lot_size: 25,
+            tick_size: 0.05,
+            symbol_name: "NIFTY-FUT".to_string(),
+            display_name: "NIFTY FUT".to_string(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: DerivativeContract =
+            rkyv::deserialize::<DerivativeContract, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.expiry_date, original.expiry_date);
+        assert_eq!(deserialized.security_id, 49001);
+        assert_eq!(deserialized.underlying_symbol, "NIFTY");
+    }
+
+    #[test]
+    fn test_rkyv_datetime_fixed_offset_roundtrip() {
+        let ist = crate::trading_calendar::ist_offset();
+        let original = UniverseBuildMetadata {
+            csv_source: "test".to_string(),
+            csv_row_count: 42,
+            parsed_row_count: 20,
+            index_count: 5,
+            equity_count: 10,
+            underlying_count: 3,
+            derivative_count: 50,
+            option_chain_count: 8,
+            build_duration: std::time::Duration::from_millis(1234),
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(
+            deserialized.build_timestamp.timestamp(),
+            original.build_timestamp.timestamp()
+        );
+        assert_eq!(
+            deserialized.build_timestamp.offset().local_minus_utc(),
+            19_800
+        );
+        assert_eq!(deserialized.csv_row_count, 42);
+    }
+
+    #[test]
+    fn test_rkyv_duration_as_millis_roundtrip() {
+        let ist = crate::trading_calendar::ist_offset();
+        let original = UniverseBuildMetadata {
+            csv_source: "test".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::from_millis(5678),
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(
+            deserialized.build_duration,
+            std::time::Duration::from_millis(5678)
+        );
+    }
+
+    // =====================================================================
+    // Archived → Owned From conversion tests
+    // =====================================================================
+
+    #[test]
+    fn test_archived_underlying_kind_from_all_variants() {
+        // Roundtrip through rkyv archive to get ArchivedUnderlyingKind
+        let underlying = FnoUnderlying {
+            underlying_symbol: "NIFTY".to_string(),
+            underlying_security_id: 26000,
+            price_feed_security_id: 13,
+            price_feed_segment: ExchangeSegment::IdxI,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: UnderlyingKind::NseIndex,
+            lot_size: 25,
+            contract_count: 2,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&underlying).unwrap();
+        let archived = rkyv::access::<ArchivedFnoUnderlying, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(
+            UnderlyingKind::from(&archived.kind),
+            UnderlyingKind::NseIndex
+        );
+
+        // BseIndex variant
+        let mut bse = underlying.clone();
+        bse.kind = UnderlyingKind::BseIndex;
+        let bytes2 = rkyv::to_bytes::<rkyv::rancor::Error>(&bse).unwrap();
+        let archived2 =
+            rkyv::access::<ArchivedFnoUnderlying, rkyv::rancor::Error>(&bytes2).unwrap();
+        assert_eq!(
+            UnderlyingKind::from(&archived2.kind),
+            UnderlyingKind::BseIndex
+        );
+
+        // Stock variant
+        let mut stock = underlying;
+        stock.kind = UnderlyingKind::Stock;
+        let bytes3 = rkyv::to_bytes::<rkyv::rancor::Error>(&stock).unwrap();
+        let archived3 =
+            rkyv::access::<ArchivedFnoUnderlying, rkyv::rancor::Error>(&bytes3).unwrap();
+        assert_eq!(UnderlyingKind::from(&archived3.kind), UnderlyingKind::Stock);
+    }
+
+    #[test]
+    fn test_archived_dhan_instrument_kind_from_all_variants() {
+        let make_contract = |kind: DhanInstrumentKind| DerivativeContract {
+            security_id: 49001,
+            underlying_symbol: "TEST".to_string(),
+            instrument_kind: kind,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 0.0,
+            option_type: None,
+            lot_size: 25,
+            tick_size: 0.05,
+            symbol_name: "T".to_string(),
+            display_name: "T".to_string(),
+        };
+
+        for kind in [
+            DhanInstrumentKind::FutureIndex,
+            DhanInstrumentKind::FutureStock,
+            DhanInstrumentKind::OptionIndex,
+            DhanInstrumentKind::OptionStock,
+        ] {
+            let contract = make_contract(kind);
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+            let archived =
+                rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+            assert_eq!(DhanInstrumentKind::from(&archived.instrument_kind), kind);
+        }
+    }
+
+    #[test]
+    fn test_archived_index_category_from_all_variants() {
+        let make_index = |cat: IndexCategory| SubscribedIndex {
+            symbol: "TEST".to_string(),
+            security_id: 13,
+            exchange: Exchange::NationalStockExchange,
+            category: cat,
+            subcategory: IndexSubcategory::Fno,
+        };
+
+        for cat in [IndexCategory::FnoUnderlying, IndexCategory::DisplayIndex] {
+            let idx = make_index(cat);
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&idx).unwrap();
+            let archived =
+                rkyv::access::<ArchivedSubscribedIndex, rkyv::rancor::Error>(&bytes).unwrap();
+            assert_eq!(IndexCategory::from(&archived.category), cat);
+        }
+    }
+
+    // =====================================================================
+    // Error type Display + Error impl tests
+    // =====================================================================
+
+    #[test]
+    fn test_naive_date_from_archived_i32_valid() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+        let days = rkyv::rend::i32_le::from_native(date.num_days_from_ce());
+        let result = naive_date_from_archived_i32(&days);
+        assert_eq!(result, date);
+    }
+
+    // =====================================================================
+    // ConstituencyBuildMetadata::default test
+    // =====================================================================
+
+    #[test]
+    fn test_constituency_build_metadata_default() {
+        let meta = ConstituencyBuildMetadata::default();
+        assert_eq!(meta.indices_downloaded, 0);
+        assert_eq!(meta.indices_failed, 0);
+        assert_eq!(meta.unique_stocks, 0);
+        assert_eq!(meta.total_mappings, 0);
+        assert_eq!(meta.download_duration, std::time::Duration::default());
+        // build_timestamp should be IST (UTC+5:30)
+        assert_eq!(meta.build_timestamp.offset().local_minus_utc(), 19_800);
+    }
+
+    // =====================================================================
+    // IndexSubcategory Display for all variants
+    // =====================================================================
+
+    #[test]
+    fn test_index_subcategory_display_all_variants() {
+        assert_eq!(format!("{}", IndexSubcategory::Volatility), "Volatility");
+        assert_eq!(format!("{}", IndexSubcategory::BroadMarket), "BroadMarket");
+        assert_eq!(format!("{}", IndexSubcategory::MidCap), "MidCap");
+        assert_eq!(format!("{}", IndexSubcategory::SmallCap), "SmallCap");
+        assert_eq!(format!("{}", IndexSubcategory::Sectoral), "Sectoral");
+        assert_eq!(format!("{}", IndexSubcategory::Thematic), "Thematic");
+        assert_eq!(format!("{}", IndexSubcategory::Fno), "Fno");
+    }
+
+    // =====================================================================
+    // UnderlyingKind Display for BseIndex (was uncovered)
+    // =====================================================================
+
+    #[test]
+    fn test_underlying_kind_display_bse_index() {
+        assert_eq!(format!("{}", UnderlyingKind::BseIndex), "BseIndex");
+    }
+
+    // =====================================================================
+    // DhanInstrumentKind Display for all variants
+    // =====================================================================
+
+    #[test]
+    fn test_dhan_instrument_kind_display_all_variants() {
+        assert_eq!(
+            format!("{}", DhanInstrumentKind::FutureIndex),
+            "FutureIndex"
+        );
+        assert_eq!(
+            format!("{}", DhanInstrumentKind::FutureStock),
+            "FutureStock"
+        );
+        assert_eq!(
+            format!("{}", DhanInstrumentKind::OptionIndex),
+            "OptionIndex"
+        );
+        assert_eq!(
+            format!("{}", DhanInstrumentKind::OptionStock),
+            "OptionStock"
+        );
+    }
+
+    // =====================================================================
+    // FnoUniverse rkyv roundtrip (exercises all nested rkyv wrappers)
+    // =====================================================================
+
+    #[test]
+    fn test_fno_universe_rkyv_full_roundtrip() {
+        let original = make_test_fno_universe();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived = rkyv::access::<ArchivedFnoUniverse, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: FnoUniverse =
+            rkyv::deserialize::<FnoUniverse, rkyv::rancor::Error>(archived).unwrap();
+
+        assert_eq!(deserialized.underlyings.len(), original.underlyings.len());
+        assert_eq!(
+            deserialized.derivative_contracts.len(),
+            original.derivative_contracts.len()
+        );
+        assert_eq!(
+            deserialized.subscribed_indices.len(),
+            original.subscribed_indices.len()
+        );
+
+        // Verify a derivative contract survived the roundtrip including NaiveDate
+        let contract = deserialized.derivative_contracts.get(&49001).unwrap();
+        assert_eq!(
+            contract.expiry_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap()
+        );
+        assert_eq!(contract.underlying_symbol, "RELIANCE");
+    }
+
+    // =====================================================================
+    // IndexConstituencyMap tests
+    // =====================================================================
+
+    #[test]
+    fn test_index_constituency_map_forward_lookup() {
+        let mut map = IndexConstituencyMap::default();
+        let constituent = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.5,
+            sector: "Oil & Gas".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        };
+        map.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![constituent]);
+        assert_eq!(map.get_constituents("Nifty 50").unwrap().len(), 1);
+        assert!(map.get_constituents("Nifty Bank").is_none());
+    }
+
+    #[test]
+    fn test_index_constituency_map_reverse_lookup() {
+        let mut map = IndexConstituencyMap::default();
+        map.stock_to_indices.insert(
+            "RELIANCE".to_string(),
+            vec!["Nifty 50".to_string(), "Nifty 100".to_string()],
+        );
+        assert_eq!(map.get_indices_for_stock("RELIANCE").unwrap().len(), 2);
+        assert!(map.get_indices_for_stock("TCS").is_none());
+    }
+
+    #[test]
+    fn test_index_constituency_map_counts_and_membership() {
+        let mut map = IndexConstituencyMap::default();
+        map.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![]);
+        map.index_to_constituents
+            .insert("Nifty Bank".to_string(), vec![]);
+        map.stock_to_indices.insert("RELIANCE".to_string(), vec![]);
+        assert_eq!(map.index_count(), 2);
+        assert_eq!(map.stock_count(), 1);
+        assert!(map.contains_index("Nifty 50"));
+        assert!(!map.contains_index("Nifty Auto"));
+        assert!(map.contains_stock("RELIANCE"));
+        assert!(!map.contains_stock("TCS"));
+    }
+
+    #[test]
+    fn test_index_constituency_map_all_index_names_sorted() {
+        let mut map = IndexConstituencyMap::default();
+        map.index_to_constituents
+            .insert("Nifty Bank".to_string(), vec![]);
+        map.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![]);
+        map.index_to_constituents
+            .insert("Nifty Auto".to_string(), vec![]);
+        let names = map.all_index_names();
+        assert_eq!(names, vec!["Nifty 50", "Nifty Auto", "Nifty Bank"]);
+    }
+
+    // =====================================================================
+    // Additional coverage tests — NaiveDateRkyvError, DateTimeRkyvError,
+    // duration_serde, rkyv wrappers, OptionChain roundtrip, ExpiryCalendar
+    // =====================================================================
+
+    #[test]
+    fn test_naive_date_rkyv_error_display() {
+        let err = NaiveDateRkyvError;
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid NaiveDate"));
+    }
+
+    #[test]
+    fn test_naive_date_rkyv_error_is_std_error() {
+        let err: &dyn std::error::Error = &NaiveDateRkyvError;
+        assert!(err.to_string().contains("NaiveDate"));
+    }
+
+    #[test]
+    fn test_datetime_rkyv_error_display() {
+        let err = DateTimeRkyvError;
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid DateTime"));
+    }
+
+    #[test]
+    fn test_datetime_rkyv_error_is_std_error() {
+        let err: &dyn std::error::Error = &DateTimeRkyvError;
+        assert!(err.to_string().contains("DateTime"));
+    }
+
+    #[test]
+    fn test_duration_serde_zero() {
+        let ist = crate::trading_calendar::ist_offset();
+        let metadata = UniverseBuildMetadata {
+            csv_source: "test".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::ZERO,
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        let deserialized: UniverseBuildMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.build_duration, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_duration_serde_large_value() {
+        let ist = crate::trading_calendar::ist_offset();
+        let dur = std::time::Duration::from_millis(u64::MAX / 2);
+        let metadata = UniverseBuildMetadata {
+            csv_source: "test".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: dur,
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        let deserialized: UniverseBuildMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.build_duration, dur);
+    }
+
+    #[test]
+    fn test_option_chain_rkyv_roundtrip() {
+        let chain = OptionChain {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            calls: vec![OptionChainEntry {
+                security_id: 49001,
+                strike_price: 24000.0,
+                lot_size: 75,
+            }],
+            puts: vec![OptionChainEntry {
+                security_id: 49002,
+                strike_price: 24000.0,
+                lot_size: 75,
+            }],
+            future_security_id: Some(50001),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&chain).unwrap();
+        let archived = rkyv::access::<ArchivedOptionChain, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: OptionChain =
+            rkyv::deserialize::<OptionChain, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "NIFTY");
+        assert_eq!(deserialized.calls.len(), 1);
+        assert_eq!(deserialized.puts.len(), 1);
+        assert_eq!(deserialized.future_security_id, Some(50001));
+        assert_eq!(
+            deserialized.expiry_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_expiry_calendar_rkyv_roundtrip() {
+        let cal = ExpiryCalendar {
+            underlying_symbol: "BANKNIFTY".to_string(),
+            expiry_dates: vec![
+                chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+            ],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cal).unwrap();
+        let archived = rkyv::access::<ArchivedExpiryCalendar, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: ExpiryCalendar =
+            rkyv::deserialize::<ExpiryCalendar, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "BANKNIFTY");
+        assert_eq!(deserialized.expiry_dates.len(), 2);
+        assert_eq!(
+            deserialized.expiry_dates[0],
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_index_constituency_map_empty_default() {
+        let map = IndexConstituencyMap::default();
+        assert_eq!(map.index_count(), 0);
+        assert_eq!(map.stock_count(), 0);
+        assert!(map.all_index_names().is_empty());
+        assert!(!map.contains_stock("RELIANCE"));
+        assert!(!map.contains_index("Nifty 50"));
+        assert!(map.get_constituents("Nifty 50").is_none());
+        assert!(map.get_indices_for_stock("RELIANCE").is_none());
+    }
+
+    #[test]
+    fn test_instrument_info_index_variant_rkyv() {
+        use crate::types::Exchange;
+        let info = InstrumentInfo::Index {
+            security_id: 13,
+            symbol: "NIFTY".to_string(),
+            exchange: Exchange::NationalStockExchange,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&info).unwrap();
+        let archived = rkyv::access::<ArchivedInstrumentInfo, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: InstrumentInfo =
+            rkyv::deserialize::<InstrumentInfo, rkyv::rancor::Error>(archived).unwrap();
+        match deserialized {
+            InstrumentInfo::Index {
+                security_id,
+                symbol,
+                ..
+            } => {
+                assert_eq!(security_id, 13);
+                assert_eq!(symbol, "NIFTY");
+            }
+            _ => panic!("expected Index variant"),
+        }
+    }
+
+    #[test]
+    fn test_instrument_info_equity_variant_rkyv() {
+        let info = InstrumentInfo::Equity {
+            security_id: 2885,
+            symbol: "RELIANCE".to_string(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&info).unwrap();
+        let archived = rkyv::access::<ArchivedInstrumentInfo, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: InstrumentInfo =
+            rkyv::deserialize::<InstrumentInfo, rkyv::rancor::Error>(archived).unwrap();
+        match deserialized {
+            InstrumentInfo::Equity {
+                security_id,
+                symbol,
+            } => {
+                assert_eq!(security_id, 2885);
+                assert_eq!(symbol, "RELIANCE");
+            }
+            _ => panic!("expected Equity variant"),
+        }
+    }
+
+    #[test]
+    fn test_constituency_build_metadata_serde_roundtrip() {
+        let meta = ConstituencyBuildMetadata::default();
+        let json = serde_json::to_string(&meta).unwrap();
+        let deserialized: ConstituencyBuildMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.indices_downloaded, 0);
+        assert_eq!(deserialized.indices_failed, 0);
+        assert_eq!(
+            deserialized.download_duration,
+            std::time::Duration::default()
+        );
+    }
+
+    #[test]
+    fn test_subscribed_index_rkyv_roundtrip() {
+        use crate::types::Exchange;
+        let idx = SubscribedIndex {
+            symbol: "INDIA VIX".to_string(),
+            security_id: 26017,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::DisplayIndex,
+            subcategory: IndexSubcategory::Volatility,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&idx).unwrap();
+        let archived =
+            rkyv::access::<ArchivedSubscribedIndex, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: SubscribedIndex =
+            rkyv::deserialize::<SubscribedIndex, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.symbol, "INDIA VIX");
+        assert_eq!(deserialized.security_id, 26017);
+    }
 }

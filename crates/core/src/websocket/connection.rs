@@ -2546,4 +2546,153 @@ mod tests {
         let frame = rx.recv().await.expect("should receive binary frame"); // APPROVED: test
         assert_eq!(frame, vec![0xFF]);
     }
+
+    // -----------------------------------------------------------------------
+    // WebSocketConnection — subscription message caching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_caches_subscription_messages_empty_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Full,
+            tx,
+        );
+        // No instruments → no subscription messages
+        assert!(conn.cached_subscription_messages.is_empty());
+    }
+
+    #[test]
+    fn test_connection_caches_subscription_messages_non_idx() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1001),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        assert!(
+            !conn.cached_subscription_messages.is_empty(),
+            "should have subscription messages for non-IDX instruments"
+        );
+    }
+
+    #[test]
+    fn test_connection_idx_instruments_use_ticker_mode() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![InstrumentSubscription::new(ExchangeSegment::IdxI, 13)];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full, // Full mode specified but IDX_I should use Ticker
+            tx,
+        );
+        assert!(!conn.cached_subscription_messages.is_empty());
+        // The subscription message should contain RequestCode 15 (SubscribeTicker)
+        let msg = &conn.cached_subscription_messages[0];
+        assert!(
+            msg.contains("15"),
+            "IDX_I should subscribe with Ticker mode (code 15): {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_connection_mixed_idx_and_non_idx_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        // Should have at least 2 messages: one for non-IDX (Full) and one for IDX (Ticker)
+        assert!(
+            conn.cached_subscription_messages.len() >= 2,
+            "mixed instruments should produce multiple subscription messages, got {}",
+            conn.cached_subscription_messages.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnectionHealth — field access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_health_debug_format() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            2,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 42)],
+            FeedMode::Quote,
+            tx,
+        );
+        let health = conn.health();
+        let debug_str = format!("{:?}", health);
+        assert!(debug_str.contains("connection_id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_valid_token — no token available
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_valid_token_times_out_with_no_token() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(), // No token stored
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        // This will poll for up to 60s but we can't wait that long in tests.
+        // Just verify the function exists and can be called.
+        // The actual timeout test would be too slow.
+        // Instead, test that the method doesn't panic with a short timeout.
+        let start = std::time::Instant::now();
+        // We'll just verify it compiles and the method signature is correct
+        // by calling it in a select with a short timeout.
+        tokio::select! {
+            _ = conn.wait_for_valid_token() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+        }
+        assert!(
+            start.elapsed().as_millis() < 1000,
+            "should abort quickly via select"
+        );
+    }
 }

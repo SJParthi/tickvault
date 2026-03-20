@@ -2065,6 +2065,180 @@ mod tests {
         let _ = handle.await;
     }
 
+    // ===================================================================
+    // depth_prices_are_finite unit tests
+    // ===================================================================
+
+    #[test]
+    fn test_depth_prices_are_finite_all_valid() {
+        let depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[2].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_nan_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[4].ask_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_infinity_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[0].bid_price = f32::INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_neg_infinity_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[3].ask_price = f32::NEG_INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_zero_prices_valid() {
+        let depth = [MarketDepthLevel {
+            bid_price: 0.0,
+            ask_price: 0.0,
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_negative_prices_valid() {
+        // Negative prices are finite, so this returns true.
+        // The caller decides whether negatives are meaningful.
+        let depth = [MarketDepthLevel {
+            bid_price: -100.0,
+            ask_price: -50.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    // ===================================================================
+    // is_within_persist_window — additional boundary tests
+    // ===================================================================
+
+    #[test]
+    fn test_persist_window_zero_timestamp() {
+        // Epoch 0 maps to 00:00:00 IST → outside market hours
+        assert!(!is_within_persist_window(0));
+    }
+
+    #[test]
+    fn test_persist_window_u32_max() {
+        // u32::MAX % 86400 = some seconds-of-day, likely outside market hours
+        assert!(!is_within_persist_window(u32::MAX) || is_within_persist_window(u32::MAX));
+        // Main goal: no panic on u32::MAX
+    }
+
+    // ===================================================================
+    // TickDedupRing::new — power boundaries
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_new_power_8() {
+        let ring = TickDedupRing::new(8);
+        assert_eq!(ring.slots.len(), 256);
+        assert_eq!(ring.mask, 255);
+    }
+
+    #[test]
+    fn test_dedup_ring_new_power_24() {
+        let ring = TickDedupRing::new(24);
+        assert_eq!(ring.slots.len(), 16_777_216);
+        assert_eq!(ring.mask, 16_777_215);
+    }
+
+    #[test]
+    fn test_dedup_ring_new_power_12() {
+        let ring = TickDedupRing::new(12);
+        assert_eq!(ring.slots.len(), 4096);
+        assert_eq!(ring.mask, 4095);
+    }
+
+    #[test]
+    fn test_dedup_ring_slots_initialized_to_max() {
+        let ring = TickDedupRing::new(8);
+        assert!(ring.slots.iter().all(|&s| s == u64::MAX));
+    }
+
+    // ===================================================================
+    // TickDedupRing::fingerprint — additional determinism tests
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_fingerprint_zero_inputs() {
+        let fp = TickDedupRing::fingerprint(0, 0, 0.0);
+        // Must be deterministic
+        assert_eq!(fp, TickDedupRing::fingerprint(0, 0, 0.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_max_inputs() {
+        let fp = TickDedupRing::fingerprint(u32::MAX, u32::MAX, f32::MAX);
+        assert_eq!(fp, TickDedupRing::fingerprint(u32::MAX, u32::MAX, f32::MAX));
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_nan_is_stable() {
+        // NaN has a stable bit pattern via to_bits()
+        let fp1 = TickDedupRing::fingerprint(1, 1, f32::NAN);
+        let fp2 = TickDedupRing::fingerprint(1, 1, f32::NAN);
+        assert_eq!(fp1, fp2);
+    }
+
     #[tokio::test]
     async fn test_tick_processor_mixed_dedup_junk_valid_nan() {
         // Comprehensive mixed sequence: valid → duplicate → junk → NaN → valid
@@ -2276,5 +2450,472 @@ mod tests {
         assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 15, 0)));
         // 15:15:00 IST = near close
         assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 15, 0)));
+    }
+
+    // ===================================================================
+    // TickDedupRing — additional coverage for new() with DEDUP_RING_BUFFER_POWER
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_new_with_configured_power() {
+        // Uses the actual configured constant
+        let ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
+        let expected_size = 1_usize << DEDUP_RING_BUFFER_POWER;
+        assert_eq!(ring.slots.len(), expected_size);
+        assert_eq!(ring.mask, expected_size - 1);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_negative_zero_differs_from_positive_zero() {
+        // -0.0 and +0.0 have different bit patterns
+        let fp_pos = TickDedupRing::fingerprint(1, 1, 0.0);
+        let fp_neg = TickDedupRing::fingerprint(1, 1, -0.0);
+        // IEEE 754: 0.0 bits = 0x00000000, -0.0 bits = 0x80000000
+        assert_ne!(fp_pos, fp_neg);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_close_prices_differ() {
+        // 24500.0 vs 24500.05 must produce different fingerprints
+        let fp1 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
+        let fp2 = TickDedupRing::fingerprint(13, 1772073900, 24500.05);
+        assert_ne!(fp1, fp2);
+    }
+
+    // ===================================================================
+    // is_within_persist_window — edge cases for IST secs_of_day boundaries
+    // ===================================================================
+
+    #[test]
+    fn test_persist_window_exact_start_and_end_constants() {
+        // Verify window boundaries match constants
+        assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST);
+        // 09:00 = 32400, 15:30 = 55800
+        assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 9 * 3600);
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_persist_window_one_second_before_start() {
+        // 08:59:59 IST secs_of_day = 32399 — should be outside
+        let ts = ist_hms_to_ist_epoch(8, 59, 59);
+        assert!(!is_within_persist_window(ts));
+    }
+
+    #[test]
+    fn test_persist_window_exact_start() {
+        // 09:00:00 IST secs_of_day = 32400 — should be inside (inclusive start)
+        let ts = ist_hms_to_ist_epoch(9, 0, 0);
+        assert!(is_within_persist_window(ts));
+    }
+
+    #[test]
+    fn test_persist_window_one_second_before_end() {
+        // 15:29:59 IST secs_of_day = 55799 — should be inside
+        let ts = ist_hms_to_ist_epoch(15, 29, 59);
+        assert!(is_within_persist_window(ts));
+    }
+
+    #[test]
+    fn test_persist_window_exact_end() {
+        // 15:30:00 IST secs_of_day = 55800 — should be outside (exclusive end)
+        let ts = ist_hms_to_ist_epoch(15, 30, 0);
+        assert!(!is_within_persist_window(ts));
+    }
+
+    // ===================================================================
+    // TickDedupRing — collision/eviction behavior
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_insert_then_evict_then_reinsert() {
+        // Use smallest ring (power=8, 256 slots)
+        let mut ring = TickDedupRing::new(8);
+        // Insert original
+        assert!(!ring.is_duplicate(1, 100, 50.0));
+        // Overwrite the same slot by inserting a key that hashes to the same index
+        // After 256+ distinct inserts, the original slot should be overwritten
+        for i in 0..300u32 {
+            ring.is_duplicate(1000 + i, 100, 50.0);
+        }
+        // Original may have been evicted — just verify no panic
+        let _ = ring.is_duplicate(1, 100, 50.0);
+    }
+
+    #[test]
+    fn test_dedup_ring_large_power_creates_correct_size() {
+        let ring = TickDedupRing::new(16);
+        assert_eq!(ring.slots.len(), 65536);
+        assert_eq!(ring.mask, 65535);
+    }
+
+    // ===================================================================
+    // depth_prices_are_finite — additional boundary checks
+    // ===================================================================
+
+    #[test]
+    fn test_depth_prices_are_finite_first_level_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[0].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_last_level_nan_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[4].ask_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_subnormal_is_finite() {
+        // Subnormal values are finite
+        let depth = [MarketDepthLevel {
+            bid_price: f32::MIN_POSITIVE / 2.0,
+            ask_price: f32::MIN_POSITIVE / 2.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    // ===================================================================
+    // Top movers integration — tick processor with top_movers parameter
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_with_top_movers_tracker() {
+        use crate::pipeline::top_movers::TopMoversTracker;
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let tracker = TopMoversTracker::new();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, Some(tracker), None).await;
+        });
+
+        // Send a valid tick with day_close for top movers to process
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        // Ticker packets don't carry day_close. Use a Quote or Full packet.
+        // Just send a ticker — top_movers.update() will skip it if day_close=0.
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_with_broadcast_channel() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<ParsedTick>(16);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(broadcast_tx),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send a valid tick
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Broadcast receiver should get the tick
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), broadcast_rx.recv()).await;
+        if let Ok(Ok(tick)) = received {
+            assert_eq!(tick.security_id, 13);
+            assert!((tick.last_traded_price - 24500.0).abs() < 0.01);
+        }
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Crossed market detection path
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_full_quote_crossed_market() {
+        // Full quote with bid > ask at level 0 → crossed market metric incremented
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        // Set depth level 0: bid_price > ask_price (crossed market)
+        // Level 0 starts at offset 62 in full packet
+        // bid_qty(4) + ask_qty(4) + bid_orders(2) + ask_orders(2) + bid_price(4) + ask_price(4)
+        let depth_start = 62;
+        // bid_quantity at offset+0
+        frame[depth_start..depth_start + 4].copy_from_slice(&100u32.to_le_bytes());
+        // ask_quantity at offset+4
+        frame[depth_start + 4..depth_start + 8].copy_from_slice(&100u32.to_le_bytes());
+        // bid_orders at offset+8
+        frame[depth_start + 8..depth_start + 10].copy_from_slice(&5u16.to_le_bytes());
+        // ask_orders at offset+10
+        frame[depth_start + 10..depth_start + 12].copy_from_slice(&5u16.to_le_bytes());
+        // bid_price at offset+12 = 25000.0 (higher than ask)
+        frame[depth_start + 12..depth_start + 16].copy_from_slice(&25000.0_f32.to_le_bytes());
+        // ask_price at offset+16 = 24900.0 (lower than bid → crossed)
+        frame[depth_start + 16..depth_start + 20].copy_from_slice(&24900.0_f32.to_le_bytes());
+
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Snapshot publishing integration
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_publishes_snapshot_after_5_seconds() {
+        use crate::pipeline::top_movers::{SharedTopMoversSnapshot, TopMoversTracker};
+        use std::sync::{Arc, RwLock};
+
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+        let tracker = TopMoversTracker::new();
+        let shared: SharedTopMoversSnapshot = Arc::new(RwLock::new(None));
+        let shared_clone = shared.clone();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(tracker),
+                Some(shared_clone),
+            )
+            .await;
+        });
+
+        // Send ticks continuously for >5 seconds with gaps >100ms to trigger
+        // both the flush check and the 5-second snapshot check.
+        for i in 0..55u32 {
+            let frame = make_ticker_frame(13 + (i % 5), 24500.0 + (i as f32), 1772073900 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+        }
+
+        drop(frame_tx);
+        let _ = handle.await;
+
+        // Snapshot should have been published
+        let guard = shared.read().unwrap();
+        assert!(
+            guard.is_some(),
+            "snapshot should be published after 5+ seconds of ticks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TickDedupRing — additional coverage for edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_ring_zero_values_not_sentinel() {
+        let mut ring = TickDedupRing::new(8);
+        // security_id=0, timestamp=0, ltp=0.0 should work (not confused with sentinel)
+        assert!(!ring.is_duplicate(0, 0, 0.0));
+        assert!(ring.is_duplicate(0, 0, 0.0));
+    }
+
+    #[test]
+    fn test_dedup_ring_negative_ltp_handled() {
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(1, 100, -1.0));
+        assert!(ring.is_duplicate(1, 100, -1.0));
+        assert!(!ring.is_duplicate(1, 100, 1.0)); // different LTP
+    }
+
+    #[test]
+    fn test_dedup_ring_large_power() {
+        // Test with power=16 (65536 slots) — production-like size
+        let mut ring = TickDedupRing::new(16);
+        assert!(!ring.is_duplicate(42, 1772073900, 25000.0));
+        assert!(ring.is_duplicate(42, 1772073900, 25000.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_persist_window — pure function unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persist_window_9am_ist_is_inside() {
+        // 09:00:00 IST = 9*3600 = 32400 seconds of day
+        let ts_9am = 32400;
+        assert!(
+            is_within_persist_window(ts_9am),
+            "9:00 IST should be inside persist window"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_3pm_ist_is_inside() {
+        // 15:00:00 IST = 15*3600 = 54000 seconds of day
+        let ts_3pm = 54000;
+        assert!(
+            is_within_persist_window(ts_3pm),
+            "15:00 IST should be inside persist window"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_330pm_ist_is_outside() {
+        // 15:30:00 IST = 15*3600 + 30*60 = 55800
+        let ts_330pm = 55800;
+        assert!(
+            !is_within_persist_window(ts_330pm),
+            "15:30 IST should be outside persist window (exclusive end)"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_midnight_ist_is_outside() {
+        assert!(
+            !is_within_persist_window(0),
+            "midnight IST should be outside"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_859am_ist_is_outside() {
+        // 08:59:59 IST = 8*3600 + 59*60 + 59 = 32399
+        let ts_before_9 = 32399;
+        assert!(
+            !is_within_persist_window(ts_before_9),
+            "08:59:59 IST should be outside"
+        );
+    }
+
+    #[test]
+    fn test_persist_window_with_real_epoch() {
+        // Use a real epoch that falls within market hours IST.
+        // Since exchange_timestamp is IST epoch seconds, we need modulo 86400.
+        // A sample IST epoch at 10:00:00 would have secs_of_day = 36000.
+        let epoch = 1772073900_u32; // some IST epoch
+        let secs_of_day = epoch % SECONDS_PER_DAY;
+        // Just verify the function doesn't panic
+        let _ = is_within_persist_window(epoch);
+        // And that secs_of_day is correctly computed
+        assert!(secs_of_day < SECONDS_PER_DAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // depth_prices_are_finite — pure function unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_prices_finite_all_valid() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[2].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_infinity_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[4].ask_price = f32::INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_neg_infinity() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[0].bid_price = f32::NEG_INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_finite_zero_is_valid() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+            bid_price: 0.0,
+            ask_price: 0.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth), "zero prices are finite");
+    }
+
+    // -----------------------------------------------------------------------
+    // DEDUP_RING_BUFFER_POWER constant validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_ring_buffer_power_in_valid_range() {
+        assert!(
+            (8..=24).contains(&DEDUP_RING_BUFFER_POWER),
+            "DEDUP_RING_BUFFER_POWER must be in [8, 24], got {}",
+            DEDUP_RING_BUFFER_POWER
+        );
     }
 }

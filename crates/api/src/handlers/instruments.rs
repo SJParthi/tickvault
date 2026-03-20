@@ -169,4 +169,49 @@ mod tests {
         assert!(!json.contains("derivative_count"));
         assert!(!json.contains("underlying_count"));
     }
+
+    #[test]
+    fn test_rebuild_response_in_progress() {
+        let resp = RebuildResponse {
+            status: "in_progress".to_string(),
+            message: "another instrument rebuild is already running".to_string(),
+            derivative_count: None,
+            underlying_count: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"status\":\"in_progress\""));
+    }
+
+    #[test]
+    fn test_rebuild_response_failed() {
+        let resp = RebuildResponse {
+            status: "failed".to_string(),
+            message: "rebuild failed: connection error".to_string(),
+            derivative_count: None,
+            underlying_count: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"status\":\"failed\""));
+        assert!(json.contains("connection error"));
+    }
+
+    #[test]
+    fn test_rebuild_guard_clears_flag_on_drop() {
+        let flag = AtomicBool::new(true);
+        {
+            let _guard = RebuildGuard { flag: &flag };
+            assert!(flag.load(Ordering::SeqCst)); // still true while guard alive
+        }
+        // Guard dropped — flag should be false
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_rebuild_guard_clears_flag_even_if_was_false() {
+        let flag = AtomicBool::new(false);
+        {
+            let _guard = RebuildGuard { flag: &flag };
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+    }
 }
