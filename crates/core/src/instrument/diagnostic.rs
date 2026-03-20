@@ -1059,4 +1059,76 @@ mod tests {
         let d = format!("{:?}", check);
         assert!(d.contains("\"t\""));
     }
+
+    // -----------------------------------------------------------------------
+    // check_time_gate — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_time_gate_narrow_window() {
+        let result = check_time_gate("00:00:01", "00:00:02");
+        assert!(result.passed);
+        assert!(result.detail.contains("window=[00:00:01, 00:00:02)"));
+    }
+
+    #[test]
+    fn test_check_time_gate_market_hours_window() {
+        let result = check_time_gate("08:00:00", "16:00:00");
+        assert!(result.passed);
+        assert!(result.detail.contains("08:00:00"));
+        assert!(result.detail.contains("16:00:00"));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_cache_status — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_cache_status_temp_dir_no_csv() {
+        let tmp = std::env::temp_dir().join("dlt_diag_cache_test_v2");
+        let _ = std::fs::create_dir_all(&tmp);
+        let result = check_cache_status(tmp.to_str().unwrap_or("/tmp"), "nonexistent_file.csv");
+        assert!(result.passed);
+        assert!(result.detail.contains("dir_exists=true"));
+        assert!(result.detail.contains("csv_exists=false"));
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn test_check_cache_status_with_existing_file() {
+        let tmp = std::env::temp_dir().join("dlt_diag_cache_test2_v2");
+        let _ = std::fs::create_dir_all(&tmp);
+        let csv_path = tmp.join("test.csv");
+        std::fs::write(&csv_path, "header\nrow1").unwrap();
+        let result = check_cache_status(tmp.to_str().unwrap_or("/tmp"), "test.csv");
+        assert!(result.passed);
+        assert!(result.detail.contains("csv_exists=true"));
+        assert!(result.detail.contains("csv_bytes="));
+        let _ = std::fs::remove_file(&csv_path);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_csv_headers — BOM and extra columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_csv_headers_with_extra_columns_shows_count() {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       CUSTOM_COL1,CUSTOM_COL2";
+        let result = check_csv_headers(header);
+        assert!(result.passed);
+        assert!(result.detail.contains("2 extra columns"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_bom_stripped() {
+        let header = "\u{FEFF}EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG";
+        let result = check_csv_headers(header);
+        assert!(result.passed, "BOM should be stripped: {}", result.detail);
+    }
 }
