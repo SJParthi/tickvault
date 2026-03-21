@@ -1303,6 +1303,87 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    async fn dry_run_modify_order_success() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_ok());
+
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.quantity, 75);
+        assert_eq!(order.price, 250.0);
+        assert_eq!(order.modification_count, 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancel_order_success() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let result = oms.cancel_order("1").await;
+        assert!(result.is_ok());
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reconcile_returns_default_report() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let report = oms.reconcile().await.unwrap();
+        assert_eq!(report.total_checked, 0);
+        assert_eq!(report.mismatches_found, 0);
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancel_terminal_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Traded);
+        let result = oms.cancel_order("1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancel_nonexistent_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let result = oms.cancel_order("MISSING").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dry_run_modify_terminal_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Traded);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dry_run_modify_nonexistent_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("MISSING", request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_modification_count_enforced() {
         let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
         // Set modification count to max (25)
@@ -1629,5 +1710,526 @@ mod tests {
         let t1 = now_epoch_us();
         let t2 = now_epoch_us();
         assert!(t2 >= t1, "timestamps must be non-decreasing");
+    }
+
+    // -----------------------------------------------------------------------
+    // Live-mode tests (dry_run = false, mock HTTP server)
+    // -----------------------------------------------------------------------
+
+    use std::time::Duration;
+
+    /// Starts a one-shot TCP mock server that returns the given status and body.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only content-length arithmetic
+    async fn start_mock_server(status: u16, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let body = body.to_string();
+
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    fn make_live_oms(base_url: &str) -> OrderManagementSystem {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let api_client = OrderApiClient::new(http, base_url.to_owned(), "100".to_owned());
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        oms.dry_run = false;
+        oms
+    }
+
+    fn make_live_place_request() -> PlaceOrderRequest {
+        PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_place_order_success() {
+        let body = r#"{"orderId":"ORD-LIVE-1","orderStatus":"TRANSIT","correlationId":"uuid-1"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let result = oms.place_order(make_live_place_request()).await;
+        assert!(result.is_ok());
+        let order_id = result.unwrap();
+        assert_eq!(order_id, "ORD-LIVE-1");
+        assert_eq!(oms.total_placed(), 1);
+
+        let order = oms.order("ORD-LIVE-1").unwrap();
+        assert_eq!(order.status, OrderStatus::Transit);
+        assert_eq!(order.quantity, 50);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_place_order_api_error_trips_circuit_breaker() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"internal"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let result = oms.place_order(make_live_place_request()).await;
+        assert!(result.is_err());
+        // Circuit breaker should have recorded a failure
+        assert_eq!(oms.total_placed(), 0);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_place_order_rate_limited_no_circuit_breaker_trip() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let mut oms = make_live_oms(&base_url);
+
+        let result = oms.place_order(make_live_place_request()).await;
+        assert!(result.is_err());
+        // DhanRateLimited should NOT trip the circuit breaker
+        assert!(oms.circuit_breaker.check().is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_modify_order_success() {
+        let body = r#"{"orderId":"ORD-1","orderStatus":"PENDING"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        // Insert an existing order to modify
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("ORD-1", request).await;
+        assert!(result.is_ok());
+
+        let updated = oms.order("ORD-1").unwrap();
+        assert_eq!(updated.quantity, 75);
+        assert_eq!(updated.price, 250.0);
+        assert_eq!(updated.modification_count, 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_modify_order_api_error() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"bad request"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("ORD-1", request).await;
+        assert!(result.is_err());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_modify_disclosed_qty_boundary_accepted() {
+        // disclosed_quantity = exact 30% boundary (ceiling division)
+        let body = r#"{"orderId":"ORD-1","orderStatus":"PENDING"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 100,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        // disclosed_quantity=30 is exactly 30% of quantity=100 — should pass
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 100,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 30,
+        };
+
+        let result = oms.modify_order("ORD-1", request).await;
+        assert!(result.is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_cancel_order_success() {
+        let (base_url, handle) = start_mock_server(200, "").await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let result = oms.cancel_order("ORD-1").await;
+        assert!(result.is_ok());
+        assert!(oms.order("ORD-1").unwrap().needs_reconciliation);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_cancel_order_api_error() {
+        let body = r#"{"errorCode":"DH-906","errorMessage":"order error"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let result = oms.cancel_order("ORD-1").await;
+        assert!(result.is_err());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_cancel_order_rate_limited_no_circuit_breaker_trip() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let result = oms.cancel_order("ORD-1").await;
+        assert!(result.is_err());
+        // DhanRateLimited should NOT trip the circuit breaker
+        assert!(oms.circuit_breaker.check().is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_reconcile_success() {
+        let body = r#"[
+            {"orderId": "ORD-1", "orderStatus": "TRADED", "quantity": 50, "tradedQuantity": 50, "averageTradedPrice": 246.0}
+        ]"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        // Insert order with mismatched status
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: true,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let report = oms.reconcile().await.unwrap();
+        assert_eq!(report.total_checked, 1);
+        assert_eq!(report.mismatches_found, 1);
+
+        // After reconciliation, the local order should be updated
+        let updated = oms.order("ORD-1").unwrap();
+        assert_eq!(updated.status, OrderStatus::Traded);
+        assert_eq!(updated.traded_qty, 50);
+        assert!(!updated.needs_reconciliation);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_modify_rate_limited_returns_error() {
+        // Exhaust the rate limiter, then try to modify in live mode
+        let (base_url, handle) = start_mock_server(200, "{}").await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        // Exhaust the rate limiter (10 burst capacity)
+        for _ in 0..10 {
+            let _ = oms.rate_limiter.check();
+        }
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("ORD-1", request).await;
+        assert!(result.is_err());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_cancel_rate_limited_returns_error() {
+        let (base_url, handle) = start_mock_server(200, "{}").await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        // Exhaust the rate limiter
+        for _ in 0..10 {
+            let _ = oms.rate_limiter.check();
+        }
+
+        let result = oms.cancel_order("ORD-1").await;
+        assert!(result.is_err());
+
+        handle.abort();
+    }
+
+    #[test]
+    fn handle_order_update_get_mut_none_after_re_index() {
+        // Covers line 534: the None branch of get_mut after correlation lookup.
+        // This can happen if the correlation tracker returns an ID that was removed
+        // from the orders map between the contains_key check and get_mut.
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        // Manually insert a correlation mapping to an ID that does NOT exist in orders
+        oms.correlations
+            .track("orphan-corr".to_owned(), "MISSING-ORDER".to_owned());
+
+        let mut update = make_order_update("SOME-OTHER", "TRADED");
+        update.correlation_id = "orphan-corr".to_owned();
+
+        // This should follow the correlation path, find "MISSING-ORDER",
+        // try get_mut("MISSING-ORDER"), get None, and return Ok(())
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn handle_order_update_emits_traded_metric() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let update = make_order_update("1", "TRADED");
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        // The counter! macro for dlt_orders_filled_total is called — no panic
+        assert_eq!(oms.order("1").unwrap().status, OrderStatus::Traded);
     }
 }

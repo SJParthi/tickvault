@@ -438,6 +438,24 @@ mod tests {
     }
 
     #[test]
+    fn state_closed_when_failures_at_threshold_but_opened_at_zero() {
+        // Covers the defensive branch at line 157: opened_at == 0
+        // with failures >= threshold. This can happen if the AtomicU64
+        // for opened_at was reset (e.g., by record_success) while
+        // failures counter hasn't been atomically synchronized yet.
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(0), // zero despite high failures
+            reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        // Should return Closed because opened_at is 0 (defensive fallback)
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
     fn half_open_failure_reopens_circuit() {
         let cb = OrderCircuitBreaker {
             consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),

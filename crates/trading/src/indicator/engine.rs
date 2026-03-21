@@ -831,6 +831,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sma_period_zero_returns_zero_sma() {
+        // Covers the sma_count == 0 branch (line 281) where sma_period = 0
+        // causes min(ring_len, 0) = 0 regardless of ring contents.
+        let params = IndicatorParams {
+            sma_period: 0,
+            ..Default::default()
+        };
+        let mut engine = IndicatorEngine::new(params);
+        let tick = make_tick(100, 250.0, 260.0, 240.0, 1000);
+        let snap = engine.update(&tick);
+        assert_eq!(snap.sma, 0.0, "sma_period=0 must yield sma=0.0");
+    }
+
+    #[test]
     fn test_warmup_counter_at_max_still_produces_valid_indicators() {
         let mut engine = default_engine();
         let sid = 100_usize;
