@@ -1548,3 +1548,181 @@ fn test_engine_params_returns_correct_values() {
     assert_eq!(engine.params().ema_fast_period, 8);
     assert_eq!(engine.params().ema_slow_period, 21);
 }
+
+// ===========================================================================
+// Proptest: Strategy Evaluator with Random Indicator Snapshots
+// ===========================================================================
+
+mod proptest_strategy {
+    use dhan_live_trader_trading::indicator::IndicatorSnapshot;
+    use dhan_live_trader_trading::strategy::evaluator::StrategyInstance;
+    use dhan_live_trader_trading::strategy::types::{
+        ComparisonOp, Condition, ExitReason, IndicatorField, Signal, StrategyDefinition,
+    };
+    use proptest::prelude::*;
+
+    fn test_strategy() -> StrategyDefinition {
+        StrategyDefinition {
+            name: "proptest_rsi".to_owned(),
+            security_ids: vec![1],
+            entry_long_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Lt,
+                threshold: 30.0,
+            }],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 50.0,
+            }],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        }
+    }
+
+    proptest! {
+        /// INVARIANT: evaluate() never panics regardless of input values.
+        #[test]
+        fn evaluate_never_panics(
+            rsi in 0.0f64..100.0,
+            ltp in 0.01f64..100000.0,
+            atr in 0.0f64..1000.0,
+            sid in 0u32..100,
+        ) {
+            let def = test_strategy();
+            let mut instance = StrategyInstance::new(def, 101);
+            let snap = IndicatorSnapshot {
+                security_id: sid,
+                rsi,
+                last_traded_price: ltp,
+                atr,
+                is_warm: true,
+                ..Default::default()
+            };
+            // Must not panic
+            let _signal = instance.evaluate(&snap);
+        }
+
+        /// INVARIANT: Not-warm snapshots always produce Hold.
+        #[test]
+        fn not_warm_always_holds(
+            rsi in 0.0f64..100.0,
+            ltp in 0.01f64..100000.0,
+            atr in 0.0f64..1000.0,
+        ) {
+            let def = test_strategy();
+            let mut instance = StrategyInstance::new(def, 10);
+            let snap = IndicatorSnapshot {
+                security_id: 1,
+                rsi,
+                last_traded_price: ltp,
+                atr,
+                is_warm: false,
+                ..Default::default()
+            };
+            let signal = instance.evaluate(&snap);
+            prop_assert_eq!(signal, Signal::Hold);
+        }
+
+        /// INVARIANT: Entry signals always have valid stop-loss and target.
+        #[test]
+        fn entry_signals_have_valid_sl_target(
+            ltp in 10.0f64..50000.0,
+            atr in 0.1f64..500.0,
+        ) {
+            let def = test_strategy();
+            let mut instance = StrategyInstance::new(def, 10);
+
+            // Force long entry: RSI < 30
+            let snap = IndicatorSnapshot {
+                security_id: 1,
+                rsi: 20.0,
+                last_traded_price: ltp,
+                atr,
+                is_warm: true,
+                ..Default::default()
+            };
+            let signal = instance.evaluate(&snap);
+            if let Signal::EnterLong { stop_loss, target, .. } = signal {
+                prop_assert!(stop_loss < ltp, "SL {} must be < LTP {}", stop_loss, ltp);
+                prop_assert!(target > ltp, "Target {} must be > LTP {}", target, ltp);
+                prop_assert!(stop_loss.is_finite());
+                prop_assert!(target.is_finite());
+            }
+        }
+
+        /// INVARIANT: Short entry signals have SL > LTP and Target < LTP.
+        #[test]
+        fn short_entry_sl_above_target_below(
+            ltp in 10.0f64..50000.0,
+            atr in 0.1f64..500.0,
+        ) {
+            let def = test_strategy();
+            let mut instance = StrategyInstance::new(def, 10);
+
+            // Force short entry: RSI > 70
+            let snap = IndicatorSnapshot {
+                security_id: 1,
+                rsi: 85.0,
+                last_traded_price: ltp,
+                atr,
+                is_warm: true,
+                ..Default::default()
+            };
+            let signal = instance.evaluate(&snap);
+            if let Signal::EnterShort { stop_loss, target, .. } = signal {
+                prop_assert!(stop_loss > ltp, "SL {} must be > LTP {}", stop_loss, ltp);
+                prop_assert!(target < ltp, "Target {} must be < LTP {}", target, ltp);
+                prop_assert!(stop_loss.is_finite());
+                prop_assert!(target.is_finite());
+            }
+        }
+
+        /// INVARIANT: Stop-loss exit always produces StopLossHit reason.
+        #[test]
+        fn stop_loss_exit_reason_is_correct(
+            drop_pct in 0.01f64..0.5,
+        ) {
+            let def = test_strategy();
+            let mut instance = StrategyInstance::new(def, 10);
+
+            // Enter long at 100, ATR=5, SL=90
+            let snap = IndicatorSnapshot {
+                security_id: 1,
+                rsi: 20.0,
+                last_traded_price: 100.0,
+                atr: 5.0,
+                is_warm: true,
+                ..Default::default()
+            };
+            instance.evaluate(&snap);
+
+            // Drop below stop loss (90) — use RSI 40 to avoid exit condition
+            let sl_price = 90.0 - (drop_pct * 10.0);
+            let snap = IndicatorSnapshot {
+                security_id: 1,
+                rsi: 40.0,
+                last_traded_price: sl_price,
+                atr: 5.0,
+                is_warm: true,
+                ..Default::default()
+            };
+            let signal = instance.evaluate(&snap);
+            prop_assert_eq!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::StopLossHit,
+                },
+            );
+        }
+    }
+}
