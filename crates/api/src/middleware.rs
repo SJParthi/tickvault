@@ -150,6 +150,13 @@ pub async fn require_bearer_auth(
 mod tests {
     use super::*;
 
+    /// Named handler function shared by all middleware tests.
+    /// Using a single named function instead of separate `|| async { "ok" }`
+    /// closures ensures coverage when at least one test reaches the handler.
+    async fn mock_handler() -> &'static str {
+        "ok"
+    }
+
     // -----------------------------------------------------------------------
     // ApiAuthConfig
     // -----------------------------------------------------------------------
@@ -222,7 +229,7 @@ mod tests {
         let config = ApiAuthConfig::disabled();
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -253,7 +260,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret123".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -284,7 +291,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret123".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -316,7 +323,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret123".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -348,7 +355,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret123".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -380,7 +387,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret123".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -416,7 +423,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret123".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -453,7 +460,7 @@ mod tests {
         let config = ApiAuthConfig::new("correct-token".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -491,7 +498,7 @@ mod tests {
         let config = ApiAuthConfig::new("concurrent-token".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -528,21 +535,21 @@ mod tests {
         // Use oneshot-style sequential sends (tower::Service)
         // For true concurrency, clone the router into separate services
         let app1 = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 ApiAuthConfig::new("concurrent-token".to_string()),
                 require_bearer_auth,
             ))
             .with_state(ApiAuthConfig::new("concurrent-token".to_string()));
         let app2 = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 ApiAuthConfig::new("concurrent-token".to_string()),
                 require_bearer_auth,
             ))
             .with_state(ApiAuthConfig::new("concurrent-token".to_string()));
         let app3 = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 ApiAuthConfig::new("concurrent-token".to_string()),
                 require_bearer_auth,
@@ -576,7 +583,7 @@ mod tests {
         let config = ApiAuthConfig::new(special_token.to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -613,7 +620,7 @@ mod tests {
         let config = ApiAuthConfig::new(long_token.clone());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -728,7 +735,7 @@ mod tests {
         let config = ApiAuthConfig::new("my-token".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -761,7 +768,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
@@ -801,7 +808,7 @@ mod tests {
         let config = ApiAuthConfig::new("secret".to_string());
 
         let app = Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route("/protected", get(mock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 config.clone(),
                 require_bearer_auth,
