@@ -1136,4 +1136,18 @@ mod tests {
         assert!(result.is_approved());
         assert!(!engine.is_halted());
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: reset_halt when not halted (no-op path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_halt_when_not_halted_is_safe_noop() {
+        let mut engine = make_engine();
+        assert!(!engine.is_halted());
+        // Calling reset_halt when not halted should be a no-op (no panic, no state change)
+        engine.reset_halt();
+        assert!(!engine.is_halted());
+        assert!(engine.halt_reason().is_none());
+    }
 }

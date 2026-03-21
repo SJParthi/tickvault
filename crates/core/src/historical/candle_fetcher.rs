@@ -3560,6 +3560,940 @@ mod tests {
         listener_handle.abort();
     }
 
+    // ===================================================================
+    // fetch_intraday_with_retry — additional error path coverage
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_intraday_invalid_json_response() {
+        // Server returns 200 OK but body is not valid JSON — should fail after retries
+        let (url, server_handle) = start_mock_http_server(
+            200,
+            Box::leak("not valid json".to_string().into_boxed_str()),
+        )
+        .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_intraday_badjson_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 0,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request_body = IntradayRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            interval: "1".to_string(),
+            oi: true,
+            from_date: "2023-11-10 09:15:00".to_string(),
+            to_date: "2023-11-15 15:30:00".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_intraday_with_retry(
+            &client,
+            &url,
+            &request_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            2,
+            "1m",
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "invalid JSON should return Failed after all retries"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_intraday_inconsistent_arrays() {
+        // Server returns 200 OK with inconsistent array lengths
+        let response_body = r#"{"open":[100.0,101.0],"high":[103.0],"low":[99.0],"close":[101.0],"volume":[1000],"timestamp":[1700031000],"open_interest":[]}"#;
+        let (url, server_handle) =
+            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_intraday_inconsistent_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 0,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request_body = IntradayRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            interval: "1".to_string(),
+            oi: true,
+            from_date: "2023-11-10 09:15:00".to_string(),
+            to_date: "2023-11-15 15:30:00".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_intraday_with_retry(
+            &client,
+            &url,
+            &request_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            2,
+            "1m",
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "inconsistent arrays should return Failed"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_intraday_standard_retry_exhausted() {
+        // Server returns 500 with unknown error body — exhausts retries
+        let response_body = r#"{"errorCode": 800, "message": "Internal server error"}"#;
+        let (url, server_handle) =
+            start_mock_http_server(500, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_intraday_stdretry_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 1,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request_body = IntradayRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            interval: "1".to_string(),
+            oi: true,
+            from_date: "2023-11-10 09:15:00".to_string(),
+            to_date: "2023-11-15 15:30:00".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_intraday_with_retry(
+            &client,
+            &url,
+            &request_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            2,
+            "1m",
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "standard retry exhausted should return Failed"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_intraday_http_429_rate_limited() {
+        // HTTP 429 should return Failed after max backoff attempts
+        let response_body = r#"{"errorCode": "DH-904", "message": "Rate limited"}"#;
+        let (url, server_handle) =
+            start_mock_http_server(429, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_intraday_429_errors");
+
+        // max_retries >= DH_904_MAX_BACKOFF_ATTEMPTS so the rate limit path gives up
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: DH_904_MAX_BACKOFF_ATTEMPTS,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request_body = IntradayRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            interval: "1".to_string(),
+            oi: true,
+            from_date: "2023-11-10 09:15:00".to_string(),
+            to_date: "2023-11-15 15:30:00".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_intraday_with_retry(
+            &client,
+            &url,
+            &request_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            2,
+            "1m",
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "rate limited past max attempts should return Failed"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // fetch_daily_with_retry — additional error path coverage
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_daily_empty_response() {
+        let response_body = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[],"open_interest":[]}"#;
+        let (url, server_handle) =
+            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_daily_empty_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 0,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let daily_body = DailyRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2023-11-01".to_string(),
+            to_date: "2023-11-16".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_daily_with_retry(
+            &client,
+            &url,
+            &daily_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            0,
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Ok(0, 0)),
+            "empty daily response should return Ok(0, 0)"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_daily_token_expired() {
+        let response_body = r#"{"errorCode": 807, "message": "token expired"}"#;
+        let (url, server_handle) =
+            start_mock_http_server(401, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_daily_expired_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 0,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let daily_body = DailyRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2023-11-01".to_string(),
+            to_date: "2023-11-16".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_daily_with_retry(
+            &client,
+            &url,
+            &daily_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            0,
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::TokenExpired),
+            "807 on daily should return TokenExpired"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_daily_never_retry_dh905() {
+        let response_body =
+            r#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "bad input"}"#;
+        let (url, server_handle) =
+            start_mock_http_server(400, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_daily_dh905_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 3,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let daily_body = DailyRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2023-11-01".to_string(),
+            to_date: "2023-11-16".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_daily_with_retry(
+            &client,
+            &url,
+            &daily_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            0,
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "DH-905 on daily should return Failed (never retry)"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_daily_connection_refused() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_daily_connrefused_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 2,
+            request_delay_ms: 0,
+            max_retries: 0,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let daily_body = DailyRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2023-11-01".to_string(),
+            to_date: "2023-11-16".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_daily_with_retry(
+            &client,
+            "http://127.0.0.1:1/v2/charts/historical",
+            &daily_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            0,
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "connection refused on daily should return Failed"
+        );
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_daily_invalid_json_response() {
+        let (url, server_handle) =
+            start_mock_http_server(200, Box::leak("garbage body".to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_daily_badjson_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 0,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let daily_body = DailyRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2023-11-01".to_string(),
+            to_date: "2023-11-16".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_daily_with_retry(
+            &client,
+            &url,
+            &daily_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            0,
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "invalid JSON on daily should return Failed"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fetch_daily_standard_retry_exhausted() {
+        let response_body = r#"{"errorCode": 800, "message": "Internal server error"}"#;
+        let (url, server_handle) =
+            start_mock_http_server(500, Box::leak(response_body.to_string().into_boxed_str()))
+                .await;
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_fetch_daily_stdretry_errors");
+
+        let config = HistoricalDataConfig {
+            enabled: true,
+            lookback_days: 90,
+            request_timeout_secs: 5,
+            request_delay_ms: 0,
+            max_retries: 1,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let daily_body = DailyRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            expiry_code: None,
+            from_date: "2023-11-01".to_string(),
+            to_date: "2023-11-16".to_string(),
+        };
+        let access_token = Zeroizing::new("test_token".to_string());
+        let client_id = SecretString::from("test_client");
+
+        let result = fetch_daily_with_retry(
+            &client,
+            &url,
+            &daily_body,
+            &access_token,
+            &client_id,
+            &config,
+            42,
+            0,
+            &mut writer,
+            &m_api_errors,
+        )
+        .await;
+
+        assert!(
+            matches!(result, TimeframeFetchResult::Failed),
+            "standard retry exhausted on daily should return Failed"
+        );
+
+        server_handle.abort();
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // persist_intraday_candles — additional edge case coverage
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_intraday_candles_infinity_in_high() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_intraday_inf_high_errors");
+
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![f64::INFINITY],
+            low: vec![99.0],
+            close: vec![101.0],
+            volume: vec![1000],
+            timestamp: vec![1700031000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "candle with Infinity high should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_intraday_candles_neg_infinity_in_low() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_intraday_neginf_low_errors");
+
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![f64::NEG_INFINITY],
+            close: vec![101.0],
+            volume: vec![1000],
+            timestamp: vec![1700031000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "candle with NEG_INFINITY low should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_intraday_candles_nan_in_close() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_intraday_nan_close_errors");
+
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![99.0],
+            close: vec![f64::NAN],
+            volume: vec![1000],
+            timestamp: vec![1700031000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "candle with NaN close should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_intraday_candles_zero_close_only() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_intraday_zero_close_errors");
+
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![99.0],
+            close: vec![0.0],
+            volume: vec![1000],
+            timestamp: vec![1700031000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "candle with zero close should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_intraday_candles_negative_low_only() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_intraday_neg_low_errors");
+
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![-1.0],
+            close: vec![102.0],
+            volume: vec![1000],
+            timestamp: vec![1700031000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "candle with negative low should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_intraday_candles_mixed_valid_and_invalid() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_intraday_mixed_errors");
+
+        // 5 candles: valid, NaN, zero, high<low, valid — only 2 should persist
+        let data = DhanIntradayResponse {
+            open: vec![100.0, f64::NAN, 0.0, 100.0, 200.0],
+            high: vec![105.0, 106.0, 0.0, 99.0, 210.0],
+            low: vec![99.0, 100.0, 0.0, 100.0, 195.0],
+            close: vec![102.0, 103.0, 0.0, 100.5, 205.0],
+            volume: vec![1000, 2000, 3000, 4000, 5000],
+            timestamp: vec![1700031000, 1700031060, 1700031120, 1700031180, 1700031240],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+        assert_eq!(
+            count, 2,
+            "only the 2 valid candles should persist (indices 0 and 4)"
+        );
+
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // persist_daily_candles — additional edge case coverage
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_daily_candles_nan_in_close() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_daily_nan_close_errors");
+
+        let data = DhanDailyResponse {
+            open: vec![24000.0],
+            high: vec![24500.0],
+            low: vec![23800.0],
+            close: vec![f64::NAN],
+            volume: vec![100000],
+            timestamp: vec![1700000000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "daily candle with NaN close should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_daily_candles_neg_infinity_in_high() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_daily_neginf_high_errors");
+
+        let data = DhanDailyResponse {
+            open: vec![24000.0],
+            high: vec![f64::NEG_INFINITY],
+            low: vec![23800.0],
+            close: vec![24300.0],
+            volume: vec![100000],
+            timestamp: vec![1700000000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
+        assert_eq!(
+            count, 0,
+            "daily candle with NEG_INFINITY high should be skipped"
+        );
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_daily_candles_zero_high_only() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_daily_zero_high_errors");
+
+        let data = DhanDailyResponse {
+            open: vec![24000.0],
+            high: vec![0.0],
+            low: vec![23800.0],
+            close: vec![24300.0],
+            volume: vec![100000],
+            timestamp: vec![1700000000],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
+        assert_eq!(count, 0, "daily candle with zero high should be skipped");
+
+        listener_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_persist_daily_candles_mixed_valid_and_invalid() {
+        let (mut writer, listener_handle) = create_mock_candle_writer().await;
+        let m_api_errors = counter!("test_persist_daily_mixed_errors");
+
+        // 4 candles: valid, zero open, high<low, valid
+        let data = DhanDailyResponse {
+            open: vec![100.0, 0.0, 100.0, 200.0],
+            high: vec![105.0, 0.0, 98.0, 210.0],
+            low: vec![99.0, 0.0, 99.0, 195.0],
+            close: vec![102.0, 0.0, 99.5, 205.0],
+            volume: vec![1000, 2000, 3000, 4000],
+            timestamp: vec![1700000000, 1700086400, 1700172800, 1700259200],
+            open_interest: vec![],
+        };
+
+        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
+        assert_eq!(count, 2, "only 2 valid daily candles should persist");
+
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // DhanDailyResponse — additional inconsistency patterns
+    // ===================================================================
+
+    #[test]
+    fn test_dhan_daily_response_inconsistent_high_length() {
+        let response = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(
+            !response.is_consistent(),
+            "mismatched high array length must fail consistency"
+        );
+    }
+
+    #[test]
+    fn test_dhan_daily_response_inconsistent_low_length() {
+        let response = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(
+            !response.is_consistent(),
+            "mismatched low array length must fail consistency"
+        );
+    }
+
+    #[test]
+    fn test_dhan_daily_response_inconsistent_open_length() {
+        let response = DhanDailyResponse {
+            open: vec![100.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(
+            !response.is_consistent(),
+            "mismatched open array length must fail consistency"
+        );
+    }
+
+    #[test]
+    fn test_dhan_daily_response_inconsistent_oi_length() {
+        let response = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![50000],
+        };
+        assert!(
+            !response.is_consistent(),
+            "mismatched OI array length (non-empty but wrong size) must fail consistency"
+        );
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_inconsistent_timestamp_length() {
+        let response = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![105.0, 106.0],
+            low: vec![99.0, 100.0],
+            close: vec![102.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000],
+            open_interest: vec![],
+        };
+        // timestamp has 1 element but others have 2 — len() returns 1 from timestamp
+        // but open.len() == 2 != 1, so is_consistent should be false
+        assert!(
+            !response.is_consistent(),
+            "fewer timestamps than OHLCV arrays must fail consistency"
+        );
+    }
+
+    // ===================================================================
+    // classify_error — combined and edge case coverage
+    // ===================================================================
+
+    #[test]
+    fn test_classify_error_dh910_standard_retry() {
+        let body = br#"{"errorType": "OTHER", "errorCode": "DH-910", "errorMessage": "Unknown"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(
+            action,
+            ErrorAction::StandardRetry,
+            "DH-910 should fall to StandardRetry"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_dh907_standard_retry() {
+        let body = br#"{"errorType": "DATA", "errorCode": "DH-907", "errorMessage": "Data error"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            action,
+            ErrorAction::StandardRetry,
+            "DH-907 should fall to StandardRetry"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_data_api_809_standard_retry() {
+        let body = br#"{"errorCode": 809, "message": "Token invalid"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(
+            action,
+            ErrorAction::StandardRetry,
+            "data API 809 should fall to StandardRetry"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_data_api_814_standard_retry() {
+        let body = br#"{"errorCode": 814, "message": "Invalid request"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            action,
+            ErrorAction::StandardRetry,
+            "data API 814 should fall to StandardRetry"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_mixed_format_numeric_takes_priority() {
+        // Body has numeric errorCode (807) AND string errorCode — numeric tried first
+        let body = br#"{"errorCode": 807, "errorType": "RATE_LIMIT", "errorMessage": "conflict"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(
+            action,
+            ErrorAction::TokenExpired,
+            "numeric 807 should take priority"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_fetch_intraday_connection_refused() {
         // Point to a port that nobody is listening on

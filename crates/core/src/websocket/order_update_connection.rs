@@ -879,4 +879,92 @@ mod tests {
         assert!(ORDER_UPDATE_READ_TIMEOUT_SECS > 0);
         assert!(ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS > 0);
     }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — pure logic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_collection_start_is_nine_am() {
+        assert_eq!(DATA_COLLECTION_START, (9, 0));
+    }
+
+    #[test]
+    fn test_data_collection_end_is_four_pm() {
+        assert_eq!(DATA_COLLECTION_END, (16, 0));
+    }
+
+    #[test]
+    fn test_is_within_market_hours_uses_calendar() {
+        // We cannot test the actual function easily without a calendar that
+        // returns true for today, but we can verify the constants used.
+        let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0);
+        let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0);
+        assert!(start.is_some(), "09:00:00 must be a valid NaiveTime");
+        assert!(end.is_some(), "16:00:00 must be a valid NaiveTime");
+        assert!(start.unwrap() < end.unwrap(), "start must be before end");
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — Debug trait
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_debug_format() {
+        let err = OrderUpdateConnectionError::NoToken;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("NoToken"));
+
+        let err = OrderUpdateConnectionError::TokenExpired;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("TokenExpired"));
+
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("ReadTimeout"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Backoff — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backoff_consecutive_failures_zero() {
+        let shift = 0_u32.saturating_sub(1).min(63);
+        let delay = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
+            .saturating_mul(1_u64 << shift)
+            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+    }
+
+    #[test]
+    fn test_backoff_consecutive_failures_one() {
+        let shift = 1_u32.saturating_sub(1).min(63);
+        let delay = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
+            .saturating_mul(1_u64 << shift)
+            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+    }
+
+    #[test]
+    fn test_backoff_caps_at_max_with_large_failures() {
+        let shift = 100_u32.saturating_sub(1).min(63);
+        let delay = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
+            .saturating_mul(1_u64 << shift)
+            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn test_off_hours_timeout_greater_than_market_hours() {
+        assert!(
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS >= ORDER_UPDATE_READ_TIMEOUT_SECS,
+            "off-hours timeout should be >= market-hours timeout"
+        );
+    }
+
+    #[test]
+    fn test_max_reconnect_attempts_positive() {
+        assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS > 0);
+    }
 }

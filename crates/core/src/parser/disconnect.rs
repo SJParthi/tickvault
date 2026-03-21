@@ -98,6 +98,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_disconnect_empty_buffer() {
+        let hdr = PacketHeader {
+            response_code: 50,
+            message_length: 10,
+            exchange_segment_code: 0,
+            security_id: 0,
+        };
+        let err = parse_disconnect_packet(&[], &hdr).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 10,
+            actual: 0,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
+    }
+
+    #[test]
     fn test_parse_disconnect_truncated() {
         let buf = vec![0u8; 9];
         let hdr = PacketHeader {

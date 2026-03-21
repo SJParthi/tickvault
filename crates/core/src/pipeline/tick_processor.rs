@@ -3597,4 +3597,751 @@ mod tests {
         depth[4].ask_price = f32::NAN;
         assert!(!depth_prices_are_finite(&depth));
     }
+
+    // ===================================================================
+    // Coverage: PreviousClose persistence with tick_writer during market hours
+    // Exercises lines 498-516 (build_previous_close_row path)
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_previous_close_persisted_with_writer() {
+        use dhan_live_trader_common::constants::PREV_CLOSE_OFFSET_PRICE;
+
+        let (writer, listener_handle) = create_mock_ilp_writer().await;
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, Some(writer), None, None, None, None, None, None).await;
+        });
+
+        // Build a previous close frame with a real price
+        let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        frame[PREV_CLOSE_OFFSET_PRICE..PREV_CLOSE_OFFSET_PRICE + 4]
+            .copy_from_slice(&24300.0_f32.to_le_bytes());
+
+        // The received_at_nanos from Utc::now() will determine whether we're in
+        // market hours. We can't control it, but the test exercises the code path.
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: TickWithDepth with tick_writer — exercises the outside
+    // market hours filtering for TickWithDepth + storage error paths
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_tick_with_depth_with_writer_market_hours() {
+        let (writer, listener_handle) = create_mock_ilp_writer().await;
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, Some(writer), None, None, None, None, None, None).await;
+        });
+
+        // Full frame with timestamp within market hours (10:00 IST = 36000 secs_of_day)
+        let frame = make_full_frame_with_depth(13, 24500.0, 36000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Full frame with timestamp outside market hours (20:00 IST = 72000)
+        let frame2 = make_full_frame_with_depth(14, 24600.0, 72000);
+        frame_tx.send(bytes::Bytes::from(frame2)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: TickWithDepth storage error when tick_writer fails
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_tick_with_depth_storage_error() {
+        let writer = create_broken_ilp_writer().await;
+        let (frame_tx, frame_rx) = mpsc::channel(200);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, Some(writer), None, None, None, None, None, None).await;
+        });
+
+        // Send multiple Full frames to hit storage error rate limiting
+        for i in 0..5u32 {
+            let frame = make_full_frame_with_depth(13 + i, 24500.0 + (i as f32), 36000 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait for writer flush interval
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Send more to trigger periodic flush
+        for i in 0..3u32 {
+            let frame = make_full_frame_with_depth(20 + i, 25000.0, 36010 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: TickWithDepth broadcast + candle agg + top movers
+    // Exercises the TickWithDepth-specific broadcast/candle/movers paths
+    // (lines 436-448) which differ from the Tick-only paths
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_tick_with_depth_broadcast_candle_movers() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+        use crate::pipeline::top_movers::TopMoversTracker;
+
+        let (tick_tx, mut tick_rx) = broadcast::channel::<ParsedTick>(100);
+        let candle_agg = CandleAggregator::new();
+        let tracker = TopMoversTracker::new();
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_tx),
+                Some(candle_agg),
+                None,
+                Some(tracker),
+                None,
+            )
+            .await;
+        });
+
+        // Send a Full frame with valid depth and valid timestamp
+        // ts=36000 is 10:00 IST (within market hours)
+        let frame = make_full_frame_with_depth(13, 24500.0, 36000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Verify broadcast received the tick from TickWithDepth path
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), tick_rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "should receive broadcast from TickWithDepth"
+        );
+
+        // Send a Market Depth code 3 (valid LTP, no timestamp):
+        // broadcast should still fire for LTP-valid depth frames
+        let md_frame = make_market_depth_frame(14, 25000.0);
+        frame_tx.send(bytes::Bytes::from(md_frame)).await.unwrap();
+
+        let received2 =
+            tokio::time::timeout(std::time::Duration::from_millis(500), tick_rx.recv()).await;
+        // Market Depth code 3 has valid LTP → broadcast fires
+        assert!(
+            received2.is_ok(),
+            "should receive broadcast from Market Depth code 3"
+        );
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: TickWithDepth path where depth is outside market hours
+    // but still has valid LTP — exercises the outside_hours branch
+    // for depth (not tick) persistence
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_depth_outside_market_hours_with_writer() {
+        use dhan_live_trader_common::config::QuestDbConfig;
+
+        let depth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let depth_port = depth_listener.local_addr().unwrap().port();
+        let depth_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = depth_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let depth_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: depth_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let depth_writer = DepthPersistenceWriter::new(&depth_config).unwrap();
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                Some(depth_writer),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Full frame with timestamp outside market hours (20:00 IST)
+        // Valid LTP+timestamp but outside persist window → outside_hours_filtered
+        let frame = make_full_frame_with_depth(42, 25000.0, 72000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        depth_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: Depth writer storage error path (lines 419-429)
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_depth_writer_broken_storage_error() {
+        use dhan_live_trader_common::config::QuestDbConfig;
+        use tokio::net::TcpListener;
+
+        // Create a depth writer that will fail on flush
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener_handle = tokio::spawn(async move {
+            if let Ok((_stream, _)) = listener.accept().await {
+                // Drop stream immediately to break connection
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let depth_writer = DepthPersistenceWriter::new(&config).unwrap();
+        let _ = listener_handle.await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (frame_tx, frame_rx) = mpsc::channel(200);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                Some(depth_writer),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send Full frames with valid depth during market hours
+        // These will attempt to persist depth → storage error on broken writer
+        for i in 0..5u32 {
+            let frame = make_full_frame_with_depth(13 + i, 24500.0 + (i as f32), 36000 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: Final flush paths with writers (lines 634-644)
+    // when tick and depth writers both exist on channel close
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_final_flush_with_both_writers() {
+        let (tick_writer, tick_listener_handle) = create_mock_ilp_writer().await;
+
+        use dhan_live_trader_common::config::QuestDbConfig;
+        let depth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let depth_port = depth_listener.local_addr().unwrap().port();
+        let depth_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = depth_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let depth_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: depth_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let depth_writer = DepthPersistenceWriter::new(&depth_config).unwrap();
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                Some(tick_writer),
+                Some(depth_writer),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send a few ticks and depth frames to buffer data
+        let frame = make_ticker_frame(13, 24500.0, 36000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        let depth = make_full_frame_with_depth(14, 24600.0, 36001);
+        frame_tx.send(bytes::Bytes::from(depth)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Close channel to trigger final flush on both writers
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        tick_listener_handle.abort();
+        depth_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: Candle aggregator final flush with candles outside
+    // market hours (the `if !is_within_persist_window` continue branch)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_candle_final_flush_outside_hours_skipped() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+
+        let candle_agg = CandleAggregator::new();
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                Some(candle_agg),
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send ticks at timestamps outside market hours (20:00 IST = 72000)
+        // These will create candles with timestamp_secs outside persist window
+        for i in 0..3u32 {
+            let frame = make_ticker_frame(13, 24500.0 + (i as f32), 72000 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Trigger sweep with another tick
+        let frame = make_ticker_frame(13, 24510.0, 72010);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: Top movers tracker final logging path (lines 681-687)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_top_movers_final_logging() {
+        use crate::pipeline::top_movers::TopMoversTracker;
+
+        let tracker = TopMoversTracker::new();
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, Some(tracker), None).await;
+        });
+
+        // Send several valid ticks so movers processes some data
+        for i in 0..5u32 {
+            let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Close channel → triggers final top movers logging path
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: Multiple storage errors exceed 100 threshold for
+    // TickWithDepth path — suppression kicks in
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_storage_error_suppression_tick_with_depth() {
+        let writer = create_broken_ilp_writer().await;
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, Some(writer), None, None, None, None, None, None).await;
+        });
+
+        // Send 105 Full frames to exercise storage error suppression at 100
+        for i in 0..105u32 {
+            let frame = make_full_frame_with_depth(13 + (i % 50), 24500.0 + (i as f32), 36000 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait for flush interval to elapse so writer actually tries to flush
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Send more to trigger periodic flush check
+        for i in 0..5u32 {
+            let frame = make_full_frame_with_depth(200 + i, 25000.0, 36200 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: Ticker tick with writer but outside market hours
+    // Exercises the outside_hours_filtered path for simple Tick variant
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_ticker_outside_market_hours_with_writer() {
+        let (writer, listener_handle) = create_mock_ilp_writer().await;
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, Some(writer), None, None, None, None, None, None).await;
+        });
+
+        // Ticker with timestamp at 20:00 IST (outside market hours)
+        let frame = make_ticker_frame(13, 24500.0, 72000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Ticker within market hours (10:00 IST = 36000)
+        let frame2 = make_ticker_frame(14, 24600.0, 36000);
+        frame_tx.send(bytes::Bytes::from(frame2)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: Live candle writer periodic flush path (line 611-614)
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_live_candle_writer_periodic_flush() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+        use dhan_live_trader_common::config::QuestDbConfig;
+
+        let candle_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let candle_port = candle_listener.local_addr().unwrap().port();
+        let candle_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = candle_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let candle_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: candle_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let candle_writer = LiveCandleWriter::new(&candle_config).unwrap();
+        let candle_agg = CandleAggregator::new();
+
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                Some(candle_agg),
+                Some(candle_writer),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send ticks spread over multiple seconds within market hours
+        // to produce completed candles that will be persisted
+        for sec in 0..6u32 {
+            let ts = 36000 + sec;
+            let frame = make_ticker_frame(13, 24500.0 + (sec as f32), ts);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait for periodic flush (>100ms)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Trigger sweep by sending a tick with later timestamp
+        let frame = make_ticker_frame(13, 24510.0, 36020);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        candle_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: TickWithDepth junk suppression > 10 threshold (lines 361-369)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_tick_with_depth_junk_suppression() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // Send > 10 Full frames with NaN LTP to exercise junk suppression
+        for i in 0..15u32 {
+            let frame = make_full_frame_with_depth(13 + i, f32::NAN, 36000);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: TickWithDepth with all optional components simultaneously
+    // (tick_writer + depth_writer + broadcast + candle_agg + top_movers + shared_snapshot)
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_all_components_simultaneously() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+        use crate::pipeline::top_movers::{SharedTopMoversSnapshot, TopMoversTracker};
+        use dhan_live_trader_common::config::QuestDbConfig;
+        use std::sync::{Arc, RwLock};
+
+        // Tick writer
+        let (tick_writer, tick_listener_handle) = create_mock_ilp_writer().await;
+
+        // Depth writer
+        let depth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let depth_port = depth_listener.local_addr().unwrap().port();
+        let depth_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = depth_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let depth_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: depth_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let depth_writer = DepthPersistenceWriter::new(&depth_config).unwrap();
+
+        // Candle writer
+        let candle_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let candle_port = candle_listener.local_addr().unwrap().port();
+        let candle_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = candle_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let candle_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: candle_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let candle_writer = LiveCandleWriter::new(&candle_config).unwrap();
+
+        let candle_agg = CandleAggregator::new();
+        let (broadcast_tx, _broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+        let tracker = TopMoversTracker::new();
+        let shared: SharedTopMoversSnapshot = Arc::new(RwLock::new(None));
+        let shared_clone = shared.clone();
+
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                Some(tick_writer),
+                Some(depth_writer),
+                Some(broadcast_tx),
+                Some(candle_agg),
+                Some(candle_writer),
+                Some(tracker),
+                Some(shared_clone),
+            )
+            .await;
+        });
+
+        // Mix of frame types exercising all paths:
+        // 1. Valid Ticker (within market hours)
+        let frame = make_ticker_frame(13, 24500.0, 36000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // 2. Valid Full with depth (within market hours)
+        let frame = make_full_frame_with_depth(14, 24600.0, 36001);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // 3. Market Depth code 3 (no timestamp, valid LTP)
+        let frame = make_market_depth_frame(15, 24700.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // 4. OI update
+        let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // 5. Previous close with valid price
+        let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        frame[8..12].copy_from_slice(&24300.0_f32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // 6. Market status
+        let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Wait for periodic flush
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Send more ticks to trigger sweep
+        for i in 0..3u32 {
+            let frame = make_ticker_frame(13, 24510.0 + (i as f32), 36010 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        tick_listener_handle.abort();
+        depth_listener_handle.abort();
+        candle_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Coverage: Crossed market where bid > 0 and ask == 0 — no detection
+    // (bid > ask is true, but ask_price > 0.0 is false → no crossed log)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_crossed_market_zero_ask_no_detection() {
+        use dhan_live_trader_common::constants::FULL_OFFSET_DEPTH_START;
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let ts = 36000_u32;
+        let mut frame = make_full_frame_with_depth(13, 24500.0, ts);
+        // bid > 0, ask = 0 → bid > ask is true but ask_price > 0.0 is false
+        let base = FULL_OFFSET_DEPTH_START;
+        frame[base + 12..base + 16].copy_from_slice(&100.0_f32.to_le_bytes()); // bid
+        frame[base + 16..base + 20].copy_from_slice(&0.0_f32.to_le_bytes()); // ask=0
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Coverage: Crossed market where bid == 0 and ask > 0 — no detection
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_crossed_market_zero_bid_no_detection() {
+        use dhan_live_trader_common::constants::FULL_OFFSET_DEPTH_START;
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let ts = 36000_u32;
+        let mut frame = make_full_frame_with_depth(13, 24500.0, ts);
+        // bid = 0, ask > 0 → bid > ask is false → no crossed market
+        let base = FULL_OFFSET_DEPTH_START;
+        frame[base + 12..base + 16].copy_from_slice(&0.0_f32.to_le_bytes()); // bid=0
+        frame[base + 16..base + 20].copy_from_slice(&100.0_f32.to_le_bytes()); // ask
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
 }

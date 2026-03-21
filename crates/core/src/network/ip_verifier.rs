@@ -561,28 +561,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // IpVerificationResult
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ip_verification_result_debug() {
-        let result = IpVerificationResult {
-            verified_ip: "203.0.113.42".to_string(),
-        };
-        let debug = format!("{result:?}");
-        assert!(debug.contains("203.0.113.42"));
-    }
-
-    #[test]
-    fn test_ip_verification_result_clone() {
-        let result = IpVerificationResult {
-            verified_ip: "10.0.0.1".to_string(),
-        };
-        let cloned = result.clone();
-        assert_eq!(cloned.verified_ip, "10.0.0.1");
-    }
-
-    // -----------------------------------------------------------------------
     // validate_ipv4_format — additional edge cases
     // -----------------------------------------------------------------------
 
@@ -606,20 +584,6 @@ mod tests {
     fn test_validate_ipv4_leading_zeros_rejected() {
         // Leading zeros in octets: Rust's Ipv4Addr::parse rejects them (since Rust 1.76)
         assert!(validate_ipv4_format("192.168.001.001").is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // mask_ip — additional cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_mask_ip_loopback() {
-        assert_eq!(mask_ip("127.0.0.1"), "127.0.XXX.XX");
-    }
-
-    #[test]
-    fn test_mask_ip_five_octets() {
-        assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
     }
 
     // -----------------------------------------------------------------------

@@ -2669,4 +2669,275 @@ mod tests {
             "1 failure is below threshold — CB should still be closed"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Dry-run: modify order updates local state
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dry_run_modify_order_updates_local_state() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        // Place a dry-run order first
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let order_id = oms.place_order(request).await.unwrap();
+
+        // Modify the dry-run order
+        let modify = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order(&order_id, modify).await;
+        assert!(result.is_ok(), "dry-run modify must succeed");
+
+        let order = oms.order(&order_id).unwrap();
+        assert_eq!(order.quantity, 75);
+        assert!((order.price - 250.0).abs() < f64::EPSILON);
+        assert_eq!(order.modification_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dry-run: cancel order updates local status
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dry_run_cancel_order_updates_status() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let order_id = oms.place_order(request).await.unwrap();
+
+        let result = oms.cancel_order(&order_id).await;
+        assert!(result.is_ok(), "dry-run cancel must succeed");
+
+        let order = oms.order(&order_id).unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert!(order.is_terminal());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dry-run: reconcile returns empty report
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dry_run_reconcile_returns_empty_default_report() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let report = oms.reconcile().await.unwrap();
+        assert_eq!(report.total_checked, 0);
+        assert_eq!(report.mismatches_found, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Modify: terminal order rejected
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_terminal_order_returns_error_with_status() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Traded);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderTerminal { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Modify: nonexistent order returns error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_nonexistent_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("999", request).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderNotFound { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel: terminal order rejected
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cancel_terminal_order_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Rejected);
+        let result = oms.cancel_order("1").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderTerminal { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel: nonexistent order returns error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cancel_nonexistent_order_returns_order_not_found() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let result = oms.cancel_order("nonexistent").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::OrderNotFound { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Modify: max modifications exceeded
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_max_modifications_exceeded_returns_error() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        // Set modification count to max
+        oms.orders.get_mut("1").unwrap().modification_count = MAX_MODIFICATIONS_PER_ORDER;
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Modify: disclosed quantity validation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_disclosed_qty_too_low_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 100,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 10, // 10 < 30% of 100 = 30
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate modify fields: SL order with zero trigger
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_stop_loss_zero_trigger_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLoss,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0, // SL requires trigger > 0
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate modify fields: MARKET order with nonzero price
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_market_order_nonzero_price_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Market,
+            quantity: 50,
+            price: 245.50, // MARKET must have price=0
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
 }

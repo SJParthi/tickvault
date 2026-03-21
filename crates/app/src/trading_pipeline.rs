@@ -2836,4 +2836,317 @@ threshold = 30.0
         assert_eq!(update.source, "P");
         assert_eq!(update.correlation_id, "corr-001");
     }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — exercise hot-reload path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_with_hot_reloader_receives_ticks() {
+        // This test exercises the hot-reload check inside the pipeline loop.
+        // The reloader is created from a real TOML file, but we do not modify
+        // the file during the test. The pipeline should still process ticks
+        // normally when no reload event is pending.
+        let handle = make_token_handle_with_value("jwt");
+        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_hot_reload");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("hot_reload_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "hot_reload_test"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let result = StrategyHotReloader::new(&config_path);
+        assert!(result.is_ok());
+        let (reloader, defs, params) = result.unwrap();
+        let strategies: Vec<StrategyInstance> = defs
+            .into_iter()
+            .map(|def| StrategyInstance::new(def, MAX_INDICATOR_INSTRUMENTS))
+            .collect();
+
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(64);
+        let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: params,
+            strategies,
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        // Pass the reloader to the pipeline — exercises the `if let Some(ref reloader)` path
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, Some(reloader));
+
+        // Send ticks to exercise the pipeline with the hot-reloader present
+        for i in 0..15_u32 {
+            let mut tick = ParsedTick::default();
+            tick.security_id = 100;
+            tick.last_traded_price = 200.0 + (i as f32 * 1.5);
+            tick.volume = 2000 + i;
+            let _ = tick_tx.send(tick);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(tick_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task_handle).await;
+        assert!(
+            result.is_ok(),
+            "pipeline with hot-reloader should stop cleanly"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — exercise many ticks to warm up indicator engine
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_warmup_with_many_ticks() {
+        // Send enough ticks to potentially warm up the indicator engine,
+        // which may cause strategy evaluations to produce non-Hold signals.
+        let handle = make_token_handle_with_value("jwt");
+        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_warmup");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("warmup_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "warmup_test"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.entry_short]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 50.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let result = StrategyHotReloader::new(&config_path);
+        assert!(result.is_ok());
+        let (_reloader, defs, params) = result.unwrap();
+        let strategies: Vec<StrategyInstance> = defs
+            .into_iter()
+            .map(|def| StrategyInstance::new(def, MAX_INDICATOR_INSTRUMENTS))
+            .collect();
+
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(256);
+        let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: params,
+            strategies,
+            max_daily_loss_percent: 5.0,
+            max_position_lots: 50,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+
+        // Send many ticks with varying prices to exercise indicator warmup
+        // and potentially trigger strategy signals
+        for i in 0..100_u32 {
+            let mut tick = ParsedTick::default();
+            tick.security_id = 100;
+            // Oscillating price pattern to exercise indicators
+            let price = if i % 20 < 10 {
+                200.0 + (i as f32 * 0.5) // Rising
+            } else {
+                210.0 - (i as f32 * 0.3) // Falling
+            };
+            tick.last_traded_price = price;
+            tick.volume = 5000 + (i * 10);
+            let _ = tick_tx.send(tick);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(tick_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task_handle).await;
+        assert!(
+            result.is_ok(),
+            "pipeline should handle warmup ticks and potential signals"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — concurrent tick and order update processing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_concurrent_ticks_and_order_updates() {
+        let handle = make_token_handle_with_value("jwt");
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(64);
+        let (order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+
+        // Send ticks and order updates interleaved
+        for i in 0..10_u32 {
+            let mut tick = ParsedTick::default();
+            tick.security_id = 100 + i;
+            tick.last_traded_price = 200.0 + i as f32;
+            let _ = tick_tx.send(tick);
+
+            let mut update = make_order_update();
+            update.order_no = format!("ORD-{i}");
+            update.status = "PENDING".to_string();
+            let _ = order_tx.send(update);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(tick_tx);
+        drop(order_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(
+            result.is_ok(),
+            "pipeline should handle concurrent tick and order update streams"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — propagates risk config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_trading_pipeline_propagates_risk_config() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_risk");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("risk_strategies.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[strategy]]
+name = "risk_test"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#,
+        )
+        .unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "client");
+        assert!(result.is_some());
+
+        let (pipeline_config, _) = result.unwrap();
+        // Risk config should be propagated from ApplicationConfig
+        assert!(
+            pipeline_config.max_daily_loss_percent > 0.0,
+            "max_daily_loss_percent must be positive from config"
+        );
+        assert!(
+            pipeline_config.max_position_lots > 0,
+            "max_position_lots must be positive from config"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — hot_reloader is Some for valid TOML
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_trading_pipeline_returns_hot_reloader_for_valid_config() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_reloader");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("reloader_strategies.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[strategy]]
+name = "reloader_test"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#,
+        )
+        .unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "client");
+        assert!(result.is_some());
+
+        let (_, hot_reloader) = result.unwrap();
+        assert!(
+            hot_reloader.is_some(),
+            "valid TOML should produce a hot reloader"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
 }

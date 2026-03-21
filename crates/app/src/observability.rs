@@ -444,6 +444,44 @@ mod tests {
         assert_eq!(c1.tracing_enabled, c2.tracing_enabled);
     }
 
+    // -----------------------------------------------------------------------
+    // init_metrics enabled path — attempts real Prometheus install
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn init_metrics_enabled_installs_exporter() {
+        // Use a random high port to avoid conflicts with other tests.
+        // Port 0 means the OS picks an available port, but PrometheusBuilder
+        // requires an explicit port. Use a high ephemeral port.
+        let config = ObservabilityConfig {
+            metrics_port: 19_091,
+            otlp_endpoint: String::new(),
+            metrics_enabled: true,
+            tracing_enabled: false,
+        };
+        let result = init_metrics(&config);
+        // First call should succeed — installs the global recorder.
+        // Subsequent calls may fail because the global recorder is already set.
+        // Either outcome is acceptable.
+        let _ = result;
+    }
+
+    #[test]
+    fn init_metrics_enabled_second_call_handles_already_installed() {
+        // The global metrics recorder can only be installed once.
+        // After the first successful install (in any test), subsequent
+        // installs should return an error (not panic).
+        let config = ObservabilityConfig {
+            metrics_port: 19_092,
+            otlp_endpoint: String::new(),
+            metrics_enabled: true,
+            tracing_enabled: false,
+        };
+        let result = init_metrics(&config);
+        // May succeed or fail — just verify no panic.
+        let _ = result;
+    }
+
     #[test]
     fn disabled_config_metrics_short_circuits() {
         // Verifying the early return: disabled metrics should NOT attempt

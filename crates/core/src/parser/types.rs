@@ -370,6 +370,107 @@ mod tests {
     }
 
     #[test]
+    fn test_parsed_frame_tick_with_depth_debug() {
+        let tick = ParsedTick {
+            security_id: 42,
+            exchange_segment_code: 1,
+            last_traded_price: 100.0,
+            exchange_timestamp: 999,
+            ..Default::default()
+        };
+        let depth = [MarketDepthLevel::default(); 5];
+        let frame = ParsedFrame::TickWithDepth(tick, depth);
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("TickWithDepth"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn test_parsed_frame_oi_update_debug() {
+        let frame = ParsedFrame::OiUpdate {
+            security_id: 77,
+            exchange_segment_code: 2,
+            open_interest: 50000,
+        };
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("OiUpdate"));
+        assert!(debug.contains("77"));
+        assert!(debug.contains("50000"));
+    }
+
+    #[test]
+    fn test_parsed_frame_previous_close_debug() {
+        let frame = ParsedFrame::PreviousClose {
+            security_id: 13,
+            exchange_segment_code: 1,
+            previous_close: 1500.5,
+            previous_oi: 99000,
+        };
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("PreviousClose"));
+        assert!(debug.contains("13"));
+        assert!(debug.contains("99000"));
+    }
+
+    #[test]
+    fn test_parsed_frame_market_status_debug() {
+        let frame = ParsedFrame::MarketStatus {
+            security_id: 0,
+            exchange_segment_code: 0,
+        };
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("MarketStatus"));
+    }
+
+    #[test]
+    fn test_parsed_frame_disconnect_debug() {
+        let frame = ParsedFrame::Disconnect(DisconnectCode::ExceededActiveConnections);
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("Disconnect"));
+        assert!(debug.contains("ExceededActiveConnections"));
+    }
+
+    #[test]
+    fn test_parsed_frame_deep_depth_debug() {
+        let frame = ParsedFrame::DeepDepth {
+            security_id: 100,
+            exchange_segment_code: 2,
+            side: DepthSide::Ask,
+            levels: vec![],
+            message_sequence: 42,
+            received_at_nanos: 12345,
+        };
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("DeepDepth"));
+        assert!(debug.contains("100"));
+        assert!(debug.contains("Ask"));
+    }
+
+    #[test]
+    fn test_parsed_frame_tick_debug() {
+        let tick = ParsedTick {
+            security_id: 55,
+            exchange_segment_code: 1,
+            last_traded_price: 200.0,
+            exchange_timestamp: 1772073900,
+            ..Default::default()
+        };
+        let frame = ParsedFrame::Tick(tick);
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("Tick"));
+        assert!(debug.contains("55"));
+    }
+
+    #[test]
+    fn test_parse_error_invalid_row_count_source_is_none() {
+        let err = ParseError::InvalidRowCount {
+            actual: 500,
+            max: 200,
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
     fn test_parsed_frame_deep_depth_empty_levels() {
         let frame = ParsedFrame::DeepDepth {
             security_id: 1,

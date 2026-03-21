@@ -88,6 +88,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_previous_close_debug_format() {
+        let data = PreviousCloseData {
+            previous_close: 24300.5,
+            previous_oi: 120000,
+        };
+        let debug = format!("{data:?}");
+        assert!(debug.contains("24300.5"));
+        assert!(debug.contains("120000"));
+    }
+
+    #[test]
+    fn test_parse_previous_close_empty_buffer() {
+        let hdr = PacketHeader {
+            response_code: 6,
+            message_length: 16,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_previous_close_packet(&[], &hdr).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 16,
+            actual: 0,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
+    }
+
+    #[test]
     fn test_parse_previous_close_truncated() {
         let buf = vec![0u8; 15];
         let hdr = PacketHeader {

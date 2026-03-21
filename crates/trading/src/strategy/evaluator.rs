@@ -1551,4 +1551,356 @@ mod tests {
         let signal = instance.evaluate(&snap);
         assert_eq!(signal, Signal::Hold, "neither condition met → must hold");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: short entry with confirmation ticks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_entry_with_confirmation_ticks() {
+        let def = StrategyDefinition {
+            name: "short_confirm".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 2,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // First tick: RSI=80 > 70 → enters WaitingForConfirmation (short)
+        let snap1 = make_warm_snapshot(100, 250.0, 80.0, 5.0);
+        let signal = instance.evaluate(&snap1);
+        assert_eq!(signal, Signal::Hold, "should wait for confirmation");
+
+        // Second tick: still waiting (1 tick elapsed, need 2)
+        let snap2 = make_warm_snapshot(100, 251.0, 82.0, 5.0);
+        let signal = instance.evaluate(&snap2);
+        assert_eq!(signal, Signal::Hold, "still waiting for confirmation");
+
+        // Third tick: 2 ticks elapsed, conditions re-validated → enter short
+        let snap3 = make_warm_snapshot(100, 252.0, 81.0, 5.0);
+        let signal = instance.evaluate(&snap3);
+        assert!(
+            matches!(signal, Signal::EnterShort { .. }),
+            "should enter short after confirmation: got {signal:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: short in-position stop-loss hit (with entry conditions)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_stop_loss_hit_via_rsi_entry() {
+        let def = StrategyDefinition {
+            name: "short_sl".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter short: RSI=80 > 70, price=100, ATR=5
+        // SL = 100 + 2*5 = 110, target = 100 - 3*5 = 85
+        let entry = make_warm_snapshot(100, 100.0, 80.0, 5.0);
+        let signal = instance.evaluate(&entry);
+        assert!(matches!(signal, Signal::EnterShort { .. }));
+
+        // Price rises to 110 (hits SL)
+        let sl_snap = make_warm_snapshot(100, 110.0, 60.0, 5.0);
+        let signal = instance.evaluate(&sl_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::StopLossHit
+                }
+            ),
+            "short SL must fire: got {signal:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: short target hit (with explicit ATR-based target)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_target_hit_via_rsi_entry() {
+        let def = StrategyDefinition {
+            name: "short_target".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter short: price=100, ATR=5 → target=85
+        let entry = make_warm_snapshot(100, 100.0, 80.0, 5.0);
+        let signal = instance.evaluate(&entry);
+        assert!(matches!(signal, Signal::EnterShort { .. }));
+
+        // Price drops to 85 (hits target)
+        let target_snap = make_warm_snapshot(100, 85.0, 50.0, 5.0);
+        let signal = instance.evaluate(&target_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::TargetHit
+                }
+            ),
+            "short target must fire: got {signal:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: short trailing stop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_trailing_stop_triggers_exit() {
+        let def = StrategyDefinition {
+            name: "short_trail".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 5.0,
+            target_atr_multiplier: 10.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: true,
+            trailing_stop_atr_multiplier: 1.0,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter short: price=200, ATR=5, SL=225, target=150
+        let entry = make_warm_snapshot(100, 200.0, 80.0, 5.0);
+        let signal = instance.evaluate(&entry);
+        assert!(matches!(signal, Signal::EnterShort { .. }));
+
+        // Price drops to 180, new lowest = 180
+        let low_snap = make_warm_snapshot(100, 180.0, 60.0, 5.0);
+        let signal = instance.evaluate(&low_snap);
+        assert_eq!(signal, Signal::Hold, "should hold while price drops");
+
+        // Price rises to 186: trailing = 180 + 1.0*5 = 185 < SL(225)
+        // price=186 >= 185 AND 185 < 225 → trailing stop fires
+        let trail_snap = make_warm_snapshot(100, 186.0, 60.0, 5.0);
+        let signal = instance.evaluate(&trail_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::TrailingStop
+                }
+            ),
+            "short trailing stop must fire: got {signal:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: signal reversal exit (OR logic on exit conditions)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exit_condition_or_logic_triggers_signal_reversal() {
+        let def = StrategyDefinition {
+            name: "with_exit".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Lt,
+                threshold: 30.0,
+            }],
+            entry_short_conditions: vec![],
+            exit_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 60.0,
+            }],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 10.0, // high target so it won't hit
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long: RSI=25 < 30
+        let entry = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let signal = instance.evaluate(&entry);
+        assert!(matches!(signal, Signal::EnterLong { .. }));
+
+        // RSI rises to 65 > 60 → exit condition triggers
+        let exit_snap = make_warm_snapshot(100, 105.0, 65.0, 5.0);
+        let signal = instance.evaluate(&exit_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::SignalReversal
+                }
+            ),
+            "exit condition must trigger SignalReversal: got {signal:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ExitPending state stays in ExitPending
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exit_pending_stays_pending() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long
+        let entry = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry);
+
+        // Force SL hit to enter ExitPending
+        // SL = 100 - 2*5 = 90, price drops to 89
+        let sl_snap = make_warm_snapshot(100, 89.0, 25.0, 5.0);
+        let signal = instance.evaluate(&sl_snap);
+        assert!(matches!(
+            signal,
+            Signal::Exit {
+                reason: ExitReason::StopLossHit
+            }
+        ));
+
+        // Next evaluate should return Hold (ExitPending stays)
+        let next = make_warm_snapshot(100, 88.0, 25.0, 5.0);
+        let signal = instance.evaluate(&next);
+        assert_eq!(signal, Signal::Hold, "ExitPending must return Hold");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: reset_state returns to Idle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_state_returns_to_idle() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long
+        let entry = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry);
+
+        // Reset state
+        instance.reset_state(100);
+
+        // Should be idle again — same conditions should trigger new entry
+        let snap = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let signal = instance.evaluate(&snap);
+        assert!(
+            matches!(signal, Signal::EnterLong { .. }),
+            "after reset, should re-enter"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: reset_state with out-of-bounds security_id (no-op)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_state_oob_security_id_is_noop() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 10);
+        // No panic, just a no-op
+        instance.reset_state(9999);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: confirmation period conditions no longer met → back to Idle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_confirmation_conditions_no_longer_met_returns_to_idle() {
+        let def = StrategyDefinition {
+            name: "confirm_fail".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Lt,
+                threshold: 30.0,
+            }],
+            entry_short_conditions: vec![],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 1,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // First tick: RSI=25 < 30 → WaitingForConfirmation
+        let snap1 = make_warm_snapshot(100, 250.0, 25.0, 5.0);
+        let signal = instance.evaluate(&snap1);
+        assert_eq!(signal, Signal::Hold);
+
+        // Second tick: RSI=50 > 30 → conditions no longer met → back to Idle
+        let snap2 = make_warm_snapshot(100, 250.0, 50.0, 5.0);
+        let signal = instance.evaluate(&snap2);
+        assert_eq!(signal, Signal::Hold, "conditions failed → back to Idle");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: definition() accessor returns correct strategy name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_definition_accessor_returns_name() {
+        let def = make_long_only_definition(30.0);
+        let instance = StrategyInstance::new(def, 200);
+        assert_eq!(instance.definition().name, "test_long");
+        assert_eq!(instance.definition().security_ids, vec![100]);
+    }
 }

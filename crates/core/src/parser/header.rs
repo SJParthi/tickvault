@@ -228,6 +228,65 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_header_two_bytes_fails() {
+        let err = parse_header(&[0u8; 2]).unwrap_err();
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 2);
+    }
+
+    #[test]
+    fn test_parse_header_three_bytes_fails() {
+        let err = parse_header(&[0u8; 3]).unwrap_err();
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 3);
+    }
+
+    #[test]
+    fn test_parse_header_four_bytes_fails() {
+        let err = parse_header(&[0u8; 4]).unwrap_err();
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 4);
+    }
+
+    #[test]
+    fn test_parse_header_five_bytes_fails() {
+        let err = parse_header(&[0u8; 5]).unwrap_err();
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 5);
+    }
+
+    #[test]
+    fn test_parse_header_six_bytes_fails() {
+        let err = parse_header(&[0u8; 6]).unwrap_err();
+        let ParseError::InsufficientBytes { expected, actual } = err else {
+            panic!("wrong error variant")
+        };
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 6);
+    }
+
+    #[test]
+    fn test_parse_header_nine_bytes_ok() {
+        let buf = make_header(2, 16, 1, 42);
+        let mut extended = buf.clone();
+        extended.push(0xFF);
+        let hdr = parse_header(&extended).unwrap();
+        assert_eq!(hdr.security_id, 42);
+    }
+
+    #[test]
     fn test_parse_header_all_valid_exchange_segments_accepted() {
         use dhan_live_trader_common::types::ExchangeSegment;
 

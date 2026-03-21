@@ -3216,4 +3216,50 @@ mod tests {
         ));
         handle.abort();
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: cancel_order success (200) — exercises cancel path end-to-end
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_order_success_returns_ok() {
+        let (base_url, handle) = start_mock_server(200, "{}").await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-123").await;
+        assert!(result.is_ok());
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: modify_order success (200) — exercises modify path end-to-end
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_modify_order_success_returns_ok() {
+        let (base_url, handle) = start_mock_server(200, "{}").await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+        assert!(result.is_ok());
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: check_rate_limit with various non-429 codes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_rate_limit_ok_on_various_non_429_codes() {
+        let client = OrderApiClient::new(
+            Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        assert!(client.check_rate_limit(400, "test").is_ok());
+        assert!(client.check_rate_limit(403, "test").is_ok());
+        assert!(client.check_rate_limit(500, "test").is_ok());
+    }
 }

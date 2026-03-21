@@ -1131,4 +1131,204 @@ mod tests {
         let result = check_csv_headers(header);
         assert!(result.passed, "BOM should be stripped: {}", result.detail);
     }
+
+    // -----------------------------------------------------------------------
+    // run_instrument_diagnostic — download failure path (exercises checks 5-8
+    // skip path when download fails, covering the None csv_text branch)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_diagnostic_download_failure_stops_at_check_5() {
+        // Both URLs unreachable, no cache — download fails, checks 6-8 skipped
+        let cfg = InstrumentConfig {
+            daily_download_time: "08:30:00".to_string(),
+            csv_cache_directory: "/tmp/dlt-diag-no-cache-xyzzy".to_string(),
+            csv_cache_filename: "nonexistent.csv".to_string(),
+            csv_download_timeout_secs: 1,
+            build_window_start: "08:25:00".to_string(),
+            build_window_end: "08:55:00".to_string(),
+        };
+        let report = run_instrument_diagnostic(
+            "http://127.0.0.1:1/primary",
+            "http://127.0.0.1:1/fallback",
+            &cfg,
+        )
+        .await;
+
+        // Should have 5 checks: 2 URL reachability + time_gate + cache_status + csv_download (failed)
+        assert_eq!(
+            report.checks.len(),
+            5,
+            "checks: {:?}",
+            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !report.healthy,
+            "download failure should make report unhealthy"
+        );
+
+        // csv_download check should be present and failed
+        let dl_check = report.checks.iter().find(|c| c.name == "csv_download");
+        assert!(dl_check.is_some(), "csv_download check should exist");
+        assert!(!dl_check.unwrap().passed, "csv_download should have failed");
+        assert!(dl_check.unwrap().detail.contains("download failed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run_instrument_diagnostic — csv parse failure path
+    // (exercises the Err branch in parse_result)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_diagnostic_csv_parse_failure_path() {
+        // Create a cached CSV with valid size but invalid content
+        let dir = std::env::temp_dir().join(format!("dlt-diag-parse-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // CSV with correct header but garbage data that exceeds min size
+        let garbage = "A".repeat(2_000_000);
+        std::fs::write(dir.join("bad.csv"), &garbage).unwrap();
+
+        let cfg = InstrumentConfig {
+            daily_download_time: "08:30:00".to_string(),
+            csv_cache_directory: dir.to_str().unwrap().to_string(),
+            csv_cache_filename: "bad.csv".to_string(),
+            csv_download_timeout_secs: 1,
+            build_window_start: "00:00:00".to_string(),
+            build_window_end: "23:59:59".to_string(),
+        };
+        let report =
+            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
+
+        // Should have checks up to csv_headers at minimum
+        assert!(report.checks.len() >= 5, "expected at least 5 checks");
+
+        // csv_headers should fail (garbage has no expected columns)
+        let hdr_check = report.checks.iter().find(|c| c.name == "csv_headers");
+        if let Some(hdr) = hdr_check {
+            assert!(!hdr.passed, "garbage CSV should fail header validation");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_instrument_diagnostic — csv parse success but universe build failure
+    // (exercises the parse Ok → build Err path)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_diagnostic_parse_ok_but_universe_build_fails() {
+        // Create a CSV with valid headers and enough parseable rows for the
+        // parser to accept (>100K rows), but without the data needed for
+        // validation to pass (no must-exist indices/equities)
+        let dir = std::env::temp_dir().join(format!("dlt-diag-build-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       ASM_GSM_FLAG,ASM_GSM_CATEGORY,BUY_SELL_INDICATOR,MTF_LEVERAGE";
+        // Generate 110K rows (above INSTRUMENT_CSV_MIN_ROWS = 100000)
+        let mut rows = Vec::with_capacity(110_000);
+        for i in 0..110_000_u32 {
+            rows.push(format!(
+                "NSE,E,{},INE{:09}01,EQUITY,{},DUMMY{},DUMMY{},Dummy{} Display,EQUITY,EQ,1,0001-01-01,0,XX,0.05,0,N,NA,1,0",
+                i.saturating_add(10000), i, i, i, i, i
+            ));
+        }
+        let csv_content = format!("{header}\n{}", rows.join("\n"));
+        std::fs::write(dir.join("partial.csv"), &csv_content).unwrap();
+
+        let cfg = InstrumentConfig {
+            daily_download_time: "08:30:00".to_string(),
+            csv_cache_directory: dir.to_str().unwrap().to_string(),
+            csv_cache_filename: "partial.csv".to_string(),
+            csv_download_timeout_secs: 1,
+            build_window_start: "00:00:00".to_string(),
+            build_window_end: "23:59:59".to_string(),
+        };
+        let report =
+            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
+
+        // Should have all 8 checks
+        assert!(
+            report.checks.len() >= 7,
+            "expected at least 7 checks, got {}",
+            report.checks.len()
+        );
+
+        // csv_parse should succeed (enough rows)
+        let parse_check = report.checks.iter().find(|c| c.name == "csv_parse");
+        if let Some(pc) = parse_check {
+            assert!(pc.passed, "csv_parse should succeed: {}", pc.detail);
+            assert!(
+                pc.detail.contains("NSE_E="),
+                "should show segment counts: {}",
+                pc.detail
+            );
+        }
+
+        // universe_build_and_validate should fail (missing must-exist indices)
+        let build_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "universe_build_and_validate");
+        if let Some(bc) = build_check {
+            assert!(!bc.passed, "universe validation should fail: {}", bc.detail);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_instrument_diagnostic — healthy report (all checks pass)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diagnostic_report_healthy_is_all_checks_pass() {
+        let checks = vec![
+            CheckResult {
+                name: "a".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 1,
+            },
+            CheckResult {
+                name: "b".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 2,
+            },
+        ];
+        let healthy = checks.iter().all(|c| c.passed);
+        let report = DiagnosticReport { healthy, checks };
+        assert!(report.healthy);
+    }
+
+    #[test]
+    fn test_check_csv_headers_single_expected_column_missing() {
+        // All present except SEGMENT
+        let header = "EXCH_ID,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG";
+        let result = check_csv_headers(header);
+        assert!(!result.passed);
+        assert!(
+            result.detail.contains("SEGMENT"),
+            "should report SEGMENT missing"
+        );
+        // Other 14 should be present, only SEGMENT missing
+    }
+
+    #[test]
+    fn test_check_csv_headers_tabs_as_separator_fails() {
+        // Tab-separated — our parser splits by comma, so all columns will be "missing"
+        let header = "EXCH_ID\tSEGMENT\tSECURITY_ID";
+        let result = check_csv_headers(header);
+        assert!(
+            !result.passed,
+            "tab-separated should not match comma-split columns"
+        );
+    }
 }

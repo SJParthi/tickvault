@@ -161,6 +161,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_quote_empty_buffer() {
+        let hdr = PacketHeader {
+            response_code: 4,
+            message_length: 50,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_quote_packet(&[], &hdr, 0).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 50,
+            actual: 0,
+        } = err
+        else {
+            panic!("wrong error variant")
+        };
+    }
+
+    #[test]
     fn test_parse_quote_truncated_at_49() {
         let buf = vec![0u8; 49];
         let hdr = PacketHeader {
