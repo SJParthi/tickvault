@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "dhan_live_trader_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dhan-live-trader"
 path = "src/main.rs"
