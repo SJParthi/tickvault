@@ -110,3 +110,4 @@ mutants.out/
 mutants.out.old/
 target/llvm-cov-target/
 .claude/worktrees/
+target2/
