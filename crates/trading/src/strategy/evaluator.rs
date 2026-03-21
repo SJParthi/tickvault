@@ -1903,4 +1903,187 @@ mod tests {
         assert_eq!(instance.definition().name, "test_long");
         assert_eq!(instance.definition().security_ids, vec![100]);
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: short confirmation "still waiting" branch strength calculation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_confirmation_still_waiting_updates_strength() {
+        let def = StrategyDefinition {
+            name: "short_wait_strength".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 3, // Need 3 ticks
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // First tick: RSI=80 > 70 -> WaitingForConfirmation (short)
+        let snap1 = make_warm_snapshot(100, 300.0, 80.0, 10.0);
+        let signal = instance.evaluate(&snap1);
+        assert_eq!(signal, Signal::Hold);
+
+        // Second tick: still within confirmation period (need 3 ticks)
+        // RSI=85 -> strength = 1.0 - 85/100 = 0.15
+        let snap2 = make_warm_snapshot(100, 301.0, 85.0, 10.0);
+        let signal = instance.evaluate(&snap2);
+        assert_eq!(signal, Signal::Hold, "still waiting for short confirmation");
+
+        // Verify the state is WaitingForConfirmation with is_long=false
+        match instance.states[100] {
+            StrategyState::WaitingForConfirmation { is_long, .. } => {
+                assert!(!is_long, "must be short confirmation");
+            }
+            other => panic!("expected WaitingForConfirmation, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: long confirmation "still waiting" updates strength
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_long_confirmation_still_waiting_updates_strength() {
+        let mut def = make_long_only_definition(30.0);
+        def.confirmation_ticks = 3;
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // First tick: RSI=25 < 30 -> WaitingForConfirmation (long)
+        let snap1 = make_warm_snapshot(100, 250.0, 25.0, 5.0);
+        let signal = instance.evaluate(&snap1);
+        assert_eq!(signal, Signal::Hold);
+
+        // Second tick: still waiting, strength = RSI/100 = 20/100 = 0.2
+        let snap2 = make_warm_snapshot(100, 251.0, 20.0, 5.0);
+        let signal = instance.evaluate(&snap2);
+        assert_eq!(signal, Signal::Hold, "still waiting for long confirmation");
+
+        match instance.states[100] {
+            StrategyState::WaitingForConfirmation {
+                is_long, strength, ..
+            } => {
+                assert!(is_long, "must be long confirmation");
+                assert!(
+                    (strength - 0.2).abs() < f64::EPSILON,
+                    "strength = RSI/100 = 0.2"
+                );
+            }
+            other => panic!("expected WaitingForConfirmation, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: short confirmation fails when conditions no longer met
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_short_confirmation_conditions_no_longer_met() {
+        let def = StrategyDefinition {
+            name: "short_confirm_fail".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![],
+            entry_short_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Gt,
+                threshold: 70.0,
+            }],
+            exit_conditions: vec![],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 3.0,
+            confirmation_ticks: 2,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // First: RSI=80 > 70 -> WaitingForConfirmation
+        let snap1 = make_warm_snapshot(100, 300.0, 80.0, 10.0);
+        let _signal = instance.evaluate(&snap1);
+
+        // Second: still waiting
+        let snap2 = make_warm_snapshot(100, 301.0, 80.0, 10.0);
+        let _signal = instance.evaluate(&snap2);
+
+        // Third: confirmation elapsed but RSI dropped to 60 < 70
+        let snap3 = make_warm_snapshot(100, 302.0, 60.0, 10.0);
+        let signal = instance.evaluate(&snap3);
+        assert_eq!(
+            signal,
+            Signal::Hold,
+            "short conditions no longer met -> back to Idle"
+        );
+
+        // State should be Idle
+        assert_eq!(instance.states[100], StrategyState::Idle);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: multiple exit conditions — first match triggers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_exit_conditions_first_match_triggers() {
+        let def = StrategyDefinition {
+            name: "multi_exit".to_owned(),
+            security_ids: vec![100],
+            entry_long_conditions: vec![Condition {
+                field: IndicatorField::Rsi,
+                operator: ComparisonOp::Lt,
+                threshold: 30.0,
+            }],
+            entry_short_conditions: vec![],
+            exit_conditions: vec![
+                Condition {
+                    field: IndicatorField::Rsi,
+                    operator: ComparisonOp::Gt,
+                    threshold: 90.0, // Won't match
+                },
+                Condition {
+                    field: IndicatorField::Rsi,
+                    operator: ComparisonOp::Gt,
+                    threshold: 60.0, // Will match
+                },
+            ],
+            position_size_fraction: 0.1,
+            stop_loss_atr_multiplier: 2.0,
+            target_atr_multiplier: 10.0,
+            confirmation_ticks: 0,
+            trailing_stop_enabled: false,
+            trailing_stop_atr_multiplier: 1.5,
+        };
+
+        let mut instance = StrategyInstance::new(def, 200);
+
+        // Enter long
+        let entry = make_warm_snapshot(100, 100.0, 25.0, 5.0);
+        let _signal = instance.evaluate(&entry);
+
+        // RSI=65 > 60 but < 90 — second exit condition triggers
+        let exit_snap = make_warm_snapshot(100, 105.0, 65.0, 5.0);
+        let signal = instance.evaluate(&exit_snap);
+        assert!(
+            matches!(
+                signal,
+                Signal::Exit {
+                    reason: ExitReason::SignalReversal
+                }
+            ),
+            "second exit condition should trigger SignalReversal"
+        );
+    }
 }

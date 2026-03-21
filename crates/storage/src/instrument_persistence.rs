@@ -4071,4 +4071,174 @@ mod tests {
             "persist_instrument_snapshot always returns Ok"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // LifecycleEventType::as_str — all 9 variants (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_type_as_str_all_nine_variants() {
+        assert_eq!(LifecycleEventType::ContractAdded.as_str(), "contract_added");
+        assert_eq!(
+            LifecycleEventType::ContractExpired.as_str(),
+            "contract_expired"
+        );
+        assert_eq!(
+            LifecycleEventType::LotSizeChanged.as_str(),
+            "lot_size_changed"
+        );
+        assert_eq!(
+            LifecycleEventType::TickSizeChanged.as_str(),
+            "tick_size_changed"
+        );
+        assert_eq!(LifecycleEventType::FieldChanged.as_str(), "field_changed");
+        assert_eq!(
+            LifecycleEventType::UnderlyingAdded.as_str(),
+            "underlying_added"
+        );
+        assert_eq!(
+            LifecycleEventType::UnderlyingRemoved.as_str(),
+            "underlying_removed"
+        );
+        assert_eq!(
+            LifecycleEventType::SecurityIdReused.as_str(),
+            "security_id_reused"
+        );
+        assert_eq!(
+            LifecycleEventType::SecurityIdReassigned.as_str(),
+            "security_id_reassigned"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_debug_impl() {
+        let event = LifecycleEventType::ContractAdded;
+        let debug = format!("{event:?}");
+        assert!(debug.contains("ContractAdded"));
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_clone_and_eq() {
+        let a = LifecycleEventType::LotSizeChanged;
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_lifecycle_event_struct_fields() {
+        let event = LifecycleEvent {
+            security_id: 50001,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: "new_contract".to_string(),
+        };
+        assert_eq!(event.security_id, 50001);
+        assert_eq!(event.underlying_symbol, "NIFTY");
+        assert_eq!(event.event_type.as_str(), "contract_added");
+        assert!(event.field_changed.is_empty());
+        assert!(event.old_value.is_empty());
+        assert_eq!(event.new_value, "new_contract");
+    }
+
+    #[test]
+    fn test_lifecycle_event_debug() {
+        let event = LifecycleEvent {
+            security_id: 0,
+            underlying_symbol: "RELIANCE".to_string(),
+            event_type: LifecycleEventType::UnderlyingRemoved,
+            field_changed: String::new(),
+            old_value: "old".to_string(),
+            new_value: String::new(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("LifecycleEvent"));
+        assert!(debug.contains("RELIANCE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DDL constants coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_constants_content() {
+        assert_eq!(DEDUP_KEY_BUILD_METADATA, "csv_source");
+        assert_eq!(DEDUP_KEY_FNO_UNDERLYINGS, "underlying_symbol");
+        assert_eq!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol",
+            "I-P1-05: must include underlying_symbol"
+        );
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+    }
+
+    #[test]
+    fn test_ddl_constants_are_single_statements() {
+        assert!(
+            !BUILD_METADATA_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+        assert!(
+            !FNO_UNDERLYINGS_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+        assert!(
+            !DERIVATIVE_CONTRACTS_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+        assert!(
+            !SUBSCRIBED_INDICES_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+    }
+
+    #[test]
+    fn test_ddl_constants_use_wal() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("WAL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("WAL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("WAL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_ddl_constants_have_timestamp() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+    }
+
+    #[test]
+    fn test_ddl_timeout_is_reasonable() {
+        assert!((5..=30).contains(&QUESTDB_DDL_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn test_build_metadata_ddl_has_key_columns() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_source SYMBOL"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("derivative_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_duration_ms LONG"));
+    }
+
+    #[test]
+    fn test_fno_underlyings_ddl_has_key_columns() {
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("contract_count LONG"));
+    }
+
+    #[test]
+    fn test_derivative_contracts_ddl_has_key_columns() {
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("security_id LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("strike_price DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("expiry_date STRING"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("option_type SYMBOL"));
+    }
+
+    #[test]
+    fn test_subscribed_indices_ddl_has_key_columns() {
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("security_id LONG"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("symbol SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("category SYMBOL"));
+    }
 }
