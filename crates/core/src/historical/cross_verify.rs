@@ -523,6 +523,152 @@ fn determine_cross_match_passed(
     total_mismatches == 0 && total_compared > 0 && missing_views_count == 0
 }
 
+/// Parsed fields from a single QuestDB violation row.
+/// Expected row columns: security_id, segment, timeframe, ts, open, high, low, close, volume.
+#[derive(Debug, Clone)]
+struct ParsedViolationRow {
+    security_id: i64,
+    segment: String,
+    timeframe: String,
+    timestamp_value: serde_json::Value,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: i64,
+}
+
+/// Parses a single QuestDB violation row from JSON values.
+///
+/// Returns `None` if the row has fewer than 9 columns.
+fn parse_single_violation_row(row: &[serde_json::Value]) -> Option<ParsedViolationRow> {
+    if row.len() < 9 {
+        return None;
+    }
+    Some(ParsedViolationRow {
+        security_id: row[0].as_i64().unwrap_or(0),
+        segment: row[1].as_str().unwrap_or("").to_string(),
+        timeframe: row[2].as_str().unwrap_or("").to_string(),
+        timestamp_value: row[3].clone(),
+        open: row[4].as_f64().unwrap_or(0.0),
+        high: row[5].as_f64().unwrap_or(0.0),
+        low: row[6].as_f64().unwrap_or(0.0),
+        close: row[7].as_f64().unwrap_or(0.0),
+        volume: row[8].as_i64().unwrap_or(0),
+    })
+}
+
+/// Converts a `ParsedViolationRow` into a `ViolationDetail` using the registry for
+/// symbol lookup and `format_timestamp_ist` for timestamp formatting.
+fn violation_row_to_detail(
+    parsed: &ParsedViolationRow,
+    registry: &InstrumentRegistry,
+    violation_type: &str,
+) -> ViolationDetail {
+    build_violation_detail(
+        CandleContext {
+            symbol: lookup_symbol(registry, parsed.security_id),
+            segment: parsed.segment.clone(),
+            timeframe: parsed.timeframe.clone(),
+            timestamp_ist: format_timestamp_ist(&parsed.timestamp_value),
+        },
+        violation_type,
+        CandleValues {
+            open: parsed.open,
+            high: parsed.high,
+            low: parsed.low,
+            close: parsed.close,
+            volume: parsed.volume,
+            oi: 0,
+        },
+    )
+}
+
+/// Parsed fields from a single QuestDB cross-match row.
+/// Expected columns: security_id, segment, ts,
+///   h_open, h_high, h_low, h_close, h_volume,
+///   m_open, m_high, m_low, m_close, m_volume,
+///   h_open_interest, m_open_interest
+#[derive(Debug, Clone)]
+struct ParsedCrossMatchRow {
+    security_id: i64,
+    segment: String,
+    timestamp_value: serde_json::Value,
+    hist: CandleValues,
+    live_is_null: bool,
+    live: CandleValues,
+}
+
+/// Parses a single QuestDB cross-match row from JSON values.
+///
+/// Returns `None` if the row has fewer than 15 columns.
+fn parse_single_cross_match_row(row: &[serde_json::Value]) -> Option<ParsedCrossMatchRow> {
+    if row.len() < 15 {
+        return None;
+    }
+
+    let live_is_null = row[8].is_null();
+
+    let live = if live_is_null {
+        CandleValues {
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0,
+            oi: 0,
+        }
+    } else {
+        CandleValues {
+            open: row[8].as_f64().unwrap_or(0.0),
+            high: row[9].as_f64().unwrap_or(0.0),
+            low: row[10].as_f64().unwrap_or(0.0),
+            close: row[11].as_f64().unwrap_or(0.0),
+            volume: row[12].as_i64().unwrap_or(0),
+            oi: row[14].as_i64().unwrap_or(0),
+        }
+    };
+
+    Some(ParsedCrossMatchRow {
+        security_id: row[0].as_i64().unwrap_or(0),
+        segment: row[1].as_str().unwrap_or("").to_string(),
+        timestamp_value: row[2].clone(),
+        hist: CandleValues {
+            open: row[3].as_f64().unwrap_or(0.0),
+            high: row[4].as_f64().unwrap_or(0.0),
+            low: row[5].as_f64().unwrap_or(0.0),
+            close: row[6].as_f64().unwrap_or(0.0),
+            volume: row[7].as_i64().unwrap_or(0),
+            oi: row[13].as_i64().unwrap_or(0),
+        },
+        live_is_null,
+        live,
+    })
+}
+
+/// Classifies a parsed cross-match row into a mismatch detail, if any.
+///
+/// Returns `Some(CrossMatchMismatch)` if there is a mismatch (price, volume, OI, or missing live),
+/// or `None` if the row passes all tolerance checks.
+fn classify_parsed_cross_match_row(
+    parsed: &ParsedCrossMatchRow,
+    registry: &InstrumentRegistry,
+    timeframe: &str,
+) -> Option<CrossMatchMismatch> {
+    let ctx = CandleContext {
+        symbol: lookup_symbol(registry, parsed.security_id),
+        segment: parsed.segment.clone(),
+        timeframe: timeframe.to_string(),
+        timestamp_ist: format_timestamp_ist(&parsed.timestamp_value),
+    };
+
+    if parsed.live_is_null {
+        return Some(build_missing_live_mismatch(ctx, parsed.hist));
+    }
+
+    classify_cross_match_row(ctx, parsed.hist, parsed.live)
+}
+
 // ---------------------------------------------------------------------------
 // Cross-Verification Logic
 // ---------------------------------------------------------------------------
@@ -1073,37 +1219,9 @@ async fn parse_violation_rows(
     let mut details = Vec::with_capacity(data.dataset.len().min(MAX_VIOLATION_DETAILS));
 
     for row in &data.dataset {
-        if row.len() < 9 {
-            continue;
+        if let Some(parsed) = parse_single_violation_row(row) {
+            details.push(violation_row_to_detail(&parsed, registry, violation_type));
         }
-
-        let sid = row[0].as_i64().unwrap_or(0);
-        let segment = row[1].as_str().unwrap_or("").to_string();
-        let timeframe = row[2].as_str().unwrap_or("").to_string();
-        let timestamp_ist = format_timestamp_ist(&row[3]);
-        let open = row[4].as_f64().unwrap_or(0.0);
-        let high = row[5].as_f64().unwrap_or(0.0);
-        let low = row[6].as_f64().unwrap_or(0.0);
-        let close = row[7].as_f64().unwrap_or(0.0);
-        let volume = row[8].as_i64().unwrap_or(0);
-
-        details.push(build_violation_detail(
-            CandleContext {
-                symbol: lookup_symbol(registry, sid),
-                segment,
-                timeframe,
-                timestamp_ist,
-            },
-            violation_type,
-            CandleValues {
-                open,
-                high,
-                low,
-                close,
-                volume,
-                oi: 0,
-            },
-        ));
 
         if details.len() >= MAX_VIOLATION_DETAILS {
             break;
@@ -1133,72 +1251,11 @@ async fn parse_cross_match_rows_with_oi(
     let mut details = Vec::with_capacity(data.dataset.len().min(MAX_VIOLATION_DETAILS));
 
     for row in &data.dataset {
-        if row.len() < 15 {
+        let Some(parsed) = parse_single_cross_match_row(row) else {
             continue;
-        }
-
-        let sid = row[0].as_i64().unwrap_or(0);
-        let segment = row[1].as_str().unwrap_or("").to_string();
-        let timestamp_ist = format_timestamp_ist(&row[2]);
-
-        let h_open = row[3].as_f64().unwrap_or(0.0);
-        let h_high = row[4].as_f64().unwrap_or(0.0);
-        let h_low = row[5].as_f64().unwrap_or(0.0);
-        let h_close = row[6].as_f64().unwrap_or(0.0);
-        let h_volume = row[7].as_i64().unwrap_or(0);
-        let h_oi = row[13].as_i64().unwrap_or(0);
-
-        // Live values: NULL if missing (LEFT JOIN with no match)
-        let live_is_null = row[8].is_null();
-
-        let hist = CandleValues {
-            open: h_open,
-            high: h_high,
-            low: h_low,
-            close: h_close,
-            volume: h_volume,
-            oi: h_oi,
         };
 
-        if live_is_null {
-            details.push(build_missing_live_mismatch(
-                CandleContext {
-                    symbol: lookup_symbol(registry, sid),
-                    segment,
-                    timeframe: timeframe.to_string(),
-                    timestamp_ist,
-                },
-                hist,
-            ));
-            continue;
-        }
-
-        let m_open = row[8].as_f64().unwrap_or(0.0);
-        let m_high = row[9].as_f64().unwrap_or(0.0);
-        let m_low = row[10].as_f64().unwrap_or(0.0);
-        let m_close = row[11].as_f64().unwrap_or(0.0);
-        let m_volume = row[12].as_i64().unwrap_or(0);
-        let m_oi = row[14].as_i64().unwrap_or(0);
-
-        let live = CandleValues {
-            open: m_open,
-            high: m_high,
-            low: m_low,
-            close: m_close,
-            volume: m_volume,
-            oi: m_oi,
-        };
-
-        if let Some(mismatch) = classify_cross_match_row(
-            CandleContext {
-                symbol: lookup_symbol(registry, sid),
-                segment,
-                timeframe: timeframe.to_string(),
-                timestamp_ist,
-            },
-            hist,
-            live,
-        ) {
+        if let Some(mismatch) = classify_parsed_cross_match_row(&parsed, registry, timeframe) {
             details.push(mismatch);
         } else {
             // SQL pre-filter caught it but Rust-side says it's fine (e.g., volume diff < 10%)
@@ -2626,5 +2683,417 @@ mod tests {
         map.insert("60m".to_string(), vec![(42, 7)]);
         map.insert("1d".to_string(), vec![(42, 1)]);
         assert_eq!(count_unique_instruments(&map), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_single_violation_row tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_violation_row_valid() {
+        let row = vec![
+            serde_json::json!(1333),                          // security_id
+            serde_json::json!("NSE_EQ"),                      // segment
+            serde_json::json!("1m"),                          // timeframe
+            serde_json::json!("2026-03-18T10:15:00.000000Z"), // ts
+            serde_json::json!(2450.0),                        // open
+            serde_json::json!(2465.0),                        // high
+            serde_json::json!(2448.0),                        // low
+            serde_json::json!(2460.0),                        // close
+            serde_json::json!(125000),                        // volume
+        ];
+        let parsed = parse_single_violation_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 1333);
+        assert_eq!(parsed.segment, "NSE_EQ");
+        assert_eq!(parsed.timeframe, "1m");
+        assert_eq!(parsed.open, 2450.0);
+        assert_eq!(parsed.high, 2465.0);
+        assert_eq!(parsed.low, 2448.0);
+        assert_eq!(parsed.close, 2460.0);
+        assert_eq!(parsed.volume, 125000);
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_too_short() {
+        let row = vec![
+            serde_json::json!(1333),
+            serde_json::json!("NSE_EQ"),
+            serde_json::json!("1m"),
+        ];
+        assert!(parse_single_violation_row(&row).is_none());
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_empty() {
+        assert!(parse_single_violation_row(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_exactly_8_columns() {
+        // 8 columns is still too short (need 9)
+        let row: Vec<serde_json::Value> = (0..8).map(|i| serde_json::json!(i)).collect();
+        assert!(parse_single_violation_row(&row).is_none());
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_null_values_default() {
+        let row = vec![
+            serde_json::Value::Null, // security_id -> 0
+            serde_json::Value::Null, // segment -> ""
+            serde_json::Value::Null, // timeframe -> ""
+            serde_json::Value::Null, // ts
+            serde_json::Value::Null, // open -> 0.0
+            serde_json::Value::Null, // high -> 0.0
+            serde_json::Value::Null, // low -> 0.0
+            serde_json::Value::Null, // close -> 0.0
+            serde_json::Value::Null, // volume -> 0
+        ];
+        let parsed = parse_single_violation_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 0);
+        assert_eq!(parsed.segment, "");
+        assert_eq!(parsed.timeframe, "");
+        assert_eq!(parsed.open, 0.0);
+        assert_eq!(parsed.high, 0.0);
+        assert_eq!(parsed.low, 0.0);
+        assert_eq!(parsed.close, 0.0);
+        assert_eq!(parsed.volume, 0);
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_extra_columns() {
+        let row = vec![
+            serde_json::json!(42),
+            serde_json::json!("NSE_FNO"),
+            serde_json::json!("5m"),
+            serde_json::json!("2026-03-18T12:00:00Z"),
+            serde_json::json!(100.0),
+            serde_json::json!(110.0),
+            serde_json::json!(95.0),
+            serde_json::json!(105.0),
+            serde_json::json!(50000),
+            serde_json::json!("extra"), // extra column — ignored
+        ];
+        let parsed = parse_single_violation_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 42);
+        assert_eq!(parsed.segment, "NSE_FNO");
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_string_number_defaults() {
+        // String in numeric field -> as_i64() returns None -> defaults to 0
+        let row = vec![
+            serde_json::json!("not_a_number"),
+            serde_json::json!("NSE_EQ"),
+            serde_json::json!("1m"),
+            serde_json::json!("2026-03-18T10:15:00Z"),
+            serde_json::json!("not_float"),
+            serde_json::json!(100.0),
+            serde_json::json!(95.0),
+            serde_json::json!(98.0),
+            serde_json::json!("not_int"),
+        ];
+        let parsed = parse_single_violation_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 0);
+        assert_eq!(parsed.open, 0.0);
+        assert_eq!(parsed.volume, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // violation_row_to_detail tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_violation_row_to_detail_basic() {
+        let parsed = ParsedViolationRow {
+            security_id: 1333,
+            segment: "NSE_EQ".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00.000000Z"),
+            open: 2450.0,
+            high: 2440.0,
+            low: 2460.0,
+            close: 2445.0,
+            volume: 100,
+        };
+        let registry = InstrumentRegistry::empty();
+        let detail = violation_row_to_detail(&parsed, &registry, "high < low");
+        assert_eq!(detail.symbol, "1333"); // empty registry falls back to id
+        assert_eq!(detail.segment, "NSE_EQ");
+        assert_eq!(detail.timeframe, "1m");
+        assert_eq!(detail.violation, "high < low");
+        assert!(detail.values.contains("O=2450"));
+        assert!(detail.values.contains("H=2440"));
+        assert_eq!(detail.timestamp_ist, "2026-03-18 10:15 IST");
+    }
+
+    #[test]
+    fn test_violation_row_to_detail_price_violation() {
+        let parsed = ParsedViolationRow {
+            security_id: 42,
+            segment: "NSE_FNO".to_string(),
+            timeframe: "5m".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T11:00:00Z"),
+            open: 0.0,
+            high: 100.0,
+            low: 95.0,
+            close: 98.0,
+            volume: 500,
+        };
+        let registry = InstrumentRegistry::empty();
+        let detail = violation_row_to_detail(&parsed, &registry, "price <= 0");
+        assert_eq!(detail.violation, "price <= 0");
+        assert!(detail.values.contains("O=0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_single_cross_match_row tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_cross_match_row_valid_with_live() {
+        let row = vec![
+            serde_json::json!(1333),                   // security_id
+            serde_json::json!("NSE_EQ"),               // segment
+            serde_json::json!("2026-03-18T10:15:00Z"), // ts
+            serde_json::json!(2450.0),                 // h_open
+            serde_json::json!(2465.0),                 // h_high
+            serde_json::json!(2448.0),                 // h_low
+            serde_json::json!(2460.0),                 // h_close
+            serde_json::json!(125000),                 // h_volume
+            serde_json::json!(2450.0),                 // m_open
+            serde_json::json!(2465.0),                 // m_high
+            serde_json::json!(2448.0),                 // m_low
+            serde_json::json!(2460.0),                 // m_close
+            serde_json::json!(125000),                 // m_volume
+            serde_json::json!(0),                      // h_oi
+            serde_json::json!(0),                      // m_oi
+        ];
+        let parsed = parse_single_cross_match_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 1333);
+        assert_eq!(parsed.segment, "NSE_EQ");
+        assert!(!parsed.live_is_null);
+        assert_eq!(parsed.hist.open, 2450.0);
+        assert_eq!(parsed.hist.high, 2465.0);
+        assert_eq!(parsed.live.open, 2450.0);
+        assert_eq!(parsed.live.volume, 125000);
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_live_null() {
+        let row = vec![
+            serde_json::json!(1333),
+            serde_json::json!("NSE_EQ"),
+            serde_json::json!("2026-03-18T10:15:00Z"),
+            serde_json::json!(2450.0),
+            serde_json::json!(2465.0),
+            serde_json::json!(2448.0),
+            serde_json::json!(2460.0),
+            serde_json::json!(125000),
+            serde_json::Value::Null, // live open is NULL (missing live)
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::json!(5000), // h_oi
+            serde_json::Value::Null, // m_oi
+        ];
+        let parsed = parse_single_cross_match_row(&row).unwrap();
+        assert!(parsed.live_is_null);
+        assert_eq!(parsed.hist.oi, 5000);
+        // Live values should be zeroed when null
+        assert_eq!(parsed.live.open, 0.0);
+        assert_eq!(parsed.live.volume, 0);
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_too_short() {
+        let row: Vec<serde_json::Value> = (0..14).map(|i| serde_json::json!(i)).collect();
+        assert!(parse_single_cross_match_row(&row).is_none());
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_empty() {
+        assert!(parse_single_cross_match_row(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_with_oi() {
+        let row = vec![
+            serde_json::json!(49081),
+            serde_json::json!("NSE_FNO"),
+            serde_json::json!("2026-03-18T09:30:00Z"),
+            serde_json::json!(23000.0),
+            serde_json::json!(23050.0),
+            serde_json::json!(22990.0),
+            serde_json::json!(23040.0),
+            serde_json::json!(500000),
+            serde_json::json!(23000.0),
+            serde_json::json!(23050.0),
+            serde_json::json!(22990.0),
+            serde_json::json!(23040.0),
+            serde_json::json!(500000),
+            serde_json::json!(10000), // h_oi
+            serde_json::json!(12000), // m_oi
+        ];
+        let parsed = parse_single_cross_match_row(&row).unwrap();
+        assert_eq!(parsed.hist.oi, 10000);
+        assert_eq!(parsed.live.oi, 12000);
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_null_defaults() {
+        let row: Vec<serde_json::Value> = vec![serde_json::Value::Null; 15];
+        let parsed = parse_single_cross_match_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 0);
+        assert_eq!(parsed.segment, "");
+        assert!(parsed.live_is_null);
+        assert_eq!(parsed.hist.open, 0.0);
+        assert_eq!(parsed.hist.volume, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_parsed_cross_match_row tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_no_mismatch() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 1333,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00Z"),
+            hist: cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+            live_is_null: false,
+            live: cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "1m");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_missing_live() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 1333,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00Z"),
+            hist: cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+            live_is_null: true,
+            live: cv(0.0, 0.0, 0.0, 0.0, 0, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "1m").unwrap();
+        assert_eq!(result.mismatch_type, "missing_live");
+        assert!(result.live_values.contains("MISSING"));
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_price_diff() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 1333,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00Z"),
+            hist: cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+            live_is_null: false,
+            live: cv(2450.0, 2465.0, 2448.0, 2455.0, 125000, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "1m").unwrap();
+        assert_eq!(result.mismatch_type, "price_diff");
+        assert!(result.diff_summary.contains('C'));
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_volume_diff() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 42,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T11:00:00Z"),
+            hist: cv(3500.0, 3510.0, 3495.0, 3505.0, 100000, 0),
+            live_is_null: false,
+            live: cv(3500.0, 3510.0, 3495.0, 3505.0, 120000, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "5m").unwrap();
+        assert_eq!(result.mismatch_type, "volume_diff");
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_oi_diff() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 49081,
+            segment: "NSE_FNO".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T09:30:00Z"),
+            hist: cv(23000.0, 23050.0, 22990.0, 23040.0, 500000, 10000),
+            live_is_null: false,
+            live: cv(23000.0, 23050.0, 22990.0, 23040.0, 500000, 12000),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "1m").unwrap();
+        assert_eq!(result.mismatch_type, "oi_diff");
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_within_tolerance() {
+        // Volume diff = 5% which is within 10% tolerance
+        let parsed = ParsedCrossMatchRow {
+            security_id: 42,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:00:00Z"),
+            hist: cv(3500.0, 3510.0, 3495.0, 3505.0, 100000, 0),
+            live_is_null: false,
+            live: cv(3500.0, 3510.0, 3495.0, 3505.0, 105000, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "1m");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_preserves_timeframe() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 1333,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00Z"),
+            hist: cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+            live_is_null: true,
+            live: cv(0.0, 0.0, 0.0, 0.0, 0, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "15m").unwrap();
+        assert_eq!(result.timeframe, "15m");
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_symbol_lookup() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 99999,
+            segment: "NSE_EQ".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00Z"),
+            hist: cv(100.0, 110.0, 95.0, 105.0, 50000, 0),
+            live_is_null: true,
+            live: cv(0.0, 0.0, 0.0, 0.0, 0, 0),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "1m").unwrap();
+        // Empty registry falls back to security_id string
+        assert_eq!(result.symbol, "99999");
+    }
+
+    #[test]
+    fn test_classify_parsed_cross_match_row_all_mismatches() {
+        let parsed = ParsedCrossMatchRow {
+            security_id: 1333,
+            segment: "NSE_FNO".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T12:00:00Z"),
+            hist: cv(2450.0, 2465.0, 2448.0, 2460.0, 100000, 10000),
+            live_is_null: false,
+            live: cv(2455.0, 2470.0, 2445.0, 2450.0, 120000, 12000),
+        };
+        let registry = InstrumentRegistry::empty();
+        let result = classify_parsed_cross_match_row(&parsed, &registry, "15m").unwrap();
+        assert_eq!(result.mismatch_type, "price_diff"); // price takes priority
+        assert!(result.diff_summary.contains('O'));
+        assert!(result.diff_summary.contains('V'));
+        assert!(result.diff_summary.contains("OI("));
     }
 }

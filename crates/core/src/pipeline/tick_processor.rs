@@ -230,7 +230,7 @@ pub async fn run_tick_processor(
     mut candle_aggregator: Option<super::candle_aggregator::CandleAggregator>,
     mut live_candle_writer: Option<LiveCandleWriter>,
     mut top_movers: Option<super::top_movers::TopMoversTracker>,
-    shared_snapshot: Option<super::top_movers::SharedTopMoversSnapshot>,
+    shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -2892,5 +2892,329 @@ mod tests {
         let nanos: i64 = 2_000_000_000_000_000_000; // ~2033
         let ts = derive_depth_timestamp_secs(false, 0, nanos);
         assert_eq!(ts, 2_000_000_000);
+    }
+
+    // ===================================================================
+    // Broadcast channel + top movers + candle aggregator integration
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_with_broadcast_channel() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (tick_broadcast_tx, mut tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_broadcast_tx),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send valid tick — should be broadcast
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Receive from broadcast
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let tick = tick_broadcast_rx.try_recv();
+        assert!(tick.is_ok(), "valid tick should be broadcast");
+        let tick = tick.unwrap();
+        assert_eq!(tick.security_id, 13);
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_with_top_movers() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let top_movers = crate::pipeline::top_movers::TopMoversTracker::new();
+        let shared_snapshot: crate::pipeline::top_movers::SharedTopMoversSnapshot =
+            std::sync::Arc::new(std::sync::RwLock::new(None));
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(top_movers),
+                Some(shared_snapshot),
+            )
+            .await;
+        });
+
+        // Send valid ticks
+        for i in 0..5 {
+            let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait for periodic snapshot check (>5s)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_quote_with_broadcast_and_top_movers() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (tick_broadcast_tx, _tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+        let top_movers = crate::pipeline::top_movers::TopMoversTracker::new();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_broadcast_tx),
+                None,
+                None,
+                Some(top_movers),
+                None,
+            )
+            .await;
+        });
+
+        // Send Full Quote packet with valid LTP and timestamp
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_market_depth_valid_ltp_no_timestamp_broadcast() {
+        // Market depth code 3 has valid LTP but timestamp=0.
+        // LTP valid: should broadcast and update top movers.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (tick_broadcast_tx, mut tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+        let top_movers = crate::pipeline::top_movers::TopMoversTracker::new();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_broadcast_tx),
+                None,
+                None,
+                Some(top_movers),
+                None,
+            )
+            .await;
+        });
+
+        let frame = make_market_depth_frame(42, 25000.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let tick = tick_broadcast_rx.try_recv();
+        // Market depth with valid LTP should broadcast
+        assert!(tick.is_ok(), "market depth with valid LTP should broadcast");
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tracing subscriber tests — forces field expression evaluation
+    // -----------------------------------------------------------------------
+
+    struct SinkSubscriber;
+    impl tracing::Subscriber for SinkSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_parse_error_with_tracing_subscriber() {
+        // Exercises warn! field expressions in the parse error path (line 285)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        frame_tx
+            .send(bytes::Bytes::from(vec![0u8; 4]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_junk_tick_with_tracing_subscriber() {
+        // Exercises debug! field expressions in junk tick path (lines 306-311)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_ticker_frame(13, 0.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_quote_junk_with_tracing_subscriber() {
+        // Exercises debug! field expressions in full-quote junk path (lines 424-430)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&0.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_crossed_market_with_tracing_subscriber() {
+        // Exercises debug! field expressions in crossed market path (lines 448-453)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        // Build a Full packet with bid > ask at level 0 to trigger crossed market
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        // Set bid_price > ask_price at depth level 0 (offset 62 in full packet)
+        // Level 0: bid_qty@62, ask_qty@66, bid_orders@70, ask_orders@72,
+        //          bid_price@74, ask_price@78
+        frame[62..66].copy_from_slice(&100u32.to_le_bytes()); // bid_qty
+        frame[66..70].copy_from_slice(&100u32.to_le_bytes()); // ask_qty
+        frame[70..72].copy_from_slice(&5u16.to_le_bytes()); // bid_orders
+        frame[72..74].copy_from_slice(&5u16.to_le_bytes()); // ask_orders
+        frame[74..78].copy_from_slice(&25000.0_f32.to_le_bytes()); // bid > ask
+        frame[78..82].copy_from_slice(&24900.0_f32.to_le_bytes()); // ask
+        // Fill remaining depth levels with valid finite prices
+        for level in 1..5 {
+            let base = 62 + level * 20;
+            frame[base..base + 4].copy_from_slice(&10u32.to_le_bytes());
+            frame[base + 4..base + 8].copy_from_slice(&10u32.to_le_bytes());
+            frame[base + 8..base + 10].copy_from_slice(&1u16.to_le_bytes());
+            frame[base + 10..base + 12].copy_from_slice(&1u16.to_le_bytes());
+            frame[base + 12..base + 16].copy_from_slice(&24500.0_f32.to_le_bytes());
+            frame[base + 16..base + 20].copy_from_slice(&24501.0_f32.to_le_bytes());
+        }
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_disconnect_with_tracing_subscriber() {
+        // Exercises error! field expression in disconnect path (line 597)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
+        frame[8..10].copy_from_slice(&805u16.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_oi_with_tracing_subscriber() {
+        // Exercises debug! field expressions in OI path (lines 519-522)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_market_status_with_tracing_subscriber() {
+        // Exercises info! field expressions in market status path (line 577)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_valid_tick_with_tracing_subscriber() {
+        // Exercises trace! field expressions in successful tick path (lines 367-371)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_valid_with_tracing_subscriber() {
+        // Exercises debug! field expressions in previous close persist path (lines 567-570)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        // Build a PrevClose packet with valid previous_close price
+        let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        frame[8..12].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
     }
 }

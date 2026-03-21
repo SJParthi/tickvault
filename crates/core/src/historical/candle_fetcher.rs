@@ -328,6 +328,89 @@ fn is_response_oversized(body_len: usize) -> bool {
     body_len > MAX_RESPONSE_BODY_SIZE
 }
 
+/// Builds valid intraday candles from a `DhanIntradayResponse`, filtering out:
+/// - Candles with non-finite prices (NaN/Inf)
+/// - Candles with non-positive prices (zero or negative)
+/// - Candles with high < low
+/// - Candles outside the intraday window (>= 15:30 IST)
+///
+/// Returns a vector of valid `HistoricalCandle` structs, plus counts of
+/// `(valid_candle_count, invalid_candle_count)`.
+fn build_valid_intraday_candles(
+    data: &DhanIntradayResponse,
+    security_id: u32,
+    segment_code: u8,
+    timeframe_label: &'static str,
+) -> (Vec<HistoricalCandle>, usize) {
+    let mut candles = Vec::with_capacity(data.len());
+    let mut invalid_count = 0_usize;
+    for i in 0..data.len() {
+        let open = data.open[i];
+        let high = data.high[i];
+        let low = data.low[i];
+        let close = data.close[i];
+
+        match validate_candle_ohlc(open, high, low, close) {
+            CandleValidation::Valid => {}
+            CandleValidation::NonFinite
+            | CandleValidation::NonPositive
+            | CandleValidation::HighBelowLow => {
+                invalid_count = invalid_count.saturating_add(1);
+                continue;
+            }
+        }
+
+        // Reject candles at or after 15:30 IST
+        if is_outside_intraday_window(data.timestamp[i]) {
+            continue;
+        }
+
+        candles.push(build_intraday_candle(
+            data,
+            i,
+            security_id,
+            segment_code,
+            timeframe_label,
+        ));
+    }
+    (candles, invalid_count)
+}
+
+/// Builds valid daily candles from a `DhanDailyResponse`, filtering out:
+/// - Candles with non-finite prices (NaN/Inf)
+/// - Candles with non-positive prices (zero or negative)
+/// - Candles with high < low
+///
+/// Returns a vector of valid `HistoricalCandle` structs, plus counts of
+/// `(valid_candle_count, invalid_candle_count)`.
+fn build_valid_daily_candles(
+    data: &DhanDailyResponse,
+    security_id: u32,
+    segment_code: u8,
+) -> (Vec<HistoricalCandle>, usize) {
+    let mut candles = Vec::with_capacity(data.len());
+    let mut invalid_count = 0_usize;
+    for i in 0..data.len() {
+        let open = data.open[i];
+        let high = data.high[i];
+        let low = data.low[i];
+        let close = data.close[i];
+
+        match validate_candle_ohlc(open, high, low, close) {
+            CandleValidation::Valid => {}
+            CandleValidation::NonFinite
+            | CandleValidation::NonPositive
+            | CandleValidation::HighBelowLow => {
+                invalid_count = invalid_count.saturating_add(1);
+                continue;
+            }
+        }
+
+        candles.push(build_daily_candle(data, i, security_id, segment_code));
+    }
+    (candles, invalid_count)
+}
+
 /// Collects the names of failed instruments for notification, capped at `MAX_FAILED_INSTRUMENT_NAMES`.
 ///
 /// # Arguments
@@ -1319,65 +1402,26 @@ fn persist_intraday_candles(
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
 ) -> (usize, usize) {
+    let (candles, invalid_count) =
+        build_valid_intraday_candles(data, security_id, segment_code, timeframe_label);
+
+    if invalid_count > 0 {
+        warn!(
+            security_id,
+            timeframe = timeframe_label,
+            invalid_count,
+            "skipped invalid candles in API response"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: usize->u64 is lossless on 64-bit targets
+        m_api_errors.increment(invalid_count as u64);
+    }
+
     let mut count = 0_usize;
     let mut persist_failures = 0_usize;
     let mut consecutive_persist_failures = 0_usize;
-    for i in 0..data.len() {
-        let open = data.open[i];
-        let high = data.high[i];
-        let low = data.low[i];
-        let close = data.close[i];
-
-        match validate_candle_ohlc(open, high, low, close) {
-            CandleValidation::Valid => {}
-            CandleValidation::NonFinite => {
-                warn!(
-                    security_id,
-                    idx = i,
-                    timeframe = timeframe_label,
-                    "NaN/Inf price in API response — skipping candle"
-                );
-                m_api_errors.increment(1);
-                continue;
-            }
-            CandleValidation::NonPositive => {
-                warn!(
-                    security_id,
-                    idx = i,
-                    timeframe = timeframe_label,
-                    open,
-                    high,
-                    low,
-                    close,
-                    "non-positive price in API response — skipping candle"
-                );
-                m_api_errors.increment(1);
-                continue;
-            }
-            CandleValidation::HighBelowLow => {
-                warn!(
-                    security_id,
-                    idx = i,
-                    timeframe = timeframe_label,
-                    high,
-                    low,
-                    "high < low in API response — skipping candle"
-                );
-                m_api_errors.increment(1);
-                continue;
-            }
-        }
-
-        // Reject candles at or after 15:30 IST — market close is always exclusive.
-        // Dhan may return closing session candles (15:30+) for higher timeframes;
-        // we discard them to keep [09:15, 15:30) IST as the strict intraday window.
-        if is_outside_intraday_window(data.timestamp[i]) {
-            continue; // silently skip — this is expected for 5m/15m/60m
-        }
-
-        let candle = build_intraday_candle(data, i, security_id, segment_code, timeframe_label);
-
-        if let Err(err) = candle_writer.append_candle(&candle) {
+    for candle in &candles {
+        if let Err(err) = candle_writer.append_candle(candle) {
             warn!(
                 ?err,
                 security_id,
@@ -1413,58 +1457,25 @@ fn persist_daily_candles(
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
 ) -> (usize, usize) {
+    let (candles, invalid_count) = build_valid_daily_candles(data, security_id, segment_code);
+
+    if invalid_count > 0 {
+        warn!(
+            security_id,
+            timeframe = TIMEFRAME_1D,
+            invalid_count,
+            "skipped invalid candles in daily response"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: usize->u64 is lossless on 64-bit targets
+        m_api_errors.increment(invalid_count as u64);
+    }
+
     let mut count = 0_usize;
     let mut persist_failures = 0_usize;
     let mut consecutive_persist_failures = 0_usize;
-    for i in 0..data.len() {
-        let open = data.open[i];
-        let high = data.high[i];
-        let low = data.low[i];
-        let close = data.close[i];
-
-        match validate_candle_ohlc(open, high, low, close) {
-            CandleValidation::Valid => {}
-            CandleValidation::NonFinite => {
-                warn!(
-                    security_id,
-                    idx = i,
-                    timeframe = TIMEFRAME_1D,
-                    "NaN/Inf price in daily response — skipping candle"
-                );
-                m_api_errors.increment(1);
-                continue;
-            }
-            CandleValidation::NonPositive => {
-                warn!(
-                    security_id,
-                    idx = i,
-                    timeframe = TIMEFRAME_1D,
-                    open,
-                    high,
-                    low,
-                    close,
-                    "non-positive price in daily response — skipping candle"
-                );
-                m_api_errors.increment(1);
-                continue;
-            }
-            CandleValidation::HighBelowLow => {
-                warn!(
-                    security_id,
-                    idx = i,
-                    timeframe = TIMEFRAME_1D,
-                    high,
-                    low,
-                    "high < low in daily response — skipping candle"
-                );
-                m_api_errors.increment(1);
-                continue;
-            }
-        }
-
-        let candle = build_daily_candle(data, i, security_id, segment_code);
-
-        if let Err(err) = candle_writer.append_candle(&candle) {
+    for candle in &candles {
+        if let Err(err) = candle_writer.append_candle(candle) {
             warn!(
                 ?err,
                 security_id,
@@ -3388,5 +3399,360 @@ mod tests {
     #[test]
     fn test_max_failed_instrument_names_value() {
         assert_eq!(MAX_FAILED_INSTRUMENT_NAMES, 50);
+    }
+
+    // =======================================================================
+    // build_valid_intraday_candles tests
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_intraday_candles_all_valid() {
+        let data = sample_intraday_response();
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 3);
+        assert_eq!(candles[0].security_id, 42);
+        assert_eq!(candles[0].exchange_segment_code, 2);
+        assert_eq!(candles[0].timeframe, "1m");
+        assert_eq!(candles[0].open, 100.0);
+        assert_eq!(candles[2].close, 105.0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_nan() {
+        let mut data = sample_intraday_response();
+        data.open[1] = f64::NAN;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+        // First and third candle should remain
+        assert_eq!(candles[0].open, 100.0);
+        assert_eq!(candles[1].open, 102.0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_infinity() {
+        let mut data = sample_intraday_response();
+        data.high[0] = f64::INFINITY;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_zero_price() {
+        let mut data = sample_intraday_response();
+        data.low[2] = 0.0;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_negative_price() {
+        let mut data = sample_intraday_response();
+        data.close[0] = -5.0;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_high_below_low() {
+        let mut data = sample_intraday_response();
+        data.high[1] = 90.0; // below low of 99.0
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_post_market() {
+        let mut data = sample_intraday_response();
+        // Set timestamp to 15:30 IST (10:00 UTC) — should be filtered
+        // 15:30 IST = 10:00 UTC, base 2026-03-09 midnight UTC = 1_773_014_400
+        data.timestamp[1] = 1_773_014_400 + 10 * 3600; // 15:30 IST
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0); // post-market is not an "invalid" candle
+        assert_eq!(candles.len(), 2); // but it's filtered out
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_all_invalid() {
+        let data = DhanIntradayResponse {
+            open: vec![0.0, f64::NAN, 100.0],
+            high: vec![100.0, 200.0, 50.0], // third: high < low
+            low: vec![50.0, 100.0, 60.0],
+            close: vec![75.0, 150.0, 55.0],
+            volume: vec![1000, 2000, 3000],
+            timestamp: vec![1_773_027_900, 1_773_027_960, 1_773_028_020],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 3);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_empty_response() {
+        let data = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_preserves_oi() {
+        let data = sample_intraday_response();
+        let (candles, _) = build_valid_intraday_candles(&data, 42, 2, "5m");
+        assert_eq!(candles[0].open_interest, 5000);
+        assert_eq!(candles[1].open_interest, 6000);
+        assert_eq!(candles[2].open_interest, 7000);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_empty_oi_returns_zero() {
+        let mut data = sample_intraday_response();
+        data.open_interest = vec![];
+        let (candles, _) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        for candle in &candles {
+            assert_eq!(candle.open_interest, 0);
+        }
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_timeframe_propagated() {
+        let data = sample_intraday_response();
+        for &tf in &["1m", "5m", "15m", "60m"] {
+            let (candles, _) = build_valid_intraday_candles(&data, 42, 2, tf);
+            for candle in &candles {
+                assert_eq!(candle.timeframe, tf);
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_mixed_valid_and_invalid() {
+        let mut data = sample_intraday_response();
+        // Make second candle invalid (NaN), keep first and third
+        data.high[1] = f64::NAN;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 99, 1, "15m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].security_id, 99);
+        assert_eq!(candles[0].exchange_segment_code, 1);
+        assert_eq!(candles[0].open, 100.0);
+        assert_eq!(candles[1].open, 102.0);
+    }
+
+    // =======================================================================
+    // build_valid_daily_candles tests
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_daily_candles_all_valid() {
+        let data = sample_daily_response();
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].security_id, 11536);
+        assert_eq!(candles[0].exchange_segment_code, 1);
+        assert_eq!(candles[0].timeframe, TIMEFRAME_1D);
+        assert_eq!(candles[0].open, 200.0);
+        assert_eq!(candles[1].close, 206.0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_nan() {
+        let mut data = sample_daily_response();
+        data.close[0] = f64::NAN;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 201.0); // second candle
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_zero_price() {
+        let mut data = sample_daily_response();
+        data.open[1] = 0.0;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_high_below_low() {
+        let mut data = sample_daily_response();
+        data.high[0] = 190.0; // below low of 195.0
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_empty_response() {
+        let data = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 0);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_all_invalid() {
+        let data = DhanDailyResponse {
+            open: vec![f64::NAN, -1.0],
+            high: vec![200.0, 200.0],
+            low: vec![100.0, 100.0],
+            close: vec![150.0, 150.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_772_928_000, 1_773_014_400],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 2);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_preserves_oi() {
+        let mut data = sample_daily_response();
+        data.open_interest = vec![50_000, 60_000];
+        let (candles, _) = build_valid_daily_candles(&data, 13, 0);
+        assert_eq!(candles[0].open_interest, 50_000);
+        assert_eq!(candles[1].open_interest, 60_000);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_empty_oi() {
+        let data = sample_daily_response();
+        let (candles, _) = build_valid_daily_candles(&data, 13, 0);
+        assert_eq!(candles[0].open_interest, 0);
+        assert_eq!(candles[1].open_interest, 0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_always_1d_timeframe() {
+        let data = sample_daily_response();
+        let (candles, _) = build_valid_daily_candles(&data, 42, 2);
+        for candle in &candles {
+            assert_eq!(candle.timeframe, TIMEFRAME_1D);
+        }
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_segment_code_propagated() {
+        let data = sample_daily_response();
+        for code in [0_u8, 1, 2, 4, 5, 7, 8] {
+            let (candles, _) = build_valid_daily_candles(&data, 42, code);
+            for candle in &candles {
+                assert_eq!(candle.exchange_segment_code, code);
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_neg_infinity_filtered() {
+        let mut data = sample_daily_response();
+        data.low[0] = f64::NEG_INFINITY;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_negative_close() {
+        let mut data = sample_daily_response();
+        data.close[1] = -0.01;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_boundary_1529_passes() {
+        // 15:29 IST = valid (inside window)
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![98.0],
+            close: vec![103.0],
+            volume: vec![1000],
+            // 15:29 IST = 09:59 UTC on 2026-03-09
+            timestamp: vec![1_773_014_400 + 9 * 3600 + 59 * 60],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_boundary_1530_filtered() {
+        // 15:30 IST = invalid (outside window)
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![98.0],
+            close: vec![103.0],
+            volume: vec![1000],
+            // 15:30 IST = 10:00 UTC on 2026-03-09
+            timestamp: vec![1_773_014_400 + 10 * 3600],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0); // window filter is not counted as invalid
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_single_candle_valid() {
+        let data = DhanDailyResponse {
+            open: vec![100.0],
+            high: vec![110.0],
+            low: vec![95.0],
+            close: vec![105.0],
+            volume: vec![50000],
+            timestamp: vec![1_772_928_000],
+            open_interest: vec![12000],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open_interest, 12000);
+        assert_eq!(candles[0].timestamp_utc_secs, 1_772_928_000);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_penny_stock_valid() {
+        let data = DhanIntradayResponse {
+            open: vec![0.05],
+            high: vec![0.10],
+            low: vec![0.01],
+            close: vec![0.07],
+            volume: vec![100000],
+            timestamp: vec![1_773_027_900],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 1, "1m");
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 0.05);
     }
 }
