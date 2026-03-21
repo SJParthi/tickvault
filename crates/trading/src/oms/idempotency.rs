@@ -148,6 +148,13 @@ mod tests {
     }
 
     #[test]
+    fn default_trait_creates_empty_tracker() {
+        let tracker = CorrelationTracker::default();
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+    }
+
+    #[test]
     fn multiple_correlations() {
         let mut tracker = CorrelationTracker::new();
         tracker.track("c1".to_owned(), "o1".to_owned());
