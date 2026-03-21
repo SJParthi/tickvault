@@ -13,6 +13,23 @@ use crate::state::SharedAppState;
 /// Timeout for QuestDB quote queries (cold path, not tick processing).
 const QUESTDB_QUOTE_TIMEOUT_SECS: u64 = 3;
 
+/// Builds a reqwest client with the given timeout. Returns an error response
+/// on failure (practically impossible, but defensive).
+// APPROVED: Response is the natural error type for an HTTP handler helper.
+#[allow(clippy::result_large_err)]
+fn build_questdb_client(timeout_secs: u64) -> Result<reqwest::Client, axum::response::Response> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to build HTTP client"})),
+            )
+                .into_response()
+        })
+}
+
 /// Latest quote response for a single security.
 #[derive(Debug, Serialize)]
 pub struct QuoteResponse {
@@ -36,18 +53,9 @@ pub async fn get_quote(
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(QUESTDB_QUOTE_TIMEOUT_SECS))
-        .build()
-    {
+    let client = match build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS) {
         Ok(c) => c,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to build HTTP client"})),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
 
     match query_latest_tick(&client, &base_url, security_id).await {
@@ -204,17 +212,16 @@ mod tests {
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
         });
 
         base_url
@@ -379,17 +386,16 @@ mod tests {
 
         tokio::spawn(async move {
             for body in responses {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                }
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
         });
 
@@ -534,5 +540,162 @@ mod tests {
     fn test_questdb_quote_timeout_secs_is_reasonable() {
         assert!(QUESTDB_QUOTE_TIMEOUT_SECS > 0);
         assert!(QUESTDB_QUOTE_TIMEOUT_SECS <= 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // query_latest_tick: partial row coverage — each ? branch exercised
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_2() {
+        // Row with 2 elements — row.get(2)? returns None (ltp missing)
+        let body = r#"{"dataset":[[12345,2]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_3() {
+        // Row with 3 elements — row.get(3)? returns None (ltq missing)
+        let body = r#"{"dataset":[[12345,2,1500.5]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_4() {
+        // Row with 4 elements — row.get(4)? returns None (volume missing)
+        let body = r#"{"dataset":[[12345,2,1500.5,100]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_5() {
+        // Row with 5 elements — row.get(5)? returns None (day_open missing)
+        let body = r#"{"dataset":[[12345,2,1500.5,100,50000]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_6() {
+        // Row with 6 elements — row.get(6)? returns None (day_high missing)
+        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_7() {
+        // Row with 7 elements — row.get(7)? returns None (day_low missing)
+        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_8() {
+        // Row with 8 elements — row.get(8)? returns None (day_close missing)
+        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_tick_row_missing_field_at_index_9() {
+        // Row with 9 elements — row.get(9)? returns None (timestamp missing)
+        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0,1495.0]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // query_latest_tick: empty row (row.first()? returns None)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_query_latest_tick_empty_row_returns_none() {
+        // Row is empty array — row.first()? returns None
+        let body = r#"{"dataset":[[]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // query_latest_tick: dataset element not an array
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_query_latest_tick_dataset_element_not_array() {
+        // dataset first element is a number, not an array
+        let body = r#"{"dataset":[42]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // query_latest_tick: dataset is not an array
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_query_latest_tick_dataset_not_array() {
+        let body = r#"{"dataset":"not_array"}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_questdb_client: success path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_questdb_client_success() {
+        let result = build_questdb_client(3);
+        assert!(result.is_ok());
     }
 }

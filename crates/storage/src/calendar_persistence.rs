@@ -697,4 +697,49 @@ mod tests {
         let has_muhurat = entries.iter().any(|e| e.is_muhurat);
         assert!(has_muhurat, "calendar should contain a muhurat entry");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL warn! field evaluation with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_non_success_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, warn! body expressions are evaluated.
+        ensure_calendar_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_send_error_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_calendar_table(&config).await;
+    }
 }

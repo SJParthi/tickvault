@@ -692,4 +692,43 @@ mod tests {
         assert_eq!(last.name, "candles_1M");
         assert_eq!(last.interval, "1M");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: tracing subscriber forces warn!/info! field evaluation
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, info! field `views_total` is evaluated.
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_failure_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let base_url = format!("http://127.0.0.1:{port}/exec");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // With tracing subscriber, warn! body expression is evaluated.
+        let result = execute_ddl(&client, &base_url, "BAD SQL", "test_label").await;
+        assert!(!result);
+    }
 }

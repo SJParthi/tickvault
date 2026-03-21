@@ -3642,4 +3642,203 @@ mod tests {
         // Must not panic, just logs warnings
         ensure_tick_table_dedup_keys(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL warn! field evaluation with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    /// Helper: install a tracing subscriber so `warn!` field expressions
+    /// (e.g., `body.chars().take(200).collect::<String>()`) are evaluated.
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_non_success_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With a tracing subscriber, warn! field expressions are evaluated,
+        // covering `body.chars().take(200).collect::<String>()` lines.
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_send_error_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        // Server accepts connection then immediately drops it → send error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_non_success_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises execute_ddl_best_effort non-success path with field eval.
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_send_error_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept first connection and respond OK, then drop second
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately → send error on DEDUP DDL
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_dedup_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        // Two-phase: first request (CREATE TABLE) succeeds,
+        // second request (DEDUP) gets connection dropped → send error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond with 200
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately → DEDUP send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: flush_if_needed with time elapsed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_writer_flush_if_needed_triggers_after_interval() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Append one tick so pending_count > 0
+        let tick = make_test_tick(42, 100.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Force last_flush_ms to be old enough by sleeping past the interval
+        std::thread::sleep(std::time::Duration::from_millis(
+            TICK_FLUSH_INTERVAL_MS + 100,
+        ));
+
+        // Now flush_if_needed should trigger force_flush
+        writer.flush_if_needed().unwrap();
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "flush_if_needed must flush when interval elapsed"
+        );
+    }
+
+    #[test]
+    fn test_depth_writer_flush_if_needed_triggers_after_interval() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 100.0,
+            ask_price: 100.5,
+        }; 5];
+        writer
+            .append_depth(
+                42,
+                EXCHANGE_SEGMENT_NSE_EQ,
+                1_700_000_000_000_000_000,
+                &depth,
+            )
+            .unwrap();
+        assert!(writer.pending_count > 0);
+
+        // Sleep past the flush interval
+        std::thread::sleep(std::time::Duration::from_millis(
+            TICK_FLUSH_INTERVAL_MS + 100,
+        ));
+
+        // Now flush_if_needed should trigger force_flush
+        writer.flush_if_needed().unwrap();
+        assert_eq!(
+            writer.pending_count, 0,
+            "flush_if_needed must flush depth when interval elapsed"
+        );
+    }
 }

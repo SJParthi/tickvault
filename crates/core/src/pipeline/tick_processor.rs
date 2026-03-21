@@ -2918,4 +2918,508 @@ mod tests {
             DEDUP_RING_BUFFER_POWER
         );
     }
+
+    // ===================================================================
+    // Full packet with valid depth: exercises TickWithDepth path
+    // including broadcast, candle aggregator, and top movers
+    // ===================================================================
+
+    /// Build a Full Quote (code 8) frame with valid depth data at all 5 levels.
+    fn make_full_frame_with_depth(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        use dhan_live_trader_common::constants::FULL_OFFSET_DEPTH_START;
+
+        let mut buf = vec![0u8; FULL_QUOTE_PACKET_SIZE];
+        buf[HEADER_OFFSET_RESPONSE_CODE] = RESPONSE_CODE_FULL;
+        buf[HEADER_OFFSET_MESSAGE_LENGTH..HEADER_OFFSET_MESSAGE_LENGTH + 2]
+            .copy_from_slice(&(FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes());
+        buf[HEADER_OFFSET_EXCHANGE_SEGMENT] = 2; // NSE_FNO
+        buf[HEADER_OFFSET_SECURITY_ID..HEADER_OFFSET_SECURITY_ID + 4]
+            .copy_from_slice(&security_id.to_le_bytes());
+        // LTP and LTT
+        buf[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&ltp.to_le_bytes());
+        buf[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4].copy_from_slice(&ltt.to_le_bytes());
+        // Set valid depth at all 5 levels (20 bytes each)
+        for level in 0..5_usize {
+            let base = FULL_OFFSET_DEPTH_START + level * 20;
+            // bid_quantity (u32)
+            buf[base..base + 4].copy_from_slice(&100u32.to_le_bytes());
+            // ask_quantity (u32)
+            buf[base + 4..base + 8].copy_from_slice(&200u32.to_le_bytes());
+            // bid_orders (u16)
+            buf[base + 8..base + 10].copy_from_slice(&5u16.to_le_bytes());
+            // ask_orders (u16)
+            buf[base + 10..base + 12].copy_from_slice(&10u16.to_le_bytes());
+            // bid_price (f32)
+            let bid = ltp - 1.0 - (level as f32);
+            buf[base + 12..base + 16].copy_from_slice(&bid.to_le_bytes());
+            // ask_price (f32)
+            let ask = ltp + 1.0 + (level as f32);
+            buf[base + 16..base + 20].copy_from_slice(&ask.to_le_bytes());
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_with_depth_broadcast_and_candle() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+
+        let (tick_tx, mut tick_rx) = broadcast::channel::<ParsedTick>(100);
+        let candle_agg = CandleAggregator::new();
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_tx),
+                Some(candle_agg),
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send Full frame with valid depth and market-hours timestamp
+        // 10:00:00 IST = secs_of_day 36000
+        let ts = 36000_u32;
+        let frame = make_full_frame_with_depth(13, 24500.0, ts);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Verify broadcast received the tick
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), tick_rx.recv()).await;
+        assert!(received.is_ok(), "should receive broadcast tick");
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_with_depth_top_movers() {
+        use crate::pipeline::top_movers::TopMoversTracker;
+
+        let tracker = TopMoversTracker::new();
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, Some(tracker), None).await;
+        });
+
+        let ts = 36000_u32; // 10:00 IST
+        let frame = make_full_frame_with_depth(42, 25000.0, ts);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_dedup_duplicate_with_depth() {
+        // Send two identical Full frames: first passes, second is deduped.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let ts = 36000_u32;
+        let frame = make_full_frame_with_depth(13, 24500.0, ts);
+        frame_tx
+            .send(bytes::Bytes::from(frame.clone()))
+            .await
+            .unwrap();
+        // Send exact duplicate
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_with_depth_nan_depth_filtered() {
+        // Full frame with valid LTP but NaN bid_price in depth level 0
+        use dhan_live_trader_common::constants::FULL_OFFSET_DEPTH_START;
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let ts = 36000_u32;
+        let mut frame = make_full_frame_with_depth(13, 24500.0, ts);
+        // Corrupt bid_price at level 0 to NaN
+        let base = FULL_OFFSET_DEPTH_START;
+        frame[base + 12..base + 16].copy_from_slice(&f32::NAN.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_crossed_market() {
+        // Full frame where bid > ask at best level (crossed market detection)
+        use dhan_live_trader_common::constants::FULL_OFFSET_DEPTH_START;
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let ts = 36000_u32;
+        let mut frame = make_full_frame_with_depth(13, 24500.0, ts);
+        // Set bid > ask at level 0 (crossed market)
+        let base = FULL_OFFSET_DEPTH_START;
+        frame[base + 12..base + 16].copy_from_slice(&24600.0_f32.to_le_bytes()); // bid
+        frame[base + 16..base + 20].copy_from_slice(&24400.0_f32.to_le_bytes()); // ask
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_outside_market_hours() {
+        // Full frame with timestamp outside market hours: depth should not persist
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // 20:00 IST = secs_of_day 72000 (outside [09:00, 15:30))
+        let ts = 72000_u32;
+        let frame = make_full_frame_with_depth(13, 24500.0, ts);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // PreviousClose with market-hours received_at_nanos
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_with_valid_price() {
+        use dhan_live_trader_common::constants::PREV_CLOSE_OFFSET_PRICE;
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // Build a previous close frame with a real price
+        let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        frame[PREV_CLOSE_OFFSET_PRICE..PREV_CLOSE_OFFSET_PRICE + 4]
+            .copy_from_slice(&24300.0_f32.to_le_bytes());
+
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_nan_price_filtered() {
+        use dhan_live_trader_common::constants::PREV_CLOSE_OFFSET_PRICE;
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        frame[PREV_CLOSE_OFFSET_PRICE..PREV_CLOSE_OFFSET_PRICE + 4]
+            .copy_from_slice(&f32::NAN.to_le_bytes());
+
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Deep depth frame processing
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_deep_depth_frame() {
+        use dhan_live_trader_common::constants::{
+            DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
+        };
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // Build a 20-level bid depth frame (response_code 41)
+        let total_size = DEEP_DEPTH_HEADER_SIZE + TWENTY_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE;
+        let mut buf = vec![0u8; total_size];
+        // Deep depth header: bytes 0-1 = msg_len, byte 2 = response_code, byte 3 = segment
+        buf[0..2].copy_from_slice(&(total_size as u16).to_le_bytes());
+        buf[2] = 41; // Bid side
+        buf[3] = 2; // NSE_FNO
+        buf[4..8].copy_from_slice(&42u32.to_le_bytes()); // security_id
+        buf[8..12].copy_from_slice(&20u32.to_le_bytes()); // sequence/row_count
+
+        // Fill 20 levels with valid depth data
+        for level in 0..TWENTY_DEPTH_LEVELS {
+            let base = DEEP_DEPTH_HEADER_SIZE + level * DEEP_DEPTH_LEVEL_SIZE;
+            // price (f64)
+            let price = 24500.0_f64 - (level as f64);
+            buf[base..base + 8].copy_from_slice(&price.to_le_bytes());
+            // quantity (u32)
+            buf[base + 8..base + 12].copy_from_slice(&100u32.to_le_bytes());
+            // orders (u32)
+            buf[base + 12..base + 16].copy_from_slice(&5u32.to_le_bytes());
+        }
+
+        frame_tx.send(bytes::Bytes::from(buf)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // ===================================================================
+    // Candle aggregator with periodic sweep and final flush
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_candle_aggregator_sweep_and_flush() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+
+        let candle_agg = CandleAggregator::new();
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                Some(candle_agg),
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send ticks at different seconds to create multiple candle buckets
+        // ts = 36000 is 10:00:00 IST (within market hours)
+        for sec_offset in 0..5_u32 {
+            let ts = 36000 + sec_offset;
+            let frame = make_ticker_frame(13, 24500.0 + (sec_offset as f32), ts);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait >100ms to trigger periodic sweep
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Send more ticks to trigger the sweep check
+        for sec_offset in 5..8_u32 {
+            let ts = 36000 + sec_offset;
+            let frame = make_ticker_frame(13, 24510.0, ts);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_candle_persist_with_live_writer() {
+        use crate::pipeline::candle_aggregator::CandleAggregator;
+        use dhan_live_trader_common::config::QuestDbConfig;
+
+        // Mock QuestDB for candle writer
+        let candle_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let candle_port = candle_listener.local_addr().unwrap().port();
+        let candle_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = candle_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let candle_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: candle_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let candle_writer = LiveCandleWriter::new(&candle_config).unwrap();
+        let candle_agg = CandleAggregator::new();
+
+        let (frame_tx, frame_rx) = mpsc::channel(500);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                Some(candle_agg),
+                Some(candle_writer),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send ticks spread over multiple seconds to generate completed candles
+        for sec_offset in 0..4_u32 {
+            let ts = 36000 + sec_offset;
+            let frame = make_ticker_frame(13, 24500.0 + (sec_offset as f32), ts);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait for periodic flush + sweep
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Send more to trigger sweep of stale candles
+        let frame = make_ticker_frame(13, 24510.0, 36010);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        candle_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // TickWithDepth with zero-timestamp (Market Depth code 3 path)
+    // uses received_at_nanos for depth_ts_secs
+    // ===================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tick_processor_market_depth_code3_with_depth_writer() {
+        use dhan_live_trader_common::config::QuestDbConfig;
+
+        // Mock QuestDB for depth writer
+        let depth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let depth_port = depth_listener.local_addr().unwrap().port();
+        let depth_listener_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = depth_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let depth_config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: depth_port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let depth_writer = DepthPersistenceWriter::new(&depth_config).unwrap();
+
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                Some(depth_writer),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send a Market Depth code 3 frame with valid LTP
+        let frame = make_market_depth_frame(42, 25000.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Also send a Full frame with depth (code 8)
+        let full_frame = make_full_frame_with_depth(42, 25000.0, 36000);
+        frame_tx.send(bytes::Bytes::from(full_frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        drop(frame_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        depth_listener_handle.abort();
+    }
+
+    // ===================================================================
+    // Full frame with valid tick but LTP valid, no exchange_timestamp
+    // (code 3 style: LTP valid but exchange_timestamp < MINIMUM_VALID)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_full_valid_ltp_no_timestamp_depth_still_persists() {
+        // Full packet with valid LTP but exchange_timestamp=0
+        // LTP is valid so depth should still be processed (not filtered as junk)
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // timestamp = 0 but LTP is valid
+        let frame = make_full_frame_with_depth(13, 24500.0, 0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_junk_ltp_with_depth_skips_all() {
+        // Full frame with NaN LTP: both tick and depth should be skipped
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let frame = make_full_frame_with_depth(13, f32::NAN, 36000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_negative_ltp_with_depth_skips_all() {
+        // Full frame with negative LTP: both tick and depth should be skipped
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        let frame = make_full_frame_with_depth(13, -1.0, 36000);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
 }

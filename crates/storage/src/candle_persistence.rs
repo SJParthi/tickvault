@@ -1170,4 +1170,81 @@ mod tests {
         };
         ensure_candle_table_dedup_keys(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL warn! field evaluation with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_non_success_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, warn! body expressions are evaluated.
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_send_error_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        // Accept connection then drop → send error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_dedup_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        // Two-phase mock: first request (CREATE TABLE) succeeds,
+        // second request (DEDUP) gets connection dropped → send error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond with 200
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately → DEDUP send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_candle_table_dedup_keys(&config).await;
+    }
 }

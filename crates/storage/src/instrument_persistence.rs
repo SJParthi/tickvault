@@ -3660,4 +3660,154 @@ mod tests {
         assert!(debug_str.contains("LotSizeChanged"));
         assert!(debug_str.contains("TEST"));
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL warn! field evaluation with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_non_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, warn! body expressions are evaluated.
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_table_dedup_keys_non_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Covers ensure_table_dedup_keys non-success body evaluation.
+        ensure_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_persist_instrument_snapshot_ok_path_with_mock_http_and_ilp() {
+        let _guard = install_test_subscriber();
+        // Mock HTTP for DDL (ensure_table_dedup_keys)
+        let http_port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        // TCP drain for ILP writes
+        let ilp_port = spawn_multi_accept_tcp_drain_server();
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: http_port,
+            ilp_port,
+        };
+
+        let universe = FnoUniverse {
+            build_metadata: make_test_metadata(),
+            underlyings: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+                m
+            },
+            derivative_contracts: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(50001, make_test_contract(50001));
+                m
+            },
+            subscribed_indices: vec![make_test_fno_index("NIFTY 50", 13)],
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+        };
+
+        let result = persist_instrument_snapshot(&universe, &config).await;
+        assert!(
+            result.is_ok(),
+            "persist_instrument_snapshot with valid HTTP+ILP must succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_inner_write_error_covers_question_mark_propagation() {
+        let _guard = install_test_subscriber();
+        // Mock HTTP for DDL (best-effort, continues on error)
+        let http_port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        // TCP server that accepts connection then immediately closes it.
+        // The ILP Sender connects successfully but flush fails.
+        let ilp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ilp_port = ilp_listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Accept one connection and drop it immediately
+            if let Ok((_stream, _)) = ilp_listener.accept() {
+                // Connection accepted but immediately dropped
+            }
+        });
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: http_port,
+            ilp_port,
+        };
+
+        let universe = FnoUniverse {
+            build_metadata: make_test_metadata(),
+            underlyings: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+                m
+            },
+            derivative_contracts: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(50001, make_test_contract(50001));
+                m
+            },
+            subscribed_indices: vec![make_test_fno_index("NIFTY 50", 13)],
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+        };
+
+        // persist_inner should fail at one of the write_* calls when flush
+        // encounters the dropped connection. persist_instrument_snapshot
+        // wraps it and returns Ok.
+        let result = persist_instrument_snapshot(&universe, &config).await;
+        assert!(
+            result.is_ok(),
+            "persist_instrument_snapshot always returns Ok"
+        );
+    }
 }

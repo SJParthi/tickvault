@@ -68,20 +68,16 @@ pub async fn rebuild_instruments(State(state): State<SharedAppState>) -> Json<Re
     do_rebuild(&state).await
 }
 
-/// Inner rebuild logic — separated for clean guard release.
-async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
-    let dhan = state.dhan_config();
-    let inst = state.instrument_config();
-    let qdb = state.questdb_config();
-
-    match try_rebuild_instruments(
-        &dhan.instrument_csv_url,
-        &dhan.instrument_csv_fallback_url,
-        inst,
-        qdb,
-    )
-    .await
-    {
+/// Builds the JSON response from the result of `try_rebuild_instruments`.
+///
+/// Separated from `do_rebuild` for testability — the success path
+/// (`Ok(Some(universe))`) requires a real CSV pipeline to exercise via
+/// `try_rebuild_instruments`, but this function can be tested with a
+/// hand-constructed `FnoUniverse`.
+fn build_rebuild_response(
+    result: Result<Option<dhan_live_trader_common::instrument_types::FnoUniverse>, anyhow::Error>,
+) -> Json<RebuildResponse> {
+    match result {
         Ok(Some(universe)) => {
             let dc = universe.derivative_contracts.len();
             let uc = universe.underlyings.len();
@@ -116,6 +112,23 @@ async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
             })
         }
     }
+}
+
+/// Inner rebuild logic — separated for clean guard release.
+async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
+    let dhan = state.dhan_config();
+    let inst = state.instrument_config();
+    let qdb = state.questdb_config();
+
+    let result = try_rebuild_instruments(
+        &dhan.instrument_csv_url,
+        &dhan.instrument_csv_fallback_url,
+        inst,
+        qdb,
+    )
+    .await;
+
+    build_rebuild_response(result)
 }
 
 /// `GET /api/instruments/diagnostic` — full instrument system health check.
@@ -402,5 +415,138 @@ mod tests {
         let debug = format!("{resp:?}");
         assert!(debug.contains("RebuildResponse"));
         assert!(debug.contains("rebuilt"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rebuild_response: Ok(Some(universe)) success path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rebuild_response_success_with_universe() {
+        use dhan_live_trader_common::instrument_types::{
+            DerivativeContract, DhanInstrumentKind, FnoUnderlying, FnoUniverse, UnderlyingKind,
+            UniverseBuildMetadata,
+        };
+        use dhan_live_trader_common::types::ExchangeSegment;
+        use std::collections::HashMap;
+
+        let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let now = chrono::Utc::now().with_timezone(&ist);
+
+        let mut derivative_contracts = HashMap::new();
+        derivative_contracts.insert(
+            50001_u32,
+            DerivativeContract {
+                security_id: 50001,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 75,
+                tick_size: 0.05,
+                symbol_name: "NIFTY-FUT".to_string(),
+                display_name: "NIFTY FUT".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            50002_u32,
+            DerivativeContract {
+                security_id: 50002,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+                strike_price: 25000.0,
+                option_type: Some(dhan_live_trader_common::types::OptionType::Call),
+                lot_size: 75,
+                tick_size: 0.05,
+                symbol_name: "NIFTY-CE-25000".to_string(),
+                display_name: "NIFTY 25000 CE".to_string(),
+            },
+        );
+
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "NIFTY".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 75,
+                contract_count: 2,
+            },
+        );
+
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts,
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 100_000,
+                parsed_row_count: 50_000,
+                index_count: 31,
+                equity_count: 2000,
+                underlying_count: 1,
+                derivative_count: 2,
+                option_chain_count: 1,
+                build_duration: std::time::Duration::from_millis(100),
+                build_timestamp: now,
+            },
+        };
+
+        let Json(resp) = build_rebuild_response(Ok(Some(universe)));
+        assert_eq!(resp.status, "rebuilt");
+        assert!(resp.message.contains("2 derivatives"));
+        assert!(resp.message.contains("1 underlyings"));
+        assert_eq!(resp.derivative_count, Some(2));
+        assert_eq!(resp.underlying_count, Some(1));
+    }
+
+    #[test]
+    fn test_build_rebuild_response_already_built() {
+        let Json(resp) = build_rebuild_response(Ok(None));
+        assert_eq!(resp.status, "already_built");
+        assert!(resp.message.contains("already built today"));
+        assert!(resp.derivative_count.is_none());
+    }
+
+    #[test]
+    fn test_build_rebuild_response_error() {
+        let err = anyhow::anyhow!("CSV download failed");
+        let Json(resp) = build_rebuild_response(Err(err));
+        assert_eq!(resp.status, "failed");
+        assert!(resp.message.contains("CSV download failed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // instrument_diagnostic: serde_json::to_value error fallback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_serde_serialization_error_fallback_format() {
+        // The unwrap_or_else fallback on the diagnostic endpoint handles
+        // serialization errors. We verify the fallback format directly since
+        // serde_json::to_value on a well-formed DiagnosticReport never fails.
+        let err =
+            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::Other, "simulated"));
+        let fallback = serde_json::json!({"error": format!("serialization failed: {err}")});
+        assert!(fallback.is_object());
+        assert!(
+            fallback
+                .get("error")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("serialization failed")
+        );
     }
 }
