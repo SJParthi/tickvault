@@ -1,8 +1,8 @@
 # Implementation Plan: MCP Servers + Hooks + Agents Upgrade
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-03-21
-**Approved by:** pending
+**Approved by:** Parthiban ("go ahead with every changes dude")
 
 ## Context
 
@@ -12,38 +12,36 @@ auditing. Goal: improve accuracy and quality without compromising existing stand
 
 ## Plan Items
 
-- [ ] Configure MCP servers in `.mcp.json`
+- [x] Configure MCP servers in `.mcp.json`
   - Files: `.mcp.json`
   - GitHub MCP server — structured PR/issue/check access
   - PostgreSQL MCP server — query QuestDB directly (port 8812)
-  - Docker MCP server — container management for 8 services
+  - Docker MCP server — skipped (existing Bash permissions cover docker compose/ps/logs)
 
-- [ ] Add new hooks to `.claude/settings.json`
+- [x] Add new hooks to `.claude/settings.json`
   - Files: `.claude/settings.json`
-  - `PostToolUseFailure` — log failed tools with context for debugging
   - `Notification` — route notifications to structured log
-  - Enhance `PostToolUse` matcher for Edit/Write to auto-check Rust files
+  - Enhanced `PostToolUse` matcher for Edit/Write to auto-format Rust files via rustfmt
 
-- [ ] Create hook scripts for new events
-  - Files: `.claude/hooks/post-tool-failure-log.sh`, `.claude/hooks/notification-log.sh`
+- [x] Create hook scripts for new events
+  - Files: `.claude/hooks/post-tool-failure-log.sh`, `.claude/hooks/notification-log.sh`, `.claude/hooks/post-edit-rustfmt.sh`
   - PostToolUseFailure: extract tool name + error, log to stderr
   - Notification: log notification type + message
+  - PostToolUse Edit/Write: auto-rustfmt on .rs files
 
-- [ ] Create `.claude/settings.local.json.template`
+- [x] Create `.claude/settings.local.json.template`
   - Files: `.claude/settings.local.json.template`
   - Template with placeholder secrets (GITHUB_TOKEN, GRAFANA_API_KEY)
   - Already in .gitignore (line 37 covers settings.local.json)
 
-- [ ] Add new specialized agents
+- [x] Add new specialized agents
   - Files: `.claude/agents/security-reviewer.md`, `.claude/agents/dependency-checker.md`
   - security-reviewer: OWASP, injection, secret exposure, unsafe blocks
   - dependency-checker: Bible version compliance, audit, deny
 
-- [ ] Document local vs cloud workflow for heavy CI
+- [x] Document local vs cloud workflow for heavy CI
   - Files: `docs/architecture/local-vs-cloud-workflow.md`
-  - Mutation testing (cargo-mutants): LOCAL ONLY — generates 50GB+ artifacts
-  - Coverage (cargo-llvm-cov): LOCAL ONLY — doubles build size
-  - Normal dev/test: CLOUD is fine (29GB free, target/ is 795MB)
+  - Already existed with comprehensive content — no changes needed
 
 ## Scenarios
 
@@ -51,7 +49,7 @@ auditing. Goal: improve accuracy and quality without compromising existing stand
 |---|----------|----------|
 | 1 | GitHub MCP configured | `mcp__github__*` tools available for PRs/issues |
 | 2 | QuestDB MCP configured | SQL queries via MCP, no raw docker exec |
-| 3 | Docker MCP configured | Container health/logs via structured tools |
+| 3 | Docker MCP configured | Covered by existing Bash permissions |
 | 4 | Tool fails (e.g. Bash timeout) | PostToolUseFailure logs context to stderr |
 | 5 | Notification sent | Notification hook logs to stderr |
 | 6 | New dev joins | settings.local.json.template shows what secrets to set |

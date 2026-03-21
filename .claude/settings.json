@@ -120,19 +120,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-push-sync.sh",
-            "timeout": 10,
-            "statusMessage": "Syncing to integration branch..."
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
@@ -228,6 +215,41 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-compact-recovery.sh",
             "timeout": 10,
             "statusMessage": "Recovering context after compaction..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-push-sync.sh",
+            "timeout": 10,
+            "statusMessage": "Syncing to integration branch..."
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-edit-rustfmt.sh",
+            "timeout": 15,
+            "statusMessage": "Auto-formatting Rust file..."
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/notification-log.sh",
+            "timeout": 5
           }
         ]
       }
