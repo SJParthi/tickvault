@@ -66,6 +66,72 @@ fn is_within_persist_window(exchange_timestamp: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// O(1) Tick Validity Checks (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the LTP is a valid tradeable price.
+///
+/// Invalid: NaN, Infinity, zero, or negative values.
+/// O(1) — 1 `is_finite()` + 1 comparison.
+#[inline(always)]
+fn is_valid_ltp(ltp: f32) -> bool {
+    ltp.is_finite() && ltp > 0.0
+}
+
+/// Returns `true` if the tick has valid price AND timestamp.
+///
+/// Combines LTP validity with exchange timestamp range check.
+/// O(1) — 2 comparisons after `is_valid_ltp`.
+#[inline(always)]
+fn is_valid_tick(ltp: f32, exchange_timestamp: u32) -> bool {
+    is_valid_ltp(ltp) && exchange_timestamp >= MINIMUM_VALID_EXCHANGE_TIMESTAMP
+}
+
+/// Returns `true` if best bid > best ask (both positive).
+///
+/// Indicates an auction / pre-open period. Metric-only, do NOT filter.
+/// O(1) — 3 comparisons.
+#[inline(always)]
+fn is_crossed_market(best_bid: f32, best_ask: f32) -> bool {
+    best_bid > best_ask && best_bid > 0.0 && best_ask > 0.0
+}
+
+/// Converts UTC nanoseconds to IST seconds-of-day.
+///
+/// Used for PreviousClose and candle sweep timestamps that arrive as UTC
+/// `received_at_nanos` but need IST time-of-day for persist window check.
+///
+/// O(1) — 3 arithmetic ops.
+#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
+#[inline(always)]
+fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
+    received_at_nanos
+        .saturating_div(1_000_000_000)
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
+}
+
+/// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
+///
+/// Full packets (code 8) have exchange_timestamp > 0. Market Depth standalone
+/// packets (code 3) have exchange_timestamp=0, so we derive from received_at_nanos.
+///
+/// O(1) — 1 branch + optionally `utc_nanos_to_ist_secs_of_day`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // APPROVED: epoch fits u32 until 2106
+#[inline(always)]
+fn derive_depth_timestamp_secs(
+    tick_is_valid: bool,
+    exchange_timestamp: u32,
+    received_at_nanos: i64,
+) -> u32 {
+    if tick_is_valid {
+        exchange_timestamp
+    } else {
+        (received_at_nanos / 1_000_000_000) as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
 // O(1) Tick Deduplication Ring Buffer
 // ---------------------------------------------------------------------------
 
@@ -233,10 +299,7 @@ pub async fn run_tick_processor(
 
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
                 // or epoch timestamps (heartbeat/init frames from Dhan).
-                if !tick.last_traded_price.is_finite()
-                    || tick.last_traded_price <= 0.0
-                    || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
-                {
+                if !is_valid_tick(tick.last_traded_price, tick.exchange_timestamp) {
                     junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
@@ -315,9 +378,8 @@ pub async fn run_tick_processor(
                 // (code 3) have exchange_timestamp=0 by design, but their 5-level
                 // depth is valid. The tick portion is only persisted when the
                 // exchange timestamp is valid (Full packets, code 8).
-                let ltp_valid = tick.last_traded_price.is_finite() && tick.last_traded_price > 0.0;
-                let tick_is_valid =
-                    ltp_valid && tick.exchange_timestamp >= MINIMUM_VALID_EXCHANGE_TIMESTAMP;
+                let ltp_valid = is_valid_ltp(tick.last_traded_price);
+                let tick_is_valid = is_valid_tick(tick.last_traded_price, tick.exchange_timestamp);
 
                 if tick_is_valid {
                     // O(1) dedup: skip entire snapshot if tick is exact duplicate.
@@ -381,10 +443,7 @@ pub async fn run_tick_processor(
 
                 // O(1) crossed market detection: bid > ask at best level.
                 // Occurs during auction periods — metric only, do NOT filter.
-                if depth[0].bid_price > depth[0].ask_price
-                    && depth[0].bid_price > 0.0
-                    && depth[0].ask_price > 0.0
-                {
+                if is_crossed_market(depth[0].bid_price, depth[0].ask_price) {
                     m_crossed_market.increment(1);
                     debug!(
                         security_id = tick.security_id,
@@ -399,13 +458,11 @@ pub async fn run_tick_processor(
                 // For Full packets (code 8), use exchange_timestamp.
                 // For Market Depth standalone (code 3), exchange_timestamp=0,
                 // so derive wall-clock seconds from received_at_nanos.
-                // APPROVED: i64→u32 truncation is safe: epoch fits u32 until 2106
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let depth_ts_secs = if tick_is_valid {
-                    tick.exchange_timestamp
-                } else {
-                    (tick.received_at_nanos / 1_000_000_000) as u32
-                };
+                let depth_ts_secs = derive_depth_timestamp_secs(
+                    tick_is_valid,
+                    tick.exchange_timestamp,
+                    tick.received_at_nanos,
+                );
                 if is_within_persist_window(depth_ts_secs) {
                     m_depth_snapshots.increment(1);
                     if let Some(ref mut dw) = depth_writer
@@ -481,16 +538,8 @@ pub async fn run_tick_processor(
 
                 // Only persist previous close during market hours [09:00, 15:30) IST.
                 // PrevClose packets arrive on every subscription, even pre-market.
-                // APPROVED: i64→u32 truncation safe: secs-of-day fits u32
-                #[allow(clippy::cast_possible_truncation)]
-                let prev_close_ist_secs = received_at_nanos
-                    .saturating_div(1_000_000_000)
-                    .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
-                    .rem_euclid(i64::from(SECONDS_PER_DAY))
-                    as u32;
-                if !((TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
-                    .contains(&prev_close_ist_secs))
-                {
+                let prev_close_ist_secs = utc_nanos_to_ist_secs_of_day(received_at_nanos);
+                if !is_within_persist_window(prev_close_ist_secs) {
                     continue;
                 }
 
@@ -2579,5 +2628,269 @@ mod tests {
             !(TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
                 .contains(&prev_close_ist_secs)
         );
+    }
+
+    // ===================================================================
+    // is_valid_ltp — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_is_valid_ltp_positive_price() {
+        assert!(is_valid_ltp(24500.0));
+        assert!(is_valid_ltp(0.01));
+        assert!(is_valid_ltp(f32::MAX));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_zero() {
+        assert!(!is_valid_ltp(0.0));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_negative_zero() {
+        assert!(!is_valid_ltp(-0.0));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_negative() {
+        assert!(!is_valid_ltp(-1.0));
+        assert!(!is_valid_ltp(-24500.0));
+        assert!(!is_valid_ltp(f32::MIN));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_nan() {
+        assert!(!is_valid_ltp(f32::NAN));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_positive_infinity() {
+        assert!(!is_valid_ltp(f32::INFINITY));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_negative_infinity() {
+        assert!(!is_valid_ltp(f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_subnormal() {
+        // Subnormal is finite and > 0.0, so it's valid
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        assert!(subnormal.is_subnormal());
+        assert!(is_valid_ltp(subnormal));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_min_positive() {
+        assert!(is_valid_ltp(f32::MIN_POSITIVE));
+    }
+
+    // ===================================================================
+    // is_valid_tick — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_is_valid_tick_valid_inputs() {
+        assert!(is_valid_tick(24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP));
+        assert!(is_valid_tick(100.0, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_zero_ltp() {
+        assert!(!is_valid_tick(0.0, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_nan_ltp() {
+        assert!(!is_valid_tick(f32::NAN, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_inf_ltp() {
+        assert!(!is_valid_tick(f32::INFINITY, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_negative_ltp() {
+        assert!(!is_valid_tick(-1.0, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_zero_timestamp() {
+        assert!(!is_valid_tick(24500.0, 0));
+    }
+
+    #[test]
+    fn test_is_valid_tick_below_minimum_timestamp() {
+        assert!(!is_valid_tick(
+            24500.0,
+            MINIMUM_VALID_EXCHANGE_TIMESTAMP - 1
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_tick_at_minimum_timestamp() {
+        assert!(is_valid_tick(24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP));
+    }
+
+    #[test]
+    fn test_is_valid_tick_both_invalid() {
+        assert!(!is_valid_tick(0.0, 0));
+        assert!(!is_valid_tick(f32::NAN, 0));
+    }
+
+    // ===================================================================
+    // is_crossed_market — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_is_crossed_market_normal_spread() {
+        // bid < ask — normal market, not crossed
+        assert!(!is_crossed_market(24500.0, 24501.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_equal() {
+        // bid == ask — locked market, not crossed
+        assert!(!is_crossed_market(24500.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_bid_greater() {
+        // bid > ask — crossed market
+        assert!(is_crossed_market(24501.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_zero_bid() {
+        // bid = 0 — not crossed (bid not > 0)
+        assert!(!is_crossed_market(0.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_zero_ask() {
+        // ask = 0 — not crossed (ask not > 0)
+        assert!(!is_crossed_market(24501.0, 0.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_both_zero() {
+        assert!(!is_crossed_market(0.0, 0.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_negative_bid() {
+        assert!(!is_crossed_market(-1.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_negative_ask() {
+        assert!(!is_crossed_market(24501.0, -1.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_small_inversion() {
+        // 0.05 paise inversion — still crossed
+        assert!(is_crossed_market(24500.05, 24500.0));
+    }
+
+    // ===================================================================
+    // utc_nanos_to_ist_secs_of_day — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_zero() {
+        // UTC epoch 0 → IST 05:30:00 → secs_of_day = 19800
+        let secs = utc_nanos_to_ist_secs_of_day(0);
+        assert_eq!(secs, 19800);
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_market_open() {
+        // IST 09:00:00 = UTC 03:30:00 = 3*3600 + 30*60 = 12600 secs
+        // nanos = 12600 * 1_000_000_000
+        let nanos: i64 = 12600 * 1_000_000_000;
+        let secs = utc_nanos_to_ist_secs_of_day(nanos);
+        assert_eq!(secs, 32400); // 09:00 IST = 32400 secs-of-day
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_market_close() {
+        // IST 15:30:00 = UTC 10:00:00 = 36000 secs
+        let nanos: i64 = 36000 * 1_000_000_000;
+        let secs = utc_nanos_to_ist_secs_of_day(nanos);
+        assert_eq!(secs, 55800); // 15:30 IST = 55800 secs-of-day
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_result_in_range() {
+        // Any valid input should produce secs_of_day in [0, 86400)
+        for epoch_secs in [0_i64, 1772073900, 1_000_000_000, i64::MAX / 2] {
+            let nanos = epoch_secs.saturating_mul(1_000_000_000);
+            let secs = utc_nanos_to_ist_secs_of_day(nanos);
+            assert!(
+                secs < SECONDS_PER_DAY,
+                "secs_of_day out of range for input {epoch_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_negative_nanos() {
+        // Negative nanos (before epoch) should still produce valid secs-of-day via rem_euclid
+        let secs = utc_nanos_to_ist_secs_of_day(-1_000_000_000);
+        assert!(secs < SECONDS_PER_DAY);
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_midnight_ist() {
+        // IST midnight = UTC 18:30 previous day = 18*3600 + 30*60 = 66600 UTC secs-of-day
+        // But we need full epoch. Let's use a known date.
+        // 2026-03-17 UTC 18:30:00 = IST 2026-03-18 00:00:00
+        // nanos = 66600 * 1_000_000_000
+        let nanos: i64 = 66600 * 1_000_000_000;
+        let secs = utc_nanos_to_ist_secs_of_day(nanos);
+        // 66600 UTC secs + 19800 IST offset = 86400 → 86400 % 86400 = 0 → midnight IST
+        assert_eq!(secs, 0);
+    }
+
+    // ===================================================================
+    // derive_depth_timestamp_secs — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_derive_depth_timestamp_valid_tick() {
+        // tick_is_valid = true → use exchange_timestamp
+        let ts = derive_depth_timestamp_secs(true, 1772073900, 1_772_000_000_000_000_000);
+        assert_eq!(ts, 1772073900);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_invalid_tick() {
+        // tick_is_valid = false → derive from received_at_nanos
+        let nanos: i64 = 1_772_073_900_000_000_000;
+        let ts = derive_depth_timestamp_secs(false, 0, nanos);
+        assert_eq!(ts, 1_772_073_900);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_invalid_tick_zero_nanos() {
+        let ts = derive_depth_timestamp_secs(false, 0, 0);
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_valid_ignores_nanos() {
+        // Even with different nanos, valid tick uses exchange_timestamp
+        let ts = derive_depth_timestamp_secs(true, 12345, 99_999_999_999_999_999);
+        assert_eq!(ts, 12345);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_invalid_large_nanos() {
+        let nanos: i64 = 2_000_000_000_000_000_000; // ~2033
+        let ts = derive_depth_timestamp_secs(false, 0, nanos);
+        assert_eq!(ts, 2_000_000_000);
     }
 }

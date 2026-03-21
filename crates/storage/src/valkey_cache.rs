@@ -660,4 +660,184 @@ mod tests {
         // target = 0, so past → wrap: 86400 - 19800 + 0 = 66600
         assert_eq!(ttl, 66_600);
     }
+
+    // -----------------------------------------------------------------------
+    // compute_instrument_ttl_secs — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_instrument_ttl_target_hour_23() {
+        // target_hour = 23 → target_secs = 82800
+        // epoch 0 → IST 05:30 → ist_secs_today = 19800
+        // 19800 < 82800 → remaining = 82800 - 19800 = 63000
+        let ttl = compute_instrument_ttl_secs(0, 23);
+        assert_eq!(ttl, 63_000);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_exactly_at_target() {
+        // When IST time == target → wraps to next day (86400)
+        let target_secs: u64 = 12 * 3600; // 12:00 IST = 43200
+        // Need (epoch + 19800) % 86400 = 43200
+        let epoch = 86_400 + 43_200 - 19_800; // = 109800
+        let ttl = compute_instrument_ttl_secs(epoch, 12);
+        assert_eq!(ttl, 86_400);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_one_second_after_target() {
+        // IST time = target_secs + 1 → wrap to next day minus 1 second
+        let target_secs: u64 = 6 * 3600; // 06:00 IST = 21600
+        // Need (epoch + 19800) % 86400 = 21601
+        let epoch = 86_400 + 21_601 - 19_800;
+        let ttl = compute_instrument_ttl_secs(epoch, 6);
+        // remaining = 86400 - 21601 + 21600 = 86399
+        assert_eq!(ttl, 86_399);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_always_at_least_60() {
+        // Test various inputs — TTL should never be below 60
+        for hour in 0..24_u8 {
+            for epoch_offset in [0_u64, 100, 1000, 86400, 172800] {
+                let ttl = compute_instrument_ttl_secs(epoch_offset, hour);
+                assert!(
+                    ttl >= 60,
+                    "TTL must be >= 60 for hour={hour}, epoch={epoch_offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_always_at_most_86400() {
+        for hour in 0..24_u8 {
+            for epoch_offset in [0_u64, 100, 1000, 86400, 172800] {
+                let ttl = compute_instrument_ttl_secs(epoch_offset, hour);
+                assert!(
+                    ttl <= 86_400,
+                    "TTL must be <= 86400 for hour={hour}, epoch={epoch_offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_large_epoch() {
+        // Far future epoch value
+        let ttl = compute_instrument_ttl_secs(2_000_000_000, 8);
+        assert!(ttl >= 60);
+        assert!(ttl <= 86_400);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_valkey_url — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_valkey_url_min_port() {
+        let url = build_valkey_url("host", 1);
+        assert_eq!(url, "redis://host:1");
+    }
+
+    #[test]
+    fn test_build_valkey_url_max_port() {
+        let url = build_valkey_url("host", u16::MAX);
+        assert_eq!(url, "redis://host:65535");
+    }
+
+    #[test]
+    fn test_build_valkey_url_empty_host() {
+        let url = build_valkey_url("", 6379);
+        assert_eq!(url, "redis://:6379");
+    }
+
+    #[test]
+    fn test_build_valkey_url_localhost() {
+        let url = build_valkey_url("localhost", 6379);
+        assert_eq!(url, "redis://localhost:6379");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_instrument_cache_key — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_instrument_cache_key_long_suffix() {
+        let key = build_instrument_cache_key("binary_cache_2026_03_21");
+        assert_eq!(key, "dlt:instrument:binary_cache_2026_03_21");
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_special_chars() {
+        let key = build_instrument_cache_key("csv:hash:v2");
+        assert_eq!(key, "dlt:instrument:csv:hash:v2");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_token_cache_key — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_token_cache_key_empty_suffix() {
+        let key = build_token_cache_key("");
+        assert_eq!(key, "dlt:token:");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_refresh() {
+        let key = build_token_cache_key("refresh_at");
+        assert_eq!(key, "dlt:token:refresh_at");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tick_cache_key — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_tick_cache_key_empty_suffix() {
+        let key = build_tick_cache_key(11536, "");
+        assert_eq!(key, "dlt:tick:11536:");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_complex_suffix() {
+        let key = build_tick_cache_key(42, "ohlcv:1m");
+        assert_eq!(key, "dlt:tick:42:ohlcv:1m");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_one() {
+        let key = build_tick_cache_key(1, "ltp");
+        assert_eq!(key, "dlt:tick:1:ltp");
+    }
+
+    // -----------------------------------------------------------------------
+    // ValkeyPool::new — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pool_new_returns_ok_with_typical_config() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        assert!(ValkeyPool::new(&config).is_ok());
+    }
+
+    #[test]
+    fn test_pool_status_fields() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 8,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+        let status = pool.pool.status();
+        assert_eq!(status.max_size, 8);
+        assert_eq!(status.size, 0);
+        assert_eq!(status.available, 0);
+        assert_eq!(status.waiting, 0);
+    }
 }

@@ -699,4 +699,143 @@ mod tests {
         assert!(msg.contains("login message"));
         assert!(msg.contains("broken pipe"));
     }
+
+    // -----------------------------------------------------------------------
+    // compute_reconnect_backoff_ms — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_reconnect_backoff_monotonically_increases() {
+        let mut prev = 0_u64;
+        for failures in 0..=10 {
+            let delay = compute_reconnect_backoff_ms(failures);
+            assert!(
+                delay >= prev,
+                "backoff must not decrease: {prev} -> {delay} at failures={failures}"
+            );
+            prev = delay;
+        }
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_always_positive() {
+        for failures in 0..=100 {
+            let delay = compute_reconnect_backoff_ms(failures);
+            assert!(delay > 0, "delay must be positive for failures={failures}");
+        }
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_capped_consistently() {
+        // Once capped, all higher failure counts return the same max
+        let max_delay = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        let high = compute_reconnect_backoff_ms(30);
+        let higher = compute_reconnect_backoff_ms(50);
+        let highest = compute_reconnect_backoff_ms(u32::MAX);
+        assert_eq!(high, max_delay);
+        assert_eq!(higher, max_delay);
+        assert_eq!(highest, max_delay);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_read_timeout_secs — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_read_timeout_returns_constants() {
+        // Verify the function returns exact constant values
+        assert_eq!(
+            select_read_timeout_secs(true),
+            ORDER_UPDATE_READ_TIMEOUT_SECS
+        );
+        assert_eq!(
+            select_read_timeout_secs(false),
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_time_within_data_collection_window — boundary saturation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_at_0915_is_within_window() {
+        // Pre-open ends at 09:15 IST, continuous trading starts — well within window
+        let time = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_1530_is_within_window() {
+        // 15:30 IST is still within [09:00, 16:00) order data collection window
+        let time = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_2359_is_outside_window() {
+        let time = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_reconnect_action — exhaustive matrix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconnect_action_exhausted_outside_hours_non_timeout() {
+        // Non-timeout outside hours at max+1 → exhausted (timeout check is first)
+        let action = decide_reconnect_action(false, false, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::Exhausted);
+    }
+
+    #[test]
+    fn test_reconnect_action_zero_failures_increments() {
+        // First failure (tentative_failures=1) should increment
+        let action = decide_reconnect_action(false, true, 1);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_timeout_outside_hours_at_zero_failures() {
+        let action = decide_reconnect_action(true, false, 0);
+        assert_eq!(action, ReconnectAction::ResetAndReconnect);
+    }
+
+    // -----------------------------------------------------------------------
+    // DATA_COLLECTION constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_collection_window_constants() {
+        assert_eq!(DATA_COLLECTION_START, (9, 0));
+        assert_eq!(DATA_COLLECTION_END, (16, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // ReconnectAction derive coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconnect_action_debug() {
+        let action = ReconnectAction::ResetAndReconnect;
+        let debug = format!("{action:?}");
+        assert!(debug.contains("ResetAndReconnect"));
+    }
+
+    #[test]
+    fn test_reconnect_action_all_variants_distinct() {
+        let variants = [
+            ReconnectAction::ResetAndReconnect,
+            ReconnectAction::IncrementAndRetry,
+            ReconnectAction::Exhausted,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "variants {i} and {j} must be distinct");
+                }
+            }
+        }
+    }
 }
