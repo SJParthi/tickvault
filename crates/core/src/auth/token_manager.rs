@@ -2556,4 +2556,124 @@ mod tests {
         handle.store(Arc::new(None));
         assert!(handle.load().as_ref().is_none(), "None store must clear");
     }
+
+    // -----------------------------------------------------------------------
+    // Error classification — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_permanent_auth_error_invalid_pin() {
+        assert!(is_permanent_auth_error("Dhan auth error: Invalid Pin"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_invalid_client() {
+        assert!(is_permanent_auth_error("Invalid Client ID"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_blocked() {
+        assert!(is_permanent_auth_error(
+            "Account is blocked due to violations"
+        ));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_suspended() {
+        assert!(is_permanent_auth_error("account suspended by admin"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_disabled() {
+        assert!(is_permanent_auth_error("API access disabled"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_case_insensitive() {
+        assert!(is_permanent_auth_error("INVALID PIN"));
+        assert!(is_permanent_auth_error("BLOCKED"));
+        assert!(is_permanent_auth_error("Suspended"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_transient_not_permanent() {
+        assert!(!is_permanent_auth_error("connection timeout"));
+        assert!(!is_permanent_auth_error("network error"));
+        assert!(!is_permanent_auth_error("rate limit exceeded"));
+        assert!(!is_permanent_auth_error(""));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_totp_not_permanent() {
+        // TOTP errors are handled separately by is_totp_error
+        assert!(!is_permanent_auth_error("Invalid TOTP code"));
+    }
+
+    #[test]
+    fn test_is_totp_error_invalid_totp() {
+        assert!(is_totp_error("Dhan auth error: Invalid TOTP"));
+    }
+
+    #[test]
+    fn test_is_totp_error_totp_failed() {
+        assert!(is_totp_error("TOTP verification failed"));
+    }
+
+    #[test]
+    fn test_is_totp_error_case_insensitive() {
+        assert!(is_totp_error("invalid totp code"));
+        assert!(is_totp_error("TOTP INVALID"));
+    }
+
+    #[test]
+    fn test_is_totp_error_requires_both_keywords() {
+        // Must contain both "totp" and ("invalid" or "failed")
+        assert!(!is_totp_error("totp code generated")); // totp without invalid/failed
+        assert!(!is_totp_error("invalid PIN")); // invalid without totp
+    }
+
+    #[test]
+    fn test_is_totp_error_not_other_errors() {
+        assert!(!is_totp_error("connection timeout"));
+        assert!(!is_totp_error("rate limit"));
+        assert!(!is_totp_error(""));
+    }
+
+    #[test]
+    fn test_is_dhan_rate_limited_every_2_minutes() {
+        assert!(is_dhan_rate_limited(
+            "Token can be generated every 2 minutes"
+        ));
+    }
+
+    #[test]
+    fn test_is_dhan_rate_limited_once_every() {
+        assert!(is_dhan_rate_limited("once every 120 seconds"));
+    }
+
+    #[test]
+    fn test_is_dhan_rate_limited_not_other_errors() {
+        assert!(!is_dhan_rate_limited("DH-904 rate limit"));
+        assert!(!is_dhan_rate_limited("connection timeout"));
+        assert!(!is_dhan_rate_limited(""));
+    }
+
+    #[test]
+    fn test_error_classification_mutual_exclusion() {
+        // Verify that typical error messages only match one classifier
+        let pin_error = "Invalid Pin";
+        assert!(is_permanent_auth_error(pin_error));
+        assert!(!is_totp_error(pin_error));
+        assert!(!is_dhan_rate_limited(pin_error));
+
+        let totp_error = "Invalid TOTP code";
+        assert!(!is_permanent_auth_error(totp_error));
+        assert!(is_totp_error(totp_error));
+        assert!(!is_dhan_rate_limited(totp_error));
+
+        let rate_error = "Token can be generated every 2 minutes";
+        assert!(!is_permanent_auth_error(rate_error));
+        assert!(!is_totp_error(rate_error));
+        assert!(is_dhan_rate_limited(rate_error));
+    }
 }

@@ -3096,4 +3096,120 @@ mod tests {
         assert!(result.diff_summary.contains('V'));
         assert!(result.diff_summary.contains("OI("));
     }
+
+    // -----------------------------------------------------------------------
+    // parse_single_violation_row — additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_violation_row_all_null_values() {
+        let row = vec![
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ];
+        let parsed = parse_single_violation_row(&row).unwrap();
+        assert_eq!(parsed.security_id, 0);
+        assert_eq!(parsed.segment, "");
+        assert_eq!(parsed.open, 0.0);
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_exactly_9_elements() {
+        let row: Vec<serde_json::Value> = (0..9).map(|i| serde_json::json!(i)).collect();
+        assert!(parse_single_violation_row(&row).is_some());
+    }
+
+    #[test]
+    fn test_parse_single_violation_row_8_elements() {
+        let row: Vec<serde_json::Value> = (0..8).map(|i| serde_json::json!(i)).collect();
+        assert!(parse_single_violation_row(&row).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_single_cross_match_row — additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_cross_match_row_null_live_data() {
+        let row: Vec<serde_json::Value> = vec![
+            serde_json::json!(1333),
+            serde_json::json!("NSE_EQ"),
+            serde_json::json!("2026-03-18T10:15:00Z"),
+            serde_json::json!(100.0),
+            serde_json::json!(110.0),
+            serde_json::json!(95.0),
+            serde_json::json!(105.0),
+            serde_json::json!(50000),
+            serde_json::Value::Null, // m_open is null
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(0),
+        ];
+        let parsed = parse_single_cross_match_row(&row).unwrap();
+        assert!(parsed.live_is_null);
+        assert_eq!(parsed.live.open, 0.0);
+        assert_eq!(parsed.live.volume, 0);
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_14_elements_rejected() {
+        let row: Vec<serde_json::Value> = (0..14).map(|i| serde_json::json!(i)).collect();
+        assert!(parse_single_cross_match_row(&row).is_none());
+    }
+
+    #[test]
+    fn test_parse_single_cross_match_row_15_elements_accepted() {
+        let row: Vec<serde_json::Value> = (0..15).map(|i| serde_json::json!(i as f64)).collect();
+        assert!(parse_single_cross_match_row(&row).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // violation_row_to_detail tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_violation_row_to_detail_uses_registry_fallback() {
+        let parsed = ParsedViolationRow {
+            security_id: 1333,
+            segment: "NSE_EQ".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp_value: serde_json::json!("2026-03-18T10:15:00Z"),
+            open: 100.0,
+            high: 90.0,
+            low: 95.0,
+            close: 92.0,
+            volume: 1000,
+        };
+        let registry = InstrumentRegistry::empty();
+        let detail = violation_row_to_detail(&parsed, &registry, "high < low");
+        assert_eq!(detail.symbol, "1333"); // fallback to security_id string
+        assert_eq!(detail.violation, "high < low");
+        assert_eq!(detail.segment, "NSE_EQ");
+        assert_eq!(detail.timeframe, "1m");
+        assert!(detail.values.contains("H=90"));
+    }
+
+    // -----------------------------------------------------------------------
+    // failed_report and failed_cross_match_report consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_failed_report_always_not_passed() {
+        assert!(!failed_report().passed);
+    }
+
+    #[test]
+    fn test_failed_cross_match_report_always_not_passed() {
+        assert!(!failed_cross_match_report().passed);
+    }
 }

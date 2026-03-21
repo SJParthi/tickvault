@@ -3755,4 +3755,183 @@ mod tests {
         assert_eq!(candles.len(), 1);
         assert_eq!(candles[0].open, 0.05);
     }
+
+    // =======================================================================
+    // build_valid_intraday_candles — filtering logic
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_nan_standalone() {
+        let data = DhanIntradayResponse {
+            open: vec![100.0, f64::NAN],
+            high: vec![105.0, 110.0],
+            low: vec![98.0, 99.0],
+            close: vec![103.0, 105.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_773_027_900, 1_773_027_960],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1, "NaN candle must be counted as invalid");
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 100.0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_non_positive() {
+        let data = DhanIntradayResponse {
+            open: vec![0.0, 100.0],
+            high: vec![105.0, 105.0],
+            low: vec![98.0, 98.0],
+            close: vec![103.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_773_027_900, 1_773_027_960],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "5m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_high_below_low_standalone() {
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![95.0], // high < low
+            low: vec![98.0],
+            close: vec![97.0],
+            volume: vec![1000],
+            timestamp: vec![1_773_027_900],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_outside_window() {
+        // 15:30 IST = 10:00 UTC on 2026-03-09
+        let utc_epoch_after_close: i64 = 1_773_014_400 + 10 * 3600;
+        let data = DhanIntradayResponse {
+            open: vec![100.0, 200.0],
+            high: vec![105.0, 210.0],
+            low: vec![98.0, 195.0],
+            close: vec![103.0, 205.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_773_027_900, utc_epoch_after_close],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0, "outside-window is not counted as invalid");
+        assert_eq!(candles.len(), 1, "outside-window candle should be filtered");
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_empty_data() {
+        let data = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert!(candles.is_empty());
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_preserves_oi_single_candle() {
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![98.0],
+            close: vec![103.0],
+            volume: vec![1000],
+            timestamp: vec![1_773_027_900],
+            open_interest: vec![5000],
+        };
+        let (candles, _) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(candles[0].open_interest, 5000);
+    }
+
+    // =======================================================================
+    // build_valid_daily_candles — filtering logic
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_nan_single_candle() {
+        let data = DhanDailyResponse {
+            open: vec![f64::NAN],
+            high: vec![210.0],
+            low: vec![195.0],
+            close: vec![205.0],
+            volume: vec![10000],
+            timestamp: vec![1_772_928_000],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 1);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_negative_price() {
+        let data = DhanDailyResponse {
+            open: vec![200.0, -1.0],
+            high: vec![210.0, 211.0],
+            low: vec![195.0, 196.0],
+            close: vec![205.0, 206.0],
+            volume: vec![10000, 20000],
+            timestamp: vec![1_772_928_000, 1_773_014_400],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 200.0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_empty_data() {
+        let data = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert!(candles.is_empty());
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_all_valid_timeframe_check() {
+        let data = sample_daily_response();
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].timeframe, TIMEFRAME_1D);
+        assert_eq!(candles[1].timeframe, TIMEFRAME_1D);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_no_intraday_window_filter() {
+        // Daily candles should NOT be filtered by intraday window
+        // (they have midnight timestamps which are "outside" market hours)
+        let data = sample_daily_response();
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(
+            candles.len(),
+            2,
+            "daily candles should not be window-filtered"
+        );
+        assert_eq!(invalid, 0);
+    }
 }
