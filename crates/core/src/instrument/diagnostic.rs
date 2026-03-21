@@ -989,6 +989,71 @@ mod tests {
         assert!(result.detail.contains("cache_dir="));
     }
 
+    #[test]
+    fn test_check_cache_status_with_actual_csv_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-diag-cache-status-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let csv_filename = "test-instruments.csv";
+        let csv_path = temp_dir.join(csv_filename);
+        std::fs::write(&csv_path, "HEADER,ROW\ndata,here\n").unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), csv_filename);
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("dir_exists=true"),
+            "detail: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csv_exists=true"),
+            "detail: {}",
+            result.detail
+        );
+        // csv_bytes should be non-zero
+        assert!(
+            !result.detail.contains("csv_bytes=0"),
+            "csv_bytes should be non-zero when file exists: {}",
+            result.detail
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_check_cache_status_with_fresh_marker() {
+        use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-diag-fresh-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Write today's marker
+        let today = chrono::Utc::now()
+            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset())
+            .date_naive()
+            .to_string();
+        std::fs::write(temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME), &today).unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), "missing.csv");
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("fresh=true"),
+            "should be fresh when marker matches today: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(&today),
+            "marker content should appear: {}",
+            result.detail
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     // -----------------------------------------------------------------------
     // DiagnosticReport / CheckResult additional tests
     // -----------------------------------------------------------------------

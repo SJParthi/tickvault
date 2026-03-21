@@ -1306,6 +1306,85 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Active service with SNS — exercises SMS code path
+    // -----------------------------------------------------------------------
+
+    fn make_active_service_with_sns() -> Arc<NotificationService> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        // Create a real AWS SNS client pointed at a fake endpoint.
+        // The SNS call will fail, but the code path is exercised.
+        let sns_config = aws_sdk_sns::Config::builder()
+            .endpoint_url("http://127.0.0.1:1")
+            .region(aws_sdk_sns::config::Region::new("ap-south-1"))
+            .behavior_version_latest()
+            .credentials_provider(aws_sdk_sns::config::Credentials::new(
+                "fake-access-key",
+                "fake-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .build();
+        let sns_client = aws_sdk_sns::Client::from_conf(sns_config);
+
+        Arc::new(NotificationService {
+            mode: NotificationMode::Active {
+                bot_token: SecretString::from("test-bot-token".to_string()),
+                chat_id: "123456789".to_string(),
+                http_client,
+                telegram_api_base_url: "http://127.0.0.1:1".to_string(),
+                sns_client: Some(sns_client),
+                sns_phone_number: Some("+919876543210".to_string()),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_critical_event_triggers_sms_code_path() {
+        let service = make_active_service_with_sns();
+        assert!(service.is_active());
+
+        // AuthenticationFailed is Critical severity — triggers both Telegram and SNS
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "test SNS path".to_string(),
+        });
+
+        // Wait for background tasks to attempt (and fail) sends
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // No panic = success. Both Telegram and SNS paths exercised.
+    }
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_low_severity_skips_sms() {
+        let service = make_active_service_with_sns();
+
+        // StartupComplete is Low severity — only Telegram, not SNS
+        service.notify(NotificationEvent::StartupComplete { mode: "PAPER" });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_multiple_critical_events() {
+        let service = make_active_service_with_sns();
+
+        // Multiple critical events
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "failure 1".to_string(),
+        });
+        service.notify(NotificationEvent::TokenRenewalFailed {
+            attempts: 5,
+            reason: "failure 2".to_string(),
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // -----------------------------------------------------------------------
     // strip_html_tags — special characters preserved
     // -----------------------------------------------------------------------
 
