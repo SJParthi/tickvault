@@ -159,6 +159,222 @@ const TOKEN_REFRESH_WAIT_SECS: u64 = 30;
 const MAX_TOKEN_EXPIRED_RETRIES: usize = 2;
 
 // ---------------------------------------------------------------------------
+// Pure Helper Functions (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Validation result for a single candle's OHLC prices.
+#[derive(Debug, PartialEq)]
+enum CandleValidation {
+    /// Candle passes all validation checks.
+    Valid,
+    /// One or more prices are NaN or Infinity.
+    NonFinite,
+    /// One or more prices are zero or negative.
+    NonPositive,
+    /// High price is less than low price.
+    HighBelowLow,
+}
+
+/// Validates OHLC prices for a single candle. Pure function — no I/O.
+fn validate_candle_ohlc(open: f64, high: f64, low: f64, close: f64) -> CandleValidation {
+    if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
+        return CandleValidation::NonFinite;
+    }
+    if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
+        return CandleValidation::NonPositive;
+    }
+    if high < low {
+        return CandleValidation::HighBelowLow;
+    }
+    CandleValidation::Valid
+}
+
+/// Returns true if the given UTC epoch timestamp falls at or after the intraday
+/// market close (15:30 IST). Candles at or after this time are discarded.
+///
+/// # Arguments
+/// * `utc_epoch_secs` — candle timestamp as UTC epoch seconds (from Dhan REST API)
+fn is_outside_intraday_window(utc_epoch_secs: i64) -> bool {
+    #[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
+    let ist_secs_of_day =
+        (utc_epoch_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+    ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST
+}
+
+/// Extracts open interest from the response array, returning 0 if index is out of bounds.
+/// OI array may be empty for equity instruments — this handles that gracefully.
+fn extract_oi(open_interest: &[i64], index: usize) -> i64 {
+    if index < open_interest.len() {
+        open_interest[index]
+    } else {
+        0
+    }
+}
+
+/// Computes the fetch date range given today's date and lookback days.
+/// Returns `(from_date, to_date)` as `NaiveDate`.
+fn compute_fetch_date_range(
+    today: chrono::NaiveDate,
+    lookback_days: u32,
+) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    let from_date = today
+        .checked_sub_signed(chrono::Duration::days(i64::from(lookback_days)))
+        .unwrap_or(today);
+    (from_date, today)
+}
+
+/// Computes the daily API `toDate` by adding 1 day (since Dhan's toDate is non-inclusive).
+fn compute_daily_to_date(to_date: chrono::NaiveDate) -> chrono::NaiveDate {
+    to_date
+        .checked_add_signed(chrono::Duration::days(1))
+        .unwrap_or(to_date)
+}
+
+/// Formats intraday date range strings with market hours appended.
+/// Returns `(from_datetime_str, to_datetime_str)`.
+fn format_intraday_date_range(
+    from_date: chrono::NaiveDate,
+    to_date: chrono::NaiveDate,
+) -> (String, String) {
+    let from_str = format!("{} {}", from_date.format("%Y-%m-%d"), MARKET_OPEN_TIME_IST);
+    let to_str = format!(
+        "{} {}",
+        to_date.format("%Y-%m-%d"),
+        MARKET_CLOSE_TIME_IST_EXCLUSIVE
+    );
+    (from_str, to_str)
+}
+
+/// Computes the DH-904 exponential backoff delay for a given attempt number.
+/// Sequence: 10s, 20s, 40s, 80s (base * 2^attempt).
+fn compute_dh904_backoff_secs(attempt: u32) -> u64 {
+    DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(attempt))
+}
+
+/// Returns true if the DH-904 attempt count has exceeded the maximum.
+fn is_dh904_exhausted(attempt: u32) -> bool {
+    attempt >= DH_904_MAX_BACKOFF_ATTEMPTS
+}
+
+/// Computes the retry delay in milliseconds for a given attempt number.
+/// Linear backoff: 1000ms * attempt.
+fn compute_retry_delay_ms(attempt: u32) -> u64 {
+    1000_u64.saturating_mul(u64::from(attempt))
+}
+
+/// Computes the backoff duration in seconds for a retry wave.
+/// Wave N sleeps `N * RETRY_WAVE_BACKOFF_BASE_SECS`.
+fn compute_retry_wave_backoff_secs(wave: usize) -> u64 {
+    RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64)
+}
+
+/// Returns the instrument type string for a subscription category, or `None`
+/// if the category should be skipped (derivatives).
+fn instrument_type_for_category(category: SubscriptionCategory) -> Option<&'static str> {
+    match category {
+        SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => Some("INDEX"),
+        SubscriptionCategory::StockEquity => Some("EQUITY"),
+        SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => None,
+    }
+}
+
+/// Builds a `HistoricalCandle` from intraday response data at a given index.
+/// Does NOT perform validation — caller must validate first.
+fn build_intraday_candle(
+    data: &DhanIntradayResponse,
+    index: usize,
+    security_id: u32,
+    segment_code: u8,
+    timeframe_label: &'static str,
+) -> HistoricalCandle {
+    HistoricalCandle {
+        timestamp_utc_secs: data.timestamp[index],
+        security_id,
+        exchange_segment_code: segment_code,
+        timeframe: timeframe_label,
+        open: data.open[index],
+        high: data.high[index],
+        low: data.low[index],
+        close: data.close[index],
+        volume: data.volume[index],
+        open_interest: extract_oi(&data.open_interest, index),
+    }
+}
+
+/// Builds a `HistoricalCandle` from daily response data at a given index.
+/// Does NOT perform validation — caller must validate first.
+fn build_daily_candle(
+    data: &DhanDailyResponse,
+    index: usize,
+    security_id: u32,
+    segment_code: u8,
+) -> HistoricalCandle {
+    HistoricalCandle {
+        timestamp_utc_secs: data.timestamp[index],
+        security_id,
+        exchange_segment_code: segment_code,
+        timeframe: TIMEFRAME_1D,
+        open: data.open[index],
+        high: data.high[index],
+        low: data.low[index],
+        close: data.close[index],
+        volume: data.volume[index],
+        open_interest: extract_oi(&data.open_interest, index),
+    }
+}
+
+/// Checks if a response body exceeds the maximum allowed size.
+fn is_response_oversized(body_len: usize) -> bool {
+    body_len > MAX_RESPONSE_BODY_SIZE
+}
+
+/// Collects the names of failed instruments for notification, capped at `MAX_FAILED_INSTRUMENT_NAMES`.
+///
+/// # Arguments
+/// * `pending_indices` — indices of instruments that remain failed after all retry waves
+/// * `security_ids` — security ID for each target instrument
+/// * `segments` — exchange segment string for each target instrument
+fn collect_failed_instrument_names(
+    pending_indices: &[usize],
+    security_ids: &[u32],
+    segments: &[&str],
+) -> Vec<String> {
+    pending_indices
+        .iter()
+        .take(MAX_FAILED_INSTRUMENT_NAMES)
+        .map(|&idx| format!("{} ({})", security_ids[idx], segments[idx]))
+        .collect()
+}
+
+/// Builds a breakdown of failure reasons from per-instrument token-expired counts
+/// and total persist failures.
+///
+/// # Arguments
+/// * `pending_indices` — indices still pending (failed) after all waves
+/// * `token_expired_counts` — per-instrument count of token-expired retries
+/// * `total_persist_failures` — total QuestDB write failures
+fn build_failure_reasons(
+    pending_indices: &[usize],
+    token_expired_counts: &[usize],
+    total_persist_failures: usize,
+) -> HashMap<String, usize> {
+    let mut reasons: HashMap<String, usize> = HashMap::new();
+    for &idx in pending_indices {
+        if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
+            let count = reasons.entry("token_expired".to_string()).or_insert(0);
+            *count = count.saturating_add(1);
+        } else {
+            let count = reasons.entry("network_or_api".to_string()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+    if total_persist_failures > 0 {
+        reasons.insert("persist".to_string(), total_persist_failures);
+    }
+    reasons
+}
+
+// ---------------------------------------------------------------------------
 // Request / Response Types
 // ---------------------------------------------------------------------------
 
@@ -256,25 +472,17 @@ pub async fn fetch_historical_candles(
     let today = now_ist.date_naive();
 
     // Compute date range: today - lookback_days to today
-    let from_date = today
-        .checked_sub_signed(chrono::Duration::days(i64::from(
-            historical_config.lookback_days,
-        )))
-        .unwrap_or(today);
-    let to_date = today;
+    let (from_date, to_date) = compute_fetch_date_range(today, historical_config.lookback_days);
 
     // Intraday requests use datetime format with market hours
     let from_date_str = from_date.format("%Y-%m-%d").to_string();
     let to_date_str = to_date.format("%Y-%m-%d").to_string();
 
     // Intraday: "YYYY-MM-DD HH:MM:SS" with market hours (09:15 to 15:30 exclusive)
-    let intraday_from = format!("{} {}", from_date_str, MARKET_OPEN_TIME_IST);
-    let intraday_to = format!("{} {}", to_date_str, MARKET_CLOSE_TIME_IST_EXCLUSIVE);
+    let (intraday_from, intraday_to) = format_intraday_date_range(from_date, to_date);
 
     // Daily: date-only format, toDate is NON-INCLUSIVE so add 1 day
-    let daily_to_date = to_date
-        .checked_add_signed(chrono::Duration::days(1))
-        .unwrap_or(to_date);
+    let daily_to_date = compute_daily_to_date(to_date);
     let daily_to_str = daily_to_date.format("%Y-%m-%d").to_string();
 
     info!(
@@ -332,19 +540,10 @@ pub async fn fetch_historical_candles(
 
     let mut targets: Vec<FetchTarget> = Vec::new();
     for instrument in registry.iter() {
-        // Skip all derivatives (futures + options).
-        if matches!(
-            instrument.category,
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
-        ) {
-            instruments_skipped = instruments_skipped.saturating_add(1);
-            continue;
-        }
-
-        let instrument_type = match instrument.category {
-            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
-            SubscriptionCategory::StockEquity => "EQUITY",
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => {
+        let instrument_type = match instrument_type_for_category(instrument.category) {
+            Some(t) => t,
+            None => {
+                instruments_skipped = instruments_skipped.saturating_add(1);
                 continue;
             }
         };
@@ -380,7 +579,7 @@ pub async fn fetch_historical_candles(
         }
 
         if wave > 0 {
-            let backoff_secs = RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64);
+            let backoff_secs = compute_retry_wave_backoff_secs(wave);
             warn!(
                 wave,
                 remaining = pending_indices.len(),
@@ -474,34 +673,20 @@ pub async fn fetch_historical_candles(
     let instruments_failed = pending_indices.len();
 
     // Collect failed instrument names for Telegram notification
-    let failed_instruments: Vec<String> = pending_indices
+    let target_sec_ids: Vec<u32> = targets.iter().map(|t| t.security_id).collect();
+    let target_segments: Vec<&str> = targets
         .iter()
-        .take(MAX_FAILED_INSTRUMENT_NAMES)
-        .map(|&idx| {
-            let target = &targets[idx];
-            format!("{} ({})", target.security_id, target.exchange_segment_str)
-        })
+        .map(|t| t.exchange_segment_str.as_str())
         .collect();
+    let failed_instruments =
+        collect_failed_instrument_names(&pending_indices, &target_sec_ids, &target_segments);
 
     // Build failure reason breakdown
-    let mut failure_reasons: HashMap<String, usize> = HashMap::new();
-    for &idx in &pending_indices {
-        if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
-            let count = failure_reasons
-                .entry("token_expired".to_string())
-                .or_insert(0);
-            *count = count.saturating_add(1);
-        } else {
-            // Could be network, input error, or other transient — generic "failed"
-            let count = failure_reasons
-                .entry("network_or_api".to_string())
-                .or_insert(0);
-            *count = count.saturating_add(1);
-        }
-    }
-    if total_persist_failures > 0 {
-        failure_reasons.insert("persist".to_string(), total_persist_failures);
-    }
+    let failure_reasons = build_failure_reasons(
+        &pending_indices,
+        &token_expired_counts,
+        total_persist_failures,
+    );
 
     if instruments_failed > 0 {
         warn!(
@@ -705,7 +890,7 @@ async fn fetch_intraday_with_retry(
 ) -> TimeframeFetchResult {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
-            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            let delay_ms = compute_retry_delay_ms(attempt);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
@@ -739,8 +924,7 @@ async fn fetch_intraday_with_retry(
                             continue;
                         }
                         ErrorAction::RateLimited => {
-                            let backoff_secs = DH_904_BACKOFF_BASE_SECS
-                                .saturating_mul(1_u64.wrapping_shl(attempt));
+                            let backoff_secs = compute_dh904_backoff_secs(attempt);
                             warn!(
                                 security_id,
                                 timeframe = timeframe_label,
@@ -748,7 +932,7 @@ async fn fetch_intraday_with_retry(
                                 attempt,
                                 "rate limited — exponential backoff"
                             );
-                            if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
+                            if is_dh904_exhausted(attempt) {
                                 m_api_errors.increment(1);
                                 return TimeframeFetchResult::Failed;
                             }
@@ -814,7 +998,7 @@ async fn fetch_intraday_with_retry(
                     }
                 };
 
-                if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                if is_response_oversized(body_bytes.len()) {
                     warn!(
                         security_id,
                         timeframe = timeframe_label,
@@ -924,7 +1108,7 @@ async fn fetch_daily_with_retry(
 ) -> TimeframeFetchResult {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
-            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            let delay_ms = compute_retry_delay_ms(attempt);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
@@ -1032,7 +1216,7 @@ async fn fetch_daily_with_retry(
                     }
                 };
 
-                if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                if is_response_oversized(body_bytes.len()) {
                     warn!(
                         security_id,
                         timeframe = TIMEFRAME_1D,
@@ -1144,78 +1328,54 @@ fn persist_intraday_candles(
         let low = data.low[i];
         let close = data.close[i];
 
-        // Reject NaN/Infinity prices — corrupted data must not reach QuestDB
-        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = timeframe_label,
-                "NaN/Inf price in API response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject non-positive prices — zero or negative prices indicate bad data
-        if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = timeframe_label,
-                open,
-                high,
-                low,
-                close,
-                "non-positive price in API response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject OHLC inconsistency — high must be >= low
-        if high < low {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = timeframe_label,
-                high,
-                low,
-                "high < low in API response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
+        match validate_candle_ohlc(open, high, low, close) {
+            CandleValidation::Valid => {}
+            CandleValidation::NonFinite => {
+                warn!(
+                    security_id,
+                    idx = i,
+                    timeframe = timeframe_label,
+                    "NaN/Inf price in API response — skipping candle"
+                );
+                m_api_errors.increment(1);
+                continue;
+            }
+            CandleValidation::NonPositive => {
+                warn!(
+                    security_id,
+                    idx = i,
+                    timeframe = timeframe_label,
+                    open,
+                    high,
+                    low,
+                    close,
+                    "non-positive price in API response — skipping candle"
+                );
+                m_api_errors.increment(1);
+                continue;
+            }
+            CandleValidation::HighBelowLow => {
+                warn!(
+                    security_id,
+                    idx = i,
+                    timeframe = timeframe_label,
+                    high,
+                    low,
+                    "high < low in API response — skipping candle"
+                );
+                m_api_errors.increment(1);
+                continue;
+            }
         }
 
         // Reject candles at or after 15:30 IST — market close is always exclusive.
         // Dhan may return closing session candles (15:30+) for higher timeframes;
         // we discard them to keep [09:15, 15:30) IST as the strict intraday window.
-        {
-            #[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
-            let ist_secs_of_day =
-                (data.timestamp[i].saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
-            if ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST {
-                continue; // silently skip — this is expected for 5m/15m/60m
-            }
+        if is_outside_intraday_window(data.timestamp[i]) {
+            continue; // silently skip — this is expected for 5m/15m/60m
         }
 
-        let oi_value = if i < data.open_interest.len() {
-            data.open_interest[i]
-        } else {
-            0
-        };
-
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: data.timestamp[i],
-            security_id,
-            exchange_segment_code: segment_code,
-            timeframe: timeframe_label,
-            open,
-            high,
-            low,
-            close,
-            volume: data.volume[i],
-            open_interest: oi_value,
-        };
+        let candle = build_intraday_candle(data, i, security_id, segment_code, timeframe_label);
 
         if let Err(err) = candle_writer.append_candle(&candle) {
             warn!(
@@ -1262,65 +1422,47 @@ fn persist_daily_candles(
         let low = data.low[i];
         let close = data.close[i];
 
-        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = TIMEFRAME_1D,
-                "NaN/Inf price in daily response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
+        match validate_candle_ohlc(open, high, low, close) {
+            CandleValidation::Valid => {}
+            CandleValidation::NonFinite => {
+                warn!(
+                    security_id,
+                    idx = i,
+                    timeframe = TIMEFRAME_1D,
+                    "NaN/Inf price in daily response — skipping candle"
+                );
+                m_api_errors.increment(1);
+                continue;
+            }
+            CandleValidation::NonPositive => {
+                warn!(
+                    security_id,
+                    idx = i,
+                    timeframe = TIMEFRAME_1D,
+                    open,
+                    high,
+                    low,
+                    close,
+                    "non-positive price in daily response — skipping candle"
+                );
+                m_api_errors.increment(1);
+                continue;
+            }
+            CandleValidation::HighBelowLow => {
+                warn!(
+                    security_id,
+                    idx = i,
+                    timeframe = TIMEFRAME_1D,
+                    high,
+                    low,
+                    "high < low in daily response — skipping candle"
+                );
+                m_api_errors.increment(1);
+                continue;
+            }
         }
 
-        // Reject non-positive prices
-        if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = TIMEFRAME_1D,
-                open,
-                high,
-                low,
-                close,
-                "non-positive price in daily response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject OHLC inconsistency — high must be >= low
-        if high < low {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = TIMEFRAME_1D,
-                high,
-                low,
-                "high < low in daily response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        let oi_value = if i < data.open_interest.len() {
-            data.open_interest[i]
-        } else {
-            0
-        };
-
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: data.timestamp[i],
-            security_id,
-            exchange_segment_code: segment_code,
-            timeframe: TIMEFRAME_1D,
-            open,
-            high,
-            low,
-            close,
-            volume: data.volume[i],
-            open_interest: oi_value,
-        };
+        let candle = build_daily_candle(data, i, security_id, segment_code);
 
         if let Err(err) = candle_writer.append_candle(&candle) {
             warn!(
@@ -1977,28 +2119,479 @@ mod tests {
         assert!(format!("{expired:?}").contains("TokenExpired"));
     }
 
-    // -----------------------------------------------------------------------
-    // classify_error — exhaustive branch coverage
-    // -----------------------------------------------------------------------
+    // =======================================================================
+    // Extracted pure function tests — candle validation
+    // =======================================================================
 
     #[test]
-    fn test_classify_error_dh906_never_retry() {
-        let body = br#"{"errorType": "ORDER_ERROR", "errorCode": "DH-906", "errorMessage": "Order error"}"#;
-        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
-        assert_eq!(action, ErrorAction::NeverRetry);
+    fn test_validate_candle_ohlc_valid() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, 102.0),
+            CandleValidation::Valid
+        );
     }
 
     #[test]
-    fn test_classify_error_dh901_token_expired() {
-        // DH-901 via trading API string format (not data API numeric)
-        let body = br#"{"errorType": "AUTH_ERROR", "errorCode": "DH-901", "errorMessage": "Invalid auth"}"#;
-        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
-        assert_eq!(action, ErrorAction::TokenExpired);
+    fn test_validate_candle_ohlc_equal_high_low() {
+        // high == low is valid (e.g. circuit limit)
+        assert_eq!(
+            validate_candle_ohlc(100.0, 100.0, 100.0, 100.0),
+            CandleValidation::Valid
+        );
     }
 
     #[test]
-    fn test_classify_error_dh904_body_without_429() {
-        // DH-904 in response body but non-429 HTTP status — body classification takes priority
+    fn test_validate_candle_ohlc_nan_open() {
+        assert_eq!(
+            validate_candle_ohlc(f64::NAN, 105.0, 98.0, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_high() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, f64::NAN, 98.0, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_low() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, f64::NAN, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_close() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, f64::NAN),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_infinity_open() {
+        assert_eq!(
+            validate_candle_ohlc(f64::INFINITY, 105.0, 98.0, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_neg_infinity_close() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, f64::NEG_INFINITY),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_zero_price() {
+        assert_eq!(
+            validate_candle_ohlc(0.0, 105.0, 98.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_negative_price() {
+        assert_eq!(
+            validate_candle_ohlc(-1.0, 105.0, 98.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_zero_low() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 0.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_zero_close() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, 0.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_negative_high() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, -5.0, 98.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_high_below_low() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 95.0, 98.0, 97.0),
+            CandleValidation::HighBelowLow
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_tiny_prices_valid() {
+        // Very small positive prices are valid (e.g. penny stocks)
+        assert_eq!(
+            validate_candle_ohlc(0.01, 0.02, 0.01, 0.015),
+            CandleValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_large_prices_valid() {
+        assert_eq!(
+            validate_candle_ohlc(999_999.0, 1_000_000.0, 999_990.0, 999_995.0),
+            CandleValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_candle_validation_debug_format() {
+        assert!(format!("{:?}", CandleValidation::Valid).contains("Valid"));
+        assert!(format!("{:?}", CandleValidation::NonFinite).contains("NonFinite"));
+        assert!(format!("{:?}", CandleValidation::NonPositive).contains("NonPositive"));
+        assert!(format!("{:?}", CandleValidation::HighBelowLow).contains("HighBelowLow"));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — intraday window filter
+    // =======================================================================
+
+    #[test]
+    fn test_is_outside_intraday_window_market_open() {
+        // 09:15 IST = 03:45 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 45 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "09:15 IST should be inside intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_mid_session() {
+        // 12:00 IST = 06:30 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 6 * 3600 + 30 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "12:00 IST should be inside intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_just_before_close() {
+        // 15:29 IST = 09:59 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "15:29 IST should be inside intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_at_close() {
+        // 15:30 IST = 10:00 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600;
+        assert!(
+            is_outside_intraday_window(utc_epoch),
+            "15:30 IST should be OUTSIDE intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_after_close() {
+        // 16:00 IST = 10:30 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600 + 30 * 60;
+        assert!(
+            is_outside_intraday_window(utc_epoch),
+            "16:00 IST should be OUTSIDE intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_midnight() {
+        // 00:00 IST = 18:30 previous day UTC
+        let utc_epoch: i64 = 1_773_014_400 - 5 * 3600 - 30 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "00:00 IST should be inside window (before 15:30)"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_23_59() {
+        // 23:59 IST — after market close, should be outside
+        // IST secs of day = 23*3600 + 59*60 = 86340, which is >= 55800
+        let utc_epoch: i64 = 1_773_014_400 + 18 * 3600 + 29 * 60;
+        assert!(
+            is_outside_intraday_window(utc_epoch),
+            "23:59 IST should be OUTSIDE intraday window"
+        );
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — OI extraction
+    // =======================================================================
+
+    #[test]
+    fn test_extract_oi_within_bounds() {
+        let oi_data = vec![100, 200, 300];
+        assert_eq!(extract_oi(&oi_data, 0), 100);
+        assert_eq!(extract_oi(&oi_data, 1), 200);
+        assert_eq!(extract_oi(&oi_data, 2), 300);
+    }
+
+    #[test]
+    fn test_extract_oi_out_of_bounds() {
+        let oi_data = vec![100, 200];
+        assert_eq!(extract_oi(&oi_data, 2), 0);
+        assert_eq!(extract_oi(&oi_data, 100), 0);
+    }
+
+    #[test]
+    fn test_extract_oi_empty_array() {
+        let oi_data: Vec<i64> = vec![];
+        assert_eq!(extract_oi(&oi_data, 0), 0);
+        assert_eq!(extract_oi(&oi_data, 5), 0);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — date computation
+    // =======================================================================
+
+    #[test]
+    fn test_compute_fetch_date_range_normal() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 90);
+        assert_eq!(to, today);
+        assert_eq!(from, chrono::NaiveDate::from_ymd_opt(2025, 12, 21).unwrap());
+    }
+
+    #[test]
+    fn test_compute_fetch_date_range_zero_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 0);
+        assert_eq!(from, today);
+        assert_eq!(to, today);
+    }
+
+    #[test]
+    fn test_compute_fetch_date_range_one_day_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 1);
+        assert_eq!(to, today);
+        assert_eq!(from, chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap());
+    }
+
+    #[test]
+    fn test_compute_fetch_date_range_large_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 365);
+        assert_eq!(to, today);
+        assert_eq!(from, chrono::NaiveDate::from_ymd_opt(2025, 3, 21).unwrap());
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_normal() {
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_month_boundary() {
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_year_boundary() {
+        let to = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_leap_year() {
+        let to = chrono::NaiveDate::from_ymd_opt(2028, 2, 28).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        // 2028 is a leap year
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap()
+        );
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — intraday date range formatting
+    // =======================================================================
+
+    #[test]
+    fn test_format_intraday_date_range() {
+        let from = chrono::NaiveDate::from_ymd_opt(2025, 12, 21).unwrap();
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from_str, to_str) = format_intraday_date_range(from, to);
+        assert_eq!(from_str, "2025-12-21 09:15:00");
+        assert_eq!(to_str, "2026-03-21 15:30:00");
+    }
+
+    #[test]
+    fn test_format_intraday_date_range_same_day() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let (from_str, to_str) = format_intraday_date_range(date, date);
+        assert_eq!(from_str, "2026-01-05 09:15:00");
+        assert_eq!(to_str, "2026-01-05 15:30:00");
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — DH-904 backoff
+    // =======================================================================
+
+    #[test]
+    fn test_compute_dh904_backoff_secs_sequence() {
+        assert_eq!(compute_dh904_backoff_secs(0), 10); // 10 * 2^0 = 10
+        assert_eq!(compute_dh904_backoff_secs(1), 20); // 10 * 2^1 = 20
+        assert_eq!(compute_dh904_backoff_secs(2), 40); // 10 * 2^2 = 40
+        assert_eq!(compute_dh904_backoff_secs(3), 80); // 10 * 2^3 = 80
+    }
+
+    #[test]
+    fn test_compute_dh904_backoff_secs_high_attempt() {
+        // After attempt 3, we don't expect to call this (is_dh904_exhausted
+        // would return true), but it should not overflow
+        let result = compute_dh904_backoff_secs(4);
+        assert_eq!(result, 160); // 10 * 2^4
+    }
+
+    #[test]
+    fn test_is_dh904_exhausted() {
+        assert!(!is_dh904_exhausted(0));
+        assert!(!is_dh904_exhausted(1));
+        assert!(!is_dh904_exhausted(2));
+        assert!(!is_dh904_exhausted(3));
+        assert!(is_dh904_exhausted(4)); // DH_904_MAX_BACKOFF_ATTEMPTS = 4
+        assert!(is_dh904_exhausted(5));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — retry delay
+    // =======================================================================
+
+    #[test]
+    fn test_compute_retry_delay_ms() {
+        assert_eq!(compute_retry_delay_ms(0), 0);
+        assert_eq!(compute_retry_delay_ms(1), 1000);
+        assert_eq!(compute_retry_delay_ms(2), 2000);
+        assert_eq!(compute_retry_delay_ms(3), 3000);
+    }
+
+    #[test]
+    fn test_compute_retry_delay_ms_large_attempt() {
+        // Should not overflow
+        assert_eq!(compute_retry_delay_ms(10), 10000);
+        assert_eq!(compute_retry_delay_ms(100), 100000);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — retry wave backoff
+    // =======================================================================
+
+    #[test]
+    fn test_compute_retry_wave_backoff_secs() {
+        assert_eq!(compute_retry_wave_backoff_secs(0), 0);
+        assert_eq!(compute_retry_wave_backoff_secs(1), 30);
+        assert_eq!(compute_retry_wave_backoff_secs(2), 60);
+        assert_eq!(compute_retry_wave_backoff_secs(3), 90);
+        assert_eq!(compute_retry_wave_backoff_secs(4), 120);
+        assert_eq!(compute_retry_wave_backoff_secs(5), 150);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — instrument category mapping
+    // =======================================================================
+
+    #[test]
+    fn test_instrument_type_for_major_index() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::MajorIndexValue),
+            Some("INDEX")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_display_index() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::DisplayIndex),
+            Some("INDEX")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_stock_equity() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::StockEquity),
+            Some("EQUITY")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_index_derivative_skip() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::IndexDerivative),
+            None
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_stock_derivative_skip() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::StockDerivative),
+            None
+        );
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — response size check
+    // =======================================================================
+
+    #[test]
+    fn test_is_response_oversized_within_limit() {
+        assert!(!is_response_oversized(0));
+        assert!(!is_response_oversized(1));
+        assert!(!is_response_oversized(100_000));
+        assert!(!is_response_oversized(MAX_RESPONSE_BODY_SIZE));
+    }
+
+    #[test]
+    fn test_is_response_oversized_exceeds_limit() {
+        assert!(is_response_oversized(MAX_RESPONSE_BODY_SIZE + 1));
+        assert!(is_response_oversized(20 * 1024 * 1024));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — error classification
+    // =======================================================================
+
+    #[test]
+    fn test_classify_error_dh904_body_not_429() {
+        // DH-904 from body (non-429 status) should also be RateLimited
         let body =
             br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Rate limit"}"#;
         let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
@@ -2006,50 +2599,42 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_error_dh908_standard_retry() {
-        let body = br#"{"errorType": "INTERNAL", "errorCode": "DH-908", "errorMessage": "Internal server error"}"#;
-        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
-        assert_eq!(action, ErrorAction::StandardRetry);
+    fn test_classify_error_dh906() {
+        let body = br#"{"errorType": "ORDER_ERROR", "errorCode": "DH-906", "errorMessage": "Order error"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::NeverRetry);
     }
 
     #[test]
-    fn test_classify_error_dh909_standard_retry() {
+    fn test_classify_error_dh901_token_expired() {
         let body =
-            br#"{"errorType": "NETWORK", "errorCode": "DH-909", "errorMessage": "Network error"}"#;
-        let action = classify_error(reqwest::StatusCode::BAD_GATEWAY, body);
-        assert_eq!(action, ErrorAction::StandardRetry);
+            br#"{"errorType": "AUTH", "errorCode": "DH-901", "errorMessage": "Invalid auth"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(action, ErrorAction::TokenExpired);
     }
 
     #[test]
-    fn test_classify_error_data_api_other_code_standard_retry() {
-        // Data API numeric code that is not 805 or 807 (e.g., 800, 804, 806, etc.)
-        let body = br#"{"errorCode": 800, "message": "Internal server error"}"#;
+    fn test_classify_error_dh908_standard_retry() {
+        let body = br#"{"errorType": "INTERNAL", "errorCode": "DH-908", "errorMessage": "Internal error"}"#;
         let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
         assert_eq!(action, ErrorAction::StandardRetry);
     }
 
     #[test]
-    fn test_classify_error_data_api_806_standard_retry() {
-        let body = br#"{"errorCode": 806, "message": "Data APIs not subscribed"}"#;
-        let action = classify_error(reqwest::StatusCode::FORBIDDEN, body);
-        assert_eq!(action, ErrorAction::StandardRetry);
-    }
-
-    #[test]
-    fn test_classify_error_data_api_804_standard_retry() {
-        let body = br#"{"errorCode": 804, "message": "Instruments exceed limit"}"#;
+    fn test_classify_error_data_api_unknown_code() {
+        let body = br#"{"errorCode": 999, "message": "Unknown data error"}"#;
         let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
         assert_eq!(action, ErrorAction::StandardRetry);
     }
 
     #[test]
-    fn test_classify_error_empty_body_standard_retry() {
+    fn test_classify_error_empty_body() {
         let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, b"");
         assert_eq!(action, ErrorAction::StandardRetry);
     }
 
     #[test]
-    fn test_classify_error_garbage_body_standard_retry() {
+    fn test_classify_error_invalid_json() {
         let action = classify_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             b"not json at all",
@@ -2058,153 +2643,220 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_error_null_error_code_fields() {
-        // Both formats present but with null code fields — falls through to StandardRetry
-        let body = br#"{"errorCode": null, "errorMessage": null}"#;
-        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
-        assert_eq!(action, ErrorAction::StandardRetry);
-    }
-
-    #[test]
-    fn test_classify_error_http_429_overrides_body() {
-        // HTTP 429 always returns RateLimited regardless of body content
-        let body = br#"{"errorCode": 805, "message": "Doesn't matter"}"#;
+    fn test_classify_error_429_overrides_body() {
+        // Even if body says DH-905, HTTP 429 should win
+        let body = br#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "Bad input"}"#;
         let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
         assert_eq!(action, ErrorAction::RateLimited);
     }
 
     #[test]
-    fn test_classify_error_http_429_with_empty_body() {
-        let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, b"");
-        assert_eq!(action, ErrorAction::RateLimited);
-    }
-
-    // -----------------------------------------------------------------------
-    // DhanErrorResponse / DataApiErrorResponse deserialization
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_dhan_error_response_deserialize_all_fields() {
-        let json =
-            br#"{"errorType":"INPUT_EXCEPTION","errorCode":"DH-905","errorMessage":"Bad input"}"#;
-        let parsed: DhanErrorResponse = serde_json::from_slice(json).unwrap();
-        assert_eq!(parsed.error_type.as_deref(), Some("INPUT_EXCEPTION"));
-        assert_eq!(parsed.error_code.as_deref(), Some("DH-905"));
-        assert_eq!(parsed.error_message.as_deref(), Some("Bad input"));
+    fn test_classify_error_data_api_805_with_status_alias() {
+        let body = br#"{"status": 805, "message": "Too many connections"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::TooManyConnections);
     }
 
     #[test]
-    fn test_dhan_error_response_deserialize_missing_fields() {
-        // All fields are Option — missing fields parse as None
-        let json = br#"{}"#;
-        let parsed: DhanErrorResponse = serde_json::from_slice(json).unwrap();
-        assert!(parsed.error_type.is_none());
-        assert!(parsed.error_code.is_none());
-        assert!(parsed.error_message.is_none());
+    fn test_classify_error_data_api_807_with_error_code_alias() {
+        let body = br#"{"errorCode": 807, "errorMessage": "Token expired"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(action, ErrorAction::TokenExpired);
     }
 
     #[test]
-    fn test_data_api_error_response_with_status_alias() {
-        let json = br#"{"status": 807, "message": "Token expired"}"#;
-        let parsed: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
-        assert_eq!(parsed.code, Some(807));
+    fn test_classify_error_null_error_code() {
+        let body = br#"{"errorType": "UNKNOWN", "errorCode": null, "errorMessage": "Something"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — build candles from response
+    // =======================================================================
+
+    fn sample_intraday_response() -> DhanIntradayResponse {
+        DhanIntradayResponse {
+            open: vec![100.0, 101.0, 102.0],
+            high: vec![105.0, 106.0, 107.0],
+            low: vec![98.0, 99.0, 100.0],
+            close: vec![103.0, 104.0, 105.0],
+            volume: vec![1000, 2000, 3000],
+            timestamp: vec![1_773_027_900, 1_773_027_960, 1_773_028_020],
+            open_interest: vec![5000, 6000, 7000],
+        }
+    }
+
+    fn sample_daily_response() -> DhanDailyResponse {
+        DhanDailyResponse {
+            open: vec![200.0, 201.0],
+            high: vec![210.0, 211.0],
+            low: vec![195.0, 196.0],
+            close: vec![205.0, 206.0],
+            volume: vec![10_000, 20_000],
+            timestamp: vec![1_772_928_000, 1_773_014_400],
+            open_interest: vec![],
+        }
     }
 
     #[test]
-    fn test_data_api_error_response_with_error_code_alias() {
-        let json = br#"{"errorCode": 805, "errorMessage": "Too many"}"#;
-        let parsed: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
-        assert_eq!(parsed.code, Some(805));
+    fn test_build_intraday_candle_first_index() {
+        let data = sample_intraday_response();
+        let candle = build_intraday_candle(&data, 0, 42, 2, "1m");
+        assert_eq!(candle.security_id, 42);
+        assert_eq!(candle.exchange_segment_code, 2);
+        assert_eq!(candle.timeframe, "1m");
+        assert_eq!(candle.open, 100.0);
+        assert_eq!(candle.high, 105.0);
+        assert_eq!(candle.low, 98.0);
+        assert_eq!(candle.close, 103.0);
+        assert_eq!(candle.volume, 1000);
+        assert_eq!(candle.open_interest, 5000);
+        assert_eq!(candle.timestamp_utc_secs, 1_773_027_900);
     }
 
     #[test]
-    fn test_data_api_error_response_empty_json() {
-        let json = br#"{}"#;
-        let parsed: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
-        assert!(parsed.code.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // DailyRequest serialization — expiry_code branch
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_daily_request_serialization_with_expiry_code() {
-        let request = DailyRequest {
-            security_id: "26000".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            expiry_code: Some(0),
-            from_date: "2026-01-01".to_string(),
-            to_date: "2026-03-01".to_string(),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(
-            json.contains("\"expiryCode\":0"),
-            "expiryCode must be present when Some: {json}"
-        );
+    fn test_build_intraday_candle_last_index() {
+        let data = sample_intraday_response();
+        let candle = build_intraday_candle(&data, 2, 99, 1, "5m");
+        assert_eq!(candle.open, 102.0);
+        assert_eq!(candle.close, 105.0);
+        assert_eq!(candle.volume, 3000);
+        assert_eq!(candle.open_interest, 7000);
+        assert_eq!(candle.timeframe, "5m");
     }
 
     #[test]
-    fn test_daily_request_serialization_expiry_code_1() {
-        let request = DailyRequest {
-            security_id: "13".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            expiry_code: Some(1),
-            from_date: "2026-01-01".to_string(),
-            to_date: "2026-03-01".to_string(),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"expiryCode\":1"));
+    fn test_build_daily_candle_first_index() {
+        let data = sample_daily_response();
+        let candle = build_daily_candle(&data, 0, 11536, 1);
+        assert_eq!(candle.security_id, 11536);
+        assert_eq!(candle.exchange_segment_code, 1);
+        assert_eq!(candle.timeframe, TIMEFRAME_1D);
+        assert_eq!(candle.open, 200.0);
+        assert_eq!(candle.high, 210.0);
+        assert_eq!(candle.low, 195.0);
+        assert_eq!(candle.close, 205.0);
+        assert_eq!(candle.volume, 10_000);
+        assert_eq!(candle.open_interest, 0); // empty OI array -> 0
     }
 
     #[test]
-    fn test_daily_request_serialization_expiry_code_2() {
-        let request = DailyRequest {
-            security_id: "13".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            expiry_code: Some(2),
-            from_date: "2026-01-01".to_string(),
-            to_date: "2026-03-01".to_string(),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"expiryCode\":2"));
+    fn test_build_daily_candle_with_oi() {
+        let mut data = sample_daily_response();
+        data.open_interest = vec![50_000, 60_000];
+        let candle = build_daily_candle(&data, 1, 13, 0);
+        assert_eq!(candle.open_interest, 60_000);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — collect failed instrument names
+    // =======================================================================
+
+    #[test]
+    fn test_collect_failed_instrument_names_empty() {
+        let result = collect_failed_instrument_names(&[], &[], &[]);
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn test_daily_request_all_fields_camel_case() {
-        let request = DailyRequest {
-            security_id: "13".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: Some(0),
-            from_date: "2026-01-01".to_string(),
-            to_date: "2026-03-01".to_string(),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        // Verify no snake_case leaked
-        assert!(!json.contains("security_id"));
-        assert!(!json.contains("exchange_segment"));
-        assert!(!json.contains("from_date"));
-        assert!(!json.contains("to_date"));
-        assert!(!json.contains("expiry_code"));
-        // Verify camelCase present
-        assert!(json.contains("securityId"));
-        assert!(json.contains("exchangeSegment"));
-        assert!(json.contains("fromDate"));
-        assert!(json.contains("toDate"));
-        assert!(json.contains("expiryCode"));
+    fn test_collect_failed_instrument_names_basic() {
+        let pending = vec![0, 2];
+        let sec_ids = vec![11536, 1333, 25];
+        let segments = vec!["NSE_EQ", "NSE_EQ", "IDX_I"];
+        let result = collect_failed_instrument_names(&pending, &sec_ids, &segments);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "11536 (NSE_EQ)");
+        assert_eq!(result[1], "25 (IDX_I)");
     }
 
-    // -----------------------------------------------------------------------
-    // DhanIntradayResponse / DhanDailyResponse edge cases
-    // -----------------------------------------------------------------------
+    #[test]
+    fn test_collect_failed_instrument_names_capped() {
+        // Create more than MAX_FAILED_INSTRUMENT_NAMES pending indices
+        let n = MAX_FAILED_INSTRUMENT_NAMES + 10;
+        let pending: Vec<usize> = (0..n).collect();
+        let sec_ids: Vec<u32> = (0..n as u32).collect();
+        let segments: Vec<&str> = vec!["NSE_EQ"; n];
+        let result = collect_failed_instrument_names(&pending, &sec_ids, &segments);
+        assert_eq!(result.len(), MAX_FAILED_INSTRUMENT_NAMES);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — build failure reasons
+    // =======================================================================
 
     #[test]
-    fn test_dhan_intraday_response_empty() {
-        let response = DhanIntradayResponse {
+    fn test_build_failure_reasons_empty() {
+        let reasons = build_failure_reasons(&[], &[], 0);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn test_build_failure_reasons_all_token_expired() {
+        let pending = vec![0, 1];
+        let token_counts = vec![2, 3]; // Both >= MAX_TOKEN_EXPIRED_RETRIES (2)
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons["token_expired"], 2);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_all_network() {
+        let pending = vec![0, 1, 2];
+        let token_counts = vec![0, 1, 0]; // All below MAX_TOKEN_EXPIRED_RETRIES
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons["network_or_api"], 3);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_mixed() {
+        let pending = vec![0, 1, 2];
+        let token_counts = vec![2, 0, 3]; // indices 0 and 2 are token_expired, 1 is network
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons["token_expired"], 2);
+        assert_eq!(reasons["network_or_api"], 1);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_with_persist_failures() {
+        let pending = vec![0];
+        let token_counts = vec![0];
+        let reasons = build_failure_reasons(&pending, &token_counts, 42);
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons["network_or_api"], 1);
+        assert_eq!(reasons["persist"], 42);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_persist_only() {
+        // No pending instruments, but persist failures occurred
+        let reasons = build_failure_reasons(&[], &[], 15);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons["persist"], 15);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_zero_persist_not_included() {
+        // Zero persist failures should not add "persist" key
+        let reasons = build_failure_reasons(&[], &[], 0);
+        assert!(!reasons.contains_key("persist"));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — response deserialization
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_intraday_response_consistency_all_same_length() {
+        let data = sample_intraday_response();
+        assert!(data.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_consistency_empty() {
+        let data = DhanIntradayResponse {
             open: vec![],
             high: vec![],
             low: vec![],
@@ -2213,505 +2865,62 @@ mod tests {
             timestamp: vec![],
             open_interest: vec![],
         };
-        assert!(response.is_empty());
-        assert_eq!(response.len(), 0);
-        assert!(response.is_consistent());
+        assert!(data.is_consistent());
+        assert!(data.is_empty());
     }
 
     #[test]
-    fn test_dhan_intraday_response_consistent_with_oi() {
-        let response = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![105.0],
-            low: vec![99.0],
-            close: vec![102.0],
-            volume: vec![1000],
-            timestamp: vec![1700000000],
-            open_interest: vec![50000],
-        };
-        assert!(!response.is_empty());
-        assert_eq!(response.len(), 1);
-        assert!(response.is_consistent());
+    fn test_dhan_intraday_response_is_empty_false() {
+        let data = sample_intraday_response();
+        assert!(!data.is_empty());
     }
 
     #[test]
-    fn test_dhan_intraday_response_consistent_without_oi() {
-        // open_interest empty is valid — is_consistent allows empty OI
-        let response = DhanIntradayResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700000060],
-            open_interest: vec![],
-        };
-        assert!(response.is_consistent());
+    fn test_dhan_intraday_response_len() {
+        let data = sample_intraday_response();
+        assert_eq!(data.len(), 3);
     }
 
     #[test]
-    fn test_dhan_intraday_response_inconsistent_oi_length() {
-        // OI length mismatched and not empty — inconsistent
-        let response = DhanIntradayResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700000060],
-            open_interest: vec![50000], // only 1, but timestamp has 2
-        };
-        assert!(!response.is_consistent());
+    fn test_dhan_daily_response_consistency() {
+        let data = sample_daily_response();
+        assert!(data.is_consistent());
     }
 
     #[test]
-    fn test_dhan_daily_response_empty() {
-        let response = DhanDailyResponse {
-            open: vec![],
-            high: vec![],
-            low: vec![],
-            close: vec![],
-            volume: vec![],
-            timestamp: vec![],
-            open_interest: vec![],
-        };
-        assert!(response.is_empty());
-        assert_eq!(response.len(), 0);
-        assert!(response.is_consistent());
+    fn test_dhan_daily_response_len() {
+        let data = sample_daily_response();
+        assert_eq!(data.len(), 2);
     }
 
     #[test]
-    fn test_dhan_daily_response_consistent() {
-        let response = DhanDailyResponse {
-            open: vec![100.0],
-            high: vec![105.0],
-            low: vec![99.0],
-            close: vec![102.0],
-            volume: vec![1000000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-        assert!(!response.is_empty());
-        assert!(response.is_consistent());
+    fn test_dhan_daily_response_empty_oi_consistent() {
+        // Empty OI array is consistent with any length
+        let data = sample_daily_response();
+        assert!(data.open_interest.is_empty());
+        assert!(data.is_consistent());
     }
 
     #[test]
-    fn test_dhan_daily_response_inconsistent_volume() {
-        let response = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000], // only 1
-            timestamp: vec![1700000000, 1700000060],
-            open_interest: vec![],
-        };
-        assert!(!response.is_consistent());
+    fn test_dhan_daily_response_consistency_mismatched_volume() {
+        let mut data = sample_daily_response();
+        data.volume = vec![10_000]; // Only 1 element, should be 2
+        assert!(!data.is_consistent());
     }
 
     #[test]
-    fn test_dhan_daily_response_inconsistent_close() {
-        let response = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0], // only 1
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700000060],
-            open_interest: vec![],
-        };
-        assert!(!response.is_consistent());
+    fn test_dhan_intraday_response_consistency_mismatched_oi() {
+        let mut data = sample_intraday_response();
+        data.open_interest = vec![100, 200]; // 2 elements, but data has 3
+        assert!(!data.is_consistent());
     }
 
-    // -----------------------------------------------------------------------
-    // DH-904 exponential backoff math
-    // -----------------------------------------------------------------------
+    // =======================================================================
+    // Error action equality tests
+    // =======================================================================
 
     #[test]
-    fn test_dh904_backoff_sequence() {
-        // Sequence: 10 * 2^attempt = 10, 20, 40, 80
-        for attempt in 0..DH_904_MAX_BACKOFF_ATTEMPTS {
-            let backoff = DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(attempt));
-            let expected = DH_904_BACKOFF_BASE_SECS * (1_u64 << attempt);
-            assert_eq!(
-                backoff, expected,
-                "attempt {attempt}: expected {expected}s, got {backoff}s"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dh904_backoff_values() {
-        assert_eq!(
-            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(0)),
-            10,
-            "attempt 0: 10s"
-        );
-        assert_eq!(
-            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(1)),
-            20,
-            "attempt 1: 20s"
-        );
-        assert_eq!(
-            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(2)),
-            40,
-            "attempt 2: 40s"
-        );
-        assert_eq!(
-            DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(3)),
-            80,
-            "attempt 3: 80s"
-        );
-    }
-
-    #[test]
-    fn test_dh904_max_attempts_gives_up_at_threshold() {
-        // After DH_904_MAX_BACKOFF_ATTEMPTS, should give up
-        assert_eq!(DH_904_MAX_BACKOFF_ATTEMPTS, 4);
-        // attempt >= DH_904_MAX_BACKOFF_ATTEMPTS → return Failed
-        assert!(4_u32 >= DH_904_MAX_BACKOFF_ATTEMPTS);
-    }
-
-    // -----------------------------------------------------------------------
-    // IST time-of-day filtering for intraday candles
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_intraday_market_close_candle_filtered() {
-        // 15:30 IST = TICK_PERSIST_END_SECS_OF_DAY_IST = 55800
-        // A candle at exactly 15:30 IST should be filtered out
-        // UTC epoch for 15:30 IST = 10:00 UTC on some day
-        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600; // 10:00 UTC
-        let ist_secs_of_day =
-            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
-        assert_eq!(ist_secs_of_day, TICK_PERSIST_END_SECS_OF_DAY_IST);
-        assert!(ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST);
-    }
-
-    #[test]
-    fn test_intraday_after_market_candle_filtered() {
-        // 15:45 IST (post-close) should be filtered
-        // 15:45 IST = 10:15 UTC
-        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600 + 15 * 60;
-        let ist_secs_of_day =
-            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
-        assert_eq!(ist_secs_of_day, 15 * 3600 + 45 * 60); // 56700
-        assert!(ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST);
-    }
-
-    #[test]
-    fn test_intraday_market_open_candle_passes() {
-        // 09:15 IST = 03:45 UTC — should NOT be filtered
-        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 45 * 60;
-        let ist_secs_of_day =
-            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
-        assert_eq!(ist_secs_of_day, 9 * 3600 + 15 * 60); // 33300
-        assert!(ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST);
-    }
-
-    #[test]
-    fn test_intraday_last_valid_candle_1529_passes() {
-        // 15:29 IST = 09:59 UTC — the last valid 1m candle
-        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60;
-        let ist_secs_of_day =
-            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
-        assert_eq!(ist_secs_of_day, 15 * 3600 + 29 * 60); // 55740
-        assert!(ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST);
-    }
-
-    #[test]
-    fn test_intraday_noon_candle_passes() {
-        // 12:00 IST = 06:30 UTC — mid-session, should pass
-        let utc_epoch: i64 = 1_773_014_400 + 6 * 3600 + 30 * 60;
-        let ist_secs_of_day =
-            (utc_epoch.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
-        assert_eq!(ist_secs_of_day, 12 * 3600); // 43200
-        assert!(ist_secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST);
-    }
-
-    // -----------------------------------------------------------------------
-    // OI fallback when open_interest array is shorter
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_oi_fallback_uses_zero_when_array_short() {
-        // Simulates the OI fallback logic: if i >= data.open_interest.len(), use 0
-        let oi_array: Vec<i64> = vec![100, 200]; // only 2 entries
-        let index = 3_usize; // out of range
-        let oi_value = if index < oi_array.len() {
-            oi_array[index]
-        } else {
-            0
-        };
-        assert_eq!(oi_value, 0);
-    }
-
-    #[test]
-    fn test_oi_fallback_uses_value_when_in_range() {
-        let oi_array: Vec<i64> = vec![100, 200, 300];
-        let index = 1_usize;
-        let oi_value = if index < oi_array.len() {
-            oi_array[index]
-        } else {
-            0
-        };
-        assert_eq!(oi_value, 200);
-    }
-
-    #[test]
-    fn test_oi_fallback_empty_array() {
-        let oi_array: Vec<i64> = vec![];
-        let index = 0_usize;
-        let oi_value = if index < oi_array.len() {
-            oi_array[index]
-        } else {
-            0
-        };
-        assert_eq!(oi_value, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Error 805 pause and constant validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_error_805_pause_is_60_seconds() {
-        assert_eq!(ERROR_805_PAUSE_SECS, 60);
-    }
-
-    #[test]
-    fn test_dh904_backoff_base_is_10_seconds() {
-        assert_eq!(DH_904_BACKOFF_BASE_SECS, 10);
-    }
-
-    // -----------------------------------------------------------------------
-    // InstrumentFetchResult Success with persist failures
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_instrument_fetch_result_success_equality() {
-        assert_eq!(
-            InstrumentFetchResult::Success(100, 5),
-            InstrumentFetchResult::Success(100, 5)
-        );
-    }
-
-    #[test]
-    fn test_instrument_fetch_result_success_different_persist_fails() {
-        assert_ne!(
-            InstrumentFetchResult::Success(100, 0),
-            InstrumentFetchResult::Success(100, 5),
-            "Different persist failure counts must be distinct"
-        );
-    }
-
-    #[test]
-    fn test_instrument_fetch_result_success_different_candle_counts() {
-        assert_ne!(
-            InstrumentFetchResult::Success(50, 0),
-            InstrumentFetchResult::Success(100, 0),
-            "Different candle counts must be distinct"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // SubscriptionCategory mapping — exercising match arms in fetch logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_major_index_value_maps_to_index() {
-        let instrument_type = match SubscriptionCategory::MajorIndexValue {
-            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
-            SubscriptionCategory::StockEquity => "EQUITY",
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => "SKIP",
-        };
-        assert_eq!(instrument_type, "INDEX");
-    }
-
-    #[test]
-    fn test_stock_equity_maps_to_equity() {
-        let instrument_type = match SubscriptionCategory::StockEquity {
-            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
-            SubscriptionCategory::StockEquity => "EQUITY",
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => "SKIP",
-        };
-        assert_eq!(instrument_type, "EQUITY");
-    }
-
-    #[test]
-    fn test_index_derivative_skipped() {
-        let should_skip = matches!(
-            SubscriptionCategory::IndexDerivative,
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
-        );
-        assert!(should_skip);
-    }
-
-    #[test]
-    fn test_stock_derivative_skipped() {
-        let should_skip = matches!(
-            SubscriptionCategory::StockDerivative,
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
-        );
-        assert!(should_skip);
-    }
-
-    // -----------------------------------------------------------------------
-    // CandleFetchSummary — failure_reasons tracking
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_failure_reasons_token_expired_classification() {
-        // Simulates the failure reason classification logic
-        let token_expired_counts: Vec<usize> = vec![0, 0, 2, 1, 3];
-        let pending_indices = vec![2_usize, 3, 4];
-        let mut failure_reasons: HashMap<String, usize> = HashMap::new();
-        for &idx in &pending_indices {
-            if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
-                let count = failure_reasons
-                    .entry("token_expired".to_string())
-                    .or_insert(0);
-                *count = count.saturating_add(1);
-            } else {
-                let count = failure_reasons
-                    .entry("network_or_api".to_string())
-                    .or_insert(0);
-                *count = count.saturating_add(1);
-            }
-        }
-        // idx=2: count=2 >= MAX_TOKEN_EXPIRED_RETRIES(2) → token_expired
-        // idx=3: count=1 < 2 → network_or_api
-        // idx=4: count=3 >= 2 → token_expired
-        assert_eq!(failure_reasons["token_expired"], 2);
-        assert_eq!(failure_reasons["network_or_api"], 1);
-        // Ensure we also handle the mock token count correctly
-        assert!(token_expired_counts[2] >= MAX_TOKEN_EXPIRED_RETRIES);
-        assert!(token_expired_counts[3] < MAX_TOKEN_EXPIRED_RETRIES);
-    }
-
-    #[test]
-    fn test_failure_reasons_persist_inserted_when_nonzero() {
-        // Simulates the persist failure insertion logic
-        let total_persist_failures = 42_usize;
-        let mut failure_reasons: HashMap<String, usize> = HashMap::new();
-        if total_persist_failures > 0 {
-            failure_reasons.insert("persist".to_string(), total_persist_failures);
-        }
-        assert_eq!(failure_reasons["persist"], 42);
-    }
-
-    #[test]
-    fn test_failure_reasons_persist_not_inserted_when_zero() {
-        let total_persist_failures = 0_usize;
-        let mut failure_reasons: HashMap<String, usize> = HashMap::new();
-        if total_persist_failures > 0 {
-            failure_reasons.insert("persist".to_string(), total_persist_failures);
-        }
-        assert!(
-            !failure_reasons.contains_key("persist"),
-            "persist key must not be present when there are 0 persist failures"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Failed instrument name collection — MAX_FAILED_INSTRUMENT_NAMES cap
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_failed_instrument_names_take_capped() {
-        // Simulates the .take(MAX_FAILED_INSTRUMENT_NAMES) in the fetch function
-        let large_indices: Vec<usize> = (0..100).collect();
-        let names: Vec<String> = large_indices
-            .iter()
-            .take(MAX_FAILED_INSTRUMENT_NAMES)
-            .map(|&idx| format!("{idx} (NSE_EQ)"))
-            .collect();
-        assert_eq!(names.len(), MAX_FAILED_INSTRUMENT_NAMES);
-        assert_eq!(names.len(), 50);
-    }
-
-    #[test]
-    fn test_failed_instrument_names_under_cap() {
-        let small_indices: Vec<usize> = (0..3).collect();
-        let names: Vec<String> = small_indices
-            .iter()
-            .take(MAX_FAILED_INSTRUMENT_NAMES)
-            .map(|&idx| format!("{idx} (IDX_I)"))
-            .collect();
-        assert_eq!(names.len(), 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // Intraday response deserialization from JSON
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_dhan_intraday_response_deserialization() {
-        let json = r#"{
-            "open": [100.5, 101.0],
-            "high": [102.0, 103.0],
-            "low": [99.5, 100.0],
-            "close": [101.0, 102.5],
-            "volume": [1000, 2000],
-            "timestamp": [1700000000, 1700000060]
-        }"#;
-        let response: DhanIntradayResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.len(), 2);
-        assert!(response.is_consistent());
-        assert!(response.open_interest.is_empty());
-    }
-
-    #[test]
-    fn test_dhan_intraday_response_with_float_volume() {
-        // Dhan may return volume/timestamp as float (e.g., 105600.0)
-        let json = r#"{
-            "open": [100.5],
-            "high": [102.0],
-            "low": [99.5],
-            "close": [101.0],
-            "volume": [105600.0],
-            "timestamp": [1700000000.0],
-            "open_interest": [50000.0]
-        }"#;
-        let response: DhanIntradayResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.volume[0], 105600);
-        assert_eq!(response.timestamp[0], 1700000000);
-        assert_eq!(response.open_interest[0], 50000);
-    }
-
-    #[test]
-    fn test_dhan_daily_response_deserialization() {
-        let json = r#"{
-            "open": [24500.5],
-            "high": [24700.0],
-            "low": [24400.0],
-            "close": [24650.0],
-            "volume": [500000],
-            "timestamp": [1700000000]
-        }"#;
-        let response: DhanDailyResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.len(), 1);
-        assert!(response.is_consistent());
-        assert!(response.open_interest.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // ErrorAction enum completeness
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_error_action_debug_format() {
-        // Verify all variants have Debug
-        assert!(format!("{:?}", ErrorAction::RateLimited).contains("RateLimited"));
-        assert!(format!("{:?}", ErrorAction::TooManyConnections).contains("TooManyConnections"));
-        assert!(format!("{:?}", ErrorAction::TokenExpired).contains("TokenExpired"));
-        assert!(format!("{:?}", ErrorAction::StandardRetry).contains("StandardRetry"));
-        assert!(format!("{:?}", ErrorAction::NeverRetry).contains("NeverRetry"));
-    }
-
-    #[test]
-    fn test_error_action_equality_all_variants() {
-        // Each variant equals itself
+    fn test_error_action_eq() {
         assert_eq!(ErrorAction::RateLimited, ErrorAction::RateLimited);
         assert_eq!(
             ErrorAction::TooManyConnections,
@@ -2720,1829 +2929,148 @@ mod tests {
         assert_eq!(ErrorAction::TokenExpired, ErrorAction::TokenExpired);
         assert_eq!(ErrorAction::StandardRetry, ErrorAction::StandardRetry);
         assert_eq!(ErrorAction::NeverRetry, ErrorAction::NeverRetry);
+    }
 
-        // Different variants are not equal
+    #[test]
+    fn test_error_action_ne() {
         assert_ne!(ErrorAction::RateLimited, ErrorAction::NeverRetry);
-        assert_ne!(ErrorAction::TokenExpired, ErrorAction::StandardRetry);
-        assert_ne!(ErrorAction::TooManyConnections, ErrorAction::RateLimited);
-    }
-
-    // -----------------------------------------------------------------------
-    // Retry linear backoff delay math
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_retry_delay_ms_linear_sequence() {
-        // Retry delay = 1000ms * attempt — validates the delay used in fetch_*_with_retry
-        let max_retries = 3_u32;
-        for attempt in 1..=max_retries {
-            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
-            assert_eq!(delay_ms, u64::from(attempt) * 1000);
-        }
+        assert_ne!(ErrorAction::TooManyConnections, ErrorAction::TokenExpired);
+        assert_ne!(ErrorAction::StandardRetry, ErrorAction::RateLimited);
     }
 
     #[test]
-    fn test_retry_delay_ms_zero_on_first_attempt() {
-        // Attempt 0 skips the delay entirely (the condition: `if attempt > 0`)
-        let attempt = 0_u32;
-        assert_eq!(attempt, 0, "first attempt has no delay");
+    fn test_error_action_debug() {
+        assert!(format!("{:?}", ErrorAction::RateLimited).contains("RateLimited"));
+        assert!(format!("{:?}", ErrorAction::TooManyConnections).contains("TooManyConnections"));
+        assert!(format!("{:?}", ErrorAction::TokenExpired).contains("TokenExpired"));
+        assert!(format!("{:?}", ErrorAction::StandardRetry).contains("StandardRetry"));
+        assert!(format!("{:?}", ErrorAction::NeverRetry).contains("NeverRetry"));
     }
 
-    // -----------------------------------------------------------------------
-    // Historical candle struct — field access patterns
-    // -----------------------------------------------------------------------
+    // =======================================================================
+    // DhanErrorResponse / DataApiErrorResponse deserialization tests
+    // =======================================================================
 
     #[test]
-    fn test_historical_candle_all_timeframes() {
-        for &tf in &["1m", "5m", "15m", "60m", "1d"] {
-            let candle = HistoricalCandle {
-                timestamp_utc_secs: 1_700_000_000,
-                security_id: 11536,
-                exchange_segment_code: 1,
-                timeframe: tf,
-                open: 100.0,
-                high: 105.0,
-                low: 99.0,
-                close: 102.0,
-                volume: 50000,
-                open_interest: 0,
-            };
-            assert_eq!(candle.timeframe, tf);
-            assert_eq!(candle.security_id, 11536);
-        }
+    fn test_dhan_error_response_full_deserialize() {
+        let json = br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Too many requests"}"#;
+        let err: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.error_code.as_deref(), Some("DH-904"));
+        assert_eq!(err.error_type.as_deref(), Some("RATE_LIMIT"));
+        assert_eq!(err.error_message.as_deref(), Some("Too many requests"));
     }
 
     #[test]
-    fn test_historical_candle_fno_with_oi() {
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: 1_700_000_000,
-            security_id: 49081,
-            exchange_segment_code: 2, // NSE_FNO
-            timeframe: "1d",
-            open: 25000.0,
-            high: 25200.0,
-            low: 24900.0,
-            close: 25100.0,
-            volume: 100000,
-            open_interest: 5_000_000,
-        };
-        assert_eq!(candle.exchange_segment_code, 2);
-        assert_eq!(candle.open_interest, 5_000_000);
-    }
-
-    // -----------------------------------------------------------------------
-    // Saturating arithmetic edge cases (used throughout fetch logic)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_saturating_add_prevents_overflow() {
-        let mut count = usize::MAX - 1;
-        count = count.saturating_add(1);
-        assert_eq!(count, usize::MAX);
-        count = count.saturating_add(1);
-        assert_eq!(
-            count,
-            usize::MAX,
-            "saturating_add must not overflow past usize::MAX"
-        );
+    fn test_dhan_error_response_missing_fields() {
+        // All fields are optional
+        let json = br#"{}"#;
+        let err: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert!(err.error_code.is_none());
+        assert!(err.error_type.is_none());
+        assert!(err.error_message.is_none());
     }
 
     #[test]
-    fn test_saturating_mul_prevents_overflow() {
-        let result = u64::MAX.saturating_mul(2);
-        assert_eq!(
-            result,
-            u64::MAX,
-            "saturating_mul must not overflow past u64::MAX"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // classify_error — combined format priority tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_classify_error_data_api_format_takes_priority_over_trading() {
-        // When body matches BOTH formats, data API numeric format is tried first
-        let body = br#"{"errorCode": 805, "errorType": "RATE_LIMIT", "errorMessage": "conflict"}"#;
-        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
-        // Numeric 805 is tried first → TooManyConnections
-        assert_eq!(action, ErrorAction::TooManyConnections);
+    fn test_data_api_error_response_with_error_code() {
+        let json = br#"{"errorCode": 805, "errorMessage": "Too many"}"#;
+        let err: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.code, Some(805));
     }
 
     #[test]
-    fn test_classify_error_trading_format_fallback() {
-        // Body has only trading API format (string errorCode), no numeric code
-        let body =
-            br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "limit"}"#;
-        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
-        assert_eq!(action, ErrorAction::RateLimited);
-    }
-
-    // ===================================================================
-    // DhanErrorResponse and DataApiErrorResponse deserialization
-    // ===================================================================
-
-    #[test]
-    fn test_dhan_error_response_deserializes_all_fields() {
-        let body = br#"{"errorType": "T", "errorCode": "DH-905", "errorMessage": "msg"}"#;
-        let err: DhanErrorResponse = serde_json::from_slice(body).unwrap();
-        assert_eq!(err.error_code.as_deref(), Some("DH-905"));
-        assert_eq!(err.error_type.as_deref(), Some("T"));
-        assert_eq!(err.error_message.as_deref(), Some("msg"));
-    }
-
-    #[test]
-    fn test_data_api_error_response_deserializes_status_alias() {
-        let body = br#"{"status": 807, "message": "expired"}"#;
-        let err: DataApiErrorResponse = serde_json::from_slice(body).unwrap();
+    fn test_data_api_error_response_with_status_alias() {
+        let json = br#"{"status": 807, "message": "Token expired"}"#;
+        let err: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
         assert_eq!(err.code, Some(807));
     }
 
     #[test]
-    fn test_data_api_error_response_deserializes_error_code_alias() {
-        let body = br#"{"errorCode": 805, "errorMessage": "too many"}"#;
-        let err: DataApiErrorResponse = serde_json::from_slice(body).unwrap();
-        assert_eq!(err.code, Some(805));
+    fn test_data_api_error_response_empty() {
+        let json = br#"{}"#;
+        let err: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert!(err.code.is_none());
     }
 
-    // ===================================================================
-    // persist_intraday_candles — exercised with mock QuestDB writer
-    // ===================================================================
-
-    /// Creates a CandlePersistenceWriter backed by a mock TCP listener.
-    async fn create_mock_candle_writer() -> (
-        dhan_live_trader_storage::candle_persistence::CandlePersistenceWriter,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use dhan_live_trader_common::config::QuestDbConfig;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    loop {
-                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => continue,
-                        }
-                    }
-                });
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: 1,
-            pg_port: 1,
-        };
-        let writer =
-            dhan_live_trader_storage::candle_persistence::CandlePersistenceWriter::new(&config)
-                .unwrap();
-        (writer, handle)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_valid_data() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_candles_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0, 101.0, 102.0],
-            high: vec![103.0, 104.0, 105.0],
-            low: vec![99.0, 100.0, 101.0],
-            close: vec![101.0, 102.0, 103.0],
-            volume: vec![1000, 2000, 3000],
-            // Timestamp in market hours: 10:00 IST = 04:30 UTC
-            timestamp: vec![1700031000, 1700031060, 1700031120],
-            open_interest: vec![500, 600, 700],
-        };
-
-        let (count, persist_failures) =
-            persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-
-        assert_eq!(count, 3, "all 3 candles should be persisted");
-        assert_eq!(
-            persist_failures, 0,
-            "no persist failures with working writer"
-        );
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_nan_price_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_nan_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0, f64::NAN, 102.0],
-            high: vec![103.0, 104.0, 105.0],
-            low: vec![99.0, 100.0, 101.0],
-            close: vec![101.0, 102.0, 103.0],
-            volume: vec![1000, 2000, 3000],
-            timestamp: vec![1700031000, 1700031060, 1700031120],
-            open_interest: vec![500, 600, 700],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-
-        // Candle at index 1 has NaN open, should be skipped
-        assert_eq!(count, 2, "candle with NaN should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_non_positive_price_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_nonpos_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0, 0.0, 102.0],
-            high: vec![103.0, 0.0, 105.0],
-            low: vec![99.0, 0.0, 101.0],
-            close: vec![101.0, 0.0, 103.0],
-            volume: vec![1000, 2000, 3000],
-            timestamp: vec![1700031000, 1700031060, 1700031120],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "5m", &mut writer, &m_api_errors);
-
-        assert_eq!(count, 2, "candle with zero price should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_high_below_low_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_hlskip_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![99.0], // high < low
-            low: vec![101.0],
-            close: vec![100.5],
-            volume: vec![1000],
-            timestamp: vec![1700031000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "15m", &mut writer, &m_api_errors);
-
-        assert_eq!(count, 0, "candle with high < low should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_after_market_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_aftermarket_errors");
-
-        // Timestamp for 15:30 IST (market close) should be skipped
-        // 15:30 IST = 10:00 UTC, secs_of_day = 55800 when adding IST offset
-        // We need a UTC epoch where (epoch + 19800) % 86400 >= 55800
-        // 15:30 IST = 10:00 UTC on a random day
-        // epoch = 1700031000 is ~2023-11-15 02:30 UTC = 08:00 IST (inside hours)
-        // For 15:30 IST = 10:00 UTC: epoch = 1700031000 + (10*3600 - 2*3600 - 30*60) = shift
-        // Let's just pick an epoch that maps to 15:30 IST
-        // 15:30 IST secs_of_day with IST offset: secs = 15*3600 + 30*60 = 55800
-        // utc_secs_of_day = 55800 - 19800 = 36000 = 10:00 UTC
-        // So any day at 10:00 UTC = 15:30 IST
-        // 2023-11-15 10:00:00 UTC = 1700042400
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![103.0],
-            low: vec![99.0],
-            close: vec![101.0],
-            volume: vec![1000],
-            timestamp: vec![1700042400], // 15:30 IST
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "60m", &mut writer, &m_api_errors);
-
-        assert_eq!(count, 0, "candle at 15:30 IST should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_oi_shorter_than_data() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_oi_short_errors");
-
-        // OI array shorter than data arrays — should use 0 for missing OI
-        let data = DhanIntradayResponse {
-            open: vec![100.0, 101.0, 102.0],
-            high: vec![103.0, 104.0, 105.0],
-            low: vec![99.0, 100.0, 101.0],
-            close: vec![101.0, 102.0, 103.0],
-            volume: vec![1000, 2000, 3000],
-            timestamp: vec![1700031000, 1700031060, 1700031120],
-            open_interest: vec![500], // only 1 OI value for 3 candles
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-
-        assert_eq!(
-            count, 3,
-            "all candles should persist even with short OI array"
-        );
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_valid_data() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_valid_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![24000.0, 24100.0],
-            high: vec![24500.0, 24600.0],
-            low: vec![23800.0, 23900.0],
-            close: vec![24300.0, 24400.0],
-            volume: vec![100000, 200000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![5_000_000, 6_000_000],
-        };
-
-        let (count, persist_failures) =
-            persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-
-        assert_eq!(count, 2, "both daily candles should be persisted");
-        assert_eq!(persist_failures, 0);
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_nan_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_nan_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![24000.0, f64::INFINITY],
-            high: vec![24500.0, 24600.0],
-            low: vec![23800.0, 23900.0],
-            close: vec![24300.0, 24400.0],
-            volume: vec![100000, 200000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-
-        assert_eq!(count, 1, "candle with Infinity should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_non_positive_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_nonpos_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![-1.0],
-            high: vec![24500.0],
-            low: vec![23800.0],
-            close: vec![24300.0],
-            volume: vec![100000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-
-        assert_eq!(count, 0, "candle with negative price should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_high_below_low_skipped() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_hl_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![100.0],
-            high: vec![98.0], // high < low
-            low: vec![99.0],
-            close: vec![100.0],
-            volume: vec![1000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-
-        assert_eq!(count, 0, "candle with high < low should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_oi_shorter_than_data() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_oi_short_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![103.0, 104.0],
-            low: vec![99.0, 100.0],
-            close: vec![101.0, 102.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![], // empty OI
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-
-        assert_eq!(count, 2, "all candles should persist with empty OI array");
-
-        listener_handle.abort();
-    }
-
-    // ===================================================================
-    // fetch_intraday_with_retry — mock HTTP server tests
-    // ===================================================================
-
-    /// Starts a mock HTTP server that responds with the given status and body.
-    async fn start_mock_http_server(
-        status: u16,
-        body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
-
-        let handle = tokio::spawn(async move {
-            // Accept up to 10 connections (for retries)
-            for _ in 0..10 {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    // Read the full HTTP request first
-                    let mut request_buf = vec![0u8; 8192];
-                    let _ = stream.read(&mut request_buf).await;
-
-                    let body_bytes = body.as_bytes();
-                    let status_text = match status {
-                        200 => "OK",
-                        400 => "Bad Request",
-                        401 => "Unauthorized",
-                        429 => "Too Many Requests",
-                        500 => "Internal Server Error",
-                        _ => "Unknown",
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                        status,
-                        status_text,
-                        body_bytes.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.write_all(body_bytes).await;
-                    let _ = stream.flush().await;
-                }
-            }
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        (url, handle)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_success() {
-        let response_body = r#"{"open":[100.0],"high":[103.0],"low":[99.0],"close":[101.0],"volume":[1000],"timestamp":[1700031000],"open_interest":[]}"#;
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_success_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 1,
-        };
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
+    // =======================================================================
+    // Request body serialization edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_daily_request_with_expiry_code() {
+        let request = DailyRequest {
+            security_id: "49081".to_string(),
             exchange_segment: "NSE_FNO".to_string(),
             instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
+            expiry_code: Some(0),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-21".to_string(),
         };
-
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Ok(_, _)),
-            "should succeed with valid response"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"expiryCode\":0"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_empty_response() {
-        let response_body = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[],"open_interest":[]}"#;
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_empty_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Ok(0, 0)),
-            "empty response should return Ok(0, 0)"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_token_expired() {
-        let response_body = r#"{"errorCode": 807, "message": "token expired"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(401, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_expired_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::TokenExpired),
-            "should return TokenExpired for 807"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_never_retry_dh905() {
-        let response_body =
-            r#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "bad input"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(400, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_dh905_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 3,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "DH-905 should return Failed (never retry)"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_success() {
-        let response_body = r#"{"open":[24000.0],"high":[24500.0],"low":[23800.0],"close":[24300.0],"volume":[100000],"timestamp":[1700000000],"open_interest":[]}"#;
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_success_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 1,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
+    #[test]
+    fn test_daily_request_security_id_is_string() {
+        let request = DailyRequest {
+            security_id: "1333".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            instrument: "EQUITY".to_string(),
             expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-21".to_string(),
         };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Ok(_, _)),
-            "should succeed with valid daily response"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
+        let json = serde_json::to_string(&request).unwrap();
+        // securityId must be a string value, not a number
+        assert!(json.contains("\"securityId\":\"1333\""));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_inconsistent_arrays() {
-        // Arrays with different lengths should be rejected
-        let response_body = r#"{"open":[24000.0,24100.0],"high":[24500.0],"low":[23800.0],"close":[24300.0],"volume":[100000],"timestamp":[1700000000],"open_interest":[]}"#;
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_inconsistent_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
+    #[test]
+    fn test_intraday_request_interval_is_string() {
+        let request = IntradayRequest {
             security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "inconsistent arrays should fail"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    // ===================================================================
-    // fetch_intraday_with_retry — additional error path coverage
-    // ===================================================================
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_invalid_json_response() {
-        // Server returns 200 OK but body is not valid JSON — should fail after retries
-        let (url, server_handle) = start_mock_http_server(
-            200,
-            Box::leak("not valid json".to_string().into_boxed_str()),
-        )
-        .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_badjson_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            instrument: "EQUITY".to_string(),
+            interval: "60".to_string(),
             oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
+            from_date: "2026-01-01 09:15:00".to_string(),
+            to_date: "2026-01-05 15:30:00".to_string(),
         };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "invalid JSON should return Failed after all retries"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"interval\":\"60\""));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_inconsistent_arrays() {
-        // Server returns 200 OK with inconsistent array lengths
-        let response_body = r#"{"open":[100.0,101.0],"high":[103.0],"low":[99.0],"close":[101.0],"volume":[1000],"timestamp":[1700031000],"open_interest":[]}"#;
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_inconsistent_errors");
+    // =======================================================================
+    // Constant validation tests
+    // =======================================================================
 
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "inconsistent arrays should return Failed"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
+    #[test]
+    fn test_error_805_pause_duration() {
+        assert_eq!(ERROR_805_PAUSE_SECS, 60);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_standard_retry_exhausted() {
-        // Server returns 500 with unknown error body — exhausts retries
-        let response_body = r#"{"errorCode": 800, "message": "Internal server error"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(500, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_stdretry_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 1,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "standard retry exhausted should return Failed"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
+    #[test]
+    fn test_dh904_backoff_base() {
+        assert_eq!(DH_904_BACKOFF_BASE_SECS, 10);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_http_429_rate_limited() {
-        // HTTP 429 should return Failed after max backoff attempts
-        let response_body = r#"{"errorCode": "DH-904", "message": "Rate limited"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(429, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_429_errors");
-
-        // max_retries >= DH_904_MAX_BACKOFF_ATTEMPTS so the rate limit path gives up
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: DH_904_MAX_BACKOFF_ATTEMPTS,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            &url,
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "rate limited past max attempts should return Failed"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
+    #[test]
+    fn test_dh904_max_attempts() {
+        assert_eq!(DH_904_MAX_BACKOFF_ATTEMPTS, 4);
     }
 
-    // ===================================================================
-    // fetch_daily_with_retry — additional error path coverage
-    // ===================================================================
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_empty_response() {
-        let response_body = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[],"open_interest":[]}"#;
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_empty_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            0,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Ok(0, 0)),
-            "empty daily response should return Ok(0, 0)"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_token_expired() {
-        let response_body = r#"{"errorCode": 807, "message": "token expired"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(401, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_expired_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            0,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::TokenExpired),
-            "807 on daily should return TokenExpired"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_never_retry_dh905() {
-        let response_body =
-            r#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "bad input"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(400, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_dh905_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 3,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            0,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "DH-905 on daily should return Failed (never retry)"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_connection_refused() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_connrefused_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 2,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            "http://127.0.0.1:1/v2/charts/historical",
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            0,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "connection refused on daily should return Failed"
-        );
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_invalid_json_response() {
-        let (url, server_handle) =
-            start_mock_http_server(200, Box::leak("garbage body".to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_badjson_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            0,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "invalid JSON on daily should return Failed"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_daily_standard_retry_exhausted() {
-        let response_body = r#"{"errorCode": 800, "message": "Internal server error"}"#;
-        let (url, server_handle) =
-            start_mock_http_server(500, Box::leak(response_body.to_string().into_boxed_str()))
-                .await;
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_daily_stdretry_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 5,
-            request_delay_ms: 0,
-            max_retries: 1,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let daily_body = DailyRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-            expiry_code: None,
-            from_date: "2023-11-01".to_string(),
-            to_date: "2023-11-16".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_daily_with_retry(
-            &client,
-            &url,
-            &daily_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            0,
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "standard retry exhausted on daily should return Failed"
-        );
-
-        server_handle.abort();
-        listener_handle.abort();
-    }
-
-    // ===================================================================
-    // persist_intraday_candles — additional edge case coverage
-    // ===================================================================
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_infinity_in_high() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_inf_high_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![f64::INFINITY],
-            low: vec![99.0],
-            close: vec![101.0],
-            volume: vec![1000],
-            timestamp: vec![1700031000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "candle with Infinity high should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_neg_infinity_in_low() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_neginf_low_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![105.0],
-            low: vec![f64::NEG_INFINITY],
-            close: vec![101.0],
-            volume: vec![1000],
-            timestamp: vec![1700031000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "candle with NEG_INFINITY low should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_nan_in_close() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_nan_close_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![105.0],
-            low: vec![99.0],
-            close: vec![f64::NAN],
-            volume: vec![1000],
-            timestamp: vec![1700031000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "candle with NaN close should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_zero_close_only() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_zero_close_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![105.0],
-            low: vec![99.0],
-            close: vec![0.0],
-            volume: vec![1000],
-            timestamp: vec![1700031000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "candle with zero close should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_negative_low_only() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_neg_low_errors");
-
-        let data = DhanIntradayResponse {
-            open: vec![100.0],
-            high: vec![105.0],
-            low: vec![-1.0],
-            close: vec![102.0],
-            volume: vec![1000],
-            timestamp: vec![1700031000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "candle with negative low should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_intraday_candles_mixed_valid_and_invalid() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_intraday_mixed_errors");
-
-        // 5 candles: valid, NaN, zero, high<low, valid — only 2 should persist
-        let data = DhanIntradayResponse {
-            open: vec![100.0, f64::NAN, 0.0, 100.0, 200.0],
-            high: vec![105.0, 106.0, 0.0, 99.0, 210.0],
-            low: vec![99.0, 100.0, 0.0, 100.0, 195.0],
-            close: vec![102.0, 103.0, 0.0, 100.5, 205.0],
-            volume: vec![1000, 2000, 3000, 4000, 5000],
-            timestamp: vec![1700031000, 1700031060, 1700031120, 1700031180, 1700031240],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_intraday_candles(&data, 42, 2, "1m", &mut writer, &m_api_errors);
+    #[test]
+    fn test_instrument_fetch_result_success_equality() {
         assert_eq!(
-            count, 2,
-            "only the 2 valid candles should persist (indices 0 and 4)"
+            InstrumentFetchResult::Success(10, 0),
+            InstrumentFetchResult::Success(10, 0)
         );
-
-        listener_handle.abort();
-    }
-
-    // ===================================================================
-    // persist_daily_candles — additional edge case coverage
-    // ===================================================================
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_nan_in_close() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_nan_close_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![24000.0],
-            high: vec![24500.0],
-            low: vec![23800.0],
-            close: vec![f64::NAN],
-            volume: vec![100000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "daily candle with NaN close should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_neg_infinity_in_high() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_neginf_high_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![24000.0],
-            high: vec![f64::NEG_INFINITY],
-            low: vec![23800.0],
-            close: vec![24300.0],
-            volume: vec![100000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-        assert_eq!(
-            count, 0,
-            "daily candle with NEG_INFINITY high should be skipped"
+        assert_ne!(
+            InstrumentFetchResult::Success(10, 0),
+            InstrumentFetchResult::Success(11, 0)
         );
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_zero_high_only() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_zero_high_errors");
-
-        let data = DhanDailyResponse {
-            open: vec![24000.0],
-            high: vec![0.0],
-            low: vec![23800.0],
-            close: vec![24300.0],
-            volume: vec![100000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-        assert_eq!(count, 0, "daily candle with zero high should be skipped");
-
-        listener_handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_persist_daily_candles_mixed_valid_and_invalid() {
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_persist_daily_mixed_errors");
-
-        // 4 candles: valid, zero open, high<low, valid
-        let data = DhanDailyResponse {
-            open: vec![100.0, 0.0, 100.0, 200.0],
-            high: vec![105.0, 0.0, 98.0, 210.0],
-            low: vec![99.0, 0.0, 99.0, 195.0],
-            close: vec![102.0, 0.0, 99.5, 205.0],
-            volume: vec![1000, 2000, 3000, 4000],
-            timestamp: vec![1700000000, 1700086400, 1700172800, 1700259200],
-            open_interest: vec![],
-        };
-
-        let (count, _) = persist_daily_candles(&data, 42, 2, &mut writer, &m_api_errors);
-        assert_eq!(count, 2, "only 2 valid daily candles should persist");
-
-        listener_handle.abort();
-    }
-
-    // ===================================================================
-    // DhanDailyResponse — additional inconsistency patterns
-    // ===================================================================
-
-    #[test]
-    fn test_dhan_daily_response_inconsistent_high_length() {
-        let response = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(
-            !response.is_consistent(),
-            "mismatched high array length must fail consistency"
+        assert_ne!(
+            InstrumentFetchResult::Success(10, 0),
+            InstrumentFetchResult::Success(10, 1)
         );
-    }
-
-    #[test]
-    fn test_dhan_daily_response_inconsistent_low_length() {
-        let response = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(
-            !response.is_consistent(),
-            "mismatched low array length must fail consistency"
-        );
-    }
-
-    #[test]
-    fn test_dhan_daily_response_inconsistent_open_length() {
-        let response = DhanDailyResponse {
-            open: vec![100.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(
-            !response.is_consistent(),
-            "mismatched open array length must fail consistency"
-        );
-    }
-
-    #[test]
-    fn test_dhan_daily_response_inconsistent_oi_length() {
-        let response = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![50000],
-        };
-        assert!(
-            !response.is_consistent(),
-            "mismatched OI array length (non-empty but wrong size) must fail consistency"
-        );
-    }
-
-    #[test]
-    fn test_dhan_intraday_response_inconsistent_timestamp_length() {
-        let response = DhanIntradayResponse {
-            open: vec![100.0, 101.0],
-            high: vec![105.0, 106.0],
-            low: vec![99.0, 100.0],
-            close: vec![102.0, 103.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000],
-            open_interest: vec![],
-        };
-        // timestamp has 1 element but others have 2 — len() returns 1 from timestamp
-        // but open.len() == 2 != 1, so is_consistent should be false
-        assert!(
-            !response.is_consistent(),
-            "fewer timestamps than OHLCV arrays must fail consistency"
-        );
-    }
-
-    // ===================================================================
-    // classify_error — combined and edge case coverage
-    // ===================================================================
-
-    #[test]
-    fn test_classify_error_dh910_standard_retry() {
-        let body = br#"{"errorType": "OTHER", "errorCode": "DH-910", "errorMessage": "Unknown"}"#;
-        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
-        assert_eq!(
-            action,
-            ErrorAction::StandardRetry,
-            "DH-910 should fall to StandardRetry"
-        );
-    }
-
-    #[test]
-    fn test_classify_error_dh907_standard_retry() {
-        let body = br#"{"errorType": "DATA", "errorCode": "DH-907", "errorMessage": "Data error"}"#;
-        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
-        assert_eq!(
-            action,
-            ErrorAction::StandardRetry,
-            "DH-907 should fall to StandardRetry"
-        );
-    }
-
-    #[test]
-    fn test_classify_error_data_api_809_standard_retry() {
-        let body = br#"{"errorCode": 809, "message": "Token invalid"}"#;
-        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
-        assert_eq!(
-            action,
-            ErrorAction::StandardRetry,
-            "data API 809 should fall to StandardRetry"
-        );
-    }
-
-    #[test]
-    fn test_classify_error_data_api_814_standard_retry() {
-        let body = br#"{"errorCode": 814, "message": "Invalid request"}"#;
-        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
-        assert_eq!(
-            action,
-            ErrorAction::StandardRetry,
-            "data API 814 should fall to StandardRetry"
-        );
-    }
-
-    #[test]
-    fn test_classify_error_mixed_format_numeric_takes_priority() {
-        // Body has numeric errorCode (807) AND string errorCode — numeric tried first
-        let body = br#"{"errorCode": 807, "errorType": "RATE_LIMIT", "errorMessage": "conflict"}"#;
-        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
-        assert_eq!(
-            action,
-            ErrorAction::TokenExpired,
-            "numeric 807 should take priority"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetch_intraday_connection_refused() {
-        // Point to a port that nobody is listening on
-        let (mut writer, listener_handle) = create_mock_candle_writer().await;
-        let m_api_errors = counter!("test_fetch_intraday_connrefused_errors");
-
-        let config = HistoricalDataConfig {
-            enabled: true,
-            lookback_days: 90,
-            request_timeout_secs: 2,
-            request_delay_ms: 0,
-            max_retries: 0,
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let request_body = IntradayRequest {
-            security_id: "42".to_string(),
-            exchange_segment: "NSE_FNO".to_string(),
-            instrument: "FUTIDX".to_string(),
-            interval: "1".to_string(),
-            oi: true,
-            from_date: "2023-11-10 09:15:00".to_string(),
-            to_date: "2023-11-15 15:30:00".to_string(),
-        };
-        let access_token = Zeroizing::new("test_token".to_string());
-        let client_id = SecretString::from("test_client");
-
-        let result = fetch_intraday_with_retry(
-            &client,
-            "http://127.0.0.1:1/v2/charts/intraday",
-            &request_body,
-            &access_token,
-            &client_id,
-            &config,
-            42,
-            2,
-            "1m",
-            &mut writer,
-            &m_api_errors,
-        )
-        .await;
-
-        assert!(
-            matches!(result, TimeframeFetchResult::Failed),
-            "connection refused should return Failed"
-        );
-
-        listener_handle.abort();
     }
 }

@@ -206,6 +206,324 @@ const CROSS_MATCH_TIMEFRAMES: &[(&str, &str)] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Pure Helper Functions (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Parses coverage rows into a per-timeframe map of (security_id, candle_count).
+///
+/// Each row is expected to have [timeframe, security_id, count].
+fn parse_coverage_rows(
+    dataset: &[Vec<serde_json::Value>],
+) -> (HashMap<String, Vec<(i64, usize)>>, usize) {
+    let mut timeframe_instruments: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+    let mut total_candles = 0_usize;
+
+    for row in dataset {
+        if row.len() < 3 {
+            continue;
+        }
+        let tf = row[0].as_str().unwrap_or("").to_string();
+        let sid = row[1].as_i64().unwrap_or(0);
+        let count = row[2].as_i64().unwrap_or(0).max(0) as usize;
+        total_candles = total_candles.saturating_add(count);
+
+        timeframe_instruments
+            .entry(tf)
+            .or_default()
+            .push((sid, count));
+    }
+
+    (timeframe_instruments, total_candles)
+}
+
+/// Builds per-timeframe coverage summaries from the parsed timeframe map.
+fn build_timeframe_coverage(
+    timeframe_instruments: &HashMap<String, Vec<(i64, usize)>>,
+) -> Vec<TimeframeCoverage> {
+    let mut timeframe_counts: Vec<TimeframeCoverage> =
+        Vec::with_capacity(VERIFIED_TIMEFRAMES.len());
+    for &tf in VERIFIED_TIMEFRAMES {
+        let instruments = timeframe_instruments.get(tf);
+        let instrument_count = instruments.map_or(0, Vec::len);
+        let candle_count: usize = instruments.map_or(0, |v| v.iter().map(|(_, c)| *c).sum());
+        timeframe_counts.push(TimeframeCoverage {
+            timeframe: tf.to_string(),
+            instrument_count,
+            candle_count,
+        });
+    }
+    timeframe_counts
+}
+
+/// Classifies instruments by 1m candle coverage completeness.
+///
+/// Returns `(instruments_complete, instruments_with_gaps)`.
+fn classify_1m_coverage(instruments: &[(i64, usize)], min_candles: usize) -> (usize, usize) {
+    let mut complete = 0_usize;
+    let mut gaps = 0_usize;
+
+    for &(_sid, count) in instruments {
+        if count >= min_candles {
+            complete = complete.saturating_add(1);
+        } else {
+            gaps = gaps.saturating_add(1);
+        }
+    }
+
+    (complete, gaps)
+}
+
+/// Collects unique instrument IDs across all timeframes.
+fn count_unique_instruments(timeframe_instruments: &HashMap<String, Vec<(i64, usize)>>) -> usize {
+    let mut all_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for instruments in timeframe_instruments.values() {
+        for &(sid, _) in instruments {
+            all_ids.insert(sid);
+        }
+    }
+    all_ids.len()
+}
+
+/// Determines if the cross-verification report should pass.
+///
+/// FAIL if: zero instruments OR any gaps OR any violations of any type.
+fn determine_verification_passed(
+    instruments_checked: usize,
+    instruments_with_gaps: usize,
+    ohlc_violations: usize,
+    data_violations: usize,
+    timestamp_violations: usize,
+) -> bool {
+    instruments_checked > 0
+        && instruments_with_gaps == 0
+        && ohlc_violations == 0
+        && data_violations == 0
+        && timestamp_violations == 0
+}
+
+/// Detects whether a price mismatch exists between historical and live OHLC values.
+///
+/// Returns `true` if any of the four price fields differ by more than epsilon.
+fn has_price_mismatch(d_open: f64, d_high: f64, d_low: f64, d_close: f64, epsilon: f64) -> bool {
+    d_open.abs() > epsilon
+        || d_high.abs() > epsilon
+        || d_low.abs() > epsilon
+        || d_close.abs() > epsilon
+}
+
+/// Detects whether a volume mismatch exists.
+///
+/// Uses relative tolerance: |diff| / max(hist_volume, 1) > tolerance_pct.
+fn has_volume_mismatch(h_volume: i64, m_volume: i64, tolerance_pct: f64) -> bool {
+    let h_vol_max = (h_volume.max(1)) as f64;
+    let vol_diff_pct = (m_volume.saturating_sub(h_volume) as f64).abs() / h_vol_max;
+    vol_diff_pct > tolerance_pct
+}
+
+/// Detects whether an OI mismatch exists.
+///
+/// Only applies when both historical and live OI > 0 (derivatives).
+fn has_oi_mismatch(h_oi: i64, m_oi: i64, tolerance_pct: f64) -> bool {
+    if h_oi > 0 && m_oi > 0 {
+        let h_oi_max = h_oi.max(1) as f64;
+        let oi_diff_pct = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
+        oi_diff_pct > tolerance_pct
+    } else {
+        false
+    }
+}
+
+/// Classifies the type of mismatch based on which fields differ.
+///
+/// Returns one of: `"oi_diff"`, `"volume_diff"`, or `"price_diff"`.
+fn classify_mismatch_type(
+    price_mismatch: bool,
+    volume_mismatch: bool,
+    oi_mismatch: bool,
+) -> &'static str {
+    if oi_mismatch && !price_mismatch && !volume_mismatch {
+        "oi_diff"
+    } else if volume_mismatch && !price_mismatch {
+        "volume_diff"
+    } else {
+        "price_diff"
+    }
+}
+
+/// OHLCV + OI values for a single candle (used in cross-match comparisons).
+#[derive(Debug, Clone, Copy)]
+struct CandleValues {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: i64,
+    oi: i64,
+}
+
+impl CandleValues {
+    /// Formats as display string with OI.
+    fn format_with_oi(self) -> String {
+        format!(
+            "O={} H={} L={} C={} V={} OI={}",
+            self.open, self.high, self.low, self.close, self.volume, self.oi
+        )
+    }
+
+    /// Formats as display string without OI.
+    fn format_ohlcv(self) -> String {
+        format!(
+            "O={} H={} L={} C={} V={}",
+            self.open, self.high, self.low, self.close, self.volume
+        )
+    }
+}
+
+/// Context identifying a candle row (symbol, segment, timeframe, timestamp).
+struct CandleContext {
+    symbol: String,
+    segment: String,
+    timeframe: String,
+    timestamp_ist: String,
+}
+
+/// Parameters for building a diff summary.
+struct DiffSummaryParams {
+    d_open: f64,
+    d_high: f64,
+    d_low: f64,
+    d_close: f64,
+    h_volume: i64,
+    m_volume: i64,
+    h_oi: i64,
+    m_oi: i64,
+    epsilon: f64,
+    volume_mismatch: bool,
+    oi_mismatch: bool,
+}
+
+/// Builds a diff summary string for fields that exceed tolerance.
+///
+/// Example output: `"O(+1.50) H(-0.75) V(+5000 15%)"`.
+fn build_diff_summary(params: &DiffSummaryParams) -> String {
+    let mut diffs = Vec::new();
+    if params.d_open.abs() > params.epsilon {
+        diffs.push(format!("O({:+.2})", params.d_open));
+    }
+    if params.d_high.abs() > params.epsilon {
+        diffs.push(format!("H({:+.2})", params.d_high));
+    }
+    if params.d_low.abs() > params.epsilon {
+        diffs.push(format!("L({:+.2})", params.d_low));
+    }
+    if params.d_close.abs() > params.epsilon {
+        diffs.push(format!("C({:+.2})", params.d_close));
+    }
+    let d_vol = params.m_volume.saturating_sub(params.h_volume);
+    if params.volume_mismatch {
+        let h_vol_max = (params.h_volume.max(1)) as f64;
+        let vol_diff_pct =
+            (params.m_volume.saturating_sub(params.h_volume) as f64).abs() / h_vol_max;
+        diffs.push(format!("V({d_vol:+} {vol_diff_pct:.0}%)"));
+    }
+    if params.oi_mismatch {
+        let d_oi = params.m_oi.saturating_sub(params.h_oi);
+        diffs.push(format!("OI({d_oi:+})"));
+    }
+    diffs.join(" ")
+}
+
+/// Builds a `ViolationDetail` from parsed candle row values.
+fn build_violation_detail(
+    ctx: CandleContext,
+    violation_type: &str,
+    candle: CandleValues,
+) -> ViolationDetail {
+    ViolationDetail {
+        symbol: ctx.symbol,
+        segment: ctx.segment,
+        timeframe: ctx.timeframe,
+        timestamp_ist: ctx.timestamp_ist,
+        violation: violation_type.to_string(),
+        values: candle.format_ohlcv(),
+    }
+}
+
+/// Classifies a single cross-match row and returns a mismatch if any tolerance exceeded.
+///
+/// Returns `None` if the row passes all tolerance checks (no mismatch).
+fn classify_cross_match_row(
+    ctx: CandleContext,
+    hist: CandleValues,
+    live: CandleValues,
+) -> Option<CrossMatchMismatch> {
+    let d_open = live.open - hist.open;
+    let d_high = live.high - hist.high;
+    let d_low = live.low - hist.low;
+    let d_close = live.close - hist.close;
+
+    let price_mismatch =
+        has_price_mismatch(d_open, d_high, d_low, d_close, CROSS_MATCH_PRICE_EPSILON);
+    let volume_mismatch =
+        has_volume_mismatch(hist.volume, live.volume, CROSS_MATCH_VOLUME_TOLERANCE_PCT);
+    let oi_mismatch = has_oi_mismatch(hist.oi, live.oi, CROSS_MATCH_OI_TOLERANCE_PCT);
+
+    if !price_mismatch && !volume_mismatch && !oi_mismatch {
+        return None;
+    }
+
+    let mismatch_type = classify_mismatch_type(price_mismatch, volume_mismatch, oi_mismatch);
+
+    let diff_summary = build_diff_summary(&DiffSummaryParams {
+        d_open,
+        d_high,
+        d_low,
+        d_close,
+        h_volume: hist.volume,
+        m_volume: live.volume,
+        h_oi: hist.oi,
+        m_oi: live.oi,
+        epsilon: CROSS_MATCH_PRICE_EPSILON,
+        volume_mismatch,
+        oi_mismatch,
+    });
+
+    Some(CrossMatchMismatch {
+        symbol: ctx.symbol,
+        segment: ctx.segment,
+        timeframe: ctx.timeframe,
+        timestamp_ist: ctx.timestamp_ist,
+        mismatch_type: mismatch_type.to_string(),
+        hist_values: hist.format_with_oi(),
+        live_values: live.format_with_oi(),
+        diff_summary,
+    })
+}
+
+/// Builds a `CrossMatchMismatch` for when live data is missing.
+fn build_missing_live_mismatch(ctx: CandleContext, hist: CandleValues) -> CrossMatchMismatch {
+    CrossMatchMismatch {
+        symbol: ctx.symbol,
+        segment: ctx.segment,
+        timeframe: ctx.timeframe,
+        timestamp_ist: ctx.timestamp_ist,
+        mismatch_type: "missing_live".to_string(),
+        hist_values: hist.format_with_oi(),
+        live_values: "[MISSING — no live data for this candle]".to_string(),
+        diff_summary: String::new(),
+    }
+}
+
+/// Determines if the cross-match report should pass.
+fn determine_cross_match_passed(
+    total_mismatches: usize,
+    total_compared: usize,
+    missing_views_count: usize,
+) -> bool {
+    total_mismatches == 0 && total_compared > 0 && missing_views_count == 0
+}
+
+// ---------------------------------------------------------------------------
 // Cross-Verification Logic
 // ---------------------------------------------------------------------------
 
@@ -279,37 +597,10 @@ pub async fn verify_candle_integrity(
     };
 
     // Parse coverage results into per-timeframe maps
-    let mut timeframe_instruments: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
-    let mut total_candles = 0_usize;
-
-    for row in &coverage_data.dataset {
-        if row.len() < 3 {
-            continue;
-        }
-        let tf = row[0].as_str().unwrap_or("").to_string();
-        let sid = row[1].as_i64().unwrap_or(0);
-        let count = row[2].as_i64().unwrap_or(0).max(0) as usize;
-        total_candles = total_candles.saturating_add(count);
-
-        timeframe_instruments
-            .entry(tf)
-            .or_default()
-            .push((sid, count));
-    }
+    let (timeframe_instruments, total_candles) = parse_coverage_rows(&coverage_data.dataset);
 
     // Build per-timeframe coverage summary
-    let mut timeframe_counts: Vec<TimeframeCoverage> =
-        Vec::with_capacity(VERIFIED_TIMEFRAMES.len());
-    for &tf in VERIFIED_TIMEFRAMES {
-        let instruments = timeframe_instruments.get(tf);
-        let instrument_count = instruments.map_or(0, Vec::len);
-        let candle_count: usize = instruments.map_or(0, |v| v.iter().map(|(_, c)| *c).sum());
-        timeframe_counts.push(TimeframeCoverage {
-            timeframe: tf.to_string(),
-            instrument_count,
-            candle_count,
-        });
-    }
+    let timeframe_counts = build_timeframe_coverage(&timeframe_instruments);
 
     // --- Step 2: 1m coverage check (primary completeness metric) ---
     let one_m_instruments = timeframe_instruments.get(TIMEFRAME_1M);
@@ -318,38 +609,30 @@ pub async fn verify_candle_integrity(
     // APPROVED: f64 multiplication for coverage ratio check — no overflow risk
     let min_candles = (CANDLES_PER_TRADING_DAY as f64 * MIN_CANDLE_COVERAGE_RATIO) as usize;
 
-    let mut instruments_complete = 0_usize;
-    let mut instruments_with_gaps = 0_usize;
-    let mut gap_log_count = 0_usize;
-
-    if let Some(instruments) = one_m_instruments {
+    let (instruments_complete, instruments_with_gaps) = if let Some(instruments) = one_m_instruments
+    {
+        let (complete, gaps) = classify_1m_coverage(instruments, min_candles);
+        // Log first 10 gaps for debugging
+        let mut gap_log_count = 0_usize;
         for &(sid, count) in instruments {
-            if count >= min_candles {
-                instruments_complete = instruments_complete.saturating_add(1);
-            } else {
-                instruments_with_gaps = instruments_with_gaps.saturating_add(1);
-                if gap_log_count < 10 {
-                    debug!(
-                        security_id = sid,
-                        candle_count = count,
-                        expected = CANDLES_PER_TRADING_DAY,
-                        timeframe = TIMEFRAME_1M,
-                        "instrument has incomplete 1m candle coverage"
-                    );
-                    gap_log_count = gap_log_count.saturating_add(1);
-                }
+            if count < min_candles && gap_log_count < 10 {
+                debug!(
+                    security_id = sid,
+                    candle_count = count,
+                    expected = CANDLES_PER_TRADING_DAY,
+                    timeframe = TIMEFRAME_1M,
+                    "instrument has incomplete 1m candle coverage"
+                );
+                gap_log_count = gap_log_count.saturating_add(1);
             }
         }
-    }
+        (complete, gaps)
+    } else {
+        (0_usize, 0_usize)
+    };
 
     // Count unique instruments across all timeframes
-    let mut all_instrument_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for instruments in timeframe_instruments.values() {
-        for &(sid, _) in instruments {
-            all_instrument_ids.insert(sid);
-        }
-    }
-    let instruments_checked = all_instrument_ids.len();
+    let instruments_checked = count_unique_instruments(&timeframe_instruments);
 
     // --- Step 3: OHLC consistency check (high < low) with details ---
     let ohlc_count_query = format!(
@@ -476,11 +759,13 @@ pub async fn verify_candle_integrity(
 
     // --- Step 6: Determine pass/fail ---
     // FAIL if: zero instruments OR any gaps OR any violations of any type
-    let passed = instruments_checked > 0
-        && instruments_with_gaps == 0
-        && ohlc_violations == 0
-        && data_violations == 0
-        && timestamp_violations == 0;
+    let passed = determine_verification_passed(
+        instruments_checked,
+        instruments_with_gaps,
+        ohlc_violations,
+        data_violations,
+        timestamp_violations,
+    );
 
     // Log per-timeframe summary
     for tc in &timeframe_counts {
@@ -639,7 +924,8 @@ pub async fn cross_match_historical_vs_live(
         all_details.extend(details);
     }
 
-    let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
+    let passed =
+        determine_cross_match_passed(total_mismatches, total_compared, missing_views.len());
 
     info!(
         timeframes_checked,
@@ -801,14 +1087,23 @@ async fn parse_violation_rows(
         let close = row[7].as_f64().unwrap_or(0.0);
         let volume = row[8].as_i64().unwrap_or(0);
 
-        details.push(ViolationDetail {
-            symbol: lookup_symbol(registry, sid),
-            segment,
-            timeframe,
-            timestamp_ist,
-            violation: violation_type.to_string(),
-            values: format!("O={open} H={high} L={low} C={close} V={volume}"),
-        });
+        details.push(build_violation_detail(
+            CandleContext {
+                symbol: lookup_symbol(registry, sid),
+                segment,
+                timeframe,
+                timestamp_ist,
+            },
+            violation_type,
+            CandleValues {
+                open,
+                high,
+                low,
+                close,
+                volume,
+                oi: 0,
+            },
+        ));
 
         if details.len() >= MAX_VIOLATION_DETAILS {
             break;
@@ -856,19 +1151,25 @@ async fn parse_cross_match_rows_with_oi(
         // Live values: NULL if missing (LEFT JOIN with no match)
         let live_is_null = row[8].is_null();
 
+        let hist = CandleValues {
+            open: h_open,
+            high: h_high,
+            low: h_low,
+            close: h_close,
+            volume: h_volume,
+            oi: h_oi,
+        };
+
         if live_is_null {
-            details.push(CrossMatchMismatch {
-                symbol: lookup_symbol(registry, sid),
-                segment,
-                timeframe: timeframe.to_string(),
-                timestamp_ist,
-                mismatch_type: "missing_live".to_string(),
-                hist_values: format!(
-                    "O={h_open} H={h_high} L={h_low} C={h_close} V={h_volume} OI={h_oi}"
-                ),
-                live_values: "[MISSING — no live data for this candle]".to_string(),
-                diff_summary: String::new(),
-            });
+            details.push(build_missing_live_mismatch(
+                CandleContext {
+                    symbol: lookup_symbol(registry, sid),
+                    segment,
+                    timeframe: timeframe.to_string(),
+                    timestamp_ist,
+                },
+                hist,
+            ));
             continue;
         }
 
@@ -879,82 +1180,30 @@ async fn parse_cross_match_rows_with_oi(
         let m_volume = row[12].as_i64().unwrap_or(0);
         let m_oi = row[14].as_i64().unwrap_or(0);
 
-        // Rust-side mismatch detection with proper tolerances
-        let d_open = m_open - h_open;
-        let d_high = m_high - h_high;
-        let d_low = m_low - h_low;
-        let d_close = m_close - h_close;
-
-        let price_mismatch = d_open.abs() > CROSS_MATCH_PRICE_EPSILON
-            || d_high.abs() > CROSS_MATCH_PRICE_EPSILON
-            || d_low.abs() > CROSS_MATCH_PRICE_EPSILON
-            || d_close.abs() > CROSS_MATCH_PRICE_EPSILON;
-
-        // H1: Volume mismatch — relative 10% tolerance
-        let h_vol_max = (h_volume.max(1)) as f64;
-        let vol_diff_pct = (m_volume.saturating_sub(h_volume) as f64).abs() / h_vol_max;
-        let volume_mismatch = vol_diff_pct > CROSS_MATCH_VOLUME_TOLERANCE_PCT;
-
-        // H2: OI mismatch — only when both > 0 (derivatives)
-        let oi_mismatch = if h_oi > 0 && m_oi > 0 {
-            let h_oi_max = h_oi.max(1) as f64;
-            let oi_diff_pct = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
-            oi_diff_pct > CROSS_MATCH_OI_TOLERANCE_PCT
-        } else {
-            false
+        let live = CandleValues {
+            open: m_open,
+            high: m_high,
+            low: m_low,
+            close: m_close,
+            volume: m_volume,
+            oi: m_oi,
         };
 
-        if !price_mismatch && !volume_mismatch && !oi_mismatch {
+        if let Some(mismatch) = classify_cross_match_row(
+            CandleContext {
+                symbol: lookup_symbol(registry, sid),
+                segment,
+                timeframe: timeframe.to_string(),
+                timestamp_ist,
+            },
+            hist,
+            live,
+        ) {
+            details.push(mismatch);
+        } else {
             // SQL pre-filter caught it but Rust-side says it's fine (e.g., volume diff < 10%)
             continue;
         }
-
-        // Determine mismatch type
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-
-        // Build diff summary for ALL fields that exceed tolerance
-        let mut diffs = Vec::new();
-        if d_open.abs() > CROSS_MATCH_PRICE_EPSILON {
-            diffs.push(format!("O({d_open:+.2})"));
-        }
-        if d_high.abs() > CROSS_MATCH_PRICE_EPSILON {
-            diffs.push(format!("H({d_high:+.2})"));
-        }
-        if d_low.abs() > CROSS_MATCH_PRICE_EPSILON {
-            diffs.push(format!("L({d_low:+.2})"));
-        }
-        if d_close.abs() > CROSS_MATCH_PRICE_EPSILON {
-            diffs.push(format!("C({d_close:+.2})"));
-        }
-        let d_vol = m_volume.saturating_sub(h_volume);
-        if volume_mismatch {
-            diffs.push(format!("V({d_vol:+} {vol_diff_pct:.0}%)"));
-        }
-        if oi_mismatch {
-            let d_oi = m_oi.saturating_sub(h_oi);
-            diffs.push(format!("OI({d_oi:+})"));
-        }
-
-        details.push(CrossMatchMismatch {
-            symbol: lookup_symbol(registry, sid),
-            segment,
-            timeframe: timeframe.to_string(),
-            timestamp_ist,
-            mismatch_type: mismatch_type.to_string(),
-            hist_values: format!(
-                "O={h_open} H={h_high} L={h_low} C={h_close} V={h_volume} OI={h_oi}"
-            ),
-            live_values: format!(
-                "O={m_open} H={m_high} L={m_low} C={m_close} V={m_volume} OI={m_oi}"
-            ),
-            diff_summary: diffs.join(" "),
-        });
 
         if details.len() >= MAX_VIOLATION_DETAILS {
             break;
@@ -1348,1297 +1597,717 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pure helper function tests
+    // parse_coverage_rows tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_lookup_symbol_not_found_returns_id_string() {
-        let registry = InstrumentRegistry::empty();
-        assert_eq!(lookup_symbol(&registry, 99999), "99999");
+    fn test_parse_coverage_rows_empty() {
+        let (map, total) = parse_coverage_rows(&[]);
+        assert!(map.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[test]
-    fn test_lookup_symbol_zero() {
-        let registry = InstrumentRegistry::empty();
-        assert_eq!(lookup_symbol(&registry, 0), "0");
+    fn test_parse_coverage_rows_single_row() {
+        let dataset = vec![vec![
+            serde_json::json!("1m"),
+            serde_json::json!(1333),
+            serde_json::json!(375),
+        ]];
+        let (map, total) = parse_coverage_rows(&dataset);
+        assert_eq!(total, 375);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["1m"], vec![(1333, 375)]);
+    }
+
+    #[test]
+    fn test_parse_coverage_rows_multiple_timeframes() {
+        let dataset = vec![
+            vec![
+                serde_json::json!("1m"),
+                serde_json::json!(100),
+                serde_json::json!(375),
+            ],
+            vec![
+                serde_json::json!("5m"),
+                serde_json::json!(100),
+                serde_json::json!(75),
+            ],
+            vec![
+                serde_json::json!("1m"),
+                serde_json::json!(200),
+                serde_json::json!(350),
+            ],
+        ];
+        let (map, total) = parse_coverage_rows(&dataset);
+        assert_eq!(total, 800);
+        assert_eq!(map["1m"].len(), 2);
+        assert_eq!(map["5m"].len(), 1);
+    }
+
+    #[test]
+    fn test_parse_coverage_rows_short_row_skipped() {
+        let dataset = vec![
+            vec![serde_json::json!("1m"), serde_json::json!(100)], // too short
+            vec![
+                serde_json::json!("1m"),
+                serde_json::json!(200),
+                serde_json::json!(100),
+            ],
+        ];
+        let (map, total) = parse_coverage_rows(&dataset);
+        assert_eq!(total, 100);
+        assert_eq!(map["1m"].len(), 1);
+    }
+
+    #[test]
+    fn test_parse_coverage_rows_negative_count_clamped() {
+        let dataset = vec![vec![
+            serde_json::json!("1m"),
+            serde_json::json!(100),
+            serde_json::json!(-5),
+        ]];
+        let (map, total) = parse_coverage_rows(&dataset);
+        assert_eq!(total, 0);
+        assert_eq!(map["1m"], vec![(100, 0)]);
+    }
+
+    #[test]
+    fn test_parse_coverage_rows_null_values() {
+        let dataset = vec![vec![
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ]];
+        let (map, total) = parse_coverage_rows(&dataset);
+        assert_eq!(total, 0);
+        assert_eq!(map[""], vec![(0, 0)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_timeframe_coverage tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_timeframe_coverage_empty() {
+        let map = HashMap::new();
+        let result = build_timeframe_coverage(&map);
+        assert_eq!(result.len(), 5);
+        for tc in &result {
+            assert_eq!(tc.instrument_count, 0);
+            assert_eq!(tc.candle_count, 0);
+        }
+    }
+
+    #[test]
+    fn test_build_timeframe_coverage_partial() {
+        let mut map: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        map.insert("1m".to_string(), vec![(100, 375), (200, 300)]);
+        map.insert("1d".to_string(), vec![(100, 1)]);
+
+        let result = build_timeframe_coverage(&map);
+        let tf_1m = result.iter().find(|tc| tc.timeframe == "1m").unwrap();
+        assert_eq!(tf_1m.instrument_count, 2);
+        assert_eq!(tf_1m.candle_count, 675);
+
+        let tf_1d = result.iter().find(|tc| tc.timeframe == "1d").unwrap();
+        assert_eq!(tf_1d.instrument_count, 1);
+        assert_eq!(tf_1d.candle_count, 1);
+
+        let tf_5m = result.iter().find(|tc| tc.timeframe == "5m").unwrap();
+        assert_eq!(tf_5m.instrument_count, 0);
+        assert_eq!(tf_5m.candle_count, 0);
+    }
+
+    #[test]
+    fn test_build_timeframe_coverage_all_five_timeframes() {
+        let result = build_timeframe_coverage(&HashMap::new());
+        let timeframes: Vec<&str> = result.iter().map(|tc| tc.timeframe.as_str()).collect();
+        assert_eq!(timeframes, vec!["1m", "5m", "15m", "60m", "1d"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_1m_coverage tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_1m_coverage_empty() {
+        let (complete, gaps) = classify_1m_coverage(&[], 356);
+        assert_eq!(complete, 0);
+        assert_eq!(gaps, 0);
+    }
+
+    #[test]
+    fn test_classify_1m_coverage_all_complete() {
+        let instruments = vec![(100, 375), (200, 356), (300, 400)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 356);
+        assert_eq!(complete, 3);
+        assert_eq!(gaps, 0);
+    }
+
+    #[test]
+    fn test_classify_1m_coverage_all_gaps() {
+        let instruments = vec![(100, 100), (200, 50), (300, 0)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 356);
+        assert_eq!(complete, 0);
+        assert_eq!(gaps, 3);
+    }
+
+    #[test]
+    fn test_classify_1m_coverage_mixed() {
+        let instruments = vec![(100, 375), (200, 100), (300, 356)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 356);
+        assert_eq!(complete, 2);
+        assert_eq!(gaps, 1);
+    }
+
+    #[test]
+    fn test_classify_1m_coverage_exact_threshold() {
+        let instruments = vec![(100, 356)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 356);
+        assert_eq!(complete, 1);
+        assert_eq!(gaps, 0);
+    }
+
+    #[test]
+    fn test_classify_1m_coverage_one_below_threshold() {
+        let instruments = vec![(100, 355)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 356);
+        assert_eq!(complete, 0);
+        assert_eq!(gaps, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // count_unique_instruments tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_unique_instruments_empty() {
+        assert_eq!(count_unique_instruments(&HashMap::new()), 0);
+    }
+
+    #[test]
+    fn test_count_unique_instruments_no_overlap() {
+        let mut map: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        map.insert("1m".to_string(), vec![(100, 375)]);
+        map.insert("5m".to_string(), vec![(200, 75)]);
+        assert_eq!(count_unique_instruments(&map), 2);
+    }
+
+    #[test]
+    fn test_count_unique_instruments_with_overlap() {
+        let mut map: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        map.insert("1m".to_string(), vec![(100, 375), (200, 300)]);
+        map.insert("5m".to_string(), vec![(100, 75), (300, 60)]);
+        // Unique: 100, 200, 300
+        assert_eq!(count_unique_instruments(&map), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_verification_passed tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_verification_passed_all_good() {
+        assert!(determine_verification_passed(100, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_zero_instruments() {
+        assert!(!determine_verification_passed(0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_with_gaps() {
+        assert!(!determine_verification_passed(100, 5, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_with_ohlc() {
+        assert!(!determine_verification_passed(100, 0, 3, 0, 0));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_with_data_violations() {
+        assert!(!determine_verification_passed(100, 0, 0, 2, 0));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_with_timestamp_violations() {
+        assert!(!determine_verification_passed(100, 0, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_all_violations() {
+        assert!(!determine_verification_passed(100, 1, 2, 3, 4));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_price_mismatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_price_mismatch_no_mismatch() {
+        assert!(!has_price_mismatch(0.0, 0.0, 0.0, 0.0, 1e-6));
+    }
+
+    #[test]
+    fn test_has_price_mismatch_open_exceeds() {
+        assert!(has_price_mismatch(0.01, 0.0, 0.0, 0.0, 1e-6));
+    }
+
+    #[test]
+    fn test_has_price_mismatch_high_exceeds() {
+        assert!(has_price_mismatch(0.0, -0.05, 0.0, 0.0, 1e-6));
+    }
+
+    #[test]
+    fn test_has_price_mismatch_low_exceeds() {
+        assert!(has_price_mismatch(0.0, 0.0, 0.001, 0.0, 1e-6));
+    }
+
+    #[test]
+    fn test_has_price_mismatch_close_exceeds() {
+        assert!(has_price_mismatch(0.0, 0.0, 0.0, -1.5, 1e-6));
+    }
+
+    #[test]
+    fn test_has_price_mismatch_within_epsilon() {
+        let eps = 1e-6;
+        assert!(!has_price_mismatch(1e-7, -1e-7, 5e-8, -3e-8, eps));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_volume_mismatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_volume_mismatch_no_mismatch() {
+        assert!(!has_volume_mismatch(100000, 105000, 0.10));
+    }
+
+    #[test]
+    fn test_has_volume_mismatch_exceeds_tolerance() {
+        assert!(has_volume_mismatch(100000, 115000, 0.10));
+    }
+
+    #[test]
+    fn test_has_volume_mismatch_exact_tolerance() {
+        // 10% of 100 = 10, diff = 10 → not exceeds (> not >=)
+        assert!(!has_volume_mismatch(100, 110, 0.10));
+    }
+
+    #[test]
+    fn test_has_volume_mismatch_zero_hist() {
+        // h_volume = 0, max(0,1) = 1, diff = |50-0|/1 = 50.0 > 0.10
+        assert!(has_volume_mismatch(0, 50, 0.10));
+    }
+
+    #[test]
+    fn test_has_volume_mismatch_both_zero() {
+        assert!(!has_volume_mismatch(0, 0, 0.10));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_oi_mismatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_oi_mismatch_both_zero() {
+        assert!(!has_oi_mismatch(0, 0, 0.10));
+    }
+
+    #[test]
+    fn test_has_oi_mismatch_hist_zero() {
+        // When hist_oi = 0, condition `h_oi > 0 && m_oi > 0` is false
+        assert!(!has_oi_mismatch(0, 1000, 0.10));
+    }
+
+    #[test]
+    fn test_has_oi_mismatch_live_zero() {
+        assert!(!has_oi_mismatch(1000, 0, 0.10));
+    }
+
+    #[test]
+    fn test_has_oi_mismatch_within_tolerance() {
+        assert!(!has_oi_mismatch(10000, 10500, 0.10));
+    }
+
+    #[test]
+    fn test_has_oi_mismatch_exceeds_tolerance() {
+        assert!(has_oi_mismatch(10000, 12000, 0.10));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_mismatch_type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_mismatch_type_oi_only() {
+        assert_eq!(classify_mismatch_type(false, false, true), "oi_diff");
+    }
+
+    #[test]
+    fn test_classify_mismatch_type_volume_only() {
+        assert_eq!(classify_mismatch_type(false, true, false), "volume_diff");
+    }
+
+    #[test]
+    fn test_classify_mismatch_type_price_only() {
+        assert_eq!(classify_mismatch_type(true, false, false), "price_diff");
+    }
+
+    #[test]
+    fn test_classify_mismatch_type_price_and_volume() {
+        assert_eq!(classify_mismatch_type(true, true, false), "price_diff");
+    }
+
+    #[test]
+    fn test_classify_mismatch_type_all_mismatches() {
+        assert_eq!(classify_mismatch_type(true, true, true), "price_diff");
+    }
+
+    #[test]
+    fn test_classify_mismatch_type_volume_and_oi() {
+        // When both volume and OI mismatch but no price → falls to volume_diff
+        assert_eq!(classify_mismatch_type(false, true, true), "volume_diff");
+    }
+
+    #[test]
+    fn test_classify_mismatch_type_none() {
+        // Edge case: no mismatches at all → defaults to price_diff
+        assert_eq!(classify_mismatch_type(false, false, false), "price_diff");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_diff_summary tests
+    // -----------------------------------------------------------------------
+
+    // Helper to build DiffSummaryParams concisely in tests
+    fn diff_params(
+        d_open: f64,
+        d_high: f64,
+        d_low: f64,
+        d_close: f64,
+        h_volume: i64,
+        m_volume: i64,
+        h_oi: i64,
+        m_oi: i64,
+        volume_mismatch: bool,
+        oi_mismatch: bool,
+    ) -> DiffSummaryParams {
+        DiffSummaryParams {
+            d_open,
+            d_high,
+            d_low,
+            d_close,
+            h_volume,
+            m_volume,
+            h_oi,
+            m_oi,
+            epsilon: 1e-6,
+            volume_mismatch,
+            oi_mismatch,
+        }
+    }
+
+    fn test_ctx(symbol: &str, segment: &str, tf: &str, ts: &str) -> CandleContext {
+        CandleContext {
+            symbol: symbol.to_string(),
+            segment: segment.to_string(),
+            timeframe: tf.to_string(),
+            timestamp_ist: ts.to_string(),
+        }
+    }
+
+    fn cv(open: f64, high: f64, low: f64, close: f64, volume: i64, oi: i64) -> CandleValues {
+        CandleValues {
+            open,
+            high,
+            low,
+            close,
+            volume,
+            oi,
+        }
+    }
+
+    #[test]
+    fn test_build_diff_summary_price_only() {
+        let result = build_diff_summary(&diff_params(
+            1.5, 0.0, 0.0, -0.5, 1000, 1000, 0, 0, false, false,
+        ));
+        assert!(result.contains("O(+1.50)"));
+        assert!(result.contains("C(-0.50)"));
+        assert!(!result.contains('H'));
+        assert!(!result.contains('L'));
+        assert!(!result.contains('V'));
+    }
+
+    #[test]
+    fn test_build_diff_summary_volume_mismatch() {
+        let result = build_diff_summary(&diff_params(
+            0.0, 0.0, 0.0, 0.0, 1000, 1200, 0, 0, true, false,
+        ));
+        assert!(result.contains('V'));
+        assert!(!result.contains('O'));
+    }
+
+    #[test]
+    fn test_build_diff_summary_oi_mismatch() {
+        let result = build_diff_summary(&diff_params(
+            0.0, 0.0, 0.0, 0.0, 1000, 1000, 5000, 6000, false, true,
+        ));
+        assert!(result.contains("OI("));
+    }
+
+    #[test]
+    fn test_build_diff_summary_all_fields() {
+        let result = build_diff_summary(&diff_params(
+            1.0, -2.0, 0.5, -0.3, 1000, 1500, 5000, 6000, true, true,
+        ));
+        assert!(result.contains("O(+1.00)"));
+        assert!(result.contains("H(-2.00)"));
+        assert!(result.contains("L(+0.50)"));
+        assert!(result.contains("C(-0.30)"));
+        assert!(result.contains('V'));
+        assert!(result.contains("OI("));
+    }
+
+    #[test]
+    fn test_build_diff_summary_empty_when_no_diffs() {
+        let result = build_diff_summary(&diff_params(
+            0.0, 0.0, 0.0, 0.0, 1000, 1000, 0, 0, false, false,
+        ));
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CandleValues format tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_values_format_ohlcv() {
+        let c = cv(100.5, 110.0, 95.0, 105.0, 50000, 0);
+        assert_eq!(c.format_ohlcv(), "O=100.5 H=110 L=95 C=105 V=50000");
+    }
+
+    #[test]
+    fn test_candle_values_format_with_oi() {
+        let c = cv(100.5, 110.0, 95.0, 105.0, 50000, 12000);
+        assert_eq!(
+            c.format_with_oi(),
+            "O=100.5 H=110 L=95 C=105 V=50000 OI=12000"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_violation_detail tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_violation_detail() {
+        let detail = build_violation_detail(
+            test_ctx("RELIANCE", "NSE_EQ", "1m", "2026-03-18 10:15 IST"),
+            "high < low",
+            cv(2450.0, 2440.0, 2450.0, 2445.0, 100, 0),
+        );
+        assert_eq!(detail.symbol, "RELIANCE");
+        assert_eq!(detail.violation, "high < low");
+        assert!(detail.values.contains("O=2450"));
+        assert!(detail.values.contains("H=2440"));
+    }
+
+    #[test]
+    fn test_build_violation_detail_price_violation() {
+        let detail = build_violation_detail(
+            test_ctx("TCS", "NSE_EQ", "5m", "2026-03-18 11:00 IST"),
+            "price <= 0",
+            cv(0.0, 100.0, 95.0, 98.0, 500, 0),
+        );
+        assert_eq!(detail.violation, "price <= 0");
+        assert!(detail.values.contains("O=0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_cross_match_row tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_cross_match_row_no_mismatch() {
+        let result = classify_cross_match_row(
+            test_ctx("RELIANCE", "NSE_EQ", "1m", "2026-03-18 10:15 IST"),
+            cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+            cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+        );
+        assert!(result.is_none(), "identical values should return None");
+    }
+
+    #[test]
+    fn test_classify_cross_match_row_price_diff() {
+        let result = classify_cross_match_row(
+            test_ctx("RELIANCE", "NSE_EQ", "1m", "2026-03-18 10:15 IST"),
+            cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+            cv(2450.0, 2465.0, 2448.0, 2455.0, 125000, 0),
+        );
+        let mismatch = result.unwrap();
+        assert_eq!(mismatch.mismatch_type, "price_diff");
+        assert!(mismatch.diff_summary.contains('C'));
+    }
+
+    #[test]
+    fn test_classify_cross_match_row_volume_diff() {
+        let result = classify_cross_match_row(
+            test_ctx("TCS", "NSE_EQ", "5m", "2026-03-18 11:00 IST"),
+            cv(3500.0, 3510.0, 3495.0, 3505.0, 100000, 0),
+            cv(3500.0, 3510.0, 3495.0, 3505.0, 120000, 0),
+        );
+        let mismatch = result.unwrap();
+        assert_eq!(mismatch.mismatch_type, "volume_diff");
+        assert!(mismatch.diff_summary.contains('V'));
+    }
+
+    #[test]
+    fn test_classify_cross_match_row_oi_diff() {
+        let result = classify_cross_match_row(
+            test_ctx("NIFTY", "NSE_FNO", "1m", "2026-03-18 09:30 IST"),
+            cv(23000.0, 23050.0, 22990.0, 23040.0, 500000, 10000),
+            cv(23000.0, 23050.0, 22990.0, 23040.0, 500000, 12000),
+        );
+        let mismatch = result.unwrap();
+        assert_eq!(mismatch.mismatch_type, "oi_diff");
+        assert!(mismatch.diff_summary.contains("OI("));
+    }
+
+    #[test]
+    fn test_classify_cross_match_row_within_volume_tolerance() {
+        // Volume diff = 5% which is within 10% tolerance
+        let result = classify_cross_match_row(
+            test_ctx("TCS", "NSE_EQ", "1m", "2026-03-18 10:00 IST"),
+            cv(3500.0, 3510.0, 3495.0, 3505.0, 100000, 0),
+            cv(3500.0, 3510.0, 3495.0, 3505.0, 105000, 0),
+        );
+        assert!(result.is_none(), "5% volume diff is within 10% tolerance");
+    }
+
+    #[test]
+    fn test_classify_cross_match_row_all_mismatches() {
+        let result = classify_cross_match_row(
+            test_ctx("RELIANCE", "NSE_FNO", "15m", "2026-03-18 12:00 IST"),
+            cv(2450.0, 2465.0, 2448.0, 2460.0, 100000, 10000),
+            cv(2455.0, 2470.0, 2445.0, 2450.0, 120000, 12000),
+        );
+        let mismatch = result.unwrap();
+        assert_eq!(mismatch.mismatch_type, "price_diff");
+        assert!(mismatch.diff_summary.contains('O'));
+        assert!(mismatch.diff_summary.contains('H'));
+        assert!(mismatch.diff_summary.contains('V'));
+        assert!(mismatch.diff_summary.contains("OI("));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_missing_live_mismatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_missing_live_mismatch() {
+        let mismatch = build_missing_live_mismatch(
+            test_ctx("RELIANCE", "NSE_EQ", "1m", "2026-03-18 10:15 IST"),
+            cv(2450.0, 2465.0, 2448.0, 2460.0, 125000, 0),
+        );
+        assert_eq!(mismatch.mismatch_type, "missing_live");
+        assert!(mismatch.live_values.contains("MISSING"));
+        assert!(mismatch.diff_summary.is_empty());
+        assert!(mismatch.hist_values.contains("O=2450"));
+    }
+
+    #[test]
+    fn test_build_missing_live_mismatch_with_oi() {
+        let mismatch = build_missing_live_mismatch(
+            test_ctx("NIFTY", "NSE_FNO", "5m", "2026-03-18 14:00 IST"),
+            cv(23000.0, 23050.0, 22990.0, 23040.0, 500000, 15000),
+        );
+        assert!(mismatch.hist_values.contains("OI=15000"));
+        assert_eq!(mismatch.timeframe, "5m");
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_cross_match_passed tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_cross_match_passed_all_good() {
+        assert!(determine_cross_match_passed(0, 100, 0));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_with_mismatches() {
+        assert!(!determine_cross_match_passed(5, 100, 0));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_zero_compared() {
+        assert!(!determine_cross_match_passed(0, 0, 0));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_with_missing_views() {
+        assert!(!determine_cross_match_passed(0, 100, 2));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_mismatches_and_missing_views() {
+        assert!(!determine_cross_match_passed(3, 100, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_timestamp_ist additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_timestamp_ist_short_time() {
+        let ts = serde_json::Value::String("2026-03-18T09:15Z".to_string());
+        let result = format_timestamp_ist(&ts);
+        // Time part "09:15" with Z trimmed, len >= 5
+        assert_eq!(result, "2026-03-18 09:15 IST");
     }
 
     #[test]
     fn test_format_timestamp_ist_no_t_separator() {
-        let ts = serde_json::Value::String("2026-01-01 10:00:00".to_string());
-        assert_eq!(format_timestamp_ist(&ts), "2026-01-01 10:00:00");
+        let ts = serde_json::Value::String("2026-03-18 10:30:00".to_string());
+        let result = format_timestamp_ist(&ts);
+        // No 'T' separator — returns as-is
+        assert_eq!(result, "2026-03-18 10:30:00");
     }
 
     #[test]
     fn test_format_timestamp_ist_null_value() {
-        assert_eq!(format_timestamp_ist(&serde_json::Value::Null), "null");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_bool_value() {
-        assert_eq!(format_timestamp_ist(&serde_json::Value::Bool(true)), "true");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_short_time() {
-        let ts = serde_json::Value::String("2026-01-01T9:5Z".to_string());
+        let ts = serde_json::Value::Null;
         let result = format_timestamp_ist(&ts);
-        assert!(result.contains("2026-01-01"));
+        assert_eq!(result, "null");
     }
 
     #[test]
-    fn test_format_timestamp_ist_float_epoch() {
-        let ts = serde_json::json!(1773050340.5);
-        assert!(format_timestamp_ist(&ts).contains("1773050340"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Mock HTTP server for async function tests
-    // -----------------------------------------------------------------------
-
-    async fn mock_http_server(body: &'static str) -> (tokio::task::JoinHandle<()>, u16) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            for _ in 0..20 {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                }
-            }
-        });
-        (handle, port)
-    }
-
-    async fn mock_http_error_server() -> (tokio::task::JoinHandle<()>, u16) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            for _ in 0..5 {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                }
-            }
-        });
-        (handle, port)
-    }
-
-    async fn mock_http_bad_json_server() -> (tokio::task::JoinHandle<()>, u16) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            for _ in 0..5 {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let body = "not json";
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                }
-            }
-        });
-        (handle, port)
-    }
-
-    // -----------------------------------------------------------------------
-    // execute_query tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_execute_query_success() {
-        let (handle, port) = mock_http_server(r#"{"dataset": [[1, 2, 3]], "count": 1}"#).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let result = execute_query(&client, &url, "SELECT 1").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().dataset.len(), 1);
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_execute_query_unreachable() {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-        assert!(
-            execute_query(&client, "http://127.0.0.1:1", "SELECT 1")
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_execute_query_non_success_status() {
-        let (handle, port) = mock_http_error_server().await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        assert!(execute_query(&client, &url, "SELECT 1").await.is_none());
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_execute_query_invalid_json() {
-        let (handle, port) = mock_http_bad_json_server().await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        assert!(execute_query(&client, &url, "SELECT 1").await.is_none());
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_count tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_extract_count_success() {
-        let (handle, port) = mock_http_server(r#"{"dataset": [[42]], "count": 1}"#).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        assert_eq!(extract_count(&client, &url, "SELECT count()").await, 42);
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_extract_count_empty_dataset() {
-        let (handle, port) = mock_http_server(r#"{"dataset": [], "count": 0}"#).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        assert_eq!(extract_count(&client, &url, "SELECT count()").await, 0);
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_extract_count_unreachable() {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-        assert_eq!(extract_count(&client, "http://127.0.0.1:1", "q").await, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_violation_rows tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_parse_violation_rows_success() {
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "1m", "2026-03-18T09:15:00.000000Z", 100.0, 99.0, 100.5, 100.2, 5000]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_violation_rows(&client, &url, "q", &registry, "high < low").await;
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].violation, "high < low");
-        assert_eq!(details[0].segment, "NSE_EQ");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_parse_violation_rows_short_row_skipped() {
-        let body = r#"{"dataset": [[11536, "NSE_EQ"]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_violation_rows(&client, &url, "q", &registry, "test").await;
-        assert!(details.is_empty());
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_parse_violation_rows_unreachable() {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-        let registry = InstrumentRegistry::empty();
-        let details =
-            parse_violation_rows(&client, "http://127.0.0.1:1", "q", &registry, "t").await;
-        assert!(details.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_cross_match_rows_with_oi tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_cross_match_rows_missing_live() {
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, null, null, null, null, null, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].mismatch_type, "missing_live");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_price_diff() {
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.5, 105.0, 99.0, 102.0, 5000, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].mismatch_type, "price_diff");
-        assert!(details[0].diff_summary.contains("O("));
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_volume_diff() {
-        // Prices match, volume differs > 10%
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 10000, 100.0, 105.0, 99.0, 102.0, 8000, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].mismatch_type, "volume_diff");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_oi_diff() {
-        // Prices+volume match, OI differs > 10%
-        let body = r#"{"dataset": [[49081, "NSE_FNO", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.0, 105.0, 99.0, 102.0, 5000, 100000, 80000]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].mismatch_type, "oi_diff");
-        assert!(details[0].diff_summary.contains("OI("));
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_no_mismatch() {
-        // Everything matches within tolerance
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.0, 105.0, 99.0, 102.0, 5000, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert!(details.is_empty());
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_short_row_skipped() {
-        let body = r#"{"dataset": [[11536, "NSE_EQ"]], "count": 1}"#;
-        let (handle, port) = mock_http_server(body).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert!(details.is_empty());
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // verify_candle_integrity with mock — empty DB
-    // -----------------------------------------------------------------------
-
-    async fn mock_empty_db_server() -> (tokio::task::JoinHandle<()>, u16) {
-        mock_http_server(r#"{"dataset": [], "count": 0}"#).await
-    }
-
-    #[tokio::test]
-    async fn test_verify_candle_integrity_empty_db() {
-        let (handle, port) = mock_empty_db_server().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: 1,
-            ilp_port: 1,
-        };
-        let registry = InstrumentRegistry::empty();
-        let report = verify_candle_integrity(&config, &registry).await;
-        assert!(!report.passed);
-        assert_eq!(report.instruments_checked, 0);
-        assert_eq!(report.ohlc_violations, 0);
-        assert_eq!(report.data_violations, 0);
-        assert_eq!(report.timestamp_violations, 0);
-        assert_eq!(report.timeframe_counts.len(), 5);
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // verify_candle_integrity with mock — good data (375 1m candles)
-    // -----------------------------------------------------------------------
-
-    async fn mock_good_data_server() -> (tokio::task::JoinHandle<()>, u16) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let mut query_idx = 0_usize;
-            for _ in 0..20 {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let body = if query_idx == 0 {
-                        r#"{"dataset": [["1m", 11536, 375]], "count": 1}"#.to_string()
-                    } else {
-                        r#"{"dataset": [[0]], "count": 1}"#.to_string()
-                    };
-                    query_idx += 1;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                }
-            }
-        });
-        (handle, port)
-    }
-
-    #[tokio::test]
-    async fn test_verify_candle_integrity_with_data() {
-        let (handle, port) = mock_good_data_server().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: 1,
-            ilp_port: 1,
-        };
-        let registry = InstrumentRegistry::empty();
-        let report = verify_candle_integrity(&config, &registry).await;
-        assert!(report.passed);
-        assert_eq!(report.instruments_checked, 1);
-        assert_eq!(report.instruments_complete, 1);
-        assert_eq!(report.instruments_with_gaps, 0);
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // cross_match_historical_vs_live with mock — empty tables
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_cross_match_empty_tables() {
-        let (handle, port) = mock_empty_db_server().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: 1,
-            ilp_port: 1,
-        };
-        let registry = InstrumentRegistry::empty();
-        let report = cross_match_historical_vs_live(&config, &registry).await;
-        assert!(!report.passed);
-        assert_eq!(report.candles_compared, 0);
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // OI / volume mismatch logic unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_oi_mismatch_both_zero_no_mismatch() {
-        let h_oi = 0_i64;
-        let m_oi = 0_i64;
-        let mismatch = h_oi > 0 && m_oi > 0;
-        assert!(!mismatch);
-    }
-
-    #[test]
-    fn test_oi_mismatch_exceeds_tolerance() {
-        let h_oi = 100000_i64;
-        let m_oi = 80000_i64;
-        let h_oi_max = h_oi.max(1) as f64;
-        let diff = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
-        assert!(diff > CROSS_MATCH_OI_TOLERANCE_PCT);
-    }
-
-    #[test]
-    fn test_volume_mismatch_within_tolerance() {
-        let h_vol = 10000_i64;
-        let m_vol = 9500_i64;
-        let h_vol_max = h_vol.max(1) as f64;
-        let diff = (m_vol.saturating_sub(h_vol) as f64).abs() / h_vol_max;
-        assert!(diff <= CROSS_MATCH_VOLUME_TOLERANCE_PCT);
-    }
-
-    #[test]
-    fn test_volume_mismatch_exceeds_tolerance() {
-        let h_vol = 10000_i64;
-        let m_vol = 8000_i64;
-        let h_vol_max = h_vol.max(1) as f64;
-        let diff = (m_vol.saturating_sub(h_vol) as f64).abs() / h_vol_max;
-        assert!(diff > CROSS_MATCH_VOLUME_TOLERANCE_PCT);
-    }
-
-    #[test]
-    fn test_cross_match_pass_requires_data_and_no_missing() {
-        let total_mismatches = 0_usize;
-        let total_compared = 100_usize;
-        let missing_views: Vec<String> = vec!["candles_1m".to_string()];
-        let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
-        assert!(!passed, "missing views must fail");
-    }
-
-    // -----------------------------------------------------------------------
-    // cross_match pass/fail logic — additional branch coverage
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cross_match_passes_with_data_no_mismatches_no_missing() {
-        let total_mismatches = 0_usize;
-        let total_compared = 100_usize;
-        let missing_views: Vec<String> = vec![];
-        let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
-        assert!(passed, "zero mismatches + data + no missing = pass");
-    }
-
-    #[test]
-    fn test_cross_match_fails_with_mismatches_present() {
-        let total_mismatches = 5_usize;
-        let total_compared = 100_usize;
-        let missing_views: Vec<String> = vec![];
-        let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
-        assert!(!passed, "mismatches present must fail");
-    }
-
-    #[test]
-    fn test_cross_match_fails_with_zero_compared() {
-        let total_mismatches = 0_usize;
-        let total_compared = 0_usize;
-        let missing_views: Vec<String> = vec![];
-        let passed = total_mismatches == 0 && total_compared > 0 && missing_views.is_empty();
-        assert!(!passed, "zero candles compared must fail");
-    }
-
-    // -----------------------------------------------------------------------
-    // format_timestamp_ist — additional edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_format_timestamp_ist_empty_string() {
-        let ts = serde_json::Value::String(String::new());
+    fn test_format_timestamp_ist_boolean_value() {
+        let ts = serde_json::json!(true);
         let result = format_timestamp_ist(&ts);
-        assert_eq!(result, "", "empty string returned as-is");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_just_date_no_time() {
-        let ts = serde_json::Value::String("2026-03-18".to_string());
-        let result = format_timestamp_ist(&ts);
-        // No 'T' separator, so returns as-is
-        assert_eq!(result, "2026-03-18");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_with_milliseconds() {
-        let ts = serde_json::Value::String("2026-03-18T14:30:00.123456Z".to_string());
-        let result = format_timestamp_ist(&ts);
-        assert_eq!(result, "2026-03-18 14:30 IST");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_array_value() {
-        let ts = serde_json::json!([1, 2, 3]);
-        let result = format_timestamp_ist(&ts);
-        assert_eq!(result, "[1,2,3]");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_object_value() {
-        let ts = serde_json::json!({"time": 123});
-        let result = format_timestamp_ist(&ts);
-        assert_eq!(result, r#"{"time":123}"#);
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_negative_epoch() {
-        let ts = serde_json::json!(-100);
-        let result = format_timestamp_ist(&ts);
-        assert_eq!(result, "-100");
-    }
-
-    #[test]
-    fn test_format_timestamp_ist_very_short_time_part() {
-        // Time part shorter than 5 chars (e.g., "9:5") — uses full time_part
-        let ts = serde_json::Value::String("2026-01-01T9:5Z".to_string());
-        let result = format_timestamp_ist(&ts);
-        // time_rest = "9:5Z", after splitting on '.' => "9:5Z", trim Z => "9:5"
-        // len("9:5") = 3 < 5, so uses "9:5" directly
-        assert_eq!(result, "2026-01-01 9:5 IST");
+        assert_eq!(result, "true");
     }
 
     // -----------------------------------------------------------------------
-    // lookup_symbol — additional coverage
+    // lookup_symbol tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_lookup_symbol_negative_id() {
+    fn test_lookup_symbol_empty_registry() {
         let registry = InstrumentRegistry::empty();
-        // Negative i64 cast to u32 wraps around — tests robustness
-        let result = lookup_symbol(&registry, -1);
-        assert_eq!(result, "-1", "negative ID should return the string form");
+        let result = lookup_symbol(&registry, 1333);
+        assert_eq!(result, "1333");
     }
 
     #[test]
-    fn test_lookup_symbol_max_i64() {
+    fn test_lookup_symbol_zero_id() {
         let registry = InstrumentRegistry::empty();
-        let result = lookup_symbol(&registry, i64::MAX);
-        assert_eq!(result, i64::MAX.to_string());
-    }
-
-    // -----------------------------------------------------------------------
-    // violation detail coverage cap logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_max_violation_details_is_500() {
-        assert_eq!(MAX_VIOLATION_DETAILS, 500);
-    }
-
-    // -----------------------------------------------------------------------
-    // coverage gap parsing — short rows and edge cases
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_parse_violation_rows_multiple_rows() {
-        let body = r#"{"dataset": [
-            [11536, "NSE_EQ", "1m", "2026-03-18T09:15:00.000000Z", 100.0, 99.0, 100.5, 100.2, 5000],
-            [1333, "NSE_EQ", "5m", "2026-03-18T10:00:00.000000Z", 200.0, 195.0, 210.0, 205.0, 8000],
-            [25, "IDX_I", "1d", "2026-03-18T00:00:00.000000Z", 24500.0, 24400.0, 24600.0, 24550.0, 0]
-        ], "count": 3}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_violation_rows(&client, &url, "q", &registry, "price <= 0").await;
-        assert_eq!(details.len(), 3);
-        assert_eq!(details[0].segment, "NSE_EQ");
-        assert_eq!(details[1].timeframe, "5m");
-        assert_eq!(details[2].segment, "IDX_I");
-        assert_eq!(details[0].violation, "price <= 0");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_parse_violation_rows_mixed_short_and_valid() {
-        // Mix of valid rows and short rows — short rows should be skipped
-        let body = r#"{"dataset": [
-            [11536, "NSE_EQ", "1m", "2026-03-18T09:15:00.000000Z", 100.0, 99.0, 100.5, 100.2, 5000],
-            [1333, "NSE_EQ"],
-            [25, "IDX_I", "1d", "2026-03-18T00:00:00.000000Z", 24500.0, 24400.0, 24600.0, 24550.0, 0]
-        ], "count": 3}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_violation_rows(&client, &url, "q", &registry, "test").await;
-        assert_eq!(details.len(), 2, "short row should be skipped");
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // cross-match rows — additional mismatch type combinations
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_cross_match_rows_price_and_volume_diff() {
-        // Both price and volume differ — should classify as "price_diff"
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 10000, 100.5, 105.5, 99.0, 102.0, 8000, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert_eq!(details.len(), 1);
-        // price_diff takes priority when price mismatch is present
-        assert_eq!(details[0].mismatch_type, "price_diff");
-        assert!(details[0].diff_summary.contains("O("));
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_volume_within_tolerance() {
-        // Volume differs by < 10% — should NOT be flagged
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 10000, 100.0, 105.0, 99.0, 102.0, 9500, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert!(
-            details.is_empty(),
-            "5% volume diff should be within 10% tolerance"
-        );
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_oi_within_tolerance() {
-        // OI differs by < 10% — should NOT be flagged
-        let body = r#"{"dataset": [[49081, "NSE_FNO", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.0, 105.0, 99.0, 102.0, 5000, 100000, 95000]], "count": 1}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert!(
-            details.is_empty(),
-            "5% OI diff should be within 10% tolerance"
-        );
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_oi_one_zero_no_mismatch() {
-        // OI mismatch only checked when BOTH > 0. If one is zero, skip OI check
-        let body = r#"{"dataset": [[49081, "NSE_FNO", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 100.0, 105.0, 99.0, 102.0, 5000, 100000, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert!(
-            details.is_empty(),
-            "when live OI is 0, OI mismatch should not trigger"
-        );
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_all_price_fields_differ() {
-        // All OHLC fields differ — diff summary should include all 4
-        let body = r#"{"dataset": [[11536, "NSE_EQ", "2026-03-18T09:15:00.000000Z", 100.0, 105.0, 99.0, 102.0, 5000, 101.0, 106.0, 100.0, 103.0, 5000, 0, 0]], "count": 1}"#;
-        let (handle, port) = mock_http_server(Box::leak(body.to_string().into_boxed_str())).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let registry = InstrumentRegistry::empty();
-        let details = parse_cross_match_rows_with_oi(&client, &url, "q", &registry, "1m").await;
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].mismatch_type, "price_diff");
-        assert!(details[0].diff_summary.contains("O("));
-        assert!(details[0].diff_summary.contains("H("));
-        assert!(details[0].diff_summary.contains("L("));
-        assert!(details[0].diff_summary.contains("C("));
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_cross_match_rows_unreachable_returns_empty() {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-        let registry = InstrumentRegistry::empty();
-        let details =
-            parse_cross_match_rows_with_oi(&client, "http://127.0.0.1:1", "q", &registry, "1m")
-                .await;
-        assert!(details.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // ViolationDetail values formatting
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_violation_detail_values_format() {
-        let detail = ViolationDetail {
-            symbol: "NIFTY50".to_string(),
-            segment: "IDX_I".to_string(),
-            timeframe: "1d".to_string(),
-            timestamp_ist: "2026-03-18 00:00 IST".to_string(),
-            violation: "price <= 0".to_string(),
-            values: "O=0 H=24500 L=24400 C=24550 V=0".to_string(),
-        };
-        assert!(detail.values.contains("O=0"));
-        assert!(detail.values.contains("H=24500"));
-        assert_eq!(detail.violation, "price <= 0");
-    }
-
-    #[test]
-    fn test_violation_detail_clone() {
-        let detail = ViolationDetail {
-            symbol: "TCS".to_string(),
-            segment: "NSE_EQ".to_string(),
-            timeframe: "5m".to_string(),
-            timestamp_ist: "2026-03-18 12:00 IST".to_string(),
-            violation: "outside 09:15-15:29 market hours".to_string(),
-            values: "O=3500 H=3520 L=3490 C=3510 V=10000".to_string(),
-        };
-        let cloned = detail.clone();
-        assert_eq!(cloned.symbol, detail.symbol);
-        assert_eq!(cloned.violation, detail.violation);
-    }
-
-    // -----------------------------------------------------------------------
-    // CrossMatchMismatch clone and field access
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cross_match_mismatch_clone() {
-        let mismatch = CrossMatchMismatch {
-            symbol: "RELIANCE".to_string(),
-            segment: "NSE_EQ".to_string(),
-            timeframe: "1m".to_string(),
-            timestamp_ist: "2026-03-18 10:15 IST".to_string(),
-            mismatch_type: "volume_diff".to_string(),
-            hist_values: "O=2450 H=2465 L=2448 C=2460 V=125000 OI=0".to_string(),
-            live_values: "O=2450 H=2465 L=2448 C=2460 V=100000 OI=0".to_string(),
-            diff_summary: "V(-25000 20%)".to_string(),
-        };
-        let cloned = mismatch.clone();
-        assert_eq!(cloned.mismatch_type, "volume_diff");
-        assert_eq!(cloned.diff_summary, "V(-25000 20%)");
-    }
-
-    // -----------------------------------------------------------------------
-    // TimeframeCoverage clone
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_timeframe_coverage_clone() {
-        let tc = TimeframeCoverage {
-            timeframe: "60m".to_string(),
-            instrument_count: 100,
-            candle_count: 600,
-        };
-        let cloned = tc.clone();
-        assert_eq!(cloned.timeframe, "60m");
-        assert_eq!(cloned.instrument_count, 100);
-    }
-
-    // -----------------------------------------------------------------------
-    // CrossMatchReport — pass conditions
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cross_match_report_passed_true() {
-        let report = CrossMatchReport {
-            timeframes_checked: 5,
-            candles_compared: 100000,
-            mismatches: 0,
-            missing_live: 0,
-            missing_historical: 0,
-            oi_mismatches: 0,
-            mismatch_details: vec![],
-            missing_views: vec![],
-            passed: true,
-        };
-        assert!(report.passed);
-        assert_eq!(report.mismatches, 0);
-        assert!(report.missing_views.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // coverage query row parsing edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_coverage_row_short_rows_skipped() {
-        // Simulates the coverage parsing logic: rows with < 3 columns are skipped
-        let rows: Vec<Vec<serde_json::Value>> = vec![
-            vec![serde_json::json!("1m")],
-            vec![serde_json::json!("5m"), serde_json::json!(11536)],
-            vec![
-                serde_json::json!("1m"),
-                serde_json::json!(1333),
-                serde_json::json!(375),
-            ],
-        ];
-
-        let mut timeframe_instruments: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
-        for row in &rows {
-            if row.len() < 3 {
-                continue;
-            }
-            let tf = row[0].as_str().unwrap_or("").to_string();
-            let sid = row[1].as_i64().unwrap_or(0);
-            let count = row[2].as_i64().unwrap_or(0).max(0) as usize;
-            timeframe_instruments
-                .entry(tf)
-                .or_default()
-                .push((sid, count));
-        }
-        // Only the 3rd row (length 3) should be included
-        assert_eq!(timeframe_instruments.len(), 1);
-        assert!(timeframe_instruments.contains_key("1m"));
-        assert_eq!(timeframe_instruments["1m"].len(), 1);
-        assert_eq!(timeframe_instruments["1m"][0], (1333, 375));
-    }
-
-    #[test]
-    fn test_coverage_row_null_values() {
-        let row: Vec<serde_json::Value> = vec![
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-        ];
-        let tf = row[0].as_str().unwrap_or("").to_string();
-        let sid = row[1].as_i64().unwrap_or(0);
-        let count = row[2].as_i64().unwrap_or(0).max(0) as usize;
-        assert_eq!(tf, "");
-        assert_eq!(sid, 0);
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_coverage_row_negative_count_clamped() {
-        let row: Vec<serde_json::Value> = vec![
-            serde_json::json!("1m"),
-            serde_json::json!(100),
-            serde_json::json!(-5),
-        ];
-        let count = row[2].as_i64().unwrap_or(0).max(0) as usize;
-        assert_eq!(count, 0, "negative count should be clamped to 0");
-    }
-
-    // -----------------------------------------------------------------------
-    // 1m coverage completeness logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_instrument_complete_at_exact_threshold() {
-        #[allow(clippy::arithmetic_side_effects)]
-        let min_candles = (CANDLES_PER_TRADING_DAY as f64 * MIN_CANDLE_COVERAGE_RATIO) as usize;
-        // Instrument at exactly the threshold should be complete
-        let count = min_candles;
-        assert!(count >= min_candles);
-    }
-
-    #[test]
-    fn test_instrument_incomplete_below_threshold() {
-        #[allow(clippy::arithmetic_side_effects)]
-        let min_candles = (CANDLES_PER_TRADING_DAY as f64 * MIN_CANDLE_COVERAGE_RATIO) as usize;
-        let count = min_candles.saturating_sub(1);
-        assert!(count < min_candles);
-    }
-
-    #[test]
-    fn test_instrument_complete_above_threshold() {
-        #[allow(clippy::arithmetic_side_effects)]
-        let min_candles = (CANDLES_PER_TRADING_DAY as f64 * MIN_CANDLE_COVERAGE_RATIO) as usize;
-        let count = CANDLES_PER_TRADING_DAY;
-        assert!(count >= min_candles);
-    }
-
-    // -----------------------------------------------------------------------
-    // OI/volume tolerance math edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_oi_mismatch_h_zero_m_nonzero_no_mismatch() {
-        // When h_oi == 0, the OI check is skipped regardless of m_oi
-        let h_oi = 0_i64;
-        let m_oi = 50000_i64;
-        let mismatch = if h_oi > 0 && m_oi > 0 {
-            let h_oi_max = h_oi.max(1) as f64;
-            let oi_diff_pct = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
-            oi_diff_pct > CROSS_MATCH_OI_TOLERANCE_PCT
-        } else {
-            false
-        };
-        assert!(!mismatch, "h_oi=0 should skip OI comparison");
-    }
-
-    #[test]
-    fn test_volume_mismatch_zero_hist_volume() {
-        // When h_vol == 0, h_vol_max = max(0,1) = 1, diff = |m_vol| / 1
-        let h_vol = 0_i64;
-        let m_vol = 100_i64;
-        let h_vol_max = h_vol.max(1) as f64;
-        let vol_diff_pct = (m_vol.saturating_sub(h_vol) as f64).abs() / h_vol_max;
-        assert!(
-            vol_diff_pct > CROSS_MATCH_VOLUME_TOLERANCE_PCT,
-            "100% diff should exceed 10% tolerance"
-        );
-    }
-
-    #[test]
-    fn test_volume_mismatch_both_zero() {
-        let h_vol = 0_i64;
-        let m_vol = 0_i64;
-        let h_vol_max = h_vol.max(1) as f64;
-        let vol_diff_pct = (m_vol.saturating_sub(h_vol) as f64).abs() / h_vol_max;
-        assert!(
-            vol_diff_pct <= CROSS_MATCH_VOLUME_TOLERANCE_PCT,
-            "both zero volumes should not mismatch"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // QuestDbQueryResponse deserialization
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_questdb_response_empty_dataset() {
-        let json = r#"{"dataset": [], "count": 0}"#;
-        let resp: QuestDbQueryResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.dataset.is_empty());
-        assert_eq!(resp.count, 0);
-    }
-
-    #[test]
-    fn test_questdb_response_with_data() {
-        let json = r#"{"dataset": [["1m", 11536, 375], ["5m", 11536, 75]], "count": 2}"#;
-        let resp: QuestDbQueryResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.dataset.len(), 2);
-        assert_eq!(resp.count, 2);
-        assert_eq!(resp.dataset[0][0].as_str(), Some("1m"));
-        assert_eq!(resp.dataset[0][1].as_i64(), Some(11536));
-    }
-
-    // -----------------------------------------------------------------------
-    // Mismatch type classification logic unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_mismatch_type_oi_only() {
-        let price_mismatch = false;
-        let volume_mismatch = false;
-        let oi_mismatch = true;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "oi_diff");
-    }
-
-    #[test]
-    fn test_mismatch_type_volume_only() {
-        let price_mismatch = false;
-        let volume_mismatch = true;
-        let oi_mismatch = false;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "volume_diff");
-    }
-
-    #[test]
-    fn test_mismatch_type_price_and_volume() {
-        let price_mismatch = true;
-        let volume_mismatch = true;
-        let oi_mismatch = false;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "price_diff");
-    }
-
-    #[test]
-    fn test_mismatch_type_all_three() {
-        let price_mismatch = true;
-        let volume_mismatch = true;
-        let oi_mismatch = true;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "price_diff");
-    }
-
-    #[test]
-    fn test_mismatch_type_price_only() {
-        let price_mismatch = true;
-        let volume_mismatch = false;
-        let oi_mismatch = false;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "price_diff");
-    }
-
-    #[test]
-    fn test_mismatch_type_volume_and_oi() {
-        let price_mismatch = false;
-        let volume_mismatch = true;
-        let oi_mismatch = true;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "volume_diff");
-    }
-
-    #[test]
-    fn test_mismatch_type_price_and_oi() {
-        let price_mismatch = true;
-        let volume_mismatch = false;
-        let oi_mismatch = true;
-        let mismatch_type = if oi_mismatch && !price_mismatch && !volume_mismatch {
-            "oi_diff"
-        } else if volume_mismatch && !price_mismatch {
-            "volume_diff"
-        } else {
-            "price_diff"
-        };
-        assert_eq!(mismatch_type, "price_diff");
-    }
-
-    // -----------------------------------------------------------------------
-    // Price epsilon boundary tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_price_diff_at_epsilon_boundary() {
-        let h_open = 100.0_f64;
-        let m_open = 100.0_f64 + CROSS_MATCH_PRICE_EPSILON;
-        let diff = (m_open - h_open).abs();
-        // Exactly at epsilon boundary — should NOT be flagged
-        // (we use >, not >=, so diff == epsilon is NOT a mismatch)
-        assert!(
-            !(diff > CROSS_MATCH_PRICE_EPSILON),
-            "diff exactly at epsilon should NOT trigger mismatch"
-        );
-    }
-
-    #[test]
-    fn test_price_diff_above_epsilon() {
-        let h_open = 100.0_f64;
-        let m_open = 100.0_f64 + CROSS_MATCH_PRICE_EPSILON * 2.0;
-        let diff = (m_open - h_open).abs();
-        assert!(diff > CROSS_MATCH_PRICE_EPSILON);
-    }
-
-    #[test]
-    fn test_price_diff_below_epsilon() {
-        let h_open = 100.0_f64;
-        let m_open = 100.0_f64 + CROSS_MATCH_PRICE_EPSILON * 0.5;
-        let diff = (m_open - h_open).abs();
-        assert!(
-            !(diff > CROSS_MATCH_PRICE_EPSILON),
-            "half epsilon should not trigger mismatch"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_count — additional edge cases
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_extract_count_negative_value_clamped() {
-        let (handle, port) = mock_http_server(r#"{"dataset": [[-5]], "count": 1}"#).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let result = extract_count(&client, &url, "SELECT count()").await;
-        assert_eq!(result, 0, "negative count should be clamped to 0");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_extract_count_null_value() {
-        let (handle, port) = mock_http_server(r#"{"dataset": [[null]], "count": 1}"#).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let result = extract_count(&client, &url, "SELECT count()").await;
-        assert_eq!(result, 0, "null value should return 0");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_extract_count_string_value() {
-        let (handle, port) =
-            mock_http_server(r#"{"dataset": [["not a number"]], "count": 1}"#).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let url = format!("http://127.0.0.1:{}", port);
-        let result = extract_count(&client, &url, "SELECT count()").await;
-        assert_eq!(result, 0, "string value should return 0");
-        handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // CrossVerificationReport — pass conditions combinatorial
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_verification_passes_with_all_conditions_met() {
-        let instruments_checked = 50_usize;
-        let instruments_with_gaps = 0_usize;
-        let ohlc_violations = 0_usize;
-        let data_violations = 0_usize;
-        let timestamp_violations = 0_usize;
-
-        let passed = instruments_checked > 0
-            && instruments_with_gaps == 0
-            && ohlc_violations == 0
-            && data_violations == 0
-            && timestamp_violations == 0;
-        assert!(passed);
-    }
-
-    #[test]
-    fn test_verification_fails_multiple_violations() {
-        let instruments_checked = 50_usize;
-        let instruments_with_gaps = 2_usize;
-        let ohlc_violations = 3_usize;
-        let data_violations = 1_usize;
-        let timestamp_violations = 5_usize;
-
-        let passed = instruments_checked > 0
-            && instruments_with_gaps == 0
-            && ohlc_violations == 0
-            && data_violations == 0
-            && timestamp_violations == 0;
-        assert!(!passed);
-    }
-
-    // -----------------------------------------------------------------------
-    // CROSS_MATCH_TIMEFRAMES mapping completeness
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cross_match_timeframes_1m_maps_to_candles_1m() {
-        let mapping = CROSS_MATCH_TIMEFRAMES.iter().find(|(tf, _)| *tf == "1m");
-        assert_eq!(mapping, Some(&("1m", "candles_1m")));
-    }
-
-    #[test]
-    fn test_cross_match_timeframes_5m_maps_to_candles_5m() {
-        let mapping = CROSS_MATCH_TIMEFRAMES.iter().find(|(tf, _)| *tf == "5m");
-        assert_eq!(mapping, Some(&("5m", "candles_5m")));
-    }
-
-    #[test]
-    fn test_cross_match_timeframes_15m_maps_to_candles_15m() {
-        let mapping = CROSS_MATCH_TIMEFRAMES.iter().find(|(tf, _)| *tf == "15m");
-        assert_eq!(mapping, Some(&("15m", "candles_15m")));
-    }
-
-    #[test]
-    fn test_cross_match_timeframes_1d_maps_to_candles_1d() {
-        let mapping = CROSS_MATCH_TIMEFRAMES.iter().find(|(tf, _)| *tf == "1d");
-        assert_eq!(mapping, Some(&("1d", "candles_1d")));
-    }
-
-    // -----------------------------------------------------------------------
-    // VERIFY_QUERY_TIMEOUT_SECS constant
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_verify_query_timeout_is_reasonable() {
-        const {
-            assert!(VERIFY_QUERY_TIMEOUT_SECS >= 5, "timeout too low");
-            assert!(VERIFY_QUERY_TIMEOUT_SECS <= 120, "timeout too high");
-        }
+        let result = lookup_symbol(&registry, 0);
+        assert_eq!(result, "0");
     }
 }

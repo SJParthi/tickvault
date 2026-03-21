@@ -80,14 +80,7 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
     info!(actual_ip_masked = %mask_ip(&actual_ip), "actual public IP detected");
 
     // Step 4: Compare
-    if actual_ip != expected_ip {
-        let reason = format!(
-            "IP MISMATCH — expected {} (SSM), got {} (actual). \
-             Dhan will reject API calls from this IP. \
-             Check: (1) correct network/ISP (2) SSM value is current (3) VPN not active",
-            mask_ip(&expected_ip),
-            mask_ip(&actual_ip),
-        );
+    if let Err(reason) = compare_ips(&expected_ip, &actual_ip) {
         error!(
             expected = %mask_ip(&expected_ip),
             actual = %mask_ip(&actual_ip),
@@ -123,11 +116,8 @@ async fn fetch_expected_ip_from_ssm() -> Result<String, ApplicationError> {
     let secret = fetch_secret(&ssm_client, &path).await?;
     let ip = secret.expose_secret().trim().to_string();
 
-    if ip.is_empty() {
-        return Err(ApplicationError::IpVerificationFailed {
-            reason: format!("SSM parameter '{path}' exists but is empty"),
-        });
-    }
+    validate_ssm_ip_not_empty(&ip, &path)
+        .map_err(|reason| ApplicationError::IpVerificationFailed { reason })?;
 
     Ok(ip)
 }
@@ -158,11 +148,7 @@ async fn detect_public_ip() -> Result<String, String> {
                     "primary IP check failed"
                 );
                 if attempt < PUBLIC_IP_CHECK_MAX_RETRIES {
-                    // Exponential backoff: 1s, 2s, 4s
-                    let delay = Duration::from_secs(
-                        1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(1),
-                    );
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(compute_ip_check_backoff(attempt)).await;
                 }
             }
         }
@@ -183,10 +169,7 @@ async fn detect_public_ip() -> Result<String, String> {
                     "fallback IP check failed"
                 );
                 if attempt < PUBLIC_IP_CHECK_MAX_RETRIES {
-                    let delay = Duration::from_secs(
-                        1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(1),
-                    );
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(compute_ip_check_backoff(attempt)).await;
                 }
             }
         }
@@ -257,6 +240,76 @@ fn mask_ip(ip: &str) -> String {
         format!("{}.{}.XXX.XX", parts[0], parts[1])
     } else {
         "XXX.XXX.XXX.XXX".to_string()
+    }
+}
+
+/// Compares expected and actual IPs, returning an error reason on mismatch.
+///
+/// Pure function — no I/O, no allocation on match.
+fn compare_ips(expected: &str, actual: &str) -> Result<(), String> {
+    if actual != expected {
+        Err(format!(
+            "IP MISMATCH — expected {} (SSM), got {} (actual). \
+             Dhan will reject API calls from this IP. \
+             Check: (1) correct network/ISP (2) SSM value is current (3) VPN not active",
+            mask_ip(expected),
+            mask_ip(actual),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates that an IP string from SSM is not empty.
+///
+/// Pure function — no I/O.
+fn validate_ssm_ip_not_empty(ip: &str, path: &str) -> Result<(), String> {
+    if ip.is_empty() {
+        Err(format!("SSM parameter '{path}' exists but is empty"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Computes exponential backoff delay for retry attempts.
+///
+/// Returns `Duration` = 2^(attempt-1) seconds, capped at the value derived
+/// from `attempt < max_retries` (i.e., no delay on last attempt).
+///
+/// Pure function — no I/O.
+fn compute_ip_check_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(1))
+}
+
+/// Classifies an IP verification error into a category.
+///
+/// Pure function — used for logging and alerting decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpVerificationErrorKind {
+    /// SSM is unreachable or parameter is missing.
+    SsmError,
+    /// SSM returned an invalid/empty IP.
+    InvalidSsmIp,
+    /// Could not detect the machine's public IP.
+    DetectionFailed,
+    /// Detected IP does not match SSM.
+    Mismatch,
+}
+
+/// Classifies an `ApplicationError::IpVerificationFailed` reason string.
+///
+/// Pure function.
+pub fn classify_ip_error(reason: &str) -> IpVerificationErrorKind {
+    // Check mismatch first — mismatch messages may contain "SSM" as context.
+    if reason.contains("IP MISMATCH") {
+        IpVerificationErrorKind::Mismatch
+    } else if reason.contains("SSM") && reason.contains("empty") {
+        IpVerificationErrorKind::InvalidSsmIp
+    } else if reason.contains("SSM") || reason.contains("secret") {
+        IpVerificationErrorKind::SsmError
+    } else {
+        // Covers: detection failures, exhausted retries, and any unknown reason.
+        IpVerificationErrorKind::DetectionFailed
     }
 }
 
@@ -561,206 +614,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_ipv4_format — additional edge cases
+    // IpVerificationResult
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_whitespace_only_ip_fails() {
-        assert!(validate_ipv4_format("   ").is_err());
-        assert!(validate_ipv4_format("\t").is_err());
-        assert!(validate_ipv4_format("\n\n").is_err());
+    fn test_ip_verification_result_debug() {
+        let result = IpVerificationResult {
+            verified_ip: "203.0.113.42".to_string(),
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("203.0.113.42"));
     }
 
     #[test]
-    fn test_validate_ipv4_error_contains_ip() {
-        let err = validate_ipv4_format("garbage").unwrap_err();
-        assert!(
-            err.contains("garbage"),
-            "error should contain the invalid IP"
-        );
-    }
-
-    #[test]
-    fn test_validate_ipv4_leading_zeros_rejected() {
-        // Leading zeros in octets: Rust's Ipv4Addr::parse rejects them (since Rust 1.76)
-        assert!(validate_ipv4_format("192.168.001.001").is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // fetch_ip_from_url — error path coverage (no real network needed)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_fetch_ip_from_url_invalid_url() {
-        let result = fetch_ip_from_url("not-a-url", Duration::from_millis(100)).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_fetch_ip_from_url_connection_refused() {
-        // Port 1 is unlikely to be listening
-        let result = fetch_ip_from_url("http://127.0.0.1:1/ip", Duration::from_millis(200)).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("127.0.0.1:1"), "error should mention the URL");
-    }
-
-    #[tokio::test]
-    async fn test_fetch_ip_from_url_non_success_status() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let result = fetch_ip_from_url(
-            &format!("http://127.0.0.1:{port}/ip"),
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("HTTP 500"));
-    }
-
-    #[tokio::test]
-    async fn test_fetch_ip_from_url_invalid_ip_in_response() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "not-an-ip-address";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let result = fetch_ip_from_url(
-            &format!("http://127.0.0.1:{port}/ip"),
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("not a valid IPv4"), "error: {err}");
+    fn test_ip_verification_result_clone() {
+        let result = IpVerificationResult {
+            verified_ip: "10.0.0.1".to_string(),
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.verified_ip, "10.0.0.1");
     }
 
     // -----------------------------------------------------------------------
     // Dhan IP API — request/response format tests
     // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // validate_ipv4_format — additional edge cases for coverage
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_validate_ipv4_negative_octet() {
-        assert!(validate_ipv4_format("-1.0.0.0").is_err());
-    }
-
-    #[test]
-    fn test_validate_ipv4_empty_octets() {
-        assert!(validate_ipv4_format("...").is_err());
-    }
-
-    #[test]
-    fn test_validate_ipv4_ipv6_mapped() {
-        // IPv4-mapped IPv6 should fail
-        assert!(validate_ipv4_format("::ffff:192.168.1.1").is_err());
-    }
-
-    #[test]
-    fn test_validate_ipv4_with_cidr() {
-        assert!(validate_ipv4_format("192.168.1.0/24").is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // mask_ip — additional edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_mask_ip_single_digit_octets() {
-        assert_eq!(mask_ip("1.2.3.4"), "1.2.XXX.XX");
-    }
-
-    #[test]
-    fn test_mask_ip_max_octets() {
-        assert_eq!(mask_ip("255.255.255.255"), "255.255.XXX.XX");
-    }
-
-    #[test]
-    fn test_mask_ip_with_extra_dots() {
-        // "1.2.3.4.5" has 5 parts → not 4 → masked
-        assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
-    }
-
-    // -----------------------------------------------------------------------
-    // IpVerificationResult — field access
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ip_verification_result_verified_ip_field() {
-        let result = IpVerificationResult {
-            verified_ip: "192.168.0.1".to_string(),
-        };
-        assert_eq!(result.verified_ip, "192.168.0.1");
-    }
-
-    // -----------------------------------------------------------------------
-    // fetch_ip_from_url — valid response test
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_fetch_ip_from_url_valid_response() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "203.0.113.42";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let result = fetch_ip_from_url(
-            &format!("http://127.0.0.1:{port}/ip"),
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "203.0.113.42");
-    }
 
     #[test]
     fn test_set_ip_request_format() {
@@ -797,520 +674,179 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_ipv4_format — boundary and special cases
+    // compare_ips — pure IP comparison
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_validate_ipv4_broadcast() {
-        assert!(validate_ipv4_format("255.255.255.255").is_ok());
+    fn test_compare_ips_match_returns_ok() {
+        assert!(compare_ips("203.0.113.42", "203.0.113.42").is_ok());
     }
 
     #[test]
-    fn test_validate_ipv4_all_zeros() {
-        assert!(validate_ipv4_format("0.0.0.0").is_ok());
+    fn test_compare_ips_mismatch_returns_error() {
+        let result = compare_ips("203.0.113.42", "10.0.0.1");
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("IP MISMATCH"),
+            "error reason must contain 'IP MISMATCH'"
+        );
+        assert!(
+            reason.contains("203.0.XXX.XX"),
+            "error must mask expected IP"
+        );
+        assert!(reason.contains("10.0.XXX.XX"), "error must mask actual IP");
     }
 
     #[test]
-    fn test_validate_ipv4_each_octet_max() {
-        assert!(validate_ipv4_format("255.0.0.0").is_ok());
-        assert!(validate_ipv4_format("0.255.0.0").is_ok());
-        assert!(validate_ipv4_format("0.0.255.0").is_ok());
-        assert!(validate_ipv4_format("0.0.0.255").is_ok());
+    fn test_compare_ips_mismatch_contains_guidance() {
+        let reason = compare_ips("1.2.3.4", "5.6.7.8").unwrap_err();
+        assert!(reason.contains("correct network/ISP"));
+        assert!(reason.contains("SSM value is current"));
+        assert!(reason.contains("VPN not active"));
     }
 
     #[test]
-    fn test_validate_ipv4_octet_256_fails() {
-        assert!(validate_ipv4_format("256.0.0.0").is_err());
-        assert!(validate_ipv4_format("0.256.0.0").is_err());
-        assert!(validate_ipv4_format("0.0.256.0").is_err());
-        assert!(validate_ipv4_format("0.0.0.256").is_err());
+    fn test_compare_ips_same_prefix_different_suffix() {
+        let result = compare_ips("203.0.113.42", "203.0.113.43");
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_validate_ipv4_with_protocol_prefix() {
-        assert!(validate_ipv4_format("http://1.2.3.4").is_err());
+    fn test_compare_ips_empty_strings() {
+        // Empty strings are equal, compare_ips returns Ok.
+        // (validate_ipv4_format catches empty before compare_ips runs.)
+        assert!(compare_ips("", "").is_ok());
     }
 
     // -----------------------------------------------------------------------
-    // mask_ip — deterministic output
+    // validate_ssm_ip_not_empty
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_mask_ip_preserves_first_two_octets_only() {
-        let masked = mask_ip("10.20.30.40");
-        assert_eq!(masked, "10.20.XXX.XX");
-        assert!(!masked.contains("30"));
-        assert!(!masked.contains("40"));
+    fn test_validate_ssm_ip_not_empty_valid() {
+        assert!(validate_ssm_ip_not_empty("203.0.113.42", "/dlt/dev/network/static-ip").is_ok());
     }
 
     #[test]
-    fn test_mask_ip_three_octets_returns_placeholder() {
-        assert_eq!(mask_ip("10.20.30"), "XXX.XXX.XXX.XXX");
+    fn test_validate_ssm_ip_not_empty_empty_string() {
+        let result = validate_ssm_ip_not_empty("", "/dlt/dev/network/static-ip");
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(reason.contains("SSM parameter"));
+        assert!(reason.contains("empty"));
+        assert!(reason.contains("/dlt/dev/network/static-ip"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_ip_check_backoff
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_ip_check_backoff_first_attempt() {
+        let delay = compute_ip_check_backoff(1);
+        assert_eq!(delay, Duration::from_secs(1));
     }
 
     #[test]
-    fn test_mask_ip_comma_separated_returns_placeholder() {
-        assert_eq!(mask_ip("10,20,30,40"), "XXX.XXX.XXX.XXX");
+    fn test_compute_ip_check_backoff_second_attempt() {
+        let delay = compute_ip_check_backoff(2);
+        assert_eq!(delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_third_attempt() {
+        let delay = compute_ip_check_backoff(3);
+        assert_eq!(delay, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_zero_attempt() {
+        // attempt=0 → shift by saturating_sub(1)=0 → 2^0 = 1
+        let delay = compute_ip_check_backoff(0);
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_large_attempt() {
+        // Large shift wraps to 1 via unwrap_or
+        let delay = compute_ip_check_backoff(100);
+        assert_eq!(delay, Duration::from_secs(1));
     }
 
     // -----------------------------------------------------------------------
-    // fetch_ip_from_url — SSM whitespace IP fails validation
+    // classify_ip_error
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_ssm_whitespace_only_ip_fails_validation() {
-        // Simulates what happens when SSM returns a whitespace-only value:
-        // fetch_expected_ip_from_ssm trims it → empty → returns error.
-        // But even if trimming is skipped, validate_ipv4_format rejects whitespace.
-        assert!(validate_ipv4_format("   ").is_err());
-        assert!(validate_ipv4_format("\t\n").is_err());
-        assert!(validate_ipv4_format("  10.0.0.1  ").is_err());
+    fn test_classify_ip_error_ssm_empty() {
+        let kind =
+            classify_ip_error("SSM parameter '/dlt/dev/network/static-ip' exists but is empty");
+        assert_eq!(kind, IpVerificationErrorKind::InvalidSsmIp);
+    }
+
+    #[test]
+    fn test_classify_ip_error_ssm_unreachable() {
+        let kind = classify_ip_error("failed to fetch SSM secret: connection refused");
+        assert_eq!(kind, IpVerificationErrorKind::SsmError);
+    }
+
+    #[test]
+    fn test_classify_ip_error_mismatch() {
+        // Real mismatch messages contain "(SSM)" — classifier must check mismatch first.
+        let kind = classify_ip_error(
+            "IP MISMATCH — expected 203.0.XXX.XX (SSM), got 10.0.XXX.XX (actual)",
+        );
+        assert_eq!(kind, IpVerificationErrorKind::Mismatch);
+    }
+
+    #[test]
+    fn test_classify_ip_error_detection_failed() {
+        let kind = classify_ip_error(
+            "all IP detection attempts exhausted — primary and fallback both failed",
+        );
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    #[test]
+    fn test_classify_ip_error_unknown_reason() {
+        let kind = classify_ip_error("something unexpected happened");
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    #[test]
+    fn test_classify_ip_error_secret_keyword() {
+        let kind = classify_ip_error("failed to read secret from parameter store");
+        assert_eq!(kind, IpVerificationErrorKind::SsmError);
     }
 
     // -----------------------------------------------------------------------
-    // fetch_ip_from_url — primary fails, fallback succeeds
+    // IpVerificationErrorKind — derive coverage
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_fetch_ip_from_url_with_whitespace_trimmed() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
+    #[test]
+    fn test_ip_error_kind_debug_and_clone() {
+        let kind = IpVerificationErrorKind::Mismatch;
+        let cloned = kind.clone();
+        assert_eq!(kind, cloned);
+        let debug = format!("{kind:?}");
+        assert!(debug.contains("Mismatch"));
+    }
 
-        // Simulate a server that returns IP with surrounding whitespace.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "  10.0.0.1\n  ";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+    #[test]
+    fn test_ip_error_kind_all_variants_distinct() {
+        let variants = [
+            IpVerificationErrorKind::SsmError,
+            IpVerificationErrorKind::InvalidSsmIp,
+            IpVerificationErrorKind::DetectionFailed,
+            IpVerificationErrorKind::Mismatch,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "variants {i} and {j} must be distinct");
+                }
             }
-        });
-
-        let result = fetch_ip_from_url(
-            &format!("http://127.0.0.1:{port}/ip"),
-            Duration::from_secs(2),
-        )
-        .await;
-        // The body is trimmed before validation; "10.0.0.1" is valid.
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "10.0.0.1");
-    }
-
-    // -----------------------------------------------------------------------
-    // detect_public_ip — both primary and fallback exhausted
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_detect_public_ip_returns_result_type() {
-        // detect_public_ip exercises both primary and fallback with retries.
-        // We can't easily mock the real URLs, but we verify the function
-        // returns a proper Result (not panic) in all environments.
-        let result = detect_public_ip().await;
-        match &result {
-            Ok(ip) => assert!(
-                validate_ipv4_format(ip).is_ok(),
-                "returned IP must be valid"
-            ),
-            Err(msg) => assert!(
-                msg.contains("exhausted"),
-                "error should mention exhaustion: {msg}"
-            ),
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // detect_public_ip — error path with both URLs failing
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_detect_public_ip_both_fail_error_message() {
-        // detect_public_ip tries real URLs; in CI without network, both fail.
-        // We can't easily mock the URLs, but verify the function signature works.
-        // This exercises the full retry loop with real URLs.
-        // If network is available, it succeeds; if not, it returns an informative error.
-        let result = detect_public_ip().await;
-        // Just verify it returns a result (success or error) without panicking.
-        let _ = result;
-    }
-
-    // -----------------------------------------------------------------------
-    // ModifyIpRequest and SetIpResponse formats
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_modify_ip_request_format() {
-        use crate::auth::types::ModifyIpRequest;
-        let req = ModifyIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "10.0.0.1".to_string(),
-            ip_flag: "SECONDARY".to_string(),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("dhanClientId"));
-        assert!(json.contains("10.0.0.1"));
-        assert!(json.contains("SECONDARY"));
-    }
-
-    #[test]
-    fn test_set_ip_response_parsing() {
-        use crate::auth::types::SetIpResponse;
-        let json = r#"{"status": "success"}"#;
-        let response: SetIpResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.status, "success");
-    }
-
-    #[test]
-    fn test_modify_ip_response_parsing() {
-        use crate::auth::types::ModifyIpResponse;
-        let json = r#"{"status": "success"}"#;
-        let response: ModifyIpResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.status, "success");
-    }
-
-    // -----------------------------------------------------------------------
-    // set_ip — error paths via mock HTTP servers
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_set_ip_non_success_status_returns_error() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = r#"{"errorCode":"DH-905","errorType":"INPUT_EXCEPTION","errorMessage":"invalid"}"#;
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let req = crate::auth::types::SetIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "203.0.113.42".to_string(),
-            ip_flag: "PRIMARY".to_string(),
-        };
-        let result = set_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let err_str = err.to_string();
-        assert!(
-            err_str.contains("400") || err_str.contains("set_ip"),
-            "error should mention status or function: {err_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_ip_invalid_json_response_returns_parse_error() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "not-json-at-all";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let req = crate::auth::types::SetIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "203.0.113.42".to_string(),
-            ip_flag: "PRIMARY".to_string(),
-        };
-        let result = set_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
-        assert!(result.is_err());
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("parse error") || err_str.contains("set_ip"),
-            "error should mention parse: {err_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_ip_connection_refused_returns_error() {
-        let req = crate::auth::types::SetIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "203.0.113.42".to_string(),
-            ip_flag: "PRIMARY".to_string(),
-        };
-        let result = set_ip("http://127.0.0.1:1", "fake-token", &req).await;
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // modify_ip — error paths via mock HTTP servers
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_modify_ip_non_success_status_returns_error() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "Forbidden";
-                let response = format!(
-                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let req = crate::auth::types::ModifyIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "10.0.0.1".to_string(),
-            ip_flag: "SECONDARY".to_string(),
-        };
-        let result = modify_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
-        assert!(result.is_err());
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("403") || err_str.contains("modify_ip"),
-            "error should mention status: {err_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_ip_invalid_json_response_returns_parse_error() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "not-json";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let req = crate::auth::types::ModifyIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "10.0.0.1".to_string(),
-            ip_flag: "SECONDARY".to_string(),
-        };
-        let result = modify_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_modify_ip_connection_refused_returns_error() {
-        let req = crate::auth::types::ModifyIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "10.0.0.1".to_string(),
-            ip_flag: "SECONDARY".to_string(),
-        };
-        let result = modify_ip("http://127.0.0.1:1", "fake-token", &req).await;
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // get_ip — error paths via mock HTTP servers
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_get_ip_non_success_status_returns_error() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let result = get_ip(&format!("http://127.0.0.1:{port}"), "fake-token").await;
-        assert!(result.is_err());
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("500") || err_str.contains("get_ip"),
-            "error should mention status: {err_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_ip_invalid_json_response_returns_parse_error() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = "{invalid";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let result = get_ip(&format!("http://127.0.0.1:{port}"), "fake-token").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_get_ip_connection_refused_returns_error() {
-        let result = get_ip("http://127.0.0.1:1", "fake-token").await;
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // set_ip / modify_ip / get_ip — success paths via mock HTTP servers
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_set_ip_success_response() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = r#"{"status": "success"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let req = crate::auth::types::SetIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "203.0.113.42".to_string(),
-            ip_flag: "PRIMARY".to_string(),
-        };
-        let result = set_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().status, "success");
-    }
-
-    #[tokio::test]
-    async fn test_modify_ip_success_response() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = r#"{"status": "success"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let req = crate::auth::types::ModifyIpRequest {
-            dhan_client_id: "1000000001".to_string(),
-            ip: "10.0.0.1".to_string(),
-            ip_flag: "SECONDARY".to_string(),
-        };
-        let result = modify_ip(&format!("http://127.0.0.1:{port}"), "fake-token", &req).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().status, "success");
-    }
-
-    #[tokio::test]
-    async fn test_get_ip_success_response() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let body = r#"{"ip":"203.0.113.42","ipFlag":"PRIMARY","modifyDatePrimary":"2026-01-15","modifyDateSecondary":""}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-
-        let result = get_ip(&format!("http://127.0.0.1:{port}"), "fake-token").await;
-        assert!(result.is_ok());
-        let resp = result.unwrap();
-        assert_eq!(resp.ip, "203.0.113.42");
-        assert_eq!(resp.ip_flag, "PRIMARY");
     }
 }

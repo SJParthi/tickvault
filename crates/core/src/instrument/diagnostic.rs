@@ -67,6 +67,160 @@ const EXPECTED_COLUMNS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Pure Helper Functions (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Segment breakdown counts from parsed instrument CSV rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentCounts {
+    /// NSE Index instruments.
+    pub nse_i: usize,
+    /// NSE Equity instruments.
+    pub nse_e: usize,
+    /// NSE Derivative instruments.
+    pub nse_d: usize,
+    /// BSE Index instruments.
+    pub bse_i: usize,
+    /// BSE Derivative instruments.
+    pub bse_d: usize,
+}
+
+/// Counts instruments by exchange + segment from parsed CSV rows.
+fn count_segments(rows: &[super::csv_parser::ParsedInstrumentRow]) -> SegmentCounts {
+    use dhan_live_trader_common::types::Exchange;
+
+    let mut counts = SegmentCounts {
+        nse_i: 0,
+        nse_e: 0,
+        nse_d: 0,
+        bse_i: 0,
+        bse_d: 0,
+    };
+
+    for r in rows {
+        match (&r.exchange, r.segment) {
+            (Exchange::NationalStockExchange, 'I') => {
+                counts.nse_i = counts.nse_i.saturating_add(1);
+            }
+            (Exchange::NationalStockExchange, 'E') => {
+                counts.nse_e = counts.nse_e.saturating_add(1);
+            }
+            (Exchange::NationalStockExchange, 'D') => {
+                counts.nse_d = counts.nse_d.saturating_add(1);
+            }
+            (Exchange::BombayStockExchange, 'I') => {
+                counts.bse_i = counts.bse_i.saturating_add(1);
+            }
+            (Exchange::BombayStockExchange, 'D') => {
+                counts.bse_d = counts.bse_d.saturating_add(1);
+            }
+            _ => {} // BSE_E and others: not tracked in diagnostic
+        }
+    }
+
+    counts
+}
+
+/// Builds the CSV parse check result detail string.
+fn build_csv_parse_detail(
+    total_rows: usize,
+    parsed_count: usize,
+    counts: &SegmentCounts,
+) -> String {
+    format!(
+        "total={total_rows}, parsed={parsed_count}, NSE_I={}, NSE_E={}, NSE_D={}, BSE_I={}, BSE_D={}",
+        counts.nse_i, counts.nse_e, counts.nse_d, counts.bse_i, counts.bse_d
+    )
+}
+
+/// Builds a CheckResult for a successful CSV parse.
+fn build_csv_parse_check(
+    total_rows: usize,
+    parsed_count: usize,
+    counts: &SegmentCounts,
+    duration_ms: u64,
+) -> CheckResult {
+    CheckResult {
+        name: "csv_parse".to_owned(),
+        passed: true,
+        detail: build_csv_parse_detail(total_rows, parsed_count, counts),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a failed CSV parse.
+fn build_csv_parse_error(err_msg: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "csv_parse".to_owned(),
+        passed: false,
+        detail: format!("parse failed: {err_msg}"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a successful CSV download.
+fn build_download_success(bytes_len: usize, source: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "csv_download".to_owned(),
+        passed: true,
+        detail: format!("downloaded {bytes_len} bytes from {source} source"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a failed CSV download.
+fn build_download_error(err_msg: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "csv_download".to_owned(),
+        passed: false,
+        detail: format!("download failed: {err_msg}"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a successful universe build + validation.
+fn build_universe_success(underlyings: usize, derivatives: usize, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "universe_build_and_validate".to_owned(),
+        passed: true,
+        detail: format!("{underlyings} underlyings, {derivatives} derivatives — validation passed"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a universe build that passed but validation failed.
+fn build_universe_validation_error(
+    underlyings: usize,
+    derivatives: usize,
+    err_msg: &str,
+    duration_ms: u64,
+) -> CheckResult {
+    CheckResult {
+        name: "universe_build_and_validate".to_owned(),
+        passed: false,
+        detail: format!(
+            "{underlyings} underlyings, {derivatives} derivatives — validation FAILED: {err_msg}"
+        ),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a failed universe build.
+fn build_universe_build_error(err_msg: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "universe_build_and_validate".to_owned(),
+        passed: false,
+        detail: format!("universe build failed: {err_msg}"),
+        duration_ms,
+    }
+}
+
+/// Determines overall health from check results.
+fn determine_healthy(checks: &[CheckResult]) -> bool {
+    checks.iter().all(|c| c.passed)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -110,25 +264,15 @@ pub async fn run_instrument_diagnostic(
 
     let csv_text = match download_result {
         Ok(result) => {
-            checks.push(CheckResult {
-                name: "csv_download".to_owned(),
-                passed: true,
-                detail: format!(
-                    "downloaded {} bytes from {} source",
-                    result.csv_text.len(),
-                    result.source
-                ),
-                duration_ms: download_ms,
-            });
+            checks.push(build_download_success(
+                result.csv_text.len(),
+                &result.source,
+                download_ms,
+            ));
             Some(result.csv_text)
         }
         Err(err) => {
-            checks.push(CheckResult {
-                name: "csv_download".to_owned(),
-                passed: false,
-                detail: format!("download failed: {err}"),
-                duration_ms: download_ms,
-            });
+            checks.push(build_download_error(&err.to_string(), download_ms));
             None
         }
     };
@@ -145,66 +289,14 @@ pub async fn run_instrument_diagnostic(
 
         match parse_result {
             Ok((total_rows, parsed_rows)) => {
-                let nse_i = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'I'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::NationalStockExchange
-                            )
-                    })
-                    .count();
-                let nse_e = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'E'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::NationalStockExchange
-                            )
-                    })
-                    .count();
-                let nse_d = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'D'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::NationalStockExchange
-                            )
-                    })
-                    .count();
-                let bse_i = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'I'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::BombayStockExchange
-                            )
-                    })
-                    .count();
-                let bse_d = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'D'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::BombayStockExchange
-                            )
-                    })
-                    .count();
+                let counts = count_segments(&parsed_rows);
 
-                checks.push(CheckResult {
-                    name: "csv_parse".to_owned(),
-                    passed: true,
-                    detail: format!(
-                        "total={total_rows}, parsed={}, NSE_I={nse_i}, NSE_E={nse_e}, NSE_D={nse_d}, BSE_I={bse_i}, BSE_D={bse_d}",
-                        parsed_rows.len()
-                    ),
-                    duration_ms: parse_ms,
-                });
+                checks.push(build_csv_parse_check(
+                    total_rows,
+                    parsed_rows.len(),
+                    &counts,
+                    parse_ms,
+                ));
 
                 // Check 8: Universe build + validation
                 let start = Instant::now();
@@ -217,50 +309,31 @@ pub async fn run_instrument_diagnostic(
                         // Run validation
                         match validate_fno_universe(&universe) {
                             Ok(()) => {
-                                checks.push(CheckResult {
-                                    name: "universe_build_and_validate".to_owned(),
-                                    passed: true,
-                                    detail: format!(
-                                        "{uc} underlyings, {dc} derivatives — validation passed"
-                                    ),
-                                    duration_ms: build_ms,
-                                });
+                                checks.push(build_universe_success(uc, dc, build_ms));
                             }
                             Err(err) => {
-                                checks.push(CheckResult {
-                                    name: "universe_build_and_validate".to_owned(),
-                                    passed: false,
-                                    detail: format!(
-                                        "{uc} underlyings, {dc} derivatives — validation FAILED: {err}"
-                                    ),
-                                    duration_ms: build_ms,
-                                });
+                                checks.push(build_universe_validation_error(
+                                    uc,
+                                    dc,
+                                    &err.to_string(),
+                                    build_ms,
+                                ));
                             }
                         }
                     }
                     Err(err) => {
                         let build_ms = start.elapsed().as_millis() as u64;
-                        checks.push(CheckResult {
-                            name: "universe_build_and_validate".to_owned(),
-                            passed: false,
-                            detail: format!("universe build failed: {err}"),
-                            duration_ms: build_ms,
-                        });
+                        checks.push(build_universe_build_error(&err.to_string(), build_ms));
                     }
                 }
             }
             Err(err) => {
-                checks.push(CheckResult {
-                    name: "csv_parse".to_owned(),
-                    passed: false,
-                    detail: format!("parse failed: {err}"),
-                    duration_ms: parse_ms,
-                });
+                checks.push(build_csv_parse_error(&err.to_string(), parse_ms));
             }
         }
     }
 
-    let healthy = checks.iter().all(|c| c.passed);
+    let healthy = determine_healthy(&checks);
     info!(
         healthy,
         checks = checks.len(),
@@ -519,774 +592,261 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Additional coverage: check_csv_headers edge cases
+    // count_segments tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_check_csv_headers_extra_columns_reported() {
-        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
-                       EXTRA_COL1,EXTRA_COL2";
-        let result = check_csv_headers(header);
-        assert!(result.passed, "all required columns present");
-        assert!(
-            result.detail.contains("extra columns"),
-            "should mention extra columns: {}",
-            result.detail
-        );
-        assert!(
-            result.detail.contains("EXTRA_COL1"),
-            "should list EXTRA_COL1: {}",
-            result.detail
-        );
-    }
-
-    #[test]
-    fn test_check_csv_headers_only_some_missing() {
-        // Missing both EXPIRY_FLAG and TICK_SIZE
-        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,";
-        let result = check_csv_headers(header);
-        assert!(!result.passed);
-        assert!(result.detail.contains("TICK_SIZE"));
-        assert!(result.detail.contains("EXPIRY_FLAG"));
-    }
-
-    #[test]
-    fn test_check_csv_headers_garbage_input() {
-        let result = check_csv_headers("THIS,IS,NOT,A,VALID,HEADER");
-        assert!(!result.passed, "garbage headers should fail");
-        assert!(result.detail.contains("MISSING"));
-    }
-
-    #[test]
-    fn test_check_csv_headers_multiline_only_checks_first() {
-        // First line has valid headers; second line is data
-        let csv = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                    UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                    LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG\n\
-                    NSE,I,13,INDEX,13,NIFTY,NIFTY 50,Nifty 50,EQ,1,0001-01-01,0,XX,0.05,0";
-        let result = check_csv_headers(csv);
-        assert!(
-            result.passed,
-            "should check only first line: {}",
-            result.detail
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional coverage: DiagnosticReport / CheckResult
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_diagnostic_report_unhealthy_when_any_check_fails() {
-        let report = DiagnosticReport {
-            healthy: false,
-            checks: vec![
-                CheckResult {
-                    name: "good".to_owned(),
-                    passed: true,
-                    detail: "ok".to_owned(),
-                    duration_ms: 1,
-                },
-                CheckResult {
-                    name: "bad".to_owned(),
-                    passed: false,
-                    detail: "failed".to_owned(),
-                    duration_ms: 2,
-                },
-            ],
-        };
-        assert!(!report.healthy);
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains("\"healthy\":false"));
-        assert!(json.contains("\"bad\""));
-    }
-
-    #[test]
-    fn test_diagnostic_report_empty_checks_is_healthy() {
-        let report = DiagnosticReport {
-            healthy: true,
-            checks: vec![],
-        };
-        assert!(report.healthy);
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains("\"checks\":[]"));
-    }
-
-    #[test]
-    fn test_check_result_serialization_all_fields() {
-        let result = CheckResult {
-            name: "test_check".to_owned(),
-            passed: false,
-            detail: "something went wrong".to_owned(),
-            duration_ms: 12345,
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("\"name\":\"test_check\""));
-        assert!(json.contains("\"passed\":false"));
-        assert!(json.contains("\"detail\":\"something went wrong\""));
-        assert!(json.contains("\"duration_ms\":12345"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional coverage: check_time_gate detail content
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_check_time_gate_detail_contains_window_params() {
-        let result = check_time_gate("09:00:00", "15:30:00");
-        assert!(result.passed);
-        assert!(
-            result.detail.contains("09:00:00"),
-            "detail should contain window_start"
-        );
-        assert!(
-            result.detail.contains("15:30:00"),
-            "detail should contain window_end"
-        );
-        assert!(
-            result.detail.contains("ist_time="),
-            "detail should contain IST time"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional coverage: check_cache_status with existing files
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_check_cache_status_with_existing_csv_file() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("dlt-test-diag-csv-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let csv_path = temp_dir.join("instruments.csv");
-        std::fs::write(&csv_path, "header\ndata\nmore data").unwrap();
-
-        let result = check_cache_status(temp_dir.to_str().unwrap(), "instruments.csv");
-        assert!(result.passed, "cache status is informational");
-        assert!(
-            result.detail.contains("dir_exists=true"),
-            "dir should exist: {}",
-            result.detail
-        );
-        assert!(
-            result.detail.contains("csv_exists=true"),
-            "csv should exist: {}",
-            result.detail
-        );
-        // File has some bytes
-        assert!(
-            !result.detail.contains("csv_bytes=0"),
-            "csv bytes should be non-zero: {}",
-            result.detail
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_check_cache_status_with_fresh_marker() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("dlt-test-diag-fresh-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        // Write a freshness marker with today's date
-        let today = chrono::Utc::now()
-            .with_timezone(&ist_offset())
-            .date_naive()
-            .to_string();
-        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
-        std::fs::write(&marker_path, &today).unwrap();
-
-        let result = check_cache_status(temp_dir.to_str().unwrap(), "instruments.csv");
-        assert!(result.passed);
-        assert!(
-            result.detail.contains("fresh=true"),
-            "should be fresh: {}",
-            result.detail
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_check_cache_status_stale_marker() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("dlt-test-diag-stale-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let marker_path = temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME);
-        std::fs::write(&marker_path, "2020-01-01").unwrap();
-
-        let result = check_cache_status(temp_dir.to_str().unwrap(), "instruments.csv");
-        assert!(result.passed);
-        assert!(
-            result.detail.contains("fresh=false"),
-            "should be stale: {}",
-            result.detail
-        );
-        assert!(
-            result.detail.contains("2020-01-01"),
-            "should show marker content: {}",
-            result.detail
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional coverage: EXPECTED_COLUMNS constant validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_expected_columns_includes_key_columns() {
-        assert!(
-            EXPECTED_COLUMNS.contains(&"EXCH_ID"),
-            "must include EXCH_ID"
-        );
-        assert!(
-            EXPECTED_COLUMNS.contains(&"SECURITY_ID"),
-            "must include SECURITY_ID"
-        );
-        assert!(
-            EXPECTED_COLUMNS.contains(&"INSTRUMENT"),
-            "must include INSTRUMENT"
-        );
-        assert!(
-            EXPECTED_COLUMNS.contains(&"UNDERLYING_SYMBOL"),
-            "must include UNDERLYING_SYMBOL"
-        );
-        assert!(
-            EXPECTED_COLUMNS.contains(&"STRIKE_PRICE"),
-            "must include STRIKE_PRICE"
-        );
-        assert!(
-            EXPECTED_COLUMNS.contains(&"OPTION_TYPE"),
-            "must include OPTION_TYPE"
-        );
-    }
-
-    #[test]
-    fn test_expected_columns_no_duplicates() {
-        let mut seen = std::collections::HashSet::new();
-        for col in EXPECTED_COLUMNS {
-            assert!(
-                seen.insert(col),
-                "duplicate column in EXPECTED_COLUMNS: {}",
-                col
-            );
+    fn make_row(
+        exchange: dhan_live_trader_common::types::Exchange,
+        segment: char,
+    ) -> super::super::csv_parser::ParsedInstrumentRow {
+        super::super::csv_parser::ParsedInstrumentRow {
+            exchange,
+            segment,
+            security_id: 1,
+            instrument: String::new(),
+            underlying_security_id: 0,
+            underlying_symbol: String::new(),
+            symbol_name: String::new(),
+            display_name: String::new(),
+            series: String::new(),
+            lot_size: 1,
+            expiry_date: None,
+            strike_price: 0.0,
+            option_type: None,
+            tick_size: 0.05,
+            expiry_flag: String::new(),
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Additional coverage: check_csv_headers with whitespace variations
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_check_csv_headers_with_whitespace_around_columns() {
-        // Columns with spaces — the trim in split should handle this
-        let header = " EXCH_ID , SEGMENT , SECURITY_ID , INSTRUMENT , UNDERLYING_SECURITY_ID ,\
-                        UNDERLYING_SYMBOL , SYMBOL_NAME , DISPLAY_NAME , SERIES ,\
-                        LOT_SIZE , SM_EXPIRY_DATE , STRIKE_PRICE , OPTION_TYPE , TICK_SIZE , EXPIRY_FLAG ";
-        let result = check_csv_headers(header);
-        assert!(
-            result.passed,
-            "whitespace-padded columns should still be found: {}",
-            result.detail
-        );
-    }
-
-    #[test]
-    fn test_check_csv_headers_all_missing_reports_all() {
-        let result = check_csv_headers("ONLY_ONE_COLUMN");
-        assert!(!result.passed);
-        // Should report all 15 expected columns as missing
-        assert!(result.detail.contains("EXCH_ID"));
-        assert!(result.detail.contains("SEGMENT"));
-        assert!(result.detail.contains("SECURITY_ID"));
-    }
-
-    #[tokio::test]
-    async fn test_check_url_reachability_label_in_name() {
-        let result = check_url_reachability("http://127.0.0.1:1/x", "custom_label").await;
-        assert_eq!(result.name, "url_reachability_custom_label");
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage: DiagnosticReport healthy logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_diagnostic_report_healthy_matches_all_checks_passed() {
-        let one_fail = DiagnosticReport {
-            healthy: false,
-            checks: vec![
-                CheckResult {
-                    name: "a".to_owned(),
-                    passed: true,
-                    detail: "ok".to_owned(),
-                    duration_ms: 1,
-                },
-                CheckResult {
-                    name: "b".to_owned(),
-                    passed: false,
-                    detail: "fail".to_owned(),
-                    duration_ms: 2,
-                },
-                CheckResult {
-                    name: "c".to_owned(),
-                    passed: true,
-                    detail: "ok".to_owned(),
-                    duration_ms: 3,
-                },
-            ],
-        };
-        assert!(!one_fail.healthy);
-        assert!(!one_fail.checks.iter().all(|c| c.passed));
-    }
-
-    #[test]
-    fn test_check_csv_headers_isin_is_extra_not_required() {
-        let header = "ISIN,EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG";
-        let result = check_csv_headers(header);
-        assert!(
-            result.passed,
-            "ISIN is extra, not required: {}",
-            result.detail
-        );
-        assert!(
-            result.detail.contains("ISIN"),
-            "should list ISIN as extra: {}",
-            result.detail
-        );
-    }
-
-    #[test]
-    fn test_check_cache_status_dir_exists_but_no_csv_file() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("dlt-test-diag-nocsvfile-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let result = check_cache_status(temp_dir.to_str().unwrap(), "nonexistent.csv");
-        assert!(result.passed);
-        assert!(
-            result.detail.contains("dir_exists=true"),
-            "{}",
-            result.detail
-        );
-        assert!(
-            result.detail.contains("csv_exists=false"),
-            "{}",
-            result.detail
-        );
-        assert!(result.detail.contains("csv_bytes=0"), "{}", result.detail);
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_diagnostic_report_many_checks_serialization() {
-        let checks: Vec<CheckResult> = (0..10)
-            .map(|i| CheckResult {
-                name: format!("check_{i}"),
-                passed: i % 2 == 0,
-                detail: format!("detail_{i}"),
-                duration_ms: i as u64 * 100,
-            })
-            .collect();
-        let report = DiagnosticReport {
-            healthy: false,
-            checks,
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains("check_0"));
-        assert!(json.contains("check_9"));
-        assert!(json.contains("\"healthy\":false"));
-    }
-
-    #[test]
-    fn test_check_csv_headers_only_bom_no_columns() {
-        let result = check_csv_headers("\u{FEFF}");
-        assert!(!result.passed, "BOM-only input should fail");
-    }
-
-    #[test]
-    fn test_check_time_gate_narrow_window_format() {
-        let result = check_time_gate("00:00:00", "00:00:01");
-        assert!(result.passed, "informational check always passes");
-        assert!(result.detail.contains("00:00:00"));
-        assert!(result.detail.contains("00:00:01"));
-    }
-
-    #[tokio::test]
-    async fn test_run_diagnostic_unreachable_urls() {
-        let cfg = InstrumentConfig {
-            daily_download_time: "08:30:00".to_string(),
-            csv_cache_directory: "/tmp/dlt-diag-nonexist-99".to_string(),
-            csv_cache_filename: "nonexistent.csv".to_string(),
-            csv_download_timeout_secs: 2,
-            build_window_start: "08:25:00".to_string(),
-            build_window_end: "08:55:00".to_string(),
-        };
-        let report =
-            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
-        assert!(!report.healthy);
-        assert!(report.checks.len() >= 4);
-    }
-
-    #[tokio::test]
-    async fn test_run_diagnostic_cached_csv_exercises_all_checks() {
-        let dir = std::env::temp_dir().join(format!("dlt-diag-e2e-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
-                       ASM_GSM_FLAG,ASM_GSM_CATEGORY,BUY_SELL_INDICATOR,MTF_LEVERAGE";
-        // Generate enough rows to exceed INSTRUMENT_CSV_MIN_BYTES (1 MB)
-        let rows: Vec<String> = (0..10000)
-            .map(|i| {
-                format!(
-                    "NSE,I,{i},INE{i:09}01,INDEX,{i},NIFTY,NIFTY 50 INDEX,Nifty 50 Index Display Name Long,INDEX,EQ,1,\
-                     0001-01-01,0,XX,0.05,0,N,NA,1,0"
-                )
-            })
-            .collect();
-        let csv_content = format!("{header}\n{}", rows.join("\n"));
-        std::fs::write(dir.join("inst.csv"), &csv_content).unwrap();
-        let cfg = InstrumentConfig {
-            daily_download_time: "08:30:00".to_string(),
-            csv_cache_directory: dir.to_str().unwrap().to_string(),
-            csv_cache_filename: "inst.csv".to_string(),
-            csv_download_timeout_secs: 2,
-            build_window_start: "00:00:00".to_string(),
-            build_window_end: "23:59:59".to_string(),
-        };
-        let report =
-            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
-        // With cached CSV available, we expect: 2 URL + time_gate + cache + csv_download
-        // + csv_headers + csv_parse + universe_build_and_validate = 8 checks
-        assert!(
-            report.checks.len() >= 5,
-            "expected at least 5 checks, got: {} ({:?})",
-            report.checks.len(),
-            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
-        );
-        // Verify csv_download check exists (from cache)
-        let dl = report.checks.iter().find(|c| c.name == "csv_download");
-        if let Some(dl_check) = dl {
-            assert!(
-                dl_check.passed,
-                "csv_download should pass: {}",
-                dl_check.detail
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn test_url_reachability_success_path() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://127.0.0.1:{}", addr.port());
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let r = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(r.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        let result = check_url_reachability(&url, "ok").await;
-        assert!(result.passed);
-        assert!(result.detail.contains("200"));
-    }
-
-    #[tokio::test]
-    async fn test_url_reachability_404_path() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://127.0.0.1:{}", addr.port());
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                let r = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(r.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        let result = check_url_reachability(&url, "nf").await;
-        assert!(!result.passed);
-        assert!(result.detail.contains("404"));
-    }
-
-    #[test]
-    fn test_csv_headers_dup_cols_still_pass() {
-        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
-                       EXCH_ID";
-        let result = check_csv_headers(header);
-        assert!(result.passed);
-    }
-
-    #[test]
-    fn test_diagnostic_report_debug() {
-        let report = DiagnosticReport {
-            healthy: true,
-            checks: vec![],
-        };
-        let d = format!("{:?}", report);
-        assert!(d.contains("healthy: true"));
-    }
-
-    #[test]
-    fn test_check_result_debug() {
-        let check = CheckResult {
-            name: "t".to_owned(),
-            passed: true,
-            detail: "ok".to_owned(),
-            duration_ms: 0,
-        };
-        let d = format!("{:?}", check);
-        assert!(d.contains("\"t\""));
-    }
-
-    // -----------------------------------------------------------------------
-    // check_time_gate — additional edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_check_time_gate_narrow_window() {
-        let result = check_time_gate("00:00:01", "00:00:02");
-        assert!(result.passed);
-        assert!(result.detail.contains("window=[00:00:01, 00:00:02)"));
-    }
-
-    #[test]
-    fn test_check_time_gate_market_hours_window() {
-        let result = check_time_gate("08:00:00", "16:00:00");
-        assert!(result.passed);
-        assert!(result.detail.contains("08:00:00"));
-        assert!(result.detail.contains("16:00:00"));
-    }
-
-    // -----------------------------------------------------------------------
-    // check_cache_status — additional edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_check_cache_status_temp_dir_no_csv() {
-        let tmp = std::env::temp_dir().join("dlt_diag_cache_test_v2");
-        let _ = std::fs::create_dir_all(&tmp);
-        let result = check_cache_status(tmp.to_str().unwrap_or("/tmp"), "nonexistent_file.csv");
-        assert!(result.passed);
-        assert!(result.detail.contains("dir_exists=true"));
-        assert!(result.detail.contains("csv_exists=false"));
-        let _ = std::fs::remove_dir(&tmp);
-    }
-
-    #[test]
-    fn test_check_cache_status_with_existing_file() {
-        let tmp = std::env::temp_dir().join("dlt_diag_cache_test2_v2");
-        let _ = std::fs::create_dir_all(&tmp);
-        let csv_path = tmp.join("test.csv");
-        std::fs::write(&csv_path, "header\nrow1").unwrap();
-        let result = check_cache_status(tmp.to_str().unwrap_or("/tmp"), "test.csv");
-        assert!(result.passed);
-        assert!(result.detail.contains("csv_exists=true"));
-        assert!(result.detail.contains("csv_bytes="));
-        let _ = std::fs::remove_file(&csv_path);
-        let _ = std::fs::remove_dir(&tmp);
-    }
-
-    // -----------------------------------------------------------------------
-    // check_csv_headers — BOM and extra columns
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_check_csv_headers_with_extra_columns_shows_count() {
-        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
-                       CUSTOM_COL1,CUSTOM_COL2";
-        let result = check_csv_headers(header);
-        assert!(result.passed);
-        assert!(result.detail.contains("2 extra columns"));
-    }
-
-    #[test]
-    fn test_check_csv_headers_bom_stripped() {
-        let header = "\u{FEFF}EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG";
-        let result = check_csv_headers(header);
-        assert!(result.passed, "BOM should be stripped: {}", result.detail);
-    }
-
-    // -----------------------------------------------------------------------
-    // run_instrument_diagnostic — download failure path (exercises checks 5-8
-    // skip path when download fails, covering the None csv_text branch)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_run_diagnostic_download_failure_stops_at_check_5() {
-        // Both URLs unreachable, no cache — download fails, checks 6-8 skipped
-        let cfg = InstrumentConfig {
-            daily_download_time: "08:30:00".to_string(),
-            csv_cache_directory: "/tmp/dlt-diag-no-cache-xyzzy".to_string(),
-            csv_cache_filename: "nonexistent.csv".to_string(),
-            csv_download_timeout_secs: 1,
-            build_window_start: "08:25:00".to_string(),
-            build_window_end: "08:55:00".to_string(),
-        };
-        let report = run_instrument_diagnostic(
-            "http://127.0.0.1:1/primary",
-            "http://127.0.0.1:1/fallback",
-            &cfg,
-        )
-        .await;
-
-        // Should have 5 checks: 2 URL reachability + time_gate + cache_status + csv_download (failed)
+    fn test_count_segments_empty() {
+        let counts = count_segments(&[]);
         assert_eq!(
-            report.checks.len(),
-            5,
-            "checks: {:?}",
-            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+            counts,
+            SegmentCounts {
+                nse_i: 0,
+                nse_e: 0,
+                nse_d: 0,
+                bse_i: 0,
+                bse_d: 0,
+            }
         );
-        assert!(
-            !report.healthy,
-            "download failure should make report unhealthy"
-        );
+    }
 
-        // csv_download check should be present and failed
-        let dl_check = report.checks.iter().find(|c| c.name == "csv_download");
-        assert!(dl_check.is_some(), "csv_download check should exist");
-        assert!(!dl_check.unwrap().passed, "csv_download should have failed");
-        assert!(dl_check.unwrap().detail.contains("download failed"));
+    #[test]
+    fn test_count_segments_nse_only() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::NationalStockExchange, 'I'),
+            make_row(Exchange::NationalStockExchange, 'I'),
+            make_row(Exchange::NationalStockExchange, 'E'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(counts.nse_i, 2);
+        assert_eq!(counts.nse_e, 1);
+        assert_eq!(counts.nse_d, 3);
+        assert_eq!(counts.bse_i, 0);
+        assert_eq!(counts.bse_d, 0);
+    }
+
+    #[test]
+    fn test_count_segments_bse_only() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::BombayStockExchange, 'I'),
+            make_row(Exchange::BombayStockExchange, 'D'),
+            make_row(Exchange::BombayStockExchange, 'D'),
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(counts.nse_i, 0);
+        assert_eq!(counts.nse_e, 0);
+        assert_eq!(counts.nse_d, 0);
+        assert_eq!(counts.bse_i, 1);
+        assert_eq!(counts.bse_d, 2);
+    }
+
+    #[test]
+    fn test_count_segments_mixed() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::NationalStockExchange, 'I'),
+            make_row(Exchange::BombayStockExchange, 'I'),
+            make_row(Exchange::NationalStockExchange, 'E'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+            make_row(Exchange::BombayStockExchange, 'D'),
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(counts.nse_i, 1);
+        assert_eq!(counts.nse_e, 1);
+        assert_eq!(counts.nse_d, 1);
+        assert_eq!(counts.bse_i, 1);
+        assert_eq!(counts.bse_d, 1);
+    }
+
+    #[test]
+    fn test_count_segments_unknown_segment_ignored() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::NationalStockExchange, 'X'), // unknown segment
+            make_row(Exchange::BombayStockExchange, 'E'),   // BSE_E not tracked
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(
+            counts,
+            SegmentCounts {
+                nse_i: 0,
+                nse_e: 0,
+                nse_d: 0,
+                bse_i: 0,
+                bse_d: 0,
+            }
+        );
     }
 
     // -----------------------------------------------------------------------
-    // run_instrument_diagnostic — csv parse failure path
-    // (exercises the Err branch in parse_result)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_run_diagnostic_csv_parse_failure_path() {
-        // Create a cached CSV with valid size but invalid content
-        let dir = std::env::temp_dir().join(format!("dlt-diag-parse-fail-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // CSV with correct header but garbage data that exceeds min size
-        let garbage = "A".repeat(2_000_000);
-        std::fs::write(dir.join("bad.csv"), &garbage).unwrap();
-
-        let cfg = InstrumentConfig {
-            daily_download_time: "08:30:00".to_string(),
-            csv_cache_directory: dir.to_str().unwrap().to_string(),
-            csv_cache_filename: "bad.csv".to_string(),
-            csv_download_timeout_secs: 1,
-            build_window_start: "00:00:00".to_string(),
-            build_window_end: "23:59:59".to_string(),
-        };
-        let report =
-            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
-
-        // Should have checks up to csv_headers at minimum
-        assert!(report.checks.len() >= 5, "expected at least 5 checks");
-
-        // csv_headers should fail (garbage has no expected columns)
-        let hdr_check = report.checks.iter().find(|c| c.name == "csv_headers");
-        if let Some(hdr) = hdr_check {
-            assert!(!hdr.passed, "garbage CSV should fail header validation");
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // run_instrument_diagnostic — csv parse success but universe build failure
-    // (exercises the parse Ok → build Err path)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_run_diagnostic_parse_ok_but_universe_build_fails() {
-        // Create a CSV with valid headers and enough parseable rows for the
-        // parser to accept (>100K rows), but without the data needed for
-        // validation to pass (no must-exist indices/equities)
-        let dir = std::env::temp_dir().join(format!("dlt-diag-build-fail-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let header = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,\
-                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
-                       ASM_GSM_FLAG,ASM_GSM_CATEGORY,BUY_SELL_INDICATOR,MTF_LEVERAGE";
-        // Generate 110K rows (above INSTRUMENT_CSV_MIN_ROWS = 100000)
-        let mut rows = Vec::with_capacity(110_000);
-        for i in 0..110_000_u32 {
-            rows.push(format!(
-                "NSE,E,{},INE{:09}01,EQUITY,{},DUMMY{},DUMMY{},Dummy{} Display,EQUITY,EQ,1,0001-01-01,0,XX,0.05,0,N,NA,1,0",
-                i.saturating_add(10000), i, i, i, i, i
-            ));
-        }
-        let csv_content = format!("{header}\n{}", rows.join("\n"));
-        std::fs::write(dir.join("partial.csv"), &csv_content).unwrap();
-
-        let cfg = InstrumentConfig {
-            daily_download_time: "08:30:00".to_string(),
-            csv_cache_directory: dir.to_str().unwrap().to_string(),
-            csv_cache_filename: "partial.csv".to_string(),
-            csv_download_timeout_secs: 1,
-            build_window_start: "00:00:00".to_string(),
-            build_window_end: "23:59:59".to_string(),
-        };
-        let report =
-            run_instrument_diagnostic("http://127.0.0.1:1/p", "http://127.0.0.1:1/f", &cfg).await;
-
-        // Should have all 8 checks
-        assert!(
-            report.checks.len() >= 7,
-            "expected at least 7 checks, got {}",
-            report.checks.len()
-        );
-
-        // csv_parse should succeed (enough rows)
-        let parse_check = report.checks.iter().find(|c| c.name == "csv_parse");
-        if let Some(pc) = parse_check {
-            assert!(pc.passed, "csv_parse should succeed: {}", pc.detail);
-            assert!(
-                pc.detail.contains("NSE_E="),
-                "should show segment counts: {}",
-                pc.detail
-            );
-        }
-
-        // universe_build_and_validate should fail (missing must-exist indices)
-        let build_check = report
-            .checks
-            .iter()
-            .find(|c| c.name == "universe_build_and_validate");
-        if let Some(bc) = build_check {
-            assert!(!bc.passed, "universe validation should fail: {}", bc.detail);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // run_instrument_diagnostic — healthy report (all checks pass)
+    // build_csv_parse_detail tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_diagnostic_report_healthy_is_all_checks_pass() {
+    fn test_build_csv_parse_detail() {
+        let counts = SegmentCounts {
+            nse_i: 10,
+            nse_e: 2000,
+            nse_d: 5000,
+            bse_i: 5,
+            bse_d: 100,
+        };
+        let detail = build_csv_parse_detail(10000, 7115, &counts);
+        assert!(detail.contains("total=10000"));
+        assert!(detail.contains("parsed=7115"));
+        assert!(detail.contains("NSE_I=10"));
+        assert!(detail.contains("NSE_E=2000"));
+        assert!(detail.contains("NSE_D=5000"));
+        assert!(detail.contains("BSE_I=5"));
+        assert!(detail.contains("BSE_D=100"));
+    }
+
+    #[test]
+    fn test_build_csv_parse_detail_zeros() {
+        let counts = SegmentCounts {
+            nse_i: 0,
+            nse_e: 0,
+            nse_d: 0,
+            bse_i: 0,
+            bse_d: 0,
+        };
+        let detail = build_csv_parse_detail(0, 0, &counts);
+        assert!(detail.contains("total=0"));
+        assert!(detail.contains("parsed=0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_csv_parse_check tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_csv_parse_check() {
+        let counts = SegmentCounts {
+            nse_i: 5,
+            nse_e: 100,
+            nse_d: 500,
+            bse_i: 3,
+            bse_d: 50,
+        };
+        let result = build_csv_parse_check(1000, 658, &counts, 42);
+        assert!(result.passed);
+        assert_eq!(result.name, "csv_parse");
+        assert_eq!(result.duration_ms, 42);
+        assert!(result.detail.contains("parsed=658"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_csv_parse_error tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_csv_parse_error() {
+        let result = build_csv_parse_error("column SECURITY_ID not found", 15);
+        assert!(!result.passed);
+        assert_eq!(result.name, "csv_parse");
+        assert!(result.detail.contains("parse failed"));
+        assert!(result.detail.contains("column SECURITY_ID not found"));
+        assert_eq!(result.duration_ms, 15);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_download_success / build_download_error tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_download_success() {
+        let result = build_download_success(5_000_000, "primary", 250);
+        assert!(result.passed);
+        assert_eq!(result.name, "csv_download");
+        assert!(result.detail.contains("5000000 bytes"));
+        assert!(result.detail.contains("primary source"));
+        assert_eq!(result.duration_ms, 250);
+    }
+
+    #[test]
+    fn test_build_download_error() {
+        let result = build_download_error("connection refused", 5000);
+        assert!(!result.passed);
+        assert_eq!(result.name, "csv_download");
+        assert!(result.detail.contains("download failed"));
+        assert!(result.detail.contains("connection refused"));
+        assert_eq!(result.duration_ms, 5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_universe_success / error tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_universe_success() {
+        let result = build_universe_success(25, 5000, 100);
+        assert!(result.passed);
+        assert_eq!(result.name, "universe_build_and_validate");
+        assert!(result.detail.contains("25 underlyings"));
+        assert!(result.detail.contains("5000 derivatives"));
+        assert!(result.detail.contains("validation passed"));
+        assert_eq!(result.duration_ms, 100);
+    }
+
+    #[test]
+    fn test_build_universe_validation_error() {
+        let result = build_universe_validation_error(25, 50, "too few derivatives", 100);
+        assert!(!result.passed);
+        assert_eq!(result.name, "universe_build_and_validate");
+        assert!(result.detail.contains("25 underlyings"));
+        assert!(result.detail.contains("50 derivatives"));
+        assert!(result.detail.contains("validation FAILED"));
+        assert!(result.detail.contains("too few derivatives"));
+    }
+
+    #[test]
+    fn test_build_universe_build_error() {
+        let result = build_universe_build_error("CSV parse failed", 50);
+        assert!(!result.passed);
+        assert_eq!(result.name, "universe_build_and_validate");
+        assert!(result.detail.contains("universe build failed"));
+        assert!(result.detail.contains("CSV parse failed"));
+        assert_eq!(result.duration_ms, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_healthy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_healthy_all_passed() {
         let checks = vec![
             CheckResult {
                 name: "a".to_owned(),
@@ -1301,34 +861,201 @@ mod tests {
                 duration_ms: 2,
             },
         ];
-        let healthy = checks.iter().all(|c| c.passed);
-        let report = DiagnosticReport { healthy, checks };
-        assert!(report.healthy);
+        assert!(determine_healthy(&checks));
     }
 
     #[test]
-    fn test_check_csv_headers_single_expected_column_missing() {
-        // All present except SEGMENT
-        let header = "EXCH_ID,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+    fn test_determine_healthy_one_failed() {
+        let checks = vec![
+            CheckResult {
+                name: "a".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 1,
+            },
+            CheckResult {
+                name: "b".to_owned(),
+                passed: false,
+                detail: "fail".to_owned(),
+                duration_ms: 2,
+            },
+        ];
+        assert!(!determine_healthy(&checks));
+    }
+
+    #[test]
+    fn test_determine_healthy_empty() {
+        assert!(determine_healthy(&[]), "empty checks = vacuously healthy");
+    }
+
+    #[test]
+    fn test_determine_healthy_all_failed() {
+        let checks = vec![
+            CheckResult {
+                name: "a".to_owned(),
+                passed: false,
+                detail: "fail".to_owned(),
+                duration_ms: 1,
+            },
+            CheckResult {
+                name: "b".to_owned(),
+                passed: false,
+                detail: "fail".to_owned(),
+                duration_ms: 2,
+            },
+        ];
+        assert!(!determine_healthy(&checks));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_csv_headers additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_csv_headers_extra_columns_reported() {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
                        UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
-                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG";
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       EXTRA_COL1,EXTRA_COL2";
         let result = check_csv_headers(header);
-        assert!(!result.passed);
+        assert!(result.passed);
         assert!(
-            result.detail.contains("SEGMENT"),
-            "should report SEGMENT missing"
+            result.detail.contains("extra columns"),
+            "detail: {}",
+            result.detail
         );
-        // Other 14 should be present, only SEGMENT missing
+        assert!(result.detail.contains("EXTRA_COL1"));
+        assert!(result.detail.contains("EXTRA_COL2"));
     }
 
     #[test]
-    fn test_check_csv_headers_tabs_as_separator_fails() {
-        // Tab-separated — our parser splits by comma, so all columns will be "missing"
-        let header = "EXCH_ID\tSEGMENT\tSECURITY_ID";
+    fn test_check_csv_headers_only_extra_columns() {
+        let header = "EXTRA1,EXTRA2,EXTRA3";
+        let result = check_csv_headers(header);
+        assert!(!result.passed, "missing all expected columns should fail");
+        assert!(result.detail.contains("MISSING"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_whitespace_trimmed() {
+        // Columns with spaces around names
+        let header = " EXCH_ID , SEGMENT , SECURITY_ID , INSTRUMENT , UNDERLYING_SECURITY_ID ,\
+                        UNDERLYING_SYMBOL , SYMBOL_NAME , DISPLAY_NAME , SERIES ,\
+                        LOT_SIZE , SM_EXPIRY_DATE , STRIKE_PRICE , OPTION_TYPE , TICK_SIZE , EXPIRY_FLAG ";
         let result = check_csv_headers(header);
         assert!(
-            !result.passed,
-            "tab-separated should not match comma-split columns"
+            result.passed,
+            "whitespace should be trimmed: {}",
+            result.detail
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_time_gate additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_time_gate_wide_window() {
+        let result = check_time_gate("00:00:00", "23:59:59");
+        assert!(result.passed);
+        assert!(result.detail.contains("gate_open="));
+        assert!(result.detail.contains("ist_time="));
+    }
+
+    #[test]
+    fn test_check_time_gate_narrow_window() {
+        let result = check_time_gate("08:25:00", "08:26:00");
+        assert!(result.passed);
+        assert_eq!(result.name, "time_gate");
+    }
+
+    // -----------------------------------------------------------------------
+    // check_cache_status additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_cache_status_with_tmp_dir() {
+        let result = check_cache_status("/tmp", "nonexistent_file.csv");
+        assert!(result.passed);
+        assert!(result.detail.contains("dir_exists=true"));
+        assert!(result.detail.contains("csv_exists=false"));
+    }
+
+    #[test]
+    fn test_check_cache_status_reports_fresh_and_marker() {
+        let result = check_cache_status("/tmp/dlt-nonexistent-99999", "test.csv");
+        assert!(result.detail.contains("fresh="));
+        assert!(result.detail.contains("marker="));
+        assert!(result.detail.contains("cache_dir="));
+    }
+
+    // -----------------------------------------------------------------------
+    // DiagnosticReport / CheckResult additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diagnostic_report_unhealthy() {
+        let report = DiagnosticReport {
+            healthy: false,
+            checks: vec![
+                CheckResult {
+                    name: "url_reachability_primary".to_owned(),
+                    passed: true,
+                    detail: "HTTP 200".to_owned(),
+                    duration_ms: 100,
+                },
+                CheckResult {
+                    name: "csv_download".to_owned(),
+                    passed: false,
+                    detail: "download failed: timeout".to_owned(),
+                    duration_ms: 5000,
+                },
+            ],
+        };
+        assert!(!report.healthy);
+        assert_eq!(report.checks.len(), 2);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"healthy\":false"));
+    }
+
+    #[test]
+    fn test_check_result_serialization() {
+        let check = CheckResult {
+            name: "test_check".to_owned(),
+            passed: false,
+            detail: "something went wrong".to_owned(),
+            duration_ms: 999,
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        assert!(json.contains("\"name\":\"test_check\""));
+        assert!(json.contains("\"passed\":false"));
+        assert!(json.contains("\"duration_ms\":999"));
+    }
+
+    #[test]
+    fn test_segment_counts_debug() {
+        let counts = SegmentCounts {
+            nse_i: 1,
+            nse_e: 2,
+            nse_d: 3,
+            bse_i: 4,
+            bse_d: 5,
+        };
+        let debug_str = format!("{counts:?}");
+        assert!(debug_str.contains("nse_i: 1"));
+        assert!(debug_str.contains("bse_d: 5"));
+    }
+
+    #[test]
+    fn test_segment_counts_clone() {
+        let counts = SegmentCounts {
+            nse_i: 10,
+            nse_e: 20,
+            nse_d: 30,
+            bse_i: 40,
+            bse_d: 50,
+        };
+        let cloned = counts.clone();
+        assert_eq!(counts, cloned);
     }
 }

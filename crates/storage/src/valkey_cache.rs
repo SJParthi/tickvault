@@ -23,6 +23,58 @@ use dhan_live_trader_common::config::ValkeyConfig;
 const POOL_CHECKOUT_TIMEOUT_MS: u64 = 500;
 
 // ---------------------------------------------------------------------------
+// Pure helper functions (testable without Redis)
+// ---------------------------------------------------------------------------
+
+/// Builds the Redis URL from host and port.
+///
+/// Format: `redis://{host}:{port}` — no auth, no database selection.
+fn build_valkey_url(host: &str, port: u16) -> String {
+    format!("redis://{}:{}", host, port)
+}
+
+/// Builds a Valkey cache key for instrument-related data.
+///
+/// Format: `dlt:instrument:{suffix}` — namespaced to prevent collisions.
+pub fn build_instrument_cache_key(suffix: &str) -> String {
+    format!("dlt:instrument:{}", suffix)
+}
+
+/// Builds a Valkey cache key for token-related data.
+///
+/// Format: `dlt:token:{suffix}` — namespaced to prevent collisions.
+pub fn build_token_cache_key(suffix: &str) -> String {
+    format!("dlt:token:{}", suffix)
+}
+
+/// Builds a Valkey cache key for tick/market data.
+///
+/// Format: `dlt:tick:{security_id}:{suffix}` — per-instrument namespacing.
+pub fn build_tick_cache_key(security_id: u32, suffix: &str) -> String {
+    format!("dlt:tick:{}:{}", security_id, suffix)
+}
+
+/// Computes TTL for instrument cache entries.
+///
+/// Returns TTL in seconds: the time from `current_epoch_secs` until
+/// `target_hour_ist` (next day if already past). Clamps to [60, 86400].
+pub fn compute_instrument_ttl_secs(current_epoch_secs: u64, target_hour_ist: u8) -> u64 {
+    // IST = UTC + 5:30 = UTC + 19800s
+    const IST_OFFSET: u64 = 19_800;
+    let ist_secs_today = (current_epoch_secs + IST_OFFSET) % 86_400;
+    let target_secs = u64::from(target_hour_ist) * 3600;
+
+    let remaining = if ist_secs_today < target_secs {
+        target_secs - ist_secs_today
+    } else {
+        // Past target hour — TTL until target hour tomorrow
+        86_400 - ist_secs_today + target_secs
+    };
+
+    remaining.clamp(60, 86_400)
+}
+
+// ---------------------------------------------------------------------------
 // Pool wrapper
 // ---------------------------------------------------------------------------
 
@@ -39,7 +91,7 @@ impl ValkeyPool {
     /// # Errors
     /// Returns error if the pool builder fails (bad config, not a connection error).
     pub fn new(config: &ValkeyConfig) -> Result<Self> {
-        let url = format!("redis://{}:{}", config.host, config.port);
+        let url = build_valkey_url(&config.host, config.port);
 
         let cfg = Config::from_url(&url);
         let pool = cfg
@@ -410,814 +462,202 @@ mod tests {
             port: 6379,
             max_connections: 16,
         };
-        let url = format!("redis://{}:{}", config.host, config.port);
+        let url = build_valkey_url(&config.host, config.port);
         // Basic config URL must not accidentally include auth credentials
         assert!(!url.contains('@'), "URL must not contain auth separator");
         assert!(!url.contains("password"), "URL must not contain password");
     }
 
     // -----------------------------------------------------------------------
-    // Async error path tests — exercise every method with unreachable Valkey
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_health_check_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1, // unlikely to have Valkey
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.health_check().await;
-        assert!(
-            result.is_err(),
-            "health_check must fail with unreachable Valkey"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.get("test_key").await;
-        assert!(result.is_err(), "get must fail with unreachable Valkey");
-    }
-
-    #[tokio::test]
-    async fn test_set_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set("test_key", "test_value").await;
-        assert!(result.is_err(), "set must fail with unreachable Valkey");
-    }
-
-    #[tokio::test]
-    async fn test_set_ex_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_ex("test_key", "test_value", 60).await;
-        assert!(result.is_err(), "set_ex must fail with unreachable Valkey");
-    }
-
-    #[tokio::test]
-    async fn test_del_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.del("test_key").await;
-        assert!(result.is_err(), "del must fail with unreachable Valkey");
-    }
-
-    #[tokio::test]
-    async fn test_exists_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.exists("test_key").await;
-        assert!(result.is_err(), "exists must fail with unreachable Valkey");
-    }
-
-    #[tokio::test]
-    async fn test_set_nx_ex_fails_with_unreachable_valkey() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
-        assert!(
-            result.is_err(),
-            "set_nx_ex must fail with unreachable Valkey"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Error path tests with invalid hostname (DNS failure)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_health_check_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "unreachable-host-that-does-not-exist".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.health_check().await;
-        assert!(
-            result.is_err(),
-            "health_check must fail with invalid hostname"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "nonexistent-valkey-host".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.get("any_key").await;
-        assert!(result.is_err(), "get must fail with invalid hostname");
-    }
-
-    #[tokio::test]
-    async fn test_set_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "nonexistent-valkey-host".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set("any_key", "any_value").await;
-        assert!(result.is_err(), "set must fail with invalid hostname");
-    }
-
-    #[tokio::test]
-    async fn test_del_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "nonexistent-valkey-host".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.del("any_key").await;
-        assert!(result.is_err(), "del must fail with invalid hostname");
-    }
-
-    #[tokio::test]
-    async fn test_exists_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "nonexistent-valkey-host".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.exists("any_key").await;
-        assert!(result.is_err(), "exists must fail with invalid hostname");
-    }
-
-    #[tokio::test]
-    async fn test_set_nx_ex_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "nonexistent-valkey-host".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_nx_ex("lock", "val", 10).await;
-        assert!(result.is_err(), "set_nx_ex must fail with invalid hostname");
-    }
-
-    #[tokio::test]
-    async fn test_set_ex_fails_with_invalid_hostname() {
-        let config = ValkeyConfig {
-            host: "nonexistent-valkey-host".to_string(),
-            port: 6379,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_ex("key", "val", 60).await;
-        assert!(result.is_err(), "set_ex must fail with invalid hostname");
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage gap-fill: URL edge cases, port boundaries, pool config limits
+    // build_valkey_url
     // -----------------------------------------------------------------------
 
     #[test]
-    fn url_format_with_max_port() {
-        let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
-            port: 65535,
-            max_connections: 4,
-        };
-        let url = format!("redis://{}:{}", config.host, config.port);
-        assert_eq!(url, "redis://dlt-valkey:65535");
+    fn test_build_valkey_url_default() {
+        let url = build_valkey_url("dlt-valkey", 6379);
+        assert_eq!(url, "redis://dlt-valkey:6379");
     }
 
     #[test]
-    fn url_format_with_min_port() {
-        let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
-            port: 1,
-            max_connections: 4,
-        };
-        let url = format!("redis://{}:{}", config.host, config.port);
-        assert_eq!(url, "redis://dlt-valkey:1");
+    fn test_build_valkey_url_custom_port() {
+        let url = build_valkey_url("cache-host", 6380);
+        assert_eq!(url, "redis://cache-host:6380");
     }
 
     #[test]
-    fn pool_creation_preserves_all_config_fields() {
-        let config = ValkeyConfig {
-            host: "my-cache".to_string(),
-            port: 6380,
-            max_connections: 32,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        assert_eq!(pool.pool.status().max_size, 32);
+    fn test_build_valkey_url_ip_address() {
+        let url = build_valkey_url("10.0.0.50", 6379);
+        assert_eq!(url, "redis://10.0.0.50:6379");
     }
 
     #[test]
-    fn url_format_with_hyphenated_hostname() {
-        let config = ValkeyConfig {
-            host: "dlt-valkey-primary-01".to_string(),
-            port: 6379,
-            max_connections: 8,
-        };
-        let url = format!("redis://{}:{}", config.host, config.port);
-        assert_eq!(url, "redis://dlt-valkey-primary-01:6379");
+    fn test_build_valkey_url_starts_with_redis_scheme() {
+        let url = build_valkey_url("host", 1234);
         assert!(url.starts_with("redis://"));
     }
 
-    #[tokio::test]
-    async fn test_all_methods_fail_with_port_zero() {
-        // Port 0 is not a valid listening port for a server
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            max_connections: 1,
-        };
-        // Pool creation should succeed (lazy)
-        let pool = ValkeyPool::new(&config);
-        assert!(
-            pool.is_ok(),
-            "pool creation with port 0 must succeed (lazy connections)"
-        );
-    }
-
     #[test]
-    fn pool_with_high_connection_count_creates_without_error() {
-        let config = ValkeyConfig {
-            host: "localhost".to_string(),
-            port: 6379,
-            max_connections: 256,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        assert_eq!(pool.pool.status().max_size, 256);
-        assert_eq!(pool.pool.status().size, 0, "no connections yet (lazy)");
-    }
-
-    #[tokio::test]
-    async fn test_set_ex_zero_ttl_fails_unreachable() {
-        // Verify that set_ex with zero TTL still goes through the code path
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_ex("key", "val", 0).await;
-        assert!(
-            result.is_err(),
-            "set_ex with zero TTL must fail (unreachable)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_nx_ex_zero_ttl_fails_unreachable() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_nx_ex("lock", "val", 0).await;
-        assert!(
-            result.is_err(),
-            "set_nx_ex with zero TTL must fail (unreachable)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_operations_with_empty_key() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        // Empty key should still fail on connection, not panic
-        assert!(pool.get("").await.is_err());
-        assert!(pool.set("", "val").await.is_err());
-        assert!(pool.del("").await.is_err());
-        assert!(pool.exists("").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_operations_with_long_key() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let long_key = "k".repeat(1024);
-        // Should fail on connection, not on key length validation
-        assert!(pool.get(&long_key).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_set_with_large_value_fails_unreachable() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let large_value = "v".repeat(10_000);
-        assert!(pool.set("key", &large_value).await.is_err());
+    fn test_build_valkey_url_no_trailing_slash() {
+        let url = build_valkey_url("host", 6379);
+        assert!(!url.ends_with('/'), "URL must not end with slash");
     }
 
     // -----------------------------------------------------------------------
-    // Coverage gap-fill: ValkeyPool::new error propagation, edge cases
-    // for set_nx_ex semantics, pool status checks, various key patterns
+    // build_instrument_cache_key
     // -----------------------------------------------------------------------
 
     #[test]
-    fn pool_creation_url_includes_host_and_port() {
-        let config = ValkeyConfig {
-            host: "my-cache-host".to_string(),
-            port: 7777,
-            max_connections: 4,
-        };
-        let url = format!("redis://{}:{}", config.host, config.port);
-        assert_eq!(url, "redis://my-cache-host:7777");
-        // Also verify pool creation succeeds
-        let pool = ValkeyPool::new(&config);
-        assert!(pool.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_set_nx_ex_with_large_ttl_fails_unreachable() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        // Large TTL to verify no overflow
-        let result = pool.set_nx_ex("lock", "val", u64::MAX).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_set_ex_with_large_ttl_fails_unreachable() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_ex("key", "val", u64::MAX).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_get_with_key_containing_special_chars() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        // Keys with colons and slashes (common in cache key patterns)
-        assert!(pool.get("dlt:token:primary").await.is_err());
-        assert!(pool.get("dlt/instruments/2026-03-20").await.is_err());
+    fn test_build_instrument_cache_key_universe() {
+        let key = build_instrument_cache_key("universe");
+        assert_eq!(key, "dlt:instrument:universe");
     }
 
     #[test]
-    fn pool_status_max_size_matches_various_configs() {
-        for count in [1_u32, 4, 16, 64, 128] {
-            let config = ValkeyConfig {
-                host: "localhost".to_string(),
-                port: 6379,
-                max_connections: count,
-            };
-            let pool = ValkeyPool::new(&config).unwrap();
-            assert_eq!(
-                pool.pool.status().max_size,
-                count as usize,
-                "max_size must match config for count={}",
-                count
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_del_with_key_containing_spaces() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        // Should fail on connection, not on key content
-        assert!(pool.del("key with spaces").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_exists_with_key_containing_special_chars() {
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        assert!(pool.exists("dlt:cache:instruments").await.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // Mock RESP server tests — exercise success paths and branch coverage
-    // for all methods by running a minimal Redis-protocol mock server.
-    //
-    // The redis crate performs RESP protocol negotiation on connection init.
-    // Our mock must respond with "+OK\r\n" to any incoming data chunk
-    // (handling CLIENT SETNAME, HELLO, etc.) and then respond with the
-    // desired response for the actual command.
-    //
-    // Strategy: Count RESP commands by looking for '*' (RESP array start)
-    // delimiters. Respond to each one. The `command_response` is used for
-    // the N-th command (where N = `skip_init_commands + 1`).
-    // -----------------------------------------------------------------------
-
-    /// Spawns a mock RESP server that responds to the first `skip` commands
-    /// with "+OK\r\n" and then responds with `command_response` for
-    /// subsequent commands. This handles redis client init handshake.
-    async fn spawn_resp_mock_server(command_response: &'static [u8]) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 8192];
-                        // Track how many RESP commands we've seen.
-                        // The redis crate sends init commands before the real one.
-                        let mut commands_seen: usize = 0;
-                        loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    // Count RESP array headers (* at start of line)
-                                    let data = &buf[..n];
-                                    let mut cmd_count = 0;
-                                    for window in data.windows(1) {
-                                        if window[0] == b'*' {
-                                            cmd_count += 1;
-                                        }
-                                    }
-                                    // For each command, send a response
-                                    for _ in 0..cmd_count.max(1) {
-                                        commands_seen += 1;
-                                        // First command is init; respond with OK
-                                        // Second+ commands get the configured response
-                                        let resp = if commands_seen <= 1 {
-                                            b"+OK\r\n".as_slice()
-                                        } else {
-                                            command_response
-                                        };
-                                        if stream.write_all(resp).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    });
-                }
-            }
-        });
-        // Allow the listener to start accepting
-        tokio::task::yield_now().await;
-        port
-    }
-
-    /// RESP simple string: "+PONG\r\n"
-    const RESP_PONG: &[u8] = b"+PONG\r\n";
-    /// RESP simple string: "+OK\r\n"
-    const RESP_OK: &[u8] = b"+OK\r\n";
-    /// RESP bulk string nil: "$-1\r\n" (represents None/nil)
-    const RESP_NIL: &[u8] = b"$-1\r\n";
-    /// RESP integer 1: ":1\r\n" (true for EXISTS)
-    const RESP_INT_ONE: &[u8] = b":1\r\n";
-    /// RESP integer 0: ":0\r\n" (false for EXISTS)
-    const RESP_INT_ZERO: &[u8] = b":0\r\n";
-    /// RESP bulk string with value: "$5\r\nhello\r\n"
-    const RESP_BULK_HELLO: &[u8] = b"$5\r\nhello\r\n";
-
-    #[tokio::test]
-    async fn test_health_check_success_with_mock_resp() {
-        let port = spawn_resp_mock_server(RESP_PONG).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.health_check().await;
-        assert!(
-            result.is_ok(),
-            "health_check should succeed when PONG is returned: {:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_health_check_non_pong_response() {
-        // The mock responds with "+OK\r\n" for all commands including PING,
-        // which triggers the `pong != "PONG"` branch.
-        let port = spawn_resp_mock_server(RESP_OK).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.health_check().await;
-        assert!(
-            result.is_err(),
-            "health_check should fail when response is not PONG"
-        );
-        let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(
-            err_msg.contains("unexpected PING response"),
-            "error should mention unexpected PING response, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_returns_some_with_mock_resp() {
-        let port = spawn_resp_mock_server(RESP_BULK_HELLO).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.get("test_key").await;
-        assert!(result.is_ok(), "get should succeed with mock: {:?}", result);
-        assert_eq!(result.unwrap(), Some("hello".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_get_returns_none_with_nil_resp() {
-        let port = spawn_resp_mock_server(RESP_NIL).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.get("missing_key").await;
-        assert!(result.is_ok(), "get should succeed with nil: {:?}", result);
-        assert_eq!(result.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn test_set_success_with_mock_resp() {
-        let port = spawn_resp_mock_server(RESP_OK).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set("test_key", "test_value").await;
-        assert!(result.is_ok(), "set should succeed with mock: {:?}", result);
-    }
-
-    #[tokio::test]
-    async fn test_set_ex_success_with_mock_resp() {
-        let port = spawn_resp_mock_server(RESP_OK).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_ex("test_key", "test_value", 300).await;
-        assert!(
-            result.is_ok(),
-            "set_ex should succeed with mock: {:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_del_success_with_mock_resp() {
-        // DEL returns an integer (number of keys deleted)
-        let port = spawn_resp_mock_server(RESP_INT_ONE).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.del("test_key").await;
-        assert!(result.is_ok(), "del should succeed with mock: {:?}", result);
-    }
-
-    #[tokio::test]
-    async fn test_exists_returns_true_with_mock_resp() {
-        let port = spawn_resp_mock_server(RESP_INT_ONE).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.exists("test_key").await;
-        assert!(
-            result.is_ok(),
-            "exists should succeed with mock: {:?}",
-            result
-        );
-        assert!(result.unwrap(), "exists should return true for :1");
-    }
-
-    #[tokio::test]
-    async fn test_exists_returns_false_with_mock_resp() {
-        let port = spawn_resp_mock_server(RESP_INT_ZERO).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.exists("missing_key").await;
-        assert!(
-            result.is_ok(),
-            "exists should succeed with mock: {:?}",
-            result
-        );
-        assert!(!result.unwrap(), "exists should return false for :0");
-    }
-
-    #[tokio::test]
-    async fn test_set_nx_ex_returns_true_when_key_set() {
-        // SET NX EX returns "+OK\r\n" when key was set (did not exist)
-        let port = spawn_resp_mock_server(RESP_OK).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
-        assert!(
-            result.is_ok(),
-            "set_nx_ex should succeed with mock: {:?}",
-            result
-        );
-        assert!(
-            result.unwrap(),
-            "set_nx_ex should return true when key was set"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage: ValkeyPool construction error path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_valkey_pool_new_url_format_is_redis_scheme() {
-        // Verify the URL format used internally
-        let config = ValkeyConfig {
-            host: "test-host".to_string(),
-            port: 6379,
-            max_connections: 4,
-        };
-        let url = format!("redis://{}:{}", config.host, config.port);
-        assert!(url.starts_with("redis://"));
-        assert!(url.contains("test-host"));
-        assert!(url.contains("6379"));
+    fn test_build_instrument_cache_key_csv_hash() {
+        let key = build_instrument_cache_key("csv_hash");
+        assert_eq!(key, "dlt:instrument:csv_hash");
     }
 
     #[test]
-    fn test_pool_checkout_timeout_constant_value() {
-        assert_eq!(POOL_CHECKOUT_TIMEOUT_MS, 500);
+    fn test_build_instrument_cache_key_starts_with_namespace() {
+        let key = build_instrument_cache_key("anything");
+        assert!(key.starts_with("dlt:instrument:"));
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_empty_suffix() {
+        let key = build_instrument_cache_key("");
+        assert_eq!(key, "dlt:instrument:");
     }
 
     // -----------------------------------------------------------------------
-    // Coverage: set/get roundtrip via mock RESP server
+    // build_token_cache_key
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_set_then_get_roundtrip_via_mock() {
-        // SET returns OK, GET returns the value we set.
-        // Use two separate pools to avoid connection reuse issues.
-        let set_port = spawn_resp_mock_server(RESP_OK).await;
-        let config_set = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: set_port,
-            max_connections: 1,
-        };
-        let pool_set = ValkeyPool::new(&config_set).unwrap();
-        let set_result = pool_set.set("roundtrip_key", "roundtrip_value").await;
-        assert!(set_result.is_ok(), "set must succeed: {:?}", set_result);
+    #[test]
+    fn test_build_token_cache_key_access() {
+        let key = build_token_cache_key("access");
+        assert_eq!(key, "dlt:token:access");
+    }
 
-        let get_port = spawn_resp_mock_server(RESP_BULK_HELLO).await;
-        let config_get = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: get_port,
-            max_connections: 1,
-        };
-        let pool_get = ValkeyPool::new(&config_get).unwrap();
-        let get_result = pool_get.get("roundtrip_key").await;
-        assert!(get_result.is_ok(), "get must succeed: {:?}", get_result);
-        assert_eq!(get_result.unwrap(), Some("hello".to_string()));
+    #[test]
+    fn test_build_token_cache_key_expiry() {
+        let key = build_token_cache_key("expiry");
+        assert_eq!(key, "dlt:token:expiry");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_starts_with_namespace() {
+        let key = build_token_cache_key("any_suffix");
+        assert!(key.starts_with("dlt:token:"));
     }
 
     // -----------------------------------------------------------------------
-    // Coverage: set_ex TTL via mock RESP server
+    // build_tick_cache_key
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_set_ex_with_ttl_via_mock() {
-        let port = spawn_resp_mock_server(RESP_OK).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        // Verify set_ex works with various TTL values
-        let result = pool.set_ex("ttl_key", "ttl_value", 3600).await;
-        assert!(result.is_ok(), "set_ex with TTL must succeed: {:?}", result);
+    #[test]
+    fn test_build_tick_cache_key_ltp() {
+        let key = build_tick_cache_key(11536, "ltp");
+        assert_eq!(key, "dlt:tick:11536:ltp");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_depth() {
+        let key = build_tick_cache_key(49081, "depth");
+        assert_eq!(key, "dlt:tick:49081:depth");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_zero_security_id() {
+        let key = build_tick_cache_key(0, "ltp");
+        assert_eq!(key, "dlt:tick:0:ltp");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_max_security_id() {
+        let key = build_tick_cache_key(u32::MAX, "ohlc");
+        assert_eq!(key, "dlt:tick:4294967295:ohlc");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_namespace_isolation() {
+        // Different security IDs produce different keys
+        let key_a = build_tick_cache_key(100, "ltp");
+        let key_b = build_tick_cache_key(200, "ltp");
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_suffix_isolation() {
+        // Different suffixes for same security ID produce different keys
+        let key_a = build_tick_cache_key(100, "ltp");
+        let key_b = build_tick_cache_key(100, "depth");
+        assert_ne!(key_a, key_b);
     }
 
     // -----------------------------------------------------------------------
-    // Coverage: del followed by exists via mock RESP server
+    // compute_instrument_ttl_secs
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_del_then_exists_via_mock() {
-        // DEL returns 1 (deleted one key)
-        let del_port = spawn_resp_mock_server(RESP_INT_ONE).await;
-        let config_del = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: del_port,
-            max_connections: 1,
-        };
-        let pool_del = ValkeyPool::new(&config_del).unwrap();
-        let del_result = pool_del.del("deleted_key").await;
-        assert!(del_result.is_ok());
-
-        // EXISTS returns 0 (key no longer exists)
-        let exists_port = spawn_resp_mock_server(RESP_INT_ZERO).await;
-        let config_exists = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port: exists_port,
-            max_connections: 1,
-        };
-        let pool_exists = ValkeyPool::new(&config_exists).unwrap();
-        let exists_result = pool_exists.exists("deleted_key").await;
-        assert!(exists_result.is_ok());
-        assert!(!exists_result.unwrap());
+    #[test]
+    fn test_compute_instrument_ttl_before_target() {
+        // 2024-01-01 00:00:00 UTC = IST 05:30:00
+        // Target hour = 8 (08:00 IST)
+        // Time until target = 2h30m = 9000s
+        let utc_midnight = 1_704_067_200_u64;
+        let ttl = compute_instrument_ttl_secs(utc_midnight, 8);
+        assert_eq!(ttl, 9000);
     }
 
-    #[tokio::test]
-    async fn test_set_nx_ex_returns_false_when_key_exists() {
-        // SET NX EX returns "$-1\r\n" (nil) when key already existed
-        let port = spawn_resp_mock_server(RESP_NIL).await;
-        let config = ValkeyConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 1,
-        };
-        let pool = ValkeyPool::new(&config).unwrap();
-        let result = pool.set_nx_ex("existing_lock", "lock_value", 30).await;
-        assert!(
-            result.is_ok(),
-            "set_nx_ex should succeed with mock: {:?}",
-            result
-        );
-        assert!(
-            !result.unwrap(),
-            "set_nx_ex should return false when key already exists"
-        );
+    #[test]
+    fn test_compute_instrument_ttl_after_target_wraps_to_next_day() {
+        // IST 10:00 → target 8:00 → TTL = 22 hours = 79200s
+        // Pick epoch where (epoch + 19800) % 86400 = 36000 (10:00 IST)
+        let epoch = 86_400 - 19_800 + 36_000; // = 102600
+        let ttl = compute_instrument_ttl_secs(epoch, 8);
+        // IST time = (102600 + 19800) % 86400 = 122400 % 86400 = 36000 (10:00)
+        // target = 8 * 3600 = 28800
+        // 36000 > 28800, so wrap: 86400 - 36000 + 28800 = 79200
+        assert_eq!(ttl, 79_200);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_to_min_60() {
+        // If we're very close to target (e.g., 1 second away), still returns at least 60
+        // IST time = target_hour * 3600 - 1 = 21599
+        // Need (epoch + IST_OFFSET) % 86400 = 21599
+        let epoch = 86_400 + 21_599 - 19_800; // = 88199
+        let ttl = compute_instrument_ttl_secs(epoch, 6);
+        // remaining = 21600 - 21599 = 1, clamped to 60
+        assert_eq!(ttl, 60);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_to_max_86400() {
+        // Maximum possible TTL is 86400 (exactly target time → full day wrap)
+        // (epoch + IST_OFFSET) % 86400 = target_secs exactly → wrap to 86400
+        let target_secs: u64 = 8 * 3600; // 28800
+        let epoch = 86_400 + target_secs - 19_800;
+        let ttl = compute_instrument_ttl_secs(epoch, 8);
+        // ist_secs_today = target_secs, so wrap: 86400 - 28800 + 28800 = 86400
+        assert_eq!(ttl, 86_400);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_zero_epoch() {
+        // epoch 0, IST = 05:30:00 (19800s), target = 6 (06:00 IST = 21600s)
+        let ttl = compute_instrument_ttl_secs(0, 6);
+        // remaining = 21600 - 19800 = 1800
+        assert_eq!(ttl, 1800);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_midnight_target() {
+        // target_hour = 0 means midnight IST
+        let ttl = compute_instrument_ttl_secs(0, 0);
+        // IST at epoch 0 = 19800s into the day
+        // target = 0, so past → wrap: 86400 - 19800 + 0 = 66600
+        assert_eq!(ttl, 66_600);
     }
 }

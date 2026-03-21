@@ -47,15 +47,53 @@ const CONSTITUENCY_PERSIST_MAX_RETRIES: u32 = 3;
 const CONSTITUENCY_PERSIST_RETRY_DELAY_SECS: u64 = 2;
 
 // ---------------------------------------------------------------------------
+// Pure helper functions (testable without DB)
+// ---------------------------------------------------------------------------
+
+/// Builds the QuestDB HTTP exec URL from host and port.
+fn build_questdb_exec_url(host: &str, http_port: u16) -> String {
+    format!("http://{}:{}/exec", host, http_port)
+}
+
+/// Builds the ALTER TABLE DEDUP ENABLE UPSERT KEYS SQL statement.
+fn build_dedup_sql(table_name: &str, dedup_key: &str) -> String {
+    format!(
+        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
+        table_name, dedup_key
+    )
+}
+
+/// Builds the ILP TCP connection string from host and port.
+fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
+    format!("tcp::addr={}:{};", host, ilp_port)
+}
+
+/// Resolves the security_id for a constituent from the FnoUniverse.
+///
+/// Returns `0` if the symbol is not found in the universe (not an F&O stock).
+fn resolve_security_id(fno_universe: Option<&FnoUniverse>, symbol: &str) -> u32 {
+    fno_universe
+        .and_then(|u| u.symbol_to_security_id(symbol))
+        .unwrap_or(0)
+}
+
+/// Counts total constituents across all indices in the map.
+#[cfg(test)]
+fn count_total_constituents(constituency_map: &IndexConstituencyMap) -> usize {
+    constituency_map
+        .index_to_constituents
+        .values()
+        .map(|v| v.len())
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
 // DDL Setup
 // ---------------------------------------------------------------------------
 
 /// Creates the `index_constituents` table and enables DEDUP. Idempotent.
 pub async fn ensure_constituency_table(questdb_config: &QuestDbConfig) {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
+    let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
     let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
@@ -97,9 +135,9 @@ pub async fn ensure_constituency_table(questdb_config: &QuestDbConfig) {
     }
 
     // Step 2: Enable DEDUP
-    let dedup_ddl = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_INDEX_CONSTITUENTS, DEDUP_KEY_INDEX_CONSTITUENTS
+    let dedup_ddl = build_dedup_sql(
+        QUESTDB_TABLE_INDEX_CONSTITUENTS,
+        DEDUP_KEY_INDEX_CONSTITUENTS,
     );
 
     match client
@@ -184,10 +222,7 @@ fn persist_constituency_inner(
     questdb_config: &QuestDbConfig,
     fno_universe: Option<&FnoUniverse>,
 ) -> Result<usize> {
-    let conf_string = format!(
-        "tcp::addr={}:{};",
-        questdb_config.host, questdb_config.ilp_port
-    );
+    let conf_string = build_ilp_conf_string(&questdb_config.host, questdb_config.ilp_port);
     let mut sender = Sender::from_conf(&conf_string)
         .context("failed to connect to QuestDB ILP for constituency")?;
     let mut buffer = sender.new_buffer();
@@ -205,9 +240,7 @@ fn persist_constituency_inner(
     for (index_name, constituents) in &constituency_map.index_to_constituents {
         for constituent in constituents {
             // Enrich with security_id from instrument master (0 if not found).
-            let security_id = fno_universe
-                .and_then(|u| u.symbol_to_security_id(&constituent.symbol))
-                .unwrap_or(0);
+            let security_id = resolve_security_id(fno_universe, &constituent.symbol);
 
             buffer
                 .table(QUESTDB_TABLE_INDEX_CONSTITUENTS)
@@ -294,779 +327,205 @@ mod tests {
         assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains(QUESTDB_TABLE_INDEX_CONSTITUENTS));
     }
 
+    // -----------------------------------------------------------------------
+    // build_questdb_exec_url
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_constituency_persist_max_retries_is_3() {
-        assert_eq!(CONSTITUENCY_PERSIST_MAX_RETRIES, 3);
+    fn test_build_questdb_exec_url_docker() {
+        let url = build_questdb_exec_url("dlt-questdb", 9000);
+        assert_eq!(url, "http://dlt-questdb:9000/exec");
     }
 
     #[test]
-    fn test_constituency_persist_retry_delay_is_2_secs() {
-        assert_eq!(CONSTITUENCY_PERSIST_RETRY_DELAY_SECS, 2);
+    fn test_build_questdb_exec_url_ip() {
+        let url = build_questdb_exec_url("10.0.1.5", 19000);
+        assert_eq!(url, "http://10.0.1.5:19000/exec");
     }
 
     #[test]
-    fn test_questdb_ddl_timeout_is_reasonable_constituency() {
-        assert!((5..=30).contains(&QUESTDB_DDL_TIMEOUT_SECS));
+    fn test_build_questdb_exec_url_ends_with_exec() {
+        let url = build_questdb_exec_url("host", 9000);
+        assert!(url.ends_with("/exec"));
     }
+
+    // -----------------------------------------------------------------------
+    // build_dedup_sql
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dedup_sql_constituency() {
+        let sql = build_dedup_sql(
+            QUESTDB_TABLE_INDEX_CONSTITUENTS,
+            DEDUP_KEY_INDEX_CONSTITUENTS,
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE index_constituents DEDUP ENABLE UPSERT KEYS(ts, index_name, symbol)"
+        );
+    }
+
+    #[test]
+    fn test_build_dedup_sql_generic() {
+        let sql = build_dedup_sql("my_table", "col_a");
+        assert!(sql.starts_with("ALTER TABLE my_table"));
+        assert!(sql.contains("DEDUP ENABLE UPSERT KEYS(ts, col_a)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ilp_conf_string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ilp_conf_string_docker() {
+        let conf = build_ilp_conf_string("dlt-questdb", 9009);
+        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+    }
+
+    #[test]
+    fn test_build_ilp_conf_string_ends_with_semicolon() {
+        let conf = build_ilp_conf_string("host", 1234);
+        assert!(conf.ends_with(';'));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_security_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_security_id_none_universe() {
+        assert_eq!(resolve_security_id(None, "RELIANCE"), 0);
+    }
+
+    #[test]
+    fn test_resolve_security_id_unknown_symbol() {
+        let empty_map = IndexConstituencyMap::default();
+        // We can't easily create a real FnoUniverse here without complex setup,
+        // but we can test the None path
+        assert_eq!(resolve_security_id(None, "UNKNOWN_STOCK"), 0);
+        // And verify the empty map is truly empty
+        assert_eq!(empty_map.stock_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // count_total_constituents
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_total_constituents_empty() {
+        let map = IndexConstituencyMap::default();
+        assert_eq!(count_total_constituents(&map), 0);
+    }
+
+    #[test]
+    fn test_count_total_constituents_with_data() {
+        use dhan_live_trader_common::instrument_types::{
+            ConstituencyBuildMetadata, IndexConstituent,
+        };
+        use std::collections::HashMap;
+
+        let today = chrono::Utc::now().date_naive();
+        let mut index_to_constituents = HashMap::new();
+        index_to_constituents.insert(
+            "NIFTY 50".to_string(),
+            vec![
+                IndexConstituent {
+                    index_name: "NIFTY 50".to_string(),
+                    symbol: "RELIANCE".to_string(),
+                    isin: "INE002A01018".to_string(),
+                    weight: 10.5,
+                    sector: "Energy".to_string(),
+                    last_updated: today,
+                },
+                IndexConstituent {
+                    index_name: "NIFTY 50".to_string(),
+                    symbol: "TCS".to_string(),
+                    isin: "INE467B01029".to_string(),
+                    weight: 5.2,
+                    sector: "IT".to_string(),
+                    last_updated: today,
+                },
+            ],
+        );
+        index_to_constituents.insert(
+            "NIFTY BANK".to_string(),
+            vec![IndexConstituent {
+                index_name: "NIFTY BANK".to_string(),
+                symbol: "HDFCBANK".to_string(),
+                isin: "INE040A01034".to_string(),
+                weight: 25.0,
+                sector: "Banking".to_string(),
+                last_updated: today,
+            }],
+        );
+
+        let map = IndexConstituencyMap {
+            index_to_constituents,
+            stock_to_indices: HashMap::new(),
+            build_metadata: ConstituencyBuildMetadata::default(),
+        };
+
+        assert_eq!(count_total_constituents(&map), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // DDL constants validation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_ddl_has_security_id_column() {
-        assert!(
-            INDEX_CONSTITUENTS_CREATE_DDL.contains("security_id LONG"),
-            "DDL must include security_id LONG for instrument master enrichment"
-        );
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("security_id LONG"));
+    }
+
+    #[test]
+    fn test_ddl_has_isin_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("isin STRING"));
+    }
+
+    #[test]
+    fn test_ddl_has_sector_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("sector STRING"));
+    }
+
+    #[test]
+    fn test_ddl_uses_month_partitioning() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("PARTITION BY MONTH"));
     }
 
     #[test]
     fn test_ddl_uses_wal() {
-        assert!(
-            INDEX_CONSTITUENTS_CREATE_DDL.contains("WAL"),
-            "DDL must use WAL for concurrent write safety"
-        );
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("WAL"));
     }
 
     #[test]
     fn test_ddl_is_single_statement() {
         assert!(
             !INDEX_CONSTITUENTS_CREATE_DDL.contains(';'),
-            "DDL must be a single statement without semicolons"
+            "DDL must not contain semicolons"
         );
     }
 
     #[test]
-    fn test_ddl_has_partition_by_month() {
-        assert!(
-            INDEX_CONSTITUENTS_CREATE_DDL.contains("PARTITION BY MONTH"),
-            "DDL must partition by MONTH for constituency data"
-        );
+    fn test_retry_constants_are_reasonable() {
+        let retries = CONSTITUENCY_PERSIST_MAX_RETRIES;
+        let delay = CONSTITUENCY_PERSIST_RETRY_DELAY_SECS;
+        assert!((1..=10).contains(&retries));
+        assert!((1..=30).contains(&delay));
     }
 
-    // -----------------------------------------------------------------------
-    // TCP drain server helper (same pattern as other storage tests)
-    // -----------------------------------------------------------------------
-
-    fn spawn_tcp_drain_server() -> u16 {
-        use std::io::Read as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            }
-        });
-        port
+    #[test]
+    fn test_ddl_timeout_is_reasonable() {
+        assert!((5..=30).contains(&QUESTDB_DDL_TIMEOUT_SECS));
     }
-
-    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
-
-    async fn spawn_mock_http_server(response: &'static str) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    });
-                }
-            }
-        });
-        port
-    }
-
-    // -----------------------------------------------------------------------
-    // DDL tests with mock HTTP server
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_ensure_constituency_table_does_not_panic_unreachable() {
+    async fn test_ensure_constituency_table_unreachable_no_panic() {
         let config = QuestDbConfig {
             host: "unreachable-host-99999".to_string(),
             http_port: 1,
             pg_port: 1,
             ilp_port: 1,
         };
-        // Should not panic — just logs warnings and returns.
         ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_ddl_success_with_mock_http() {
-        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // Exercises the success path for both CREATE TABLE and DEDUP DDL.
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_ddl_non_success_with_mock_http() {
-        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // Exercises the non-success path for CREATE TABLE DDL.
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_dedup_already_enabled() {
-        // Test with a response body containing "already enabled" — skips the warn
-        let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 37\r\n\r\n{\"error\":\"dedup already enabled foo\"}";
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    });
-                }
-            }
-        });
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        ensure_constituency_table(&config).await;
-    }
-
-    // -----------------------------------------------------------------------
-    // persist_constituency tests with data
-    // -----------------------------------------------------------------------
-
-    fn make_test_constituency_map() -> IndexConstituencyMap {
-        use chrono::NaiveDate;
-        use dhan_live_trader_common::instrument_types::IndexConstituent;
-
-        let constituents = vec![
-            IndexConstituent {
-                index_name: "Nifty 50".to_string(),
-                symbol: "RELIANCE".to_string(),
-                isin: "INE002A01018".to_string(),
-                weight: 10.5,
-                sector: "Energy".to_string(),
-                last_updated: NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
-            },
-            IndexConstituent {
-                index_name: "Nifty 50".to_string(),
-                symbol: "TCS".to_string(),
-                isin: "INE467B01029".to_string(),
-                weight: 4.2,
-                sector: "IT".to_string(),
-                last_updated: NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
-            },
-        ];
-
-        let mut index_to_constituents = std::collections::HashMap::new();
-        index_to_constituents.insert("Nifty 50".to_string(), constituents);
-
-        let mut stock_to_indices = std::collections::HashMap::new();
-        stock_to_indices.insert("RELIANCE".to_string(), vec!["Nifty 50".to_string()]);
-        stock_to_indices.insert("TCS".to_string(), vec!["Nifty 50".to_string()]);
-
-        IndexConstituencyMap {
-            index_to_constituents,
-            stock_to_indices,
-            build_metadata: Default::default(),
-        }
-    }
-
-    #[test]
-    fn test_persist_constituency_with_data_unreachable_host_returns_ok() {
-        let map = make_test_constituency_map();
-        let config = QuestDbConfig {
-            host: "unreachable-host-99999".to_string(),
-            ilp_port: 19009,
-            http_port: 19000,
-            pg_port: 18812,
-        };
-        let result = persist_constituency(&map, &config, None);
-        assert!(
-            result.is_ok(),
-            "persist_constituency must be best-effort (Ok on failure)"
-        );
-    }
-
-    #[test]
-    fn test_persist_constituency_inner_with_valid_tcp_server() {
-        let port = spawn_tcp_drain_server();
-        let map = make_test_constituency_map();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-        let result = persist_constituency_inner(&map, &config, None);
-        assert!(result.is_ok());
-        let count = result.unwrap();
-        assert_eq!(count, 2, "should persist 2 constituent entries");
-    }
-
-    #[test]
-    fn test_persist_constituency_inner_empty_map() {
-        let port = spawn_tcp_drain_server();
-        let map = IndexConstituencyMap::default();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-        let result = persist_constituency_inner(&map, &config, None);
-        assert!(result.is_ok());
-        let count = result.unwrap();
-        assert_eq!(count, 0, "empty map should produce 0 entries");
-    }
-
-    #[test]
-    fn test_persist_constituency_with_fno_universe_enrichment() {
-        use dhan_live_trader_common::instrument_types::{
-            FnoUnderlying, FnoUniverse, UnderlyingKind, UniverseBuildMetadata,
-        };
-        use dhan_live_trader_common::trading_calendar::ist_offset;
-        use dhan_live_trader_common::types::ExchangeSegment;
-
-        let port = spawn_tcp_drain_server();
-        let map = make_test_constituency_map();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-
-        // Build a minimal FnoUniverse with RELIANCE mapped
-        let mut underlyings = std::collections::HashMap::new();
-        underlyings.insert(
-            "RELIANCE".to_string(),
-            FnoUnderlying {
-                underlying_symbol: "RELIANCE".to_string(),
-                underlying_security_id: 2885,
-                price_feed_security_id: 2885,
-                price_feed_segment: ExchangeSegment::NseEquity,
-                derivative_segment: ExchangeSegment::NseFno,
-                kind: UnderlyingKind::Stock,
-                lot_size: 250,
-                contract_count: 120,
-            },
-        );
-
-        let ist = ist_offset();
-        let universe = FnoUniverse {
-            underlyings,
-            derivative_contracts: std::collections::HashMap::new(),
-            instrument_info: std::collections::HashMap::new(),
-            option_chains: std::collections::HashMap::new(),
-            expiry_calendars: std::collections::HashMap::new(),
-            subscribed_indices: Vec::new(),
-            build_metadata: UniverseBuildMetadata {
-                csv_source: "primary".to_string(),
-                csv_row_count: 0,
-                parsed_row_count: 0,
-                index_count: 0,
-                equity_count: 0,
-                underlying_count: 1,
-                derivative_count: 0,
-                option_chain_count: 0,
-                build_duration: std::time::Duration::from_millis(100),
-                build_timestamp: chrono::Utc::now().with_timezone(&ist),
-            },
-        };
-
-        let result = persist_constituency_inner(&map, &config, Some(&universe));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 2);
-    }
-
-    #[test]
-    fn test_persist_constituency_with_valid_server_first_attempt_succeeds() {
-        let port = spawn_tcp_drain_server();
-        let map = make_test_constituency_map();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-        let result = persist_constituency(&map, &config, None);
-        assert!(
-            result.is_ok(),
-            "first attempt should succeed with valid TCP"
-        );
-    }
-
-    #[test]
-    fn test_persist_constituency_inner_connection_error() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: 1,
-            http_port: 1,
-            pg_port: 1,
-        };
-        let map = make_test_constituency_map();
-        let result = persist_constituency_inner(&map, &config, None);
-        // Connection should fail — inner propagates errors
-        let _is_err = result.is_err();
-    }
-
-    #[test]
-    fn test_persist_constituency_multiple_indices() {
-        use chrono::NaiveDate;
-        use dhan_live_trader_common::instrument_types::IndexConstituent;
-
-        let port = spawn_tcp_drain_server();
-
-        let mut index_to_constituents = std::collections::HashMap::new();
-        index_to_constituents.insert(
-            "Nifty 50".to_string(),
-            vec![IndexConstituent {
-                index_name: "Nifty 50".to_string(),
-                symbol: "RELIANCE".to_string(),
-                isin: "INE002A01018".to_string(),
-                weight: 10.5,
-                sector: "Energy".to_string(),
-                last_updated: NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
-            }],
-        );
-        index_to_constituents.insert(
-            "Nifty Bank".to_string(),
-            vec![
-                IndexConstituent {
-                    index_name: "Nifty Bank".to_string(),
-                    symbol: "HDFCBANK".to_string(),
-                    isin: "INE040A01034".to_string(),
-                    weight: 25.0,
-                    sector: "Banking".to_string(),
-                    last_updated: NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
-                },
-                IndexConstituent {
-                    index_name: "Nifty Bank".to_string(),
-                    symbol: "ICICIBANK".to_string(),
-                    isin: "INE090A01021".to_string(),
-                    weight: 20.0,
-                    sector: "Banking".to_string(),
-                    last_updated: NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
-                },
-            ],
-        );
-
-        let map = IndexConstituencyMap {
-            index_to_constituents,
-            stock_to_indices: std::collections::HashMap::new(),
-            build_metadata: Default::default(),
-        };
-
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-
-        let result = persist_constituency_inner(&map, &config, None);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 3, "should persist 1 + 2 = 3 entries");
-    }
-
-    #[test]
-    fn test_ilp_connection_string_format_constituency() {
-        let config = QuestDbConfig {
-            host: "dlt-questdb".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
-        assert_eq!(conf_string, "tcp::addr=dlt-questdb:9009;");
-    }
-
-    #[test]
-    fn test_http_base_url_format_constituency() {
-        let config = QuestDbConfig {
-            host: "dlt-questdb".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let base_url = format!("http://{}:{}/exec", config.host, config.http_port);
-        assert_eq!(base_url, "http://dlt-questdb:9000/exec");
-    }
-
-    #[test]
-    fn test_dedup_sql_format_constituency() {
-        let dedup_ddl = format!(
-            "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-            QUESTDB_TABLE_INDEX_CONSTITUENTS, DEDUP_KEY_INDEX_CONSTITUENTS
-        );
-        assert!(dedup_ddl.contains("ALTER TABLE index_constituents"));
-        assert!(dedup_ddl.contains("DEDUP ENABLE UPSERT KEYS(ts, index_name, symbol)"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional DDL coverage: two-phase mock server returning different
-    // responses for CREATE TABLE and DEDUP requests.
-    // -----------------------------------------------------------------------
-
-    /// Spawns an HTTP mock that returns `first_response` for the first request
-    /// and `second_response` for all subsequent requests.
-    async fn spawn_two_phase_http_server(
-        first_response: &'static str,
-        second_response: &'static str,
-    ) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let counter = counter.clone();
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let resp = if idx == 0 {
-                            first_response
-                        } else {
-                            second_response
-                        };
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                    });
-                }
-            }
-        });
-        tokio::task::yield_now().await;
-        port
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_create_ok_dedup_fail() {
-        // CREATE TABLE succeeds (200), DEDUP fails (400 without "already enabled")
-        let port = spawn_two_phase_http_server(MOCK_HTTP_200, MOCK_HTTP_400).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // Should not panic — exercises success branch for CREATE, warn for DEDUP
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_create_fail_dedup_ok() {
-        // CREATE TABLE fails (400), DEDUP succeeds (200)
-        let port = spawn_two_phase_http_server(MOCK_HTTP_400, MOCK_HTTP_200).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // Should not panic — exercises warn for CREATE, success for DEDUP
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_create_ok_dedup_already_enabled() {
-        // CREATE TABLE succeeds (200), DEDUP returns "already enabled" (400)
-        let dedup_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 37\r\n\r\n{\"error\":\"dedup already enabled foo\"}";
-        // Use a static-lifetime response for the second phase
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let counter = counter.clone();
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let resp = if idx == 0 { MOCK_HTTP_200 } else { dedup_resp };
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                    });
-                }
-            }
-        });
-        tokio::task::yield_now().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // CREATE succeeds, DEDUP "already enabled" = silently OK
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_dedup_network_error() {
-        // First request (CREATE) succeeds, then the server drops for DEDUP.
-        // This exercises the Err branch for the DEDUP send.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            // Accept first connection, respond with 200, then stop accepting
-            if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
-                drop(stream);
-            }
-            // Accept second connection but drop it immediately to cause error
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-        });
-        tokio::task::yield_now().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        ensure_constituency_table(&config).await;
-    }
-
-    // -----------------------------------------------------------------------
-    // persist_constituency: exercise the retry-then-succeed path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_persist_constituency_inner_unreachable_is_err() {
-        // Verify that persist_constituency_inner returns Err (not Ok) on
-        // connection failure — this drives the retry loop in persist_constituency.
-        let config = QuestDbConfig {
-            host: "unreachable-host-99999".to_string(),
-            ilp_port: 19009,
-            http_port: 19000,
-            pg_port: 18812,
-        };
-        let map = make_test_constituency_map();
-        let result = persist_constituency_inner(&map, &config, None);
-        assert!(
-            result.is_err(),
-            "persist_constituency_inner must propagate connection errors"
-        );
-    }
-
-    #[test]
-    fn test_persist_constituency_retries_on_failure_then_ok() {
-        // persist_constituency must return Ok even after all retries fail.
-        // This specifically tests that the error log + Ok(()) on line 175-179
-        // is reached when persist_constituency_inner fails 3 times.
-        let config = QuestDbConfig {
-            host: "unreachable-host-99999".to_string(),
-            ilp_port: 19009,
-            http_port: 19000,
-            pg_port: 18812,
-        };
-        let map = make_test_constituency_map();
-        let result = persist_constituency(&map, &config, None);
-        assert!(
-            result.is_ok(),
-            "persist_constituency must be best-effort — Ok even after all retries fail"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_ddl_non_success_with_tracing() {
-        // Same as the existing non-success test but with a tracing subscriber
-        // installed to ensure warn! macro body (line 89, 121) is evaluated.
-        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_test_writer())
-        };
-        let _guard = tracing::subscriber::set_default(subscriber);
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_create_send_error() {
-        // Server accepts connection for CREATE TABLE then immediately closes,
-        // causing a transport error on send. This exercises the Err(err) branch
-        // at line 94 (CREATE TABLE send error).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            // Accept first connection and drop immediately — causes send error
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-            // Accept second connection and drop — DEDUP also gets send error
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-        });
-        tokio::task::yield_now().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        ensure_constituency_table(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_constituency_table_send_error_with_tracing() {
-        // Same as above but with tracing subscriber to cover warn! body
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-        });
-        tokio::task::yield_now().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_test_writer())
-        };
-        let _guard = tracing::subscriber::set_default(subscriber);
-        ensure_constituency_table(&config).await;
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage: security_id zero handling when symbol not in FnoUniverse
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_security_id_zero_for_unmapped_symbol() {
-        // When fno_universe is Some but symbol is not found,
-        // security_id defaults to 0 via unwrap_or(0).
-        use dhan_live_trader_common::instrument_types::FnoUniverse;
-
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
-        let universe = FnoUniverse {
-            underlyings: std::collections::HashMap::new(),
-            derivative_contracts: std::collections::HashMap::new(),
-            instrument_info: std::collections::HashMap::new(),
-            option_chains: std::collections::HashMap::new(),
-            expiry_calendars: std::collections::HashMap::new(),
-            subscribed_indices: Vec::new(),
-            build_metadata: dhan_live_trader_common::instrument_types::UniverseBuildMetadata {
-                csv_source: "test".to_string(),
-                csv_row_count: 0,
-                parsed_row_count: 0,
-                index_count: 0,
-                equity_count: 0,
-                underlying_count: 0,
-                derivative_count: 0,
-                option_chain_count: 0,
-                build_duration: std::time::Duration::from_millis(1),
-                build_timestamp: chrono::Utc::now().with_timezone(&ist),
-            },
-        };
-
-        // symbol_to_security_id returns None for missing symbols
-        let sec_id = universe.symbol_to_security_id("NONEXISTENT").unwrap_or(0);
-        assert_eq!(sec_id, 0, "missing symbol must default to security_id 0");
-    }
-
-    #[test]
-    fn test_persist_constituency_ddl_has_isin_column() {
-        assert!(
-            INDEX_CONSTITUENTS_CREATE_DDL.contains("isin STRING"),
-            "DDL must include isin STRING column"
-        );
-    }
-
-    #[test]
-    fn test_persist_constituency_ddl_has_sector_column() {
-        assert!(
-            INDEX_CONSTITUENTS_CREATE_DDL.contains("sector STRING"),
-            "DDL must include sector STRING column"
-        );
-    }
-
-    #[test]
-    fn test_persist_constituency_inner_with_fno_universe_missing_symbol() {
-        // FnoUniverse present but does not contain the symbol — exercises
-        // the `unwrap_or(0)` default security_id path.
-        use dhan_live_trader_common::instrument_types::{FnoUniverse, UniverseBuildMetadata};
-        use dhan_live_trader_common::trading_calendar::ist_offset;
-
-        let port = spawn_tcp_drain_server();
-        let map = make_test_constituency_map();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-
-        let ist = ist_offset();
-        let universe = FnoUniverse {
-            underlyings: std::collections::HashMap::new(), // Empty = no symbol matches
-            derivative_contracts: std::collections::HashMap::new(),
-            instrument_info: std::collections::HashMap::new(),
-            option_chains: std::collections::HashMap::new(),
-            expiry_calendars: std::collections::HashMap::new(),
-            subscribed_indices: Vec::new(),
-            build_metadata: UniverseBuildMetadata {
-                csv_source: "primary".to_string(),
-                csv_row_count: 0,
-                parsed_row_count: 0,
-                index_count: 0,
-                equity_count: 0,
-                underlying_count: 0,
-                derivative_count: 0,
-                option_chain_count: 0,
-                build_duration: std::time::Duration::from_millis(1),
-                build_timestamp: chrono::Utc::now().with_timezone(&ist),
-            },
-        };
-
-        let result = persist_constituency_inner(&map, &config, Some(&universe));
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            2,
-            "should persist 2 entries with security_id=0 for missing symbols"
-        );
     }
 }

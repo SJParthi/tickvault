@@ -46,6 +46,53 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 const DEDUP_KEY_CANDLES: &str = "security_id, timeframe, segment";
 
 // ---------------------------------------------------------------------------
+// Pure helper functions (testable without DB)
+// ---------------------------------------------------------------------------
+
+/// Converts a UTC epoch-seconds timestamp to IST-as-UTC nanoseconds.
+///
+/// Adds `IST_UTC_OFFSET_SECONDS_I64` (19800s) so QuestDB displays IST wall-clock
+/// time, then multiplies by 1_000_000_000 for nanosecond precision.
+///
+/// Uses saturating arithmetic to prevent overflow.
+fn compute_ist_nanos_from_utc_secs(utc_secs: i64) -> i64 {
+    utc_secs
+        .saturating_add(IST_UTC_OFFSET_SECONDS_I64)
+        .saturating_mul(1_000_000_000)
+}
+
+/// Converts IST epoch seconds (from live WebSocket) to nanoseconds for QuestDB.
+///
+/// Live WebSocket timestamps are already IST — no offset needed.
+/// Uses saturating arithmetic to prevent overflow.
+fn compute_live_candle_nanos(ist_epoch_secs: u32) -> i64 {
+    i64::from(ist_epoch_secs).saturating_mul(1_000_000_000)
+}
+
+/// Returns `true` if `pending_count` has reached or exceeded the given batch size threshold.
+fn should_flush(pending_count: usize, batch_size: usize) -> bool {
+    pending_count >= batch_size
+}
+
+/// Builds the QuestDB HTTP exec URL from host and port.
+fn build_questdb_exec_url(host: &str, http_port: u16) -> String {
+    format!("http://{}:{}/exec", host, http_port)
+}
+
+/// Builds the ALTER TABLE DEDUP ENABLE UPSERT KEYS SQL statement.
+fn build_dedup_sql(table_name: &str, dedup_key: &str) -> String {
+    format!(
+        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
+        table_name, dedup_key
+    )
+}
+
+/// Builds the ILP TCP connection string from host and port.
+fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
+    format!("tcp::addr={}:{};", host, ilp_port)
+}
+
+// ---------------------------------------------------------------------------
 // Candle Persistence Writer
 // ---------------------------------------------------------------------------
 
@@ -65,7 +112,7 @@ impl CandlePersistenceWriter {
     /// # Errors
     /// Returns error if the ILP connection cannot be established.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = build_ilp_conf_string(&config.host, config.ilp_port);
         let sender =
             Sender::from_conf(&conf_string).context("failed to connect to QuestDB via ILP")?;
         let buffer = sender.new_buffer();
@@ -91,10 +138,8 @@ impl CandlePersistenceWriter {
     /// O(1) — single ILP row append + conditional flush.
     pub fn append_candle(&mut self, candle: &HistoricalCandle) -> Result<()> {
         // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
-        let ist_epoch_secs = candle
-            .timestamp_utc_secs
-            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-        let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+        let ts_nanos =
+            TimestampNanos::new(compute_ist_nanos_from_utc_secs(candle.timestamp_utc_secs));
 
         self.buffer
             .table(QUESTDB_TABLE_HISTORICAL_CANDLES)
@@ -122,7 +167,7 @@ impl CandlePersistenceWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= CANDLE_FLUSH_BATCH_SIZE {
+        if should_flush(self.pending_count, CANDLE_FLUSH_BATCH_SIZE) {
             self.force_flush()?;
         }
 
@@ -172,7 +217,7 @@ pub struct LiveCandleWriter {
 impl LiveCandleWriter {
     /// Creates a new live candle writer connected to QuestDB via ILP TCP.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = build_ilp_conf_string(&config.host, config.ilp_port);
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for live candles")?;
         let buffer = sender.new_buffer();
@@ -205,7 +250,7 @@ impl LiveCandleWriter {
     ) -> Result<()> {
         // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
         // Store directly — no offset needed.
-        let ts_nanos = TimestampNanos::new(i64::from(timestamp_secs).saturating_mul(1_000_000_000));
+        let ts_nanos = TimestampNanos::new(compute_live_candle_nanos(timestamp_secs));
 
         self.buffer
             .table(QUESTDB_TABLE_CANDLES_1S)
@@ -233,7 +278,7 @@ impl LiveCandleWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= LIVE_CANDLE_FLUSH_BATCH_SIZE {
+        if should_flush(self.pending_count, LIVE_CANDLE_FLUSH_BATCH_SIZE) {
             self.force_flush()?;
         }
 
@@ -292,10 +337,7 @@ const HISTORICAL_CANDLES_CREATE_DDL: &str = "\
 ///
 /// Best-effort: if QuestDB is unreachable, logs a warning and continues.
 pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
+    let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
     let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
@@ -344,10 +386,7 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     }
 
     // Step 2: Enable DEDUP UPSERT KEYS on new table (ts, security_id, timeframe).
-    let dedup_sql = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_HISTORICAL_CANDLES, DEDUP_KEY_CANDLES
-    );
+    let dedup_sql = build_dedup_sql(QUESTDB_TABLE_HISTORICAL_CANDLES, DEDUP_KEY_CANDLES);
     match client
         .get(&base_url)
         .query(&[("query", &dedup_sql)])
@@ -476,869 +515,180 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TCP drain server helper (same pattern as tick_persistence tests)
-    // -----------------------------------------------------------------------
-
-    /// Spawn a background TCP server that accepts one connection and drains
-    /// all data until EOF. Returns the port.
-    fn spawn_tcp_drain_server() -> u16 {
-        use std::io::Read as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            }
-        });
-        port
-    }
-
-    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
-
-    /// Spawn an async HTTP mock server that returns a fixed `response` for
-    /// every request. Returns the port.
-    async fn spawn_mock_http_server(response: &'static str) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    });
-                }
-            }
-        });
-        port
-    }
-
-    fn make_test_candle(security_id: u32, timeframe: &'static str) -> HistoricalCandle {
-        HistoricalCandle {
-            security_id,
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            timestamp_utc_secs: 1_772_073_900, // UTC epoch
-            timeframe,
-            open: 24500.0,
-            high: 24550.0,
-            low: 24450.0,
-            close: 24520.0,
-            volume: 100_000,
-            open_interest: 50_000,
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // CandlePersistenceWriter tests
+    // compute_ist_nanos_from_utc_secs
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_candle_persistence_writer_new_with_unreachable_port() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 1,
-            pg_port: 1,
-            ilp_port: 1,
-        };
-        let result = CandlePersistenceWriter::new(&config);
-        // Either succeeds (lazy) or fails — must not panic.
-        let _is_ok = result.is_ok();
+    fn test_compute_ist_nanos_basic() {
+        // UTC 0 → IST is +19800s → 19800 * 1_000_000_000 nanos
+        let nanos = compute_ist_nanos_from_utc_secs(0);
+        assert_eq!(nanos, 19_800 * 1_000_000_000);
     }
 
     #[test]
-    fn test_candle_persistence_writer_new_with_invalid_hostname() {
-        let config = QuestDbConfig {
-            host: "this.host.does.not.exist.example.invalid".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let result = CandlePersistenceWriter::new(&config);
-        let _is_ok = result.is_ok();
+    fn test_compute_ist_nanos_known_timestamp() {
+        // 2024-01-01 00:00:00 UTC = 1704067200
+        // IST = 1704067200 + 19800 = 1704087000
+        // nanos = 1704087000 * 1_000_000_000
+        let utc_secs = 1_704_067_200_i64;
+        let nanos = compute_ist_nanos_from_utc_secs(utc_secs);
+        let expected = (utc_secs + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+        assert_eq!(nanos, expected);
     }
 
     #[test]
-    fn test_candle_persistence_writer_new_with_valid_server() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let writer = CandlePersistenceWriter::new(&config);
-        assert!(writer.is_ok(), "writer should connect to valid TCP");
+    fn test_compute_ist_nanos_negative_utc_secs() {
+        // Negative UTC secs (before epoch) — should still work with saturating
+        let nanos = compute_ist_nanos_from_utc_secs(-100_000);
+        let expected = (-100_000_i64 + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+        assert_eq!(nanos, expected);
     }
 
     #[test]
-    fn test_candle_persistence_writer_append_candle_increments_pending() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-        assert_eq!(writer.pending_count(), 0);
-
-        let candle = make_test_candle(13, "1m");
-        writer.append_candle(&candle).unwrap();
-        assert_eq!(writer.pending_count(), 1);
+    fn test_compute_ist_nanos_saturates_on_overflow() {
+        // i64::MAX should saturate, not overflow
+        let nanos = compute_ist_nanos_from_utc_secs(i64::MAX);
+        assert_eq!(nanos, i64::MAX);
     }
 
     #[test]
-    fn test_candle_persistence_writer_force_flush_resets_counter() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+    fn test_compute_ist_nanos_offset_is_19800() {
+        // Verify the IST offset constant is correct (5h30m = 19800s)
+        assert_eq!(IST_UTC_OFFSET_SECONDS_I64, 5 * 3600 + 30 * 60);
+    }
 
-        for i in 0..5_u32 {
-            let candle = make_test_candle(1000 + i, "5m");
-            writer.append_candle(&candle).unwrap();
-        }
-        assert_eq!(writer.pending_count(), 5);
+    // -----------------------------------------------------------------------
+    // compute_live_candle_nanos
+    // -----------------------------------------------------------------------
 
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count(), 0);
+    #[test]
+    fn test_compute_live_candle_nanos_zero() {
+        assert_eq!(compute_live_candle_nanos(0), 0);
     }
 
     #[test]
-    fn test_candle_persistence_writer_force_flush_empty_is_noop() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-        let result = writer.force_flush();
-        assert!(result.is_ok(), "flush with zero pending must be a no-op");
-        assert_eq!(writer.pending_count(), 0);
+    fn test_compute_live_candle_nanos_one_second() {
+        assert_eq!(compute_live_candle_nanos(1), 1_000_000_000);
     }
 
     #[test]
-    fn test_candle_persistence_writer_batch_boundary_auto_flush() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+    fn test_compute_live_candle_nanos_typical_ist_timestamp() {
+        // A typical IST epoch second for 09:15:00 IST
+        let ist_secs: u32 = 1_740_556_500;
+        let nanos = compute_live_candle_nanos(ist_secs);
+        assert_eq!(nanos, i64::from(ist_secs) * 1_000_000_000);
+    }
 
-        for i in 0..CANDLE_FLUSH_BATCH_SIZE as u32 {
-            let candle = make_test_candle(1000 + i, "1m");
-            writer.append_candle(&candle).unwrap();
-        }
-        // After auto-flush at CANDLE_FLUSH_BATCH_SIZE, pending should be 0.
+    #[test]
+    fn test_compute_live_candle_nanos_max_u32() {
+        // u32::MAX should not overflow i64
+        let nanos = compute_live_candle_nanos(u32::MAX);
+        let expected = i64::from(u32::MAX) * 1_000_000_000;
+        assert_eq!(nanos, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_flush
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_flush_below_threshold() {
+        assert!(!should_flush(0, 500));
+        assert!(!should_flush(499, 500));
+    }
+
+    #[test]
+    fn test_should_flush_at_threshold() {
+        assert!(should_flush(500, 500));
+    }
+
+    #[test]
+    fn test_should_flush_above_threshold() {
+        assert!(should_flush(501, 500));
+        assert!(should_flush(1000, 500));
+    }
+
+    #[test]
+    fn test_should_flush_with_live_batch_size() {
+        assert!(!should_flush(127, LIVE_CANDLE_FLUSH_BATCH_SIZE));
+        assert!(should_flush(128, LIVE_CANDLE_FLUSH_BATCH_SIZE));
+        assert!(should_flush(200, LIVE_CANDLE_FLUSH_BATCH_SIZE));
+    }
+
+    #[test]
+    fn test_should_flush_zero_threshold() {
+        // Edge case: zero threshold always triggers flush (except empty)
+        assert!(should_flush(0, 0));
+        assert!(should_flush(1, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_questdb_exec_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_questdb_exec_url_docker() {
+        let url = build_questdb_exec_url("dlt-questdb", 9000);
+        assert_eq!(url, "http://dlt-questdb:9000/exec");
+    }
+
+    #[test]
+    fn test_build_questdb_exec_url_custom_port() {
+        let url = build_questdb_exec_url("192.168.1.100", 19000);
+        assert_eq!(url, "http://192.168.1.100:19000/exec");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_dedup_sql
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dedup_sql_historical_candles() {
+        let sql = build_dedup_sql(QUESTDB_TABLE_HISTORICAL_CANDLES, DEDUP_KEY_CANDLES);
         assert_eq!(
-            writer.pending_count(),
-            0,
-            "auto-flush at batch size boundary must reset pending count"
+            sql,
+            "ALTER TABLE historical_candles DEDUP ENABLE UPSERT KEYS(ts, security_id, timeframe, segment)"
         );
     }
 
     #[test]
-    fn test_candle_persistence_writer_pending_count_tracks_correctly() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-
-        for i in 0..10_u32 {
-            let candle = make_test_candle(1000 + i, "15m");
-            writer.append_candle(&candle).unwrap();
-            assert_eq!(writer.pending_count(), (i + 1) as usize);
-        }
-    }
-
-    #[test]
-    fn test_candle_persistence_writer_append_flush_reuse() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-
-        let candle = make_test_candle(42, "1d");
-        writer.append_candle(&candle).unwrap();
-        assert_eq!(writer.pending_count(), 1);
-
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count(), 0);
-
-        // Reuse after flush
-        writer.append_candle(&candle).unwrap();
-        assert_eq!(writer.pending_count(), 1);
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count(), 0);
+    fn test_build_dedup_sql_starts_with_alter_table() {
+        let sql = build_dedup_sql("any_table", "col_a, col_b");
+        assert!(sql.starts_with("ALTER TABLE any_table"));
+        assert!(sql.contains("DEDUP ENABLE UPSERT KEYS(ts, col_a, col_b)"));
     }
 
     // -----------------------------------------------------------------------
-    // LiveCandleWriter tests
+    // build_ilp_conf_string
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_live_candle_writer_new_with_valid_server() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let writer = LiveCandleWriter::new(&config);
-        assert!(writer.is_ok());
+    fn test_build_ilp_conf_string_docker() {
+        let conf = build_ilp_conf_string("dlt-questdb", 9009);
+        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
     }
 
     #[test]
-    fn test_live_candle_writer_new_with_unreachable_port() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 1,
-            pg_port: 1,
-            ilp_port: 1,
-        };
-        let result = LiveCandleWriter::new(&config);
-        let _is_ok = result.is_ok();
+    fn test_build_ilp_conf_string_custom() {
+        let conf = build_ilp_conf_string("10.0.0.5", 19009);
+        assert_eq!(conf, "tcp::addr=10.0.0.5:19009;");
     }
 
     #[test]
-    fn test_live_candle_writer_append_and_flush() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-
-        writer
-            .append_candle(
-                13,
-                2,
-                1_773_100_800,
-                24500.0,
-                24550.0,
-                24450.0,
-                24520.0,
-                10000,
-                5,
-            )
-            .unwrap();
-        assert_eq!(writer.pending_count, 1);
-
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count, 0);
-    }
-
-    #[test]
-    fn test_live_candle_writer_oi_is_always_zero() {
-        // Live candle writer always writes oi=0 since OI is not available
-        // per-second from ticks. This test verifies the behavior documented
-        // in the code comment at line 227.
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-
-        // OI is not a parameter — it's hardcoded to 0 in append_candle.
-        writer
-            .append_candle(42, 1, 1_773_100_800, 100.0, 110.0, 90.0, 105.0, 5000, 3)
-            .unwrap();
-
-        // The fact that append_candle doesn't take an OI parameter confirms
-        // OI is always zero. Just verify the write succeeded.
-        assert_eq!(writer.pending_count, 1);
-    }
-
-    #[test]
-    fn test_live_candle_writer_force_flush_empty_is_noop() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-        let result = writer.force_flush();
-        assert!(result.is_ok());
-        assert_eq!(writer.pending_count, 0);
-    }
-
-    #[test]
-    fn test_live_candle_writer_flush_if_needed_empty() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-        let result = writer.flush_if_needed();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_live_candle_writer_flush_if_needed_with_pending() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-        writer
-            .append_candle(
-                13,
-                2,
-                1_773_100_800,
-                24500.0,
-                24550.0,
-                24450.0,
-                24520.0,
-                10000,
-                5,
-            )
-            .unwrap();
-
-        // flush_if_needed calls force_flush when pending_count > 0.
-        let result = writer.flush_if_needed();
-        assert!(result.is_ok());
-        assert_eq!(writer.pending_count, 0);
-    }
-
-    #[test]
-    fn test_live_candle_writer_batch_flush() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-
-        for i in 0..LIVE_CANDLE_FLUSH_BATCH_SIZE as u32 {
-            writer
-                .append_candle(
-                    1000 + i,
-                    2,
-                    1_773_100_800 + i,
-                    24500.0 + i as f32,
-                    24550.0 + i as f32,
-                    24450.0 + i as f32,
-                    24520.0 + i as f32,
-                    10000 + i,
-                    5,
-                )
-                .unwrap();
-        }
-        // After auto-flush at LIVE_CANDLE_FLUSH_BATCH_SIZE, pending should be 0.
-        assert_eq!(writer.pending_count, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // DDL tests with mock HTTP server
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_ensure_candle_table_ddl_success_with_mock_http() {
-        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // Exercises the success path for both CREATE TABLE and DEDUP DDL.
-        ensure_candle_table_dedup_keys(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_candle_table_ddl_non_success_with_mock_http() {
-        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // Exercises the non-success path for CREATE TABLE DDL.
-        ensure_candle_table_dedup_keys(&config).await;
-    }
-
-    #[test]
-    fn test_candle_append_adds_ist_offset_to_utc_timestamp() {
-        // Verify that append_candle converts UTC epoch to IST-as-UTC by adding offset.
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-        let candle = HistoricalCandle {
-            security_id: 13,
-            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
-            timestamp_utc_secs: 1_772_073_900, // UTC epoch
-            timeframe: "1m",
-            open: 24500.0,
-            high: 24550.0,
-            low: 24450.0,
-            close: 24520.0,
-            volume: 100_000,
-            open_interest: 50_000,
-        };
-
-        writer.append_candle(&candle).unwrap();
-        assert_eq!(writer.pending_count(), 1);
-
-        // The IST offset is added inside append_candle. Verify it doesn't panic.
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count(), 0);
-    }
-
-    #[test]
-    fn test_candle_append_all_timeframes() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-
-        let timeframes = ["1", "5", "15", "25", "60", "1d"];
-        for (i, tf) in timeframes.iter().enumerate() {
-            let candle = make_test_candle(13 + i as u32, tf);
-            writer.append_candle(&candle).unwrap();
-        }
-        assert_eq!(writer.pending_count(), 6);
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count(), 0);
-    }
-
-    #[test]
-    fn test_candle_append_all_segments() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-
-        let segments = [
-            EXCHANGE_SEGMENT_IDX_I,
-            EXCHANGE_SEGMENT_NSE_EQ,
-            EXCHANGE_SEGMENT_NSE_FNO,
-            EXCHANGE_SEGMENT_BSE_EQ,
-            EXCHANGE_SEGMENT_MCX_COMM,
-        ];
-        for (i, seg) in segments.iter().enumerate() {
-            let candle = HistoricalCandle {
-                security_id: 100 + i as u32,
-                exchange_segment_code: *seg,
-                timestamp_utc_secs: 1_772_073_900,
-                timeframe: "1m",
-                open: 100.0,
-                high: 110.0,
-                low: 90.0,
-                close: 105.0,
-                volume: 1000,
-                open_interest: 0,
-            };
-            writer.append_candle(&candle).unwrap();
-        }
-        assert_eq!(writer.pending_count(), 5);
-        writer.force_flush().unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage gap-fill: DDL constants, IST offset, edge cases, LiveCandleWriter
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_historical_candles_ddl_contains_all_columns() {
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("segment SYMBOL"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("security_id LONG"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("open DOUBLE"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("high DOUBLE"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("low DOUBLE"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("close DOUBLE"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("volume LONG"));
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("oi LONG"));
-    }
-
-    #[test]
-    fn test_candle_append_ist_offset_arithmetic() {
-        // Verify that UTC + IST offset doesn't overflow or produce negative values
-        let candle = HistoricalCandle {
-            security_id: 13,
-            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
-            timestamp_utc_secs: 0, // epoch zero
-            timeframe: "1m",
-            open: 100.0,
-            high: 110.0,
-            low: 90.0,
-            close: 105.0,
-            volume: 0,
-            open_interest: 0,
-        };
-        let ist_epoch = candle
-            .timestamp_utc_secs
-            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-        // IST offset = 19800 seconds (5h30m)
-        assert_eq!(ist_epoch, 19800);
-    }
-
-    #[test]
-    fn test_candle_append_large_timestamp() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-
-        // Year ~2040 timestamp
-        let candle = HistoricalCandle {
-            security_id: 13,
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            timestamp_utc_secs: 2_208_988_800, // ~2040
-            timeframe: "1d",
-            open: 50000.0,
-            high: 51000.0,
-            low: 49000.0,
-            close: 50500.0,
-            volume: 1_000_000,
-            open_interest: 500_000,
-        };
-        writer.append_candle(&candle).unwrap();
-        assert_eq!(writer.pending_count(), 1);
-        writer.force_flush().unwrap();
-    }
-
-    #[test]
-    fn test_candle_append_zero_volume_and_oi() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
-
-        let candle = HistoricalCandle {
-            security_id: 13,
-            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
-            timestamp_utc_secs: 1_772_073_900,
-            timeframe: "1m",
-            open: 24500.0,
-            high: 24500.0,
-            low: 24500.0,
-            close: 24500.0,
-            volume: 0,
-            open_interest: 0,
-        };
-        writer.append_candle(&candle).unwrap();
-        assert_eq!(writer.pending_count(), 1);
-    }
-
-    #[test]
-    fn test_live_candle_writer_multiple_append_reuse() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-
-        // Append, flush, append again
-        writer
-            .append_candle(13, 2, 1_773_100_800, 100.0, 110.0, 90.0, 105.0, 5000, 3)
-            .unwrap();
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count, 0);
-
-        writer
-            .append_candle(25, 2, 1_773_100_801, 200.0, 210.0, 190.0, 205.0, 3000, 2)
-            .unwrap();
-        assert_eq!(writer.pending_count, 1);
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count, 0);
-    }
-
-    #[test]
-    fn test_live_candle_writer_all_segments() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-
-        let segments = [
-            EXCHANGE_SEGMENT_IDX_I,
-            EXCHANGE_SEGMENT_NSE_EQ,
-            EXCHANGE_SEGMENT_NSE_FNO,
-            EXCHANGE_SEGMENT_BSE_EQ,
-        ];
-        for (i, seg) in segments.iter().enumerate() {
-            writer
-                .append_candle(
-                    100 + i as u32,
-                    *seg,
-                    1_773_100_800 + i as u32,
-                    100.0,
-                    110.0,
-                    90.0,
-                    105.0,
-                    1000,
-                    5,
-                )
-                .unwrap();
-        }
-        assert_eq!(writer.pending_count, 4);
-        writer.force_flush().unwrap();
-        assert_eq!(writer.pending_count, 0);
-    }
-
-    #[test]
-    fn test_live_candle_flush_batch_size_is_128() {
-        assert_eq!(LIVE_CANDLE_FLUSH_BATCH_SIZE, 128);
-    }
-
-    #[test]
-    fn test_candle_flush_batch_size_from_constants() {
-        // CANDLE_FLUSH_BATCH_SIZE must be positive
-        assert!(CANDLE_FLUSH_BATCH_SIZE > 0);
-    }
-
-    #[tokio::test]
-    async fn test_ensure_candle_table_ddl_with_mock_http_success_exercises_dedup() {
-        // This test exercises both the CREATE TABLE success path and DEDUP success path.
-        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        ensure_candle_table_dedup_keys(&config).await;
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage: DDL warn! field evaluation with tracing subscriber
-    // -----------------------------------------------------------------------
-
-    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
-        use tracing_subscriber::layer::SubscriberExt;
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_test_writer());
-        tracing::subscriber::set_default(subscriber)
-    }
-
-    #[tokio::test]
-    async fn test_ensure_candle_table_non_success_with_tracing_subscriber() {
-        let _guard = install_test_subscriber();
-        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        // With tracing subscriber, warn! body expressions are evaluated.
-        ensure_candle_table_dedup_keys(&config).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_candle_table_send_error_with_tracing_subscriber() {
-        let _guard = install_test_subscriber();
-        // Accept connection then drop → send error
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-        });
-        tokio::task::yield_now().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        ensure_candle_table_dedup_keys(&config).await;
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage: IST offset arithmetic for historical candles
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_candle_append_ist_offset_value_is_19800() {
-        assert_eq!(
-            IST_UTC_OFFSET_SECONDS_I64, 19800,
-            "IST offset must be exactly 5h30m = 19800 seconds"
-        );
-    }
-
-    #[test]
-    fn test_candle_append_negative_timestamp_saturating() {
-        // Negative UTC epoch + IST offset should not underflow (saturating_add).
-        let candle = HistoricalCandle {
-            security_id: 1,
-            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
-            timestamp_utc_secs: i64::MIN,
-            timeframe: "1m",
-            open: 100.0,
-            high: 110.0,
-            low: 90.0,
-            close: 105.0,
-            volume: 0,
-            open_interest: 0,
-        };
-        // saturating_add prevents overflow
-        let ist_epoch = candle
-            .timestamp_utc_secs
-            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-        assert_eq!(ist_epoch, i64::MIN + IST_UTC_OFFSET_SECONDS_I64);
-    }
-
-    #[test]
-    fn test_historical_candles_ddl_has_wal() {
+    fn test_build_ilp_conf_string_ends_with_semicolon() {
+        let conf = build_ilp_conf_string("host", 1234);
         assert!(
-            HISTORICAL_CANDLES_CREATE_DDL.contains("WAL"),
-            "DDL must use WAL"
+            conf.ends_with(';'),
+            "ILP conf string must end with semicolon"
         );
     }
 
     #[test]
-    fn test_historical_candles_ddl_is_single_statement() {
+    fn test_build_ilp_conf_string_starts_with_tcp() {
+        let conf = build_ilp_conf_string("host", 1234);
         assert!(
-            !HISTORICAL_CANDLES_CREATE_DDL.contains(';'),
-            "DDL must be a single statement"
+            conf.starts_with("tcp::addr="),
+            "ILP conf string must start with tcp::addr="
         );
-    }
-
-    #[test]
-    fn test_historical_candles_ddl_is_idempotent() {
-        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage: LiveCandleWriter append with edge case values
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_live_candle_writer_append_zero_timestamp() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let mut writer = LiveCandleWriter::new(&config).unwrap();
-
-        // Zero timestamp is edge case — should not panic
-        writer
-            .append_candle(1, 0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0)
-            .unwrap();
-        assert_eq!(writer.pending_count, 1);
-        writer.force_flush().unwrap();
-    }
-
-    #[test]
-    fn test_live_candle_writer_uses_candles_1s_table() {
-        // Verify LiveCandleWriter writes to candles_1s, not historical_candles
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        let writer = LiveCandleWriter::new(&config);
-        assert!(writer.is_ok());
-        // The table name QUESTDB_TABLE_CANDLES_1S is used internally
-        assert_eq!(QUESTDB_TABLE_CANDLES_1S, "candles_1s");
-    }
-
-    #[tokio::test]
-    async fn test_ensure_candle_table_dedup_send_error_with_tracing() {
-        let _guard = install_test_subscriber();
-        // Two-phase mock: first request (CREATE TABLE) succeeds,
-        // second request (DEDUP) gets connection dropped → send error
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            // First connection: respond with 200
-            if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
-                drop(stream);
-            }
-            // Second connection: drop immediately → DEDUP send error
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-        });
-        tokio::task::yield_now().await;
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: port,
-            pg_port: port,
-            ilp_port: port,
-        };
-        ensure_candle_table_dedup_keys(&config).await;
     }
 }

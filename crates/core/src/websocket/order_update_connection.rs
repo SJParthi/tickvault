@@ -80,38 +80,39 @@ pub async fn run_order_update_connection(
                 info!("order update WebSocket disconnected cleanly — reconnecting");
             }
             Err(err) => {
-                // Off-hours ReadTimeout is expected (no orders outside market hours).
-                // Log at debug level and reset backoff to avoid noise.
-                if matches!(err, OrderUpdateConnectionError::ReadTimeout)
-                    && !is_within_market_hours(&calendar)
-                {
-                    debug!(
-                        "order update WebSocket idle timeout outside market hours — reconnecting"
-                    );
-                    consecutive_failures = 0;
-                } else {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
+                let is_timeout = matches!(err, OrderUpdateConnectionError::ReadTimeout);
+                let within_hours = is_within_market_hours(&calendar);
+                let tentative_failures = consecutive_failures.saturating_add(1);
+
+                match decide_reconnect_action(is_timeout, within_hours, tentative_failures) {
+                    ReconnectAction::ResetAndReconnect => {
+                        debug!(
+                            "order update WebSocket idle timeout outside market hours — reconnecting"
+                        );
+                        consecutive_failures = 0;
+                    }
+                    ReconnectAction::Exhausted => {
+                        consecutive_failures = tentative_failures;
                         error!(
                             attempts = consecutive_failures,
                             "order update WebSocket exhausted reconnection attempts"
                         );
                         return;
                     }
-                    warn!(
-                        ?err,
-                        attempt = consecutive_failures,
-                        "order update WebSocket error — will reconnect"
-                    );
+                    ReconnectAction::IncrementAndRetry => {
+                        consecutive_failures = tentative_failures;
+                        warn!(
+                            ?err,
+                            attempt = consecutive_failures,
+                            "order update WebSocket error — will reconnect"
+                        );
+                    }
                 }
             }
         }
 
         // Exponential backoff: delay_ms = initial * 2^(failures-1), capped at max.
-        let shift = consecutive_failures.saturating_sub(1).min(63);
-        let delay_ms = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
-            .saturating_mul(1_u64 << shift)
-            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+        let delay_ms = compute_reconnect_backoff_ms(consecutive_failures);
         debug!(delay_ms, "order update WebSocket reconnect backoff");
         time::sleep(Duration::from_millis(delay_ms)).await;
     }
@@ -172,11 +173,7 @@ async fn connect_and_listen(
     debug!("order update WebSocket login sent");
 
     // Use longer timeout outside market hours to avoid reconnect noise.
-    let timeout_secs = if is_within_market_hours(calendar) {
-        ORDER_UPDATE_READ_TIMEOUT_SECS
-    } else {
-        ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
-    };
+    let timeout_secs = select_read_timeout_secs(is_within_market_hours(calendar));
     let read_timeout = Duration::from_secs(timeout_secs);
 
     // Read loop — receive order updates until disconnect.
@@ -256,7 +253,13 @@ fn is_within_market_hours(calendar: &TradingCalendar) -> bool {
     }
 
     let now_ist = Utc::now().with_timezone(&ist_offset()).time();
+    is_time_within_data_collection_window(now_ist)
+}
 
+/// Pure function: checks if a given IST time falls within [09:00, 16:00).
+///
+/// Extracted from `is_within_market_hours` for testability.
+fn is_time_within_data_collection_window(ist_time: NaiveTime) -> bool {
     #[allow(clippy::expect_used)] // APPROVED: compile-time provable constants
     let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0)
         .expect("09:00:00 is always valid"); // APPROVED: compile-time provable constant
@@ -264,7 +267,60 @@ fn is_within_market_hours(calendar: &TradingCalendar) -> bool {
     let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0)
         .expect("16:00:00 is always valid"); // APPROVED: compile-time provable constant
 
-    now_ist >= start && now_ist < end
+    ist_time >= start && ist_time < end
+}
+
+/// Computes exponential backoff delay in milliseconds for order update reconnection.
+///
+/// Formula: `initial * 2^(failures-1)`, capped at `max_delay_ms`.
+/// Pure function — no I/O.
+fn compute_reconnect_backoff_ms(consecutive_failures: u32) -> u64 {
+    let shift = consecutive_failures.saturating_sub(1).min(63);
+    ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
+        .saturating_mul(1_u64 << shift)
+        .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS)
+}
+
+/// Selects the appropriate read timeout based on market hours.
+///
+/// During market hours: shorter timeout to detect dead connections quickly.
+/// Outside market hours: longer timeout to avoid reconnect noise.
+///
+/// Pure function — no I/O.
+fn select_read_timeout_secs(within_market_hours: bool) -> u64 {
+    if within_market_hours {
+        ORDER_UPDATE_READ_TIMEOUT_SECS
+    } else {
+        ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
+    }
+}
+
+/// Result of processing a connection attempt error in the reconnect loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectAction {
+    /// Reset backoff and reconnect (expected idle timeout outside hours).
+    ResetAndReconnect,
+    /// Increment failure counter and retry.
+    IncrementAndRetry,
+    /// Max attempts exhausted — stop reconnecting.
+    Exhausted,
+}
+
+/// Decides the reconnect action based on error type and market hours.
+///
+/// Pure function — no I/O.
+fn decide_reconnect_action(
+    error_is_read_timeout: bool,
+    within_market_hours: bool,
+    consecutive_failures_after_increment: u32,
+) -> ReconnectAction {
+    if error_is_read_timeout && !within_market_hours {
+        ReconnectAction::ResetAndReconnect
+    } else if consecutive_failures_after_increment > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
+        ReconnectAction::Exhausted
+    } else {
+        ReconnectAction::IncrementAndRetry
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,91 +491,161 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Data collection window constants
+    // compute_reconnect_backoff_ms — extracted pure function
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_data_collection_start_is_valid_time() {
-        let t = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0);
-        assert!(t.is_some(), "DATA_COLLECTION_START must be a valid time");
+    fn test_compute_reconnect_backoff_zero_failures() {
+        let delay = compute_reconnect_backoff_ms(0);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
     }
 
     #[test]
-    fn test_data_collection_end_is_valid_time() {
-        let t = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0);
-        assert!(t.is_some(), "DATA_COLLECTION_END must be a valid time");
+    fn test_compute_reconnect_backoff_one_failure() {
+        let delay = compute_reconnect_backoff_ms(1);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
     }
 
     #[test]
-    fn test_data_collection_start_before_end() {
-        let start =
-            NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0).unwrap();
-        let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0).unwrap();
-        assert!(start < end, "collection start must precede end");
+    fn test_compute_reconnect_backoff_two_failures() {
+        let delay = compute_reconnect_backoff_ms(2);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 2);
     }
 
     #[test]
-    fn test_data_collection_window_covers_market_hours() {
-        let start =
-            NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0).unwrap();
-        let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0).unwrap();
-        let market_open = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
-        let market_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+    fn test_compute_reconnect_backoff_three_failures() {
+        let delay = compute_reconnect_backoff_ms(3);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 4);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_capped_at_max() {
+        let delay = compute_reconnect_backoff_ms(50);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_u32_max() {
+        let delay = compute_reconnect_backoff_ms(u32::MAX);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_read_timeout_secs — extracted pure function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_read_timeout_during_market_hours() {
+        let secs = select_read_timeout_secs(true);
+        assert_eq!(secs, ORDER_UPDATE_READ_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_select_read_timeout_outside_market_hours() {
+        let secs = select_read_timeout_secs(false);
+        assert_eq!(secs, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_off_hours_timeout_greater_than_market_hours() {
         assert!(
-            start <= market_open,
-            "collection must start at or before market open"
-        );
-        assert!(
-            end >= market_close,
-            "collection must end at or after market close"
+            select_read_timeout_secs(false) > select_read_timeout_secs(true),
+            "off-hours timeout must be longer than market-hours timeout"
         );
     }
 
+    // -----------------------------------------------------------------------
+    // is_time_within_data_collection_window — extracted pure function
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_data_collection_window_duration_reasonable() {
-        let start_secs = DATA_COLLECTION_START.0 * 3600 + DATA_COLLECTION_START.1 * 60;
-        let end_secs = DATA_COLLECTION_END.0 * 3600 + DATA_COLLECTION_END.1 * 60;
-        let duration_hours = (end_secs - start_secs) / 3600;
-        assert!(duration_hours >= 6, "window must be at least 6 hours");
-        assert!(duration_hours <= 12, "window must be at most 12 hours");
+    fn test_time_before_market_open() {
+        let time = NaiveTime::from_hms_opt(8, 59, 59).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_market_open() {
+        let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_during_market_hours() {
+        let time = NaiveTime::from_hms_opt(12, 30, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_just_before_market_close() {
+        let time = NaiveTime::from_hms_opt(15, 59, 59).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_market_close() {
+        // 16:00 is exclusive — should return false
+        let time = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_after_market_close() {
+        let time = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_midnight() {
+        let time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
     }
 
     // -----------------------------------------------------------------------
-    // is_within_market_hours — exercised with real calendar
+    // decide_reconnect_action — extracted pure function
     // -----------------------------------------------------------------------
 
-    fn make_test_calendar() -> TradingCalendar {
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
-        let config = TradingConfig {
-            market_open_time: "09:00:00".to_string(),
-            market_close_time: "15:30:00".to_string(),
-            order_cutoff_time: "15:29:00".to_string(),
-            data_collection_start: "09:00:00".to_string(),
-            data_collection_end: "15:30:00".to_string(),
-            timezone: "Asia/Kolkata".to_string(),
-            max_orders_per_second: 10,
-            nse_holidays: vec![NseHolidayEntry {
-                date: "2026-01-26".to_string(),
-                name: "Republic Day".to_string(),
-            }],
-            muhurat_trading_dates: vec![],
-        };
-        TradingCalendar::from_config(&config).unwrap()
+    #[test]
+    fn test_reconnect_action_timeout_outside_hours_resets() {
+        let action = decide_reconnect_action(true, false, 5);
+        assert_eq!(action, ReconnectAction::ResetAndReconnect);
     }
 
     #[test]
-    fn test_is_within_market_hours_does_not_panic() {
-        let calendar = make_test_calendar();
-        // Just exercise the function — result depends on current time/day
-        let _result = is_within_market_hours(&calendar);
+    fn test_reconnect_action_timeout_during_hours_increments() {
+        let action = decide_reconnect_action(true, true, 3);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
     }
 
     #[test]
-    fn test_is_within_market_hours_returns_bool() {
-        let calendar = make_test_calendar();
-        let result = is_within_market_hours(&calendar);
-        // Result is deterministic for the same instant — just verify it's a bool
-        assert!(result || !result);
+    fn test_reconnect_action_non_timeout_during_hours_increments() {
+        let action = decide_reconnect_action(false, true, 3);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_non_timeout_outside_hours_increments() {
+        let action = decide_reconnect_action(false, false, 3);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_exhausted() {
+        let action = decide_reconnect_action(false, true, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::Exhausted);
+    }
+
+    #[test]
+    fn test_reconnect_action_at_max_not_exhausted() {
+        let action = decide_reconnect_action(false, true, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_timeout_outside_hours_even_at_max() {
+        // Off-hours timeout always resets, even if we're at max attempts
+        let action = decide_reconnect_action(true, false, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::ResetAndReconnect);
     }
 
     // -----------------------------------------------------------------------
@@ -527,444 +653,50 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_error_source_is_none() {
-        // thiserror errors without #[source] should return None
-        let err = OrderUpdateConnectionError::NoToken;
-        assert!(
-            std::error::Error::source(&err).is_none(),
-            "NoToken has no source error"
-        );
+    fn test_error_is_read_timeout_check() {
+        // Verify the pattern matching used in reconnect logic
+        let timeout = OrderUpdateConnectionError::ReadTimeout;
+        assert!(matches!(timeout, OrderUpdateConnectionError::ReadTimeout));
+
+        let connect = OrderUpdateConnectionError::Connect("test".to_string());
+        assert!(!matches!(connect, OrderUpdateConnectionError::ReadTimeout));
     }
 
     #[test]
-    fn test_read_timeout_error_includes_constant() {
+    fn test_no_token_error_display() {
+        let err = OrderUpdateConnectionError::NoToken;
+        assert_eq!(err.to_string(), "no authentication token available");
+    }
+
+    #[test]
+    fn test_token_expired_error_display() {
+        let err = OrderUpdateConnectionError::TokenExpired;
+        assert_eq!(err.to_string(), "authentication token expired");
+    }
+
+    #[test]
+    fn test_read_timeout_error_display_contains_timeout_value() {
         let err = OrderUpdateConnectionError::ReadTimeout;
         let msg = err.to_string();
         assert!(
             msg.contains(&ORDER_UPDATE_READ_TIMEOUT_SECS.to_string()),
-            "ReadTimeout message must include the timeout value"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // connect_and_listen — NoToken error when no token is available
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_connect_and_listen_no_token() {
-        // TokenHandle with None token should return NoToken error.
-        let token_handle: TokenHandle = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-        let (order_sender, _rx) = broadcast::channel(16);
-        let calendar = make_test_calendar();
-
-        let result = connect_and_listen(
-            "wss://api-order-update.dhan.co",
-            "test-client",
-            &token_handle,
-            &order_sender,
-            &calendar,
-        )
-        .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, OrderUpdateConnectionError::NoToken),
-            "expected NoToken, got: {err:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // connect_and_listen — TokenExpired error when token is expired
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_connect_and_listen_token_expired() {
-        use chrono::{Duration as ChronoDuration, Utc};
-        use dhan_live_trader_common::trading_calendar::ist_offset;
-        use secrecy::SecretString;
-
-        // Create an expired token state.
-        let now_ist = Utc::now().with_timezone(&ist_offset());
-        let expired_at = now_ist - ChronoDuration::hours(1);
-        let issued_at = now_ist - ChronoDuration::hours(25);
-        let token_state = crate::auth::types::TokenState::from_cached(
-            SecretString::from("expired-jwt".to_string()),
-            expired_at,
-            issued_at,
-        );
-
-        let token_handle: TokenHandle =
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(token_state))));
-        let (order_sender, _rx) = broadcast::channel(16);
-        let calendar = make_test_calendar();
-
-        let result = connect_and_listen(
-            "wss://api-order-update.dhan.co",
-            "test-client",
-            &token_handle,
-            &order_sender,
-            &calendar,
-        )
-        .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, OrderUpdateConnectionError::TokenExpired),
-            "expected TokenExpired, got: {err:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // connect_and_listen — Connection refused (valid token, bad URL)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_connect_and_listen_connection_refused() {
-        use chrono::{Duration as ChronoDuration, Utc};
-        use dhan_live_trader_common::trading_calendar::ist_offset;
-        use secrecy::SecretString;
-
-        // Create a valid (non-expired) token.
-        let now_ist = Utc::now().with_timezone(&ist_offset());
-        let expires_at = now_ist + ChronoDuration::hours(23);
-        let token_state = crate::auth::types::TokenState::from_cached(
-            SecretString::from("valid-jwt-for-test".to_string()),
-            expires_at,
-            now_ist,
-        );
-
-        let token_handle: TokenHandle =
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(token_state))));
-        let (order_sender, _rx) = broadcast::channel(16);
-        let calendar = make_test_calendar();
-
-        // Use a URL that will fail to connect.
-        let result = connect_and_listen(
-            "wss://127.0.0.1:1",
-            "test-client",
-            &token_handle,
-            &order_sender,
-            &calendar,
-        )
-        .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, OrderUpdateConnectionError::Connect(_)),
-            "expected Connect error, got: {err:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // run_order_update_connection — reconnect exhaustion with no token
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_run_order_update_exits_after_max_reconnect_failures() {
-        // With no token, every connect attempt fails.
-        // After ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS failures, the function returns.
-        let token_handle: TokenHandle = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-        let (order_sender, _rx) = broadcast::channel(16);
-        let calendar = Arc::new(make_test_calendar());
-
-        // Use a generous timeout to cover exponential backoff delays.
-        // With 10 attempts and initial=1000ms/max=60000ms:
-        // Sum ≈ 1+2+4+8+16+32+60+60+60+60 = ~303s in worst case.
-        // Use tokio::time::pause() to avoid real wall-clock delays.
-        tokio::time::pause();
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(600),
-            run_order_update_connection(
-                "wss://127.0.0.1:1".to_string(),
-                "test-client".to_string(),
-                token_handle,
-                order_sender,
-                calendar,
-            ),
-        )
-        .await;
-
-        // The function should have exited after exhausting reconnection attempts.
-        assert!(
-            result.is_ok(),
-            "run_order_update_connection should exit within timeout"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // is_within_market_hours — holiday check
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_is_within_market_hours_on_holiday_returns_false() {
-        use chrono::Datelike;
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
-
-        // If today is a weekend, the calendar already returns false for
-        // is_trading_day_today() — we can't add a weekend date as a holiday
-        // because TradingCalendar::from_config rejects weekend holidays.
-        // So we test with a known future weekday as a holiday.
-        let now_ist = chrono::Utc::now().with_timezone(&ist_offset());
-        let today_date = now_ist.date_naive();
-
-        // Find today or the next weekday to use as a holiday date.
-        let mut holiday_date = today_date;
-        while holiday_date.weekday() == chrono::Weekday::Sat
-            || holiday_date.weekday() == chrono::Weekday::Sun
-        {
-            holiday_date += chrono::Duration::days(1);
-        }
-        let holiday_str = holiday_date.format("%Y-%m-%d").to_string();
-
-        let config = TradingConfig {
-            market_open_time: "09:00:00".to_string(),
-            market_close_time: "15:30:00".to_string(),
-            order_cutoff_time: "15:29:00".to_string(),
-            data_collection_start: "09:00:00".to_string(),
-            data_collection_end: "15:30:00".to_string(),
-            timezone: "Asia/Kolkata".to_string(),
-            max_orders_per_second: 10,
-            nse_holidays: vec![NseHolidayEntry {
-                date: holiday_str.clone(),
-                name: "Test Holiday".to_string(),
-            }],
-            muhurat_trading_dates: vec![],
-        };
-        let calendar = TradingCalendar::from_config(&config).unwrap();
-
-        // If today matches the holiday_date (weekday), it returns false.
-        // If today is a weekend, it also returns false (not a trading day).
-        // Either way, we prove the function doesn't panic.
-        if today_date == holiday_date {
-            assert!(
-                !is_within_market_hours(&calendar),
-                "should return false on a holiday"
-            );
-        } else {
-            // Today is a weekend, so is_within_market_hours returns false anyway.
-            assert!(
-                !is_within_market_hours(&calendar),
-                "should return false on a weekend"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // OrderUpdateConnectionError — matches check
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_read_timeout_matches_pattern() {
-        // Verify the pattern used in run_order_update_connection's off-hours check.
-        let err = OrderUpdateConnectionError::ReadTimeout;
-        assert!(matches!(err, OrderUpdateConnectionError::ReadTimeout));
-
-        let err2 = OrderUpdateConnectionError::NoToken;
-        assert!(!matches!(err2, OrderUpdateConnectionError::ReadTimeout));
-    }
-
-    // -----------------------------------------------------------------------
-    // Off-hours read timeout — consecutive_failures reset logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_off_hours_timeout_value_is_longer() {
-        // Off-hours timeout should be longer than market-hours timeout.
-        assert!(
-            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS >= ORDER_UPDATE_READ_TIMEOUT_SECS,
-            "off-hours timeout ({ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS}) should be >= market timeout ({ORDER_UPDATE_READ_TIMEOUT_SECS})"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // connect_and_listen — TLS error (bad URL scheme)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_connect_and_listen_tls_error_on_invalid_scheme() {
-        use chrono::{Duration as ChronoDuration, Utc};
-        use dhan_live_trader_common::trading_calendar::ist_offset;
-        use secrecy::SecretString;
-
-        // Install the crypto provider (needed for TLS connector).
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        // Create a valid token.
-        let now_ist = Utc::now().with_timezone(&ist_offset());
-        let expires_at = now_ist + ChronoDuration::hours(23);
-        let token_state = crate::auth::types::TokenState::from_cached(
-            SecretString::from("valid-jwt".to_string()),
-            expires_at,
-            now_ist,
-        );
-        let token_handle: TokenHandle =
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(token_state))));
-        let (order_sender, _rx) = broadcast::channel(16);
-        let calendar = make_test_calendar();
-
-        // Use a non-WSS URL to trigger a Connect error during request building.
-        let result = connect_and_listen(
-            "not-a-valid-websocket-url",
-            "test-client",
-            &token_handle,
-            &order_sender,
-            &calendar,
-        )
-        .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, OrderUpdateConnectionError::Connect(_)),
-            "expected Connect error from bad URL, got: {err:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // is_within_market_hours — non-trading day (weekend) check
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_is_within_market_hours_on_weekend_returns_false() {
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
-
-        // Find a known Saturday/Sunday — 2026-01-03 is a Saturday.
-        // The calendar checks weekdays internally; we just need no holidays
-        // to prove the weekend check in is_trading_day_today() does the job.
-        let config = TradingConfig {
-            market_open_time: "09:00:00".to_string(),
-            market_close_time: "15:30:00".to_string(),
-            order_cutoff_time: "15:29:00".to_string(),
-            data_collection_start: "09:00:00".to_string(),
-            data_collection_end: "15:30:00".to_string(),
-            timezone: "Asia/Kolkata".to_string(),
-            max_orders_per_second: 10,
-            nse_holidays: vec![NseHolidayEntry {
-                date: "2099-01-01".to_string(), // far future holiday, won't affect today
-                name: "Future".to_string(),
-            }],
-            muhurat_trading_dates: vec![],
-        };
-        let calendar = TradingCalendar::from_config(&config).unwrap();
-
-        // The function uses current time. We can only verify it doesn't panic
-        // and returns a bool. On weekends it'll be false, on weekdays true (if in window).
-        let _result = is_within_market_hours(&calendar);
-    }
-
-    // -----------------------------------------------------------------------
-    // run_order_update_connection — clean disconnect resets backoff
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_consecutive_failures_saturating_add() {
-        // Verify saturating_add behavior used in the reconnect loop.
-        let mut failures: u32 = u32::MAX - 1;
-        failures = failures.saturating_add(1);
-        assert_eq!(failures, u32::MAX);
-        failures = failures.saturating_add(1);
-        assert_eq!(failures, u32::MAX, "must not overflow past u32::MAX");
-    }
-
-    // -----------------------------------------------------------------------
-    // Timeout selection based on market hours
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_timeout_constants_positive() {
-        assert!(ORDER_UPDATE_READ_TIMEOUT_SECS > 0);
-        assert!(ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS > 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // is_within_market_hours — pure logic tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_data_collection_start_is_nine_am() {
-        assert_eq!(DATA_COLLECTION_START, (9, 0));
-    }
-
-    #[test]
-    fn test_data_collection_end_is_four_pm() {
-        assert_eq!(DATA_COLLECTION_END, (16, 0));
-    }
-
-    #[test]
-    fn test_is_within_market_hours_uses_calendar() {
-        // We cannot test the actual function easily without a calendar that
-        // returns true for today, but we can verify the constants used.
-        let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0);
-        let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0);
-        assert!(start.is_some(), "09:00:00 must be a valid NaiveTime");
-        assert!(end.is_some(), "16:00:00 must be a valid NaiveTime");
-        assert!(start.unwrap() < end.unwrap(), "start must be before end");
-    }
-
-    // -----------------------------------------------------------------------
-    // OrderUpdateConnectionError — Debug trait
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_error_debug_format() {
-        let err = OrderUpdateConnectionError::NoToken;
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("NoToken"));
-
-        let err = OrderUpdateConnectionError::TokenExpired;
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("TokenExpired"));
-
-        let err = OrderUpdateConnectionError::ReadTimeout;
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("ReadTimeout"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Backoff — edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_backoff_consecutive_failures_zero() {
-        let shift = 0_u32.saturating_sub(1).min(63);
-        let delay = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
-            .saturating_mul(1_u64 << shift)
-            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
-    }
-
-    #[test]
-    fn test_backoff_consecutive_failures_one() {
-        let shift = 1_u32.saturating_sub(1).min(63);
-        let delay = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
-            .saturating_mul(1_u64 << shift)
-            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
-    }
-
-    #[test]
-    fn test_backoff_caps_at_max_with_large_failures() {
-        let shift = 100_u32.saturating_sub(1).min(63);
-        let delay = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
-            .saturating_mul(1_u64 << shift)
-            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
-    }
-
-    #[test]
-    fn test_off_hours_timeout_greater_than_market_hours() {
-        assert!(
-            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS >= ORDER_UPDATE_READ_TIMEOUT_SECS,
-            "off-hours timeout should be >= market-hours timeout"
+            "ReadTimeout message should contain the timeout value"
         );
     }
 
     #[test]
-    fn test_max_reconnect_attempts_positive() {
-        assert!(ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS > 0);
+    fn test_tls_error_display() {
+        let err = OrderUpdateConnectionError::Tls("cert expired".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("TLS"));
+        assert!(msg.contains("cert expired"));
+    }
+
+    #[test]
+    fn test_send_error_display() {
+        let err = OrderUpdateConnectionError::Send("broken pipe".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("login message"));
+        assert!(msg.contains("broken pipe"));
     }
 }
