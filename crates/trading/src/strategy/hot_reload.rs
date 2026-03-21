@@ -795,6 +795,70 @@ target_atr_multiplier = 3.0
         cleanup_temp_dir(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // Watcher init failure — force notify::Error through WatcherInit variant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watcher_init_error_variant_converts_from_notify_error() {
+        // Verify the From<notify::Error> -> HotReloadError::WatcherInit path
+        let notify_err = notify::Error::path_not_found();
+        let hot_err = HotReloadError::WatcherInit(notify_err);
+        let display = format!("{hot_err}");
+        assert!(
+            display.contains("file watcher"),
+            "WatcherInit variant must format with 'file watcher' prefix"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Invalid TOML recovery — simulate valid → invalid → valid cycle via channel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_invalid_toml_keeps_old_config_via_no_event() {
+        // 1) Load valid config → sender gets event
+        // 2) Overwrite with invalid config → sender gets NO event
+        // 3) The consumer still holds the first event (old config preserved)
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+
+        // Initial valid load
+        handle_file_change(&file_path, &sender);
+        let initial = receiver.try_recv().unwrap();
+        assert_eq!(initial.strategies[0].name, "test_strategy");
+
+        // Overwrite with syntactically invalid TOML
+        std::fs::write(&file_path, "broken [[[[ toml %%").unwrap();
+        handle_file_change(&file_path, &sender);
+
+        // No new event — consumer retains initial config
+        assert!(
+            receiver.try_recv().is_err(),
+            "invalid TOML must not push event; old config is retained"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Receiver dropped — multiple valid TOMLs with dropped receiver
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_repeated_sends_on_dropped_receiver_no_panic() {
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        drop(receiver);
+
+        // Multiple calls with valid TOML must not panic despite dropped receiver
+        handle_file_change(&file_path, &sender);
+        handle_file_change(&file_path, &sender);
+        handle_file_change(&file_path, &sender);
+
+        cleanup_temp_dir(&dir);
+    }
+
     #[test]
     fn reload_event_carries_multiple_strategies() {
         let multi = r#"
@@ -858,6 +922,76 @@ threshold = 25.0
             assert_eq!(evt.strategies[0].name, "updated_strategy");
         }
         // If no event detected (watcher timing), that's OK for coverage purposes
+
+        cleanup_temp_dir(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Watcher init failure — nonexistent parent directory
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_fails_when_parent_directory_missing() {
+        // A config path whose parent directory does not exist should fail
+        // at either file read or watcher setup.
+        let path = Path::new("/tmp/dlt_hot_reload_no_such_parent_dir_12345/nested/config.toml");
+        let result = StrategyHotReloader::new(path);
+        assert!(
+            result.is_err(),
+            "nonexistent parent directory must cause failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Invalid TOML recovery: handle_file_change keeps old config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_invalid_then_valid_recovers() {
+        // Simulate: valid config loaded at startup, then bad TOML on disk,
+        // then restored. Old config is retained during the bad window.
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+
+        // Load initial valid config
+        handle_file_change(&file_path, &sender);
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(first.strategies.len(), 1);
+
+        // Overwrite with invalid TOML
+        std::fs::write(&file_path, "[[[[broken").unwrap();
+        handle_file_change(&file_path, &sender);
+        // No event sent — old config stays
+        assert!(
+            receiver.try_recv().is_err(),
+            "invalid TOML must not produce event"
+        );
+
+        // Restore valid TOML
+        std::fs::write(&file_path, VALID_STRATEGY_TOML).unwrap();
+        handle_file_change(&file_path, &sender);
+        let recovered = receiver.try_recv().unwrap();
+        assert_eq!(
+            recovered.strategies[0].name, "test_strategy",
+            "must recover after valid TOML is restored"
+        );
+
+        cleanup_temp_dir(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Receiver dropped — sender.send fails gracefully
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_file_change_send_fails_on_dropped_receiver_no_panic() {
+        // This tests the warn! branch when sender.send() returns Err.
+        let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        drop(receiver); // Drop receiver BEFORE handle_file_change
+
+        // Must not panic — the warn! path handles the error
+        handle_file_change(&file_path, &sender);
 
         cleanup_temp_dir(&dir);
     }

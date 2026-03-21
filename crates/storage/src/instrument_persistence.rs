@@ -3760,6 +3760,267 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Coverage: write_build_metadata / write_underlyings /
+    // write_derivative_contracts / write_subscribed_indices with TCP drain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_build_metadata_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let metadata = make_test_metadata();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_build_metadata(&mut sender, &mut buffer, &metadata, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_build_metadata must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_underlyings_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let mut underlyings = std::collections::HashMap::new();
+        underlyings.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+        underlyings.insert(
+            "BANKNIFTY".to_string(),
+            make_test_underlying("BANKNIFTY", 26009),
+        );
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_underlyings must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_derivative_contracts_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let mut contracts = std::collections::HashMap::new();
+        for sec_id in 50001..50011_u32 {
+            contracts.insert(sec_id, make_test_contract(sec_id));
+        }
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result =
+            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_derivative_contracts must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_subscribed_indices_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let indices = vec![
+            make_test_fno_index("NIFTY", 13),
+            make_test_fno_index("BANKNIFTY", 25),
+            make_test_display_index("INDIA VIX", 21, IndexSubcategory::Volatility),
+        ];
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_subscribed_indices must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_subscribed_indices_empty_list_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let indices: Vec<SubscribedIndex> = vec![];
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "empty indices list should not attempt to flush"
+        );
+    }
+
+    #[test]
+    fn test_write_derivative_contracts_empty_map_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let contracts: std::collections::HashMap<SecurityId, DerivativeContract> =
+            std::collections::HashMap::new();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result =
+            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "empty contracts should not attempt to flush"
+        );
+    }
+
+    #[test]
+    fn test_write_underlyings_single_entry_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let mut underlyings = std::collections::HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_string(),
+                underlying_security_id: 2885,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 250,
+                contract_count: 120,
+            },
+        );
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "single underlying write must succeed: {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ensure_instrument_tables success path with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, info!/debug! field expressions are evaluated.
+        ensure_instrument_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ensure_table_dedup_keys success path with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_table_dedup_keys_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Covers the success branch of ensure_table_dedup_keys.
+        ensure_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ensure_table_dedup_keys send error with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_table_dedup_keys_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Covers the Err branch of the DEDUP send.
+        ensure_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: LifecycleEvent clone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_clone_roundtrip() {
+        let event = LifecycleEvent {
+            security_id: 42,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: String::new(),
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.security_id, 42);
+        assert_eq!(cloned.underlying_symbol, "NIFTY");
+        assert_eq!(cloned.event_type, LifecycleEventType::ContractAdded);
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_eq_and_ne() {
+        assert_eq!(
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractAdded
+        );
+        assert_ne!(
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractExpired
+        );
+    }
+
     #[tokio::test]
     async fn test_persist_inner_write_error_covers_question_mark_propagation() {
         let _guard = install_test_subscriber();

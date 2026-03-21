@@ -844,6 +844,101 @@ mod tests {
         assert_eq!(snap.sma, 0.0, "sma_period=0 must yield sma=0.0");
     }
 
+    // -----------------------------------------------------------------------
+    // Additional coverage: out-of-bounds edge, warmup saturation, zero-volume VWAP
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_out_of_bounds_security_id_one_above_max_returns_default() {
+        let mut engine = default_engine();
+        let oob_id = MAX_INDICATOR_INSTRUMENTS as u32;
+        let tick = make_tick(oob_id, 500.0, 510.0, 490.0, 10000);
+        let snap = engine.update(&tick);
+        assert_eq!(snap.security_id, oob_id);
+        assert!(!snap.is_warm);
+        assert_eq!(snap.ema_fast, 0.0);
+        assert_eq!(snap.vwap, 0.0);
+        assert_eq!(snap.obv, 0.0);
+    }
+
+    #[test]
+    fn test_zero_volume_vwap_stays_unchanged_across_ticks() {
+        let mut engine = default_engine();
+        // First tick with volume → VWAP set
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let snap1 = engine.update(&make_tick(100, 110.0, 115.0, 105.0, 1000));
+        let vwap_after_volume = snap1.vwap;
+        assert!(
+            vwap_after_volume > 0.0,
+            "VWAP should be positive with volume"
+        );
+
+        // Subsequent tick with zero volume → VWAP unchanged
+        let snap2 = engine.update(&make_tick(100, 120.0, 125.0, 115.0, 0));
+        assert!(
+            (snap2.vwap - vwap_after_volume).abs() < f64::EPSILON,
+            "zero volume must not change VWAP accumulator"
+        );
+    }
+
+    #[test]
+    fn test_warmup_count_starts_at_one_after_first_tick() {
+        let mut engine = default_engine();
+        let sid = 50_usize;
+        let tick = make_tick(50, 100.0, 105.0, 95.0, 1000);
+        engine.update(&tick);
+        assert_eq!(engine.states[sid].warmup_count, 1);
+    }
+
+    #[test]
+    fn test_warmup_saturation_does_not_affect_indicator_computation() {
+        let mut engine = default_engine();
+        let sid = 100_usize;
+
+        // Set warmup_count to u16::MAX
+        engine.states[sid].warmup_count = u16::MAX;
+
+        // Feed two ticks at different prices
+        let tick1 = make_tick(100, 100.0, 105.0, 95.0, 1000);
+        let snap1 = engine.update(&tick1);
+        assert!(snap1.is_warm);
+
+        let tick2 = make_tick(100, 110.0, 115.0, 105.0, 1000);
+        let snap2 = engine.update(&tick2);
+
+        // EMA should have moved toward 110
+        assert!(
+            snap2.ema_fast > snap1.ema_fast,
+            "EMA must still update at saturated warmup"
+        );
+        // warmup_count stays at MAX
+        assert_eq!(engine.states[sid].warmup_count, u16::MAX);
+    }
+
+    #[test]
+    fn test_multiple_zero_volume_ticks_vwap_remains_zero() {
+        let mut engine = default_engine();
+        // All zero-volume ticks → VWAP stays at 0
+        for i in 0..10 {
+            let snap = engine.update(&make_tick(100, 100.0 + i as f32, 110.0, 90.0, 0));
+            assert_eq!(
+                snap.vwap, 0.0,
+                "zero volume across all ticks must keep VWAP at 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bollinger_single_tick_stddev_is_zero() {
+        let mut engine = default_engine();
+        let snap = engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        // With only one data point, variance = 0, so upper == middle == lower
+        assert!(
+            (snap.bollinger_upper - snap.bollinger_lower).abs() < f64::EPSILON,
+            "single tick: bollinger bands must collapse"
+        );
+    }
+
     #[test]
     fn test_warmup_counter_at_max_still_produces_valid_indicators() {
         let mut engine = default_engine();

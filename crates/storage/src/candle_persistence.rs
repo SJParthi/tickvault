@@ -1217,6 +1217,100 @@ mod tests {
         ensure_candle_table_dedup_keys(&config).await;
     }
 
+    // -----------------------------------------------------------------------
+    // Coverage: IST offset arithmetic for historical candles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_append_ist_offset_value_is_19800() {
+        assert_eq!(
+            IST_UTC_OFFSET_SECONDS_I64, 19800,
+            "IST offset must be exactly 5h30m = 19800 seconds"
+        );
+    }
+
+    #[test]
+    fn test_candle_append_negative_timestamp_saturating() {
+        // Negative UTC epoch + IST offset should not underflow (saturating_add).
+        let candle = HistoricalCandle {
+            security_id: 1,
+            exchange_segment_code: EXCHANGE_SEGMENT_IDX_I,
+            timestamp_utc_secs: i64::MIN,
+            timeframe: "1m",
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 105.0,
+            volume: 0,
+            open_interest: 0,
+        };
+        // saturating_add prevents overflow
+        let ist_epoch = candle
+            .timestamp_utc_secs
+            .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+        assert_eq!(ist_epoch, i64::MIN + IST_UTC_OFFSET_SECONDS_I64);
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_has_wal() {
+        assert!(
+            HISTORICAL_CANDLES_CREATE_DDL.contains("WAL"),
+            "DDL must use WAL"
+        );
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_is_single_statement() {
+        assert!(
+            !HISTORICAL_CANDLES_CREATE_DDL.contains(';'),
+            "DDL must be a single statement"
+        );
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_is_idempotent() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: LiveCandleWriter append with edge case values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_writer_append_zero_timestamp() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Zero timestamp is edge case — should not panic
+        writer
+            .append_candle(1, 0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+        writer.force_flush().unwrap();
+    }
+
+    #[test]
+    fn test_live_candle_writer_uses_candles_1s_table() {
+        // Verify LiveCandleWriter writes to candles_1s, not historical_candles
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let writer = LiveCandleWriter::new(&config);
+        assert!(writer.is_ok());
+        // The table name QUESTDB_TABLE_CANDLES_1S is used internally
+        assert_eq!(QUESTDB_TABLE_CANDLES_1S, "candles_1s");
+    }
+
     #[tokio::test]
     async fn test_ensure_candle_table_dedup_send_error_with_tracing() {
         let _guard = install_test_subscriber();

@@ -1279,6 +1279,129 @@ threshold = 0.0
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Additional validation boundary tests for coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_position_size_fraction_just_above_zero_accepted() {
+        let toml = r#"
+[[strategy]]
+name = "tiny_size"
+security_ids = [1]
+position_size_fraction = 0.001
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_ok(),
+            "position_size_fraction=0.001 must be accepted"
+        );
+        let (defs, _) = result.unwrap();
+        assert!((defs[0].position_size_fraction - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_position_size_fraction_just_below_one_accepted() {
+        let toml = r#"
+[[strategy]]
+name = "almost_full"
+security_ids = [1]
+position_size_fraction = 0.999
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(
+            result.is_ok(),
+            "position_size_fraction=0.999 must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_empty_security_ids_accepted() {
+        // Empty security_ids is structurally valid (strategy just won't match any instruments)
+        let toml = r#"
+[[strategy]]
+name = "no_sids"
+security_ids = []
+stop_loss_atr_multiplier = 2.0
+target_atr_multiplier = 3.0
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_ok(), "empty security_ids must be accepted");
+        let (defs, _) = result.unwrap();
+        assert!(defs[0].security_ids.is_empty());
+    }
+
+    #[test]
+    fn test_entry_long_only_with_exit_conditions_accepted() {
+        let toml = r#"
+[[strategy]]
+name = "long_with_exit"
+security_ids = [1]
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 50.0
+
+[[strategy.exit]]
+field = "atr"
+operator = "lt"
+threshold = 1.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_ok());
+        let (defs, _) = result.unwrap();
+        assert_eq!(defs[0].exit_conditions.len(), 2);
+        assert!(defs[0].entry_short_conditions.is_empty());
+    }
+
+    #[test]
+    fn test_trailing_stop_fields_in_strategy() {
+        let toml = r#"
+[[strategy]]
+name = "trail_enabled"
+security_ids = [1]
+trailing_stop_enabled = true
+trailing_stop_atr_multiplier = 2.5
+confirmation_ticks = 5
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        let result = parse_strategy_config(toml);
+        assert!(result.is_ok());
+        let (defs, _) = result.unwrap();
+        assert!(defs[0].trailing_stop_enabled);
+        assert!((defs[0].trailing_stop_atr_multiplier - 2.5).abs() < f64::EPSILON);
+        assert_eq!(defs[0].confirmation_ticks, 5);
+    }
+
     #[test]
     fn test_lte_operator_in_exit() {
         let toml = r#"

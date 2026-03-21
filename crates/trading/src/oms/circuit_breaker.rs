@@ -481,4 +481,192 @@ mod tests {
             "after half-open failure, circuit must be Open or HalfOpen (not Closed)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Recovery logging path: record_success when prev >= threshold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_success_recovery_resets_all_atomics() {
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(
+                OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD.saturating_add(5),
+            ),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(now_epoch_secs().saturating_sub(100)),
+            reset_timeout: Duration::from_secs(0),
+            half_open_probe_sent: AtomicBool::new(true),
+        };
+
+        // Prev count was well above threshold — this triggers the recovery info! log
+        cb.record_success();
+
+        assert_eq!(cb.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(cb.opened_at_secs.load(Ordering::Relaxed), 0);
+        assert!(!cb.half_open_probe_sent.load(Ordering::Relaxed));
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn record_success_below_threshold_no_recovery_log() {
+        // When prev < threshold, the "recovery" log branch is NOT taken
+        // but the state is still reset correctly.
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(1),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(0),
+            reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        cb.record_success();
+        assert_eq!(cb.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    // -----------------------------------------------------------------------
+    // CAS race condition: half-open probe gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn half_open_cas_gate_sequential_check() {
+        // Simulate two sequential checks: first wins, second loses
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(1),
+            reset_timeout: Duration::from_secs(0),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        // First check: CAS succeeds (false → true)
+        let r1 = cb.check();
+        assert!(r1.is_ok());
+        assert!(cb.half_open_probe_sent.load(Ordering::Relaxed));
+
+        // Second check: CAS fails (already true)
+        let r2 = cb.check();
+        assert!(r2.is_err());
+        assert!(matches!(r2.unwrap_err(), OmsError::CircuitBreakerOpen));
+
+        // Third check also fails
+        let r3 = cb.check();
+        assert!(r3.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent failures: multiple record_failure calls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_failures_all_increment() {
+        let cb = std::sync::Arc::new(OrderCircuitBreaker::new());
+
+        // Spawn multiple threads that each call record_failure once
+        let mut handles = vec![];
+        for _ in 0..OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            let cb_clone = std::sync::Arc::clone(&cb);
+            handles.push(std::thread::spawn(move || {
+                cb_clone.record_failure();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All failures should have been counted
+        assert!(
+            cb.consecutive_failures.load(Ordering::Relaxed)
+                >= OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        );
+        // The circuit should be open
+        assert_ne!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn concurrent_success_and_failure_no_panic() {
+        // Stress test: interleave success and failure calls
+        let cb = std::sync::Arc::new(OrderCircuitBreaker::new());
+
+        let mut handles = vec![];
+        for i in 0..20_u32 {
+            let cb_clone = std::sync::Arc::clone(&cb);
+            handles.push(std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    cb_clone.record_failure();
+                } else {
+                    cb_clone.record_success();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // No panic — final state is either Closed or Open depending on race
+        let state = cb.state();
+        assert!(
+            state == CircuitState::Closed
+                || state == CircuitState::Open
+                || state == CircuitState::HalfOpen,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Half-Open timing: just at the boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_exactly_at_reset_timeout_is_half_open() {
+        let reset_secs = 60_u64;
+        let opened_at = now_epoch_secs().saturating_sub(reset_secs);
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(opened_at),
+            reset_timeout: Duration::from_secs(reset_secs),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+
+        // elapsed_secs >= reset_timeout → HalfOpen
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    // -----------------------------------------------------------------------
+    // record_failure CAS: only first opener sets opened_at
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_failure_cas_only_first_sets_opened_at() {
+        let cb = OrderCircuitBreaker::new();
+
+        // Fill up to threshold
+        for _ in 0..OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+
+        let first_opened = cb.opened_at_secs.load(Ordering::Relaxed);
+        assert!(first_opened > 0, "opened_at must be set after threshold");
+
+        // Additional failure should NOT change opened_at (CAS fails because != 0)
+        cb.record_failure();
+        let second_opened = cb.opened_at_secs.load(Ordering::Relaxed);
+        assert_eq!(
+            first_opened, second_opened,
+            "opened_at must not change on subsequent failures"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Default impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_creates_closed_circuit_breaker() {
+        let cb = OrderCircuitBreaker::default();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failure_threshold, OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD);
+    }
 }

@@ -879,4 +879,78 @@ mod tests {
         );
         unsafe { std::env::remove_var("DLT_API_TOKEN") };
     }
+
+    // -------------------------------------------------------------------
+    // Non-UTF8 Authorization header: to_str().ok() returns None → 401
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_non_utf8_header_returns_401() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{HeaderValue, Request};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let config = ApiAuthConfig::new("secret".to_string());
+
+        let app = Router::new()
+            .route("/protected", get(mock_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                config.clone(),
+                require_bearer_auth,
+            ))
+            .with_state(config);
+
+        // Build a request with a non-UTF8 Authorization header value
+        let mut request = Request::builder()
+            .uri("/protected")
+            .body(Body::empty())
+            .unwrap();
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_bytes(&[0x80, 0x81, 0x82]).unwrap(),
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+        // to_str().ok() returns None → falls through to None match arm → 401
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -------------------------------------------------------------------
+    // Token exactly matching "Bearer " prefix with no token part
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_bearer_prefix_only_returns_401() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let config = ApiAuthConfig::new("nonempty".to_string());
+
+        let app = Router::new()
+            .route("/protected", get(mock_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                config.clone(),
+                require_bearer_auth,
+            ))
+            .with_state(config);
+
+        // "Bearer " (with trailing space but no token) — token is "" which != "nonempty"
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

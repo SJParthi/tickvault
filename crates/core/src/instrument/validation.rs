@@ -1760,4 +1760,248 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 7 — more than 5 orphan futures (warn cap path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_more_than_five_orphan_futures_in_option_chains() {
+        let mut universe = build_valid_universe();
+
+        use dhan_live_trader_common::instrument_types::OptionChain;
+        // Add 7 option chains with non-existent future IDs to trigger the <= 5 warn cap
+        for i in 0..7u32 {
+            let key = OptionChainKey {
+                underlying_symbol: "NIFTY".to_owned(),
+                expiry_date: NaiveDate::from_ymd_opt(2026, 5, i + 1).unwrap(),
+            };
+            universe.option_chains.insert(
+                key,
+                OptionChain {
+                    underlying_symbol: "NIFTY".to_owned(),
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 5, i + 1).unwrap(),
+                    future_security_id: Some(88880 + i),
+                    calls: vec![],
+                    puts: vec![],
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("7 option chains"),
+            "error should report 7 orphan futures: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 8 — more than 5 orphan expiry calendars (warn cap path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_more_than_five_orphan_expiry_calendars() {
+        let mut universe = build_valid_universe();
+
+        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        // Add 7 orphan calendars to test the <= 5 warn cap
+        for i in 0..7u32 {
+            universe.expiry_calendars.insert(
+                format!("ORPHAN_CAL_{}", i),
+                ExpiryCalendar {
+                    underlying_symbol: format!("ORPHAN_CAL_{}", i),
+                    expiry_dates: vec![],
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("7 expiry calendars"),
+            "error should report 7 orphan calendars: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 9 — multiple missing price feeds (warn-only, still passes)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_missing_price_feeds_in_instrument_info_still_passes() {
+        let mut universe = build_valid_universe();
+
+        // Add several stock underlyings with price_feed_security_id not in instrument_info
+        // to exercise the missing_price_feeds > 5 warn cap path and the final
+        // missing_price_feeds > 0 summary warning.
+        for i in 0..8u32 {
+            let symbol = format!("MISSINGPF{}", i);
+            universe.underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol,
+                    underlying_security_id: 70000 + i,
+                    price_feed_security_id: 70000 + i, // not in instrument_info
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 1,
+                },
+            );
+        }
+
+        // Check 9 is warn-only — validation should still pass
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "multiple missing price feeds are warn-only: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 6 — exactly 5 orphan derivatives (boundary of warn cap)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exactly_five_orphan_derivatives_all_warned() {
+        let mut universe = build_valid_universe();
+
+        // Add exactly 5 orphan derivatives — all 5 should get warn logged (not capped)
+        for i in 0..5u32 {
+            universe.derivative_contracts.insert(
+                90030 + i,
+                DerivativeContract {
+                    security_id: 90030 + i,
+                    underlying_symbol: format!("EXACT5ORPHAN{}", i),
+                    instrument_kind: DhanInstrumentKind::FutureStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                    strike_price: 0.0,
+                    option_type: None,
+                    lot_size: 100,
+                    tick_size: 0.05,
+                    symbol_name: format!("EXACT5ORPHAN{}-FUT", i),
+                    display_name: format!("EXACT5ORPHAN{} FUT", i),
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("5 derivative contracts"),
+            "error should report count 5: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 7 — exactly 5 orphan futures (boundary of warn cap)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exactly_five_orphan_futures_in_option_chains() {
+        let mut universe = build_valid_universe();
+
+        use dhan_live_trader_common::instrument_types::OptionChain;
+        for i in 0..5u32 {
+            let key = OptionChainKey {
+                underlying_symbol: "NIFTY".to_owned(),
+                expiry_date: NaiveDate::from_ymd_opt(2026, 6, i + 1).unwrap(),
+            };
+            universe.option_chains.insert(
+                key,
+                OptionChain {
+                    underlying_symbol: "NIFTY".to_owned(),
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 6, i + 1).unwrap(),
+                    future_security_id: Some(77770 + i),
+                    calls: vec![],
+                    puts: vec![],
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("5 option chains"),
+            "error should report 5 orphan chains: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 8 — exactly 5 orphan expiry calendars (boundary)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exactly_five_orphan_expiry_calendars() {
+        let mut universe = build_valid_universe();
+
+        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        for i in 0..5u32 {
+            universe.expiry_calendars.insert(
+                format!("EXACT5CAL{}", i),
+                ExpiryCalendar {
+                    underlying_symbol: format!("EXACT5CAL{}", i),
+                    expiry_dates: vec![],
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("5 expiry calendars"),
+            "error should report 5 orphan calendars: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Check 6 — exactly 6 orphan derivatives (first past warn cap)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_six_orphan_derivatives_sixth_not_warned() {
+        let mut universe = build_valid_universe();
+
+        for i in 0..6u32 {
+            universe.derivative_contracts.insert(
+                90040 + i,
+                DerivativeContract {
+                    security_id: 90040 + i,
+                    underlying_symbol: format!("SIX_ORPHAN{}", i),
+                    instrument_kind: DhanInstrumentKind::FutureStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                    strike_price: 0.0,
+                    option_type: None,
+                    lot_size: 100,
+                    tick_size: 0.05,
+                    symbol_name: format!("SIX_ORPHAN{}-FUT", i),
+                    display_name: format!("SIX_ORPHAN{} FUT", i),
+                },
+            );
+        }
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("6 derivative contracts"),
+            "error should report count 6: {}",
+            err_msg
+        );
+    }
 }

@@ -727,4 +727,258 @@ mod tests {
         assert!(inst.option_type.is_none());
         assert_eq!(inst.instrument_kind, Some(DhanInstrumentKind::FutureStock));
     }
+
+    // --- Category counting with all 5 categories ---
+
+    #[test]
+    fn test_category_counts_all_five_categories() {
+        let instruments = vec![
+            sample_instrument(1, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(2, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(3, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(10, SubscriptionCategory::DisplayIndex),
+            sample_instrument(11, SubscriptionCategory::DisplayIndex),
+            sample_instrument(100, SubscriptionCategory::IndexDerivative),
+            sample_instrument(101, SubscriptionCategory::IndexDerivative),
+            sample_instrument(102, SubscriptionCategory::IndexDerivative),
+            sample_instrument(103, SubscriptionCategory::IndexDerivative),
+            sample_instrument(200, SubscriptionCategory::StockEquity),
+            sample_instrument(300, SubscriptionCategory::StockDerivative),
+            sample_instrument(301, SubscriptionCategory::StockDerivative),
+        ];
+        let registry = InstrumentRegistry::from_instruments(instruments);
+        assert_eq!(registry.len(), 12);
+
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::MajorIndexValue),
+            3,
+        );
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::DisplayIndex),
+            2,
+        );
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::IndexDerivative),
+            4,
+        );
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::StockEquity),
+            1,
+        );
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::StockDerivative),
+            2,
+        );
+
+        // category_counts() map should have exactly 5 entries
+        let counts = registry.category_counts();
+        assert_eq!(counts.len(), 5);
+
+        // Sum of all category counts should equal total
+        let sum: usize = counts.values().sum();
+        assert_eq!(sum, registry.len());
+    }
+
+    // --- Archived builder: stock equity with BSE segment ---
+
+    #[test]
+    fn test_make_stock_equity_from_archived_bse_segment() {
+        let underlying = FnoUnderlying {
+            underlying_symbol: "SENSEX_STOCK".to_string(),
+            underlying_security_id: 30000,
+            price_feed_security_id: 5001,
+            price_feed_segment: ExchangeSegment::BseEquity,
+            derivative_segment: ExchangeSegment::BseFno,
+            kind: crate::instrument_types::UnderlyingKind::Stock,
+            lot_size: 100,
+            contract_count: 50,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&underlying).unwrap();
+        let archived = rkyv::access::<ArchivedFnoUnderlying, rkyv::rancor::Error>(&bytes).unwrap();
+        let inst = make_stock_equity_instrument_from_archived(archived, FeedMode::Quote);
+
+        assert_eq!(inst.security_id, 5001);
+        assert_eq!(inst.exchange_segment, ExchangeSegment::BseEquity);
+        assert_eq!(inst.category, SubscriptionCategory::StockEquity);
+        assert_eq!(inst.underlying_symbol, "SENSEX_STOCK");
+        assert_eq!(inst.display_label, "SENSEX_STOCK");
+        assert_eq!(inst.feed_mode, FeedMode::Quote);
+        assert!(inst.instrument_kind.is_none());
+        assert!(inst.expiry_date.is_none());
+        assert!(inst.strike_price.is_none());
+        assert!(inst.option_type.is_none());
+    }
+
+    // --- Archived builder: derivative with Put option ---
+
+    #[test]
+    fn test_make_derivative_from_archived_put_option() {
+        let contract = DerivativeContract {
+            security_id: 52500,
+            underlying_symbol: "BANKNIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+            strike_price: 45000.0,
+            option_type: Some(OptionType::Put),
+            lot_size: 15,
+            tick_size: 0.05,
+            symbol_name: "BANKNIFTY-30APR26-45000-PE".to_string(),
+            display_name: "BANKNIFTY 45000 PE Apr26".to_string(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+        let archived =
+            rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+        let inst = make_derivative_instrument_from_archived(
+            archived,
+            SubscriptionCategory::IndexDerivative,
+            FeedMode::Full,
+        );
+
+        assert_eq!(inst.security_id, 52500);
+        assert_eq!(inst.exchange_segment, ExchangeSegment::NseFno);
+        assert_eq!(inst.category, SubscriptionCategory::IndexDerivative);
+        assert_eq!(inst.underlying_symbol, "BANKNIFTY");
+        assert_eq!(inst.display_label, "BANKNIFTY 45000 PE Apr26");
+        assert_eq!(inst.instrument_kind, Some(DhanInstrumentKind::OptionIndex));
+        assert_eq!(
+            inst.expiry_date,
+            Some(NaiveDate::from_ymd_opt(2026, 4, 30).unwrap())
+        );
+        assert_eq!(inst.strike_price, Some(45000.0));
+        assert_eq!(inst.option_type, Some(OptionType::Put));
+        assert_eq!(inst.feed_mode, FeedMode::Full);
+    }
+
+    // --- by_exchange_segment with multiple instruments per segment ---
+
+    #[test]
+    fn test_by_exchange_segment_multiple_per_segment() {
+        let mut inst1 = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        inst1.exchange_segment = ExchangeSegment::IdxI;
+        let mut inst2 = sample_instrument(25, SubscriptionCategory::MajorIndexValue);
+        inst2.exchange_segment = ExchangeSegment::IdxI;
+        let mut inst3 = sample_instrument(2885, SubscriptionCategory::StockEquity);
+        inst3.exchange_segment = ExchangeSegment::NseEquity;
+        let mut inst4 = sample_instrument(2886, SubscriptionCategory::StockEquity);
+        inst4.exchange_segment = ExchangeSegment::NseEquity;
+        let mut inst5 = sample_instrument(50000, SubscriptionCategory::IndexDerivative);
+        inst5.exchange_segment = ExchangeSegment::NseFno;
+
+        let registry =
+            InstrumentRegistry::from_instruments(vec![inst1, inst2, inst3, inst4, inst5]);
+        let grouped = registry.by_exchange_segment();
+
+        assert_eq!(grouped.len(), 3); // 3 distinct segments
+        assert_eq!(grouped.get(&ExchangeSegment::IdxI).unwrap().len(), 2);
+        assert_eq!(grouped.get(&ExchangeSegment::NseEquity).unwrap().len(), 2);
+        assert_eq!(grouped.get(&ExchangeSegment::NseFno).unwrap().len(), 1);
+    }
+
+    // --- Registry clone produces independent copy ---
+
+    #[test]
+    fn test_registry_clone_is_independent() {
+        let instruments = vec![
+            sample_instrument(1, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(2, SubscriptionCategory::StockEquity),
+        ];
+        let original = InstrumentRegistry::from_instruments(instruments);
+        let cloned = original.clone();
+
+        assert_eq!(original.len(), cloned.len());
+        assert!(cloned.contains(1));
+        assert!(cloned.contains(2));
+        assert_eq!(
+            cloned.category_count(SubscriptionCategory::MajorIndexValue),
+            1,
+        );
+    }
+
+    // --- iter count matches len ---
+
+    #[test]
+    fn test_iter_count_matches_len() {
+        let instruments = vec![
+            sample_instrument(1, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(2, SubscriptionCategory::DisplayIndex),
+            sample_instrument(3, SubscriptionCategory::StockEquity),
+            sample_instrument(4, SubscriptionCategory::IndexDerivative),
+            sample_instrument(5, SubscriptionCategory::StockDerivative),
+        ];
+        let registry = InstrumentRegistry::from_instruments(instruments);
+        assert_eq!(registry.iter().count(), registry.len());
+    }
+
+    // --- Empty registry edge cases ---
+
+    #[test]
+    fn test_empty_registry_by_exchange_segment() {
+        let registry = InstrumentRegistry::empty();
+        let grouped = registry.by_exchange_segment();
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn test_empty_registry_category_counts_empty() {
+        let registry = InstrumentRegistry::empty();
+        assert!(registry.category_counts().is_empty());
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::MajorIndexValue),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_empty_registry_iter_empty() {
+        let registry = InstrumentRegistry::empty();
+        assert_eq!(registry.iter().count(), 0);
+    }
+
+    // --- make_derivative_instrument with stock derivative category ---
+
+    #[test]
+    fn test_make_derivative_instrument_stock_derivative_category() {
+        let contract = DerivativeContract {
+            security_id: 70000,
+            underlying_symbol: "HDFCBANK".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionStock,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 1700.0,
+            option_type: Some(OptionType::Call),
+            lot_size: 550,
+            tick_size: 0.05,
+            symbol_name: "HDFCBANK-27MAR26-1700-CE".to_string(),
+            display_name: "HDFCBANK 1700 CE Mar26".to_string(),
+        };
+        let inst = make_derivative_instrument(
+            &contract,
+            SubscriptionCategory::StockDerivative,
+            FeedMode::Quote,
+        );
+        assert_eq!(inst.security_id, 70000);
+        assert_eq!(inst.category, SubscriptionCategory::StockDerivative);
+        assert_eq!(inst.underlying_symbol, "HDFCBANK");
+        assert_eq!(inst.instrument_kind, Some(DhanInstrumentKind::OptionStock));
+        assert_eq!(inst.strike_price, Some(1700.0));
+        assert_eq!(inst.option_type, Some(OptionType::Call));
+        assert_eq!(inst.feed_mode, FeedMode::Quote);
+    }
+
+    // --- SubscriptionCategory hash used as HashMap key ---
+
+    #[test]
+    fn test_subscription_category_hash_all_distinct() {
+        use std::collections::HashSet;
+        let categories = [
+            SubscriptionCategory::MajorIndexValue,
+            SubscriptionCategory::DisplayIndex,
+            SubscriptionCategory::IndexDerivative,
+            SubscriptionCategory::StockEquity,
+            SubscriptionCategory::StockDerivative,
+        ];
+        let set: HashSet<SubscriptionCategory> = categories.iter().copied().collect();
+        assert_eq!(set.len(), 5);
+    }
 }

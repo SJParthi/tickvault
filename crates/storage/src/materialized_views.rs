@@ -718,6 +718,88 @@ mod tests {
         ensure_candle_views(&config).await;
     }
 
+    // -----------------------------------------------------------------------
+    // Coverage: partial failure (base table ok, views fail)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_partial_failure_base_ok_views_fail() {
+        // Two-phase mock: CREATE TABLE + DEDUP succeed (200),
+        // then views return 400 — exercises partial success path.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter_clone = counter.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let c = counter_clone.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let idx = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // First 2 requests (CREATE TABLE + DEDUP) succeed,
+                        // all subsequent view creations fail.
+                        let resp = if idx < 2 {
+                            MOCK_HTTP_200
+                        } else {
+                            MOCK_HTTP_400
+                        };
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Should not panic — logs warnings for failed views and continues.
+        ensure_candle_views(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_view_sql with specific views (all branches)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_view_sql_last_view_candles_1m_monthly() {
+        let def = &VIEW_DEFS[VIEW_DEFS.len() - 1]; // candles_1M
+        let sql = build_view_sql(def);
+        assert!(sql.contains("candles_1M"));
+        assert!(sql.contains("SAMPLE BY 1M"));
+        assert!(sql.contains("FROM candles_1d"));
+        assert!(!sql.contains("tick_count"));
+    }
+
+    #[test]
+    fn test_build_view_sql_candles_1d_from_1h() {
+        // candles_1d aggregates from candles_1h
+        let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1d").unwrap();
+        let sql = build_view_sql(def);
+        assert!(sql.contains("FROM candles_1h"));
+        assert!(sql.contains("SAMPLE BY 1d"));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_create_if_not_exists() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_all_ohlcv_columns() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("open DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("high DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("low DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("close DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("volume LONG"));
+    }
+
     #[tokio::test]
     async fn test_execute_ddl_failure_with_tracing() {
         let _guard = install_test_subscriber();

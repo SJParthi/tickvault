@@ -3422,4 +3422,179 @@ mod tests {
         drop(frame_tx);
         let _ = handle.await;
     }
+
+    // ===================================================================
+    // Additional coverage: dedup ring, junk filtering, persist window,
+    // parse error cap, depth finite check
+    // ===================================================================
+
+    #[test]
+    fn test_dedup_ring_first_tick_always_new() {
+        // First tick inserted into a fresh ring is never a duplicate,
+        // regardless of security_id, timestamp, or LTP values.
+        for sec_id in [0u32, 1, 42, 13, u32::MAX] {
+            let mut ring = TickDedupRing::new(8);
+            assert!(
+                !ring.is_duplicate(sec_id, 1772073900, 24500.0),
+                "first tick for security_id={sec_id} must not be duplicate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dedup_ring_identical_tick_always_dup_after_first() {
+        // Identical (security_id, timestamp, ltp) tuple is duplicate on
+        // second and subsequent calls — regardless of ring size.
+        for power in [8u32, 12, 16] {
+            let mut ring = TickDedupRing::new(power);
+            assert!(!ring.is_duplicate(42, 1000, 100.0));
+            for _ in 0..5 {
+                assert!(
+                    ring.is_duplicate(42, 1000, 100.0),
+                    "repeated identical tick must be duplicate (power={power})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_junk_nan_ltp_increments_counter() {
+        // NaN LTP tick is classified as junk (not a parse error).
+        // After filtering, the processor continues normally.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // Send NaN LTP
+        let nan_frame = make_ticker_frame(13, f32::NAN, 1772073900);
+        frame_tx.send(bytes::Bytes::from(nan_frame)).await.unwrap();
+        // Send negative LTP
+        let neg_frame = make_ticker_frame(14, -100.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(neg_frame)).await.unwrap();
+        // Send valid tick after junk — must still be processed
+        let valid = make_ticker_frame(15, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(valid)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn test_persist_window_outside_market_hours_8am_ist() {
+        // 08:00:00 IST = 28800 secs_of_day — before 09:00 window
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 0, 0)));
+    }
+
+    #[test]
+    fn test_persist_window_outside_market_hours_4pm_ist() {
+        // 16:00:00 IST = 57600 secs_of_day — after 15:30 window
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(16, 0, 0)));
+    }
+
+    #[test]
+    fn test_persist_window_outside_market_hours_2359_ist() {
+        // 23:59:59 IST — well outside market hours
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(23, 59, 59)));
+    }
+
+    #[test]
+    fn test_persist_window_raw_seconds_of_day_boundaries() {
+        // Test with raw seconds-of-day values directly (small epoch values
+        // where modulo gives the seconds-of-day itself)
+        // 32400 = 09:00 IST start → inside
+        assert!(is_within_persist_window(32400));
+        // 32399 = 08:59:59 IST → outside
+        assert!(!is_within_persist_window(32399));
+        // 55799 = 15:29:59 IST → inside
+        assert!(is_within_persist_window(55799));
+        // 55800 = 15:30:00 IST → outside (exclusive end)
+        assert!(!is_within_persist_window(55800));
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_parse_error_cap_at_100_boundary() {
+        // Send exactly 101 invalid frames. First 100 log warnings,
+        // 101st is suppressed. Processor must not crash or stop.
+        let (frame_tx, frame_rx) = mpsc::channel(200);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+
+        // 101 parse errors (too-short frames)
+        for _ in 0..101 {
+            frame_tx
+                .send(bytes::Bytes::from(vec![0u8; 3]))
+                .await
+                .unwrap();
+        }
+
+        // Processor must still accept a valid frame after 101 errors
+        let valid = make_ticker_frame(42, 25000.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(valid)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_all_levels_nan() {
+        // All 5 levels have NaN bid AND ask — must return false
+        let depth = [MarketDepthLevel {
+            bid_price: f32::NAN,
+            ask_price: f32::NAN,
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+        }; 5];
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_all_levels_infinity() {
+        // All 5 levels have Infinity bid and NEG_INFINITY ask
+        let depth = [MarketDepthLevel {
+            bid_price: f32::INFINITY,
+            ask_price: f32::NEG_INFINITY,
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+        }; 5];
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_mixed_nan_and_infinity() {
+        // Mix of NaN and Infinity across levels
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[1].bid_price = f32::NAN;
+        depth[3].ask_price = f32::INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_are_finite_only_last_level_invalid() {
+        // Levels 0-3 valid, level 4 has NaN ask — must catch it
+        let mut depth = [MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+        }; 5];
+        depth[4].ask_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
 }

@@ -789,4 +789,371 @@ mod tests {
         let fallback = result.unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
         assert_eq!(fallback.port(), 8080);
     }
+
+    // -----------------------------------------------------------------------
+    // create_log_file_writer — deeper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_log_file_writer_returns_some() {
+        // In a normal environment, the log file should be creatable.
+        // This exercises both the create_dir_all and OpenOptions paths.
+        let result = create_log_file_writer();
+        assert!(
+            result.is_some(),
+            "create_log_file_writer should succeed in writable directory"
+        );
+    }
+
+    #[test]
+    fn test_create_log_file_writer_file_is_writable() {
+        use std::io::Write;
+        if let Some(mut file) = create_log_file_writer() {
+            let write_result = file.write_all(b"test log line\n");
+            assert!(
+                write_result.is_ok(),
+                "log file must be writable after creation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_log_file_writer_idempotent() {
+        // Multiple calls should all succeed (file opened in append mode).
+        let f1 = create_log_file_writer();
+        let f2 = create_log_file_writer();
+        assert!(f1.is_some());
+        assert!(f2.is_some());
+    }
+
+    #[test]
+    fn test_app_log_file_path_parent_is_valid_dir() {
+        let path = std::path::Path::new(APP_LOG_FILE_PATH);
+        let parent = path.parent();
+        assert!(
+            parent.is_some(),
+            "log file path must have a parent directory"
+        );
+        let parent = parent.unwrap();
+        // After create_log_file_writer(), the parent dir should exist.
+        let _ = create_log_file_writer();
+        assert!(
+            parent.exists(),
+            "log directory must exist after writer creation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_timeframe_details — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_timeframe_details_preserves_timeframe_names() {
+        let timeframes = vec!["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
+        let coverages: Vec<TimeframeCoverage> = timeframes
+            .iter()
+            .enumerate()
+            .map(|(i, tf)| make_coverage(tf, (i + 1) * 100, 10))
+            .collect();
+        let report = make_verification_report(coverages);
+        let result = format_timeframe_details(&report);
+        for tf in &timeframes {
+            assert!(
+                result.contains(tf),
+                "output must contain timeframe name '{tf}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_timeframe_details_newline_count_matches_entries() {
+        let coverages = vec![
+            make_coverage("1m", 100, 10),
+            make_coverage("5m", 20, 10),
+            make_coverage("15m", 5, 10),
+            make_coverage("1d", 1, 10),
+        ];
+        let report = make_verification_report(coverages);
+        let result = format_timeframe_details(&report);
+        // N entries produce N-1 newlines (joined)
+        assert_eq!(
+            result.matches('\n').count(),
+            3,
+            "4 entries should have 3 newline separators"
+        );
+    }
+
+    #[test]
+    fn test_format_timeframe_details_single_entry_has_no_newline() {
+        let report = make_verification_report(vec![make_coverage("1s", 50, 1)]);
+        let result = format_timeframe_details(&report);
+        assert_eq!(result.matches('\n').count(), 0);
+        assert!(result.contains("1s"));
+        assert!(result.contains("50"));
+        assert!(result.contains("1 inst"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_violation_details — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_violation_details_special_characters_in_symbol() {
+        let violations = vec![make_violation(
+            "NIFTY BANK",
+            "IDX_I",
+            "1m",
+            "2026-03-18 10:00",
+            "high_lt_low",
+            "H=100 < L=200",
+        )];
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("NIFTY BANK"));
+    }
+
+    #[test]
+    fn test_format_violation_details_many_entries() {
+        let violations: Vec<ViolationDetail> = (0..100)
+            .map(|i| {
+                make_violation(
+                    &format!("SYM_{i}"),
+                    "NSE_EQ",
+                    "1m",
+                    &format!("2026-03-18 10:{i:02}"),
+                    "violation",
+                    &format!("val_{i}"),
+                )
+            })
+            .collect();
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 100);
+        assert!(result[0].contains("SYM_0"));
+        assert!(result[99].contains("SYM_99"));
+    }
+
+    #[test]
+    fn test_format_violation_details_empty_fields() {
+        let violations = vec![make_violation("", "", "", "", "", "")];
+        let result = format_violation_details(&violations);
+        assert_eq!(result.len(), 1);
+        // Should still produce a formatted string even with empty fields
+        assert!(result[0].starts_with('\u{2022}'));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_cross_match_details — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_cross_match_details_many_entries() {
+        let mismatches: Vec<CrossMatchMismatch> = (0..50)
+            .map(|i| {
+                make_cross_match(
+                    &format!("SYM_{i}"),
+                    "NSE_EQ",
+                    "5m",
+                    &format!("T_{i}"),
+                    &format!("H_{i}"),
+                    &format!("L_{i}"),
+                    &format!("D_{i}"),
+                )
+            })
+            .collect();
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 50);
+        assert!(result[0].contains("SYM_0"));
+        assert!(result[49].contains("SYM_49"));
+    }
+
+    #[test]
+    fn test_format_cross_match_details_mixed_empty_and_nonempty_diff() {
+        let mismatches = vec![
+            make_cross_match("A", "S1", "1m", "T1", "H1", "L1", "D1"),
+            make_cross_match("B", "S2", "5m", "T2", "H2", "L2", ""),
+            make_cross_match("C", "S3", "1d", "T3", "H3", "L3", "D3"),
+        ];
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 3);
+        // First and third should have Diff line
+        assert!(result[0].contains("Diff:"));
+        assert!(!result[1].contains("Diff:"));
+        assert!(result[2].contains("Diff:"));
+    }
+
+    #[test]
+    fn test_format_cross_match_details_long_values() {
+        let long_hist = "O=25000.50 H=25100.75 L=24900.25 C=25050.00 V=1234567890";
+        let long_live = "O=25000.55 H=25100.80 L=24900.20 C=25050.10 V=1234567895";
+        let long_diff = "open_diff=0.05 high_diff=0.05 low_diff=-0.05 close_diff=0.10 vol_diff=5";
+        let mismatches = vec![make_cross_match(
+            "RELIANCE",
+            "NSE_EQ",
+            "1m",
+            "2026-03-18 10:15",
+            long_hist,
+            long_live,
+            long_diff,
+        )];
+        let result = format_cross_match_details(&mismatches);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains(long_hist));
+        assert!(result[0].contains(long_live));
+        assert!(result[0].contains(long_diff));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_market_close_sleep — deterministic future time test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_market_close_sleep_future_time_returns_positive() {
+        // Use 23:59:59 which is always in the future during normal test runs
+        // (IST is UTC+5:30, so 23:59:59 IST is ~18:29:59 UTC)
+        let now_ist = chrono::Utc::now().with_timezone(&ist_offset());
+        let now_secs = now_ist.time().num_seconds_from_midnight();
+        let close_secs = 23 * 3600 + 59 * 60 + 59; // 23:59:59
+        if now_secs < close_secs {
+            let d = compute_market_close_sleep("23:59:59");
+            assert!(d.as_secs() > 0, "future time must return positive duration");
+            let expected_secs = close_secs - now_secs;
+            // Allow 2 seconds tolerance for test execution time
+            assert!(
+                (d.as_secs() as i64 - expected_secs as i64).unsigned_abs() <= 2,
+                "duration should match expected time until close"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_market_close_sleep_consistency() {
+        // Two calls close together should return similar durations
+        let d1 = compute_market_close_sleep("15:30:00");
+        let d2 = compute_market_close_sleep("15:30:00");
+        // Within 1 second of each other
+        let diff = if d1 > d2 {
+            d1.as_secs() - d2.as_secs()
+        } else {
+            d2.as_secs() - d1.as_secs()
+        };
+        assert!(
+            diff <= 1,
+            "consecutive calls should return similar durations"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Const assertions — compile-time guarantees
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fast_boot_window_start_is_before_nine_fifteen() {
+        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
+        let nine_fifteen = chrono::NaiveTime::parse_from_str("09:15:00", "%H:%M:%S").unwrap();
+        assert!(
+            start <= nine_fifteen,
+            "fast boot window must start at or before market open (09:15)"
+        );
+    }
+
+    #[test]
+    fn test_fast_boot_window_end_is_market_close() {
+        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
+        let market_close = chrono::NaiveTime::parse_from_str("15:30:00", "%H:%M:%S").unwrap();
+        assert_eq!(
+            end, market_close,
+            "fast boot window end must equal market close"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CrossVerificationReport field coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_verification_report_default_fields() {
+        let report = make_verification_report(vec![]);
+        assert_eq!(report.instruments_checked, 0);
+        assert_eq!(report.instruments_complete, 0);
+        assert_eq!(report.instruments_with_gaps, 0);
+        assert_eq!(report.total_candles_in_db, 0);
+        assert!(report.timeframe_counts.is_empty());
+        assert_eq!(report.ohlc_violations, 0);
+        assert!(report.ohlc_details.is_empty());
+        assert_eq!(report.data_violations, 0);
+        assert!(report.data_details.is_empty());
+        assert_eq!(report.timestamp_violations, 0);
+        assert!(report.timestamp_details.is_empty());
+        assert!(report.passed);
+    }
+
+    #[test]
+    fn test_format_timeframe_details_with_populated_report() {
+        let report = CrossVerificationReport {
+            instruments_checked: 232,
+            instruments_complete: 230,
+            instruments_with_gaps: 2,
+            total_candles_in_db: 103_500,
+            timeframe_counts: vec![
+                make_coverage("1m", 86_250, 232),
+                make_coverage("5m", 17_250, 232),
+            ],
+            ohlc_violations: 0,
+            ohlc_details: vec![],
+            data_violations: 0,
+            data_details: vec![],
+            timestamp_violations: 0,
+            timestamp_details: vec![],
+            passed: true,
+        };
+        let result = format_timeframe_details(&report);
+        assert!(result.contains("1m: 86250 (232 inst)"));
+        assert!(result.contains("5m: 17250 (232 inst)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ViolationDetail field coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_violation_detail_contains_segment_and_timeframe() {
+        let violations = vec![make_violation(
+            "TCS",
+            "NSE_FNO",
+            "15m",
+            "2026-03-18 14:00",
+            "ohlc",
+            "values",
+        )];
+        let result = format_violation_details(&violations);
+        assert!(result[0].contains("NSE_FNO"));
+        assert!(result[0].contains("15m"));
+        assert!(result[0].contains("2026-03-18 14:00"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CrossMatchMismatch field coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cross_match_mismatch_contains_all_fields() {
+        let mismatches = vec![make_cross_match(
+            "INFY",
+            "NSE_EQ",
+            "1d",
+            "2026-03-18",
+            "O=1500 H=1520",
+            "O=1501 H=1519",
+            "O=1 H=-1",
+        )];
+        let result = format_cross_match_details(&mismatches);
+        let text = &result[0];
+        assert!(text.contains("INFY"));
+        assert!(text.contains("NSE_EQ"));
+        assert!(text.contains("1d"));
+        assert!(text.contains("2026-03-18"));
+        assert!(text.contains("O=1500 H=1520"));
+        assert!(text.contains("O=1501 H=1519"));
+        assert!(text.contains("O=1 H=-1"));
+    }
 }

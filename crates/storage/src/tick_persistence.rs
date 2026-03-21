@@ -3841,4 +3841,215 @@ mod tests {
             "flush_if_needed must flush depth when interval elapsed"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DEDUP key constants for market_depth and previous_close
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_market_depth_includes_segment_and_level() {
+        // STORAGE-GAP-01: segment prevents cross-segment collision.
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("security_id"),
+            "market_depth DEDUP key must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("segment"),
+            "market_depth DEDUP key must include segment"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("level"),
+            "market_depth DEDUP key must include level"
+        );
+        assert_eq!(DEDUP_KEY_MARKET_DEPTH, "security_id, segment, level");
+    }
+
+    #[test]
+    fn test_dedup_key_previous_close_includes_segment() {
+        // STORAGE-GAP-01: segment prevents cross-segment collision.
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("security_id"),
+            "previous_close DEDUP key must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("segment"),
+            "previous_close DEDUP key must include segment"
+        );
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: TickPersistenceWriter::buffer_mut accessor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_writer_buffer_mut_returns_mutable_reference() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // buffer_mut() returns a mutable reference to the ILP buffer
+        // for writing auxiliary rows (e.g., previous close).
+        let buf = writer.buffer_mut();
+        assert!(buf.is_empty(), "buffer must start empty");
+
+        // Write a previous close row via the buffer accessor
+        build_previous_close_row(buf, 13, 2, 24300.5, 120000, 1_000_000_000).unwrap();
+        assert!(!buf.is_empty(), "buffer must have data after writing");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: market_depth DDL has all columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_market_depth_ddl_contains_all_columns_exhaustive() {
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("security_id LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("level LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_orders LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_orders LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_price DOUBLE"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_price DOUBLE"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("received_at TIMESTAMP"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ts TIMESTAMP"));
+    }
+
+    #[test]
+    fn test_market_depth_ddl_hour_partitioning_and_wal() {
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("PARTITION BY HOUR"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_market_depth_ddl_no_semicolons() {
+        assert!(
+            !MARKET_DEPTH_CREATE_DDL.contains(';'),
+            "DDL must be a single statement without semicolons"
+        );
+    }
+
+    #[test]
+    fn test_previous_close_ddl_no_semicolons() {
+        assert!(
+            !PREVIOUS_CLOSE_CREATE_DDL.contains(';'),
+            "DDL must be a single statement without semicolons"
+        );
+    }
+
+    #[test]
+    fn test_previous_close_ddl_day_partitioning_and_wal() {
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("PARTITION BY DAY"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("WAL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: execute_ddl_best_effort success path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises execute_ddl_best_effort success path with tracing.
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: IST offset arithmetic for received_at in depth rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_depth_rows_received_at_includes_ist_offset() {
+        let depth = make_test_depth();
+        let received_at_utc_nanos: i64 = 1_740_556_500_000_000_000;
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        build_depth_rows(&mut buf, 13, 2, received_at_utc_nanos, &depth).unwrap();
+        let content = String::from_utf8_lossy(buf.as_bytes());
+
+        // received_at is shifted by IST_UTC_OFFSET_NANOS for IST-as-UTC.
+        let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
+        let expected_str = format!("{expected_nanos}");
+        assert!(
+            content.contains(&expected_str),
+            "depth received_at must include IST offset. Content: {content}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: F32_DECIMAL_BUF_SIZE constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_f32_decimal_buf_size_is_24() {
+        // Maximum f32 decimal string: "-3.4028235e+38" = 15 chars. 24 is generous.
+        assert_eq!(F32_DECIMAL_BUF_SIZE, 24);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DepthPersistenceWriter pending_count consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_writer_pending_count_increments_per_snapshot() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count, 0);
+
+        let depth = make_test_depth();
+        writer
+            .append_depth(13, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+
+        writer
+            .append_depth(25, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .unwrap();
+        assert_eq!(writer.pending_count, 2);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_depth_writer_reuse_after_flush() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+
+        // Reuse after flush
+        writer.append_depth(25, 2, 1_000_000_001, &depth).unwrap();
+        assert_eq!(writer.pending_count, 1);
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
 }

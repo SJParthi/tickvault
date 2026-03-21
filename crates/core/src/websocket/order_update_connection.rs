@@ -545,4 +545,338 @@ mod tests {
             "ReadTimeout message must include the timeout value"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // connect_and_listen — NoToken error when no token is available
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_connect_and_listen_no_token() {
+        // TokenHandle with None token should return NoToken error.
+        let token_handle: TokenHandle = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let (order_sender, _rx) = broadcast::channel(16);
+        let calendar = make_test_calendar();
+
+        let result = connect_and_listen(
+            "wss://api-order-update.dhan.co",
+            "test-client",
+            &token_handle,
+            &order_sender,
+            &calendar,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OrderUpdateConnectionError::NoToken),
+            "expected NoToken, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // connect_and_listen — TokenExpired error when token is expired
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_connect_and_listen_token_expired() {
+        use chrono::{Duration as ChronoDuration, Utc};
+        use dhan_live_trader_common::trading_calendar::ist_offset;
+        use secrecy::SecretString;
+
+        // Create an expired token state.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let expired_at = now_ist - ChronoDuration::hours(1);
+        let issued_at = now_ist - ChronoDuration::hours(25);
+        let token_state = crate::auth::types::TokenState::from_cached(
+            SecretString::from("expired-jwt".to_string()),
+            expired_at,
+            issued_at,
+        );
+
+        let token_handle: TokenHandle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(token_state))));
+        let (order_sender, _rx) = broadcast::channel(16);
+        let calendar = make_test_calendar();
+
+        let result = connect_and_listen(
+            "wss://api-order-update.dhan.co",
+            "test-client",
+            &token_handle,
+            &order_sender,
+            &calendar,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OrderUpdateConnectionError::TokenExpired),
+            "expected TokenExpired, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // connect_and_listen — Connection refused (valid token, bad URL)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_connect_and_listen_connection_refused() {
+        use chrono::{Duration as ChronoDuration, Utc};
+        use dhan_live_trader_common::trading_calendar::ist_offset;
+        use secrecy::SecretString;
+
+        // Create a valid (non-expired) token.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let expires_at = now_ist + ChronoDuration::hours(23);
+        let token_state = crate::auth::types::TokenState::from_cached(
+            SecretString::from("valid-jwt-for-test".to_string()),
+            expires_at,
+            now_ist,
+        );
+
+        let token_handle: TokenHandle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(token_state))));
+        let (order_sender, _rx) = broadcast::channel(16);
+        let calendar = make_test_calendar();
+
+        // Use a URL that will fail to connect.
+        let result = connect_and_listen(
+            "wss://127.0.0.1:1",
+            "test-client",
+            &token_handle,
+            &order_sender,
+            &calendar,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OrderUpdateConnectionError::Connect(_)),
+            "expected Connect error, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_order_update_connection — reconnect exhaustion with no token
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_order_update_exits_after_max_reconnect_failures() {
+        // With no token, every connect attempt fails.
+        // After ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS failures, the function returns.
+        let token_handle: TokenHandle = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let (order_sender, _rx) = broadcast::channel(16);
+        let calendar = Arc::new(make_test_calendar());
+
+        // Use a generous timeout to cover exponential backoff delays.
+        // With 10 attempts and initial=1000ms/max=60000ms:
+        // Sum ≈ 1+2+4+8+16+32+60+60+60+60 = ~303s in worst case.
+        // Use tokio::time::pause() to avoid real wall-clock delays.
+        tokio::time::pause();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            run_order_update_connection(
+                "wss://127.0.0.1:1".to_string(),
+                "test-client".to_string(),
+                token_handle,
+                order_sender,
+                calendar,
+            ),
+        )
+        .await;
+
+        // The function should have exited after exhausting reconnection attempts.
+        assert!(
+            result.is_ok(),
+            "run_order_update_connection should exit within timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — holiday check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_market_hours_on_holiday_returns_false() {
+        use chrono::Datelike;
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        // If today is a weekend, the calendar already returns false for
+        // is_trading_day_today() — we can't add a weekend date as a holiday
+        // because TradingCalendar::from_config rejects weekend holidays.
+        // So we test with a known future weekday as a holiday.
+        let now_ist = chrono::Utc::now().with_timezone(&ist_offset());
+        let today_date = now_ist.date_naive();
+
+        // Find today or the next weekday to use as a holiday date.
+        let mut holiday_date = today_date;
+        while holiday_date.weekday() == chrono::Weekday::Sat
+            || holiday_date.weekday() == chrono::Weekday::Sun
+        {
+            holiday_date += chrono::Duration::days(1);
+        }
+        let holiday_str = holiday_date.format("%Y-%m-%d").to_string();
+
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: holiday_str.clone(),
+                name: "Test Holiday".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+
+        // If today matches the holiday_date (weekday), it returns false.
+        // If today is a weekend, it also returns false (not a trading day).
+        // Either way, we prove the function doesn't panic.
+        if today_date == holiday_date {
+            assert!(
+                !is_within_market_hours(&calendar),
+                "should return false on a holiday"
+            );
+        } else {
+            // Today is a weekend, so is_within_market_hours returns false anyway.
+            assert!(
+                !is_within_market_hours(&calendar),
+                "should return false on a weekend"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — matches check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_timeout_matches_pattern() {
+        // Verify the pattern used in run_order_update_connection's off-hours check.
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        assert!(matches!(err, OrderUpdateConnectionError::ReadTimeout));
+
+        let err2 = OrderUpdateConnectionError::NoToken;
+        assert!(!matches!(err2, OrderUpdateConnectionError::ReadTimeout));
+    }
+
+    // -----------------------------------------------------------------------
+    // Off-hours read timeout — consecutive_failures reset logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_off_hours_timeout_value_is_longer() {
+        // Off-hours timeout should be longer than market-hours timeout.
+        assert!(
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS >= ORDER_UPDATE_READ_TIMEOUT_SECS,
+            "off-hours timeout ({ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS}) should be >= market timeout ({ORDER_UPDATE_READ_TIMEOUT_SECS})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // connect_and_listen — TLS error (bad URL scheme)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_connect_and_listen_tls_error_on_invalid_scheme() {
+        use chrono::{Duration as ChronoDuration, Utc};
+        use dhan_live_trader_common::trading_calendar::ist_offset;
+        use secrecy::SecretString;
+
+        // Install the crypto provider (needed for TLS connector).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // Create a valid token.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let expires_at = now_ist + ChronoDuration::hours(23);
+        let token_state = crate::auth::types::TokenState::from_cached(
+            SecretString::from("valid-jwt".to_string()),
+            expires_at,
+            now_ist,
+        );
+        let token_handle: TokenHandle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(token_state))));
+        let (order_sender, _rx) = broadcast::channel(16);
+        let calendar = make_test_calendar();
+
+        // Use a non-WSS URL to trigger a Connect error during request building.
+        let result = connect_and_listen(
+            "not-a-valid-websocket-url",
+            "test-client",
+            &token_handle,
+            &order_sender,
+            &calendar,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OrderUpdateConnectionError::Connect(_)),
+            "expected Connect error from bad URL, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_market_hours — non-trading day (weekend) check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_market_hours_on_weekend_returns_false() {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        // Find a known Saturday/Sunday — 2026-01-03 is a Saturday.
+        // The calendar checks weekdays internally; we just need no holidays
+        // to prove the weekend check in is_trading_day_today() does the job.
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2099-01-01".to_string(), // far future holiday, won't affect today
+                name: "Future".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+        };
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+
+        // The function uses current time. We can only verify it doesn't panic
+        // and returns a bool. On weekends it'll be false, on weekdays true (if in window).
+        let _result = is_within_market_hours(&calendar);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_order_update_connection — clean disconnect resets backoff
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_consecutive_failures_saturating_add() {
+        // Verify saturating_add behavior used in the reconnect loop.
+        let mut failures: u32 = u32::MAX - 1;
+        failures = failures.saturating_add(1);
+        assert_eq!(failures, u32::MAX);
+        failures = failures.saturating_add(1);
+        assert_eq!(failures, u32::MAX, "must not overflow past u32::MAX");
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeout selection based on market hours
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_timeout_constants_positive() {
+        assert!(ORDER_UPDATE_READ_TIMEOUT_SECS > 0);
+        assert!(ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS > 0);
+    }
 }

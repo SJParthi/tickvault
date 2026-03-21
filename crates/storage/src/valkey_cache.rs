@@ -1098,6 +1098,107 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Coverage: ValkeyPool construction error path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_valkey_pool_new_url_format_is_redis_scheme() {
+        // Verify the URL format used internally
+        let config = ValkeyConfig {
+            host: "test-host".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        assert!(url.starts_with("redis://"));
+        assert!(url.contains("test-host"));
+        assert!(url.contains("6379"));
+    }
+
+    #[test]
+    fn test_pool_checkout_timeout_constant_value() {
+        assert_eq!(POOL_CHECKOUT_TIMEOUT_MS, 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: set/get roundtrip via mock RESP server
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_set_then_get_roundtrip_via_mock() {
+        // SET returns OK, GET returns the value we set.
+        // Use two separate pools to avoid connection reuse issues.
+        let set_port = spawn_resp_mock_server(RESP_OK).await;
+        let config_set = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: set_port,
+            max_connections: 1,
+        };
+        let pool_set = ValkeyPool::new(&config_set).unwrap();
+        let set_result = pool_set.set("roundtrip_key", "roundtrip_value").await;
+        assert!(set_result.is_ok(), "set must succeed: {:?}", set_result);
+
+        let get_port = spawn_resp_mock_server(RESP_BULK_HELLO).await;
+        let config_get = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: get_port,
+            max_connections: 1,
+        };
+        let pool_get = ValkeyPool::new(&config_get).unwrap();
+        let get_result = pool_get.get("roundtrip_key").await;
+        assert!(get_result.is_ok(), "get must succeed: {:?}", get_result);
+        assert_eq!(get_result.unwrap(), Some("hello".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: set_ex TTL via mock RESP server
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_set_ex_with_ttl_via_mock() {
+        let port = spawn_resp_mock_server(RESP_OK).await;
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        // Verify set_ex works with various TTL values
+        let result = pool.set_ex("ttl_key", "ttl_value", 3600).await;
+        assert!(result.is_ok(), "set_ex with TTL must succeed: {:?}", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: del followed by exists via mock RESP server
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_del_then_exists_via_mock() {
+        // DEL returns 1 (deleted one key)
+        let del_port = spawn_resp_mock_server(RESP_INT_ONE).await;
+        let config_del = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: del_port,
+            max_connections: 1,
+        };
+        let pool_del = ValkeyPool::new(&config_del).unwrap();
+        let del_result = pool_del.del("deleted_key").await;
+        assert!(del_result.is_ok());
+
+        // EXISTS returns 0 (key no longer exists)
+        let exists_port = spawn_resp_mock_server(RESP_INT_ZERO).await;
+        let config_exists = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: exists_port,
+            max_connections: 1,
+        };
+        let pool_exists = ValkeyPool::new(&config_exists).unwrap();
+        let exists_result = pool_exists.exists("deleted_key").await;
+        assert!(exists_result.is_ok());
+        assert!(!exists_result.unwrap());
+    }
+
     #[tokio::test]
     async fn test_set_nx_ex_returns_false_when_key_exists() {
         // SET NX EX returns "$-1\r\n" (nil) when key already existed

@@ -1973,17 +1973,14 @@ mod tests {
         let archived = rkyv::access::<ArchivedInstrumentInfo, rkyv::rancor::Error>(&bytes).unwrap();
         let deserialized: InstrumentInfo =
             rkyv::deserialize::<InstrumentInfo, rkyv::rancor::Error>(archived).unwrap();
-        match deserialized {
+        assert!(matches!(
+            deserialized,
             InstrumentInfo::Index {
-                security_id,
-                symbol,
+                security_id: 13,
+                ref symbol,
                 ..
-            } => {
-                assert_eq!(security_id, 13);
-                assert_eq!(symbol, "NIFTY");
-            }
-            _ => panic!("expected Index variant"),
-        }
+            } if symbol == "NIFTY"
+        ));
     }
 
     #[test]
@@ -1996,16 +1993,13 @@ mod tests {
         let archived = rkyv::access::<ArchivedInstrumentInfo, rkyv::rancor::Error>(&bytes).unwrap();
         let deserialized: InstrumentInfo =
             rkyv::deserialize::<InstrumentInfo, rkyv::rancor::Error>(archived).unwrap();
-        match deserialized {
+        assert!(matches!(
+            deserialized,
             InstrumentInfo::Equity {
-                security_id,
-                symbol,
-            } => {
-                assert_eq!(security_id, 2885);
-                assert_eq!(symbol, "RELIANCE");
-            }
-            _ => panic!("expected Equity variant"),
-        }
+                security_id: 2885,
+                ref symbol,
+            } if symbol == "RELIANCE"
+        ));
     }
 
     #[test]
@@ -2225,5 +2219,375 @@ mod tests {
             rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
         let result = rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived);
         assert!(result.is_err(), "expected error for invalid timestamp");
+    }
+
+    // =====================================================================
+    // Additional coverage: rkyv roundtrips for edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_rkyv_naive_date_boundary_dates_roundtrip() {
+        // Test boundary dates: epoch start, far future, leap day
+        let dates = [
+            chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2099, 12, 31).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(), // leap day
+            chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        ];
+        for date in dates {
+            let contract = DerivativeContract {
+                security_id: 1,
+                underlying_symbol: "TEST".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: date,
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 25,
+                tick_size: 0.05,
+                symbol_name: "T".to_string(),
+                display_name: "T".to_string(),
+            };
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+            let archived =
+                rkyv::access::<ArchivedDerivativeContract, rkyv::rancor::Error>(&bytes).unwrap();
+            let deserialized: DerivativeContract =
+                rkyv::deserialize::<DerivativeContract, rkyv::rancor::Error>(archived).unwrap();
+            assert_eq!(deserialized.expiry_date, date);
+        }
+    }
+
+    #[test]
+    fn test_rkyv_datetime_fixed_offset_utc_roundtrip() {
+        // Test with UTC offset (0 seconds) instead of IST
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let original = UniverseBuildMetadata {
+            csv_source: "utc-test".to_string(),
+            csv_row_count: 1,
+            parsed_row_count: 1,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::from_millis(100),
+            build_timestamp: chrono::Utc::now().with_timezone(&utc),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(
+            deserialized.build_timestamp.offset().local_minus_utc(),
+            0,
+            "UTC offset should be 0"
+        );
+        assert_eq!(
+            deserialized.build_timestamp.timestamp(),
+            original.build_timestamp.timestamp()
+        );
+    }
+
+    #[test]
+    fn test_rkyv_datetime_fixed_offset_negative_offset_roundtrip() {
+        // Test with negative UTC offset (e.g., US Eastern = -5:00 = -18000)
+        let offset = chrono::FixedOffset::west_opt(18_000).unwrap();
+        let original = UniverseBuildMetadata {
+            csv_source: "neg-offset-test".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::from_millis(50),
+            build_timestamp: chrono::Utc::now().with_timezone(&offset),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(
+            deserialized.build_timestamp.offset().local_minus_utc(),
+            -18_000,
+            "negative UTC offset should roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_rkyv_duration_as_millis_zero_roundtrip() {
+        let ist = crate::trading_calendar::ist_offset();
+        let original = UniverseBuildMetadata {
+            csv_source: "dur-zero".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: std::time::Duration::ZERO,
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.build_duration, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_rkyv_duration_as_millis_large_roundtrip() {
+        let ist = crate::trading_calendar::ist_offset();
+        // 24 hours in milliseconds
+        let dur = std::time::Duration::from_millis(86_400_000);
+        let original = UniverseBuildMetadata {
+            csv_source: "dur-large".to_string(),
+            csv_row_count: 0,
+            parsed_row_count: 0,
+            index_count: 0,
+            equity_count: 0,
+            underlying_count: 0,
+            derivative_count: 0,
+            option_chain_count: 0,
+            build_duration: dur,
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUniverseBuildMetadata, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.build_duration, dur);
+    }
+
+    // =====================================================================
+    // Additional coverage: InstrumentInfo::Derivative rkyv roundtrip
+    // =====================================================================
+
+    #[test]
+    fn test_instrument_info_derivative_variant_rkyv() {
+        use crate::types::OptionType;
+        let info = InstrumentInfo::Derivative {
+            security_id: 49001,
+            underlying_symbol: "RELIANCE".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionStock,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 3000.0,
+            option_type: Some(OptionType::Call),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&info).unwrap();
+        let archived = rkyv::access::<ArchivedInstrumentInfo, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: InstrumentInfo =
+            rkyv::deserialize::<InstrumentInfo, rkyv::rancor::Error>(archived).unwrap();
+        assert!(matches!(
+            deserialized,
+            InstrumentInfo::Derivative {
+                security_id: 49001,
+                ref underlying_symbol,
+                instrument_kind: DhanInstrumentKind::OptionStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                option_type: Some(OptionType::Call),
+                ..
+            } if underlying_symbol == "RELIANCE"
+        ));
+    }
+
+    // =====================================================================
+    // Additional coverage: OptionChainKey rkyv roundtrip
+    // =====================================================================
+
+    #[test]
+    fn test_option_chain_key_rkyv_roundtrip() {
+        let key = OptionChainKey {
+            underlying_symbol: "BANKNIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&key).unwrap();
+        let archived = rkyv::access::<ArchivedOptionChainKey, rkyv::rancor::Error>(&bytes).unwrap();
+        let deserialized: OptionChainKey =
+            rkyv::deserialize::<OptionChainKey, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "BANKNIFTY");
+        assert_eq!(
+            deserialized.expiry_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()
+        );
+    }
+
+    // =====================================================================
+    // Additional coverage: Display impls — exhaustive variant coverage
+    // =====================================================================
+
+    #[test]
+    fn test_underlying_kind_display_all_variants_exhaustive() {
+        // Ensure every variant produces distinct non-empty output
+        let variants = [
+            (UnderlyingKind::NseIndex, "NseIndex"),
+            (UnderlyingKind::BseIndex, "BseIndex"),
+            (UnderlyingKind::Stock, "Stock"),
+        ];
+        for (variant, expected) in variants {
+            let display = format!("{variant}");
+            assert_eq!(display, expected);
+            assert!(!display.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_dhan_instrument_kind_display_matches_as_str() {
+        // Verify Display output matches as_str() for all variants
+        let variants = [
+            DhanInstrumentKind::FutureIndex,
+            DhanInstrumentKind::FutureStock,
+            DhanInstrumentKind::OptionIndex,
+            DhanInstrumentKind::OptionStock,
+        ];
+        for variant in variants {
+            assert_eq!(format!("{variant}"), variant.as_str());
+        }
+    }
+
+    #[test]
+    fn test_index_category_display_matches_as_str() {
+        let variants = [IndexCategory::FnoUnderlying, IndexCategory::DisplayIndex];
+        for variant in variants {
+            assert_eq!(format!("{variant}"), variant.as_str());
+        }
+    }
+
+    #[test]
+    fn test_index_subcategory_display_matches_as_str() {
+        let variants = [
+            IndexSubcategory::Volatility,
+            IndexSubcategory::BroadMarket,
+            IndexSubcategory::MidCap,
+            IndexSubcategory::SmallCap,
+            IndexSubcategory::Sectoral,
+            IndexSubcategory::Thematic,
+            IndexSubcategory::Fno,
+        ];
+        for variant in variants {
+            assert_eq!(format!("{variant}"), variant.as_str());
+        }
+    }
+
+    // =====================================================================
+    // Additional coverage: Error Display and Error trait impls
+    // =====================================================================
+
+    #[test]
+    fn test_naive_date_rkyv_error_display_exact_message() {
+        let err = NaiveDateRkyvError;
+        assert_eq!(
+            err.to_string(),
+            "invalid NaiveDate days-from-CE value in rkyv archive"
+        );
+    }
+
+    #[test]
+    fn test_datetime_rkyv_error_display_exact_message() {
+        let err = DateTimeRkyvError;
+        assert_eq!(
+            err.to_string(),
+            "invalid DateTime<FixedOffset> value in rkyv archive"
+        );
+    }
+
+    #[test]
+    fn test_naive_date_rkyv_error_source_is_none() {
+        use std::error::Error;
+        let err = NaiveDateRkyvError;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_datetime_rkyv_error_source_is_none() {
+        use std::error::Error;
+        let err = DateTimeRkyvError;
+        assert!(err.source().is_none());
+    }
+
+    // =====================================================================
+    // Additional coverage: ConstituencyBuildMetadata::default
+    // =====================================================================
+
+    #[test]
+    fn test_constituency_build_metadata_default_timestamp_is_recent() {
+        let before = chrono::Utc::now();
+        let meta = ConstituencyBuildMetadata::default();
+        let after = chrono::Utc::now();
+        // The default timestamp should be between before and after (in UTC terms)
+        let meta_utc = meta.build_timestamp.timestamp();
+        assert!(meta_utc >= before.timestamp());
+        assert!(meta_utc <= after.timestamp());
+    }
+
+    // =====================================================================
+    // Additional coverage: FnoUniverse::derivative_security_ids_for_symbol
+    // =====================================================================
+
+    #[test]
+    fn test_derivative_security_ids_for_symbol_filters_correctly() {
+        let u = make_test_fno_universe();
+
+        // RELIANCE should get exactly 2 contracts (49001 future + 49002 option)
+        let mut reliance_ids = u.derivative_security_ids_for_symbol("RELIANCE");
+        reliance_ids.sort();
+        assert_eq!(reliance_ids.len(), 2);
+        assert_eq!(reliance_ids, vec![49001, 49002]);
+
+        // NIFTY should get exactly 1 contract (50001 future)
+        let nifty_ids = u.derivative_security_ids_for_symbol("NIFTY");
+        assert_eq!(nifty_ids.len(), 1);
+        assert_eq!(nifty_ids[0], 50001);
+
+        // HDFCBANK has an underlying but no derivative contracts in the test data
+        let hdfc_ids = u.derivative_security_ids_for_symbol("HDFCBANK");
+        assert!(hdfc_ids.is_empty());
+
+        // Unknown symbol returns empty
+        let unknown_ids = u.derivative_security_ids_for_symbol("TATAMOTORS");
+        assert!(unknown_ids.is_empty());
+
+        // Empty string returns empty
+        let empty_ids = u.derivative_security_ids_for_symbol("");
+        assert!(empty_ids.is_empty());
+    }
+
+    #[test]
+    fn test_derivative_security_ids_for_symbol_empty_universe() {
+        let u = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: make_test_build_metadata(),
+        };
+        assert!(u.derivative_security_ids_for_symbol("RELIANCE").is_empty());
+    }
+
+    // =====================================================================
+    // Additional coverage: naive_date_from_archived_i32 edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_naive_date_from_archived_i32_multiple_dates() {
+        let dates = [
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(), // leap day
+        ];
+        for date in dates {
+            let days = rkyv::rend::i32_le::from_native(date.num_days_from_ce());
+            let result = naive_date_from_archived_i32(&days);
+            assert_eq!(result, date);
+        }
     }
 }

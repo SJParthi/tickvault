@@ -2695,4 +2695,155 @@ mod tests {
             "should abort quickly via select"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // wait_for_valid_token — returns immediately when valid token present
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_valid_token_returns_immediately_with_valid_token() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_token_handle_with_token(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        let start = std::time::Instant::now();
+        conn.wait_for_valid_token().await;
+        // Should return almost immediately since token is valid.
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "should return immediately with valid token"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IDX_I partition: only non-IDX instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_idx_partition_no_idx_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseEquity, 100),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 200),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        // All instruments are non-IDX, so all messages use Full (code 21)
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IDX_I partition: only IDX instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_idx_partition_only_idx_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 26),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 99),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        // All instruments are IDX, so all use Ticker (code 15), no Full messages
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
+        assert!(!conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run() — non-reconnectable disconnect code via read loop
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_loop_close_frame_with_specific_ws_close_code() {
+        // Verify that a close frame with a specific code is handled cleanly.
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = make_test_conn_for_read_loop(tx);
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let read_handle = tokio::spawn(async move { conn.run_read_loop(client_ws).await });
+
+        // Send close with a specific error code (1008 = Policy Violation).
+        server_ws
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "policy violation".into(),
+            })))
+            .await
+            .expect("send close failed"); // APPROVED: test
+
+        let result = read_handle.await.expect("task panicked"); // APPROVED: test
+        assert!(result.is_ok(), "Close frame should return Ok(())");
+    }
+
+    // -----------------------------------------------------------------------
+    // run() — expired token triggers NoTokenAvailable on connect
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_expired_token_fails_with_no_token_available() {
+        use crate::auth::types::TokenState;
+        use chrono::{Duration as ChronoDuration, Utc};
+        use dhan_live_trader_common::trading_calendar::ist_offset;
+        use secrecy::SecretString;
+
+        // Create an expired token.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let expired_at = now_ist - ChronoDuration::hours(1);
+        let issued_at = now_ist - ChronoDuration::hours(25);
+        let state = TokenState::from_cached(
+            SecretString::from("expired-jwt".to_string()),
+            expired_at,
+            issued_at,
+        );
+        let token_handle: crate::auth::TokenHandle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(state))));
+
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            token_handle,
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 1,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+
+        let result = conn.run().await;
+        // Expired token → connect_and_subscribe returns NoTokenAvailable → retries exhaust.
+        assert!(result.is_err());
+    }
 }

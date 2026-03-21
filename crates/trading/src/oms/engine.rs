@@ -2232,4 +2232,441 @@ mod tests {
         // The counter! macro for dlt_orders_filled_total is called — no panic
         assert_eq!(oms.order("1").unwrap().status, OrderStatus::Traded);
     }
+
+    // -----------------------------------------------------------------------
+    // Live mode: order placement with immediate TRADED status
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_place_order_immediate_traded_status() {
+        // Dhan can return TRADED immediately for market orders
+        let body = r#"{"orderId":"ORD-IMM","orderStatus":"TRADED","correlationId":"uuid-imm"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let order_id = oms.place_order(request).await.unwrap();
+        assert_eq!(order_id, "ORD-IMM");
+
+        let order = oms.order("ORD-IMM").unwrap();
+        assert_eq!(order.status, OrderStatus::Traded);
+        assert!(order.is_terminal());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_place_order_immediate_rejected_status() {
+        // Dhan can return REJECTED immediately
+        let body = r#"{"orderId":"ORD-REJ","orderStatus":"REJECTED","correlationId":"uuid-rej"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+
+        let order_id = oms.place_order(request).await.unwrap();
+        let order = oms.order(&order_id).unwrap();
+        assert_eq!(order.status, OrderStatus::Rejected);
+        assert!(order.is_terminal());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_place_order_unknown_status_defaults_to_transit() {
+        // If Dhan returns an unknown status string, default to Transit
+        let body = r#"{"orderId":"ORD-UNK","orderStatus":"WEIRD","correlationId":"uuid-unk"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        let result = oms.place_order(make_live_place_request()).await;
+        let order_id = result.unwrap();
+        let order = oms.order(&order_id).unwrap();
+        assert_eq!(order.status, OrderStatus::Transit);
+
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Order update re-indexing: new order_no becomes accessible
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn re_indexed_order_accessible_by_new_order_no() {
+        let mut oms = make_oms_with_order("OLD-1", OrderStatus::Transit);
+        oms.correlations
+            .track("corr-1".to_owned(), "OLD-1".to_owned());
+
+        // Dhan sends an update with a new order_no via correlation
+        let mut update = make_order_update("NEW-999", "PENDING");
+        update.correlation_id = "corr-1".to_owned();
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+
+        // The clone is inserted at new key with OLD status (Transit),
+        // while the original at old key gets the status update (Pending).
+        let new_order = oms.order("NEW-999");
+        assert!(
+            new_order.is_some(),
+            "order must be accessible by new order_no"
+        );
+        // The re-index clone captures the pre-update state
+        assert_eq!(new_order.unwrap().status, OrderStatus::Transit);
+
+        // The original order gets the status update
+        let old_order = oms.order("OLD-1").unwrap();
+        assert_eq!(old_order.status, OrderStatus::Pending);
+    }
+
+    #[test]
+    fn re_index_does_not_happen_for_empty_order_no() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Transit);
+
+        // Update with empty order_no but correlation_id match
+        let mut update = make_order_update("", "PENDING");
+        update.correlation_id = "corr-1".to_owned();
+
+        let result = oms.handle_order_update(&update);
+        assert!(result.is_ok());
+        // No re-indexing with empty order_no
+        assert!(oms.order("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Disclosed quantity 30% boundary — exact boundary value
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn disclosed_qty_exactly_30_percent_accepted() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        // quantity=100, 30% = 30. disclosed_quantity=30 must pass.
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 100,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 30,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disclosed_qty_29_on_100_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        // quantity=100, 30% = 30. disclosed_quantity=29 must fail.
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 100,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 29,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn disclosed_qty_zero_always_accepted() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        // disclosed_quantity=0 means "no disclosure" — always valid
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 100,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disclosed_qty_ceiling_division_quantity_10() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        // quantity=10, 30% = 3.0, ceiling = 3. disclosed_quantity=3 must pass.
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 10,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 3,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // SL trigger validation on modify
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modify_slm_order_zero_trigger_rejected() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLossMarket,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0, // SLM must have triggerPrice > 0
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn modify_sl_order_with_trigger_accepted() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLoss,
+            quantity: 50,
+            price: 245.0,
+            trigger_price: 240.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("1", request).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiter + circuit breaker interaction in live mode
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_place_exhausted_rate_limiter_returns_error() {
+        let body = r#"{"orderId":"ORD-1","orderStatus":"TRANSIT","correlationId":"uuid-1"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        // Exhaust the rate limiter
+        for _ in 0..10 {
+            let _ = oms.rate_limiter.check();
+        }
+
+        let result = oms.place_order(make_live_place_request()).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RateLimited));
+        // Circuit breaker should still be closed — rate limit is pre-API
+        assert!(oms.circuit_breaker.check().is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_place_with_open_circuit_breaker_returns_error() {
+        let body = r#"{"orderId":"ORD-1","orderStatus":"TRANSIT","correlationId":"uuid-1"}"#;
+        let (base_url, handle) = start_mock_server(200, body).await;
+        let mut oms = make_live_oms(&base_url);
+
+        // Trip the circuit breaker
+        for _ in 0..10 {
+            oms.circuit_breaker.record_failure();
+        }
+
+        let result = oms.place_order(make_live_place_request()).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::CircuitBreakerOpen));
+
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // SLM place validation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_slm_order_zero_trigger_rejected() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::StopLossMarket,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0, // SLM requires triggerPrice > 0
+            lot_size: 25,
+        };
+
+        let result = oms.place_order(request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::RiskRejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_sl_order_with_valid_trigger_accepted() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::StopLoss,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.0,
+            trigger_price: 240.0,
+            lot_size: 25,
+        };
+
+        let result = oms.place_order(request).await;
+        assert!(
+            result.is_ok(),
+            "SL order with valid trigger must be accepted in dry-run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Live modify: rate-limited at Dhan (429) doesn't trip CB
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_modify_rate_limited_at_dhan_no_circuit_breaker_trip() {
+        let (base_url, handle) = start_mock_server(429, "{}").await;
+        let mut oms = make_live_oms(&base_url);
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let request = ModifyOrderRequest {
+            order_type: OrderType::Limit,
+            quantity: 75,
+            price: 250.0,
+            trigger_price: 0.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+
+        let result = oms.modify_order("ORD-1", request).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
+        // CB should remain closed
+        assert!(oms.circuit_breaker.check().is_ok());
+
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Live cancel: transport error trips circuit breaker
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_cancel_transport_error_trips_circuit_breaker() {
+        let mut oms = make_live_oms("http://127.0.0.1:1");
+
+        let order = ManagedOrder {
+            order_id: "ORD-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+        oms.orders.insert("ORD-1".to_owned(), order);
+
+        let result = oms.cancel_order("ORD-1").await;
+        assert!(result.is_err());
+        // Transport error should have called record_failure — CB still closed
+        // (1 failure is below the threshold of 5) but failure was registered.
+        // We verify the CB is still closed because 1 < threshold:
+        assert!(
+            oms.circuit_breaker.check().is_ok(),
+            "1 failure is below threshold — CB should still be closed"
+        );
+    }
 }

@@ -394,4 +394,92 @@ mod tests {
         let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
         assert_eq!(tick.last_traded_price, price);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: all max values simultaneously, edge field combos
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_quote_all_max_u32_fields() {
+        // All u32 fields at their maximum — verifies no truncation or overflow
+        let (buf, hdr) = make_quote_packet(
+            2,
+            u32::MAX, // security_id
+            f32::MAX, // ltp
+            u16::MAX, // ltq
+            u32::MAX, // ltt
+            f32::MAX, // atp
+            u32::MAX, // volume
+            u32::MAX, // total_sell
+            u32::MAX, // total_buy
+            f32::MAX, // open
+            f32::MAX, // close
+            f32::MAX, // high
+            f32::MAX, // low
+        );
+        let tick = parse_quote_packet(&buf, &hdr, i64::MAX).unwrap();
+        assert_eq!(tick.security_id, u32::MAX);
+        assert_eq!(tick.last_trade_quantity, u16::MAX);
+        assert_eq!(tick.exchange_timestamp, u32::MAX);
+        assert_eq!(tick.volume, u32::MAX);
+        assert_eq!(tick.total_sell_quantity, u32::MAX);
+        assert_eq!(tick.total_buy_quantity, u32::MAX);
+        assert_eq!(tick.received_at_nanos, i64::MAX);
+    }
+
+    #[test]
+    fn test_parse_quote_max_total_sell_qty() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            u32::MAX,
+            500,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.total_sell_quantity, u32::MAX);
+    }
+
+    #[test]
+    fn test_parse_quote_max_total_buy_qty() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            13,
+            100.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            u32::MAX,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert_eq!(tick.total_buy_quantity, u32::MAX);
+    }
+
+    #[test]
+    fn test_parse_quote_negative_ltp_with_valid_ohlc() {
+        // Negative LTP + valid OHLC: parser reads all fields correctly
+        let (buf, hdr) = make_quote_packet(
+            2, 13, -500.0, 10, 1772073900, 100.0, 5000, 1000, 2000, 99.0, 98.0, 101.0, 97.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.last_traded_price < 0.0);
+        assert!((tick.day_open - 99.0).abs() < 0.01);
+        assert!((tick.day_close - 98.0).abs() < 0.01);
+        assert!((tick.day_high - 101.0).abs() < 0.01);
+        assert!((tick.day_low - 97.0).abs() < 0.01);
+    }
 }

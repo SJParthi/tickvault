@@ -2335,4 +2335,505 @@ threshold = 70.0
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — disabled strategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_trading_pipeline_with_disabled_strategy() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_disabled");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("disabled_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "disabled_strategy"
+enabled = false
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "test_client");
+        assert!(
+            result.is_some(),
+            "file with disabled strategy should still return Some"
+        );
+
+        let (pipeline_config, _hot_reloader) = result.unwrap();
+        // Disabled strategies may or may not be loaded depending on
+        // implementation. Key point: the function handles it gracefully.
+        assert!(pipeline_config.dry_run);
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — multiple strategies mixed enabled/disabled
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_trading_pipeline_with_mixed_enabled_disabled() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_mixed");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("mixed_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "active_strategy"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+
+[[strategy]]
+name = "inactive_strategy"
+enabled = false
+
+[[strategy.entry_short]]
+field = "rsi"
+operator = "gt"
+threshold = 80.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "lt"
+threshold = 20.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "test_client");
+        assert!(result.is_some());
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // init_trading_pipeline — config fields populated from ApplicationConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_trading_pipeline_config_propagation() {
+        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_cfg_prop");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("prop_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "prop_test"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 70.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let config = build_test_application_config(config_path.to_str().unwrap());
+        let handle = make_token_handle_with_value("jwt");
+
+        let result = init_trading_pipeline(&config, &handle, "my_client_id");
+        assert!(result.is_some());
+
+        let (pipeline_config, _) = result.unwrap();
+        // Verify config propagation from ApplicationConfig
+        assert_eq!(
+            pipeline_config.client_id, "my_client_id",
+            "client_id must be propagated from caller"
+        );
+        assert!(
+            pipeline_config.max_orders_per_second > 0,
+            "max_orders_per_second must be positive from config"
+        );
+        assert!(
+            !pipeline_config.rest_api_base_url.is_empty(),
+            "REST API base URL must be populated from config"
+        );
+        assert!(
+            pipeline_config.capital > 0.0,
+            "capital must be positive from config"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenHandleBridge — JWT-like tokens
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_bridge_jwt_format_token() {
+        // Verify JWT-like tokens are returned as-is (no trimming, no mutation)
+        let jwt =
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwiYXVkIjoiZGhhbiJ9.sig";
+        let handle = make_token_handle_with_value(jwt);
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().expose_secret(),
+            jwt,
+            "JWT token must be returned verbatim"
+        );
+    }
+
+    #[test]
+    fn test_token_handle_bridge_long_token() {
+        let long_token = "a".repeat(4096);
+        let handle = make_token_handle_with_value(&long_token);
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().expose_secret().len(), 4096);
+    }
+
+    // -----------------------------------------------------------------------
+    // OMS — order update with various statuses
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_oms_handle_order_update_various_statuses() {
+        let handle = make_token_handle_with_value("jwt");
+        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "test".to_owned(),
+        );
+        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let bridge = Box::new(TokenHandleBridge { handle });
+        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            bridge,
+            "test".to_owned(),
+        );
+
+        // Place a paper order first
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 1,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 1,
+        };
+        let order_id = oms.place_order(request).await.unwrap();
+
+        // Send order updates with different statuses
+        let statuses = ["PENDING", "TRADED", "REJECTED", "CANCELLED"];
+        for status in &statuses {
+            let mut update = make_order_update();
+            update.order_no = order_id.clone();
+            update.status = status.to_string();
+            update.source = "P".to_string();
+            // handle_order_update may succeed or return error depending on state
+            let _ = oms.handle_order_update(&update);
+        }
+
+        // OMS should have processed updates without panicking
+        assert!(oms.total_updates() > 0 || oms.total_placed() > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline — multiple securities with strategies
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_pipeline_multiple_securities_multiple_strategies() {
+        let handle = make_token_handle_with_value("jwt");
+        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_multi_sec_strategy");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("multi_sec_strategies.toml");
+        let toml_content = r#"
+[[strategy]]
+name = "long_strategy"
+enabled = true
+
+[[strategy.entry_long]]
+field = "rsi"
+operator = "lt"
+threshold = 25.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "gt"
+threshold = 75.0
+
+[[strategy]]
+name = "short_strategy"
+enabled = true
+
+[[strategy.entry_short]]
+field = "rsi"
+operator = "gt"
+threshold = 80.0
+
+[[strategy.exit]]
+field = "rsi"
+operator = "lt"
+threshold = 30.0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let result = StrategyHotReloader::new(&config_path);
+        assert!(result.is_ok());
+        let (_reloader, defs, params) = result.unwrap();
+        let strategies: Vec<StrategyInstance> = defs
+            .into_iter()
+            .map(|def| StrategyInstance::new(def, MAX_INDICATOR_INSTRUMENTS))
+            .collect();
+
+        let (tick_tx, tick_rx) = broadcast::channel::<ParsedTick>(128);
+        let (_order_tx, order_rx) = broadcast::channel::<OrderUpdate>(16);
+
+        let config = TradingPipelineConfig {
+            indicator_params: params,
+            strategies,
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 1_000_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+
+        let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
+
+        // Send ticks for multiple securities
+        for sec_id in [100_u32, 200, 300] {
+            for i in 0..10_u32 {
+                let mut tick = ParsedTick::default();
+                tick.security_id = sec_id;
+                tick.last_traded_price = 200.0 + (i as f32 * 2.0);
+                tick.volume = 5000 + i;
+                let _ = tick_tx.send(tick);
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(tick_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task_handle).await;
+        assert!(result.is_ok(), "pipeline should handle multiple securities");
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // OMS — place and query active orders
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_oms_active_orders_tracks_security_id() {
+        let handle = make_token_handle_with_value("jwt");
+        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "test".to_owned(),
+        );
+        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let bridge = Box::new(TokenHandleBridge { handle });
+        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+            api_client,
+            rate_limiter,
+            bridge,
+            "test".to_owned(),
+        );
+
+        // Place orders for different securities
+        for sec_id in [100_u32, 200, 300] {
+            let request = PlaceOrderRequest {
+                security_id: sec_id,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Market,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 1,
+                price: 0.0,
+                trigger_price: 0.0,
+                lot_size: 1,
+            };
+            let _ = oms.place_order(request).await.unwrap();
+        }
+
+        assert_eq!(oms.total_placed(), 3);
+
+        // Verify security_id filtering on active orders
+        let active_for_100 = oms
+            .active_orders()
+            .iter()
+            .filter(|o| o.security_id == 100)
+            .count();
+        assert_eq!(
+            active_for_100, 1,
+            "should have one active order for sec 100"
+        );
+
+        let active_for_999 = oms
+            .active_orders()
+            .iter()
+            .filter(|o| o.security_id == 999)
+            .count();
+        assert_eq!(
+            active_for_999, 0,
+            "should have zero orders for non-placed security"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RiskEngine — reset_daily
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_risk_engine_reset_daily_clears_state() {
+        let mut risk = RiskEngine::new(2.0, 2, 1_000_000.0);
+        // Record some fills
+        risk.record_fill(100, 1, 100.0, 1);
+        risk.record_fill(100, 1, 100.0, 1);
+
+        // Should be at position limit
+        assert!(
+            !risk.check_order(100, 1).is_approved(),
+            "should reject before reset"
+        );
+
+        // Reset daily state
+        risk.reset_daily();
+
+        // After reset, should approve again
+        assert!(
+            risk.check_order(100, 1).is_approved(),
+            "should approve after daily reset"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TradingPipelineConfig — base URL validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pipeline_config_rest_api_base_url_is_v2() {
+        let handle = make_token_handle_with_value("jwt");
+        let config = TradingPipelineConfig {
+            indicator_params: IndicatorParams::default(),
+            strategies: Vec::new(),
+            max_daily_loss_percent: 2.0,
+            max_position_lots: 10,
+            capital: 500_000.0,
+            dry_run: true,
+            max_orders_per_second: 10,
+            rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
+            client_id: "test".to_owned(),
+            token_handle: handle,
+        };
+        assert!(
+            config.rest_api_base_url.contains("/v2"),
+            "REST API base URL must use v2"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IndicatorEngine — snapshot fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_indicator_engine_snapshot_has_price() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        // Use security_id within MAX_INDICATOR_INSTRUMENTS (25000) bounds
+        let mut tick = ParsedTick::default();
+        tick.security_id = 100;
+        tick.last_traded_price = 2450.50;
+        tick.volume = 10000;
+
+        let snapshot = engine.update(&tick);
+        assert_eq!(snapshot.security_id, 100);
+        // f32→f64 widening may introduce minor precision artifacts
+        assert!(
+            (snapshot.last_traded_price - f64::from(2450.50_f32)).abs() < f64::EPSILON,
+            "snapshot must carry the LTP from the tick"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdate — field access coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_order_update_all_fields_accessible() {
+        let mut update = make_order_update();
+        update.exchange = "NSE".to_string();
+        update.segment = "D".to_string();
+        update.security_id = "52432".to_string();
+        update.client_id = "CLIENT123".to_string();
+        update.order_no = "ORD-001".to_string();
+        update.exch_order_no = "1234567890".to_string();
+        update.product = "I".to_string();
+        update.txn_type = "B".to_string();
+        update.order_type = "MKT".to_string();
+        update.validity = "DAY".to_string();
+        update.quantity = 50;
+        update.traded_qty = 50;
+        update.remaining_quantity = 0;
+        update.price = 0.0;
+        update.trigger_price = 0.0;
+        update.traded_price = 2450.50;
+        update.avg_traded_price = 2450.50;
+        update.status = "TRADED".to_string();
+        update.symbol = "RELIANCE".to_string();
+        update.display_name = "Reliance Industries".to_string();
+        update.correlation_id = "corr-001".to_string();
+        update.source = "P".to_string();
+
+        assert_eq!(update.exchange, "NSE");
+        assert_eq!(update.segment, "D");
+        assert_eq!(update.security_id, "52432");
+        assert_eq!(update.order_no, "ORD-001");
+        assert_eq!(update.product, "I");
+        assert_eq!(update.txn_type, "B");
+        assert_eq!(update.quantity, 50);
+        assert_eq!(update.traded_qty, 50);
+        assert_eq!(update.remaining_quantity, 0);
+        assert!((update.traded_price - 2450.50).abs() < f64::EPSILON);
+        assert_eq!(update.status, "TRADED");
+        assert_eq!(update.source, "P");
+        assert_eq!(update.correlation_id, "corr-001");
+    }
 }

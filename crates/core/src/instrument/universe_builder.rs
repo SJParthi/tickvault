@@ -4564,4 +4564,190 @@ mod tests {
         let result = link_price_ids(vec![], &HashMap::new(), &HashMap::new());
         assert!(result.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: discover_fno_underlyings dedup — first occurrence wins
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_dedup_first_wins_lot_size() {
+        // Two NIFTY futures with DIFFERENT lot_sizes — first occurrence's lot_size wins
+        let rows = vec![
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75, // lot_size from first occurrence
+                Exchange::NationalStockExchange,
+            ),
+            make_futidx_row(
+                51701,
+                26000,
+                "NIFTY",
+                "2026-06-30",
+                50, // different lot_size — should be ignored
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1, "duplicate NIFTY must be deduped");
+        assert_eq!(
+            underlyings[0].lot_size, 75,
+            "first occurrence's lot_size (75) must be preserved, not second (50)"
+        );
+        assert_eq!(underlyings[0].underlying_security_id, 26000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: discover_fno_underlyings dedup — first wins for FUTSTK too
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_dedup_first_wins_futstk() {
+        // Two RELIANCE FUTSTK with different lot_sizes
+        let rows = vec![
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+            make_futstk_row(52024, 2885, "RELIANCE", "2026-06-30", 250),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1);
+        assert_eq!(
+            underlyings[0].lot_size, 500,
+            "first lot_size (500) must win over second (250)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_index_lookup — last occurrence wins (HashMap::insert)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_index_lookup_last_occurrence_wins_for_same_symbol() {
+        // Two index rows with the same symbol but different security_ids
+        // HashMap::insert overwrites, so last one wins
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_index_row(99, "NIFTY", Exchange::NationalStockExchange),
+        ];
+
+        let lookup = build_index_lookup(&rows);
+        assert_eq!(lookup.len(), 1);
+        // Last insert wins in HashMap
+        assert_eq!(lookup.get("NIFTY").unwrap().security_id, 99);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_equity_lookup — last occurrence wins for same symbol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_equity_lookup_last_occurrence_wins_for_same_symbol() {
+        let rows = vec![
+            make_equity_row(2885, "RELIANCE"),
+            make_equity_row(9999, "RELIANCE"),
+        ];
+
+        let lookup = build_equity_lookup(&rows);
+        assert_eq!(lookup.len(), 1);
+        assert_eq!(lookup.get("RELIANCE"), Some(&9999));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: discover_fno_underlyings — BSE FUTSTK skipped (TEST + BSE)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_skips_bse_futstk_with_test_marker() {
+        // Row that is both BSE FUTSTK AND has TEST marker — both filters apply
+        let rows = vec![make_futstk_row_bse(
+            80099,
+            9001,
+            "TESTBSESTOCK",
+            "2026-03-30",
+            100,
+        )];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert!(
+            underlyings.is_empty(),
+            "BSE FUTSTK with TEST marker must be double-filtered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 5 — duplicate security_id across index and derivative
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_duplicate_security_id_across_segments_keeps_first() {
+        // An index row and a derivative row with the same security_id
+        // The dedup tracker in Pass 5 should keep the first occurrence
+        let rows = vec![
+            // Index with security_id 13
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            // FUTIDX with security_id 51700
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Index (13) in instrument_info
+        assert!(result.instrument_info.contains_key(&13));
+        // Derivative (51700) in instrument_info
+        assert!(result.instrument_info.contains_key(&51700));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 5 — duplicate security_id within derivatives
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_duplicate_derivative_security_id_keeps_first_occurrence() {
+        // Two derivative rows with the same security_id — second should be skipped
+        let mut second_row = make_futidx_row(
+            51700,
+            26000,
+            "NIFTY",
+            "2026-04-30",
+            75,
+            Exchange::NationalStockExchange,
+        );
+        // Same security_id as the one in build_test_rows
+        second_row.security_id = 51700;
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            second_row,
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Should have exactly 1 derivative contract with ID 51700
+        let contract = result.derivative_contracts.get(&51700).unwrap();
+        // First occurrence's expiry (2026-03-30) should be kept
+        assert_eq!(
+            contract.expiry_date,
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            "first occurrence's expiry must be preserved"
+        );
+    }
 }

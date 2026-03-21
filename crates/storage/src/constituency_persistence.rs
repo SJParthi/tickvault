@@ -970,6 +970,59 @@ mod tests {
         ensure_constituency_table(&config).await;
     }
 
+    // -----------------------------------------------------------------------
+    // Coverage: security_id zero handling when symbol not in FnoUniverse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_security_id_zero_for_unmapped_symbol() {
+        // When fno_universe is Some but symbol is not found,
+        // security_id defaults to 0 via unwrap_or(0).
+        use dhan_live_trader_common::instrument_types::FnoUniverse;
+
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let universe = FnoUniverse {
+            underlyings: std::collections::HashMap::new(),
+            derivative_contracts: std::collections::HashMap::new(),
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: dhan_live_trader_common::instrument_types::UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: std::time::Duration::from_millis(1),
+                build_timestamp: chrono::Utc::now().with_timezone(&ist),
+            },
+        };
+
+        // symbol_to_security_id returns None for missing symbols
+        let sec_id = universe.symbol_to_security_id("NONEXISTENT").unwrap_or(0);
+        assert_eq!(sec_id, 0, "missing symbol must default to security_id 0");
+    }
+
+    #[test]
+    fn test_persist_constituency_ddl_has_isin_column() {
+        assert!(
+            INDEX_CONSTITUENTS_CREATE_DDL.contains("isin STRING"),
+            "DDL must include isin STRING column"
+        );
+    }
+
+    #[test]
+    fn test_persist_constituency_ddl_has_sector_column() {
+        assert!(
+            INDEX_CONSTITUENTS_CREATE_DDL.contains("sector STRING"),
+            "DDL must include sector STRING column"
+        );
+    }
+
     #[test]
     fn test_persist_constituency_inner_with_fno_universe_missing_symbol() {
         // FnoUniverse present but does not contain the symbol — exercises

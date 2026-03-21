@@ -1193,4 +1193,141 @@ mod tests {
         service.notify(NotificationEvent::TokenRenewed);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — non-success HTTP response (e.g., 403)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_telegram_message_403_does_not_panic() {
+        let base_url = start_mock_telegram_server(403).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        // Should log a warning but not panic or return an error.
+        send_telegram_message(&client, &base_url, &token, "999999999", "test 403").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — 500 error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_telegram_message_500_does_not_panic() {
+        let base_url = start_mock_telegram_server(500).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        send_telegram_message(&client, &base_url, &token, "123", "test 500").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service — notify with connection refused logs warn
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_notify_connection_refused_logs_warning() {
+        // The active service points to 127.0.0.1:1 (connection refused).
+        // Notify spawns a background task that will fail silently.
+        let service = make_active_service();
+
+        service.notify(NotificationEvent::Custom {
+            message: "test connection refused path".to_string(),
+        });
+
+        // Wait for the background task to attempt and fail.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // No panic = success. The error is logged as warn.
+    }
+
+    // -----------------------------------------------------------------------
+    // disabled service — is_active returns false consistently
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disabled_service_is_active_consistent() {
+        let service = NotificationService::disabled();
+        assert!(!service.is_active());
+        assert!(!service.is_active()); // idempotent
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — real notification event messages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_real_event_message() {
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "token expired".to_string(),
+        };
+        let message = event.to_message();
+        let stripped = strip_html_tags(&message);
+        // Stripped should contain the reason but no HTML tags.
+        assert!(stripped.contains("token expired"));
+        assert!(!stripped.contains('<'));
+        assert!(!stripped.contains('>'));
+    }
+
+    // -----------------------------------------------------------------------
+    // make_active_service — high severity event with no SNS client
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_critical_event_no_sns_does_not_attempt_sms() {
+        let service = make_active_service(); // no sns_client
+        // Critical event — normally would trigger SMS, but no SNS client.
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "critical without SNS".to_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // No panic = success. SMS path is skipped due to None SNS client.
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — consistency check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_consistent_output() {
+        let phone = "+919876543210";
+        let masked1 = mask_phone(phone);
+        let masked2 = mask_phone(phone);
+        assert_eq!(masked1, masked2, "masking should be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — special characters preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_preserves_special_chars() {
+        assert_eq!(strip_html_tags("a & b"), "a & b");
+        assert_eq!(strip_html_tags("100%"), "100%");
+        assert_eq!(strip_html_tags("P&L: +500"), "P&L: +500");
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service — rapid fire notifications
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_rapid_fire_does_not_panic() {
+        let service = make_active_service();
+        for i in 0..20 {
+            service.notify(NotificationEvent::Custom {
+                message: format!("rapid fire event {i}"),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

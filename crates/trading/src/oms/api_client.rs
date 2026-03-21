@@ -2656,4 +2656,564 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(debug.contains("DhanRateLimited"));
     }
+
+    // -----------------------------------------------------------------------
+    // HTTP error matrix: 403 for place, 502/503 for multiple endpoints,
+    // get_order 400/403, multi-margin 401/503, fund limit 403
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_place_order_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 403);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_place_order_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .place_order("fake-token", &make_test_place_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(message.contains("bad gateway"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(message.contains("bad gateway"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_api_error_503() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"service unavailable"}"#;
+        let (base_url, handle) = start_mock_server(503, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(message.contains("service unavailable"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(message.contains("bad gateway"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error_503() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"service unavailable"}"#;
+        let (base_url, handle) = start_mock_server(503, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.cancel_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(message.contains("service unavailable"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_order_api_error_400() {
+        let body = r#"{"errorCode":"DH-905","errorMessage":"invalid order id"}"#;
+        let (base_url, handle) = start_mock_server(400, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_order("fake-token", "BAD-ID").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(message.contains("DH-905"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_order_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 403);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_orders_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_all_orders("fake-token").await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 403,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_positions_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_positions("fake-token").await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 403,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_api_error_500() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"internal"}"#;
+        let (base_url, handle) = start_mock_server(500, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_holdings("fake-token").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 500);
+                assert!(message.contains("DH-908"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_holdings("fake-token").await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 403,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_margin_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"auth failed"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+
+        let request = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+
+        let result = client.calculate_margin("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 401,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"auth failed"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 401,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_multi_margin_api_error_503() {
+        let body = r#"{"errorCode":"DH-908","errorMessage":"service unavailable"}"#;
+        let (base_url, handle) = start_mock_server(503, body).await;
+        let client = make_test_client(&base_url);
+
+        let request = MultiMarginRequest {
+            include_position: false,
+            include_orders: false,
+            scripts: vec![],
+        };
+
+        let result = client.calculate_multi_margin("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 503,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_fund_limit_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_fund_limit("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 403,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_order_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_order("fake-token", "ORD-1").await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(message.contains("bad gateway"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_orders_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_all_orders("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exit_all_positions_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.exit_all_positions("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_positions_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_positions("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_holdings_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_holdings("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_calculate_margin_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let request = MarginCalculatorRequest {
+            dhan_client_id: "100".to_owned(),
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 50,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "52432".to_owned(),
+            price: 245.50,
+            trigger_price: 0.0,
+        };
+
+        let result = client.calculate_margin("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_fund_limit_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client.get_fund_limit("fake-token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_api_error_403() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"forbidden"}"#;
+        let (base_url, handle) = start_mock_server(403, body).await;
+        let client = make_test_client(&base_url);
+
+        let result = client
+            .modify_order("fake-token", "ORD-1", &make_test_modify_request())
+            .await;
+
+        match result.unwrap_err() {
+            OmsError::DhanApiError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 403);
+                assert!(message.contains("DH-901"));
+            }
+            other => panic!("expected DhanApiError, got: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_convert_position_api_error_401() {
+        let body = r#"{"errorCode":"DH-901","errorMessage":"auth failed"}"#;
+        let (base_url, handle) = start_mock_server(401, body).await;
+        let client = make_test_client(&base_url);
+
+        let request = DhanConvertPositionRequest {
+            dhan_client_id: "100".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            to_product_type: "CNC".to_owned(),
+            exchange_segment: "NSE_EQ".to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "2885".to_owned(),
+            convert_qty: "10".to_owned(),
+            trading_symbol: "RELIANCE".to_owned(),
+        };
+
+        let result = client.convert_position("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 401,
+                ..
+            }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_convert_position_api_error_502() {
+        let body = r#"{"errorCode":"DH-909","errorMessage":"bad gateway"}"#;
+        let (base_url, handle) = start_mock_server(502, body).await;
+        let client = make_test_client(&base_url);
+
+        let request = DhanConvertPositionRequest {
+            dhan_client_id: "100".to_owned(),
+            from_product_type: "INTRADAY".to_owned(),
+            to_product_type: "CNC".to_owned(),
+            exchange_segment: "NSE_EQ".to_owned(),
+            position_type: "LONG".to_owned(),
+            security_id: "2885".to_owned(),
+            convert_qty: "10".to_owned(),
+            trading_symbol: "RELIANCE".to_owned(),
+        };
+
+        let result = client.convert_position("fake-token", &request).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            OmsError::DhanApiError {
+                status_code: 502,
+                ..
+            }
+        ));
+        handle.abort();
+    }
 }

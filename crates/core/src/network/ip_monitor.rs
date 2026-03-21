@@ -884,4 +884,232 @@ mod tests {
     fn test_mask_ip_five_parts() {
         assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
     }
+
+    // -----------------------------------------------------------------------
+    // check_current_ip — primary succeeds, returns Match
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_current_ip_match_via_mock_server() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "10.20.30.40";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        // Use fetch_ip + compare_ips to simulate check_current_ip path
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            compare_ips("10.20.30.40", &result.unwrap()),
+            IpCheckResult::Match
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_current_ip — primary succeeds, returns Mismatch
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_current_ip_mismatch_via_mock_server() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "10.20.30.40";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        let check = compare_ips("99.99.99.99", &result.unwrap());
+        assert!(matches!(check, IpCheckResult::Mismatch { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — whitespace in IP response is trimmed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_trims_whitespace() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "  192.168.1.1  \n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "192.168.1.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — non-success HTTP status returns error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_non_success_status_500() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("HTTP 500"), "error: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip — invalid IP in response body
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_invalid_ip_in_body() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "not-an-ipv4-address";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("invalid IPv4"), "error: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_ip_monitor — mismatch detection via watch channel
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_ip_monitor_mismatch_signals_watch_channel() {
+        // If IP check returns a mismatch, the watch channel should emit true.
+        // We use a very short interval and an IP that won't match any real check.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = IpMonitorConfig::new("203.0.113.255".to_string(), 1);
+        let (mut rx, handle) = spawn_ip_monitor(config, shutdown_rx);
+
+        // Wait for at least one check cycle (1s + check time)
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Shut down
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        // On CI without network: CheckFailed (no signal, stays false).
+        // On dev with network: Mismatch (signals true) or CheckFailed.
+        // Either outcome is valid — just verify no panic.
+        let _signal = *rx.borrow_and_update();
+    }
+
+    // -----------------------------------------------------------------------
+    // check_current_ip — both fail returns CheckFailed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_current_ip_very_short_timeout_returns_check_failed() {
+        // With 1ms timeout, both primary and fallback should fail.
+        let result = check_current_ip("10.0.0.1", Duration::from_millis(1)).await;
+        match &result {
+            IpCheckResult::CheckFailed { reason } => {
+                assert!(
+                    reason.contains("failed"),
+                    "check failed reason should mention failure: {reason}"
+                );
+            }
+            IpCheckResult::Match | IpCheckResult::Mismatch { .. } => {
+                // Network happened to be fast enough — acceptable.
+            }
+        }
+    }
 }

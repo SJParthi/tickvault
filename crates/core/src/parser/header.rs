@@ -203,4 +203,45 @@ mod tests {
             _ => panic!("wrong error variant"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: unknown exchange segment bytes, boundary values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_header_unknown_exchange_byte_all_invalid_range() {
+        // Bytes 6 and 9-255 are all unknown exchange segments.
+        // parse_header reads the raw byte without validation.
+        // ExchangeSegment::from_byte should reject them.
+        use dhan_live_trader_common::types::ExchangeSegment;
+
+        let invalid_bytes = [6u8, 9, 10, 50, 100, 128, 200, 254, 255];
+        for &seg in &invalid_bytes {
+            let buf = make_header(RESPONSE_CODE_TICKER, 16, seg, 1);
+            let hdr = parse_header(&buf).unwrap();
+            assert_eq!(hdr.exchange_segment_code, seg);
+            assert!(
+                ExchangeSegment::from_byte(seg).is_none(),
+                "segment byte {seg} must return None"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_header_all_valid_exchange_segments_accepted() {
+        use dhan_live_trader_common::types::ExchangeSegment;
+
+        // Valid segments: 0=IDX_I, 1=NSE_EQ, 2=NSE_FNO, 3=NSE_CURRENCY,
+        // 4=BSE_EQ, 5=MCX_COMM, 7=BSE_CURRENCY, 8=BSE_FNO
+        let valid_bytes = [0u8, 1, 2, 3, 4, 5, 7, 8];
+        for &seg in &valid_bytes {
+            let buf = make_header(RESPONSE_CODE_TICKER, 16, seg, 42);
+            let hdr = parse_header(&buf).unwrap();
+            assert_eq!(hdr.exchange_segment_code, seg);
+            assert!(
+                ExchangeSegment::from_byte(seg).is_some(),
+                "segment byte {seg} must be recognized"
+            );
+        }
+    }
 }

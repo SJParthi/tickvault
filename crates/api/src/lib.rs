@@ -168,4 +168,249 @@ mod tests {
         ];
         let _cors = build_cors_layer(&origins);
     }
+
+    #[test]
+    fn test_build_cors_layer_single_valid_origin() {
+        let origins = vec!["https://my-dashboard.example.com".to_string()];
+        let _cors = build_cors_layer(&origins);
+    }
+
+    // -------------------------------------------------------------------
+    // build_router: smoke test — router builds without panic
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_build_router_smoke_test_dry_run() {
+        let state = state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        );
+        // dry_run=true → DLT_API_TOKEN not needed
+        let _router = build_router(state, &[], true);
+    }
+
+    #[test]
+    fn test_build_router_with_custom_origins() {
+        let state = state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        );
+        let origins = vec![
+            "http://localhost:3000".to_string(),
+            "https://dashboard.example.com".to_string(),
+        ];
+        let _router = build_router(state, &origins, true);
+    }
+
+    // -------------------------------------------------------------------
+    // build_router: request routing — health endpoint responds 200
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_build_router_health_endpoint_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        );
+        let router = build_router(state, &[], true);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    // -------------------------------------------------------------------
+    // build_router: portal endpoint returns 200
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_build_router_portal_endpoint_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        );
+        let router = build_router(state, &[], true);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/portal")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    // -------------------------------------------------------------------
+    // build_router: unknown route returns 404
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_build_router_unknown_route_returns_404() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        );
+        let router = build_router(state, &[], true);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
 }

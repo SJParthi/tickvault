@@ -890,6 +890,80 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // fetch_ip_from_url — SSM whitespace IP fails validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssm_whitespace_only_ip_fails_validation() {
+        // Simulates what happens when SSM returns a whitespace-only value:
+        // fetch_expected_ip_from_ssm trims it → empty → returns error.
+        // But even if trimming is skipped, validate_ipv4_format rejects whitespace.
+        assert!(validate_ipv4_format("   ").is_err());
+        assert!(validate_ipv4_format("\t\n").is_err());
+        assert!(validate_ipv4_format("  10.0.0.1  ").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_ip_from_url — primary fails, fallback succeeds
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_ip_from_url_with_whitespace_trimmed() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // Simulate a server that returns IP with surrounding whitespace.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let body = "  10.0.0.1\n  ";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let result = fetch_ip_from_url(
+            &format!("http://127.0.0.1:{port}/ip"),
+            Duration::from_secs(2),
+        )
+        .await;
+        // The body is trimmed before validation; "10.0.0.1" is valid.
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "10.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_public_ip — both primary and fallback exhausted
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_detect_public_ip_returns_result_type() {
+        // detect_public_ip exercises both primary and fallback with retries.
+        // We can't easily mock the real URLs, but we verify the function
+        // returns a proper Result (not panic) in all environments.
+        let result = detect_public_ip().await;
+        match &result {
+            Ok(ip) => assert!(
+                validate_ipv4_format(ip).is_ok(),
+                "returned IP must be valid"
+            ),
+            Err(msg) => assert!(
+                msg.contains("exhausted"),
+                "error should mention exhaustion: {msg}"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // detect_public_ip — error path with both URLs failing
     // -----------------------------------------------------------------------
 

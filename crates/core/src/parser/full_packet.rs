@@ -603,4 +603,135 @@ mod tests {
         let (tick, _) = parse_full_packet(&buf, &hdr, 0).unwrap();
         assert!((tick.last_traded_price - 24500.0).abs() < 0.01);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: all depth levels invalid, mixed NaN/Inf depth
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_full_all_depth_nan_bid_and_ask() {
+        // All 5 depth levels have NaN for both bid and ask prices.
+        // Parser reads them without panic — validation is caller's job.
+        let depth_data = [
+            (100u32, 200u32, 5u16, 10u16, f32::NAN, f32::NAN),
+            (100, 200, 5, 10, f32::NAN, f32::NAN),
+            (100, 200, 5, 10, f32::NAN, f32::NAN),
+            (100, 200, 5, 10, f32::NAN, f32::NAN),
+            (100, 200, 5, 10, f32::NAN, f32::NAN),
+        ];
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            24500.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            Some(depth_data),
+        );
+        let (_, depth) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        for (i, level) in depth.iter().enumerate() {
+            assert!(
+                level.bid_price.is_nan(),
+                "depth[{i}].bid_price should be NaN"
+            );
+            assert!(
+                level.ask_price.is_nan(),
+                "depth[{i}].ask_price should be NaN"
+            );
+            // Quantities are still valid
+            assert_eq!(level.bid_quantity, 100);
+            assert_eq!(level.ask_quantity, 200);
+        }
+    }
+
+    #[test]
+    fn test_parse_full_all_depth_infinity_bid_neg_infinity_ask() {
+        // All 5 levels: bid = +Inf, ask = -Inf
+        let depth_data = [
+            (50u32, 60u32, 3u16, 4u16, f32::INFINITY, f32::NEG_INFINITY),
+            (50, 60, 3, 4, f32::INFINITY, f32::NEG_INFINITY),
+            (50, 60, 3, 4, f32::INFINITY, f32::NEG_INFINITY),
+            (50, 60, 3, 4, f32::INFINITY, f32::NEG_INFINITY),
+            (50, 60, 3, 4, f32::INFINITY, f32::NEG_INFINITY),
+        ];
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            24500.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            Some(depth_data),
+        );
+        let (_, depth) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        for (i, level) in depth.iter().enumerate() {
+            assert!(
+                level.bid_price.is_infinite() && level.bid_price.is_sign_positive(),
+                "depth[{i}].bid_price should be +Infinity"
+            );
+            assert!(
+                level.ask_price.is_infinite() && level.ask_price.is_sign_negative(),
+                "depth[{i}].ask_price should be -Infinity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_full_mixed_valid_and_nan_depth() {
+        // Levels 0,2,4 valid; levels 1,3 have NaN prices
+        let depth_data = [
+            (100u32, 200u32, 5u16, 10u16, 24490.0f32, 24500.0f32),
+            (100, 200, 5, 10, f32::NAN, f32::NAN),
+            (100, 200, 5, 10, 24480.0, 24510.0),
+            (100, 200, 5, 10, f32::NAN, f32::NAN),
+            (100, 200, 5, 10, 24470.0, 24520.0),
+        ];
+        let (buf, hdr) = make_full_packet(
+            2,
+            13,
+            24500.0,
+            1,
+            1772073900,
+            100.0,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            0,
+            99.0,
+            98.0,
+            101.0,
+            97.0,
+            Some(depth_data),
+        );
+        let (_, depth) = parse_full_packet(&buf, &hdr, 0).unwrap();
+        // Valid levels
+        assert!((depth[0].bid_price - 24490.0).abs() < 0.01);
+        assert!((depth[2].bid_price - 24480.0).abs() < 0.01);
+        assert!((depth[4].bid_price - 24470.0).abs() < 0.01);
+        // NaN levels
+        assert!(depth[1].bid_price.is_nan());
+        assert!(depth[3].ask_price.is_nan());
+    }
 }

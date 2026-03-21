@@ -565,6 +565,76 @@ mod tests {
         assert!(warn.contains("15"));
     }
 
+    // -----------------------------------------------------------------------
+    // Additional coverage: warmup boundary exact count, counter saturation,
+    // multiple gaps in sequence, reset mid-tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn warmup_exact_threshold_tick_transitions_to_active() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Feed exactly TICK_GAP_MIN_TICKS_BEFORE_ACTIVE ticks (tick_count goes 1..=threshold)
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        // The NEXT tick (threshold+1) is the first active tick
+        // Feed it with a huge gap → should detect warning
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE - 1 + TICK_GAP_ALERT_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        assert!(
+            matches!(result, TickGapResult::Warning { .. }),
+            "first tick after warmup must detect gap"
+        );
+    }
+
+    #[test]
+    fn consecutive_errors_increment_counter() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Warmup
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        let mut ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE;
+        // Three consecutive error-level gaps
+        for _ in 0..3 {
+            ts += TICK_GAP_ERROR_THRESHOLD_SECS;
+            tracker.record_tick(1001, ts);
+        }
+        assert_eq!(tracker.total_errors(), 3);
+    }
+
+    #[test]
+    fn reset_mid_active_tracking_restarts_warmup() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Full warmup + active tracking
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 5 {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        assert_eq!(tracker.tracked_securities(), 1);
+
+        // Reset
+        tracker.reset();
+        assert_eq!(tracker.tracked_securities(), 0);
+
+        // After reset, warmup suppresses gaps again
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            let result = tracker.record_tick(1001, base_ts + 100_000 + i * 1000);
+            assert_eq!(
+                result,
+                TickGapResult::Ok,
+                "post-reset warmup must suppress gaps"
+            );
+        }
+    }
+
     #[test]
     fn same_timestamp_after_warmup_is_ok() {
         let mut tracker = TickGapTracker::new(10);

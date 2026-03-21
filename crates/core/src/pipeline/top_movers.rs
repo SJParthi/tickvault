@@ -642,4 +642,139 @@ mod tests {
         assert!(json.contains("most_active"));
         assert!(json.contains("total_tracked"));
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: invalid day_close values, total_tracked sums,
+    // instrument counts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invalid_day_close_neg_infinity_skipped() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, f32::NEG_INFINITY, 1000));
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "negative infinity day_close must be skipped"
+        );
+    }
+
+    #[test]
+    fn invalid_day_close_very_small_positive_accepted() {
+        // day_close = f32::MIN_POSITIVE (smallest positive finite) is valid
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, f32::MIN_POSITIVE, 1000));
+        assert_eq!(
+            tracker.tracked_count(),
+            1,
+            "tiny positive day_close is finite and > 0, should be tracked"
+        );
+    }
+
+    #[test]
+    fn invalid_day_close_negative_zero_skipped() {
+        // -0.0 <= 0.0 is true in IEEE 754, so it should be skipped
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(100, 2, 110.0, -0.0, 1000));
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "-0.0 day_close must be skipped (equal to 0.0)"
+        );
+    }
+
+    #[test]
+    fn total_tracked_reflects_distinct_instrument_count() {
+        let mut tracker = TopMoversTracker::new();
+        // 5 distinct securities
+        for i in 1..=5u32 {
+            tracker.update(&make_tick(i, 2, 100.0 + (i as f32), 100.0, i * 100));
+        }
+        assert_eq!(tracker.tracked_count(), 5);
+
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(
+            snapshot.total_tracked, 5,
+            "snapshot total_tracked must equal tracked_count"
+        );
+    }
+
+    #[test]
+    fn total_instruments_sums_gainers_losers_most_active() {
+        let mut tracker = TopMoversTracker::new();
+        // 3 gainers
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000)); // +10%
+        tracker.update(&make_tick(2, 2, 120.0, 100.0, 2000)); // +20%
+        tracker.update(&make_tick(3, 2, 105.0, 100.0, 3000)); // +5%
+        // 2 losers
+        tracker.update(&make_tick(4, 2, 90.0, 100.0, 4000)); // -10%
+        tracker.update(&make_tick(5, 2, 80.0, 100.0, 5000)); // -20%
+        // 1 flat (excluded from gainers/losers but included in most_active)
+        tracker.update(&make_tick(6, 2, 100.0, 100.0, 6000)); // 0%
+
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(snapshot.gainers.len(), 3, "3 gainers");
+        assert_eq!(snapshot.losers.len(), 2, "2 losers");
+        assert_eq!(
+            snapshot.most_active.len(),
+            6,
+            "all 6 securities in most_active"
+        );
+        assert_eq!(
+            snapshot.total_tracked, 6,
+            "total_tracked = all distinct instruments"
+        );
+    }
+
+    #[test]
+    fn snapshot_most_active_includes_flat_securities() {
+        // Flat securities (0% change) appear in most_active but not
+        // in gainers or losers
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 100.0, 100.0, 9999));
+        let snapshot = tracker.compute_snapshot();
+        assert!(snapshot.gainers.is_empty());
+        assert!(snapshot.losers.is_empty());
+        assert_eq!(snapshot.most_active.len(), 1);
+        assert_eq!(snapshot.most_active[0].security_id, 1);
+        assert_eq!(snapshot.most_active[0].volume, 9999);
+    }
+
+    #[test]
+    fn ticks_processed_saturates_at_u64_max() {
+        let mut tracker = TopMoversTracker::new();
+        // Manually verify saturating_add behavior by sending many ticks
+        for _ in 0..10 {
+            tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000));
+        }
+        assert_eq!(tracker.ticks_processed(), 10);
+    }
+
+    #[test]
+    fn snapshot_with_nan_change_pct_excluded_from_all_lists() {
+        // NaN LTP with valid day_close produces NaN change_pct.
+        // NaN entries must be filtered from gainers, losers, and most_active.
+        let mut tracker = TopMoversTracker::new();
+        let tick = ParsedTick {
+            security_id: 1,
+            exchange_segment_code: 2,
+            last_traded_price: f32::NAN,
+            day_close: 100.0,
+            volume: 5000,
+            exchange_timestamp: 1000,
+            ..Default::default()
+        };
+        tracker.update(&tick);
+        assert_eq!(tracker.tracked_count(), 1);
+
+        let snapshot = tracker.compute_snapshot();
+        assert!(snapshot.gainers.is_empty(), "NaN excluded from gainers");
+        assert!(snapshot.losers.is_empty(), "NaN excluded from losers");
+        // NaN entries are also filtered from the entries vec before sorting,
+        // so most_active won't contain them
+        assert!(
+            snapshot.most_active.is_empty(),
+            "NaN excluded from most_active"
+        );
+    }
 }

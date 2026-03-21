@@ -304,4 +304,184 @@ mod tests {
         assert!(r1.unwrap().is_none());
         assert!(r2.unwrap().is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Config combination tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_disabled_tracing_disabled_both_return_ok_none() {
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: String::new(),
+            metrics_enabled: false,
+            tracing_enabled: false,
+        };
+        assert!(init_metrics(&config).is_ok());
+        let tracing_result = init_tracing::<tracing_subscriber::Registry>(&config);
+        assert!(tracing_result.is_ok());
+        assert!(tracing_result.unwrap().is_none());
+    }
+
+    #[test]
+    fn config_with_custom_port_preserves_value() {
+        let config = ObservabilityConfig {
+            metrics_port: 9999,
+            otlp_endpoint: "http://custom:4317".to_string(),
+            metrics_enabled: false,
+            tracing_enabled: false,
+        };
+        assert_eq!(config.metrics_port, 9999);
+        assert_eq!(config.otlp_endpoint, "http://custom:4317");
+    }
+
+    #[test]
+    fn config_with_port_zero_is_valid_when_disabled() {
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: String::new(),
+            metrics_enabled: false,
+            tracing_enabled: false,
+        };
+        // Port 0 is fine when metrics are disabled
+        assert!(init_metrics(&config).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // init_tracing enabled path — builds OTLP exporter lazily
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn init_tracing_enabled_with_localhost_builds_ok() {
+        // OTLP exporter connects lazily — build should succeed even with
+        // unreachable endpoints. This exercises the full pipeline build.
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: "http://127.0.0.1:4317".to_string(),
+            metrics_enabled: false,
+            tracing_enabled: true,
+        };
+        let result = init_tracing::<tracing_subscriber::Registry>(&config);
+        assert!(
+            result.is_ok(),
+            "tracing build should succeed with lazy connection"
+        );
+        if let Ok(Some((_layer, provider))) = result {
+            drop(provider);
+        }
+    }
+
+    #[tokio::test]
+    async fn init_tracing_enabled_returns_some() {
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            metrics_enabled: false,
+            tracing_enabled: true,
+        };
+        let result = init_tracing::<tracing_subscriber::Registry>(&config);
+        assert!(result.is_ok());
+        let inner = result.unwrap();
+        assert!(
+            inner.is_some(),
+            "enabled tracing must return Some((layer, provider))"
+        );
+        if let Some((_layer, provider)) = inner {
+            drop(provider);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Default config assertions — deeper validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_config_port_is_above_reserved_range() {
+        let config = ObservabilityConfig::default();
+        // Common Prometheus exporter ports: 9090-9099, 9100+
+        assert!(
+            config.metrics_port >= 1024,
+            "default port must be above reserved range"
+        );
+    }
+
+    #[test]
+    fn default_config_endpoint_starts_with_http() {
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.otlp_endpoint.starts_with("http://")
+                || config.otlp_endpoint.starts_with("https://"),
+            "OTLP endpoint must use HTTP/HTTPS protocol"
+        );
+    }
+
+    #[test]
+    fn default_config_endpoint_contains_port() {
+        let config = ObservabilityConfig::default();
+        // OTLP endpoint should contain a port (e.g., :4317)
+        assert!(
+            config.otlp_endpoint.contains(':'),
+            "OTLP endpoint should contain port separator"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Config serialization/deserialization consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_partial_eq_via_field_comparison() {
+        let c1 = ObservabilityConfig {
+            metrics_port: 9091,
+            otlp_endpoint: "http://test:4317".to_string(),
+            metrics_enabled: true,
+            tracing_enabled: true,
+        };
+        let c2 = c1.clone();
+        assert_eq!(c1.metrics_port, c2.metrics_port);
+        assert_eq!(c1.otlp_endpoint, c2.otlp_endpoint);
+        assert_eq!(c1.metrics_enabled, c2.metrics_enabled);
+        assert_eq!(c1.tracing_enabled, c2.tracing_enabled);
+    }
+
+    #[test]
+    fn disabled_config_metrics_short_circuits() {
+        // Verifying the early return: disabled metrics should NOT attempt
+        // to bind a port. The test would fail if it tried to bind port 0
+        // and left a dangling listener.
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: String::new(),
+            metrics_enabled: false,
+            tracing_enabled: false,
+        };
+        // Should succeed instantly without side effects
+        let start = std::time::Instant::now();
+        let result = init_metrics(&config);
+        let elapsed = start.elapsed();
+        assert!(result.is_ok());
+        assert!(
+            elapsed.as_millis() < 100,
+            "disabled metrics should return immediately"
+        );
+    }
+
+    #[test]
+    fn disabled_tracing_short_circuits() {
+        let config = ObservabilityConfig {
+            metrics_port: 0,
+            otlp_endpoint: String::new(),
+            metrics_enabled: false,
+            tracing_enabled: false,
+        };
+        let start = std::time::Instant::now();
+        let result = init_tracing::<tracing_subscriber::Registry>(&config);
+        let elapsed = start.elapsed();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        assert!(
+            elapsed.as_millis() < 100,
+            "disabled tracing should return immediately"
+        );
+    }
 }

@@ -738,4 +738,238 @@ mod tests {
             assert_eq!(recovered, exchange);
         }
     }
+
+    // --- dhan_api_instrument_type: all 6 derivative combinations ---
+
+    #[test]
+    fn test_dhan_api_instrument_type_all_six_combinations() {
+        // Validates ALL (InstrumentType, is_index_underlying) → Dhan API string mappings:
+        // Future + index    → FUTIDX
+        // Future + stock    → FUTSTK
+        // Option + index    → OPTIDX
+        // Option + stock    → OPTSTK
+        // Index  + any      → INDEX
+        // Equity + any      → EQUITY
+        let cases: &[(InstrumentType, bool, &str)] = &[
+            (InstrumentType::Future, true, "FUTIDX"),
+            (InstrumentType::Future, false, "FUTSTK"),
+            (InstrumentType::Option, true, "OPTIDX"),
+            (InstrumentType::Option, false, "OPTSTK"),
+            (InstrumentType::Index, true, "INDEX"),
+            (InstrumentType::Equity, false, "EQUITY"),
+        ];
+        for &(inst_type, is_index, expected) in cases {
+            assert_eq!(
+                inst_type.dhan_api_instrument_type(is_index),
+                expected,
+                "dhan_api_instrument_type({:?}, {}) should be {}",
+                inst_type,
+                is_index,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_index_ignores_flag() {
+        // Index type always returns "INDEX" regardless of is_index_underlying flag
+        assert_eq!(
+            InstrumentType::Index.dhan_api_instrument_type(true),
+            InstrumentType::Index.dhan_api_instrument_type(false),
+        );
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_equity_ignores_flag() {
+        // Equity type always returns "EQUITY" regardless of is_index_underlying flag
+        assert_eq!(
+            InstrumentType::Equity.dhan_api_instrument_type(true),
+            InstrumentType::Equity.dhan_api_instrument_type(false),
+        );
+    }
+
+    // --- Archived From conversions: ExchangeSegment direct serialization ---
+
+    #[test]
+    fn test_archived_exchange_segment_direct_roundtrip_all_variants() {
+        // Serializes each ExchangeSegment directly (not via FnoUnderlying wrapper)
+        let segments = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        for seg in segments {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&seg).unwrap();
+            let archived =
+                rkyv::access::<ArchivedExchangeSegment, rkyv::rancor::Error>(&bytes).unwrap();
+            let recovered = ExchangeSegment::from(archived);
+            assert_eq!(recovered, seg, "Archived roundtrip failed for {:?}", seg);
+        }
+    }
+
+    #[test]
+    fn test_archived_option_type_direct_roundtrip() {
+        // Serializes each OptionType directly
+        for opt in [OptionType::Call, OptionType::Put] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&opt).unwrap();
+            let archived = rkyv::access::<ArchivedOptionType, rkyv::rancor::Error>(&bytes).unwrap();
+            let recovered = OptionType::from(archived);
+            assert_eq!(recovered, opt, "Archived roundtrip failed for {:?}", opt);
+        }
+    }
+
+    #[test]
+    fn test_archived_exchange_direct_roundtrip() {
+        // Serializes each Exchange directly (separate from the FnoUnderlying wrapper test)
+        for exchange in [
+            Exchange::NationalStockExchange,
+            Exchange::BombayStockExchange,
+        ] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&exchange).unwrap();
+            let archived = rkyv::access::<ArchivedExchange, rkyv::rancor::Error>(&bytes).unwrap();
+            let recovered = Exchange::from(archived);
+            assert_eq!(
+                recovered, exchange,
+                "Archived roundtrip failed for {:?}",
+                exchange
+            );
+        }
+    }
+
+    // --- dhan_api_instrument_type: FUTCOM and FUTCUR are not applicable ---
+    // The function maps (InstrumentType, is_index_underlying) to Dhan API strings.
+    // FUTCOM and FUTCUR are separate Dhan instrument types for commodity/currency
+    // futures, which are not representable via InstrumentType::Future + bool flag.
+    // The 6 valid combinations are: INDEX, EQUITY, FUTIDX, FUTSTK, OPTIDX, OPTSTK.
+
+    #[test]
+    fn test_dhan_api_instrument_type_returns_static_str() {
+        // Verify all return values are non-empty &'static str
+        let all_cases: &[(InstrumentType, bool)] = &[
+            (InstrumentType::Index, true),
+            (InstrumentType::Index, false),
+            (InstrumentType::Equity, true),
+            (InstrumentType::Equity, false),
+            (InstrumentType::Future, true),
+            (InstrumentType::Future, false),
+            (InstrumentType::Option, true),
+            (InstrumentType::Option, false),
+        ];
+        for &(inst_type, is_index) in all_cases {
+            let result = inst_type.dhan_api_instrument_type(is_index);
+            assert!(
+                !result.is_empty(),
+                "dhan_api_instrument_type({:?}, {}) returned empty string",
+                inst_type,
+                is_index,
+            );
+            // All valid Dhan API instrument strings are uppercase ASCII
+            assert!(
+                result.chars().all(|c| c.is_ascii_uppercase()),
+                "dhan_api_instrument_type({:?}, {}) = '{}' is not uppercase ASCII",
+                inst_type,
+                is_index,
+                result,
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_api_instrument_type_derivative_flag_matters() {
+        // For Future and Option types, the is_index_underlying flag changes the result
+        assert_ne!(
+            InstrumentType::Future.dhan_api_instrument_type(true),
+            InstrumentType::Future.dhan_api_instrument_type(false),
+        );
+        assert_ne!(
+            InstrumentType::Option.dhan_api_instrument_type(true),
+            InstrumentType::Option.dhan_api_instrument_type(false),
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_serde_roundtrip_future() {
+        let original = InstrumentType::Future;
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: InstrumentType = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_instrument_type_serde_roundtrip_option() {
+        let original = InstrumentType::Option;
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: InstrumentType = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_feed_mode_clone_copy_eq() {
+        let a = FeedMode::Ticker;
+        let b = a; // Copy
+        let c = a.clone(); // Clone (same as Copy for Copy types)
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(FeedMode::Ticker, FeedMode::Quote);
+        assert_ne!(FeedMode::Quote, FeedMode::Full);
+        assert_ne!(FeedMode::Full, FeedMode::Ticker);
+    }
+
+    #[test]
+    fn test_exchange_segment_serde_roundtrip_all_variants() {
+        let segments = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        for seg in segments {
+            let json = serde_json::to_string(&seg).unwrap();
+            let deserialized: ExchangeSegment = serde_json::from_str(&json).unwrap();
+            assert_eq!(seg, deserialized, "Serde roundtrip failed for {:?}", seg);
+        }
+    }
+
+    #[test]
+    fn test_option_type_serde_roundtrip_both_variants() {
+        for opt in [OptionType::Call, OptionType::Put] {
+            let json = serde_json::to_string(&opt).unwrap();
+            let deserialized: OptionType = serde_json::from_str(&json).unwrap();
+            assert_eq!(opt, deserialized, "Serde roundtrip failed for {:?}", opt);
+        }
+    }
+
+    #[test]
+    fn test_exchange_hash_both_variants() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(Exchange::NationalStockExchange, "nse");
+        map.insert(Exchange::BombayStockExchange, "bse");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&Exchange::NationalStockExchange), Some(&"nse"));
+        assert_eq!(map.get(&Exchange::BombayStockExchange), Some(&"bse"));
+    }
+
+    #[test]
+    fn test_from_byte_boundary_values() {
+        // Test the edges around the gap and beyond valid range
+        assert!(ExchangeSegment::from_byte(0).is_some()); // min valid
+        assert!(ExchangeSegment::from_byte(5).is_some()); // last before gap
+        assert!(ExchangeSegment::from_byte(6).is_none()); // gap
+        assert!(ExchangeSegment::from_byte(7).is_some()); // first after gap
+        assert!(ExchangeSegment::from_byte(8).is_some()); // max valid
+        assert!(ExchangeSegment::from_byte(9).is_none()); // first invalid
+        assert!(ExchangeSegment::from_byte(10).is_none());
+        assert!(ExchangeSegment::from_byte(100).is_none());
+        assert!(ExchangeSegment::from_byte(u8::MAX).is_none());
+    }
 }

@@ -459,4 +459,349 @@ mod tests {
         let cal = TradingCalendar::from_config(&config).unwrap();
         assert!(cal.all_entries().is_empty());
     }
+
+    // --- all_entries: mixed holidays and muhurat with interleaved dates ---
+
+    #[test]
+    fn test_all_entries_mixed_holidays_and_muhurat_sorted_by_date() {
+        // Create a config with muhurat dates interleaved between holidays.
+        // This tests that all_entries correctly merges and sorts both sets.
+        let mut config = make_test_config();
+        config.nse_holidays = vec![
+            NseHolidayEntry {
+                date: "2026-08-19".to_string(), // Wed
+                name: "Independence Day Obs".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-01-26".to_string(), // Mon
+                name: "Republic Day".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-11-09".to_string(), // Mon
+                name: "Diwali Holiday".to_string(),
+            },
+        ];
+        config.muhurat_trading_dates = vec![
+            NseHolidayEntry {
+                date: "2026-11-08".to_string(), // Sun (Diwali evening)
+                name: "Muhurat Trading Diwali".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-03-14".to_string(), // Sat (some hypothetical muhurat)
+                name: "Muhurat Holi".to_string(),
+            },
+        ];
+
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let entries = cal.all_entries();
+
+        // 3 holidays + 2 muhurat = 5 entries
+        assert_eq!(entries.len(), 5);
+
+        // Verify strict date ascending order
+        for window in entries.windows(2) {
+            assert!(
+                window[0].date <= window[1].date,
+                "Entries not sorted: {:?} should come before {:?}",
+                window[0].date,
+                window[1].date,
+            );
+        }
+
+        // Verify exact order: Jan 26, Mar 14, Aug 19, Nov 8, Nov 9
+        assert_eq!(
+            entries[0].date,
+            NaiveDate::from_ymd_opt(2026, 1, 26).unwrap()
+        );
+        assert!(!entries[0].is_muhurat);
+        assert_eq!(entries[0].name, "Republic Day");
+
+        assert_eq!(
+            entries[1].date,
+            NaiveDate::from_ymd_opt(2026, 3, 14).unwrap()
+        );
+        assert!(entries[1].is_muhurat);
+        assert_eq!(entries[1].name, "Muhurat Holi");
+
+        assert_eq!(
+            entries[2].date,
+            NaiveDate::from_ymd_opt(2026, 8, 19).unwrap()
+        );
+        assert!(!entries[2].is_muhurat);
+
+        assert_eq!(
+            entries[3].date,
+            NaiveDate::from_ymd_opt(2026, 11, 8).unwrap()
+        );
+        assert!(entries[3].is_muhurat);
+        assert_eq!(entries[3].name, "Muhurat Trading Diwali");
+
+        assert_eq!(
+            entries[4].date,
+            NaiveDate::from_ymd_opt(2026, 11, 9).unwrap()
+        );
+        assert!(!entries[4].is_muhurat);
+        assert_eq!(entries[4].name, "Diwali Holiday");
+    }
+
+    #[test]
+    fn test_all_entries_only_muhurat_dates() {
+        let mut config = make_test_config();
+        config.nse_holidays.clear();
+        config.muhurat_trading_dates = vec![
+            NseHolidayEntry {
+                date: "2026-11-08".to_string(),
+                name: "Muhurat A".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-03-14".to_string(),
+                name: "Muhurat B".to_string(),
+            },
+        ];
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let entries = cal.all_entries();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_muhurat);
+        assert!(entries[1].is_muhurat);
+        // Sorted: Mar 14 before Nov 8
+        assert!(entries[0].date < entries[1].date);
+        assert_eq!(entries[0].name, "Muhurat B");
+        assert_eq!(entries[1].name, "Muhurat A");
+    }
+
+    #[test]
+    fn test_all_entries_only_holidays() {
+        let mut config = make_test_config();
+        config.muhurat_trading_dates.clear();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let entries = cal.all_entries();
+
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert!(!entry.is_muhurat);
+        }
+        // All sorted ascending
+        for window in entries.windows(2) {
+            assert!(window[0].date <= window[1].date);
+        }
+    }
+
+    #[test]
+    fn test_all_entries_holiday_and_muhurat_on_same_date() {
+        // Edge case: a date is both a holiday and has muhurat trading
+        // (e.g., Diwali is a holiday but has evening muhurat session)
+        let mut config = make_test_config();
+        config.nse_holidays = vec![NseHolidayEntry {
+            date: "2026-11-09".to_string(), // Mon
+            name: "Diwali".to_string(),
+        }];
+        config.muhurat_trading_dates = vec![NseHolidayEntry {
+            date: "2026-11-09".to_string(), // Same date
+            name: "Muhurat Trading".to_string(),
+        }];
+
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let entries = cal.all_entries();
+
+        // Both entries should be present (2 entries on same date)
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].date, entries[1].date);
+        // One is holiday, one is muhurat
+        let has_holiday = entries.iter().any(|e| !e.is_muhurat);
+        let has_muhurat = entries.iter().any(|e| e.is_muhurat);
+        assert!(has_holiday);
+        assert!(has_muhurat);
+        // The date should be a holiday
+        assert!(cal.is_holiday(NaiveDate::from_ymd_opt(2026, 11, 9).unwrap()));
+        // And also a muhurat day
+        assert!(cal.is_muhurat_trading_day(NaiveDate::from_ymd_opt(2026, 11, 9).unwrap()));
+        // But NOT a regular trading day (it's a holiday)
+        assert!(!cal.is_trading_day(NaiveDate::from_ymd_opt(2026, 11, 9).unwrap()));
+    }
+
+    #[test]
+    fn test_all_entries_mixed_with_reverse_insertion_order() {
+        // Holidays inserted in reverse chronological order to verify
+        // all_entries still returns sorted output regardless of insertion order.
+        let mut config = make_test_config();
+        config.nse_holidays = vec![
+            NseHolidayEntry {
+                date: "2026-12-25".to_string(), // Fri
+                name: "Christmas".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-08-19".to_string(), // Wed
+                name: "Independence Day Obs".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-01-26".to_string(), // Mon
+                name: "Republic Day".to_string(),
+            },
+        ];
+        config.muhurat_trading_dates = vec![
+            NseHolidayEntry {
+                date: "2026-11-08".to_string(), // Sun
+                name: "Muhurat Diwali".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-03-14".to_string(), // Sat
+                name: "Muhurat Holi".to_string(),
+            },
+        ];
+
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        assert_eq!(cal.holiday_count(), 3);
+        assert_eq!(cal.muhurat_count(), 2);
+
+        let entries = cal.all_entries();
+        assert_eq!(entries.len(), 5);
+
+        // Verify strictly ascending date order
+        for window in entries.windows(2) {
+            assert!(
+                window[0].date < window[1].date,
+                "Not strictly sorted: {} should come before {}",
+                window[0].date,
+                window[1].date,
+            );
+        }
+
+        // Expected order: Jan 26, Mar 14, Aug 19, Nov 8, Dec 25
+        assert_eq!(
+            entries[0].date,
+            NaiveDate::from_ymd_opt(2026, 1, 26).unwrap()
+        );
+        assert!(!entries[0].is_muhurat);
+        assert_eq!(
+            entries[1].date,
+            NaiveDate::from_ymd_opt(2026, 3, 14).unwrap()
+        );
+        assert!(entries[1].is_muhurat);
+        assert_eq!(
+            entries[2].date,
+            NaiveDate::from_ymd_opt(2026, 8, 19).unwrap()
+        );
+        assert!(!entries[2].is_muhurat);
+        assert_eq!(
+            entries[3].date,
+            NaiveDate::from_ymd_opt(2026, 11, 8).unwrap()
+        );
+        assert!(entries[3].is_muhurat);
+        assert_eq!(
+            entries[4].date,
+            NaiveDate::from_ymd_opt(2026, 12, 25).unwrap()
+        );
+        assert!(!entries[4].is_muhurat);
+    }
+
+    #[test]
+    fn test_next_trading_day_skips_consecutive_holidays_and_weekend() {
+        // Setup: Fri holiday, Sat weekend, Sun weekend, Mon holiday
+        // next_trading_day from Fri should jump to Tue.
+        let mut config = make_test_config();
+        config.nse_holidays = vec![
+            NseHolidayEntry {
+                date: "2026-03-13".to_string(), // Fri
+                name: "Holiday A".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-03-16".to_string(), // Mon
+                name: "Holiday B".to_string(),
+            },
+        ];
+        config.muhurat_trading_dates.clear();
+
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let friday = NaiveDate::from_ymd_opt(2026, 3, 13).unwrap();
+        let expected_tuesday = NaiveDate::from_ymd_opt(2026, 3, 17).unwrap();
+        assert_eq!(cal.next_trading_day(friday), expected_tuesday);
+    }
+
+    #[test]
+    fn test_holiday_count_and_muhurat_count_independent() {
+        // Verify counts are maintained independently
+        let mut config = make_test_config();
+        config.nse_holidays = vec![
+            NseHolidayEntry {
+                date: "2026-01-26".to_string(),
+                name: "H1".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-03-03".to_string(),
+                name: "H2".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-08-19".to_string(),
+                name: "H3".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-10-20".to_string(),
+                name: "H4".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-12-25".to_string(),
+                name: "H5".to_string(),
+            },
+        ];
+        config.muhurat_trading_dates = vec![
+            NseHolidayEntry {
+                date: "2026-11-08".to_string(),
+                name: "M1".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-03-14".to_string(),
+                name: "M2".to_string(),
+            },
+            NseHolidayEntry {
+                date: "2026-06-06".to_string(),
+                name: "M3".to_string(),
+            },
+        ];
+
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        assert_eq!(cal.holiday_count(), 5);
+        assert_eq!(cal.muhurat_count(), 3);
+        // all_entries has both sets
+        assert_eq!(cal.all_entries().len(), 8);
+    }
+
+    #[test]
+    fn test_all_entries_names_preserved() {
+        // Verify that entry names match what was configured
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let entries = cal.all_entries();
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Republic Day"));
+        assert!(names.contains(&"Holi"));
+        assert!(names.contains(&"Dussehra"));
+        assert!(names.contains(&"Diwali 2026"));
+    }
+
+    #[test]
+    fn test_all_entries_is_muhurat_flag_correct() {
+        // Verify is_muhurat flag is set only for muhurat entries, not holidays
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let entries = cal.all_entries();
+
+        let muhurat_entries: Vec<&HolidayInfo> = entries.iter().filter(|e| e.is_muhurat).collect();
+        let holiday_entries: Vec<&HolidayInfo> = entries.iter().filter(|e| !e.is_muhurat).collect();
+
+        assert_eq!(muhurat_entries.len(), 1);
+        assert_eq!(holiday_entries.len(), 3);
+        assert_eq!(muhurat_entries[0].name, "Diwali 2026");
+    }
+
+    #[test]
+    fn test_next_trading_day_on_trading_day_returns_same() {
+        // When starting on a regular trading day, next_trading_day returns the same date
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let tuesday = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        assert!(cal.is_trading_day(tuesday));
+        assert_eq!(cal.next_trading_day(tuesday), tuesday);
+    }
 }
