@@ -652,4 +652,90 @@ mod tests {
         assert_eq!(report.missing_from_dhan, 0);
         assert!(updates.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Tracing subscriber — forces field evaluation in error!/warn!/info! macros
+    // -----------------------------------------------------------------------
+
+    struct SinkSubscriber;
+    impl tracing::Subscriber for SinkSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn status_mismatch_with_tracing_evaluates_error_fields() {
+        tracing::subscriber::with_default(SinkSubscriber, || {
+            let mut oms = HashMap::new();
+            oms.insert(
+                "1".to_owned(),
+                make_managed_order("1", OrderStatus::Pending),
+            );
+            let dhan = vec![make_dhan_order("1", "TRADED")];
+
+            let (report, updates) = reconcile_orders(&oms, &dhan);
+            assert_eq!(report.mismatches_found, 1);
+            assert_eq!(updates.len(), 1);
+        });
+    }
+
+    #[test]
+    fn missing_from_oms_with_tracing_evaluates_warn_fields() {
+        tracing::subscriber::with_default(SinkSubscriber, || {
+            let oms: HashMap<String, ManagedOrder> = HashMap::new();
+            let dhan = vec![make_dhan_order("999", "CONFIRMED")];
+
+            let (report, _) = reconcile_orders(&oms, &dhan);
+            assert_eq!(report.missing_from_oms, 1);
+        });
+    }
+
+    #[test]
+    fn ghost_order_with_tracing_evaluates_warn_fields() {
+        tracing::subscriber::with_default(SinkSubscriber, || {
+            let mut oms = HashMap::new();
+            oms.insert(
+                "ghost-1".to_owned(),
+                make_managed_order("ghost-1", OrderStatus::Confirmed),
+            );
+            let dhan: Vec<DhanOrderResponse> = vec![];
+
+            let (report, _) = reconcile_orders(&oms, &dhan);
+            assert_eq!(report.missing_from_dhan, 1);
+        });
+    }
+
+    #[test]
+    fn combined_mismatches_with_tracing() {
+        tracing::subscriber::with_default(SinkSubscriber, || {
+            let mut oms = HashMap::new();
+            oms.insert(
+                "1".to_owned(),
+                make_managed_order("1", OrderStatus::Confirmed),
+            );
+            oms.insert(
+                "ghost-1".to_owned(),
+                make_managed_order("ghost-1", OrderStatus::Pending),
+            );
+            let dhan = vec![
+                make_dhan_order("1", "TRADED"),   // mismatch
+                make_dhan_order("99", "PENDING"), // missing from OMS
+            ];
+
+            let (report, updates) = reconcile_orders(&oms, &dhan);
+            assert_eq!(report.mismatches_found, 1);
+            assert_eq!(report.missing_from_oms, 1);
+            assert_eq!(report.missing_from_dhan, 1);
+            assert_eq!(updates.len(), 1);
+        });
+    }
 }

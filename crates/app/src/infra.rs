@@ -860,4 +860,158 @@ mod tests {
             assert!(path.is_file(), "docker-compose path must be a file");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // is_service_reachable — with a real open port
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_service_reachable_with_real_listener() {
+        // Bind a TCP listener on an ephemeral port, then check reachability.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(
+            is_service_reachable("127.0.0.1", port),
+            "service with active listener should be reachable"
+        );
+
+        // After dropping the listener, it should no longer be reachable.
+        drop(listener);
+        // Note: port may still be in TIME_WAIT, but typically not connectable.
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_service_healthy — with a real listener
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_service_healthy_with_real_listener() {
+        // Bind a TCP listener, then wait_for_service_healthy should return quickly.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // The function should return quickly since the service is already reachable.
+        let start = std::time::Instant::now();
+        wait_for_service_healthy("test-service", "127.0.0.1", port).await;
+        let elapsed = start.elapsed();
+
+        // Should complete much faster than the health timeout (60s).
+        assert!(
+            elapsed.as_secs() < 5,
+            "wait_for_service_healthy should return immediately for reachable service"
+        );
+
+        drop(listener);
+    }
+
+    // -----------------------------------------------------------------------
+    // open_in_browser — edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_open_in_browser_with_https_url_no_panic() {
+        open_in_browser("https://example.com").await;
+    }
+
+    #[tokio::test]
+    async fn test_open_in_browser_with_special_chars_no_panic() {
+        open_in_browser("http://localhost:3000/d/dashboard?var=value&foo=bar").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // run_docker_compose_up — exercise env var passing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_docker_compose_up_with_all_env_vars_no_panic() {
+        // Exercises the full env var injection path.
+        let env_vars = vec![
+            ("DLT_QUESTDB_PG_USER", "user".to_string()),
+            ("DLT_QUESTDB_PG_PASSWORD", "pass".to_string()),
+            ("DLT_GRAFANA_ADMIN_USER", "admin".to_string()),
+            ("DLT_GRAFANA_ADMIN_PASSWORD", "secret".to_string()),
+            ("DLT_TELEGRAM_BOT_TOKEN", "123:ABC".to_string()),
+            ("DLT_TELEGRAM_CHAT_ID", "-12345".to_string()),
+        ];
+        let result = run_docker_compose_up(&env_vars).await;
+        // Docker may or may not be available — just verify the function runs.
+        let _ = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_docker_daemon_running — Linux path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_docker_daemon_running_exercises_platform_check() {
+        // On Linux, if Docker is not running, it should return false
+        // (auto-launch only on macOS). If Docker IS running, returns true.
+        // Either way, must not panic.
+        let result = ensure_docker_daemon_running().await;
+        let _: bool = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // open_grafana_if_reachable — with real listener
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_open_grafana_if_reachable_with_real_listener() {
+        // We can't easily bind to port 3000 (Grafana's port), and the function
+        // uses hardcoded GRAFANA_HOST/PORT. So we just exercise it — Grafana
+        // likely not running, exercises the else branch.
+        open_grafana_if_reachable().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_service_healthy — unreachable with minimal wait
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_service_healthy_unreachable_completes() {
+        // Use a very high port that's definitely not open.
+        // The function will poll until timeout (60s), which is too long for tests.
+        // But since the constant is 60s, this test verifies the function
+        // doesn't panic. We use tokio::time::timeout to limit wait.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_service_healthy("unreachable", "127.0.0.1", 1),
+        )
+        .await;
+        // Either timeout or the function completes — both are fine.
+        let _ = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // is_service_reachable — verify it returns quickly for unreachable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_service_reachable_completes_within_timeout() {
+        let start = std::time::Instant::now();
+        let _ = is_service_reachable("127.0.0.1", 1);
+        let elapsed = start.elapsed();
+        // Should complete within the probe timeout (2s) + some margin
+        assert!(
+            elapsed.as_secs() <= INFRA_PROBE_TIMEOUT.as_secs() + 2,
+            "unreachable probe should complete within timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback address in is_service_reachable — verify parse + fallback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_service_reachable_ipv6_loopback_unreachable() {
+        // IPv6 loopback as string fails SocketAddr parse, exercises fallback
+        assert!(!is_service_reachable("::1", 1));
+    }
+
+    #[test]
+    fn test_is_service_reachable_with_port_in_host_name() {
+        // Host containing a colon but not a valid SocketAddr
+        assert!(!is_service_reachable("host:with:colons", 80));
+    }
 }

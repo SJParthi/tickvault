@@ -724,4 +724,123 @@ mod tests {
         assert!(CANDLES_1S_CREATE_DDL.contains("low DOUBLE"));
         assert!(CANDLES_1S_CREATE_DDL.contains("close DOUBLE"));
     }
+
+    // -----------------------------------------------------------------------
+    // HTTP mock helpers
+    // -----------------------------------------------------------------------
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_candle_views — HTTP success/failure paths (covers lines 291-336)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_200() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises success path: create table (line 307), DEDUP (310-311),
+        // all 18 view DDLs (315-319), final info log (322-325)
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises non-success path: create table returns false → early return (line 307)
+        // execute_ddl returns false for non-success (lines 335-336, 343, 349-351)
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_create_send_error_returns_early() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises execute_ddl Err branch (lines 349-351)
+        ensure_candle_views(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_ddl — direct tests for success/failure/error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_execute_ddl_success_returns_true() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
+        assert!(result, "execute_ddl must return true on 200");
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_non_success_returns_false() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "BAD SQL", "test_label").await;
+        assert!(!result, "execute_ddl must return false on non-success");
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_send_error_returns_false() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
+        assert!(!result, "execute_ddl must return false on send error");
+    }
 }

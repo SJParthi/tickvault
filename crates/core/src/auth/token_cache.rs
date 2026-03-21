@@ -811,4 +811,66 @@ mod tests {
         assert_eq!(parsed.client_id_hash, 42);
         assert_eq!(parsed.client_id.as_deref(), Some("test-client"));
     }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache — invalid issued_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_invalid_issued_at_timestamp() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+        let client_id = SecretString::from("test-invalid-issued-at".to_string());
+
+        // Valid expires_at but invalid issued_at (i64::MAX overflows DateTime)
+        let entry = serde_json::json!({
+            "access_token": "test-jwt-invalid-issued",
+            "expires_at_epoch_secs": (now_ist + Duration::hours(23)).timestamp(),
+            "issued_at_epoch_secs": i64::MAX,
+            "client_id_hash": hash_client_id(&client_id),
+            "client_id": "test-invalid-issued-at",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache(&client_id);
+        assert!(
+            result.is_none(),
+            "invalid issued_at timestamp should return None"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — invalid expires_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_invalid_expires_at_timestamp() {
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        // Invalid expires_at (i64::MAX), valid issued_at, with client_id
+        let entry = serde_json::json!({
+            "access_token": "test-jwt-invalid-expires",
+            "expires_at_epoch_secs": i64::MAX,
+            "issued_at_epoch_secs": 0i64,
+            "client_id_hash": 0u64,
+            "client_id": "test-fast-invalid-expires",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "invalid expires_at timestamp should return None in fast path"
+        );
+
+        delete_cache_file();
+    }
 }

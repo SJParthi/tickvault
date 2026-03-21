@@ -388,4 +388,40 @@ mod tests {
         let result = parse_constituency_csv("Test", csv, today());
         assert_eq!(result[0].last_updated, today());
     }
+
+    // -----------------------------------------------------------------------
+    // Error paths: malformed CSV rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_csv_unterminated_quote_in_row_skips_it() {
+        // An unterminated quote in a data row causes a csv parse error.
+        // The parser should skip the bad row and continue.
+        let csv = "Symbol,ISIN Code,Series\n\
+                   RELIANCE,INE002A01018,EQ\n\
+                   \"unterminated,INE999X01001,EQ\n\
+                   HDFCBANK,INE040A01034,EQ\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        // The unterminated quote causes the csv reader to consume
+        // everything until EOF looking for the closing quote.
+        // RELIANCE should be parsed. The unterminated quote consumes
+        // the rest, so HDFCBANK may or may not appear.
+        assert!(
+            !result.is_empty(),
+            "should parse at least the first valid row"
+        );
+        assert_eq!(result[0].symbol, "RELIANCE");
+    }
+
+    #[test]
+    fn test_parse_csv_missing_required_columns_returns_empty() {
+        // Headers present but missing both Symbol AND ISIN Code
+        let csv = "Company Name,Industry,Series\n\
+                   Reliance,Energy,EQ\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert!(
+            result.is_empty(),
+            "missing both required columns should return empty"
+        );
+    }
 }

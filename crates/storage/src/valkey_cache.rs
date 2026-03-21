@@ -840,4 +840,95 @@ mod tests {
         assert_eq!(status.available, 0);
         assert_eq!(status.waiting, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Async method error path tests (ValkeyPool methods with unreachable host)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.health_check().await;
+        assert!(
+            result.is_err(),
+            "health_check must fail with unreachable host"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.get("test_key").await;
+        assert!(result.is_err(), "get must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_set_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set("key", "value").await;
+        assert!(result.is_err(), "set must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_set_ex_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_ex("key", "value", 60).await;
+        assert!(result.is_err(), "set_ex must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_del_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.del("key").await;
+        assert!(result.is_err(), "del must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_exists_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.exists("key").await;
+        assert!(result.is_err(), "exists must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_set_nx_ex_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
+        assert!(result.is_err(), "set_nx_ex must fail with unreachable host");
+    }
 }

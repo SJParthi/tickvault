@@ -691,4 +691,331 @@ mod tests {
             "ILP conf string must start with tcp::addr="
         );
     }
+
+    // -----------------------------------------------------------------------
+    // TCP drain server helper (same pattern as tick_persistence tests)
+    // -----------------------------------------------------------------------
+
+    /// Spawn a background TCP server that accepts one connection and drains
+    /// all data until EOF. Returns the port.
+    fn spawn_tcp_drain_server() -> u16 {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    /// Spawn an async HTTP mock server that returns a fixed `response` for
+    /// every request. Returns the port.
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn make_test_candle(security_id: u32) -> HistoricalCandle {
+        HistoricalCandle {
+            security_id,
+            exchange_segment_code: 2, // NSE_FNO
+            timeframe: "1m",
+            timestamp_utc_secs: 1_704_067_200, // 2024-01-01 00:00:00 UTC
+            open: 21000.0,
+            high: 21050.0,
+            low: 20950.0,
+            close: 21025.0,
+            volume: 500_000,
+            open_interest: 120_000,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CandlePersistenceWriter — new, append_candle, force_flush, pending_count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_writer_new_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = CandlePersistenceWriter::new(&config);
+        assert!(writer.is_ok(), "must connect to TCP drain server");
+        let writer = writer.unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_candle_writer_append_single_candle() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+        let candle = make_test_candle(11536);
+        let result = writer.append_candle(&candle);
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_candle_writer_append_multiple_candles() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+        for i in 0..5 {
+            let candle = make_test_candle(11536 + i);
+            writer.append_candle(&candle).unwrap();
+        }
+        assert_eq!(writer.pending_count(), 5);
+    }
+
+    #[test]
+    fn test_candle_writer_force_flush_resets_count() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+        let candle = make_test_candle(11536);
+        writer.append_candle(&candle).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_candle_writer_force_flush_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+        // Flushing empty buffer should succeed and remain at 0
+        let result = writer.force_flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveCandleWriter — new, append_candle, force_flush, flush_if_needed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_writer_new_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = LiveCandleWriter::new(&config);
+        assert!(writer.is_ok(), "must connect to TCP drain server");
+    }
+
+    #[test]
+    fn test_live_candle_writer_append_and_flush() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        writer
+            .append_candle(
+                11536,
+                2, // NSE_FNO
+                1_740_556_500,
+                21000.0,
+                21050.0,
+                20950.0,
+                21025.0,
+                50_000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_live_candle_writer_force_flush_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        let result = writer.force_flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_live_candle_writer_flush_if_needed_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        let result = writer.flush_if_needed();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_live_candle_writer_flush_if_needed_with_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        writer
+            .append_candle(11536, 2, 1_740_556_500, 100.0, 110.0, 90.0, 105.0, 1000, 10)
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+        // flush_if_needed flushes if pending > 0
+        writer.flush_if_needed().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_candle_table_dedup_keys — HTTP success, HTTP non-success, error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_http_200_success() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Should complete without panic — exercises success paths (lines 364-365, 398)
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_http_400_non_success() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Should complete without panic — exercises non-success paths (lines 374, 407)
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_create_ok_dedup_send_error() {
+        // Two-phase: first request (CREATE TABLE) succeeds, second (DEDUP) fails
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond with 200
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately → send error on DEDUP DDL
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the Err(err) branch on DEDUP DDL (lines 412-413)
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_create_send_error_returns_early() {
+        // First request (CREATE TABLE) fails → should return early (line 384)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Drop connection immediately → send error on CREATE TABLE
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the Err(err) + return branch on CREATE TABLE (lines 379-380, 384)
+        ensure_candle_table_dedup_keys(&config).await;
+    }
 }

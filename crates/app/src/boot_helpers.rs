@@ -37,6 +37,48 @@ pub const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 // Pure helper functions
 // ---------------------------------------------------------------------------
 
+/// Determines the effective WebSocket connection stagger in milliseconds.
+///
+/// During market hours, uses the configured value. Outside market hours,
+/// uses a reduced stagger (`OFF_HOURS_CONNECTION_STAGGER_MS`) to avoid
+/// unnecessary boot delay.
+pub fn effective_ws_stagger(configured_stagger_ms: u64, is_market_hours: bool) -> u64 {
+    if is_market_hours {
+        configured_stagger_ms
+    } else {
+        OFF_HOURS_CONNECTION_STAGGER_MS
+    }
+}
+
+/// Formats a host:port pair into a `SocketAddr` string.
+///
+/// Returns the formatted string — caller is responsible for parsing.
+/// This is a pure function extracted for testability.
+pub fn format_bind_addr(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
+}
+
+/// Determines the boot mode description for logging.
+///
+/// Returns `"fast"` if a valid token cache exists AND we're within market
+/// hours on a trading day. Otherwise returns `"standard"`.
+pub fn determine_boot_mode(has_cache: bool, is_market_hours: bool) -> &'static str {
+    if has_cache && is_market_hours {
+        "fast"
+    } else {
+        "standard"
+    }
+}
+
+/// Determines whether to use the fast boot path.
+///
+/// Fast boot requires BOTH a valid token cache AND being within market hours
+/// on a trading day. If the cache exists but we're outside market hours,
+/// the slow boot path is used (downloads fresh instruments, starts Docker first).
+pub fn should_fast_boot(has_cache: bool, is_market_hours: bool) -> bool {
+    has_cache && is_market_hours
+}
+
 /// Formats timeframe coverage details for Telegram notification.
 pub fn format_timeframe_details(report: &CrossVerificationReport) -> String {
     let mut lines = Vec::with_capacity(report.timeframe_counts.len());
@@ -113,7 +155,18 @@ pub fn compute_market_close_sleep(market_close_time_str: &str) -> std::time::Dur
 /// Creates `data/logs/` directory if needed. Returns `None` if the file
 /// cannot be created (best-effort — logging to stdout always works).
 pub fn create_log_file_writer() -> Option<std::fs::File> {
-    let log_dir = std::path::Path::new(APP_LOG_FILE_PATH)
+    create_log_file_writer_at(APP_LOG_FILE_PATH)
+}
+
+/// Opens (or creates) a log file at the given path for Alloy consumption.
+///
+/// Creates parent directory if needed. Returns `None` if the directory
+/// cannot be created or the file cannot be opened.
+///
+/// Extracted from `create_log_file_writer` for testability — allows tests
+/// to exercise error paths with invalid/unwritable paths.
+pub fn create_log_file_writer_at(log_file_path: &str) -> Option<std::fs::File> {
+    let log_dir = std::path::Path::new(log_file_path)
         .parent()
         .unwrap_or(std::path::Path::new("data/logs"));
 
@@ -127,12 +180,12 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(APP_LOG_FILE_PATH)
+        .open(log_file_path)
     {
         Ok(file) => Some(file),
         #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
         Err(err) => {
-            eprintln!("warning: cannot open log file {APP_LOG_FILE_PATH}: {err}");
+            eprintln!("warning: cannot open log file {log_file_path}: {err}");
             None
         } // O(1) EXEMPT: end
     }
@@ -1281,5 +1334,217 @@ mod tests {
         let result = format_timeframe_details(&report);
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines.len(), 200, "should have 200 lines for 200 entries");
+    }
+
+    // -----------------------------------------------------------------------
+    // create_log_file_writer_at — error path coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_log_file_writer_at_unwritable_directory_returns_none() {
+        // /proc is a read-only pseudo-filesystem on Linux — create_dir_all fails.
+        let result = create_log_file_writer_at("/proc/nonexistent_dlt_dir/app.log");
+        assert!(result.is_none(), "unwritable directory should return None");
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_directory_as_file_path_returns_none() {
+        // Creating a file at a path where a directory already exists fails.
+        // /tmp always exists — trying to open it as a file should fail.
+        let result = create_log_file_writer_at("/tmp");
+        assert!(
+            result.is_none(),
+            "directory path as file should return None"
+        );
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_valid_path_returns_some() {
+        let tmp = std::env::temp_dir().join("dlt_test_writer_at");
+        let log_path = tmp.join("test_at.log");
+        let path_str = log_path.to_string_lossy().to_string();
+        let result = create_log_file_writer_at(&path_str);
+        assert!(result.is_some(), "valid path should return Some");
+        // Cleanup
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_empty_path_returns_none() {
+        // Empty string as path — will fail to create dir or open file.
+        let result = create_log_file_writer_at("");
+        assert!(result.is_none(), "empty path should return None");
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_deeply_nested_creates_dirs() {
+        let tmp = std::env::temp_dir().join("dlt_test_deep/a/b/c");
+        let log_path = tmp.join("deep.log");
+        let path_str = log_path.to_string_lossy().to_string();
+        let result = create_log_file_writer_at(&path_str);
+        assert!(result.is_some(), "deeply nested path should succeed");
+        // Cleanup
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt_test_deep"));
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_default_path_matches_original() {
+        // Verify that create_log_file_writer delegates to create_log_file_writer_at
+        let result_default = create_log_file_writer();
+        let result_at = create_log_file_writer_at(APP_LOG_FILE_PATH);
+        // Both should succeed in the same environment
+        assert_eq!(
+            result_default.is_some(),
+            result_at.is_some(),
+            "both functions should agree on success/failure"
+        );
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_dev_null_returns_some() {
+        // /dev/null is always writable on Linux
+        let result = create_log_file_writer_at("/dev/null");
+        assert!(result.is_some(), "/dev/null should be openable");
+    }
+
+    #[test]
+    fn test_create_log_file_writer_at_read_only_fs_returns_none() {
+        // /sys is a sysfs pseudo-filesystem — directory creation should fail
+        let result = create_log_file_writer_at("/sys/dlt_impossible/app.log");
+        assert!(result.is_none(), "read-only filesystem should return None");
+    }
+
+    // -----------------------------------------------------------------------
+    // effective_ws_stagger tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_ws_stagger_market_hours_uses_configured() {
+        let stagger = effective_ws_stagger(3000, true);
+        assert_eq!(stagger, 3000, "market hours should use configured stagger");
+    }
+
+    #[test]
+    fn test_effective_ws_stagger_off_hours_uses_reduced() {
+        let stagger = effective_ws_stagger(3000, false);
+        assert_eq!(
+            stagger, OFF_HOURS_CONNECTION_STAGGER_MS,
+            "off-market hours should use reduced stagger"
+        );
+    }
+
+    #[test]
+    fn test_effective_ws_stagger_zero_configured_market_hours() {
+        let stagger = effective_ws_stagger(0, true);
+        assert_eq!(stagger, 0, "zero configured stagger in market hours = 0");
+    }
+
+    #[test]
+    fn test_effective_ws_stagger_zero_configured_off_hours() {
+        let stagger = effective_ws_stagger(0, false);
+        assert_eq!(stagger, OFF_HOURS_CONNECTION_STAGGER_MS);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_bind_addr tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_bind_addr_ipv4() {
+        let addr = format_bind_addr("0.0.0.0", 3001);
+        assert_eq!(addr, "0.0.0.0:3001");
+    }
+
+    #[test]
+    fn test_format_bind_addr_localhost() {
+        let addr = format_bind_addr("127.0.0.1", 8080);
+        assert_eq!(addr, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_format_bind_addr_port_zero() {
+        let addr = format_bind_addr("0.0.0.0", 0);
+        assert_eq!(addr, "0.0.0.0:0");
+    }
+
+    #[test]
+    fn test_format_bind_addr_parses_to_socket_addr() {
+        let addr = format_bind_addr("0.0.0.0", 3001);
+        let parsed: Result<SocketAddr, _> = addr.parse();
+        assert!(parsed.is_ok(), "formatted addr must parse to SocketAddr");
+        assert_eq!(parsed.unwrap().port(), 3001);
+    }
+
+    #[test]
+    fn test_format_bind_addr_high_port() {
+        let addr = format_bind_addr("0.0.0.0", 65535);
+        let parsed: SocketAddr = addr.parse().unwrap();
+        assert_eq!(parsed.port(), 65535);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_boot_mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_boot_mode_fast_with_cache_and_market() {
+        assert_eq!(determine_boot_mode(true, true), "fast");
+    }
+
+    #[test]
+    fn test_determine_boot_mode_standard_no_cache() {
+        assert_eq!(determine_boot_mode(false, true), "standard");
+    }
+
+    #[test]
+    fn test_determine_boot_mode_standard_no_market() {
+        assert_eq!(determine_boot_mode(true, false), "standard");
+    }
+
+    #[test]
+    fn test_determine_boot_mode_standard_neither() {
+        assert_eq!(determine_boot_mode(false, false), "standard");
+    }
+
+    // -----------------------------------------------------------------------
+    // should_fast_boot tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_fast_boot_true() {
+        assert!(should_fast_boot(true, true));
+    }
+
+    #[test]
+    fn test_should_fast_boot_false_no_cache() {
+        assert!(!should_fast_boot(false, true));
+    }
+
+    #[test]
+    fn test_should_fast_boot_false_no_market() {
+        assert!(!should_fast_boot(true, false));
+    }
+
+    #[test]
+    fn test_should_fast_boot_false_neither() {
+        assert!(!should_fast_boot(false, false));
+    }
+
+    #[test]
+    fn test_should_fast_boot_matches_determine_boot_mode() {
+        // should_fast_boot(true, true) <=> determine_boot_mode returns "fast"
+        for &cache in &[true, false] {
+            for &market in &[true, false] {
+                let is_fast = should_fast_boot(cache, market);
+                let mode = determine_boot_mode(cache, market);
+                assert_eq!(
+                    is_fast,
+                    mode == "fast",
+                    "should_fast_boot and determine_boot_mode must agree for cache={cache}, market={market}"
+                );
+            }
+        }
     }
 }

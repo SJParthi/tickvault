@@ -995,4 +995,87 @@ threshold = 25.0
 
         cleanup_temp_dir(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // Tracing subscriber installed — forces field evaluation in log macros
+    // -----------------------------------------------------------------------
+
+    /// Minimal subscriber that accepts all events but discards output.
+    /// Forces tracing macros to evaluate their field expressions.
+    struct SinkSubscriber;
+    impl tracing::Subscriber for SinkSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Helper: runs `f` with a tracing subscriber that evaluates all log fields.
+    fn with_tracing<F: FnOnce()>(f: F) {
+        tracing::subscriber::with_default(SinkSubscriber, f);
+    }
+
+    #[test]
+    fn new_with_subscriber_evaluates_info_fields() {
+        with_tracing(|| {
+            let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+            let result = StrategyHotReloader::new(&file_path);
+            assert!(result.is_ok());
+            let (reloader, strategies, _params) = result.unwrap();
+            assert_eq!(strategies.len(), 1);
+            assert_eq!(reloader.watched_path(), file_path);
+            cleanup_temp_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn handle_file_change_valid_with_subscriber() {
+        with_tracing(|| {
+            let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            handle_file_change(&file_path, &sender);
+            let event = receiver.try_recv().unwrap();
+            assert_eq!(event.strategies.len(), 1);
+            cleanup_temp_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn handle_file_change_invalid_with_subscriber() {
+        with_tracing(|| {
+            let (dir, file_path) = write_temp_strategy_file("[[[[broken");
+            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            handle_file_change(&file_path, &sender);
+            assert!(receiver.try_recv().is_err());
+            cleanup_temp_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn handle_file_change_missing_file_with_subscriber() {
+        with_tracing(|| {
+            let nonexistent = Path::new("/tmp/dlt_nonexistent_subscriber_test.toml");
+            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            handle_file_change(nonexistent, &sender);
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn handle_file_change_dropped_receiver_with_subscriber() {
+        with_tracing(|| {
+            let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
+            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            drop(receiver);
+            handle_file_change(&file_path, &sender);
+            cleanup_temp_dir(&dir);
+        });
+    }
 }

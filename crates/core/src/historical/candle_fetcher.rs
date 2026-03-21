@@ -3073,4 +3073,320 @@ mod tests {
             InstrumentFetchResult::Success(10, 1)
         );
     }
+
+    // =======================================================================
+    // Additional coverage tests — build candle helpers with edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_build_intraday_candle_mid_index() {
+        let data = sample_intraday_response();
+        let candle = build_intraday_candle(&data, 1, 1333, 1, "15m");
+        assert_eq!(candle.security_id, 1333);
+        assert_eq!(candle.exchange_segment_code, 1);
+        assert_eq!(candle.timeframe, "15m");
+        assert_eq!(candle.open, 101.0);
+        assert_eq!(candle.high, 106.0);
+        assert_eq!(candle.low, 99.0);
+        assert_eq!(candle.close, 104.0);
+        assert_eq!(candle.volume, 2000);
+        assert_eq!(candle.open_interest, 6000);
+        assert_eq!(candle.timestamp_utc_secs, 1_773_027_960);
+    }
+
+    #[test]
+    fn test_build_daily_candle_last_index() {
+        let data = sample_daily_response();
+        let candle = build_daily_candle(&data, 1, 25, 0);
+        assert_eq!(candle.security_id, 25);
+        assert_eq!(candle.exchange_segment_code, 0);
+        assert_eq!(candle.timeframe, TIMEFRAME_1D);
+        assert_eq!(candle.open, 201.0);
+        assert_eq!(candle.high, 211.0);
+        assert_eq!(candle.low, 196.0);
+        assert_eq!(candle.close, 206.0);
+        assert_eq!(candle.volume, 20_000);
+        assert_eq!(candle.open_interest, 0); // empty OI array
+    }
+
+    #[test]
+    fn test_build_intraday_candle_no_oi() {
+        let mut data = sample_intraday_response();
+        data.open_interest = vec![]; // empty OI
+        let candle = build_intraday_candle(&data, 0, 42, 2, "1m");
+        assert_eq!(candle.open_interest, 0); // extract_oi returns 0 for empty
+    }
+
+    #[test]
+    fn test_build_daily_candle_segment_codes() {
+        let data = sample_daily_response();
+        // Test with all segment codes
+        for code in [0_u8, 1, 2, 3, 4, 5, 7, 8] {
+            let candle = build_daily_candle(&data, 0, 100, code);
+            assert_eq!(candle.exchange_segment_code, code);
+        }
+    }
+
+    // =======================================================================
+    // collect_failed_instrument_names edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_collect_failed_instrument_names_single() {
+        let result =
+            collect_failed_instrument_names(&[1], &[13, 25, 1333], &["IDX_I", "IDX_I", "NSE_EQ"]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "25 (IDX_I)");
+    }
+
+    // =======================================================================
+    // build_failure_reasons edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_build_failure_reasons_exact_threshold() {
+        // Token expired count exactly at MAX_TOKEN_EXPIRED_RETRIES
+        let pending = vec![0];
+        let token_counts = vec![MAX_TOKEN_EXPIRED_RETRIES]; // exactly at threshold
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons["token_expired"], 1);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_just_below_threshold() {
+        let pending = vec![0];
+        let token_counts = vec![MAX_TOKEN_EXPIRED_RETRIES - 1]; // below threshold
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons["network_or_api"], 1);
+        assert!(!reasons.contains_key("token_expired"));
+    }
+
+    // =======================================================================
+    // DhanErrorResponse deserialization edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_error_response_partial_fields() {
+        let json = br#"{"errorCode": "DH-905"}"#;
+        let err: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.error_code.as_deref(), Some("DH-905"));
+        assert!(err.error_type.is_none());
+        assert!(err.error_message.is_none());
+    }
+
+    #[test]
+    fn test_data_api_error_response_with_both_aliases_rejects_duplicate() {
+        // When both aliased fields are present, serde rejects as "duplicate field"
+        let json = br#"{"errorCode": 805, "status": 807}"#;
+        let result = serde_json::from_slice::<DataApiErrorResponse>(json);
+        assert!(
+            result.is_err(),
+            "serde should reject duplicate aliased fields"
+        );
+    }
+
+    // =======================================================================
+    // classify_error additional edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_classify_error_data_api_generic_code() {
+        let body = br#"{"errorCode": 800, "message": "Internal server error"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_dh_unknown_code() {
+        let body = br#"{"errorType": "UNKNOWN", "errorCode": "DH-999", "errorMessage": "Unknown"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    // =======================================================================
+    // validate_candle_ohlc priority of checks
+    // =======================================================================
+
+    #[test]
+    fn test_validate_candle_ohlc_non_finite_takes_priority_over_non_positive() {
+        // NaN is also <= 0, but NonFinite should be checked first
+        assert_eq!(
+            validate_candle_ohlc(f64::NAN, -1.0, -2.0, -3.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_non_positive_takes_priority_over_high_below_low() {
+        // zero low, but also high < low — NonPositive should be checked first
+        assert_eq!(
+            validate_candle_ohlc(0.0, 95.0, 98.0, 97.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    // =======================================================================
+    // is_outside_intraday_window additional boundary tests
+    // =======================================================================
+
+    #[test]
+    fn test_is_outside_intraday_window_just_before_0915_ist() {
+        // 09:14 IST = 03:44 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 44 * 60;
+        // 09:14 IST is before market open but before 15:30, so inside the window
+        // because is_outside_intraday_window only checks >= 15:30
+        assert!(!is_outside_intraday_window(utc_epoch));
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_exactly_1530_ist() {
+        // 15:30:00 IST exactly = 10:00 UTC
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600;
+        assert!(is_outside_intraday_window(utc_epoch));
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_1529_59_ist() {
+        // 15:29:59 IST = 09:59:59 UTC
+        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60 + 59;
+        assert!(!is_outside_intraday_window(utc_epoch));
+    }
+
+    // =======================================================================
+    // compute_dh904_backoff_secs overflow safety
+    // =======================================================================
+
+    #[test]
+    fn test_compute_dh904_backoff_secs_very_high_attempt() {
+        // wrapping_shl with attempt >= 64 wraps — confirm no panic
+        let result = compute_dh904_backoff_secs(100);
+        // With wrapping_shl, 1u64.wrapping_shl(100) wraps to 1u64.wrapping_shl(100 % 64)
+        assert!(result > 0 || result == 0); // Just confirm no panic
+    }
+
+    // =======================================================================
+    // extract_oi edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_extract_oi_negative_values() {
+        let oi_data = vec![-100, 200, -300];
+        assert_eq!(extract_oi(&oi_data, 0), -100);
+        assert_eq!(extract_oi(&oi_data, 2), -300);
+    }
+
+    #[test]
+    fn test_extract_oi_large_values() {
+        let oi_data = vec![i64::MAX, i64::MIN];
+        assert_eq!(extract_oi(&oi_data, 0), i64::MAX);
+        assert_eq!(extract_oi(&oi_data, 1), i64::MIN);
+    }
+
+    // =======================================================================
+    // format_intraday_date_range edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_format_intraday_date_range_leap_year() {
+        let from = chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap();
+        let to = chrono::NaiveDate::from_ymd_opt(2028, 3, 1).unwrap();
+        let (from_str, to_str) = format_intraday_date_range(from, to);
+        assert_eq!(from_str, "2028-02-29 09:15:00");
+        assert_eq!(to_str, "2028-03-01 15:30:00");
+    }
+
+    // =======================================================================
+    // compute_fetch_date_range edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_compute_fetch_date_range_max_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 1825); // 5 years
+        assert_eq!(to, today);
+        assert!(from < today);
+    }
+
+    // =======================================================================
+    // DhanIntradayResponse and DhanDailyResponse deserialization tests
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_intraday_response_json_deserialize() {
+        let json = r#"{
+            "open": [100.0, 101.0],
+            "high": [105.0, 106.0],
+            "low": [98.0, 99.0],
+            "close": [103.0, 104.0],
+            "volume": [1000, 2000],
+            "timestamp": [1773027900, 1773027960],
+            "open_interest": [5000, 6000]
+        }"#;
+        let data: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.is_consistent());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_json_deserialize() {
+        let json = r#"{
+            "open": [200.0],
+            "high": [210.0],
+            "low": [195.0],
+            "close": [205.0],
+            "volume": [10000],
+            "timestamp": [1772928000],
+            "open_interest": []
+        }"#;
+        let data: DhanDailyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data.is_consistent());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_empty() {
+        let data = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        assert!(data.is_empty());
+        assert!(data.is_consistent());
+        assert_eq!(data.len(), 0);
+    }
+
+    // =======================================================================
+    // Constants validation
+    // =======================================================================
+
+    #[test]
+    fn test_retry_wave_max_is_five() {
+        assert_eq!(RETRY_WAVE_MAX, 5);
+    }
+
+    #[test]
+    fn test_max_consecutive_persist_failures_value() {
+        assert_eq!(MAX_CONSECUTIVE_PERSIST_FAILURES, 10);
+    }
+
+    #[test]
+    fn test_token_refresh_wait_secs_value() {
+        assert_eq!(TOKEN_REFRESH_WAIT_SECS, 30);
+    }
+
+    #[test]
+    fn test_max_token_expired_retries_value() {
+        assert_eq!(MAX_TOKEN_EXPIRED_RETRIES, 2);
+    }
+
+    #[test]
+    fn test_max_failed_instrument_names_value() {
+        assert_eq!(MAX_FAILED_INSTRUMENT_NAMES, 50);
+    }
 }

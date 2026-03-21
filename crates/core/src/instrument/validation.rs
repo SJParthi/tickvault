@@ -2167,4 +2167,182 @@ mod tests {
             err_msg
         );
     }
+
+    // =======================================================================
+    // Additional coverage tests — empty universe paths
+    // =======================================================================
+
+    #[test]
+    fn test_cleared_underlyings_fails_at_must_exist() {
+        let mut universe = build_valid_universe();
+        universe.underlyings.clear();
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should fail at must-exist index check before reaching empty check
+        assert!(
+            err_msg.contains("not found") || err_msg.contains("empty"),
+            "should fail for missing underlyings: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_cleared_derivative_contracts_fails_at_empty_check() {
+        let mut universe = build_valid_universe();
+        universe.derivative_contracts.clear();
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty"),
+            "should fail for empty derivative_contracts: {}",
+            err_msg
+        );
+    }
+
+    // =======================================================================
+    // Additional coverage tests — orphan option chain futures
+    // =======================================================================
+
+    #[test]
+    fn test_orphan_future_in_option_chain_fails() {
+        use dhan_live_trader_common::instrument_types::OptionChain;
+        use dhan_live_trader_common::instrument_types::OptionChainKey;
+
+        let mut universe = build_valid_universe();
+        let key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        universe.option_chains.insert(
+            key,
+            OptionChain {
+                underlying_symbol: "NIFTY".to_string(),
+                expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                future_security_id: Some(99999), // Non-existent
+                calls: vec![],
+                puts: vec![],
+            },
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("option chain") || err_msg.contains("future"),
+            "should mention option chain/future: {}",
+            err_msg
+        );
+    }
+
+    // =======================================================================
+    // Additional coverage tests — orphan expiry calendars
+    // =======================================================================
+
+    #[test]
+    fn test_orphan_expiry_calendar_fails() {
+        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        let mut universe = build_valid_universe();
+        universe.expiry_calendars.insert(
+            "NONEXISTENT_UNDERLYING".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "NONEXISTENT_UNDERLYING".to_string(),
+                expiry_dates: vec![],
+            },
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("expiry calendar"),
+            "should mention expiry calendar: {}",
+            err_msg
+        );
+    }
+
+    // =======================================================================
+    // Additional coverage tests — equity variant check
+    // =======================================================================
+
+    #[test]
+    fn test_must_exist_equity_as_index_variant_fails() {
+        let mut universe = build_valid_universe();
+        // Replace the first must-exist equity with an Index variant
+        let (symbol, security_id) = VALIDATION_MUST_EXIST_EQUITIES[0];
+        universe.instrument_info.insert(
+            security_id,
+            InstrumentInfo::Index {
+                security_id,
+                symbol: symbol.to_string(),
+                exchange: Exchange::NationalStockExchange,
+            },
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not an Equity variant"),
+            "should mention Equity variant check: {}",
+            err_msg
+        );
+    }
+
+    // =======================================================================
+    // Additional coverage tests — missing price feed (non-fatal)
+    // =======================================================================
+
+    #[test]
+    fn test_missing_price_feed_security_id_passes_with_warning() {
+        let mut universe = build_valid_universe();
+        // Use a stock underlying (not a validated index) to avoid check 1 failure
+        // Add a stock with price_feed_security_id that doesn't exist in instrument_info
+        universe.underlyings.insert(
+            "TESTSTOCK_PF".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "TESTSTOCK_PF".to_string(),
+                underlying_security_id: 88888,
+                price_feed_security_id: 77777, // non-existent in instrument_info
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 100,
+                contract_count: 5,
+            },
+        );
+        // The validation should still pass (check 9 is warn-only, not fatal)
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "missing price feed is non-fatal: {:?}",
+            result.err()
+        );
+    }
+
+    // =======================================================================
+    // Additional coverage tests — all must-exist checks
+    // =======================================================================
+
+    #[test]
+    fn test_all_must_exist_indices_present() {
+        assert!(
+            !VALIDATION_MUST_EXIST_INDICES.is_empty(),
+            "must have at least one must-exist index"
+        );
+    }
+
+    #[test]
+    fn test_all_must_exist_equities_present() {
+        assert!(
+            !VALIDATION_MUST_EXIST_EQUITIES.is_empty(),
+            "must have at least one must-exist equity"
+        );
+    }
+
+    #[test]
+    fn test_all_must_exist_fno_stocks_present() {
+        assert!(
+            !VALIDATION_MUST_EXIST_FNO_STOCKS.is_empty(),
+            "must have at least one must-exist F&O stock"
+        );
+    }
 }

@@ -27,7 +27,7 @@
 // Modules are declared in lib.rs for coverage instrumentation.
 use dhan_live_trader_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START,
-    OFF_HOURS_CONNECTION_STAGGER_MS, compute_market_close_sleep, create_log_file_writer,
+    compute_market_close_sleep, create_log_file_writer, effective_ws_stagger, format_bind_addr,
     format_cross_match_details, format_timeframe_details, format_violation_details,
 };
 use dhan_live_trader_app::{infra, observability, trading_pipeline};
@@ -544,7 +544,7 @@ async fn main() -> Result<()> {
             &config.api.allowed_origins,
             config.strategy.dry_run,
         );
-        let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+        let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
             .parse()
             .context("invalid API bind address")?;
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -945,7 +945,7 @@ async fn main() -> Result<()> {
         config.strategy.dry_run,
     );
 
-    let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
         .parse()
         .context("invalid API bind address")?;
 
@@ -1090,18 +1090,16 @@ async fn build_websocket_pool(
     };
 
     // Outside market hours, use reduced stagger to avoid unnecessary boot delay.
-    let ws_config = if is_market_hours {
-        config.websocket.clone()
-    } else {
-        let mut cfg = config.websocket.clone();
+    let mut ws_config = config.websocket.clone();
+    let stagger = effective_ws_stagger(ws_config.connection_stagger_ms, is_market_hours);
+    if stagger != ws_config.connection_stagger_ms {
         info!(
-            market_hours_stagger_ms = cfg.connection_stagger_ms,
-            off_hours_stagger_ms = OFF_HOURS_CONNECTION_STAGGER_MS,
+            market_hours_stagger_ms = ws_config.connection_stagger_ms,
+            off_hours_stagger_ms = stagger,
             "using reduced WebSocket stagger (off-market-hours boot)"
         );
-        cfg.connection_stagger_ms = OFF_HOURS_CONNECTION_STAGGER_MS;
-        cfg
-    };
+    }
+    ws_config.connection_stagger_ms = stagger;
 
     info!("building WebSocket connection pool");
 
@@ -1561,7 +1559,7 @@ async fn run_shutdown_fast(
     shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
 
@@ -1720,7 +1718,9 @@ async fn run_shutdown_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_app::boot_helpers::APP_LOG_FILE_PATH;
+    use dhan_live_trader_app::boot_helpers::{
+        APP_LOG_FILE_PATH, OFF_HOURS_CONNECTION_STAGGER_MS, determine_boot_mode, should_fast_boot,
+    };
 
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
@@ -1742,5 +1742,21 @@ mod tests {
         let _ = format_violation_details(&[]);
         let _ = format_cross_match_details(&[]);
         let _ = create_log_file_writer();
+    }
+
+    #[test]
+    fn test_new_boot_helpers_callable_from_main() {
+        // Verify the newly extracted helpers are accessible from main.
+        let addr = format_bind_addr("0.0.0.0", 3001);
+        assert!(addr.contains("3001"));
+
+        let stagger = effective_ws_stagger(3000, true);
+        assert_eq!(stagger, 3000);
+
+        let mode = determine_boot_mode(true, true);
+        assert_eq!(mode, "fast");
+
+        assert!(should_fast_boot(true, true));
+        assert!(!should_fast_boot(false, true));
     }
 }

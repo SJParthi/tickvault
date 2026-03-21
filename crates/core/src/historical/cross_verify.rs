@@ -2310,4 +2310,321 @@ mod tests {
         let result = lookup_symbol(&registry, 0);
         assert_eq!(result, "0");
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — format_timestamp_ist edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_timestamp_ist_only_date_part() {
+        let ts = serde_json::Value::String("2026-03-18T".to_string());
+        let result = format_timestamp_ist(&ts);
+        // Has 'T' but time_rest is empty — will produce date + " " + something short
+        assert!(result.contains("2026-03-18"));
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_very_short_time_part() {
+        let ts = serde_json::Value::String("2026-03-18T1Z".to_string());
+        let result = format_timestamp_ist(&ts);
+        // time_part after trimming Z is "1", len < 5 so returns as-is
+        assert_eq!(result, "2026-03-18 1 IST");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_with_fractional_and_z() {
+        let ts = serde_json::Value::String("2026-03-18T14:30:00.123456Z".to_string());
+        let result = format_timestamp_ist(&ts);
+        assert_eq!(result, "2026-03-18 14:30 IST");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_float_value() {
+        let ts = serde_json::json!(1773050340.5);
+        let result = format_timestamp_ist(&ts);
+        assert_eq!(result, "1773050340.5");
+    }
+
+    #[test]
+    fn test_format_timestamp_ist_array_value() {
+        let ts = serde_json::json!([1, 2, 3]);
+        let result = format_timestamp_ist(&ts);
+        assert_eq!(result, "[1,2,3]");
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_symbol with negative id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_symbol_negative_id() {
+        let registry = InstrumentRegistry::empty();
+        // Negative i64 cast to u32 wraps — should still return the i64 as string
+        let result = lookup_symbol(&registry, -1);
+        assert_eq!(result, "-1");
+    }
+
+    #[test]
+    fn test_lookup_symbol_large_id() {
+        let registry = InstrumentRegistry::empty();
+        let result = lookup_symbol(&registry, 999999);
+        assert_eq!(result, "999999");
+    }
+
+    // -----------------------------------------------------------------------
+    // CandleValues formatting edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_values_format_ohlcv_zero_values() {
+        let c = cv(0.0, 0.0, 0.0, 0.0, 0, 0);
+        let result = c.format_ohlcv();
+        assert_eq!(result, "O=0 H=0 L=0 C=0 V=0");
+    }
+
+    #[test]
+    fn test_candle_values_format_with_oi_zero_oi() {
+        let c = cv(100.0, 110.0, 95.0, 105.0, 50000, 0);
+        let result = c.format_with_oi();
+        assert!(result.contains("OI=0"));
+    }
+
+    #[test]
+    fn test_candle_values_format_ohlcv_large_values() {
+        let c = cv(99999.99, 100000.0, 99999.0, 99999.5, i64::MAX, 0);
+        let result = c.format_ohlcv();
+        assert!(result.contains("O=99999.99"));
+        assert!(result.contains(&format!("V={}", i64::MAX)));
+    }
+
+    #[test]
+    fn test_candle_values_format_with_oi_large_oi() {
+        let c = cv(100.0, 110.0, 95.0, 105.0, 50000, 9999999);
+        let result = c.format_with_oi();
+        assert!(result.contains("OI=9999999"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_violation_detail additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_violation_detail_timestamp_violation() {
+        let detail = build_violation_detail(
+            test_ctx("INFY", "NSE_EQ", "1m", "2026-03-18 08:00 IST"),
+            "outside 09:15-15:29 market hours",
+            cv(1500.0, 1510.0, 1495.0, 1505.0, 1000, 0),
+        );
+        assert_eq!(detail.violation, "outside 09:15-15:29 market hours");
+        assert_eq!(detail.symbol, "INFY");
+        assert_eq!(detail.segment, "NSE_EQ");
+        assert_eq!(detail.timeframe, "1m");
+        assert_eq!(detail.timestamp_ist, "2026-03-18 08:00 IST");
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_cross_match_row additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_cross_match_row_epsilon_boundary() {
+        // Differences exactly at epsilon — should NOT trigger mismatch
+        let eps = CROSS_MATCH_PRICE_EPSILON;
+        let result = classify_cross_match_row(
+            test_ctx("TCS", "NSE_EQ", "1m", "2026-03-18 10:00 IST"),
+            cv(100.0, 200.0, 50.0, 150.0, 100000, 0),
+            cv(100.0 + eps, 200.0 - eps, 50.0 + eps, 150.0 - eps, 100000, 0),
+        );
+        assert!(result.is_none(), "diffs at epsilon boundary should pass");
+    }
+
+    #[test]
+    fn test_classify_cross_match_row_just_over_epsilon() {
+        // Differences just over epsilon — should trigger mismatch
+        let over_eps = CROSS_MATCH_PRICE_EPSILON * 2.0;
+        let result = classify_cross_match_row(
+            test_ctx("TCS", "NSE_EQ", "1m", "2026-03-18 10:00 IST"),
+            cv(100.0, 200.0, 50.0, 150.0, 100000, 0),
+            cv(100.0 + over_eps, 200.0, 50.0, 150.0, 100000, 0),
+        );
+        assert!(
+            result.is_some(),
+            "diffs over epsilon should trigger mismatch"
+        );
+        let m = result.unwrap();
+        assert_eq!(m.mismatch_type, "price_diff");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_missing_live_mismatch additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_missing_live_mismatch_preserves_context() {
+        let mismatch = build_missing_live_mismatch(
+            test_ctx("INFY", "NSE_EQ", "15m", "2026-03-18 12:30 IST"),
+            cv(1500.0, 1510.0, 1495.0, 1505.0, 75000, 0),
+        );
+        assert_eq!(mismatch.symbol, "INFY");
+        assert_eq!(mismatch.segment, "NSE_EQ");
+        assert_eq!(mismatch.timeframe, "15m");
+        assert_eq!(mismatch.timestamp_ist, "2026-03-18 12:30 IST");
+        assert_eq!(mismatch.mismatch_type, "missing_live");
+    }
+
+    // -----------------------------------------------------------------------
+    // has_volume_mismatch edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_volume_mismatch_negative_volumes() {
+        // Negative volumes should still work with saturating_sub
+        assert!(has_volume_mismatch(-100, 100, 0.10));
+    }
+
+    #[test]
+    fn test_has_volume_mismatch_large_volumes() {
+        // Large but proportionally close volumes
+        assert!(!has_volume_mismatch(1_000_000, 1_050_000, 0.10));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_oi_mismatch edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_oi_mismatch_equal_values() {
+        // Identical OI values — no mismatch
+        assert!(!has_oi_mismatch(5000, 5000, 0.10));
+    }
+
+    #[test]
+    fn test_has_oi_mismatch_negative_oi() {
+        // Negative OI — condition h_oi > 0 fails
+        assert!(!has_oi_mismatch(-100, 100, 0.10));
+        assert!(!has_oi_mismatch(100, -100, 0.10));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_diff_summary edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_diff_summary_negative_volume_diff() {
+        let result = build_diff_summary(&diff_params(
+            0.0, 0.0, 0.0, 0.0, 2000, 1000, 0, 0, true, false,
+        ));
+        assert!(result.contains('V'));
+        assert!(result.contains('-'));
+    }
+
+    #[test]
+    fn test_build_diff_summary_oi_only() {
+        let result = build_diff_summary(&diff_params(
+            0.0, 0.0, 0.0, 0.0, 1000, 1000, 10000, 15000, false, true,
+        ));
+        assert!(result.contains("OI("));
+        // Should not contain "O(" price diff — only "OI("
+        assert!(!result.contains("O("));
+        assert!(!result.contains('V'));
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_cross_match_passed edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_cross_match_passed_zero_mismatches_zero_compared() {
+        // Zero compared = fails even with zero mismatches
+        assert!(!determine_cross_match_passed(0, 0, 0));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_large_values() {
+        assert!(determine_cross_match_passed(0, 1_000_000, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // failed_cross_match_report tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_failed_cross_match_report_not_passed() {
+        let report = failed_cross_match_report();
+        assert!(!report.passed);
+        assert_eq!(report.missing_historical, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_coverage_rows additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_coverage_rows_extra_columns_ignored() {
+        let dataset = vec![vec![
+            serde_json::json!("1m"),
+            serde_json::json!(1333),
+            serde_json::json!(375),
+            serde_json::json!("extra_column"), // extra columns are fine
+        ]];
+        let (map, total) = parse_coverage_rows(&dataset);
+        assert_eq!(total, 375);
+        assert_eq!(map["1m"], vec![(1333, 375)]);
+    }
+
+    #[test]
+    fn test_parse_coverage_rows_float_count_truncated() {
+        let dataset = vec![vec![
+            serde_json::json!("5m"),
+            serde_json::json!(100),
+            serde_json::json!(99.9), // float — as_i64 returns None → 0
+        ]];
+        let (map, total) = parse_coverage_rows(&dataset);
+        // serde_json::Value::Number(99.9).as_i64() is None → 0
+        assert_eq!(total, 0);
+        assert_eq!(map["5m"], vec![(100, 0)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_1m_coverage edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_1m_coverage_zero_threshold() {
+        // All instruments are "complete" when threshold is 0
+        let instruments = vec![(100, 0), (200, 1)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 0);
+        assert_eq!(complete, 2);
+        assert_eq!(gaps, 0);
+    }
+
+    #[test]
+    fn test_classify_1m_coverage_large_threshold() {
+        let instruments = vec![(100, 375), (200, 500)];
+        let (complete, gaps) = classify_1m_coverage(&instruments, 1000);
+        assert_eq!(complete, 0);
+        assert_eq!(gaps, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // count_unique_instruments edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_unique_instruments_duplicate_ids() {
+        let mut map: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        map.insert("1m".to_string(), vec![(100, 375), (100, 300)]); // same id
+        assert_eq!(count_unique_instruments(&map), 1);
+    }
+
+    #[test]
+    fn test_count_unique_instruments_all_same_id() {
+        let mut map: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        map.insert("1m".to_string(), vec![(42, 375)]);
+        map.insert("5m".to_string(), vec![(42, 75)]);
+        map.insert("15m".to_string(), vec![(42, 25)]);
+        map.insert("60m".to_string(), vec![(42, 7)]);
+        map.insert("1d".to_string(), vec![(42, 1)]);
+        assert_eq!(count_unique_instruments(&map), 1);
+    }
 }

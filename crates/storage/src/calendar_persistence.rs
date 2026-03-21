@@ -621,4 +621,206 @@ mod tests {
         };
         ensure_calendar_table(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // HTTP mock helpers
+    // -----------------------------------------------------------------------
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn spawn_tcp_drain_server() -> u16 {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_calendar_table — HTTP success/non-success/error paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_http_200() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises success paths (lines 115, 150)
+        ensure_calendar_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_http_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises non-success paths (lines 125, 161)
+        ensure_calendar_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_create_send_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises Err branch on CREATE TABLE (lines 130-131)
+        ensure_calendar_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_calendar_table_create_ok_dedup_send_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond OK
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop → DEDUP send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises Err branch on DEDUP DDL (lines 166-167)
+        ensure_calendar_table(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // persist_inner — with TCP drain (ILP write paths)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persist_inner_with_calendar_data_and_tcp_drain() {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+
+        let trading_config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![
+                NseHolidayEntry {
+                    date: "2026-01-26".to_string(),
+                    name: "Republic Day".to_string(),
+                },
+                NseHolidayEntry {
+                    date: "2026-03-10".to_string(),
+                    name: "Holi".to_string(),
+                },
+            ],
+            muhurat_trading_dates: vec![],
+        };
+
+        let calendar = TradingCalendar::from_config(&trading_config).unwrap();
+        // Exercises persist_inner ILP write paths (lines 224-258)
+        let result = persist_calendar(&calendar, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_persist_inner_with_muhurat_and_holiday() {
+        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+
+        let trading_config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-10-21".to_string(),
+                name: "Diwali".to_string(),
+            }],
+            muhurat_trading_dates: vec![NseHolidayEntry {
+                date: "2026-10-21".to_string(),
+                name: "Diwali".to_string(),
+            }],
+        };
+
+        let calendar = TradingCalendar::from_config(&trading_config).unwrap();
+        let result = persist_calendar(&calendar, &config);
+        assert!(result.is_ok());
+    }
 }

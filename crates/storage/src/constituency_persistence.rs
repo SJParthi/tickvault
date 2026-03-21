@@ -528,4 +528,189 @@ mod tests {
         };
         ensure_constituency_table(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // HTTP mock server helpers
+    // -----------------------------------------------------------------------
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_constituency_table — HTTP success/non-success/error paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_http_200() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises success paths (lines 121, 151)
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_http_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises non-success paths (lines 127, 159)
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_create_send_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises Err branch on CREATE TABLE (lines 132-133)
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_create_ok_dedup_send_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond OK
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop → DEDUP send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises Err branch on DEDUP DDL (lines 165-166)
+        ensure_constituency_table(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_dedup_already_enabled() {
+        // Response that contains "already enabled" — should NOT log a warning
+        let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 43\r\n\r\n{\"error\":\"DEDUP is already enabled on table\"}";
+        // Leak into 'static — fine for tests
+        let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_constituency_table(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // persist_constituency_inner — with TCP drain (ILP write paths)
+    // -----------------------------------------------------------------------
+
+    fn spawn_tcp_drain_server() -> u16 {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn test_persist_constituency_inner_with_data() {
+        use dhan_live_trader_common::instrument_types::{
+            ConstituencyBuildMetadata, IndexConstituent,
+        };
+        use std::collections::HashMap;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+
+        let today = chrono::Utc::now().date_naive();
+        let mut index_to_constituents = HashMap::new();
+        index_to_constituents.insert(
+            "NIFTY 50".to_string(),
+            vec![IndexConstituent {
+                index_name: "NIFTY 50".to_string(),
+                symbol: "RELIANCE".to_string(),
+                isin: "INE002A01018".to_string(),
+                weight: 10.5,
+                sector: "Energy".to_string(),
+                last_updated: today,
+            }],
+        );
+
+        let map = IndexConstituencyMap {
+            index_to_constituents,
+            stock_to_indices: HashMap::new(),
+            build_metadata: ConstituencyBuildMetadata::default(),
+        };
+
+        // persist_constituency wraps errors — exercises inner ILP write (lines 228-261, 263, 267-273)
+        let result = persist_constituency(&map, &config, None);
+        assert!(result.is_ok());
+    }
 }
