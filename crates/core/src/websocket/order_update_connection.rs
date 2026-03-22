@@ -101,11 +101,19 @@ pub async fn run_order_update_connection(
                     }
                     ReconnectAction::IncrementAndRetry => {
                         consecutive_failures = tentative_failures;
-                        warn!(
-                            ?err,
-                            attempt = consecutive_failures,
-                            "order update WebSocket error — will reconnect"
-                        );
+                        // CRITICAL alert every 10 consecutive failures (triggers Telegram).
+                        if consecutive_failures.is_multiple_of(10) {
+                            error!(
+                                consecutive_failures,
+                                "order update WebSocket reconnection threshold hit — still retrying"
+                            );
+                        } else {
+                            warn!(
+                                ?err,
+                                attempt = consecutive_failures,
+                                "order update WebSocket error — will reconnect"
+                            );
+                        }
                     }
                 }
             }
@@ -441,6 +449,10 @@ enum ReconnectAction {
 
 /// Decides the reconnect action based on error type and market hours.
 ///
+/// During market hours, NEVER returns `Exhausted` — the app lifecycle
+/// (graceful shutdown at market close) controls when connections should stop.
+/// A CRITICAL alert fires at the threshold, but retrying continues.
+///
 /// Pure function — no I/O.
 fn decide_reconnect_action(
     error_is_read_timeout: bool,
@@ -449,7 +461,10 @@ fn decide_reconnect_action(
 ) -> ReconnectAction {
     if error_is_read_timeout && !within_market_hours {
         ReconnectAction::ResetAndReconnect
-    } else if consecutive_failures_after_increment > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
+    } else if !within_market_hours
+        && consecutive_failures_after_increment > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS
+    {
+        // Only give up OUTSIDE market hours. During market hours, never stop retrying.
         ReconnectAction::Exhausted
     } else {
         ReconnectAction::IncrementAndRetry
@@ -778,8 +793,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reconnect_action_exhausted() {
+    fn test_reconnect_action_never_exhausted_during_market_hours() {
+        // During market hours, NEVER give up — infinite resilience mode.
         let action = decide_reconnect_action(false, true, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_exhausted_outside_market_hours() {
+        // Outside market hours, respect the max attempts limit.
+        let action = decide_reconnect_action(false, false, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
         assert_eq!(action, ReconnectAction::Exhausted);
     }
 

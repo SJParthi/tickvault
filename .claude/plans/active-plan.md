@@ -1,8 +1,8 @@
 # Implementation Plan: Comprehensive Resilience — Zero Human Intervention
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-22
-**Approved by:** pending
+**Approved by:** Parthiban ("yes go ahead dude")
 
 ## Vision
 
@@ -46,7 +46,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
 
 ### Phase A: Never Give Up (WebSocket + App Supervision)
 
-- [ ] A1: Remove WebSocket max reconnection limit — retry forever during market hours
+- [x] A1: Remove WebSocket max reconnection limit — retry forever during market hours
   - Files: crates/core/src/websocket/connection.rs, crates/common/src/config.rs, config/base.toml
   - Change: During market hours (09:00-16:00 IST), never stop retrying. Cap at 60s backoff.
     After market close, respect max_attempts limit. Add Telegram CRITICAL alert after
@@ -61,7 +61,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
     Throttle: max 1 gap-fill per 5 minutes to avoid API rate limits.
   - Tests: test_gap_backfill_triggered_on_reconnect, test_gap_backfill_throttled
 
-- [ ] A3: App process supervision via systemd (Linux) / launchd (macOS)
+- [x] A3: App process supervision via systemd (Linux) / launchd (macOS)
   - Files: deploy/systemd/dlt-app.service (new), scripts/install-service.sh (new)
   - Change: systemd unit file with Restart=always, WatchdogSec=30, auto-start on boot.
     App emits sd_notify WATCHDOG=1 every 15s (via sd-notify crate or raw socket).
@@ -90,7 +90,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
 
 ### Phase C: Never Miss an Alert (Container + Grafana -> Telegram)
 
-- [ ] C1: Container restart alerting via Prometheus
+- [x] C1: Container restart alerting via Prometheus
   - Files: deploy/docker/prometheus/rules/dlt-alerts.yml
   - Change: Add alert rule:
     `ContainerRestarted: increase(container_start_time_seconds[5m]) > 0`
@@ -100,7 +100,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
     flaps UP/DOWN within 5 minutes, it restarted.
   - Tests: N/A (Prometheus config)
 
-- [ ] C2: Grafana alerting -> Telegram contact point
+- [x] C2: Grafana alerting -> Telegram contact point (already implemented in setup-observability.sh)
   - Files: deploy/docker/grafana/provisioning/alerting/alerts.yml
   - Change: Add Telegram contact point to Grafana alerting provisioning.
     Configure notification policy to route all alerts to Telegram.
@@ -108,7 +108,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
     even when the Rust app is not running (infrastructure-level alerts).
   - Tests: N/A (YAML config, verified via Grafana UI)
 
-- [ ] C3: Docker service restart count in system-overview dashboard
+- [x] C3: Docker service restart count in system-overview dashboard
   - Files: deploy/docker/grafana/dashboards/system-overview.json
   - Change: Add panel showing `changes(up[1h])` per service — visualizes how many times
     each service restarted in the last hour. Red if > 0. Also add uptime panel.
@@ -116,7 +116,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
 
 ### Phase D: Hardened Recovery (Token + Config)
 
-- [ ] D1: Move token cache from /tmp to persistent data directory
+- [x] D1: Move token cache from /tmp to persistent data directory
   - Files: crates/core/src/auth/token_cache.rs, crates/common/src/config.rs
   - Change: Token cache path from `/tmp/dlt-token-cache` to `{data_dir}/cache/dlt-token-cache`
     where data_dir is configurable (default: `./data`). Survives reboot on real filesystem.

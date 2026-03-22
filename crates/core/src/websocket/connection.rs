@@ -506,9 +506,19 @@ impl WebSocketConnection {
     }
 
     /// Waits with exponential backoff. Returns false if max attempts exhausted.
+    ///
+    /// When `reconnect_max_attempts == 0` (production default), retries forever —
+    /// the app lifecycle (graceful shutdown at market close) controls when
+    /// connections should stop, not an arbitrary attempt limit. A CRITICAL alert
+    /// fires every 10 consecutive failures so the operator is aware.
     async fn wait_with_backoff(&self) -> bool {
         let attempt = self.total_reconnections.load(Ordering::Acquire);
-        if attempt >= self.ws_config.reconnect_max_attempts as u64 {
+
+        // reconnect_max_attempts == 0 → infinite retries (never give up).
+        // Non-zero → respect the limit (used by tests and explicit config overrides).
+        if self.ws_config.reconnect_max_attempts > 0
+            && attempt >= self.ws_config.reconnect_max_attempts as u64
+        {
             error!(
                 connection_id = self.connection_id,
                 attempts = attempt,
@@ -517,11 +527,20 @@ impl WebSocketConnection {
             return false;
         }
 
+        // CRITICAL alert every 10 consecutive failures (triggers Telegram).
+        if attempt.is_multiple_of(10) {
+            error!(
+                connection_id = self.connection_id,
+                consecutive_failures = attempt,
+                "WebSocket reconnection threshold hit — still retrying (infinite resilience mode)"
+            );
+        }
+
         // Exponential backoff: initial * 2^attempt, capped at max.
         let delay_ms = self
             .ws_config
             .reconnect_initial_delay_ms
-            .saturating_mul(1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX))
+            .saturating_mul(1u64.checked_shl(attempt.min(63) as u32).unwrap_or(u64::MAX))
             .min(self.ws_config.reconnect_max_delay_ms);
 
         info!(
@@ -1272,10 +1291,10 @@ mod tests {
         assert!(!result, "attempt at max should fail");
     }
 
-    // --- wait_with_backoff: zero max_attempts means immediate exhaustion ---
+    // --- wait_with_backoff: zero max_attempts means infinite retries (never give up) ---
 
     #[tokio::test]
-    async fn test_wait_with_backoff_zero_max_attempts() {
+    async fn test_wait_with_backoff_zero_max_attempts_means_infinite() {
         let (tx, _rx) = mpsc::channel(100);
         let conn = WebSocketConnection::new(
             0,
@@ -1283,7 +1302,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 0, // 0 = infinite retries
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1293,10 +1312,27 @@ mod tests {
             tx,
         );
 
-        // Even attempt 0 should fail when max_attempts is 0
+        // With max_attempts=0 (infinite), even high attempt counts should return true.
         conn.total_reconnections.store(0, Ordering::Release);
         let result = conn.wait_with_backoff().await;
-        assert!(!result, "zero max_attempts should always fail");
+        assert!(
+            result,
+            "zero max_attempts = infinite retries, should always succeed"
+        );
+
+        conn.total_reconnections.store(100, Ordering::Release);
+        let result = conn.wait_with_backoff().await;
+        assert!(
+            result,
+            "attempt 100 with infinite mode should still succeed"
+        );
+
+        conn.total_reconnections.store(10000, Ordering::Release);
+        let result = conn.wait_with_backoff().await;
+        assert!(
+            result,
+            "attempt 10000 with infinite mode should still succeed"
+        );
     }
 
     // --- connection_id boundary: 0 is valid ---

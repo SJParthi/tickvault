@@ -67,6 +67,15 @@ groups:
           summary: "Loki ingestion rate > 10MB/s"
           description: "Loki is ingesting {{ $value | humanize1024 }}B/s, which may cause ingestion limits to be hit."
 
+      - alert: ServiceFlapping
+        expr: changes(up[15m]) > 2
+        for: 0m
+        labels:
+          severity: high
+        annotations:
+          summary: "{{ $labels.job }} is flapping (restarting)"
+          description: "{{ $labels.instance }} (job={{ $labels.job }}) has restarted {{ $value }} times in the last 15 minutes. Container may be crash-looping."
+
   - name: dlt-application-alerts
     rules:
       - alert: ApplicationDown

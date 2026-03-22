@@ -1,0 +1,63 @@
+# =============================================================================
+# dhan-live-trader — systemd Service Unit
+# =============================================================================
+# Auto-restarts the trading app on crash. Watchdog kills hung processes.
+#
+# Install:
+#   sudo cp deploy/systemd/dlt-app.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable dlt-app
+#   sudo systemctl start dlt-app
+#
+# Check:
+#   systemctl status dlt-app
+#   journalctl -u dlt-app -f
+# =============================================================================
+
+[Unit]
+Description=dhan-live-trader — Live F&O Trading System
+Documentation=https://github.com/SJParthi/dhan-live-trader
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=notify
+# The app binary. Adjust path to match your deployment.
+ExecStart=/opt/dlt/dhan-live-trader
+WorkingDirectory=/opt/dlt
+
+# Auto-restart on ANY failure. RestartSec prevents tight restart loops.
+Restart=always
+RestartSec=3
+
+# Watchdog: app must call sd_notify(WATCHDOG=1) every 30s.
+# If no watchdog ping for 60s (2x interval), systemd kills and restarts.
+WatchdogSec=60
+
+# Environment
+Environment=RUST_LOG=info
+Environment=DLT_ENVIRONMENT=prod
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dlt/data /opt/dlt/config
+PrivateTmp=true
+
+# Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL.
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging to journald (also captured by Alloy → Loki if configured)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dlt-app
+
+[Install]
+WantedBy=multi-user.target

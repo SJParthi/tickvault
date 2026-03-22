@@ -85,6 +85,14 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
 
     let tmp_path = format!("{TOKEN_CACHE_FILE_PATH}.tmp");
 
+    // Ensure parent directory exists (data/cache/ may not exist on first run).
+    if let Some(parent) = std::path::Path::new(TOKEN_CACHE_FILE_PATH).parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            warn!(?err, "failed to create token cache directory");
+            return;
+        }
+    }
+
     // Write to temp file first (atomic write pattern)
     let write_result = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp_path)?;

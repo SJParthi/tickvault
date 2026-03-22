@@ -1318,7 +1318,10 @@ pub const MAX_STRATEGY_INSTANCES: usize = 256;
 /// `/tmp` is ephemeral on container restart but survives process crashes
 /// within the same container — exactly the right lifetime for crash recovery.
 /// Security: file permissions 0600, container isolation, 24h TTL token.
-pub const TOKEN_CACHE_FILE_PATH: &str = "/tmp/dlt-token-cache";
+/// Token cache file path. Uses `data/cache/` (persistent filesystem) instead of `/tmp`
+/// which may be tmpfs on Linux (wiped on reboot). The `data/` directory is the app's
+/// persistent data root, also used by rkyv instrument cache and log files.
+pub const TOKEN_CACHE_FILE_PATH: &str = "data/cache/dlt-token-cache";
 
 /// Minimum remaining token validity (hours) to accept a cached token.
 ///

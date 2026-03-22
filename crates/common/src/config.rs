@@ -599,10 +599,8 @@ impl ApplicationConfig {
             );
         }
 
-        // WebSocket: reconnect attempts must be positive.
-        if self.websocket.reconnect_max_attempts == 0 {
-            bail!("websocket.reconnect_max_attempts must be > 0");
-        }
+        // WebSocket: reconnect_max_attempts == 0 means infinite retries (production default).
+        // No validation needed — 0 is a valid sentinel for "never give up".
 
         // Dhan: max_websocket_connections must be positive (prevents division-by-zero in pool).
         if self.dhan.max_websocket_connections == 0 {
@@ -947,11 +945,11 @@ mod tests {
     }
 
     #[test]
-    fn test_websocket_zero_reconnect_max_attempts_fails() {
+    fn test_websocket_zero_reconnect_max_attempts_means_infinite() {
         let mut config = make_valid_config();
         config.websocket.reconnect_max_attempts = 0;
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("reconnect_max_attempts"));
+        // 0 = infinite retries (production default). Must pass validation.
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -174,8 +174,10 @@ ping_interval_secs = 10
 pong_timeout_secs = 10
 max_consecutive_pong_failures = 2
 reconnect_initial_delay_ms = 500
-reconnect_max_delay_ms = 30000
-reconnect_max_attempts = 10
+reconnect_max_delay_ms = 60000
+# 0 = infinite retries (never give up). App lifecycle controls shutdown.
+# Non-zero = hard limit (used for testing). CRITICAL alert fires every 10 failures.
+reconnect_max_attempts = 0
 subscription_batch_size = 100
 connection_stagger_ms = 10000
 
