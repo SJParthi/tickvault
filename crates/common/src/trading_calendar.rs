@@ -999,4 +999,83 @@ mod tests {
         // Just verify it doesn't panic
         let _is_mock = cal.is_mock_trading_today();
     }
+
+    // =====================================================================
+    // Coverage: next_trading_day edge cases (lines 185, 190)
+    // =====================================================================
+
+    #[test]
+    fn test_next_trading_day_date_max_overflow() {
+        // Line 185: NaiveDate::MAX.succ_opt() returns None → return from.
+        // NaiveDate::MAX might be a weekday, so we need to add it as a holiday
+        // to force the loop to try succ_opt() which returns None.
+        use crate::config::{NseHolidayEntry, TradingConfig};
+        let max_date = chrono::NaiveDate::MAX;
+        let config = TradingConfig {
+            market_open_time: "09:15:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: max_date.format("%Y-%m-%d").to_string(),
+                name: "Max date holiday".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // MAX is now a holiday → loop tries succ_opt() → None → return from.
+        let result = cal.next_trading_day(max_date);
+        assert_eq!(result, max_date);
+    }
+
+    #[test]
+    fn test_next_trading_day_exhausted_lookahead() {
+        // Line 190: 14 consecutive non-trading days exhausts the lookahead.
+        // Create a calendar where every weekday in a 14-day window is a holiday.
+        // Loop checks days 0..13 (14 iterations). All must be non-trading.
+        use crate::config::{NseHolidayEntry, TradingConfig};
+        let start = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(); // Monday
+        let mut holidays = Vec::new();
+        // Need to cover 14 days from start (days 0-13). Weekends are auto non-trading.
+        // Add all weekdays in the range as holidays.
+        for i in 0..15 {
+            let d = start + chrono::Duration::days(i);
+            if d.weekday() != chrono::Weekday::Sat && d.weekday() != chrono::Weekday::Sun {
+                holidays.push(NseHolidayEntry {
+                    date: d.format("%Y-%m-%d").to_string(),
+                    name: format!("Holiday {i}"),
+                });
+            }
+        }
+        let config = TradingConfig {
+            market_open_time: "09:15:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: holidays,
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // Verify all 14 days are non-trading
+        for i in 0..14 {
+            let d = start + chrono::Duration::days(i);
+            assert!(
+                !cal.is_trading_day(d),
+                "Day {i} ({d}) should be non-trading"
+            );
+        }
+        let result = cal.next_trading_day(start);
+        // Exhausted lookahead → returns last candidate (start + 14, since
+        // loop increments candidate after checking, ending at day 14).
+        let expected_last = start + chrono::Duration::days(14);
+        assert_eq!(result, expected_last);
+    }
 }
