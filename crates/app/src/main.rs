@@ -1542,6 +1542,18 @@ async fn run_tick_persistence_consumer(
                     let _ = tick_writer.flush_if_needed();
                     last_flush = std::time::Instant::now();
                 }
+
+                // B2: After QuestDB recovery + buffer drain, run integrity check.
+                if tick_writer.take_recovery_flag() {
+                    let qdb_config = questdb_config.clone();
+                    tokio::spawn(async move {
+                        dhan_live_trader_storage::tick_persistence::check_tick_gaps_after_recovery(
+                            &qdb_config,
+                            30, // Check last 30 minutes
+                        )
+                        .await;
+                    });
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!(

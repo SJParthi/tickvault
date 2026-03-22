@@ -1,6 +1,6 @@
 # Implementation Plan: Comprehensive Resilience — Zero Human Intervention
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-03-22
 **Approved by:** Parthiban ("yes go ahead dude")
 
@@ -80,7 +80,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
   - Tests: test_tick_buffer_fills_on_questdb_down, test_tick_buffer_drains_on_recovery,
     test_tick_buffer_drops_oldest_when_full
 
-- [ ] B2: Automatic data integrity check after any recovery
+- [x] B2: Automatic data integrity check after any recovery
   - Files: crates/storage/src/tick_persistence.rs, crates/app/src/main.rs
   - Change: After QuestDB reconnect, run quick gap-check query:
     `SELECT count() FROM ticks WHERE ts >= dateadd('m', -30, now()) SAMPLE BY 1m`

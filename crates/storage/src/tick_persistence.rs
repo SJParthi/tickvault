@@ -80,6 +80,9 @@ pub struct TickPersistenceWriter {
     // O(1) EXEMPT: end
     /// Total ticks dropped because the ring buffer was full (QuestDB down too long).
     ticks_dropped_total: u64,
+    /// Set to true after a successful reconnect + drain. The async consumer
+    /// checks this flag to fire the gap integrity check.
+    just_recovered: bool,
 }
 
 impl TickPersistenceWriter {
@@ -101,6 +104,7 @@ impl TickPersistenceWriter {
             ilp_conf_string: conf_string,
             tick_buffer: VecDeque::new(),
             ticks_dropped_total: 0,
+            just_recovered: false,
         })
     }
 
@@ -216,6 +220,14 @@ impl TickPersistenceWriter {
         self.ticks_dropped_total
     }
 
+    /// Returns true (once) after a successful QuestDB reconnect + buffer drain.
+    /// The async consumer uses this to trigger the gap integrity check.
+    pub fn take_recovery_flag(&mut self) -> bool {
+        let flag = self.just_recovered;
+        self.just_recovered = false;
+        flag
+    }
+
     /// Returns a mutable reference to the ILP buffer for writing auxiliary rows
     /// (e.g., previous close) that share the same flush lifecycle.
     pub fn buffer_mut(&mut self) -> &mut Buffer {
@@ -288,6 +300,8 @@ impl TickPersistenceWriter {
                 dropped_total = self.ticks_dropped_total,
                 "drained buffered ticks to QuestDB after recovery"
             );
+            // Signal the async consumer to run the gap integrity check.
+            self.just_recovered = true;
         }
         metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
         metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
@@ -956,6 +970,115 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     .await;
 
     info!("market_depth and previous_close table setup complete");
+}
+
+// ---------------------------------------------------------------------------
+// B2: Post-Recovery Data Integrity Check
+// ---------------------------------------------------------------------------
+
+/// Checks for tick data gaps in the last N minutes by querying QuestDB.
+///
+/// Runs a `SAMPLE BY 1m` query to count ticks per minute. If any minute bucket
+/// during market hours has zero ticks, logs an ERROR (triggers Telegram alert)
+/// with the specific gap time range.
+///
+/// Best-effort: if QuestDB is unreachable, logs a warning and returns.
+/// This is a cold-path operation — call after QuestDB reconnect, not per-tick.
+pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, lookback_minutes: u32) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(?err, "failed to build HTTP client for gap check");
+            return;
+        }
+    };
+
+    // Query: count ticks per 1-minute bucket in the last N minutes.
+    let sql = format!(
+        "SELECT ts, count() AS tick_count FROM ticks \
+         WHERE ts > dateadd('m', -{lookback_minutes}, now()) \
+         SAMPLE BY 1m ALIGN TO CALENDAR"
+    );
+
+    let response = match client.get(&base_url).query(&[("query", &sql)]).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(
+                ?err,
+                "tick gap check query failed — QuestDB may still be recovering"
+            );
+            return;
+        }
+    };
+
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(?err, "failed to read tick gap check response");
+            return;
+        }
+    };
+
+    // Parse QuestDB JSON response to find zero-count buckets.
+    // Response format: {"query":"...","columns":[...],"dataset":[[ts,count],...]}
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(?err, "failed to parse tick gap check response");
+            return;
+        }
+    };
+
+    let dataset = match json.get("dataset").and_then(|d| d.as_array()) {
+        Some(arr) => arr,
+        None => {
+            debug!("tick gap check: no dataset in response (table may be empty)");
+            return;
+        }
+    };
+
+    let mut gap_count: u32 = 0;
+    let mut gap_times: Vec<String> = Vec::new();
+
+    for row in dataset {
+        if let Some(arr) = row.as_array() {
+            if arr.len() >= 2 {
+                let count = arr[1].as_u64().unwrap_or(0);
+                if count == 0 {
+                    gap_count = gap_count.saturating_add(1);
+                    if let Some(ts) = arr[0].as_str() {
+                        if gap_times.len() < 10 {
+                            // O(1) EXEMPT: bounded to 10 entries for alert message
+                            gap_times.push(ts.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if gap_count > 0 {
+        error!(
+            gap_minutes = gap_count,
+            lookback_minutes,
+            first_gaps = ?gap_times,
+            "tick data gaps detected after recovery — {gap_count} minute(s) with zero ticks"
+        );
+    } else {
+        info!(
+            lookback_minutes,
+            buckets_checked = dataset.len(),
+            "tick gap check passed — no gaps detected"
+        );
+    }
 }
 
 /// Executes a DDL statement against QuestDB HTTP, logging warnings on failure.
