@@ -91,6 +91,47 @@ const PCR_SNAPSHOTS_DDL: &str = "\
     DEDUP UPSERT KEYS(underlying_symbol, expiry_date)\
 ";
 
+/// SQL to create the `dhan_option_chain_raw` table.
+///
+/// Stores raw Dhan Option Chain API response data **exactly as received**.
+/// NEVER modify, transform, or recalculate any values — store as-is for audit,
+/// cross-verification, and backtesting. One row per contract per snapshot.
+const DHAN_OPTION_CHAIN_RAW_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS dhan_option_chain_raw (\
+        security_id LONG,\
+        segment SYMBOL,\
+        symbol_name SYMBOL,\
+        underlying_symbol SYMBOL,\
+        underlying_security_id LONG,\
+        underlying_segment SYMBOL,\
+        strike_price DOUBLE,\
+        option_type SYMBOL,\
+        expiry_date SYMBOL,\
+        spot_price DOUBLE,\
+        last_price DOUBLE,\
+        average_price DOUBLE,\
+        oi LONG,\
+        previous_close_price DOUBLE,\
+        previous_oi LONG,\
+        previous_volume LONG,\
+        volume LONG,\
+        top_bid_price DOUBLE,\
+        top_bid_quantity LONG,\
+        top_ask_price DOUBLE,\
+        top_ask_quantity LONG,\
+        implied_volatility DOUBLE,\
+        delta DOUBLE,\
+        theta DOUBLE,\
+        gamma DOUBLE,\
+        vega DOUBLE,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
+    DEDUP UPSERT KEYS(security_id, segment)\
+";
+
+/// QuestDB table name for raw Dhan option chain snapshots.
+const TABLE_DHAN_OPTION_CHAIN_RAW: &str = "dhan_option_chain_raw";
+
 /// SQL to create the `greeks_verification` table.
 ///
 /// Stores cross-verification results comparing our computed Greeks
@@ -165,12 +206,21 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
     execute_ddl(
         &client,
         &base_url,
+        DHAN_OPTION_CHAIN_RAW_DDL,
+        "dhan_option_chain_raw CREATE",
+    )
+    .await;
+    execute_ddl(
+        &client,
+        &base_url,
         GREEKS_VERIFICATION_DDL,
         "greeks_verification CREATE",
     )
     .await;
 
-    info!("Greeks tables setup complete (option_greeks, pcr_snapshots, greeks_verification)");
+    info!(
+        "Greeks tables setup complete (option_greeks, pcr_snapshots, dhan_option_chain_raw, greeks_verification)"
+    );
 }
 
 /// Executes a DDL statement against QuestDB HTTP, logging warnings on failure.
@@ -366,6 +416,69 @@ mod tests {
             GREEKS_VERIFICATION_DDL.contains("symbol_name SYMBOL"),
             "greeks_verification must have symbol_name for cross-referencing"
         );
+    }
+
+    // --- Raw Dhan option chain table tests ---
+
+    #[test]
+    fn test_dhan_raw_ddl_has_all_dhan_api_fields() {
+        // Every field from Dhan Option Chain API response must be stored as-is.
+        for col in [
+            "security_id LONG",
+            "last_price DOUBLE",
+            "average_price DOUBLE",
+            "oi LONG",
+            "previous_close_price DOUBLE",
+            "previous_oi LONG",
+            "previous_volume LONG",
+            "volume LONG",
+            "top_bid_price DOUBLE",
+            "top_bid_quantity LONG",
+            "top_ask_price DOUBLE",
+            "top_ask_quantity LONG",
+            "implied_volatility DOUBLE",
+            "delta DOUBLE",
+            "theta DOUBLE",
+            "gamma DOUBLE",
+            "vega DOUBLE",
+        ] {
+            assert!(
+                DHAN_OPTION_CHAIN_RAW_DDL.contains(col),
+                "dhan_option_chain_raw missing Dhan API field: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_raw_ddl_has_identity_fields() {
+        for col in [
+            "underlying_symbol SYMBOL",
+            "underlying_security_id LONG",
+            "strike_price DOUBLE",
+            "option_type SYMBOL",
+            "expiry_date SYMBOL",
+            "spot_price DOUBLE",
+            "symbol_name SYMBOL",
+            "segment SYMBOL",
+        ] {
+            assert!(
+                DHAN_OPTION_CHAIN_RAW_DDL.contains(col),
+                "dhan_option_chain_raw missing identity field: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_raw_ddl_dedup_and_partition() {
+        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("DEDUP UPSERT KEYS(security_id, segment)"));
+        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("PARTITION BY HOUR WAL"));
+        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("TIMESTAMP(ts)"));
+        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_dhan_raw_table_name() {
+        assert_eq!(TABLE_DHAN_OPTION_CHAIN_RAW, "dhan_option_chain_raw");
     }
 
     #[test]
