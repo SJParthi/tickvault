@@ -1305,6 +1305,41 @@ mod tests {
         assert_eq!(masked1, masked2, "masking should be deterministic");
     }
 
+    #[test]
+    fn test_mask_phone_preserves_prefix_and_suffix() {
+        // 13 chars: prefix=3 (+91), suffix=5 (43210), mask=5 (XXXXX)
+        let result = mask_phone("+919876543210");
+        assert!(result.starts_with("+91"), "prefix must be preserved");
+        assert!(result.ends_with("43210"), "suffix must be preserved");
+    }
+
+    #[test]
+    fn test_mask_phone_mask_length_matches_middle() {
+        // 13 chars: 13 - 3 - 5 = 5 X's
+        let result = mask_phone("+919876543210");
+        let x_count = result.chars().filter(|c| *c == 'X').count();
+        assert_eq!(x_count, 5, "middle should be 5 X characters");
+    }
+
+    #[test]
+    fn test_strip_html_tags_alternating_content_and_tags() {
+        let input = "a<b>b</b>c<i>d</i>e";
+        assert_eq!(strip_html_tags(input), "abcde");
+    }
+
+    #[test]
+    fn test_strip_html_tags_tag_only_no_content() {
+        assert_eq!(strip_html_tags("<br>"), "");
+        assert_eq!(strip_html_tags("<hr/>"), "");
+    }
+
+    #[test]
+    fn test_strip_html_tags_multiple_gt_without_lt() {
+        // '>' without preceding '<' ends the tag state. When not in a tag, '>' triggers
+        // in_tag = false (which is already false), so the '>' is not output.
+        assert_eq!(strip_html_tags(">>>"), "");
+    }
+
     // -----------------------------------------------------------------------
     // Active service with SNS — exercises SMS code path
     // -----------------------------------------------------------------------

@@ -2590,4 +2590,368 @@ mod tests {
             assert_eq!(result, date);
         }
     }
+
+    // =====================================================================
+    // Additional coverage: IndexConstituencyMap rich data tests
+    // =====================================================================
+
+    /// Helper to build an `IndexConstituencyMap` with realistic multi-index,
+    /// multi-stock data for thorough method coverage.
+    fn make_test_constituency_map() -> IndexConstituencyMap {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap();
+        let reliance_n50 = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.5,
+            sector: "Oil & Gas".to_string(),
+            last_updated: today,
+        };
+        let hdfc_n50 = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "HDFCBANK".to_string(),
+            isin: "INE040A01034".to_string(),
+            weight: 8.2,
+            sector: "Banking".to_string(),
+            last_updated: today,
+        };
+        let hdfc_bank = IndexConstituent {
+            index_name: "Nifty Bank".to_string(),
+            symbol: "HDFCBANK".to_string(),
+            isin: "INE040A01034".to_string(),
+            weight: 25.0,
+            sector: "Banking".to_string(),
+            last_updated: today,
+        };
+
+        let mut map = IndexConstituencyMap::default();
+        map.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![reliance_n50, hdfc_n50]);
+        map.index_to_constituents
+            .insert("Nifty Bank".to_string(), vec![hdfc_bank]);
+        map.stock_to_indices
+            .insert("RELIANCE".to_string(), vec!["Nifty 50".to_string()]);
+        map.stock_to_indices.insert(
+            "HDFCBANK".to_string(),
+            vec!["Nifty 50".to_string(), "Nifty Bank".to_string()],
+        );
+        map
+    }
+
+    #[test]
+    fn test_constituency_map_get_constituents_data_integrity() {
+        let map = make_test_constituency_map();
+        let n50 = map.get_constituents("Nifty 50").unwrap();
+        assert_eq!(n50.len(), 2);
+        assert_eq!(n50[0].symbol, "RELIANCE");
+        assert_eq!(n50[0].isin, "INE002A01018");
+        assert!(n50[0].weight > 10.0);
+        assert_eq!(n50[1].symbol, "HDFCBANK");
+
+        let bank = map.get_constituents("Nifty Bank").unwrap();
+        assert_eq!(bank.len(), 1);
+        assert_eq!(bank[0].symbol, "HDFCBANK");
+        assert!(bank[0].weight > 20.0);
+    }
+
+    #[test]
+    fn test_constituency_map_get_constituents_missing_returns_none() {
+        let map = make_test_constituency_map();
+        assert!(map.get_constituents("Nifty IT").is_none());
+        assert!(map.get_constituents("").is_none());
+    }
+
+    #[test]
+    fn test_constituency_map_reverse_lookup_multi_index_stock() {
+        let map = make_test_constituency_map();
+        let hdfc_indices = map.get_indices_for_stock("HDFCBANK").unwrap();
+        assert_eq!(hdfc_indices.len(), 2);
+        assert!(hdfc_indices.contains(&"Nifty 50".to_string()));
+        assert!(hdfc_indices.contains(&"Nifty Bank".to_string()));
+    }
+
+    #[test]
+    fn test_constituency_map_reverse_lookup_single_index_stock() {
+        let map = make_test_constituency_map();
+        let reliance_indices = map.get_indices_for_stock("RELIANCE").unwrap();
+        assert_eq!(reliance_indices.len(), 1);
+        assert_eq!(reliance_indices[0], "Nifty 50");
+    }
+
+    #[test]
+    fn test_constituency_map_reverse_lookup_missing_returns_none() {
+        let map = make_test_constituency_map();
+        assert!(map.get_indices_for_stock("TCS").is_none());
+        assert!(map.get_indices_for_stock("").is_none());
+    }
+
+    #[test]
+    fn test_constituency_map_counts_with_data() {
+        let map = make_test_constituency_map();
+        assert_eq!(map.index_count(), 2);
+        assert_eq!(map.stock_count(), 2);
+    }
+
+    #[test]
+    fn test_constituency_map_all_index_names_with_data() {
+        let map = make_test_constituency_map();
+        let names = map.all_index_names();
+        assert_eq!(names.len(), 2);
+        // Must be sorted alphabetically
+        assert_eq!(names[0], "Nifty 50");
+        assert_eq!(names[1], "Nifty Bank");
+    }
+
+    #[test]
+    fn test_constituency_map_contains_checks() {
+        let map = make_test_constituency_map();
+        assert!(map.contains_stock("RELIANCE"));
+        assert!(map.contains_stock("HDFCBANK"));
+        assert!(!map.contains_stock("INFY"));
+        assert!(map.contains_index("Nifty 50"));
+        assert!(map.contains_index("Nifty Bank"));
+        assert!(!map.contains_index("Nifty IT"));
+    }
+
+    // =====================================================================
+    // Additional coverage: ConstituencyBuildMetadata non-default fields
+    // =====================================================================
+
+    #[test]
+    fn test_constituency_build_metadata_with_populated_fields() {
+        let ist = crate::trading_calendar::ist_offset();
+        let meta = ConstituencyBuildMetadata {
+            download_duration: std::time::Duration::from_millis(500),
+            indices_downloaded: 5,
+            indices_failed: 1,
+            unique_stocks: 200,
+            total_mappings: 350,
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+        assert_eq!(meta.indices_downloaded, 5);
+        assert_eq!(meta.indices_failed, 1);
+        assert_eq!(meta.unique_stocks, 200);
+        assert_eq!(meta.total_mappings, 350);
+        assert_eq!(
+            meta.download_duration,
+            std::time::Duration::from_millis(500)
+        );
+    }
+
+    // =====================================================================
+    // Additional coverage: IndexConstituent field access
+    // =====================================================================
+
+    #[test]
+    fn test_index_constituent_all_fields() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap();
+        let constituent = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.5,
+            sector: "Oil & Gas".to_string(),
+            last_updated: date,
+        };
+        assert_eq!(constituent.index_name, "Nifty 50");
+        assert_eq!(constituent.symbol, "RELIANCE");
+        assert_eq!(constituent.isin, "INE002A01018");
+        assert!((constituent.weight - 10.5).abs() < f64::EPSILON);
+        assert_eq!(constituent.sector, "Oil & Gas");
+        assert_eq!(constituent.last_updated, date);
+    }
+
+    #[test]
+    fn test_index_constituent_zero_weight() {
+        let constituent = IndexConstituent {
+            index_name: "Test".to_string(),
+            symbol: "TEST".to_string(),
+            isin: "INE000000000".to_string(),
+            weight: 0.0,
+            sector: "Unknown".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        };
+        assert!((constituent.weight - 0.0).abs() < f64::EPSILON);
+    }
+
+    // =====================================================================
+    // Additional coverage: enum Clone, Copy, PartialEq, Eq, Hash traits
+    // =====================================================================
+
+    #[test]
+    fn test_underlying_kind_clone_and_copy() {
+        let kind = UnderlyingKind::NseIndex;
+        let cloned = kind;
+        let copied = kind;
+        assert_eq!(kind, cloned);
+        assert_eq!(kind, copied);
+    }
+
+    #[test]
+    fn test_dhan_instrument_kind_clone_and_copy() {
+        let kind = DhanInstrumentKind::OptionIndex;
+        let cloned = kind;
+        let copied = kind;
+        assert_eq!(kind, cloned);
+        assert_eq!(kind, copied);
+    }
+
+    #[test]
+    fn test_index_category_clone_and_copy() {
+        let cat = IndexCategory::FnoUnderlying;
+        let cloned = cat;
+        let copied = cat;
+        assert_eq!(cat, cloned);
+        assert_eq!(cat, copied);
+    }
+
+    #[test]
+    fn test_index_subcategory_clone_and_copy() {
+        let sub = IndexSubcategory::Sectoral;
+        let cloned = sub;
+        let copied = sub;
+        assert_eq!(sub, cloned);
+        assert_eq!(sub, copied);
+    }
+
+    #[test]
+    fn test_underlying_kind_hash_all_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(UnderlyingKind::NseIndex);
+        set.insert(UnderlyingKind::BseIndex);
+        set.insert(UnderlyingKind::Stock);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn test_dhan_instrument_kind_hash_all_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DhanInstrumentKind::FutureIndex);
+        set.insert(DhanInstrumentKind::FutureStock);
+        set.insert(DhanInstrumentKind::OptionIndex);
+        set.insert(DhanInstrumentKind::OptionStock);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn test_index_category_hash_all_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(IndexCategory::FnoUnderlying);
+        set.insert(IndexCategory::DisplayIndex);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_index_subcategory_hash_all_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(IndexSubcategory::Volatility);
+        set.insert(IndexSubcategory::BroadMarket);
+        set.insert(IndexSubcategory::MidCap);
+        set.insert(IndexSubcategory::SmallCap);
+        set.insert(IndexSubcategory::Sectoral);
+        set.insert(IndexSubcategory::Thematic);
+        set.insert(IndexSubcategory::Fno);
+        assert_eq!(set.len(), 7);
+    }
+
+    // =====================================================================
+    // Additional coverage: IndexConstituencyMap serde roundtrip
+    // =====================================================================
+
+    #[test]
+    fn test_index_constituency_map_serde_roundtrip() {
+        let map = make_test_constituency_map();
+        let json = serde_json::to_string(&map).unwrap();
+        let deserialized: IndexConstituencyMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.index_count(), 2);
+        assert_eq!(deserialized.stock_count(), 2);
+        assert!(deserialized.contains_stock("RELIANCE"));
+        assert!(deserialized.contains_index("Nifty Bank"));
+        let n50 = deserialized.get_constituents("Nifty 50").unwrap();
+        assert_eq!(n50.len(), 2);
+    }
+
+    // =====================================================================
+    // Additional coverage: SubscribedIndex field access
+    // =====================================================================
+
+    #[test]
+    fn test_subscribed_index_display_index_variant() {
+        let idx = SubscribedIndex {
+            symbol: "INDIA VIX".to_string(),
+            security_id: 26017,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::DisplayIndex,
+            subcategory: IndexSubcategory::Volatility,
+        };
+        assert_eq!(idx.category, IndexCategory::DisplayIndex);
+        assert_eq!(idx.subcategory, IndexSubcategory::Volatility);
+        assert_eq!(idx.symbol, "INDIA VIX");
+    }
+
+    #[test]
+    fn test_subscribed_index_fno_underlying_variant() {
+        let idx = SubscribedIndex {
+            symbol: "NIFTY".to_string(),
+            security_id: 13,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::FnoUnderlying,
+            subcategory: IndexSubcategory::Fno,
+        };
+        assert_eq!(idx.category, IndexCategory::FnoUnderlying);
+        assert_eq!(idx.subcategory, IndexSubcategory::Fno);
+    }
+
+    // =====================================================================
+    // Additional coverage: FnoUniverse methods — edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_fno_universe_index_symbol_to_security_id_case_sensitive() {
+        let u = make_test_fno_universe();
+        assert!(u.index_symbol_to_security_id("nifty").is_none());
+        assert!(u.index_symbol_to_security_id("Nifty").is_none());
+        assert!(u.index_symbol_to_security_id("NIFTY").is_some());
+    }
+
+    #[test]
+    fn test_fno_universe_index_symbol_to_security_id_empty_string() {
+        let u = make_test_fno_universe();
+        assert!(u.index_symbol_to_security_id("").is_none());
+    }
+
+    #[test]
+    fn test_fno_universe_security_id_to_symbol_all_types() {
+        let u = make_test_fno_universe();
+        // Index
+        assert_eq!(u.security_id_to_symbol(13), Some("NIFTY"));
+        // Equity
+        assert_eq!(u.security_id_to_symbol(2885), Some("RELIANCE"));
+        assert_eq!(u.security_id_to_symbol(1333), Some("HDFCBANK"));
+        // Derivative (returns underlying symbol)
+        assert_eq!(u.security_id_to_symbol(49001), Some("RELIANCE"));
+        // Unknown
+        assert!(u.security_id_to_symbol(0).is_none());
+        assert!(u.security_id_to_symbol(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn test_fno_universe_get_underlying_all_entries() {
+        let u = make_test_fno_universe();
+        let nifty = u.get_underlying("NIFTY").unwrap();
+        assert_eq!(nifty.kind, UnderlyingKind::NseIndex);
+        assert_eq!(nifty.lot_size, 25);
+        assert_eq!(nifty.price_feed_segment, ExchangeSegment::IdxI);
+
+        let reliance = u.get_underlying("RELIANCE").unwrap();
+        assert_eq!(reliance.kind, UnderlyingKind::Stock);
+        assert_eq!(reliance.price_feed_segment, ExchangeSegment::NseEquity);
+
+        let hdfc = u.get_underlying("HDFCBANK").unwrap();
+        assert_eq!(hdfc.lot_size, 550);
+    }
 }

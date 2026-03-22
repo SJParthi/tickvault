@@ -827,6 +827,46 @@ mod tests {
     }
 
     #[test]
+    fn test_key_namespace_isolation_across_types() {
+        // Instrument, token, and tick keys must never collide
+        let instrument_key = build_instrument_cache_key("access");
+        let token_key = build_token_cache_key("access");
+        let tick_key = build_tick_cache_key(0, "access");
+        assert_ne!(instrument_key, token_key);
+        assert_ne!(instrument_key, tick_key);
+        assert_ne!(token_key, tick_key);
+    }
+
+    #[test]
+    fn test_all_key_builders_use_dlt_prefix() {
+        let instrument = build_instrument_cache_key("test");
+        let token = build_token_cache_key("test");
+        let tick = build_tick_cache_key(1, "test");
+        assert!(instrument.starts_with("dlt:"));
+        assert!(token.starts_with("dlt:"));
+        assert!(tick.starts_with("dlt:"));
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_symmetry() {
+        // Two calls with same inputs must return same result (pure function)
+        let a = compute_instrument_ttl_secs(1_700_000_000, 8);
+        let b = compute_instrument_ttl_secs(1_700_000_000, 8);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_different_targets_differ() {
+        let epoch = 1_700_000_000_u64;
+        let ttl_8 = compute_instrument_ttl_secs(epoch, 8);
+        let ttl_12 = compute_instrument_ttl_secs(epoch, 12);
+        assert_ne!(
+            ttl_8, ttl_12,
+            "different target hours must produce different TTLs"
+        );
+    }
+
+    #[test]
     fn test_pool_status_fields() {
         let config = ValkeyConfig {
             host: "localhost".to_string(),

@@ -1284,6 +1284,286 @@ mod tests {
     // --- ManagedOrder Debug ---
 
     #[test]
+    fn max_modifications_per_order_constant() {
+        assert_eq!(
+            MAX_MODIFICATIONS_PER_ORDER, 25,
+            "Dhan allows max 25 modifications per order"
+        );
+    }
+
+    #[test]
+    fn dhan_modify_order_request_serializes_camel_case() {
+        let req = DhanModifyOrderRequest {
+            dhan_client_id: "100".to_owned(),
+            order_id: "ORD-789".to_owned(),
+            order_type: "LIMIT".to_owned(),
+            leg_name: "".to_owned(),
+            quantity: 75,
+            price: 250.00,
+            trigger_price: 0.0,
+            validity: "DAY".to_owned(),
+            disclosed_quantity: 0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("dhanClientId"));
+        assert!(json.contains("orderId"));
+        assert!(json.contains("orderType"));
+        assert!(json.contains("legName"));
+        assert!(json.contains("disclosedQuantity"));
+        // Must not contain snake_case field names
+        assert!(!json.contains("dhan_client_id"));
+        assert!(!json.contains("order_id"));
+        assert!(!json.contains("leg_name"));
+    }
+
+    #[test]
+    fn dhan_order_response_all_fields_deserialize() {
+        let json = r#"{
+            "orderId": "ORD-100",
+            "correlationId": "COR-200",
+            "orderStatus": "TRADED",
+            "transactionType": "BUY",
+            "exchangeSegment": "NSE_FNO",
+            "productType": "INTRADAY",
+            "orderType": "LIMIT",
+            "validity": "DAY",
+            "securityId": "52432",
+            "quantity": 50,
+            "price": 245.50,
+            "triggerPrice": 0.0,
+            "tradedQuantity": 50,
+            "tradedPrice": 246.00,
+            "remainingQuantity": 0,
+            "filledQty": 50,
+            "averageTradedPrice": 246.00,
+            "exchangeOrderId": "EX-999",
+            "exchangeTime": "2026-03-22 10:30:00",
+            "createTime": "2026-03-22 10:29:55",
+            "updateTime": "2026-03-22 10:30:00",
+            "rejectionReason": "",
+            "tag": "strategy-1",
+            "omsErrorCode": "",
+            "omsErrorDescription": "",
+            "tradingSymbol": "NIFTY-Mar2026-24500-CE",
+            "drvExpiryDate": "2026-03-27",
+            "drvOptionType": "CALL",
+            "drvStrikePrice": 24500.0
+        }"#;
+
+        let resp: DhanOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "ORD-100");
+        assert_eq!(resp.traded_quantity, 50);
+        assert_eq!(resp.remaining_quantity, 0);
+        assert_eq!(resp.filled_qty, 50);
+        assert!((resp.average_traded_price - 246.0).abs() < f64::EPSILON);
+        assert_eq!(resp.exchange_order_id, "EX-999");
+        assert_eq!(resp.trading_symbol, "NIFTY-Mar2026-24500-CE");
+        assert_eq!(resp.drv_option_type, "CALL");
+        assert!((resp.drv_strike_price - 24500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dhan_order_response_defaults_for_missing_fields() {
+        // Empty JSON object — all fields should get their defaults
+        let json = r#"{}"#;
+        let resp: DhanOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "");
+        assert_eq!(resp.correlation_id, "");
+        assert_eq!(resp.order_status, "");
+        assert_eq!(resp.quantity, 0);
+        assert_eq!(resp.price, 0.0);
+        assert_eq!(resp.traded_quantity, 0);
+        assert_eq!(resp.remaining_quantity, 0);
+        assert_eq!(resp.oms_error_code, "");
+        assert_eq!(resp.oms_error_description, "");
+        assert_eq!(resp.drv_strike_price, 0.0);
+    }
+
+    #[test]
+    fn dhan_position_response_defaults_for_missing_fields() {
+        let json = r#"{}"#;
+        let pos: DhanPositionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(pos.dhan_client_id, "");
+        assert_eq!(pos.security_id, "");
+        assert_eq!(pos.position_type, "");
+        assert_eq!(pos.net_qty, 0);
+        assert_eq!(pos.buy_avg, 0.0);
+        assert_eq!(pos.sell_avg, 0.0);
+        assert_eq!(pos.realized_profit, 0.0);
+        assert_eq!(pos.unrealized_profit, 0.0);
+        assert_eq!(pos.multiplier, 0);
+        assert!(!pos.cross_currency);
+    }
+
+    #[test]
+    fn dhan_holding_response_defaults_for_missing_fields() {
+        let json = r#"{}"#;
+        let holding: DhanHoldingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(holding.exchange, "");
+        assert_eq!(holding.trading_symbol, "");
+        assert_eq!(holding.security_id, "");
+        assert_eq!(holding.isin, "");
+        assert_eq!(holding.total_qty, 0);
+        assert_eq!(holding.dp_qty, 0);
+        assert_eq!(holding.t1_qty, 0);
+        assert_eq!(holding.mtf_tq_qty, 0);
+        assert_eq!(holding.mtf_qty, 0);
+        assert_eq!(holding.available_qty, 0);
+        assert_eq!(holding.collateral_qty, 0);
+        assert_eq!(holding.avg_cost_price, 0.0);
+        assert_eq!(holding.last_traded_price, 0.0);
+    }
+
+    #[test]
+    fn margin_calculator_response_defaults_for_missing_fields() {
+        let json = r#"{}"#;
+        let resp: MarginCalculatorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_margin, 0.0);
+        assert_eq!(resp.span_margin, 0.0);
+        assert_eq!(resp.exposure_margin, 0.0);
+        assert_eq!(resp.available_balance, 0.0);
+        assert_eq!(resp.variable_margin, 0.0);
+        assert_eq!(resp.insufficient_balance, 0.0);
+        assert_eq!(resp.brokerage, 0.0);
+        assert_eq!(resp.leverage, "");
+    }
+
+    #[test]
+    fn multi_margin_response_defaults_for_missing_fields() {
+        let json = r#"{}"#;
+        let resp: MultiMarginResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_margin, "");
+        assert_eq!(resp.span_margin, "");
+        assert_eq!(resp.exposure_margin, "");
+        assert_eq!(resp.equity_margin, "");
+        assert_eq!(resp.fo_margin, "");
+        assert_eq!(resp.commodity_margin, "");
+        assert_eq!(resp.currency, "");
+        assert_eq!(resp.hedge_benefit, "");
+    }
+
+    #[test]
+    fn fund_limit_response_defaults_for_missing_fields() {
+        let json = r#"{}"#;
+        let resp: FundLimitResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.dhan_client_id, "");
+        assert_eq!(resp.availabel_balance, 0.0);
+        assert_eq!(resp.sod_limit, 0.0);
+        assert_eq!(resp.collateral_amount, 0.0);
+        assert_eq!(resp.receiveable_amount, 0.0);
+        assert_eq!(resp.utilized_amount, 0.0);
+        assert_eq!(resp.blocked_payout_amount, 0.0);
+        assert_eq!(resp.withdrawable_balance, 0.0);
+    }
+
+    #[test]
+    fn exit_all_response_defaults_for_missing_fields() {
+        let json = r#"{}"#;
+        let resp: DhanExitAllResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "");
+        assert_eq!(resp.message, "");
+    }
+
+    #[test]
+    fn margin_script_serializes_camel_case() {
+        let script = MarginScript {
+            exchange_segment: "NSE_FNO".to_owned(),
+            transaction_type: "BUY".to_owned(),
+            quantity: 25,
+            product_type: "INTRADAY".to_owned(),
+            security_id: "11536".to_owned(),
+            price: 100.0,
+            trigger_price: 0.0,
+        };
+        let json = serde_json::to_string(&script).unwrap();
+        assert!(json.contains("exchangeSegment"));
+        assert!(json.contains("transactionType"));
+        assert!(json.contains("productType"));
+        assert!(json.contains("securityId"));
+        assert!(json.contains("triggerPrice"));
+        // Must not contain snake_case
+        assert!(!json.contains("exchange_segment"));
+        assert!(!json.contains("security_id"));
+    }
+
+    #[test]
+    fn dhan_place_order_response_missing_correlation_id_defaults() {
+        // correlationId has #[serde(default)], so missing field should default to ""
+        let json = r#"{"orderId":"456","orderStatus":"PENDING"}"#;
+        let resp: DhanPlaceOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "456");
+        assert_eq!(resp.correlation_id, "");
+    }
+
+    #[test]
+    fn managed_order_is_terminal_false_for_all_non_terminal() {
+        let make_order = |status: OrderStatus| ManagedOrder {
+            order_id: "1".to_owned(),
+            correlation_id: "c1".to_owned(),
+            security_id: 100,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 0.0,
+            trigger_price: 0.0,
+            status,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+
+        // Exhaustive non-terminal check
+        let non_terminal = [
+            OrderStatus::Transit,
+            OrderStatus::Pending,
+            OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
+            OrderStatus::Triggered,
+        ];
+        for status in &non_terminal {
+            assert!(
+                !make_order(*status).is_terminal(),
+                "{status:?} must NOT be terminal"
+            );
+        }
+
+        // Exhaustive terminal check
+        let terminal = [
+            OrderStatus::Traded,
+            OrderStatus::Cancelled,
+            OrderStatus::Rejected,
+            OrderStatus::Expired,
+            OrderStatus::Closed,
+        ];
+        for status in &terminal {
+            assert!(
+                make_order(*status).is_terminal(),
+                "{status:?} must be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_report_fields_can_be_set() {
+        let report = ReconciliationReport {
+            total_checked: 10,
+            mismatches_found: 2,
+            missing_from_oms: 1,
+            missing_from_dhan: 0,
+            mismatched_order_ids: vec!["ORD-1".to_owned(), "ORD-2".to_owned()],
+        };
+        assert_eq!(report.total_checked, 10);
+        assert_eq!(report.mismatches_found, 2);
+        assert_eq!(report.mismatched_order_ids.len(), 2);
+    }
+
+    #[test]
     fn managed_order_debug_contains_key_fields() {
         let order = ManagedOrder {
             order_id: "ORD-123".to_owned(),

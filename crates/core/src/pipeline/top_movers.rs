@@ -777,4 +777,248 @@ mod tests {
             "NaN excluded from most_active"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: SharedTopMoversSnapshot, Debug/Clone impls,
+    // MoverEntry Debug/Serialize, snapshot after multiple compute cycles,
+    // boundary near MIN_CHANGE_PCT_THRESHOLD
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_top_movers_snapshot_default_is_none() {
+        let shared: SharedTopMoversSnapshot = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let guard = shared.read().unwrap();
+        assert!(guard.is_none(), "shared snapshot should default to None");
+    }
+
+    #[test]
+    fn shared_top_movers_snapshot_write_and_read() {
+        let shared: SharedTopMoversSnapshot = std::sync::Arc::new(std::sync::RwLock::new(None));
+
+        // Write a snapshot
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: 42,
+        };
+        {
+            let mut guard = shared.write().unwrap();
+            *guard = Some(snapshot);
+        }
+
+        // Read it back
+        let guard = shared.read().unwrap();
+        assert!(guard.is_some());
+        assert_eq!(guard.as_ref().unwrap().total_tracked, 42);
+    }
+
+    #[test]
+    fn mover_entry_debug_impl() {
+        let entry = MoverEntry {
+            security_id: 42,
+            exchange_segment_code: 2,
+            last_traded_price: 100.5,
+            change_pct: 5.25,
+            volume: 1000,
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("MoverEntry"));
+        assert!(debug.contains("42"));
+        assert!(debug.contains("100.5"));
+    }
+
+    #[test]
+    fn top_movers_snapshot_debug_impl() {
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: 0,
+        };
+        let debug = format!("{snapshot:?}");
+        assert!(debug.contains("TopMoversSnapshot"));
+        assert!(debug.contains("total_tracked"));
+    }
+
+    #[test]
+    fn top_movers_snapshot_clone() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000));
+        let snapshot = tracker.compute_snapshot();
+        let cloned = snapshot.clone();
+        assert_eq!(snapshot.total_tracked, cloned.total_tracked);
+        assert_eq!(snapshot.gainers.len(), cloned.gainers.len());
+        assert_eq!(snapshot.losers.len(), cloned.losers.len());
+        assert_eq!(snapshot.most_active.len(), cloned.most_active.len());
+    }
+
+    #[test]
+    fn change_pct_just_above_threshold_is_gainer() {
+        let mut tracker = TopMoversTracker::new();
+        // MIN_CHANGE_PCT_THRESHOLD is 0.01. Need change_pct > 0.01.
+        // close=10000, ltp=10001.1 => pct = 0.011 > 0.01
+        tracker.update(&make_tick(1, 2, 10001.1, 10000.0, 500));
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(
+            snapshot.gainers.len(),
+            1,
+            "change just above threshold should be a gainer"
+        );
+    }
+
+    #[test]
+    fn change_pct_just_below_threshold_excluded_from_gainers() {
+        let mut tracker = TopMoversTracker::new();
+        // Need change_pct > 0 but <= 0.01 to be excluded.
+        // close=100000, ltp=100009 => pct = 0.009 < 0.01
+        tracker.update(&make_tick(1, 2, 100_009.0, 100_000.0, 500));
+        let snapshot = tracker.compute_snapshot();
+        assert!(
+            snapshot.gainers.is_empty(),
+            "change just below threshold should be excluded from gainers"
+        );
+    }
+
+    #[test]
+    fn change_pct_just_below_neg_threshold_is_loser() {
+        let mut tracker = TopMoversTracker::new();
+        // Need change_pct < -0.01.
+        // close=10000, ltp=9998.9 => pct = -0.011 < -0.01
+        tracker.update(&make_tick(1, 2, 9998.9, 10000.0, 500));
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(
+            snapshot.losers.len(),
+            1,
+            "change just below neg threshold should be a loser"
+        );
+    }
+
+    #[test]
+    fn change_pct_just_above_neg_threshold_excluded_from_losers() {
+        let mut tracker = TopMoversTracker::new();
+        // Need change_pct < 0 but >= -0.01 to be excluded.
+        // close=100000, ltp=99991 => pct = -0.009 > -0.01
+        tracker.update(&make_tick(1, 2, 99_991.0, 100_000.0, 500));
+        let snapshot = tracker.compute_snapshot();
+        assert!(
+            snapshot.losers.is_empty(),
+            "change just above neg threshold should be excluded from losers"
+        );
+    }
+
+    #[test]
+    fn multiple_compute_snapshots_are_independent() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 120.0, 100.0, 1000));
+
+        let s1 = tracker.compute_snapshot();
+        let s2 = tracker.compute_snapshot();
+
+        // Both snapshots should have the same data
+        assert_eq!(s1.gainers.len(), s2.gainers.len());
+        assert_eq!(s1.total_tracked, s2.total_tracked);
+    }
+
+    #[test]
+    fn latest_snapshot_returns_most_recent() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 1000));
+        tracker.compute_snapshot();
+
+        // Add more data and compute again
+        tracker.update(&make_tick(2, 2, 130.0, 100.0, 2000));
+        tracker.compute_snapshot();
+
+        let latest = tracker.latest_snapshot().unwrap();
+        assert_eq!(
+            latest.total_tracked, 2,
+            "latest snapshot should reflect all tracked securities"
+        );
+    }
+
+    #[test]
+    fn volume_zero_still_tracked() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 110.0, 100.0, 0));
+        assert_eq!(tracker.tracked_count(), 1);
+        let snapshot = tracker.compute_snapshot();
+        assert_eq!(snapshot.most_active.len(), 1);
+        assert_eq!(snapshot.most_active[0].volume, 0);
+    }
+
+    #[test]
+    fn mover_entry_serialization_includes_all_fields() {
+        let entry = MoverEntry {
+            security_id: 12345,
+            exchange_segment_code: 1,
+            last_traded_price: 2345.50,
+            change_pct: -3.75,
+            volume: 99999,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["security_id"], 12345);
+        assert_eq!(json["exchange_segment_code"], 1);
+        assert_eq!(json["volume"], 99999);
+        // Float comparison via JSON
+        let ltp = json["last_traded_price"].as_f64().unwrap();
+        assert!((ltp - 2345.5).abs() < 0.01);
+        let pct = json["change_pct"].as_f64().unwrap();
+        assert!((pct - (-3.75)).abs() < 0.01);
+    }
+
+    #[test]
+    fn snapshot_serialization_includes_all_top_level_fields() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(1, 2, 120.0, 100.0, 5000));
+        tracker.update(&make_tick(2, 2, 80.0, 100.0, 3000));
+        let snapshot = tracker.compute_snapshot();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("gainers").is_some());
+        assert!(json.get("losers").is_some());
+        assert!(json.get("most_active").is_some());
+        assert_eq!(json["total_tracked"], 2);
+    }
+
+    #[test]
+    fn inf_ltp_with_valid_close_produces_inf_change_pct_filtered() {
+        let mut tracker = TopMoversTracker::new();
+        let tick = ParsedTick {
+            security_id: 1,
+            exchange_segment_code: 2,
+            last_traded_price: f32::INFINITY,
+            day_close: 100.0,
+            volume: 500,
+            exchange_timestamp: 1000,
+            ..Default::default()
+        };
+        tracker.update(&tick);
+        assert_eq!(tracker.tracked_count(), 1);
+
+        let snapshot = tracker.compute_snapshot();
+        // inf change_pct: is_finite() returns false, so filtered from snapshot
+        assert!(
+            snapshot.gainers.is_empty(),
+            "inf change_pct should be filtered"
+        );
+    }
+
+    #[test]
+    fn tracker_with_many_securities_caps_at_top_n_for_all_lists() {
+        let mut tracker = TopMoversTracker::new();
+        // 50 gainers, 50 losers
+        for i in 1..=50u32 {
+            let ltp = 100.0 + (i as f32) * 2.0; // gainers
+            tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
+        }
+        for i in 51..=100u32 {
+            let ltp = 100.0 - ((i - 50) as f32) * 2.0; // losers
+            tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
+        }
+        let snapshot = tracker.compute_snapshot();
+        assert!(snapshot.gainers.len() <= TOP_N);
+        assert!(snapshot.losers.len() <= TOP_N);
+        assert!(snapshot.most_active.len() <= TOP_N);
+        assert_eq!(snapshot.total_tracked, 100);
+    }
 }

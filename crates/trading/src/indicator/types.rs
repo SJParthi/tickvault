@@ -555,4 +555,202 @@ mod tests {
         let copy = state;
         assert_eq!(copy.warmup_count, state.warmup_count);
     }
+
+    // --- RingBuffer: additional coverage ---
+
+    #[test]
+    fn test_ring_buffer_capacity_is_power_of_two() {
+        assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
+    }
+
+    #[test]
+    fn test_ring_buffer_is_full_after_capacity_pushes() {
+        let mut rb = RingBuffer::new();
+        for i in 0..INDICATOR_RING_BUFFER_CAPACITY {
+            assert_ne!(
+                rb.len() as usize,
+                INDICATOR_RING_BUFFER_CAPACITY,
+                "should not be full at push {}",
+                i
+            );
+            rb.push(i as f64);
+        }
+        assert_eq!(rb.len() as usize, INDICATOR_RING_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn test_ring_buffer_count_never_exceeds_capacity() {
+        let mut rb = RingBuffer::new();
+        // Push 3x the capacity
+        for i in 0..(INDICATOR_RING_BUFFER_CAPACITY * 3) {
+            rb.push(i as f64);
+            assert!(
+                rb.len() as usize <= INDICATOR_RING_BUFFER_CAPACITY,
+                "count must never exceed capacity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ring_buffer_oldest_when_not_full_returns_zero() {
+        let mut rb = RingBuffer::new();
+        // Buffer is not full, oldest() returns whatever is at head position
+        // which is 0.0 (initial data array is zeroed)
+        rb.push(42.0);
+        // oldest() reads data[head], which is data[1] = 0.0
+        let oldest = rb.oldest();
+        assert_eq!(oldest, 0.0);
+    }
+
+    #[test]
+    fn test_ring_buffer_double_wrap() {
+        let mut rb = RingBuffer::new();
+        let cap = INDICATOR_RING_BUFFER_CAPACITY;
+        // Fill buffer twice over
+        for i in 0..(cap * 2) {
+            rb.push(i as f64);
+        }
+        assert_eq!(rb.len() as usize, cap);
+        // Oldest should be the value pushed at index `cap` (start of second fill)
+        assert_eq!(rb.oldest(), cap as f64);
+    }
+
+    #[test]
+    fn test_ring_buffer_push_single_eviction_value() {
+        let mut rb = RingBuffer::new();
+        let cap = INDICATOR_RING_BUFFER_CAPACITY;
+        // Fill with known values
+        for i in 0..cap {
+            rb.push((i + 10) as f64);
+        }
+        // Next push should evict the first value (10.0)
+        let evicted = rb.push(999.0);
+        assert_eq!(evicted, 10.0);
+        // Next push should evict 11.0
+        let evicted = rb.push(998.0);
+        assert_eq!(evicted, 11.0);
+    }
+
+    // --- IndicatorState: additional coverage ---
+
+    #[test]
+    fn test_indicator_state_warm_above_threshold() {
+        let mut state = IndicatorState::new();
+        state.warmup_count = MAX_INDICATOR_WARMUP_TICKS + 10;
+        assert!(state.is_warm());
+    }
+
+    #[test]
+    fn test_indicator_state_all_fields_zeroed() {
+        let state = IndicatorState::new();
+        assert_eq!(state.macd_signal_ema, 0.0);
+        assert_eq!(state.adx_plus_dm_smooth, 0.0);
+        assert_eq!(state.adx_minus_dm_smooth, 0.0);
+        assert_eq!(state.adx_tr_smooth, 0.0);
+        assert_eq!(state.adx_value, 0.0);
+        assert_eq!(state.vwap_cumulative_pv, 0.0);
+        assert_eq!(state.vwap_cumulative_vol, 0.0);
+        assert_eq!(state.bb_mean, 0.0);
+        assert_eq!(state.bb_m2, 0.0);
+        assert_eq!(state.bb_count, 0);
+        assert_eq!(state.sma_running_sum, 0.0);
+        assert_eq!(state.prev_close, 0.0);
+        assert_eq!(state.prev_high, 0.0);
+        assert_eq!(state.prev_low, 0.0);
+        assert_eq!(state.supertrend_upper, 0.0);
+        assert_eq!(state.supertrend_lower, 0.0);
+    }
+
+    #[test]
+    fn test_indicator_state_sma_ring_starts_empty() {
+        let state = IndicatorState::new();
+        assert!(state.sma_ring.is_empty());
+        assert_eq!(state.sma_ring.len(), 0);
+    }
+
+    // --- IndicatorParams: additional coverage ---
+
+    #[test]
+    fn test_ema_alpha_period_26() {
+        // alpha = 2 / (26 + 1) = 2/27
+        let alpha = IndicatorParams::ema_alpha(26);
+        assert!((alpha - 2.0 / 27.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wilder_factor_period_26() {
+        let factor = IndicatorParams::wilder_factor(26);
+        assert!((factor - 1.0 / 26.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ema_alpha_decreases_with_period() {
+        let alpha_fast = IndicatorParams::ema_alpha(12);
+        let alpha_slow = IndicatorParams::ema_alpha(26);
+        assert!(
+            alpha_fast > alpha_slow,
+            "shorter period must produce larger alpha"
+        );
+    }
+
+    #[test]
+    fn test_wilder_factor_decreases_with_period() {
+        let factor_short = IndicatorParams::wilder_factor(7);
+        let factor_long = IndicatorParams::wilder_factor(14);
+        assert!(
+            factor_short > factor_long,
+            "shorter period must produce larger factor"
+        );
+    }
+
+    #[test]
+    fn test_indicator_params_sma_period_within_ring_capacity() {
+        let params = IndicatorParams::default();
+        assert!(
+            (params.sma_period as usize) <= INDICATOR_RING_BUFFER_CAPACITY,
+            "SMA period must fit within ring buffer capacity"
+        );
+    }
+
+    // --- IndicatorSnapshot: additional coverage ---
+
+    #[test]
+    fn test_indicator_snapshot_all_defaults_zero() {
+        let snap = IndicatorSnapshot::default();
+        assert_eq!(snap.ema_slow, 0.0);
+        assert_eq!(snap.sma, 0.0);
+        assert_eq!(snap.macd_line, 0.0);
+        assert_eq!(snap.macd_signal, 0.0);
+        assert_eq!(snap.macd_histogram, 0.0);
+        assert_eq!(snap.bollinger_upper, 0.0);
+        assert_eq!(snap.bollinger_middle, 0.0);
+        assert_eq!(snap.bollinger_lower, 0.0);
+        assert_eq!(snap.atr, 0.0);
+        assert_eq!(snap.supertrend, 0.0);
+        assert_eq!(snap.adx, 0.0);
+        assert_eq!(snap.obv, 0.0);
+        assert_eq!(snap.last_traded_price, 0.0);
+        assert_eq!(snap.previous_close, 0.0);
+        assert_eq!(snap.day_high, 0.0);
+        assert_eq!(snap.day_low, 0.0);
+        assert_eq!(snap.volume, 0.0);
+    }
+
+    #[test]
+    fn test_indicator_snapshot_partial_init() {
+        let snap = IndicatorSnapshot {
+            security_id: 11536,
+            ema_fast: 150.25,
+            rsi: 65.0,
+            is_warm: true,
+            ..Default::default()
+        };
+        assert_eq!(snap.security_id, 11536);
+        assert!((snap.ema_fast - 150.25).abs() < f64::EPSILON);
+        assert!((snap.rsi - 65.0).abs() < f64::EPSILON);
+        assert!(snap.is_warm);
+        // Fields not set should remain zero
+        assert_eq!(snap.ema_slow, 0.0);
+        assert_eq!(snap.obv, 0.0);
+    }
 }
