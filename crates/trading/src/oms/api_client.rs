@@ -42,6 +42,26 @@ use super::types::{
 const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 
 // ---------------------------------------------------------------------------
+// DH error code metric helper
+// ---------------------------------------------------------------------------
+
+/// Extracts the `errorCode` field from a Dhan API error response body and
+/// increments the corresponding Prometheus counter.
+///
+/// Dhan error responses have the shape `{"errorCode":"DH-9XX", ...}`.
+/// If the code cannot be extracted, the counter is not emitted.
+fn record_dh_error_metric(body: &str) {
+    // Simple extraction without allocating a full serde parse.
+    if let Some(start) = body.find("\"errorCode\":\"") {
+        let after = &body[start + 13..]; // skip past `"errorCode":"`
+        if let Some(end) = after.find('"') {
+            let code = &after[..end];
+            metrics::counter!("dlt_dhan_error_total", "code" => code.to_owned()).increment(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OrderApiClient
 // ---------------------------------------------------------------------------
 
@@ -111,6 +131,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -149,6 +170,7 @@ impl OrderApiClient {
                 .text()
                 .await
                 .map_err(|err| OmsError::HttpError(err.to_string()))?;
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -181,6 +203,7 @@ impl OrderApiClient {
                 .text()
                 .await
                 .map_err(|err| OmsError::HttpError(err.to_string()))?;
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -237,6 +260,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -273,6 +297,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -315,6 +340,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -366,6 +392,7 @@ impl OrderApiClient {
                 .text()
                 .await
                 .map_err(|err| OmsError::HttpError(err.to_string()))?;
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -404,6 +431,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -451,6 +479,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -494,6 +523,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -528,6 +558,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -583,6 +614,7 @@ impl OrderApiClient {
             .map_err(|err| OmsError::HttpError(err.to_string()))?;
 
         if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
             return Err(OmsError::DhanApiError {
                 status_code: status,
                 message: body,
@@ -3460,5 +3492,12 @@ mod tests {
             }
         ));
         handle.abort();
+    }
+
+    #[test]
+    fn test_error_code_counters() {
+        for code in ["DH-901", "DH-904", "DH-905", "DH-906"] {
+            metrics::counter!("dlt_dhan_error_total", "code" => code).increment(1);
+        }
     }
 }

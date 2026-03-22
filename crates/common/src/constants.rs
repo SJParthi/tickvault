@@ -824,6 +824,10 @@ pub const SECONDS_PER_DAY: u32 = 86_400;
 /// before the WebSocket read loop is killed.
 pub const MARKET_CLOSE_DRAIN_BUFFER_SECS: u64 = 2;
 
+/// Maximum acceptable boot time in seconds. If exceeded, CRITICAL Telegram alert fires.
+/// Individual boot steps have their own timeouts; this is the overall ceiling.
+pub const BOOT_TIMEOUT_SECS: u64 = 120;
+
 // ---------------------------------------------------------------------------
 // Authentication — TOTP Configuration
 // ---------------------------------------------------------------------------

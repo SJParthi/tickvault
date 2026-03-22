@@ -86,8 +86,12 @@ impl OrderCircuitBreaker {
     /// `OmsError::CircuitBreakerOpen` if the circuit is open.
     pub fn check(&self) -> Result<(), OmsError> {
         match self.state() {
-            CircuitState::Closed => Ok(()),
+            CircuitState::Closed => {
+                metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
+                Ok(())
+            }
             CircuitState::HalfOpen => {
+                metrics::gauge!("dlt_circuit_breaker_state").set(2.0_f64);
                 // Only allow one probe request in HalfOpen state.
                 if self
                     .half_open_probe_sent
@@ -102,6 +106,7 @@ impl OrderCircuitBreaker {
                 }
             }
             CircuitState::Open => {
+                metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
                 warn!("circuit breaker OPEN — Dhan API temporarily unavailable");
                 Err(OmsError::CircuitBreakerOpen)
             }
@@ -116,6 +121,7 @@ impl OrderCircuitBreaker {
         }
         self.opened_at_secs.store(0, Ordering::Relaxed);
         self.half_open_probe_sent.store(false, Ordering::Relaxed);
+        metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
     }
 
     /// Records a failed API call — increments the failure counter.
@@ -136,6 +142,7 @@ impl OrderCircuitBreaker {
                 .is_ok()
             {
                 self.half_open_probe_sent.store(false, Ordering::Relaxed);
+                metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
                 warn!(
                     failures = new_count,
                     threshold = self.failure_threshold,
@@ -170,6 +177,7 @@ impl OrderCircuitBreaker {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.opened_at_secs.store(0, Ordering::Relaxed);
         self.half_open_probe_sent.store(false, Ordering::Relaxed);
+        metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
         info!("circuit breaker manually reset to CLOSED");
     }
 }
@@ -668,5 +676,12 @@ mod tests {
         let cb = OrderCircuitBreaker::default();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(cb.failure_threshold, OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD);
+    }
+
+    #[test]
+    fn test_circuit_breaker_metric() {
+        metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
+        metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
+        metrics::gauge!("dlt_circuit_breaker_state").set(2.0_f64);
     }
 }

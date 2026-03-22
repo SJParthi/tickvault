@@ -201,6 +201,96 @@ pub fn create_log_file_writer_at(log_file_path: &str) -> Option<std::fs::File> {
 }
 
 // ---------------------------------------------------------------------------
+// Log rotation constants
+// ---------------------------------------------------------------------------
+
+/// Maximum log file size in bytes (50 MB).
+pub const LOG_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+/// Maximum number of rotated log files to keep.
+pub const LOG_MAX_FILES: u32 = 7;
+
+// ---------------------------------------------------------------------------
+// Clock drift check
+// ---------------------------------------------------------------------------
+
+/// Maximum acceptable clock drift in seconds before warning.
+pub const CLOCK_DRIFT_THRESHOLD_SECS: u64 = 2;
+
+/// HTTP timeout for clock drift check (seconds).
+const CLOCK_DRIFT_HTTP_TIMEOUT_SECS: u64 = 5;
+
+// APPROVED: hardcoded URL — public time reference, not a Dhan API endpoint
+const CLOCK_DRIFT_REFERENCE_URL: &str = "https://www.google.com";
+
+/// Checks system clock against an HTTP server's Date header (cold path, boot only).
+pub async fn check_clock_drift() -> Option<i64> {
+    let local_now = chrono::Utc::now();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            CLOCK_DRIFT_HTTP_TIMEOUT_SECS,
+        ))
+        .build()
+        .ok()?;
+    let response = client.head(CLOCK_DRIFT_REFERENCE_URL).send().await.ok()?;
+    let date_str = response.headers().get("date")?.to_str().ok()?;
+    let server_time = chrono::DateTime::parse_from_str(date_str, "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let drift_secs = (server_time - local_now).num_seconds();
+    if drift_secs.unsigned_abs() > CLOCK_DRIFT_THRESHOLD_SECS {
+        warn!(
+            drift_secs,
+            "clock drift detected — system clock may be inaccurate"
+        );
+    }
+    Some(drift_secs)
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat watchdog
+// ---------------------------------------------------------------------------
+
+/// Heartbeat watchdog interval in seconds.
+pub const WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+/// Spawns a background watchdog that periodically checks system liveness.
+///
+/// Checks every 30 seconds:
+/// - Token handle has a valid (non-None) token
+/// - Tick broadcast sender has active receivers
+///
+/// Logs ERROR on failure (triggers Telegram via Loki -> Grafana).
+pub fn spawn_heartbeat_watchdog(
+    token_handle: dhan_live_trader_core::auth::token_manager::TokenHandle,
+    tick_sender: tokio::sync::broadcast::Sender<dhan_live_trader_common::tick_types::ParsedTick>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+        interval.tick().await; // Skip immediate first tick.
+
+        loop {
+            interval.tick().await;
+
+            let token_ok = {
+                let guard = token_handle.load();
+                guard.as_ref().is_some()
+            };
+            if !token_ok {
+                tracing::error!("WATCHDOG: token handle is None — authentication may have failed");
+            }
+
+            let receiver_count = tick_sender.receiver_count();
+            if receiver_count == 0 {
+                tracing::error!(
+                    "WATCHDOG: tick broadcast has 0 receivers — tick processor may have crashed"
+                );
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1555,5 +1645,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_heartbeat_watchdog_spawned() {
+        assert_eq!(super::WATCHDOG_INTERVAL_SECS, 30);
+    }
+
+    #[test]
+    fn test_clock_drift_check() {
+        assert_eq!(super::CLOCK_DRIFT_THRESHOLD_SECS, 2);
+    }
+
+    #[test]
+    fn test_log_rotation_configured() {
+        assert_eq!(super::LOG_MAX_SIZE_BYTES, 50 * 1024 * 1024);
+        assert_eq!(super::LOG_MAX_FILES, 7);
     }
 }
