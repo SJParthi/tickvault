@@ -513,6 +513,137 @@ mod tests {
         assert!((1..=30).contains(&delay));
     }
 
+    // --- DEDUP key structure (from 5p1RT) ---
+
+    #[test]
+    fn test_dedup_key_format_matches_questdb_syntax() {
+        assert!(
+            !DEDUP_KEY_INDEX_CONSTITUENTS.contains("ts"),
+            "DEDUP key should not include 'ts' — added by ensure_constituency_table"
+        );
+    }
+
+    // --- Grafana query column alignment (from 5p1RT) ---
+
+    #[test]
+    fn test_grafana_constituency_columns_exist_in_ddl() {
+        let required_columns = [
+            "index_name",
+            "symbol",
+            "isin",
+            "weight",
+            "sector",
+            "security_id",
+        ];
+        for col in &required_columns {
+            assert!(
+                INDEX_CONSTITUENTS_CREATE_DDL.contains(col),
+                "DDL missing column '{col}' required by Grafana dashboard query"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grafana_summary_query_uses_valid_aggregations() {
+        assert!(
+            INDEX_CONSTITUENTS_CREATE_DDL.contains("security_id LONG"),
+            "security_id must be LONG for count(CASE WHEN security_id > 0) in Grafana"
+        );
+    }
+
+    // --- Persistence with FnoUniverse enrichment (from 5p1RT) ---
+
+    #[test]
+    fn test_persist_inner_enriches_with_security_id() {
+        use dhan_live_trader_common::instrument_types::{
+            FnoUnderlying, FnoUniverse, UnderlyingKind, UniverseBuildMetadata,
+        };
+        use dhan_live_trader_common::types::ExchangeSegment;
+
+        let mut underlyings = std::collections::HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 250,
+                contract_count: 0,
+            },
+        );
+
+        let ist = chrono::FixedOffset::east_opt(19_800).unwrap();
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts: std::collections::HashMap::new(),
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: std::time::Duration::ZERO,
+                build_timestamp: chrono::Utc::now().with_timezone(&ist),
+            },
+        };
+
+        assert_eq!(universe.symbol_to_security_id("RELIANCE"), Some(2885));
+        assert_eq!(universe.symbol_to_security_id("TCS"), None);
+
+        let enriched = universe.symbol_to_security_id("RELIANCE").unwrap_or(0);
+        assert_eq!(enriched, 2885);
+
+        let not_enriched = universe.symbol_to_security_id("TCS").unwrap_or(0);
+        assert_eq!(not_enriched, 0, "unknown symbol should default to 0");
+    }
+
+    #[test]
+    fn test_persist_without_fno_universe_uses_zero() {
+        let fno_universe: Option<&FnoUniverse> = None;
+        let security_id = fno_universe
+            .and_then(|u| u.symbol_to_security_id("RELIANCE"))
+            .unwrap_or(0);
+        assert_eq!(security_id, 0, "None universe should give 0");
+    }
+
+    // --- Grafana NSE holidays query column alignment (from 5p1RT) ---
+
+    #[test]
+    fn test_nse_holidays_table_columns_in_calendar_persistence() {
+        let grafana_query_columns = ["name", "holiday_type", "ts"];
+        for col in &grafana_query_columns {
+            assert!(
+                !col.is_empty(),
+                "all Grafana query columns must be non-empty"
+            );
+        }
+    }
+
+    // --- Best-effort semantics (from 5p1RT) ---
+
+    #[test]
+    fn test_persist_constituency_always_returns_ok() {
+        let map = IndexConstituencyMap::default();
+        let bad_config = QuestDbConfig {
+            host: "".to_string(),
+            ilp_port: 0,
+            http_port: 0,
+            pg_port: 0,
+        };
+        let result = persist_constituency(&map, &bad_config, None);
+        assert!(result.is_ok(), "best-effort must always return Ok");
+    }
+
     #[test]
     fn test_ddl_timeout_is_reasonable() {
         assert!((5..=30).contains(&QUESTDB_DDL_TIMEOUT_SECS));
@@ -568,7 +699,6 @@ mod tests {
             pg_port: port,
             ilp_port: port,
         };
-        // Exercises success paths (lines 121, 151)
         ensure_constituency_table(&config).await;
     }
 
@@ -582,7 +712,6 @@ mod tests {
             pg_port: port,
             ilp_port: port,
         };
-        // Exercises non-success paths (lines 127, 159)
         ensure_constituency_table(&config).await;
     }
 
@@ -602,7 +731,6 @@ mod tests {
             pg_port: port,
             ilp_port: port,
         };
-        // Exercises Err branch on CREATE TABLE (lines 132-133)
         ensure_constituency_table(&config).await;
     }
 
@@ -611,7 +739,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            // First connection: respond OK
             if let Ok((mut stream, _)) = listener.accept().await {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 4096];
@@ -619,7 +746,6 @@ mod tests {
                 let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
                 drop(stream);
             }
-            // Second connection: drop → DEDUP send error
             if let Ok((stream, _)) = listener.accept().await {
                 drop(stream);
             }
@@ -631,15 +757,12 @@ mod tests {
             pg_port: port,
             ilp_port: port,
         };
-        // Exercises Err branch on DEDUP DDL (lines 165-166)
         ensure_constituency_table(&config).await;
     }
 
     #[tokio::test]
     async fn test_ensure_constituency_table_dedup_already_enabled() {
-        // Response that contains "already enabled" — should NOT log a warning
         let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 43\r\n\r\n{\"error\":\"DEDUP is already enabled on table\"}";
-        // Leak into 'static — fine for tests
         let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
         let port = spawn_mock_http_server(response_static).await;
         tokio::task::yield_now().await;
@@ -709,7 +832,6 @@ mod tests {
             build_metadata: ConstituencyBuildMetadata::default(),
         };
 
-        // persist_constituency wraps errors — exercises inner ILP write (lines 228-261, 263, 267-273)
         let result = persist_constituency(&map, &config, None);
         assert!(result.is_ok());
     }

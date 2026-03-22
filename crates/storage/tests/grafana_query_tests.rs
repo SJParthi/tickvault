@@ -364,6 +364,24 @@ async fn schema_nse_holidays_table() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
+async fn schema_index_constituents_table() {
+    validate_table_schema(
+        "index_constituents",
+        &[
+            ("index_name", "SYMBOL"),
+            ("symbol", "SYMBOL"),
+            ("isin", "STRING"),
+            ("weight", "DOUBLE"),
+            ("sector", "STRING"),
+            ("security_id", "LONG"),
+            ("ts", "TIMESTAMP"),
+        ],
+    )
+    .await;
+}
+
 // =========================================================================
 // 2. FUNCTIONAL — exact Grafana panel queries execute without error
 // =========================================================================
@@ -936,6 +954,53 @@ async fn functional_nse_holiday_annotations() {
         &response,
         &["time", "text", "tags"],
         "annotation:nse_holidays",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2h. Index constituency panels
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
+async fn functional_index_constituents_table() {
+    // Exact query from market-data.json — detailed table
+    let sql = "\
+        SELECT index_name, symbol, isin, weight, sector, security_id \
+        FROM index_constituents \
+        WHERE ts = (SELECT max(ts) FROM index_constituents) \
+        ORDER BY index_name, weight DESC;";
+    let response = execute_query(sql).await;
+    assert_columns_present(
+        &response,
+        &[
+            "index_name",
+            "symbol",
+            "isin",
+            "weight",
+            "sector",
+            "security_id",
+        ],
+        "table:index_constituents",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
+async fn functional_index_constituency_summary() {
+    // Exact query from market-data.json — per-index summary
+    let sql = "\
+        SELECT index_name, count(*) AS total_stocks, \
+        count(CASE WHEN security_id > 0 THEN 1 END) AS with_fno \
+        FROM index_constituents \
+        WHERE ts = (SELECT max(ts) FROM index_constituents) \
+        GROUP BY index_name \
+        ORDER BY total_stocks DESC;";
+    let response = execute_query(sql).await;
+    assert_columns_present(
+        &response,
+        &["index_name", "total_stocks", "with_fno"],
+        "summary:index_constituency",
     );
 }
 

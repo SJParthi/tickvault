@@ -763,7 +763,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date,\n  CASE day_of_week(ts)\n    WHEN 1 THEN 'Monday'\n    WHEN 2 THEN 'Tuesday'\n    WHEN 3 THEN 'Wednesday'\n    WHEN 4 THEN 'Thursday'\n    WHEN 5 THEN 'Friday'\n    WHEN 6 THEN 'Saturday'\n    WHEN 7 THEN 'Sunday'\n  END AS day_of_week\nFROM nse_holidays\nWHERE ts >= '2026-01-01' AND ts <= '2026-12-31'\nORDER BY ts;",
+          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date,\n  CASE\n    WHEN day_of_week(ts) = 1 THEN 'Monday'\n    WHEN day_of_week(ts) = 2 THEN 'Tuesday'\n    WHEN day_of_week(ts) = 3 THEN 'Wednesday'\n    WHEN day_of_week(ts) = 4 THEN 'Thursday'\n    WHEN day_of_week(ts) = 5 THEN 'Friday'\n    WHEN day_of_week(ts) = 6 THEN 'Saturday'\n    WHEN day_of_week(ts) = 7 THEN 'Sunday'\n  END AS day_of_week\nFROM nse_holidays\nORDER BY ts;",
           "refId": "A"
         }
       ]
