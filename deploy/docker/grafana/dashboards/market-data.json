@@ -235,7 +235,7 @@
         "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
       },
       "title": "Latest Ticks — All Instruments",
-      "description": "Most recent ticks. Timestamps stored as IST-as-UTC; Grafana UTC timezone displays IST wall-clock directly. Auto-refreshes every 5s.",
+      "description": "Most recent ticks. All timestamps are IST. Auto-refreshes every 5s.",
       "type": "table",
       "targets": [
         {
@@ -243,7 +243,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  ts AS exchange_time,\n  received_at\nFROM ticks\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 200;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  avg_price,\n  last_trade_qty,\n  total_buy_qty,\n  total_sell_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS exchange_time,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS received_at\nFROM ticks\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC\nLIMIT 200;",
           "refId": "A"
         }
       ]
@@ -308,7 +308,7 @@
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Historical Candles — All Instruments",
-      "description": "Multi-timeframe historical candles from Dhan REST API. Timestamps stored as IST-as-UTC; Grafana UTC timezone displays IST wall-clock directly.",
+      "description": "Multi-timeframe historical candles from Dhan REST API. All timestamps are IST.",
       "type": "table",
       "targets": [
         {
@@ -316,7 +316,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  timeframe,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  ts AS candle_time\nFROM historical_candles\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  timeframe,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss') AS candle_time\nFROM historical_candles\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -381,7 +381,7 @@
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
       "title": "Live 1-Minute Candles (from Materialized View)",
-      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. IST-as-UTC — no offset needed.",
+      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. All timestamps are IST.",
       "type": "table",
       "targets": [
         {
@@ -389,7 +389,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  ts AS candle_time\nFROM candles_1m\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss') AS candle_time\nFROM candles_1m\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -596,7 +596,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  ts AS depth_time\nFROM market_depth\nWHERE ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS depth_time\nFROM market_depth\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -883,8 +883,8 @@
   },
   "time": { "from": "now-3d", "to": "now" },
   "timepicker": {},
-  "timezone": "utc",
+  "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 7
+  "version": 8
 }

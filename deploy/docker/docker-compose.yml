@@ -157,11 +157,10 @@ services:
       - dlt-loki-data:/loki
       - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
     command: ["-config.file=/etc/loki/loki-config.yml"]
-    # Loki 3.6.6 uses a minimal scratch image with no shell — cannot run CMD-SHELL.
-    # Healthcheck runs from host via curl in verify script. Dependent services
-    # use service_started condition instead of service_healthy.
+    # Loki 3.6.6 Alpine image includes wget. Check the /ready endpoint
+    # to verify Loki is actually accepting log pushes, not just binary exists.
     healthcheck:
-      test: ["CMD", "/usr/bin/loki", "--version"]
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3100/ready || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -272,6 +271,7 @@ services:
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: "Asia/Kolkata"
       # QuestDB credentials for Grafana PostgreSQL datasource provisioning
       DLT_QUESTDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       DLT_QUESTDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
@@ -279,7 +279,7 @@ services:
       dlt-prometheus:
         condition: service_healthy
       dlt-loki:
-        condition: service_started
+        condition: service_healthy
     logging:
       driver: json-file
       options:

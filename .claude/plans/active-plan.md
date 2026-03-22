@@ -1,32 +1,52 @@
-# Implementation Plan: Security Fixes + Mock Calendar Display
+# Implementation Plan: IST Timezone Consistency + Logging Pipeline Fix
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-03-22
-**Approved by:** Parthiban
+**Approved by:** Parthiban ("Yes go ahead with the plan")
+
+## Context
+
+1. Market-data dashboard uses `"timezone": "utc"` while all 4 other dashboards use `"timezone": "Asia/Kolkata"`
+2. QuestDB timestamps stored as IST-as-UTC (IST values labeled as UTC) — prevents consistent timezone display
+3. Loki logging pipeline shows "No data" — Alloy -> Loki pipeline not delivering
+4. Loki healthcheck only checks binary exists, not readiness
+5. System-overview dashboard missing Alloy health panel
+6. Loki Ingestion metric may be wrong for single-binary mode
 
 ## Plan Items
 
-- [ ] Item 1: Fix HIGH — Add loop bound to `next_trading_day()` (max 14 iterations)
-  - Files: crates/common/src/trading_calendar.rs
-  - Tests: test_next_trading_day_bounded_loop, existing tests unchanged
+- [x] Item 1: Fix Grafana market-data dashboard timezone + SQL queries
+  - Files: deploy/docker/grafana/dashboards/market-data.json
+  - Changes: timezone utc->Asia/Kolkata, dateadd('s',19800,...) in WHERE clauses, to_str() for display timestamps
+  - Tests: N/A (JSON config)
 
-- [ ] Item 2: Fix HIGH — Add `config/local.toml` to `.gitignore`
-  - Files: .gitignore
-  - Tests: N/A (git config)
+- [x] Item 2: Set Grafana server default timezone to IST
+  - Files: deploy/docker/docker-compose.yml
+  - Changes: Added GF_DATE_FORMATS_DEFAULT_TIMEZONE: "Asia/Kolkata"
+  - Tests: N/A (Docker config)
 
-- [ ] Item 3: Add mock trading dates to `all_entries()` + Grafana display
-  - Files: crates/common/src/trading_calendar.rs (HolidayInfo + all_entries), crates/storage/src/calendar_persistence.rs (classify_holiday_type), deploy/docker/grafana/dashboards/market-data.json (color mapping + title)
-  - Tests: test_all_entries_includes_mock_trading, test_classify_holiday_type_mock
+- [x] Item 3: Fix Loki healthcheck to verify readiness
+  - Files: deploy/docker/docker-compose.yml
+  - Changes: loki --version -> wget /ready endpoint, Grafana depends_on service_healthy
+  - Tests: N/A (Docker config)
 
-- [ ] Item 4: Fix MEDIUM — Document fast-boot mock exclusion intent
-  - Files: crates/app/src/main.rs
-  - Tests: N/A (comment only)
+- [x] Item 4: Add Alloy+Valkey health panels + fix Loki Ingestion metric
+  - Files: deploy/docker/grafana/dashboards/system-overview.json
+  - Changes: 8 health panels (was 6), Loki metric added loki_request_duration fallback
+  - Tests: N/A (JSON config)
+
+- [x] Item 5: Verify depth WebSocket parser byte mappings (audit only)
+  - Files: crates/core/src/parser/deep_depth.rs, crates/common/src/constants.rs
+  - Result: PERFECT MATCH — zero mismatches across all 24 checked values
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | next_trading_day with 15 consecutive holidays | Returns error, not infinite loop |
-| 2 | Grafana dashboard on mock trading Saturday | Shows "Mock Trading Session" in orange/blue |
-| 3 | Daily instrument load with expired contracts | Expired filtered at build, never deleted from QuestDB |
-| 4 | Security ID reused across underlyings | Delta detector fires SecurityIdReused event |
+| 1 | QuestDB console shows UTC timestamp | Correct — UTC is standard for DB |
+| 2 | Grafana shows IST for all 5 dashboards | Correct — Asia/Kolkata converts UTC to IST |
+| 3 | Exchange time 15:30 IST stored as UTC 10:00 | Grafana IST shows 15:30 |
+| 4 | received_at from Utc::now() stored as UTC | Grafana IST shows correct IST |
+| 5 | Loki receives container logs from Alloy | Log Volume panel shows data |
+| 6 | Alloy status visible in system-overview | UP/DOWN stat panel present |
+| 7 | Existing dev data in QuestDB off by +5:30 | Acceptable — dev data only |
