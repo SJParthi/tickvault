@@ -133,7 +133,7 @@ echo -n "  Market status:    "
 if [ "${DAY}" -gt 5 ]; then
     echo -e "${YELLOW}WEEKEND${NC}"
 elif [ "${TIME_MINS}" -lt 540 ]; then
-    echo -e "${YELLOW}PRE-MARKET${NC} (opens 09:15)"
+    echo -e "${YELLOW}PRE-MARKET${NC} (data collection opens 09:00)"
 elif [ "${TIME_MINS}" -le 930 ]; then
     echo -e "${GREEN}OPEN${NC} (closes 15:30)"
 elif [ "${TIME_MINS}" -le 960 ]; then

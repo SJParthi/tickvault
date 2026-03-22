@@ -19,7 +19,7 @@ paths:
 - Log duplicates at WARN
 
 ## Position Reconciliation
-- After every fill: mismatch = halt trading + alert. End-of-day 15:35 IST: full Dhan vs OMS reconciliation.
+- After every fill: mismatch = halt trading + alert. End-of-day (immediately after WebSocket disconnect at 15:30 IST): full Dhan vs OMS reconciliation.
 - Both reconciliation types flag mismatches as CRITICAL
 
 ## Retention

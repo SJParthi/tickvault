@@ -39,7 +39,7 @@
    |---|---|---|
    | `0-7` | header | 8 bytes |
    | `8-11` | f32 LE | LTP |
-   | `12-15` | u32 LE | LTT (UNIX epoch UTC; non-negative, SDK uses unsigned) |
+   | `12-15` | u32 LE | LTT (IST epoch seconds — NOT UTC; subtract 19800 for UTC) |
 
 7. **PrevClose packet (code 6) — 16 bytes.** Arrives on EVERY subscription, any mode.
    | Byte (0-based) | Type | Field |
@@ -53,7 +53,7 @@
    |---|---|---|
    | `8-11` | f32 LE | LTP |
    | `12-13` | u16 LE | LTQ |
-   | `14-17` | u32 LE | LTT (UNIX epoch UTC) |
+   | `14-17` | u32 LE | LTT (IST epoch seconds — NOT UTC) |
    | `18-21` | f32 LE | ATP |
    | `22-25` | u32 LE | Volume |
    | `26-29` | u32 LE | Total Sell Qty |
@@ -73,7 +73,7 @@
     |---|---|---|
     | `8-11` | f32 LE | LTP |
     | `12-13` | u16 LE | LTQ |
-    | `14-17` | u32 LE | LTT (UNIX epoch UTC) |
+    | `14-17` | u32 LE | LTT (IST epoch seconds — NOT UTC) |
     | `18-21` | f32 LE | ATP |
     | `22-25` | u32 LE | Volume |
     | `26-29` | u32 LE | Total Sell Qty |
@@ -112,7 +112,7 @@
     - Volume, OI, quantities: `u32` (unsigned — quantities/OI cannot be negative)
     - LTQ: `u16` (unsigned)
     - Orders count: `u16` (unsigned)
-    - LTT (timestamps): `u32` (unsigned — UNIX epoch seconds are non-negative)
+    - LTT (timestamps): `u32` (unsigned — IST epoch seconds; subtract 19800 for UTC epoch)
     - Message length: `u16` (unsigned)
     - SecurityId: `u32` (unsigned in header and ParsedTick; Dhan docs say i32 but values are non-negative)
     - Disconnect reason code: `u16` (unsigned)

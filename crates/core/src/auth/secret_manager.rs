@@ -624,4 +624,126 @@ mod tests {
             "tab in environment string must be rejected"
         );
     }
+
+    // =====================================================================
+    // Additional coverage: resolve_environment, build_ssm_path edge cases,
+    // validate_environment boundary, error variant assertions
+    // =====================================================================
+
+    #[test]
+    fn test_validate_environment_only_hyphens() {
+        let env = validate_environment("---").expect("only hyphens should be valid");
+        assert_eq!(env, "---");
+    }
+
+    #[test]
+    fn test_validate_environment_long_string() {
+        let long = "a".repeat(200);
+        let env = validate_environment(&long).expect("long alphanumeric should be valid");
+        assert_eq!(env.len(), 200);
+    }
+
+    #[test]
+    fn test_validate_environment_slash_returns_error() {
+        let result = validate_environment("dev/prod");
+        assert!(result.is_err(), "slash must be rejected");
+    }
+
+    #[test]
+    fn test_validate_environment_at_sign_returns_error() {
+        let result = validate_environment("dev@prod");
+        assert!(result.is_err(), "@ must be rejected");
+    }
+
+    #[test]
+    fn test_build_ssm_path_empty_strings() {
+        // Even if inputs are empty, the function still builds the path
+        let path = build_ssm_path("", "", "");
+        assert_eq!(path, "/dlt///");
+    }
+
+    #[test]
+    fn test_validate_environment_error_type_is_configuration() {
+        let result = validate_environment("");
+        match result.unwrap_err() {
+            ApplicationError::Configuration(msg) => {
+                assert!(msg.contains("invalid characters"));
+            }
+            other => panic!("expected Configuration error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_build_ssm_path_preserves_case() {
+        let path = build_ssm_path("DEV", "DHAN", "CLIENT-ID");
+        assert_eq!(path, "/dlt/DEV/DHAN/CLIENT-ID");
+    }
+
+    #[test]
+    fn test_resolve_environment_defaults_to_dev() {
+        // This test depends on ENVIRONMENT not being set, which is racy
+        // in parallel test execution. So just test the underlying validate_environment
+        // which is the core logic.
+        let result = validate_environment(DEFAULT_SSM_ENVIRONMENT);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "dev");
+    }
+
+    #[test]
+    fn test_validate_environment_error_contains_input_value() {
+        let result = validate_environment("bad/value");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bad/value"),
+            "error should contain the invalid input, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_environment_dot_returns_error() {
+        let result = validate_environment(".");
+        assert!(result.is_err(), "dot must be rejected");
+    }
+
+    #[test]
+    fn test_validate_environment_double_dot_returns_error() {
+        let result = validate_environment("..");
+        assert!(result.is_err(), "double dot must be rejected");
+    }
+
+    #[test]
+    fn test_build_ssm_path_with_hyphenated_env() {
+        let path = build_ssm_path("dev-us-east-1", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
+        assert_eq!(path, "/dlt/dev-us-east-1/dhan/client-id");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_questdb_credentials_returns_error_without_real_ssm() {
+        let result = fetch_questdb_credentials().await;
+        if crate::test_support::has_aws_credentials() {
+            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
+        } else {
+            assert!(result.is_err(), "must fail without real SSM");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_grafana_credentials_returns_error_without_real_ssm() {
+        let result = fetch_grafana_credentials().await;
+        if crate::test_support::has_aws_credentials() {
+            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
+        } else {
+            assert!(result.is_err(), "must fail without real SSM");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_telegram_credentials_returns_error_without_real_ssm() {
+        let result = fetch_telegram_credentials().await;
+        if crate::test_support::has_aws_credentials() {
+            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
+        } else {
+            assert!(result.is_err(), "must fail without real SSM");
+        }
+    }
 }

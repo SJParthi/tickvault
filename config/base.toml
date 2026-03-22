@@ -6,7 +6,7 @@
 # =============================================================================
 
 [trading]
-market_open_time = "09:15:00"
+market_open_time = "09:00:00"
 market_close_time = "15:30:00"
 order_cutoff_time = "15:29:00"
 data_collection_start = "09:00:00"
@@ -148,16 +148,17 @@ level = "info"
 format = "json"
 
 [instrument]
-daily_download_time = "08:45:00"
+daily_download_time = "08:00:00"
 csv_cache_directory = "/app/data/instrument-cache"
 csv_cache_filename = "api-scrip-master-detailed.csv"
 csv_download_timeout_secs = 120
-build_window_start = "08:45:00"
-build_window_end = "16:00:00"
+build_window_start = "09:00:00"
+build_window_end = "15:30:00"
 
 [api]
 host = "0.0.0.0"
 port = 3001
+allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 
 [subscription]
 feed_mode = "Full"
@@ -186,3 +187,9 @@ lookback_days = 90
 request_timeout_secs = 30
 max_retries = 3
 request_delay_ms = 500
+
+[index_constituency]
+enabled = true
+download_timeout_secs = 30
+max_concurrent_downloads = 5
+inter_batch_delay_ms = 0

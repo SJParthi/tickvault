@@ -20,7 +20,7 @@ fn build_registry(count: usize) -> InstrumentRegistry {
     let mut instruments = Vec::with_capacity(count);
     // Fill with display indices (simplest constructor, no FnoUnderlying needed)
     for i in 0..count {
-        let security_id = 10000 + i as u32;
+        let security_id = 10000_u32.saturating_add(i as u32);
         instruments.push(make_display_index_instrument(
             security_id,
             "BENCH_INDEX",
@@ -53,7 +53,9 @@ fn bench_registry_contains(c: &mut Criterion) {
 
 fn bench_subscription_messages_100(c: &mut Criterion) {
     let instruments: Vec<InstrumentSubscription> = (0..100)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 10000 + i))
+        .map(|i: u32| {
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 10000_u32.saturating_add(i))
+        })
         .collect();
     c.bench_function("subscription/build_messages_100", |b| {
         b.iter(|| {
@@ -68,7 +70,9 @@ fn bench_subscription_messages_100(c: &mut Criterion) {
 
 fn bench_subscription_messages_5000(c: &mut Criterion) {
     let instruments: Vec<InstrumentSubscription> = (0..5000)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 10000 + i))
+        .map(|i: u32| {
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 10000_u32.saturating_add(i))
+        })
         .collect();
     c.bench_function("subscription/build_messages_5000", |b| {
         b.iter(|| {

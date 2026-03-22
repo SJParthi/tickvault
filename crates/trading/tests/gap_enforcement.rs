@@ -1,6 +1,7 @@
 //! Gap enforcement integration tests — Trading crate.
 //!
 //! Exhaustive tests for all OMS and Risk gap implementations:
+//! - I-P0-03: Expired contract awareness at OMS level
 //! - OMS-GAP-01: Order lifecycle state machine (transitions + parsing)
 //! - OMS-GAP-02: Order reconciliation (pure function, mismatch detection)
 //! - OMS-GAP-03: Circuit breaker (3-state FSM, threshold, reset)
@@ -9,6 +10,136 @@
 //! - RISK-GAP-01: Pre-trade risk checks (halt, daily loss, position limit)
 //! - RISK-GAP-02: Position & P&L tracking (fills, market price, reset)
 //! - RISK-GAP-03: Tick gap detection (tick_gap_tracker — warmup, warning/error thresholds, per-security isolation)
+
+// ===========================================================================
+// I-P0-03: Expired Contract Awareness at OMS
+// ===========================================================================
+
+mod i_p0_03_expired_contract_awareness {
+    use dhan_live_trader_common::order_types::{
+        OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
+    };
+    use dhan_live_trader_trading::oms::types::ManagedOrder;
+
+    /// I-P0-03: Verifies that OMS types can represent expiry information.
+    ///
+    /// The ManagedOrder struct currently does NOT have an `expiry_date` field.
+    /// Expiry checking before order submission is NOT yet implemented in the
+    /// OMS engine gates. This test documents the gap.
+    ///
+    /// GAP: Source code validation not yet implemented — expiry check at
+    /// OMS Gate 4 (engine.rs) should verify `expiry_date >= today` before
+    /// order submission. Stale universe = expired contract order = CRITICAL.
+
+    #[test]
+    fn test_i_p0_03_expired_contract_awareness() {
+        // GAP: Expiry check before order submission is not yet implemented.
+        // The ManagedOrder struct tracks security_id but not expiry_date.
+        // A future enhancement should add expiry_date to PlaceOrderRequest
+        // and validate it in the OMS engine before submitting orders.
+
+        let order = ManagedOrder {
+            order_id: "EXP-TEST-1".to_owned(),
+            correlation_id: "corr-exp".to_owned(),
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            status: OrderStatus::Confirmed,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+
+        // Verify the ManagedOrder can be created for derivative instruments
+        assert_eq!(order.security_id, 52432);
+        assert!(!order.is_terminal());
+
+        // Document the gap: ManagedOrder has security_id but no expiry_date field.
+        // The OMS engine should cross-reference security_id against the instrument
+        // universe to verify the contract has not expired before submission.
+        // GAP: Source code validation not yet implemented — test documents expected behavior
+    }
+
+    #[test]
+    fn test_i_p0_03_terminal_order_cannot_be_resubmitted() {
+        // Even without expiry checks, orders in terminal states are blocked.
+        // This is the closest existing protection against stale orders.
+        let order = ManagedOrder {
+            order_id: "TERM-1".to_owned(),
+            correlation_id: "corr-term".to_owned(),
+            security_id: 99999, // Could be an expired contract
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 100.0,
+            trigger_price: 0.0,
+            status: OrderStatus::Rejected,
+            traded_qty: 0,
+            avg_traded_price: 0.0,
+            lot_size: 25,
+            created_at_us: 0,
+            updated_at_us: 0,
+            needs_reconciliation: false,
+            modification_count: 0,
+        };
+
+        assert!(
+            order.is_terminal(),
+            "I-P0-03: rejected order must be terminal — no further actions"
+        );
+    }
+
+    #[test]
+    fn test_i_p0_03_all_terminal_states_block_modifications() {
+        let terminal_statuses = [
+            OrderStatus::Traded,
+            OrderStatus::Rejected,
+            OrderStatus::Cancelled,
+            OrderStatus::Expired,
+            OrderStatus::Closed,
+        ];
+
+        for status in &terminal_statuses {
+            let order = ManagedOrder {
+                order_id: format!("TERM-{:?}", status),
+                correlation_id: "corr-t".to_owned(),
+                security_id: 52432,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Limit,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 50,
+                price: 100.0,
+                trigger_price: 0.0,
+                status: *status,
+                traded_qty: 0,
+                avg_traded_price: 0.0,
+                lot_size: 25,
+                created_at_us: 0,
+                updated_at_us: 0,
+                needs_reconciliation: false,
+                modification_count: 0,
+            };
+
+            assert!(
+                order.is_terminal(),
+                "I-P0-03: {:?} must be terminal",
+                status
+            );
+        }
+    }
+}
 
 // ===========================================================================
 // OMS-GAP-01: Order Lifecycle State Machine

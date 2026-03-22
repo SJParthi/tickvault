@@ -31,6 +31,7 @@ pub mod network;
 pub mod notification;
 pub mod parser;
 pub mod pipeline;
+pub mod scheduler;
 pub mod websocket;
 
 #[cfg(test)]

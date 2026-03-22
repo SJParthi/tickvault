@@ -17,12 +17,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::InstrumentConfig;
 use dhan_live_trader_common::constants::*;
 use dhan_live_trader_common::instrument_types::*;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
 use super::csv_downloader::download_instrument_csv;
@@ -766,9 +767,7 @@ pub fn build_fno_universe_from_csv(csv_text: &str, source: &str) -> Result<FnoUn
     let mut underlyings = link_price_ids(unlinked, &index_lookup, &equity_lookup);
 
     // Pass 5 — Build derivatives, option chains, expiry calendars
-    let ist_offset =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
-    let today = Utc::now().with_timezone(&ist_offset).date_naive();
+    let today = Utc::now().with_timezone(&ist_offset()).date_naive();
 
     let pass5_result = build_derivatives_and_chains(&parsed_rows, &mut underlyings, today);
 
@@ -777,7 +776,7 @@ pub fn build_fno_universe_from_csv(csv_text: &str, source: &str) -> Result<FnoUn
 
     // Assemble the universe
     let build_duration = build_start.elapsed();
-    let build_timestamp = Utc::now().with_timezone(&ist_offset);
+    let build_timestamp = Utc::now().with_timezone(&ist_offset());
 
     let universe = FnoUniverse {
         build_metadata: UniverseBuildMetadata {
@@ -4050,5 +4049,705 @@ mod tests {
         let chain = &result.option_chains[&key];
         assert!(chain.calls.is_empty(), "no calls in chain");
         assert_eq!(chain.puts.len(), 2, "two puts in chain");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_fno_universe_from_csv — invalid CSV input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_fno_universe_from_csv_empty_string_fails() {
+        let result = build_fno_universe_from_csv("", "test");
+        assert!(result.is_err(), "empty CSV should fail parsing");
+    }
+
+    #[test]
+    fn test_build_fno_universe_from_csv_header_only_fails_validation() {
+        // A CSV with header but no data rows should fail validation
+        // (insufficient derivatives, missing must-exist underlyings, etc.)
+        let csv = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,\
+                    UNDERLYING_SECURITY_ID,UNDERLYING_SYMBOL,SYMBOL_NAME,\
+                    DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,LOT_SIZE,\
+                    SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,\
+                    EXPIRY_FLAG,\n";
+        let result = build_fno_universe_from_csv(csv, "test-header-only");
+        assert!(result.is_err(), "header-only CSV should fail validation");
+    }
+
+    #[test]
+    fn test_build_fno_universe_from_csv_garbage_content_fails() {
+        let result = build_fno_universe_from_csv("not,valid,csv\ndata", "test");
+        // Should fail either parsing or validation
+        assert!(result.is_err(), "garbage CSV should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: duplicate security_id across segments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_duplicate_security_id_in_index_segment_keeps_first() {
+        // Two index rows with the same security_id — second should be skipped
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_index_row(13, "NIFTY_DUP", Exchange::NationalStockExchange),
+        ];
+
+        let mut underlyings = HashMap::new();
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Only one should be in instrument_info
+        let info = result.instrument_info.get(&13).unwrap();
+        match info {
+            InstrumentInfo::Index { symbol, .. } => {
+                assert_eq!(symbol, "NIFTY", "first occurrence should be kept");
+            }
+            _ => panic!("expected Index variant"),
+        }
+    }
+
+    #[test]
+    fn test_pass5_duplicate_security_id_in_equity_segment_keeps_first() {
+        // Two equity rows with the same security_id
+        let rows = vec![
+            make_equity_row(2885, "RELIANCE"),
+            make_equity_row(2885, "RELIANCE_DUP"),
+        ];
+
+        let mut underlyings = HashMap::new();
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let info = result.instrument_info.get(&2885).unwrap();
+        match info {
+            InstrumentInfo::Equity { symbol, .. } => {
+                assert_eq!(symbol, "RELIANCE", "first occurrence should be kept");
+            }
+            _ => panic!("expected Equity variant"),
+        }
+    }
+
+    #[test]
+    fn test_pass5_duplicate_security_id_in_derivative_segment_keeps_first() {
+        // Two derivative rows with the same security_id
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            // Duplicate security_id 51700 with different underlying
+            make_futidx_row(
+                51700,
+                26009,
+                "BANKNIFTY",
+                "2026-03-30",
+                30,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Should have only one derivative with security_id 51700
+        let contract = result.derivative_contracts.get(&51700).unwrap();
+        assert_eq!(
+            contract.underlying_symbol, "NIFTY",
+            "first occurrence (NIFTY) should be kept"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: positive strike price preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_positive_strike_price_preserved() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // NIFTY option with strike 22000.0 should be preserved exactly
+        let opt = result.derivative_contracts.get(&70001).unwrap();
+        assert_eq!(opt.strike_price, 22000.0);
+    }
+
+    #[test]
+    fn test_pass5_zero_strike_price_preserved() {
+        // Create a future where strike_price is exactly 0.0
+        let mut row = make_futidx_row(
+            51700,
+            26000,
+            "NIFTY",
+            "2026-03-30",
+            75,
+            Exchange::NationalStockExchange,
+        );
+        row.strike_price = 0.0;
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            row,
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let contract = result.derivative_contracts.get(&51700).unwrap();
+        assert_eq!(contract.strike_price, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_subscribed_indices: display indices with all subcategory strings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_subscribed_indices_display_indices_all_nse_exchange() {
+        let underlyings = HashMap::new();
+        let indices = build_subscribed_indices(&underlyings);
+
+        // Every display index must have NSE exchange
+        for idx in &indices {
+            assert_eq!(
+                idx.exchange,
+                Exchange::NationalStockExchange,
+                "display index {} must be NSE",
+                idx.symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_subscribed_indices_no_duplicate_symbols() {
+        let rows = build_test_rows();
+        let underlyings = run_passes_1_through_4(&rows);
+        let indices = build_subscribed_indices(&underlyings);
+
+        let mut seen = std::collections::HashSet::new();
+        for idx in &indices {
+            assert!(
+                seen.insert(&idx.symbol),
+                "duplicate symbol in subscribed indices: {}",
+                idx.symbol
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: contract kind classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_futidx_classified_as_future_index() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_fut = result.derivative_contracts.get(&51700).unwrap();
+        assert_eq!(nifty_fut.instrument_kind, DhanInstrumentKind::FutureIndex);
+    }
+
+    #[test]
+    fn test_pass5_futstk_classified_as_future_stock() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let rel_fut = result.derivative_contracts.get(&52023).unwrap();
+        assert_eq!(rel_fut.instrument_kind, DhanInstrumentKind::FutureStock);
+    }
+
+    #[test]
+    fn test_pass5_optidx_call_classified_as_option_index() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_ce = result.derivative_contracts.get(&70001).unwrap();
+        assert_eq!(nifty_ce.instrument_kind, DhanInstrumentKind::OptionIndex);
+        assert_eq!(nifty_ce.option_type, Some(OptionType::Call));
+    }
+
+    #[test]
+    fn test_pass5_optidx_put_classified_as_option_index() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_pe = result.derivative_contracts.get(&70002).unwrap();
+        assert_eq!(nifty_pe.instrument_kind, DhanInstrumentKind::OptionIndex);
+        assert_eq!(nifty_pe.option_type, Some(OptionType::Put));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: contract details preservation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_contract_preserves_lot_size() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_fut = result.derivative_contracts.get(&51700).unwrap();
+        assert_eq!(nifty_fut.lot_size, 75);
+
+        let rel_fut = result.derivative_contracts.get(&52023).unwrap();
+        assert_eq!(rel_fut.lot_size, 500);
+    }
+
+    #[test]
+    fn test_pass5_contract_preserves_tick_size() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_fut = result.derivative_contracts.get(&51700).unwrap();
+        assert!((nifty_fut.tick_size - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pass5_contract_preserves_expiry_date() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let nifty_fut = result.derivative_contracts.get(&51700).unwrap();
+        assert_eq!(
+            nifty_fut.expiry_date,
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pass5_contract_preserves_symbol_name() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let opt = result.derivative_contracts.get(&70001).unwrap();
+        assert!(
+            opt.symbol_name.contains("NIFTY"),
+            "symbol_name should contain underlying: {}",
+            opt.symbol_name
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: futures are NOT in option chains
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_futures_not_in_option_chain_entries() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        let march_key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_owned(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+        };
+        let chain = result.option_chains.get(&march_key).unwrap();
+
+        // The NIFTY future (51700) should NOT be in calls or puts
+        let in_calls = chain.calls.iter().any(|e| e.security_id == 51700);
+        let in_puts = chain.puts.iter().any(|e| e.security_id == 51700);
+        assert!(
+            !in_calls && !in_puts,
+            "futures should not appear in option chain entries"
+        );
+
+        // But it should be linked as the future_security_id
+        assert_eq!(chain.future_security_id, Some(51700));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 5: expiry calendar contains all unique expiry dates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_expiry_calendar_contains_all_underlyings_with_contracts() {
+        let rows = build_test_rows();
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Every underlying that has derivative contracts should have an expiry calendar
+        let symbols_with_contracts: std::collections::HashSet<_> = result
+            .derivative_contracts
+            .values()
+            .map(|c| c.underlying_symbol.clone())
+            .collect();
+
+        for symbol in &symbols_with_contracts {
+            assert!(
+                result.expiry_calendars.contains_key(symbol),
+                "missing expiry calendar for {}",
+                symbol
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_fno_universe_from_csv: malformed CSV columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_fno_universe_from_csv_wrong_headers_fails() {
+        let csv = "COL_A,COL_B,COL_C\nval1,val2,val3\n";
+        let result = build_fno_universe_from_csv(csv, "test-wrong-headers");
+        assert!(result.is_err(), "wrong column names should fail parsing");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 2: build_equity_lookup — commodity and currency segments filtered
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_equity_lookup_skips_commodity_segment() {
+        let mut row = make_equity_row(100, "COMMODITYROW");
+        row.segment = 'M'; // Commodity
+        let lookup = build_equity_lookup(&[row]);
+        assert!(
+            lookup.is_empty(),
+            "M segment should be skipped in equity lookup"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 3: discover_fno_underlyings — multiple exchanges combined
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_three_exchanges_together() {
+        let rows = vec![
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            make_futidx_row(
+                60000,
+                1,
+                "SENSEX",
+                "2026-03-30",
+                20,
+                Exchange::BombayStockExchange,
+            ),
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+        ];
+        let result = discover_fno_underlyings(&rows);
+        assert_eq!(result.len(), 3);
+        let kinds: Vec<_> = result.iter().map(|u| u.kind).collect();
+        assert!(kinds.contains(&UnderlyingKind::NseIndex));
+        assert!(kinds.contains(&UnderlyingKind::BseIndex));
+        assert!(kinds.contains(&UnderlyingKind::Stock));
+    }
+
+    // -----------------------------------------------------------------------
+    // link_price_ids — verify derivative_segment assignment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_link_price_ids_nse_stock_has_nse_fno_derivative_segment() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "TESTSTOCK".to_string(),
+            underlying_security_id: 5555,
+            kind: UnderlyingKind::Stock,
+            lot_size: 100,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let mut equity_lookup = HashMap::new();
+        equity_lookup.insert("TESTSTOCK".to_string(), 5555_u32);
+
+        let result = link_price_ids(unlinked, &HashMap::new(), &equity_lookup);
+        let underlying = result.get("TESTSTOCK").unwrap();
+        assert_eq!(underlying.derivative_segment, ExchangeSegment::NseFno);
+    }
+
+    #[test]
+    fn test_link_price_ids_bse_index_has_bse_fno_derivative_segment() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "BANKEX".to_string(),
+            underlying_security_id: 2,
+            kind: UnderlyingKind::BseIndex,
+            lot_size: 30,
+            derivative_exchange: Exchange::BombayStockExchange,
+        }];
+        let mut index_lookup = HashMap::new();
+        index_lookup.insert(
+            "BANKEX".to_string(),
+            IndexEntry {
+                security_id: 69,
+                exchange: Exchange::BombayStockExchange,
+            },
+        );
+
+        let result = link_price_ids(unlinked, &index_lookup, &HashMap::new());
+        let underlying = result.get("BANKEX").unwrap();
+        assert_eq!(underlying.derivative_segment, ExchangeSegment::BseFno);
+    }
+
+    #[test]
+    fn test_link_price_ids_stock_found_in_equity_lookup() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "RELIANCE".to_string(),
+            underlying_security_id: 2885,
+            kind: UnderlyingKind::Stock,
+            lot_size: 500,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let index_lookup = HashMap::new();
+        let mut equity_lookup = HashMap::new();
+        equity_lookup.insert("RELIANCE".to_string(), 2885_u32);
+
+        let result = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+        assert_eq!(result.len(), 1);
+        let underlying = result.get("RELIANCE").unwrap();
+        assert_eq!(underlying.price_feed_security_id, 2885);
+        assert_eq!(underlying.price_feed_segment, ExchangeSegment::NseEquity);
+    }
+
+    #[test]
+    fn test_link_price_ids_stock_not_in_equity_lookup_falls_back() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "UNKNOWN_STOCK".to_string(),
+            underlying_security_id: 9999,
+            kind: UnderlyingKind::Stock,
+            lot_size: 100,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let index_lookup = HashMap::new();
+        let equity_lookup = HashMap::new();
+
+        let result = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+        assert_eq!(result.len(), 1);
+        let underlying = result.get("UNKNOWN_STOCK").unwrap();
+        // Should fall back to underlying_security_id
+        assert_eq!(underlying.price_feed_security_id, 9999);
+    }
+
+    #[test]
+    fn test_link_price_ids_index_found_in_index_lookup() {
+        let unlinked = vec![UnlinkedUnderlying {
+            underlying_symbol: "NIFTY".to_string(),
+            underlying_security_id: 26000,
+            kind: UnderlyingKind::NseIndex,
+            lot_size: 75,
+            derivative_exchange: Exchange::NationalStockExchange,
+        }];
+        let mut index_lookup = HashMap::new();
+        index_lookup.insert(
+            "NIFTY".to_string(),
+            IndexEntry {
+                security_id: 13,
+                exchange: Exchange::NationalStockExchange,
+            },
+        );
+        let equity_lookup = HashMap::new();
+
+        let result = link_price_ids(unlinked, &index_lookup, &equity_lookup);
+        assert_eq!(result.len(), 1);
+        let underlying = result.get("NIFTY").unwrap();
+        assert_eq!(underlying.price_feed_security_id, 13);
+        assert_eq!(underlying.price_feed_segment, ExchangeSegment::IdxI);
+    }
+
+    #[test]
+    fn test_link_price_ids_empty_input() {
+        let result = link_price_ids(vec![], &HashMap::new(), &HashMap::new());
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: discover_fno_underlyings dedup — first occurrence wins
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_dedup_first_wins_lot_size() {
+        // Two NIFTY futures with DIFFERENT lot_sizes — first occurrence's lot_size wins
+        let rows = vec![
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75, // lot_size from first occurrence
+                Exchange::NationalStockExchange,
+            ),
+            make_futidx_row(
+                51701,
+                26000,
+                "NIFTY",
+                "2026-06-30",
+                50, // different lot_size — should be ignored
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1, "duplicate NIFTY must be deduped");
+        assert_eq!(
+            underlyings[0].lot_size, 75,
+            "first occurrence's lot_size (75) must be preserved, not second (50)"
+        );
+        assert_eq!(underlyings[0].underlying_security_id, 26000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: discover_fno_underlyings dedup — first wins for FUTSTK too
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_dedup_first_wins_futstk() {
+        // Two RELIANCE FUTSTK with different lot_sizes
+        let rows = vec![
+            make_futstk_row(52023, 2885, "RELIANCE", "2026-03-30", 500),
+            make_futstk_row(52024, 2885, "RELIANCE", "2026-06-30", 250),
+        ];
+
+        let underlyings = discover_fno_underlyings(&rows);
+        assert_eq!(underlyings.len(), 1);
+        assert_eq!(
+            underlyings[0].lot_size, 500,
+            "first lot_size (500) must win over second (250)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_index_lookup — last occurrence wins (HashMap::insert)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_index_lookup_last_occurrence_wins_for_same_symbol() {
+        // Two index rows with the same symbol but different security_ids
+        // HashMap::insert overwrites, so last one wins
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_index_row(99, "NIFTY", Exchange::NationalStockExchange),
+        ];
+
+        let lookup = build_index_lookup(&rows);
+        assert_eq!(lookup.len(), 1);
+        // Last insert wins in HashMap
+        assert_eq!(lookup.get("NIFTY").unwrap().security_id, 99);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_equity_lookup — last occurrence wins for same symbol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_equity_lookup_last_occurrence_wins_for_same_symbol() {
+        let rows = vec![
+            make_equity_row(2885, "RELIANCE"),
+            make_equity_row(9999, "RELIANCE"),
+        ];
+
+        let lookup = build_equity_lookup(&rows);
+        assert_eq!(lookup.len(), 1);
+        assert_eq!(lookup.get("RELIANCE"), Some(&9999));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: discover_fno_underlyings — BSE FUTSTK skipped (TEST + BSE)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_discover_fno_underlyings_skips_bse_futstk_with_test_marker() {
+        // Row that is both BSE FUTSTK AND has TEST marker — both filters apply
+        let rows = vec![make_futstk_row_bse(
+            80099,
+            9001,
+            "TESTBSESTOCK",
+            "2026-03-30",
+            100,
+        )];
+        let underlyings = discover_fno_underlyings(&rows);
+        assert!(
+            underlyings.is_empty(),
+            "BSE FUTSTK with TEST marker must be double-filtered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 5 — duplicate security_id across index and derivative
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_duplicate_security_id_across_segments_keeps_first() {
+        // An index row and a derivative row with the same security_id
+        // The dedup tracker in Pass 5 should keep the first occurrence
+        let rows = vec![
+            // Index with security_id 13
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            // FUTIDX with security_id 51700
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Index (13) in instrument_info
+        assert!(result.instrument_info.contains_key(&13));
+        // Derivative (51700) in instrument_info
+        assert!(result.instrument_info.contains_key(&51700));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Pass 5 — duplicate security_id within derivatives
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pass5_duplicate_derivative_security_id_keeps_first_occurrence() {
+        // Two derivative rows with the same security_id — second should be skipped
+        let mut second_row = make_futidx_row(
+            51700,
+            26000,
+            "NIFTY",
+            "2026-04-30",
+            75,
+            Exchange::NationalStockExchange,
+        );
+        // Same security_id as the one in build_test_rows
+        second_row.security_id = 51700;
+
+        let rows = vec![
+            make_index_row(13, "NIFTY", Exchange::NationalStockExchange),
+            make_futidx_row(
+                51700,
+                26000,
+                "NIFTY",
+                "2026-03-30",
+                75,
+                Exchange::NationalStockExchange,
+            ),
+            second_row,
+        ];
+
+        let mut underlyings = run_passes_1_through_4(&rows);
+        let result = build_derivatives_and_chains(&rows, &mut underlyings, test_today());
+
+        // Should have exactly 1 derivative contract with ID 51700
+        let contract = result.derivative_contracts.get(&51700).unwrap();
+        // First occurrence's expiry (2026-03-30) should be kept
+        assert_eq!(
+            contract.expiry_date,
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            "first occurrence's expiry must be preserved"
+        );
     }
 }

@@ -21,7 +21,8 @@ pub struct ParsedTick {
     pub last_traded_price: f32,
     /// Last trade quantity (from Quote/Full packets; 0 for Ticker).
     pub last_trade_quantity: u16,
-    /// Exchange timestamp as UTC epoch seconds from Dhan V2 API.
+    /// Exchange timestamp as IST epoch seconds from Dhan WebSocket.
+    /// Note: Historical REST API returns UTC epoch seconds (see `HistoricalCandle`).
     pub exchange_timestamp: u32,
     /// Local receive timestamp in nanoseconds since Unix epoch (for latency measurement).
     pub received_at_nanos: i64,
@@ -578,5 +579,77 @@ mod tests {
         assert_eq!(tick.security_id, 52432);
         assert_eq!(tick.exchange_segment_code, 2);
         assert!((tick.last_traded_price - 245.5).abs() < f32::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DhanDailyResponse::is_consistent — non-empty OI mismatch
+    // (line 276: open_interest.len() == n branch)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_daily_response_inconsistent_oi_length() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![5000], // 1 element vs 2 candles — inconsistent
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_daily_response_consistent_with_oi() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0],
+            high: vec![102.0],
+            low: vec![99.0],
+            close: vec![101.0],
+            volume: vec![1000],
+            timestamp: vec![1700000000],
+            open_interest: vec![5000], // Same length as other arrays
+        };
+        assert!(resp.is_consistent());
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: deserialize_f64_as_i64_vec error path (line 197)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_intraday_response_invalid_volume_type_fails() {
+        // volume array contains a string instead of numbers — exercises the
+        // deserialization error path of deserialize_f64_as_i64_vec.
+        let json = r#"{
+            "open": [100.0],
+            "high": [102.0],
+            "low": [99.0],
+            "close": [101.0],
+            "volume": ["not_a_number"],
+            "timestamp": [1700000000.0]
+        }"#;
+        let result: Result<DhanIntradayResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DhanIntradayResponse::is_consistent — non-empty OI mismatch
+    // (line 228: open_interest.len() == n when OI present but wrong length)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_intraday_response_inconsistent_oi_length() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![5000], // 1 element vs 2 candles
+        };
+        assert!(!resp.is_consistent());
     }
 }

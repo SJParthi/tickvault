@@ -277,4 +277,151 @@ mod tests {
         assert_eq!(result[0].symbol, "RELIANCE");
         assert_eq!(result[0].sector, "Energy");
     }
+
+    // =====================================================================
+    // Additional coverage: missing required columns, empty symbol rows,
+    // weightage header variant, sector header variant, no series column
+    // =====================================================================
+
+    #[test]
+    fn test_parse_csv_missing_required_symbol_column() {
+        let csv = "Company Name,Industry,ISIN Code\n\
+                    Reliance,Energy,INE002A01018\n";
+        // Missing Symbol column
+        let result = parse_constituency_csv("Test", csv, today());
+        assert!(
+            result.is_empty(),
+            "missing Symbol column should return empty"
+        );
+    }
+
+    #[test]
+    fn test_parse_csv_missing_required_isin_column() {
+        let csv = "Company Name,Industry,Symbol,Series\n\
+                    Reliance,Energy,RELIANCE,EQ\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert!(result.is_empty(), "missing ISIN column should return empty");
+    }
+
+    #[test]
+    fn test_parse_csv_empty_symbol_skipped() {
+        let csv = "Company Name,Industry,Symbol,Series,ISIN Code\n\
+                    Reliance,Energy,,EQ,INE002A01018\n\
+                    HDFC,Finance,HDFCBANK,EQ,INE040A01034\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].symbol, "HDFCBANK");
+    }
+
+    #[test]
+    fn test_parse_csv_no_series_column_includes_all() {
+        // CSV without Series column should include all rows
+        let csv = "Company Name,Symbol,ISIN Code\n\
+                    Reliance,RELIANCE,INE002A01018\n\
+                    HDFC,HDFCBANK,INE040A01034\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_csv_empty_series_includes_row() {
+        // Empty series field should include the row (no filtering)
+        let csv = "Company Name,Industry,Symbol,Series,ISIN Code\n\
+                    Reliance,Energy,RELIANCE,,INE002A01018\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_csv_weightage_header_variant() {
+        let csv = "Company Name,Industry,Symbol,Series,ISIN Code,Weightage(%)\n\
+                    Reliance,Energy,RELIANCE,EQ,INE002A01018,12.5\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result.len(), 1);
+        assert!((result[0].weight - 12.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_csv_sector_header_variant() {
+        let csv = "Company Name,Sector,Symbol,Series,ISIN Code\n\
+                    Reliance,Oil & Gas,RELIANCE,EQ,INE002A01018\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].sector, "Oil & Gas");
+    }
+
+    #[test]
+    fn test_parse_csv_invalid_weight_defaults_to_zero() {
+        let csv = "Company Name,Industry,Symbol,Series,ISIN Code,Weight(%)\n\
+                    Reliance,Energy,RELIANCE,EQ,INE002A01018,not_a_number\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result.len(), 1);
+        assert!((result[0].weight - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_strip_bom_with_bom() {
+        let text = "\u{FEFF}hello";
+        assert_eq!(strip_bom(text), "hello");
+    }
+
+    #[test]
+    fn test_strip_bom_without_bom() {
+        let text = "hello";
+        assert_eq!(strip_bom(text), "hello");
+    }
+
+    #[test]
+    fn test_strip_bom_empty_string() {
+        assert_eq!(strip_bom(""), "");
+    }
+
+    #[test]
+    fn test_strip_bom_only_bom() {
+        assert_eq!(strip_bom("\u{FEFF}"), "");
+    }
+
+    #[test]
+    fn test_parse_csv_last_updated_matches_today() {
+        let csv = "Company Name,Industry,Symbol,Series,ISIN Code\n\
+                    Reliance,Energy,RELIANCE,EQ,INE002A01018\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert_eq!(result[0].last_updated, today());
+    }
+
+    // -----------------------------------------------------------------------
+    // Error paths: malformed CSV rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_csv_unterminated_quote_in_row_skips_it() {
+        // An unterminated quote in a data row causes a csv parse error.
+        // The parser should skip the bad row and continue.
+        let csv = "Symbol,ISIN Code,Series\n\
+                   RELIANCE,INE002A01018,EQ\n\
+                   \"unterminated,INE999X01001,EQ\n\
+                   HDFCBANK,INE040A01034,EQ\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        // The unterminated quote causes the csv reader to consume
+        // everything until EOF looking for the closing quote.
+        // RELIANCE should be parsed. The unterminated quote consumes
+        // the rest, so HDFCBANK may or may not appear.
+        assert!(
+            !result.is_empty(),
+            "should parse at least the first valid row"
+        );
+        assert_eq!(result[0].symbol, "RELIANCE");
+    }
+
+    #[test]
+    fn test_parse_csv_missing_required_columns_returns_empty() {
+        // Headers present but missing both Symbol AND ISIN Code
+        let csv = "Company Name,Industry,Series\n\
+                   Reliance,Energy,EQ\n";
+        let result = parse_constituency_csv("Test", csv, today());
+        assert!(
+            result.is_empty(),
+            "missing both required columns should return empty"
+        );
+    }
 }

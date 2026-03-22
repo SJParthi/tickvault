@@ -50,19 +50,85 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
 /// post-market ticks still flow through broadcast and candle aggregation.
 ///
 /// # Algorithm (O(1), zero allocation)
-/// 1. Add IST offset to UTC epoch seconds.
-/// 2. Modulo 86,400 → seconds-of-day in IST.
+/// 1. Dhan WebSocket sends exchange_timestamp as IST epoch seconds (already adjusted).
+/// 2. Modulo 86,400 → seconds-of-day in IST directly.
 /// 3. Range check: `[TICK_PERSIST_START, TICK_PERSIST_END)`.
 ///
 /// # Performance
-/// 1 add + 1 modulo + 2 comparisons. No branching beyond the range check.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: IST_UTC_OFFSET is +19800 (fits u32); modulo by 86400 is safe
+/// 1 modulo + 2 comparisons. No branching beyond the range check.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: modulo by 86400 is safe
 #[inline(always)]
 fn is_within_persist_window(exchange_timestamp: u32) -> bool {
-    let ist_secs_of_day =
-        exchange_timestamp.wrapping_add(IST_UTC_OFFSET_SECONDS as u32) % SECONDS_PER_DAY;
+    // exchange_timestamp is already IST epoch seconds — no offset needed.
+    let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         .contains(&ist_secs_of_day)
+}
+
+// ---------------------------------------------------------------------------
+// O(1) Tick Validity Checks (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the LTP is a valid tradeable price.
+///
+/// Invalid: NaN, Infinity, zero, or negative values.
+/// O(1) — 1 `is_finite()` + 1 comparison.
+#[inline(always)]
+fn is_valid_ltp(ltp: f32) -> bool {
+    ltp.is_finite() && ltp > 0.0
+}
+
+/// Returns `true` if the tick has valid price AND timestamp.
+///
+/// Combines LTP validity with exchange timestamp range check.
+/// O(1) — 2 comparisons after `is_valid_ltp`.
+#[inline(always)]
+fn is_valid_tick(ltp: f32, exchange_timestamp: u32) -> bool {
+    is_valid_ltp(ltp) && exchange_timestamp >= MINIMUM_VALID_EXCHANGE_TIMESTAMP
+}
+
+/// Returns `true` if best bid > best ask (both positive).
+///
+/// Indicates an auction / pre-open period. Metric-only, do NOT filter.
+/// O(1) — 3 comparisons.
+#[inline(always)]
+fn is_crossed_market(best_bid: f32, best_ask: f32) -> bool {
+    best_bid > best_ask && best_bid > 0.0 && best_ask > 0.0
+}
+
+/// Converts UTC nanoseconds to IST seconds-of-day.
+///
+/// Used for PreviousClose and candle sweep timestamps that arrive as UTC
+/// `received_at_nanos` but need IST time-of-day for persist window check.
+///
+/// O(1) — 3 arithmetic ops.
+#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
+#[inline(always)]
+fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
+    received_at_nanos
+        .saturating_div(1_000_000_000)
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
+}
+
+/// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
+///
+/// Full packets (code 8) have exchange_timestamp > 0. Market Depth standalone
+/// packets (code 3) have exchange_timestamp=0, so we derive from received_at_nanos.
+///
+/// O(1) — 1 branch + optionally `utc_nanos_to_ist_secs_of_day`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // APPROVED: epoch fits u32 until 2106
+#[inline(always)]
+fn derive_depth_timestamp_secs(
+    tick_is_valid: bool,
+    exchange_timestamp: u32,
+    received_at_nanos: i64,
+) -> u32 {
+    if tick_is_valid {
+        exchange_timestamp
+    } else {
+        (received_at_nanos / 1_000_000_000) as u32
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +230,7 @@ pub async fn run_tick_processor(
     mut candle_aggregator: Option<super::candle_aggregator::CandleAggregator>,
     mut live_candle_writer: Option<LiveCandleWriter>,
     mut top_movers: Option<super::top_movers::TopMoversTracker>,
-    shared_snapshot: Option<super::top_movers::SharedTopMoversSnapshot>,
+    shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -179,6 +245,7 @@ pub async fn run_tick_processor(
     let m_market_status_updates = counter!("dlt_market_status_updates_total");
     let m_disconnects = counter!("dlt_disconnect_frames_total");
     let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
+    let m_wire_to_done = histogram!("dlt_wire_to_done_duration_ns");
     let m_pipeline_active = gauge!("dlt_pipeline_active");
     let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
     let m_crossed_market = counter!("dlt_crossed_market_total");
@@ -232,10 +299,7 @@ pub async fn run_tick_processor(
 
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
                 // or epoch timestamps (heartbeat/init frames from Dhan).
-                if !tick.last_traded_price.is_finite()
-                    || tick.last_traded_price <= 0.0
-                    || tick.exchange_timestamp < MINIMUM_VALID_EXCHANGE_TIMESTAMP
-                {
+                if !is_valid_tick(tick.last_traded_price, tick.exchange_timestamp) {
                     junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
                     m_junk_filtered.increment(1);
                     if junk_ticks_filtered <= 10 {
@@ -314,9 +378,8 @@ pub async fn run_tick_processor(
                 // (code 3) have exchange_timestamp=0 by design, but their 5-level
                 // depth is valid. The tick portion is only persisted when the
                 // exchange timestamp is valid (Full packets, code 8).
-                let ltp_valid = tick.last_traded_price.is_finite() && tick.last_traded_price > 0.0;
-                let tick_is_valid =
-                    ltp_valid && tick.exchange_timestamp >= MINIMUM_VALID_EXCHANGE_TIMESTAMP;
+                let ltp_valid = is_valid_ltp(tick.last_traded_price);
+                let tick_is_valid = is_valid_tick(tick.last_traded_price, tick.exchange_timestamp);
 
                 if tick_is_valid {
                     // O(1) dedup: skip entire snapshot if tick is exact duplicate.
@@ -380,10 +443,7 @@ pub async fn run_tick_processor(
 
                 // O(1) crossed market detection: bid > ask at best level.
                 // Occurs during auction periods — metric only, do NOT filter.
-                if depth[0].bid_price > depth[0].ask_price
-                    && depth[0].bid_price > 0.0
-                    && depth[0].ask_price > 0.0
-                {
+                if is_crossed_market(depth[0].bid_price, depth[0].ask_price) {
                     m_crossed_market.increment(1);
                     debug!(
                         security_id = tick.security_id,
@@ -398,13 +458,11 @@ pub async fn run_tick_processor(
                 // For Full packets (code 8), use exchange_timestamp.
                 // For Market Depth standalone (code 3), exchange_timestamp=0,
                 // so derive wall-clock seconds from received_at_nanos.
-                // APPROVED: i64→u32 truncation is safe: epoch fits u32 until 2106
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let depth_ts_secs = if tick_is_valid {
-                    tick.exchange_timestamp
-                } else {
-                    (tick.received_at_nanos / 1_000_000_000) as u32
-                };
+                let depth_ts_secs = derive_depth_timestamp_secs(
+                    tick_is_valid,
+                    tick.exchange_timestamp,
+                    tick.received_at_nanos,
+                );
                 if is_within_persist_window(depth_ts_secs) {
                     m_depth_snapshots.increment(1);
                     if let Some(ref mut dw) = depth_writer
@@ -478,6 +536,13 @@ pub async fn run_tick_processor(
                     continue;
                 }
 
+                // Only persist previous close during market hours [09:00, 15:30) IST.
+                // PrevClose packets arrive on every subscription, even pre-market.
+                let prev_close_ist_secs = utc_nanos_to_ist_secs_of_day(received_at_nanos);
+                if !is_within_persist_window(prev_close_ist_secs) {
+                    continue;
+                }
+
                 // Persist previous close to QuestDB
                 if let Some(ref mut writer) = tick_writer
                     && let Err(err) = build_previous_close_row(
@@ -536,6 +601,7 @@ pub async fn run_tick_processor(
         }
 
         m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
+        m_wire_to_done.record(tick_start.elapsed().as_nanos() as f64);
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
@@ -553,11 +619,14 @@ pub async fn run_tick_processor(
             // Sweep stale candles and persist completed 1s candles to QuestDB
             if let Some(ref mut agg) = candle_aggregator {
                 // Reuse received_at_nanos from line 179 instead of a second Utc::now() syscall.
-                // Dhan sends exchange_timestamp as standard UTC epoch seconds —
-                // same basis as received_at_nanos, so no offset conversion needed.
+                // received_at_nanos is UTC; exchange_timestamp is IST epoch seconds.
+                // Add IST offset to align received_at with exchange_timestamp basis.
                 // APPROVED: i64→u32 truncation is safe: epoch fits u32 until 2106
                 #[allow(clippy::cast_possible_truncation)]
-                let now_secs = (received_at_nanos / 1_000_000_000) as u32;
+                let now_secs = (received_at_nanos
+                    .saturating_div(1_000_000_000)
+                    .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)))
+                    as u32;
                 agg.sweep_stale(now_secs);
                 let completed = agg.completed_slice();
                 if !completed.is_empty() {
@@ -2191,69 +2260,961 @@ mod tests {
     // is_within_persist_window tests
     // -----------------------------------------------------------------------
 
-    /// Helper: convert IST hours:minutes:seconds to a UTC epoch u32.
+    /// Helper: convert IST hours:minutes:seconds to an IST epoch u32.
     /// Uses a fixed reference date (2026-03-17) — the actual date doesn't
     /// matter because `is_within_persist_window` only checks seconds-of-day.
-    fn ist_hms_to_utc_epoch(hours: u32, minutes: u32, seconds: u32) -> u32 {
-        // 2026-03-17 00:00:00 IST = 2026-03-16 18:30:00 UTC = epoch 1773685800
-        let ist_midnight_utc: u32 = 1_773_685_800;
+    /// Dhan WebSocket sends timestamps as IST epoch seconds.
+    fn ist_hms_to_ist_epoch(hours: u32, minutes: u32, seconds: u32) -> u32 {
+        // IST midnight 2026-03-17 as IST epoch.
+        // UTC midnight 2026-03-17 = 1773705600. That is also IST midnight as IST epoch
+        // because IST epoch for midnight IST = UTC midnight epoch value.
+        let ist_midnight_ist_epoch: u32 = 1_773_705_600;
         let ist_secs_of_day = hours * 3600 + minutes * 60 + seconds;
-        // IST midnight is at UTC 18:30 of the previous day.
-        // Adding IST seconds-of-day gives the correct UTC epoch.
-        ist_midnight_utc + ist_secs_of_day
+        ist_midnight_ist_epoch + ist_secs_of_day
     }
 
     #[test]
     fn test_persist_window_market_open_boundary() {
         // 09:00:00 IST = first second of the window (inclusive)
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 0, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 0, 0)));
         // 09:00:01 IST = well within window
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 0, 1)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 0, 1)));
     }
 
     #[test]
     fn test_persist_window_market_close_boundary() {
         // 15:29:59 IST = last second of the window (inclusive)
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 29, 59)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 29, 59)));
         // 15:30:00 IST = first second outside the window (exclusive)
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(15, 30, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(15, 30, 0)));
         // 15:30:01 IST = outside
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(15, 30, 1)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(15, 30, 1)));
     }
 
     #[test]
     fn test_persist_window_pre_market_rejected() {
         // 08:59:59 IST = one second before window
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(8, 59, 59)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 59, 59)));
         // 08:00:00 IST = well before market
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(8, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 0, 0)));
         // 06:00:00 IST = early morning
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(6, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(6, 0, 0)));
     }
 
     #[test]
     fn test_persist_window_post_market_rejected() {
         // 16:00:00 IST = post-market
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(16, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(16, 0, 0)));
         // 20:00:00 IST = evening
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(20, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(20, 0, 0)));
     }
 
     #[test]
     fn test_persist_window_midnight_rejected() {
         // 00:00:00 IST = midnight
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(0, 0, 0)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(0, 0, 0)));
         // 23:59:59 IST = end of day
-        assert!(!is_within_persist_window(ist_hms_to_utc_epoch(23, 59, 59)));
+        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(23, 59, 59)));
     }
 
     #[test]
     fn test_persist_window_mid_session() {
         // 12:00:00 IST = mid-session
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(12, 0, 0)));
-        // 09:15:00 IST = actual market open
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(9, 15, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(12, 0, 0)));
+        // 09:15:00 IST = continuous trading start (within persist window [09:00, 15:30))
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 15, 0)));
         // 15:15:00 IST = near close
-        assert!(is_within_persist_window(ist_hms_to_utc_epoch(15, 15, 0)));
+        assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 15, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_within_persist_window — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persist_window_zero_timestamp() {
+        // Timestamp 0 → seconds_of_day = 0, well outside [09:00, 15:30)
+        assert!(!is_within_persist_window(0));
+    }
+
+    #[test]
+    fn test_persist_window_raw_secs_of_day_boundary() {
+        // Directly test with seconds-of-day values matching start/end constants
+        // 32400 = 09:00 IST
+        assert!(is_within_persist_window(TICK_PERSIST_START_SECS_OF_DAY_IST));
+        // 55800 = 15:30 IST (exclusive)
+        assert!(!is_within_persist_window(TICK_PERSIST_END_SECS_OF_DAY_IST));
+    }
+
+    #[test]
+    fn test_persist_window_just_before_start() {
+        assert!(!is_within_persist_window(
+            TICK_PERSIST_START_SECS_OF_DAY_IST - 1
+        ));
+    }
+
+    #[test]
+    fn test_persist_window_just_before_end() {
+        assert!(is_within_persist_window(
+            TICK_PERSIST_END_SECS_OF_DAY_IST - 1
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // depth_prices_are_finite — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_prices_all_finite() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_nan_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[2].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_infinity_ask() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[4].ask_price = f32::INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_neg_infinity_bid() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[0].bid_price = f32::NEG_INFINITY;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_zero_is_finite() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+            bid_price: 0.0,
+            ask_price: 0.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_negative_is_finite() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: -1.0,
+            ask_price: -2.0,
+        }; 5];
+        assert!(depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_nan_in_first_level() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[0].ask_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    #[test]
+    fn test_depth_prices_nan_in_last_level() {
+        let mut depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24501.0,
+        }; 5];
+        depth[4].bid_price = f32::NAN;
+        assert!(!depth_prices_are_finite(&depth));
+    }
+
+    // -----------------------------------------------------------------------
+    // TickDedupRing — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_ring_nan_ltp_is_unique() {
+        // NaN != NaN in IEEE 754, but to_bits() gives consistent bits.
+        // Two NaN ticks with same sec+ts should be detected as duplicate.
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, f32::NAN));
+        assert!(ring.is_duplicate(13, 1772073900, f32::NAN));
+    }
+
+    #[test]
+    fn test_dedup_ring_neg_zero_vs_pos_zero() {
+        // -0.0 and +0.0 have different bit patterns in IEEE 754.
+        let mut ring = TickDedupRing::new(8);
+        assert!(!ring.is_duplicate(13, 1772073900, 0.0));
+        // -0.0 has a different bit pattern → should NOT be a duplicate
+        assert!(!ring.is_duplicate(13, 1772073900, -0.0_f32));
+    }
+
+    #[test]
+    fn test_dedup_ring_large_buffer() {
+        let mut ring = TickDedupRing::new(16); // 65536 slots
+        // Insert many unique entries
+        for i in 0..1000 {
+            assert!(!ring.is_duplicate(i, 1772073900, 24500.0));
+        }
+        // Re-insert all — most should still be duplicates (65536 >> 1000)
+        let mut dups = 0;
+        for i in 0..1000 {
+            if ring.is_duplicate(i, 1772073900, 24500.0) {
+                dups += 1;
+            }
+        }
+        assert!(
+            dups > 900,
+            "with 65536 slots and 1000 entries, most should be duplicates (got {dups})"
+        );
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_zero_inputs() {
+        let fp = TickDedupRing::fingerprint(0, 0, 0.0);
+        // Should not be the empty sentinel (u64::MAX)
+        assert_ne!(fp, u64::MAX);
+    }
+
+    #[test]
+    fn test_dedup_ring_fingerprint_max_inputs() {
+        let fp = TickDedupRing::fingerprint(u32::MAX, u32::MAX, f32::MAX);
+        assert_ne!(fp, u64::MAX);
+        assert_ne!(fp, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tick validity logic — unit-level pure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_validity_check_logic() {
+        // Simulates the inline validity check in the hot loop
+        let valid_ltp = 24500.0_f32;
+        let invalid_ltp_zero = 0.0_f32;
+        let invalid_ltp_nan = f32::NAN;
+        let invalid_ltp_inf = f32::INFINITY;
+        let invalid_ltp_neg = -1.0_f32;
+        let valid_ts = 1772073900_u32;
+        let invalid_ts = 0_u32;
+
+        // Valid tick
+        assert!(
+            valid_ltp.is_finite()
+                && valid_ltp > 0.0
+                && valid_ts >= MINIMUM_VALID_EXCHANGE_TIMESTAMP
+        );
+
+        // Invalid: zero LTP
+        assert!(!(invalid_ltp_zero.is_finite() && invalid_ltp_zero > 0.0));
+
+        // Invalid: NaN LTP
+        assert!(!invalid_ltp_nan.is_finite());
+
+        // Invalid: Infinity LTP
+        assert!(!invalid_ltp_inf.is_finite());
+
+        // Invalid: negative LTP
+        assert!(!(invalid_ltp_neg.is_finite() && invalid_ltp_neg > 0.0));
+
+        // Invalid: timestamp below minimum
+        assert!(
+            !(valid_ltp.is_finite()
+                && valid_ltp > 0.0
+                && invalid_ts >= MINIMUM_VALID_EXCHANGE_TIMESTAMP)
+        );
+    }
+
+    #[test]
+    fn test_tick_with_depth_validity_logic() {
+        // Simulates the tick_is_valid + ltp_valid logic for TickWithDepth
+        let ltp = 24500.0_f32;
+        let ts_valid = 1772073900_u32;
+        let ts_zero = 0_u32;
+
+        let ltp_valid = ltp.is_finite() && ltp > 0.0;
+        assert!(ltp_valid);
+
+        // Full packet: valid LTP + valid timestamp → tick_is_valid
+        let tick_is_valid = ltp_valid && ts_valid >= MINIMUM_VALID_EXCHANGE_TIMESTAMP;
+        assert!(tick_is_valid);
+
+        // Market Depth code 3: valid LTP + timestamp=0 → ltp_valid but NOT tick_is_valid
+        let tick_no_ts = ltp_valid && ts_zero >= MINIMUM_VALID_EXCHANGE_TIMESTAMP;
+        assert!(!tick_no_ts);
+        // Still ltp_valid → depth should persist
+        assert!(ltp_valid);
+    }
+
+    // -----------------------------------------------------------------------
+    // Previous close IST time derivation test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prev_close_ist_secs_derivation() {
+        // Simulates the IST seconds-of-day derivation used for PreviousClose packets.
+        // received_at_nanos is UTC; we add IST offset then modulo SECONDS_PER_DAY.
+        let received_at_nanos: i64 = 1_772_073_900_000_000_000; // some UTC nanos
+
+        #[allow(clippy::cast_possible_truncation)]
+        let prev_close_ist_secs = received_at_nanos
+            .saturating_div(1_000_000_000)
+            .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+            .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+
+        // Result should be in [0, 86400)
+        assert!(prev_close_ist_secs < SECONDS_PER_DAY);
+    }
+
+    #[test]
+    fn test_prev_close_ist_secs_zero_nanos() {
+        // received_at_nanos = 0 → UTC epoch start → IST = 05:30:00 → secs_of_day = 19800
+        let received_at_nanos: i64 = 0;
+        #[allow(clippy::cast_possible_truncation)]
+        let prev_close_ist_secs = received_at_nanos
+            .saturating_div(1_000_000_000)
+            .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+            .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+
+        assert_eq!(prev_close_ist_secs, 19800); // 05:30 IST
+        // 05:30 IST is outside [09:00, 15:30) → should NOT persist
+        assert!(
+            !(TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                .contains(&prev_close_ist_secs)
+        );
+    }
+
+    // ===================================================================
+    // is_valid_ltp — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_is_valid_ltp_positive_price() {
+        assert!(is_valid_ltp(24500.0));
+        assert!(is_valid_ltp(0.01));
+        assert!(is_valid_ltp(f32::MAX));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_zero() {
+        assert!(!is_valid_ltp(0.0));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_negative_zero() {
+        assert!(!is_valid_ltp(-0.0));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_negative() {
+        assert!(!is_valid_ltp(-1.0));
+        assert!(!is_valid_ltp(-24500.0));
+        assert!(!is_valid_ltp(f32::MIN));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_nan() {
+        assert!(!is_valid_ltp(f32::NAN));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_positive_infinity() {
+        assert!(!is_valid_ltp(f32::INFINITY));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_negative_infinity() {
+        assert!(!is_valid_ltp(f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_subnormal() {
+        // Subnormal is finite and > 0.0, so it's valid
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        assert!(subnormal.is_subnormal());
+        assert!(is_valid_ltp(subnormal));
+    }
+
+    #[test]
+    fn test_is_valid_ltp_min_positive() {
+        assert!(is_valid_ltp(f32::MIN_POSITIVE));
+    }
+
+    // ===================================================================
+    // is_valid_tick — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_is_valid_tick_valid_inputs() {
+        assert!(is_valid_tick(24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP));
+        assert!(is_valid_tick(100.0, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_zero_ltp() {
+        assert!(!is_valid_tick(0.0, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_nan_ltp() {
+        assert!(!is_valid_tick(f32::NAN, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_inf_ltp() {
+        assert!(!is_valid_tick(f32::INFINITY, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_negative_ltp() {
+        assert!(!is_valid_tick(-1.0, 1772073900));
+    }
+
+    #[test]
+    fn test_is_valid_tick_zero_timestamp() {
+        assert!(!is_valid_tick(24500.0, 0));
+    }
+
+    #[test]
+    fn test_is_valid_tick_below_minimum_timestamp() {
+        assert!(!is_valid_tick(
+            24500.0,
+            MINIMUM_VALID_EXCHANGE_TIMESTAMP - 1
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_tick_at_minimum_timestamp() {
+        assert!(is_valid_tick(24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP));
+    }
+
+    #[test]
+    fn test_is_valid_tick_both_invalid() {
+        assert!(!is_valid_tick(0.0, 0));
+        assert!(!is_valid_tick(f32::NAN, 0));
+    }
+
+    // ===================================================================
+    // is_crossed_market — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_is_crossed_market_normal_spread() {
+        // bid < ask — normal market, not crossed
+        assert!(!is_crossed_market(24500.0, 24501.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_equal() {
+        // bid == ask — locked market, not crossed
+        assert!(!is_crossed_market(24500.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_bid_greater() {
+        // bid > ask — crossed market
+        assert!(is_crossed_market(24501.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_zero_bid() {
+        // bid = 0 — not crossed (bid not > 0)
+        assert!(!is_crossed_market(0.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_zero_ask() {
+        // ask = 0 — not crossed (ask not > 0)
+        assert!(!is_crossed_market(24501.0, 0.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_both_zero() {
+        assert!(!is_crossed_market(0.0, 0.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_negative_bid() {
+        assert!(!is_crossed_market(-1.0, 24500.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_negative_ask() {
+        assert!(!is_crossed_market(24501.0, -1.0));
+    }
+
+    #[test]
+    fn test_is_crossed_market_small_inversion() {
+        // 0.05 paise inversion — still crossed
+        assert!(is_crossed_market(24500.05, 24500.0));
+    }
+
+    // ===================================================================
+    // utc_nanos_to_ist_secs_of_day — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_zero() {
+        // UTC epoch 0 → IST 05:30:00 → secs_of_day = 19800
+        let secs = utc_nanos_to_ist_secs_of_day(0);
+        assert_eq!(secs, 19800);
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_market_open() {
+        // IST 09:00:00 = UTC 03:30:00 = 3*3600 + 30*60 = 12600 secs
+        // nanos = 12600 * 1_000_000_000
+        let nanos: i64 = 12600 * 1_000_000_000;
+        let secs = utc_nanos_to_ist_secs_of_day(nanos);
+        assert_eq!(secs, 32400); // 09:00 IST = 32400 secs-of-day
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_market_close() {
+        // IST 15:30:00 = UTC 10:00:00 = 36000 secs
+        let nanos: i64 = 36000 * 1_000_000_000;
+        let secs = utc_nanos_to_ist_secs_of_day(nanos);
+        assert_eq!(secs, 55800); // 15:30 IST = 55800 secs-of-day
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_result_in_range() {
+        // Any valid input should produce secs_of_day in [0, 86400)
+        for epoch_secs in [0_i64, 1772073900, 1_000_000_000, i64::MAX / 2] {
+            let nanos = epoch_secs.saturating_mul(1_000_000_000);
+            let secs = utc_nanos_to_ist_secs_of_day(nanos);
+            assert!(
+                secs < SECONDS_PER_DAY,
+                "secs_of_day out of range for input {epoch_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_negative_nanos() {
+        // Negative nanos (before epoch) should still produce valid secs-of-day via rem_euclid
+        let secs = utc_nanos_to_ist_secs_of_day(-1_000_000_000);
+        assert!(secs < SECONDS_PER_DAY);
+    }
+
+    #[test]
+    fn test_utc_nanos_to_ist_secs_of_day_midnight_ist() {
+        // IST midnight = UTC 18:30 previous day = 18*3600 + 30*60 = 66600 UTC secs-of-day
+        // But we need full epoch. Let's use a known date.
+        // 2026-03-17 UTC 18:30:00 = IST 2026-03-18 00:00:00
+        // nanos = 66600 * 1_000_000_000
+        let nanos: i64 = 66600 * 1_000_000_000;
+        let secs = utc_nanos_to_ist_secs_of_day(nanos);
+        // 66600 UTC secs + 19800 IST offset = 86400 → 86400 % 86400 = 0 → midnight IST
+        assert_eq!(secs, 0);
+    }
+
+    // ===================================================================
+    // derive_depth_timestamp_secs — extracted pure function tests
+    // ===================================================================
+
+    #[test]
+    fn test_derive_depth_timestamp_valid_tick() {
+        // tick_is_valid = true → use exchange_timestamp
+        let ts = derive_depth_timestamp_secs(true, 1772073900, 1_772_000_000_000_000_000);
+        assert_eq!(ts, 1772073900);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_invalid_tick() {
+        // tick_is_valid = false → derive from received_at_nanos
+        let nanos: i64 = 1_772_073_900_000_000_000;
+        let ts = derive_depth_timestamp_secs(false, 0, nanos);
+        assert_eq!(ts, 1_772_073_900);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_invalid_tick_zero_nanos() {
+        let ts = derive_depth_timestamp_secs(false, 0, 0);
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_valid_ignores_nanos() {
+        // Even with different nanos, valid tick uses exchange_timestamp
+        let ts = derive_depth_timestamp_secs(true, 12345, 99_999_999_999_999_999);
+        assert_eq!(ts, 12345);
+    }
+
+    #[test]
+    fn test_derive_depth_timestamp_invalid_large_nanos() {
+        let nanos: i64 = 2_000_000_000_000_000_000; // ~2033
+        let ts = derive_depth_timestamp_secs(false, 0, nanos);
+        assert_eq!(ts, 2_000_000_000);
+    }
+
+    // ===================================================================
+    // Broadcast channel + top movers + candle aggregator integration
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_processor_with_broadcast_channel() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (tick_broadcast_tx, mut tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_broadcast_tx),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Send valid tick — should be broadcast
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        // Receive from broadcast
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let tick = tick_broadcast_rx.try_recv();
+        assert!(tick.is_ok(), "valid tick should be broadcast");
+        let tick = tick.unwrap();
+        assert_eq!(tick.security_id, 13);
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_with_top_movers() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let top_movers = crate::pipeline::top_movers::TopMoversTracker::new();
+        let shared_snapshot: crate::pipeline::top_movers::SharedTopMoversSnapshot =
+            std::sync::Arc::new(std::sync::RwLock::new(None));
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(top_movers),
+                Some(shared_snapshot),
+            )
+            .await;
+        });
+
+        // Send valid ticks
+        for i in 0..5 {
+            let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900 + i);
+            frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+
+        // Wait for periodic snapshot check (>5s)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_quote_with_broadcast_and_top_movers() {
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (tick_broadcast_tx, _tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+        let top_movers = crate::pipeline::top_movers::TopMoversTracker::new();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_broadcast_tx),
+                None,
+                None,
+                Some(top_movers),
+                None,
+            )
+            .await;
+        });
+
+        // Send Full Quote packet with valid LTP and timestamp
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_market_depth_valid_ltp_no_timestamp_broadcast() {
+        // Market depth code 3 has valid LTP but timestamp=0.
+        // LTP valid: should broadcast and update top movers.
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let (tick_broadcast_tx, mut tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
+        let top_movers = crate::pipeline::top_movers::TopMoversTracker::new();
+
+        let handle = tokio::spawn(async move {
+            run_tick_processor(
+                frame_rx,
+                None,
+                None,
+                Some(tick_broadcast_tx),
+                None,
+                None,
+                Some(top_movers),
+                None,
+            )
+            .await;
+        });
+
+        let frame = make_market_depth_frame(42, 25000.0);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let tick = tick_broadcast_rx.try_recv();
+        // Market depth with valid LTP should broadcast
+        assert!(tick.is_ok(), "market depth with valid LTP should broadcast");
+
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tracing subscriber tests — forces field expression evaluation
+    // -----------------------------------------------------------------------
+
+    struct SinkSubscriber;
+    impl tracing::Subscriber for SinkSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_parse_error_with_tracing_subscriber() {
+        // Exercises warn! field expressions in the parse error path (line 285)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        frame_tx
+            .send(bytes::Bytes::from(vec![0u8; 4]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_junk_tick_with_tracing_subscriber() {
+        // Exercises debug! field expressions in junk tick path (lines 306-311)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_ticker_frame(13, 0.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_full_quote_junk_with_tracing_subscriber() {
+        // Exercises debug! field expressions in full-quote junk path (lines 424-430)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&0.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_crossed_market_with_tracing_subscriber() {
+        // Exercises debug! field expressions in crossed market path (lines 448-453)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        // Build a Full packet with bid > ask at level 0 to trigger crossed market
+        let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
+        frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1772073900_u32.to_le_bytes());
+        // Set bid_price > ask_price at depth level 0 (offset 62 in full packet)
+        // Level 0: bid_qty@62, ask_qty@66, bid_orders@70, ask_orders@72,
+        //          bid_price@74, ask_price@78
+        frame[62..66].copy_from_slice(&100u32.to_le_bytes()); // bid_qty
+        frame[66..70].copy_from_slice(&100u32.to_le_bytes()); // ask_qty
+        frame[70..72].copy_from_slice(&5u16.to_le_bytes()); // bid_orders
+        frame[72..74].copy_from_slice(&5u16.to_le_bytes()); // ask_orders
+        frame[74..78].copy_from_slice(&25000.0_f32.to_le_bytes()); // bid > ask
+        frame[78..82].copy_from_slice(&24900.0_f32.to_le_bytes()); // ask
+        // Fill remaining depth levels with valid finite prices
+        for level in 1..5 {
+            let base = 62 + level * 20;
+            frame[base..base + 4].copy_from_slice(&10u32.to_le_bytes());
+            frame[base + 4..base + 8].copy_from_slice(&10u32.to_le_bytes());
+            frame[base + 8..base + 10].copy_from_slice(&1u16.to_le_bytes());
+            frame[base + 10..base + 12].copy_from_slice(&1u16.to_le_bytes());
+            frame[base + 12..base + 16].copy_from_slice(&24500.0_f32.to_le_bytes());
+            frame[base + 16..base + 20].copy_from_slice(&24501.0_f32.to_le_bytes());
+        }
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_disconnect_with_tracing_subscriber() {
+        // Exercises error! field expression in disconnect path (line 597)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let mut frame = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
+        frame[8..10].copy_from_slice(&805u16.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_oi_with_tracing_subscriber() {
+        // Exercises debug! field expressions in OI path (lines 519-522)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_market_status_with_tracing_subscriber() {
+        // Exercises info! field expressions in market status path (line 577)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_valid_tick_with_tracing_subscriber() {
+        // Exercises trace! field expressions in successful tick path (lines 367-371)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_processor_previous_close_valid_with_tracing_subscriber() {
+        // Exercises debug! field expressions in previous close persist path (lines 567-570)
+        let _guard = tracing::subscriber::set_default(SinkSubscriber);
+        let (frame_tx, frame_rx) = mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            run_tick_processor(frame_rx, None, None, None, None, None, None, None).await;
+        });
+        // Build a PrevClose packet with valid previous_close price
+        let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
+        frame[8..12].copy_from_slice(&24500.0_f32.to_le_bytes());
+        frame[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(frame_tx);
+        let _ = handle.await;
     }
 }

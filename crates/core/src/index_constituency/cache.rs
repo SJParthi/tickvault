@@ -152,4 +152,90 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
+
+    // =====================================================================
+    // Additional coverage: cache_path, empty map roundtrip, overwrite
+    // =====================================================================
+
+    #[test]
+    fn test_cache_path_construction() {
+        let path = cache_path("/tmp/dlt-cache", "constituency.json");
+        assert_eq!(path, PathBuf::from("/tmp/dlt-cache/constituency.json"));
+    }
+
+    #[test]
+    fn test_cache_path_nested_dir() {
+        let path = cache_path("/a/b/c", "data.json");
+        assert_eq!(path, PathBuf::from("/a/b/c/data.json"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_empty_map_roundtrip() {
+        let cache_dir = test_cache_dir("empty-map");
+        let map = IndexConstituencyMap::default();
+
+        save_constituency_cache(&map, &cache_dir, "empty.json")
+            .await
+            .unwrap();
+
+        let loaded = load_constituency_cache(&cache_dir, "empty.json")
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.index_count(), 0);
+        assert_eq!(loaded.stock_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cache_overwrite_existing() {
+        let cache_dir = test_cache_dir("overwrite");
+
+        // Write first version
+        let mut map1 = IndexConstituencyMap::default();
+        map1.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![]);
+        save_constituency_cache(&map1, &cache_dir, "cache.json")
+            .await
+            .unwrap();
+
+        // Write second version (overwrite)
+        let mut map2 = IndexConstituencyMap::default();
+        map2.index_to_constituents
+            .insert("Nifty Bank".to_string(), vec![]);
+        map2.index_to_constituents
+            .insert("Nifty IT".to_string(), vec![]);
+        save_constituency_cache(&map2, &cache_dir, "cache.json")
+            .await
+            .unwrap();
+
+        let loaded = load_constituency_cache(&cache_dir, "cache.json")
+            .await
+            .unwrap();
+
+        // Should have the second version's data
+        assert_eq!(loaded.index_count(), 2);
+        assert!(loaded.contains_index("Nifty Bank"));
+        assert!(loaded.contains_index("Nifty IT"));
+        assert!(!loaded.contains_index("Nifty 50"));
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cache_save_creates_nested_dir() {
+        let cache_dir = format!("/tmp/dlt-test-nested-{}/sub/dir", std::process::id());
+        let map = IndexConstituencyMap::default();
+        save_constituency_cache(&map, &cache_dir, "test.json")
+            .await
+            .unwrap();
+
+        let loaded = load_constituency_cache(&cache_dir, "test.json")
+            .await
+            .unwrap();
+        assert_eq!(loaded.index_count(), 0);
+
+        let _ = std::fs::remove_dir_all(format!("/tmp/dlt-test-nested-{}", std::process::id()));
+    }
 }

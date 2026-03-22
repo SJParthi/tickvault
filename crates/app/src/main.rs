@@ -24,14 +24,18 @@
 //! 14. Spawn token renewal task
 //! 15. Await shutdown signal
 
-mod infra;
-mod observability;
-mod trading_pipeline;
+// Modules are declared in lib.rs for coverage instrumentation.
+use dhan_live_trader_app::boot_helpers::{
+    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START,
+    compute_market_close_sleep, create_log_file_writer, effective_ws_stagger, format_bind_addr,
+    format_cross_match_details, format_timeframe_details, format_violation_details,
+};
+use dhan_live_trader_app::{infra, observability, trading_pipeline};
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, Timelike, Utc};
+use chrono::Utc;
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
@@ -40,16 +44,15 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
 use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 use dhan_live_trader_core::auth::secret_manager;
 use dhan_live_trader_core::auth::token_cache;
 use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
-use dhan_live_trader_core::historical::candle_fetcher::{
-    duration_until_post_market_fetch, fetch_historical_candles,
+use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
+use dhan_live_trader_core::historical::cross_verify::{
+    cross_match_historical_vs_live, verify_candle_integrity,
 };
-use dhan_live_trader_core::historical::cross_verify::verify_candle_integrity;
 use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
 use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
 use dhan_live_trader_core::instrument::{
@@ -76,40 +79,9 @@ use dhan_live_trader_storage::tick_persistence::{
 };
 
 use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::SharedAppState;
+use dhan_live_trader_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Base config file path (relative to working directory).
-const CONFIG_BASE_PATH: &str = "config/base.toml";
-
-/// Log file path for Alloy/Loki consumption.
-///
-/// When running via `cargo run` (dev mode), this file allows Alloy
-/// to ingest app logs into Loki without requiring a Docker container.
-/// The file is created at startup; Alloy watches it and pushes to Loki.
-const APP_LOG_FILE_PATH: &str = "data/logs/app.log";
-
-/// Fast boot window start (IST). Starts 15 min before NSE pre-open (09:00)
-/// to cover crash recovery during the pre-open session.
-const FAST_BOOT_WINDOW_START: &str = "09:00:00";
-
-/// Fast boot window end (IST). NSE regular session closes at 15:30.
-const FAST_BOOT_WINDOW_END: &str = "15:30:00";
-
-/// Reduced WebSocket connection stagger for off-market-hours boot (milliseconds).
-///
-/// Dhan docs impose no rate limit on WebSocket connection establishment.
-/// During market hours we use the full 10s stagger (config) as a defensive
-/// measure against server load. Outside market hours, 1s is sufficient —
-/// avoids the unnecessary 40s boot delay while remaining respectful.
-const OFF_HOURS_CONNECTION_STAGGER_MS: u64 = 1000;
-
-/// Local override config file path (git-ignored, optional).
-/// Overrides Docker hostnames with localhost for `cargo run` on host.
-const CONFIG_LOCAL_PATH: &str = "config/local.toml";
+// Constants are in boot_helpers module (lib.rs) for coverage instrumentation.
 
 // ---------------------------------------------------------------------------
 // Main
@@ -398,6 +370,9 @@ async fn main() -> Result<()> {
                     ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
                     calendar_persistence::ensure_calendar_table(&config.questdb),
+                    dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+                        &config.questdb
+                    ),
                     dhan_live_trader_storage::materialized_views::ensure_candle_views(
                         &config.questdb
                     ),
@@ -524,17 +499,52 @@ async fn main() -> Result<()> {
             }
         };
 
+        // --- Background: Index constituency download (best-effort) ---
+        let bg_constituency =
+            dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+                &config.index_constituency,
+                &config.instrument.csv_cache_directory,
+            )
+            .await;
+
+        // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+        // Enrich with security_ids from instrument master for news-based trading.
+        if let Some(ref map) = bg_constituency {
+            match dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                map,
+                &config.questdb,
+                fresh_universe.as_ref(),
+            ) {
+                Ok(()) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "index constituency QuestDB persistence failed (best-effort)"
+                    );
+                }
+            }
+        }
+
+        let bg_shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+            std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
+
         // --- Background: API server ---
+        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
         let api_state = SharedAppState::new(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
             shared_movers.clone(),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            bg_shared_constituency,
+            health_status,
         );
 
-        let router = build_router(api_state);
-        let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+        let router = build_router(
+            api_state,
+            &config.api.allowed_origins,
+            config.strategy.dry_run,
+        );
+        let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
             .parse()
             .context("invalid API bind address")?;
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -564,6 +574,7 @@ async fn main() -> Result<()> {
                 tm,
                 &notifier,
                 std::sync::Arc::clone(&post_market_signal),
+                is_trading,
             );
         }
 
@@ -688,6 +699,9 @@ async fn main() -> Result<()> {
         ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
         calendar_persistence::ensure_calendar_table(&config.questdb),
+        dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+            &config.questdb
+        ),
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
     );
 
@@ -743,15 +757,18 @@ async fn main() -> Result<()> {
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let token_handle = token_manager.token_handle();
+
+    // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
+    // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
+    let ws_client_id = {
+        let credentials = secret_manager::fetch_dhan_credentials()
+            .await
+            .context("failed to fetch Dhan client ID for WebSocket + trading")?;
+        credentials.client_id.expose_secret().to_string()
+    };
+
     let (frame_receiver, ws_handles) = if subscription_plan.is_some() {
         info!("building WebSocket connection pool");
-
-        let ws_client_id = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for WebSocket")?;
-            credentials.client_id.expose_secret().to_string()
-        };
 
         build_websocket_pool(
             &token_handle,
@@ -828,6 +845,7 @@ async fn main() -> Result<()> {
         &token_manager,
         &notifier,
         std::sync::Arc::clone(&post_market_signal),
+        is_trading,
     );
 
     // -----------------------------------------------------------------------
@@ -838,17 +856,12 @@ async fn main() -> Result<()> {
 
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
-        let ws_client_id = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for order update WebSocket")?;
-            credentials.client_id.expose_secret().to_string()
-        };
+        let order_ws_client_id = ws_client_id.clone();
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
         tokio::spawn(async move {
-            run_order_update_connection(url, ws_client_id, token, sender, cal).await;
+            run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
         })
     };
     info!("order update WebSocket started");
@@ -857,20 +870,13 @@ async fn main() -> Result<()> {
     // Step 10.5: Spawn trading pipeline (indicators → strategies → OMS)
     // -----------------------------------------------------------------------
     let trading_handle = {
-        let ws_client_id_for_trading = {
-            let credentials = secret_manager::fetch_dhan_credentials()
-                .await
-                .context("failed to fetch Dhan client ID for trading pipeline")?;
-            credentials.client_id.expose_secret().to_string()
-        };
-
         let tick_rx = tick_broadcast_sender.subscribe();
         let order_rx = order_update_sender.subscribe();
 
         match trading_pipeline::init_trading_pipeline(
             &config,
             &token_manager.token_handle(),
-            &ws_client_id_for_trading,
+            &ws_client_id,
         ) {
             Some((pipeline_config, hot_reloader)) => {
                 let handle = trading_pipeline::spawn_trading_pipeline(
@@ -890,19 +896,56 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 10.5: Download index constituency data (non-blocking, best-effort)
+    // -----------------------------------------------------------------------
+    let constituency_map =
+        dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+            &config.index_constituency,
+            &config.instrument.csv_cache_directory,
+        )
+        .await;
+
+    // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
+    // Enrich with security_ids from instrument master for news-based trading.
+    if let Some(ref map) = constituency_map {
+        match dhan_live_trader_storage::constituency_persistence::persist_constituency(
+            map,
+            &config.questdb,
+            slow_boot_universe.as_ref(),
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "index constituency QuestDB persistence failed (best-effort)"
+                );
+            }
+        }
+    }
+
+    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+        std::sync::Arc::new(std::sync::RwLock::new(constituency_map));
+
+    // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
+    let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
     let api_state = SharedAppState::new(
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
         shared_movers.clone(),
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
+        shared_constituency.clone(),
+        health_status,
     );
 
-    let router = build_router(api_state);
+    let router = build_router(
+        api_state,
+        &config.api.allowed_origins,
+        config.strategy.dry_run,
+    );
 
-    let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
         .parse()
         .context("invalid API bind address")?;
 
@@ -966,14 +1009,7 @@ async fn load_instruments(
     .await
     {
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
-            let ist = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-                Some(tz) => tz,
-                None => {
-                    error!("invalid IST offset constant");
-                    return (None, None);
-                }
-            };
-            let today = Utc::now().with_timezone(&ist).date_naive();
+            let today = Utc::now().with_timezone(&ist_offset()).date_naive();
             let plan = build_subscription_plan(&universe, &config.subscription, today);
 
             info!(
@@ -1013,7 +1049,10 @@ async fn load_instruments(
             (Some(plan), universe)
         }
         Ok(InstrumentLoadResult::Unavailable) => {
-            info!("instruments: no cache available during market hours");
+            // I-P0-06: This should only trigger if emergency download also failed
+            error!(
+                "CRITICAL: instruments unavailable — emergency download failed, system has ZERO instruments"
+            );
             (None, None)
         }
         Err(err) => {
@@ -1026,39 +1065,7 @@ async fn load_instruments(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: Create log file writer for Alloy → Loki ingestion
-// ---------------------------------------------------------------------------
-
-/// Opens (or creates) the app log file for Alloy consumption.
-///
-/// Creates `data/logs/` directory if needed. Returns `None` if the file
-/// cannot be created (best-effort — logging to stdout always works).
-fn create_log_file_writer() -> Option<std::fs::File> {
-    let log_dir = std::path::Path::new(APP_LOG_FILE_PATH)
-        .parent()
-        .unwrap_or(std::path::Path::new("data/logs"));
-
-    // O(1) EXEMPT: begin — cold path, logging bootstrap before tracing is initialized
-    #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
-    if let Err(err) = std::fs::create_dir_all(log_dir) {
-        eprintln!("warning: cannot create log directory {log_dir:?}: {err}");
-        return None;
-    }
-
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(APP_LOG_FILE_PATH)
-    {
-        Ok(file) => Some(file),
-        #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
-        Err(err) => {
-            eprintln!("warning: cannot open log file {APP_LOG_FILE_PATH}: {err}");
-            None
-        } // O(1) EXEMPT: end
-    }
-}
+// create_log_file_writer is now in boot_helpers module (lib.rs).
 
 // ---------------------------------------------------------------------------
 // Helper: Build WebSocket connection pool (shared by fast and slow boot paths)
@@ -1083,18 +1090,16 @@ async fn build_websocket_pool(
     };
 
     // Outside market hours, use reduced stagger to avoid unnecessary boot delay.
-    let ws_config = if is_market_hours {
-        config.websocket.clone()
-    } else {
-        let mut cfg = config.websocket.clone();
+    let mut ws_config = config.websocket.clone();
+    let stagger = effective_ws_stagger(ws_config.connection_stagger_ms, is_market_hours);
+    if stagger != ws_config.connection_stagger_ms {
         info!(
-            market_hours_stagger_ms = cfg.connection_stagger_ms,
-            off_hours_stagger_ms = OFF_HOURS_CONNECTION_STAGGER_MS,
+            market_hours_stagger_ms = ws_config.connection_stagger_ms,
+            off_hours_stagger_ms = stagger,
             "using reduced WebSocket stagger (off-market-hours boot)"
         );
-        cfg.connection_stagger_ms = OFF_HOURS_CONNECTION_STAGGER_MS;
-        cfg
-    };
+    }
+    ws_config.connection_stagger_ms = stagger;
 
     info!("building WebSocket connection pool");
 
@@ -1145,6 +1150,7 @@ fn spawn_historical_candle_fetch(
     token_manager: &std::sync::Arc<TokenManager>,
     notifier: &std::sync::Arc<NotificationService>,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
+    is_trading_day: bool,
 ) {
     let plan = match subscription_plan
         .as_ref()
@@ -1174,12 +1180,15 @@ fn spawn_historical_candle_fetch(
                     instruments_fetched: 0,
                     instruments_failed: 0,
                     total_candles: 0,
+                    persist_failures: 0,
+                    failed_instruments: vec![],
+                    failure_reasons: std::collections::HashMap::new(),
                 });
                 return;
             }
         };
 
-        let mut candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
+        let candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
             Ok(writer) => writer,
             Err(err) => {
                 warn!(?err, "failed to create candle writer for background fetch");
@@ -1187,20 +1196,70 @@ fn spawn_historical_candle_fetch(
                     instruments_fetched: 0,
                     instruments_failed: 0,
                     total_candles: 0,
+                    persist_failures: 0,
+                    failed_instruments: vec![],
+                    failure_reasons: std::collections::HashMap::new(),
                 });
                 return;
             }
         };
 
-        info!("starting background historical candle fetch");
+        // -----------------------------------------------------------------
+        // Trading day: skip initial fetch — wait for post-market signal
+        //   (after 15:30 IST, WS disconnected, live data fully ingested)
+        // Non-trading day: fetch immediately at boot (no live data to wait for)
+        // -----------------------------------------------------------------
+
+        if is_trading_day {
+            info!(
+                "trading day — skipping initial historical fetch, waiting for post-market signal"
+            );
+            post_market_signal.notified().await;
+            info!("post-market signal received — WebSockets disconnected, live data ingested");
+        } else {
+            info!("non-trading day — starting historical candle fetch immediately");
+        }
+
+        // -----------------------------------------------------------------
+        // Fetch historical candles (runs immediately on non-trading days,
+        // or after post-market signal on trading days)
+        // -----------------------------------------------------------------
+
+        // Re-fetch credentials if we waited (token may have been refreshed)
+        let fetch_client_id = if is_trading_day {
+            match secret_manager::fetch_dhan_credentials().await {
+                Ok(creds) => creds.client_id,
+                Err(err) => {
+                    warn!(?err, "failed to fetch credentials for post-market fetch");
+                    return;
+                }
+            }
+        } else {
+            client_id
+        };
+
+        // Re-create writer if we waited (previous may have timed out)
+        let mut fetch_writer = if is_trading_day {
+            match CandlePersistenceWriter::new(&bg_questdb_config) {
+                Ok(writer) => writer,
+                Err(err) => {
+                    warn!(?err, "failed to create candle writer for post-market fetch");
+                    return;
+                }
+            }
+        } else {
+            candle_writer
+        };
+
+        info!("starting historical candle fetch");
 
         let summary = fetch_historical_candles(
             &bg_registry,
             &bg_dhan_config,
             &bg_historical_config,
             &bg_token_handle,
-            &client_id,
-            &mut candle_writer,
+            &fetch_client_id,
+            &mut fetch_writer,
         )
         .await;
 
@@ -1209,130 +1268,92 @@ fn spawn_historical_candle_fetch(
                 instruments_fetched: summary.instruments_fetched,
                 instruments_failed: summary.instruments_failed,
                 total_candles: summary.total_candles,
+                persist_failures: summary.persist_failures,
+                failed_instruments: summary.failed_instruments.clone(),
+                failure_reasons: summary.failure_reasons.clone(),
             });
         } else {
             bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
                 instruments_fetched: summary.instruments_fetched,
                 instruments_skipped: summary.instruments_skipped,
                 total_candles: summary.total_candles,
+                persist_failures: summary.persist_failures,
             });
         }
 
+        // -----------------------------------------------------------------
         // Cross-verify candle integrity in QuestDB
-        let verify_report = verify_candle_integrity(&bg_questdb_config).await;
+        // -----------------------------------------------------------------
+        let verify_report = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
+        let timeframe_details = format_timeframe_details(&verify_report);
         if verify_report.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
                 instruments_checked: verify_report.instruments_checked,
                 total_candles: verify_report.total_candles_in_db,
+                timeframe_details,
+                ohlc_violations: verify_report.ohlc_violations,
+                data_violations: verify_report.data_violations,
+                timestamp_violations: verify_report.timestamp_violations,
             });
         } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
                 instruments_checked: verify_report.instruments_checked,
                 instruments_with_gaps: verify_report.instruments_with_gaps,
+                timeframe_details,
+                ohlc_violations: verify_report.ohlc_violations,
+                data_violations: verify_report.data_violations,
+                timestamp_violations: verify_report.timestamp_violations,
+                ohlc_details: format_violation_details(&verify_report.ohlc_details),
+                data_details: format_violation_details(&verify_report.data_details),
+                timestamp_details: format_violation_details(&verify_report.timestamp_details),
             });
         }
 
-        info!(
-            instruments_fetched = summary.instruments_fetched,
-            instruments_failed = summary.instruments_failed,
-            total_candles = summary.total_candles,
-            verification_passed = verify_report.passed,
-            "background historical candle fetch complete"
-        );
+        // -----------------------------------------------------------------
+        // Cross-match historical vs live candle data (trading day only —
+        // on non-trading days there's no live data to compare against)
+        // -----------------------------------------------------------------
+        if is_trading_day {
+            let cross_match =
+                cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
+            if cross_match.passed {
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
+                    timeframes_checked: cross_match.timeframes_checked,
+                    candles_compared: cross_match.candles_compared,
+                });
+            } else {
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
+                    candles_compared: cross_match.candles_compared,
+                    mismatches: cross_match.mismatches,
+                    missing_live: cross_match.missing_live,
+                    mismatch_details: format_cross_match_details(&cross_match.mismatch_details),
+                });
+            }
 
-        // --- Post-market re-fetch: wait for disconnect signal OR 15:35 IST timer ---
-        let wait_duration = duration_until_post_market_fetch();
-        if wait_duration > std::time::Duration::ZERO {
             info!(
-                wait_secs = wait_duration.as_secs(),
-                "waiting for post-market signal or 15:35 IST for re-fetch"
+                instruments_fetched = summary.instruments_fetched,
+                instruments_failed = summary.instruments_failed,
+                total_candles = summary.total_candles,
+                verification_passed = verify_report.passed,
+                cross_match_passed = cross_match.passed,
+                "post-market historical fetch + cross-verification complete"
             );
-            // Wait for either the post-market disconnect signal or the timer
-            tokio::select! {
-                () = post_market_signal.notified() => {
-                    // Add buffer after disconnect for Dhan to finalize data
-                    info!("post-market disconnect signal received — waiting for data finalization");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        dhan_live_trader_common::constants::POST_MARKET_DATA_FINALIZATION_SECS,
-                    )).await;
-                }
-                () = tokio::time::sleep(wait_duration) => {
-                    info!("15:35 IST reached — starting post-market re-fetch");
-                }
-            }
         } else {
-            info!("past 15:35 IST — running post-market re-fetch immediately");
+            info!(
+                instruments_fetched = summary.instruments_fetched,
+                instruments_failed = summary.instruments_failed,
+                total_candles = summary.total_candles,
+                verification_passed = verify_report.passed,
+                "non-trading day historical fetch complete"
+            );
         }
-
-        // Re-create writer for post-market fetch (previous may have been consumed)
-        let mut pm_candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
-            Ok(writer) => writer,
-            Err(err) => {
-                warn!(?err, "failed to create candle writer for post-market fetch");
-                return;
-            }
-        };
-
-        // Re-fetch credentials (token may have been refreshed)
-        let pm_client_id = match secret_manager::fetch_dhan_credentials().await {
-            Ok(creds) => creds.client_id,
-            Err(err) => {
-                warn!(?err, "failed to fetch credentials for post-market re-fetch");
-                return;
-            }
-        };
-
-        info!("starting post-market historical candle re-fetch");
-
-        let pm_summary = fetch_historical_candles(
-            &bg_registry,
-            &bg_dhan_config,
-            &bg_historical_config,
-            &bg_token_handle,
-            &pm_client_id,
-            &mut pm_candle_writer,
-        )
-        .await;
-
-        if pm_summary.instruments_failed > 0 {
-            bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
-                instruments_fetched: pm_summary.instruments_fetched,
-                instruments_failed: pm_summary.instruments_failed,
-                total_candles: pm_summary.total_candles,
-            });
-        } else {
-            bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
-                instruments_fetched: pm_summary.instruments_fetched,
-                instruments_skipped: pm_summary.instruments_skipped,
-                total_candles: pm_summary.total_candles,
-            });
-        }
-
-        // Re-verify after post-market fetch
-        let pm_verify = verify_candle_integrity(&bg_questdb_config).await;
-        if pm_verify.passed {
-            bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
-                instruments_checked: pm_verify.instruments_checked,
-                total_candles: pm_verify.total_candles_in_db,
-            });
-        } else {
-            bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
-                instruments_checked: pm_verify.instruments_checked,
-                instruments_with_gaps: pm_verify.instruments_with_gaps,
-            });
-        }
-
-        info!(
-            instruments_fetched = pm_summary.instruments_fetched,
-            instruments_failed = pm_summary.instruments_failed,
-            total_candles = pm_summary.total_candles,
-            verification_passed = pm_verify.passed,
-            "post-market historical candle re-fetch complete"
-        );
     });
 
     info!("background historical candle fetch spawned (non-blocking)");
 }
+
+// format_timeframe_details, format_violation_details, format_cross_match_details
+// are now in boot_helpers module (lib.rs).
 
 // ---------------------------------------------------------------------------
 // Helper: Cold-path tick persistence consumer (fast boot only)
@@ -1518,44 +1539,7 @@ async fn run_candle_persistence_consumer(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: Post-market sleep computation
-// ---------------------------------------------------------------------------
-
-/// Computes how long to sleep until the configured market close time (IST).
-///
-/// Returns `Duration::ZERO` if already past market close (post-market disconnect
-/// should happen immediately or not at all depending on caller logic).
-fn compute_market_close_sleep(market_close_time_str: &str) -> std::time::Duration {
-    let close_time = match chrono::NaiveTime::parse_from_str(market_close_time_str, "%H:%M:%S") {
-        Ok(t) => t,
-        Err(err) => {
-            warn!(
-                ?err,
-                market_close_time = market_close_time_str,
-                "failed to parse market close time"
-            );
-            return std::time::Duration::ZERO;
-        }
-    };
-
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => return std::time::Duration::ZERO,
-    };
-
-    let now_ist = Utc::now().with_timezone(&ist_offset);
-    let now_time = now_ist.time();
-
-    if now_time >= close_time {
-        // Already past market close
-        return std::time::Duration::ZERO;
-    }
-
-    let now_secs = u64::from(now_time.num_seconds_from_midnight());
-    let close_secs = u64::from(close_time.num_seconds_from_midnight());
-    std::time::Duration::from_secs(close_secs.saturating_sub(now_secs))
-}
+// compute_market_close_sleep is now in boot_helpers module (lib.rs).
 
 // ---------------------------------------------------------------------------
 // Helper: Graceful shutdown (shared by fast and slow boot paths)
@@ -1575,7 +1559,7 @@ async fn run_shutdown_fast(
     shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = format!("{}:{}", config.api.host, config.api.port)
+    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
 
@@ -1646,12 +1630,32 @@ async fn run_shutdown_fast(
         // Signal historical fetch task to start post-market re-fetch
         post_market_signal.notify_one();
 
-        info!("post-market: real-time pipeline stopped, API/dashboard still running");
-        info!("press Ctrl+C for full shutdown");
+        info!(
+            "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
+        );
 
-        // Phase 2: Wait for Ctrl+C for full shutdown
-        let _ = tokio::signal::ctrl_c().await;
-        info!("shutdown signal received — stopping remaining services");
+        // Phase 2: Auto-shutdown at APP_SHUTDOWN_TIME (16:00 IST) or Ctrl+C
+        let shutdown_sleep =
+            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
+        if shutdown_sleep > std::time::Duration::ZERO {
+            info!(
+                wait_secs = shutdown_sleep.as_secs(),
+                "auto-shutdown scheduled at 16:00 IST (Ctrl+C for immediate)"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(shutdown_sleep) => {
+                    info!("16:00 IST reached — initiating full auto-shutdown");
+                }
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(err) = result {
+                        warn!(?err, "failed to listen for shutdown signal");
+                    }
+                    info!("shutdown signal received — stopping remaining services");
+                }
+            }
+        } else {
+            info!("past 16:00 IST — initiating full shutdown immediately");
+        }
     } else {
         info!("shutdown signal received — stopping gracefully");
     }
@@ -1709,81 +1713,50 @@ async fn run_shutdown_fast(
     Ok(())
 }
 
+// All pure helper function tests are in boot_helpers.rs (lib.rs target).
+// Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
+    use dhan_live_trader_app::boot_helpers::{
+        APP_LOG_FILE_PATH, OFF_HOURS_CONNECTION_STAGGER_MS, determine_boot_mode, should_fast_boot,
+    };
+
+    // All pure helper tests moved to boot_helpers.rs in the lib target.
+    // Tests below verify main.rs-specific smoke behavior.
 
     #[test]
-    fn config_base_path_is_toml() {
-        assert!(
-            CONFIG_BASE_PATH.ends_with(".toml"),
-            "config path must be a TOML file"
-        );
+    fn test_main_imports_boot_helpers() {
+        // Verify boot_helpers constants are accessible from main.
+        assert!(CONFIG_BASE_PATH.ends_with(".toml"));
+        assert!(CONFIG_LOCAL_PATH.contains("local"));
+        assert!(!APP_LOG_FILE_PATH.is_empty());
+        assert!(OFF_HOURS_CONNECTION_STAGGER_MS > 0);
+        assert!(!FAST_BOOT_WINDOW_START.is_empty());
+        assert!(!FAST_BOOT_WINDOW_END.is_empty());
     }
 
     #[test]
-    fn config_local_path_is_toml() {
-        assert!(
-            CONFIG_LOCAL_PATH.ends_with(".toml"),
-            "local config path must be a TOML file"
-        );
+    fn test_boot_helper_functions_callable() {
+        let _ = compute_market_close_sleep("15:30:00");
+        let _ = format_violation_details(&[]);
+        let _ = format_cross_match_details(&[]);
+        let _ = create_log_file_writer();
     }
 
     #[test]
-    fn socket_addr_parses_valid_host_port() {
-        let addr: Result<SocketAddr, _> = "0.0.0.0:8080".parse();
-        assert!(addr.is_ok(), "valid host:port must parse");
-    }
+    fn test_new_boot_helpers_callable_from_main() {
+        // Verify the newly extracted helpers are accessible from main.
+        let addr = format_bind_addr("0.0.0.0", 3001);
+        assert!(addr.contains("3001"));
 
-    #[test]
-    fn socket_addr_rejects_invalid() {
-        let addr: Result<SocketAddr, _> = "not_a_socket".parse();
-        assert!(addr.is_err(), "invalid address must fail");
-    }
+        let stagger = effective_ws_stagger(3000, true);
+        assert_eq!(stagger, 3000);
 
-    #[test]
-    fn test_compute_market_close_sleep_valid_time() {
-        // Should return a Duration (possibly zero if past market close)
-        let duration = compute_market_close_sleep("15:30:00");
-        assert!(
-            duration.as_secs() <= 86_400,
-            "market close sleep should not exceed 24 hours"
-        );
-    }
+        let mode = determine_boot_mode(true, true);
+        assert_eq!(mode, "fast");
 
-    #[test]
-    fn test_compute_market_close_sleep_invalid_format() {
-        // Invalid time format → Duration::ZERO (graceful fallback)
-        let duration = compute_market_close_sleep("invalid");
-        assert_eq!(duration, std::time::Duration::ZERO);
-    }
-
-    #[test]
-    fn test_compute_market_close_sleep_empty_string() {
-        let duration = compute_market_close_sleep("");
-        assert_eq!(duration, std::time::Duration::ZERO);
-    }
-
-    #[test]
-    fn test_post_market_monitor_constants() {
-        // FAST_BOOT_WINDOW_END should match market close time
-        assert_eq!(FAST_BOOT_WINDOW_END, "15:30:00");
-    }
-
-    #[test]
-    fn off_hours_stagger_is_less_than_market_hours() {
-        // Off-hours stagger must be strictly less than the default 10s market-hours stagger.
-        // This test prevents accidental regressions where off-hours boot slows down.
-        const {
-            assert!(
-                OFF_HOURS_CONNECTION_STAGGER_MS > 0,
-                // "off-hours stagger must not be zero (still respectful to Dhan servers)"
-            );
-            assert!(
-                OFF_HOURS_CONNECTION_STAGGER_MS <= 2000,
-                // "off-hours stagger should not exceed 2s to avoid unnecessary boot delay"
-            );
-        }
+        assert!(should_fast_boot(true, true));
+        assert!(!should_fast_boot(false, true));
     }
 }

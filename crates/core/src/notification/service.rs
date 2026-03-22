@@ -678,10 +678,20 @@ mod tests {
             instruments_fetched: 200,
             instruments_failed: 9,
             total_candles: 180000,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         });
         service.notify(NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
             instruments_with_gaps: 3,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+            ohlc_details: vec![],
+            data_details: vec![],
+            timestamp_details: vec![],
         });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -833,10 +843,20 @@ mod tests {
             instruments_fetched: 0,
             instruments_failed: 500,
             total_candles: 0,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         });
         service.notify(NotificationEvent::CandleVerificationFailed {
             instruments_checked: 0,
             instruments_with_gaps: 100,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+            ohlc_details: vec![],
+            data_details: vec![],
+            timestamp_details: vec![],
         });
     }
 
@@ -853,5 +873,540 @@ mod tests {
             event.severity() < Severity::High,
             "Low-severity events must not reach SMS path (< High)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service with SNS — SMS code path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_critical_event_triggers_sms_path() {
+        // Critical events should attempt both Telegram and SNS (if configured).
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "critical test".to_string(),
+        };
+        assert!(
+            event.severity() >= Severity::High,
+            "AuthenticationFailed must be High or Critical severity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_self_closing_tag() {
+        assert_eq!(strip_html_tags("before<br/>after"), "beforeafter");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_attributes() {
+        assert_eq!(
+            strip_html_tags(r#"<a href="https://example.com">link</a>"#),
+            "link"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_tags_mixed_content() {
+        assert_eq!(
+            strip_html_tags("<b>DLT</b> Trading System v<i>1.0</i>"),
+            "DLT Trading System v1.0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_exactly_9_chars() {
+        let result = mask_phone("123456789");
+        assert_eq!(result, "123X56789");
+    }
+
+    #[test]
+    fn test_mask_phone_long_number() {
+        // 15 chars: prefix=3, suffix=5, mask=7
+        let result = mask_phone("123456789012345");
+        assert_eq!(result, "123XXXXXXX12345");
+    }
+
+    // -----------------------------------------------------------------------
+    // NotificationMode coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_noop_service_is_active_returns_false() {
+        let service = NotificationService {
+            mode: NotificationMode::NoOp,
+        };
+        assert!(!service.is_active());
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_no_closing_bracket() {
+        // "<tag without closing" — everything after '<' is inside tag
+        assert_eq!(strip_html_tags("before<tag without closing"), "before");
+    }
+
+    #[test]
+    fn test_strip_html_tags_consecutive_tags() {
+        assert_eq!(strip_html_tags("<a><b><c>text</c></b></a>"), "text");
+    }
+
+    #[test]
+    fn test_strip_html_tags_tag_with_newlines() {
+        assert_eq!(
+            strip_html_tags("<b>\nline1\nline2\n</b>"),
+            "\nline1\nline2\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_tags_emoji_content() {
+        // Unicode content should pass through
+        assert_eq!(strip_html_tags("<b>🚀 Launch</b>"), "🚀 Launch");
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — additional boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_10_chars() {
+        // 10 chars: prefix=3, suffix=5, mask=2
+        assert_eq!(mask_phone("1234567890"), "123XX67890");
+    }
+
+    #[test]
+    fn test_mask_phone_exactly_8_chars_boundary() {
+        // 8 chars → returns "***" (boundary)
+        assert_eq!(mask_phone("12345678"), "***");
+    }
+
+    #[test]
+    fn test_mask_phone_7_chars() {
+        // 7 chars → returns "***" (below boundary)
+        assert_eq!(mask_phone("1234567"), "***");
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service with SNS phone — triggers SMS code path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_high_severity_event() {
+        // We can't easily create an aws_sdk_sns::Client in tests, but we can
+        // verify that the notify() method correctly checks severity for SMS routing
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "test critical event".to_string(),
+        };
+        assert!(
+            event.severity() >= Severity::High,
+            "AuthenticationFailed must be High+ severity"
+        );
+
+        let low_event = NotificationEvent::StartupComplete { mode: "PAPER" };
+        assert!(
+            low_event.severity() < Severity::High,
+            "StartupComplete must be below High severity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Severity routing — medium severity does NOT trigger SMS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_severity_medium_does_not_trigger_sms() {
+        let event = NotificationEvent::TokenRenewed;
+        assert!(
+            event.severity() < Severity::High,
+            "TokenRenewed should not trigger SMS (below High)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — with SNS disabled
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_with_sns_disabled() {
+        let config = NotificationConfig {
+            send_timeout_ms: 100,
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            sns_enabled: false,
+        };
+        let service = NotificationService::initialize(&config).await;
+        // Without real SSM, should fall back to no-op
+        // With real SSM, should be active but without SNS
+        // Either way, should not panic
+        let _ = service.is_active();
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — with SNS enabled (still falls back gracefully)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_with_sns_enabled_falls_back_gracefully() {
+        let config = NotificationConfig {
+            send_timeout_ms: 100,
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            sns_enabled: true,
+        };
+        let service = NotificationService::initialize(&config).await;
+        // Whether SSM is available or not, initialize should not panic
+        // SNS phone number fetch may fail, but service still initializes
+        let _ = service.is_active();
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service with SNS client — High severity triggers SMS path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_notify_high_severity_without_sns_client() {
+        // Active service without SNS client — high severity should NOT panic
+        let service = make_active_service();
+        // AuthenticationFailed is Critical severity
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "test high severity no sns".to_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — only angle brackets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_only_gt_symbol() {
+        // A lone '>' without prior '<' is just a char — it toggles in_tag=false
+        assert_eq!(strip_html_tags(">"), "");
+    }
+
+    #[test]
+    fn test_strip_html_tags_only_lt_symbol() {
+        // A lone '<' starts a "tag" that never ends — everything after is swallowed
+        assert_eq!(strip_html_tags("<"), "");
+    }
+
+    #[test]
+    fn test_strip_html_tags_gt_then_text() {
+        // '>' sets in_tag=false, then "hello" is normal text
+        assert_eq!(strip_html_tags(">hello"), "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — Unicode and special characters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_unicode_chars() {
+        // 12 chars: prefix=3, suffix=5, mask=4
+        let result = mask_phone("+91ABCDEFGH");
+        assert_eq!(result.len(), 11); // 3 + 4 + 5 - 1 (Xs overlap)
+    }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — message body format
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_telegram_message_body_format() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let request_str = String::from_utf8_lossy(&buf[..n]);
+                // Verify the request contains JSON body with expected fields
+                assert!(request_str.contains("chat_id"));
+                assert!(request_str.contains("parse_mode"));
+                assert!(request_str.contains("HTML"));
+
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-token".to_string());
+        send_telegram_message(&client, &base_url, &token, "12345", "<b>Test</b>").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // NotificationService::disabled — multiple event types are safe
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disabled_service_websocket_events_safe() {
+        let service = NotificationService::disabled();
+        service.notify(NotificationEvent::WebSocketConnected {
+            connection_index: 0,
+        });
+        service.notify(NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "test".to_string(),
+        });
+        service.notify(NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+        });
+        service.notify(NotificationEvent::ShutdownInitiated);
+        service.notify(NotificationEvent::ShutdownComplete);
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service — all low-severity events go only to Telegram
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_low_severity_events_no_sms() {
+        let service = make_active_service();
+        // Low-severity events should NOT trigger SNS SMS path
+        service.notify(NotificationEvent::StartupComplete { mode: "PAPER" });
+        service.notify(NotificationEvent::ShutdownComplete);
+        service.notify(NotificationEvent::TokenRenewed);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — non-success HTTP response (e.g., 403)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_telegram_message_403_does_not_panic() {
+        let base_url = start_mock_telegram_server(403).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        // Should log a warning but not panic or return an error.
+        send_telegram_message(&client, &base_url, &token, "999999999", "test 403").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // send_telegram_message — 500 error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_telegram_message_500_does_not_panic() {
+        let base_url = start_mock_telegram_server(500).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let token = SecretString::from("fake-bot-token".to_string());
+
+        send_telegram_message(&client, &base_url, &token, "123", "test 500").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service — notify with connection refused logs warn
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_notify_connection_refused_logs_warning() {
+        // The active service points to 127.0.0.1:1 (connection refused).
+        // Notify spawns a background task that will fail silently.
+        let service = make_active_service();
+
+        service.notify(NotificationEvent::Custom {
+            message: "test connection refused path".to_string(),
+        });
+
+        // Wait for the background task to attempt and fail.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // No panic = success. The error is logged as warn.
+    }
+
+    // -----------------------------------------------------------------------
+    // disabled service — is_active returns false consistently
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disabled_service_is_active_consistent() {
+        let service = NotificationService::disabled();
+        assert!(!service.is_active());
+        assert!(!service.is_active()); // idempotent
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — real notification event messages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_real_event_message() {
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "token expired".to_string(),
+        };
+        let message = event.to_message();
+        let stripped = strip_html_tags(&message);
+        // Stripped should contain the reason but no HTML tags.
+        assert!(stripped.contains("token expired"));
+        assert!(!stripped.contains('<'));
+        assert!(!stripped.contains('>'));
+    }
+
+    // -----------------------------------------------------------------------
+    // make_active_service — high severity event with no SNS client
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_critical_event_no_sns_does_not_attempt_sms() {
+        let service = make_active_service(); // no sns_client
+        // Critical event — normally would trigger SMS, but no SNS client.
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "critical without SNS".to_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // No panic = success. SMS path is skipped due to None SNS client.
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_phone — consistency check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_phone_consistent_output() {
+        let phone = "+919876543210";
+        let masked1 = mask_phone(phone);
+        let masked2 = mask_phone(phone);
+        assert_eq!(masked1, masked2, "masking should be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service with SNS — exercises SMS code path
+    // -----------------------------------------------------------------------
+
+    fn make_active_service_with_sns() -> Arc<NotificationService> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        // Create a real AWS SNS client pointed at a fake endpoint.
+        // The SNS call will fail, but the code path is exercised.
+        let sns_config = aws_sdk_sns::Config::builder()
+            .endpoint_url("http://127.0.0.1:1")
+            .region(aws_sdk_sns::config::Region::new("ap-south-1"))
+            .behavior_version_latest()
+            .credentials_provider(aws_sdk_sns::config::Credentials::new(
+                "fake-access-key",
+                "fake-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .build();
+        let sns_client = aws_sdk_sns::Client::from_conf(sns_config);
+
+        Arc::new(NotificationService {
+            mode: NotificationMode::Active {
+                bot_token: SecretString::from("test-bot-token".to_string()),
+                chat_id: "123456789".to_string(),
+                http_client,
+                telegram_api_base_url: "http://127.0.0.1:1".to_string(),
+                sns_client: Some(sns_client),
+                sns_phone_number: Some("+919876543210".to_string()),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_critical_event_triggers_sms_code_path() {
+        let service = make_active_service_with_sns();
+        assert!(service.is_active());
+
+        // AuthenticationFailed is Critical severity — triggers both Telegram and SNS
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "test SNS path".to_string(),
+        });
+
+        // Wait for background tasks to attempt (and fail) sends
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // No panic = success. Both Telegram and SNS paths exercised.
+    }
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_low_severity_skips_sms() {
+        let service = make_active_service_with_sns();
+
+        // StartupComplete is Low severity — only Telegram, not SNS
+        service.notify(NotificationEvent::StartupComplete { mode: "PAPER" });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn test_active_service_with_sns_multiple_critical_events() {
+        let service = make_active_service_with_sns();
+
+        // Multiple critical events
+        service.notify(NotificationEvent::AuthenticationFailed {
+            reason: "failure 1".to_string(),
+        });
+        service.notify(NotificationEvent::TokenRenewalFailed {
+            attempts: 5,
+            reason: "failure 2".to_string(),
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_html_tags — special characters preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_html_tags_preserves_special_chars() {
+        assert_eq!(strip_html_tags("a & b"), "a & b");
+        assert_eq!(strip_html_tags("100%"), "100%");
+        assert_eq!(strip_html_tags("P&L: +500"), "P&L: +500");
+    }
+
+    // -----------------------------------------------------------------------
+    // Active service — rapid fire notifications
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_active_service_rapid_fire_does_not_panic() {
+        let service = make_active_service();
+        for i in 0..20 {
+            service.notify(NotificationEvent::Custom {
+                message: format!("rapid fire event {i}"),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }

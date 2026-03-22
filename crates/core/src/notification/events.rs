@@ -98,6 +98,8 @@ pub enum NotificationEvent {
         instruments_skipped: usize,
         /// Total candles ingested across all timeframes.
         total_candles: usize,
+        /// Number of QuestDB write failures (candles lost during persist).
+        persist_failures: usize,
     },
 
     /// Historical candle fetch completed with failures.
@@ -108,6 +110,12 @@ pub enum NotificationEvent {
         instruments_failed: usize,
         /// Total candles ingested.
         total_candles: usize,
+        /// Number of QuestDB write failures (candles lost during persist).
+        persist_failures: usize,
+        /// Symbol names of failed instruments (up to 50).
+        failed_instruments: Vec<String>,
+        /// Breakdown of failure reasons: "token_expired", "network_or_api", "persist".
+        failure_reasons: std::collections::HashMap<String, usize>,
     },
 
     /// Candle cross-verification passed — all timeframes have expected coverage.
@@ -116,6 +124,14 @@ pub enum NotificationEvent {
         instruments_checked: usize,
         /// Total candles in QuestDB.
         total_candles: usize,
+        /// Per-timeframe breakdown (pre-formatted lines).
+        timeframe_details: String,
+        /// OHLC violations found (high < low).
+        ohlc_violations: usize,
+        /// Data violations (non-positive prices).
+        data_violations: usize,
+        /// Timestamp violations (outside market hours).
+        timestamp_violations: usize,
     },
 
     /// Candle cross-verification found gaps in stored data.
@@ -124,6 +140,40 @@ pub enum NotificationEvent {
         instruments_checked: usize,
         /// Instruments with gaps.
         instruments_with_gaps: usize,
+        /// Per-timeframe breakdown (pre-formatted lines).
+        timeframe_details: String,
+        /// OHLC violations found (high < low).
+        ohlc_violations: usize,
+        /// Data violations (non-positive prices).
+        data_violations: usize,
+        /// Timestamp violations (outside market hours).
+        timestamp_violations: usize,
+        /// Pre-formatted OHLC violation detail lines for Telegram.
+        ohlc_details: Vec<String>,
+        /// Pre-formatted data violation detail lines for Telegram.
+        data_details: Vec<String>,
+        /// Pre-formatted timestamp violation detail lines for Telegram.
+        timestamp_details: Vec<String>,
+    },
+
+    /// Historical vs Live candle cross-match passed — all OHLCV values match.
+    CandleCrossMatchPassed {
+        /// Number of timeframes compared.
+        timeframes_checked: usize,
+        /// Total candles compared.
+        candles_compared: usize,
+    },
+
+    /// Historical vs Live candle cross-match found mismatches.
+    CandleCrossMatchFailed {
+        /// Total candles compared.
+        candles_compared: usize,
+        /// Total mismatches found.
+        mismatches: usize,
+        /// Historical candle exists but no live data (WebSocket missed ticks).
+        missing_live: usize,
+        /// Pre-formatted mismatch detail lines for Telegram.
+        mismatch_details: Vec<String>,
     },
 
     /// Public IP verification failed — static IP mismatch or detection failure.
@@ -152,6 +202,49 @@ pub enum NotificationEvent {
         deadline_secs: u64,
         /// Step that was running when deadline hit.
         step: String,
+    },
+
+    /// Order rejected by Dhan API or OMS validation.
+    OrderRejected {
+        /// Correlation ID of the rejected order.
+        correlation_id: String,
+        /// Reason for rejection.
+        reason: String,
+    },
+
+    /// OMS circuit breaker opened — order API calls halted.
+    CircuitBreakerOpened {
+        /// Number of consecutive failures that triggered the open.
+        consecutive_failures: u64,
+    },
+
+    /// OMS circuit breaker closed — order API calls resumed.
+    CircuitBreakerClosed,
+
+    /// OMS rate limit exhausted — order rejected due to SEBI limits.
+    RateLimitExhausted {
+        /// Which limit was hit (e.g., "per_second", "daily").
+        limit_type: String,
+    },
+
+    /// Risk engine halted trading — daily loss breach or position limit.
+    RiskHalt {
+        /// Reason for the halt (e.g., "daily_loss_breach", "position_limit").
+        reason: String,
+    },
+
+    /// WebSocket reconnection exhausted — all retry attempts failed.
+    WebSocketReconnectionExhausted {
+        /// Connection index that failed.
+        connection_index: usize,
+        /// Total reconnection attempts made.
+        attempts: u64,
+    },
+
+    /// Token renewal deadline missed — renewal failed past safe window.
+    TokenRenewalDeadlineMissed {
+        /// IST hour when the deadline was crossed.
+        deadline_hour_ist: u32,
     },
 
     /// Custom alert from any component.
@@ -219,35 +312,160 @@ impl NotificationEvent {
                 instruments_fetched,
                 instruments_skipped,
                 total_candles,
+                persist_failures,
             } => {
-                format!(
+                let mut msg = format!(
                     "<b>Historical candles OK</b>\nFetched: {instruments_fetched}\nSkipped: {instruments_skipped}\nCandles: {total_candles}\nTimeframes: 1m, 5m, 15m, 60m, 1d"
-                )
+                );
+                if *persist_failures > 0 {
+                    msg.push_str(&format!("\nPersist errors: {persist_failures}"));
+                }
+                msg
             }
             Self::HistoricalFetchFailed {
                 instruments_fetched,
                 instruments_failed,
                 total_candles,
+                persist_failures,
+                failed_instruments,
+                failure_reasons,
             } => {
-                format!(
+                let mut msg = format!(
                     "<b>Historical candle fetch — partial failure</b>\nFetched: {instruments_fetched}\nFailed: {instruments_failed}\nCandles: {total_candles}"
-                )
+                );
+                if *persist_failures > 0 {
+                    msg.push_str(&format!("\nPersist errors: {persist_failures}"));
+                }
+                if !failure_reasons.is_empty() {
+                    msg.push_str("\n\n<b>Failure breakdown:</b>");
+                    for (reason, count) in failure_reasons {
+                        msg.push_str(&format!("\n\u{2022} {reason}: {count}"));
+                    }
+                }
+                if !failed_instruments.is_empty() {
+                    msg.push_str("\n\n<b>Failed instruments:</b>");
+                    let show_count = failed_instruments.len().min(10);
+                    for name in &failed_instruments[..show_count] {
+                        msg.push_str(&format!("\n\u{2022} {name}"));
+                    }
+                    if failed_instruments.len() > 10 {
+                        let remaining = failed_instruments.len().saturating_sub(10);
+                        msg.push_str(&format!("\n... +{remaining} more"));
+                    }
+                }
+                msg
             }
             Self::CandleVerificationPassed {
                 instruments_checked,
                 total_candles,
+                timeframe_details,
+                ohlc_violations,
+                data_violations,
+                timestamp_violations,
             } => {
-                format!(
+                let mut msg = format!(
                     "<b>Candle verification OK</b>\nInstruments: {instruments_checked}\nTotal candles: {total_candles}"
-                )
+                );
+                if !timeframe_details.is_empty() {
+                    msg.push_str("\n\n<b>Timeframes:</b>\n");
+                    msg.push_str(timeframe_details);
+                }
+                if *ohlc_violations == 0 && *data_violations == 0 && *timestamp_violations == 0 {
+                    msg.push_str("\n\nChecks: OHLC \u{2713} | Data \u{2713} | Timestamps \u{2713}");
+                } else {
+                    if *ohlc_violations > 0 {
+                        msg.push_str(&format!("\nOHLC violations: {ohlc_violations}"));
+                    }
+                    if *data_violations > 0 {
+                        msg.push_str(&format!(
+                            "\nData violations: {data_violations} (non-blocking)"
+                        ));
+                    }
+                    if *timestamp_violations > 0 {
+                        msg.push_str(&format!(
+                            "\nTimestamp violations: {timestamp_violations} (non-blocking)"
+                        ));
+                    }
+                }
+                msg
             }
             Self::CandleVerificationFailed {
                 instruments_checked,
                 instruments_with_gaps,
+                timeframe_details,
+                ohlc_violations,
+                data_violations,
+                timestamp_violations,
+                ohlc_details,
+                data_details,
+                timestamp_details,
+            } => {
+                let mut msg = if *instruments_checked == 0 {
+                    "<b>Candle verification FAILED</b>\nChecked: 0\n\nNo instrument data found \u{2014} fetch may have completely failed".to_string()
+                } else {
+                    format!(
+                        "<b>Candle verification FAILED</b>\nChecked: {instruments_checked} | Gaps: {instruments_with_gaps}"
+                    )
+                };
+
+                // OHLC violations with details
+                if *ohlc_violations > 0 {
+                    msg.push_str(&format!("\n\n<b>OHLC violations ({ohlc_violations}):</b>"));
+                    append_detail_lines(&mut msg, ohlc_details, *ohlc_violations);
+                }
+
+                // Data violations with details
+                if *data_violations > 0 {
+                    msg.push_str(&format!("\n\n<b>Data violations ({data_violations}):</b>"));
+                    append_detail_lines(&mut msg, data_details, *data_violations);
+                }
+
+                // Timestamp violations with details
+                if *timestamp_violations > 0 {
+                    msg.push_str(&format!(
+                        "\n\n<b>Timestamp violations ({timestamp_violations}):</b>"
+                    ));
+                    append_detail_lines(&mut msg, timestamp_details, *timestamp_violations);
+                }
+
+                if *instruments_checked > 0 && !timeframe_details.is_empty() {
+                    msg.push_str("\n\n<b>Timeframes:</b>\n");
+                    msg.push_str(timeframe_details);
+                }
+                msg
+            }
+            Self::CandleCrossMatchPassed {
+                timeframes_checked,
+                candles_compared,
             } => {
                 format!(
-                    "<b>Candle verification FAILED</b>\nChecked: {instruments_checked}\nWith gaps: {instruments_with_gaps}"
+                    "<b>Historical vs Live cross-match OK</b>\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match (epsilon tolerance, volume ±10%, OI ±10%)"
                 )
+            }
+            Self::CandleCrossMatchFailed {
+                candles_compared,
+                mismatches,
+                missing_live,
+                mismatch_details,
+            } => {
+                let mut msg = format!(
+                    "<b>Historical vs Live cross-match FAILED</b>\nCompared: {candles_compared} | Mismatches: {mismatches}"
+                );
+                if *missing_live > 0 {
+                    msg.push_str(&format!("\nMissing live: {missing_live}"));
+                }
+                if !mismatch_details.is_empty() {
+                    msg.push_str("\n\n<b>Mismatches:</b>");
+                    let show_count = mismatch_details.len().min(10);
+                    for line in &mismatch_details[..show_count] {
+                        msg.push_str(&format!("\n{line}"));
+                    }
+                    if mismatch_details.len() > 10 {
+                        let remaining = mismatch_details.len().saturating_sub(10);
+                        msg.push_str(&format!("\n... +{remaining} more"));
+                    }
+                }
+                msg
             }
             Self::IpVerificationFailed { reason } => {
                 format!(
@@ -273,6 +491,41 @@ impl NotificationEvent {
             }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
+            Self::OrderRejected {
+                correlation_id,
+                reason,
+            } => {
+                format!("<b>Order REJECTED</b>\nCorrelation: {correlation_id}\n{reason}")
+            }
+            Self::CircuitBreakerOpened {
+                consecutive_failures,
+            } => {
+                format!(
+                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted"
+                )
+            }
+            Self::CircuitBreakerClosed => {
+                "<b>Circuit breaker CLOSED</b>\nOrder API calls resumed".to_string()
+            }
+            Self::RateLimitExhausted { limit_type } => {
+                format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
+            }
+            Self::RiskHalt { reason } => {
+                format!("<b>RISK HALT</b>\nTrading stopped: {reason}")
+            }
+            Self::WebSocketReconnectionExhausted {
+                connection_index,
+                attempts,
+            } => {
+                format!(
+                    "<b>WebSocket #{connection_index} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data"
+                )
+            }
+            Self::TokenRenewalDeadlineMissed { deadline_hour_ist } => {
+                format!(
+                    "<b>TOKEN RENEWAL DEADLINE MISSED</b>\nPast {deadline_hour_ist}:00 IST — token not renewed"
+                )
+            }
             Self::Custom { message } => message.clone(),
         }
     }
@@ -292,11 +545,20 @@ impl NotificationEvent {
             Self::WebSocketDisconnected { .. } => Severity::High,
             Self::HistoricalFetchFailed { .. } => Severity::High,
             Self::CandleVerificationFailed { .. } => Severity::High,
+            Self::CandleCrossMatchFailed { .. } => Severity::High,
             Self::HistoricalFetchComplete { .. } => Severity::Low,
             Self::CandleVerificationPassed { .. } => Severity::Low,
+            Self::CandleCrossMatchPassed { .. } => Severity::Low,
             Self::Custom { .. } => Severity::High,
+            Self::RiskHalt { .. } => Severity::Critical,
+            Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
+            Self::TokenRenewalDeadlineMissed { .. } => Severity::Critical,
+            Self::CircuitBreakerOpened { .. } => Severity::High,
+            Self::OrderRejected { .. } => Severity::High,
+            Self::RateLimitExhausted { .. } => Severity::High,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::ShutdownInitiated => Severity::Medium,
+            Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
@@ -306,6 +568,22 @@ impl NotificationEvent {
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Appends violation detail lines to a message, with "+N more" truncation.
+fn append_detail_lines(msg: &mut String, details: &[String], total_count: usize) {
+    let show_count = details.len().min(10);
+    for line in &details[..show_count] {
+        msg.push_str(&format!("\n{line}"));
+    }
+    if total_count > show_count {
+        let remaining = total_count.saturating_sub(show_count);
+        msg.push_str(&format!("\n... +{remaining} more"));
     }
 }
 
@@ -482,6 +760,9 @@ mod tests {
             instruments_fetched: 200,
             instruments_failed: 9,
             total_candles: 180000,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("partial failure"));
@@ -496,8 +777,99 @@ mod tests {
             instruments_fetched: 200,
             instruments_failed: 9,
             total_candles: 180000,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
         };
         assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_shows_instrument_names() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 229,
+            instruments_failed: 3,
+            total_candles: 172125,
+            persist_failures: 0,
+            failed_instruments: vec![
+                "RELIANCE (NSE_EQ)".to_string(),
+                "NIFTY50 (IDX_I)".to_string(),
+                "BANKNIFTY (IDX_I)".to_string(),
+            ],
+            failure_reasons: std::collections::HashMap::new(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Failed instruments:"));
+        assert!(msg.contains("RELIANCE (NSE_EQ)"));
+        assert!(msg.contains("NIFTY50 (IDX_I)"));
+        assert!(msg.contains("BANKNIFTY (IDX_I)"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_truncates_long_list() {
+        let names: Vec<String> = (0..15).map(|i| format!("INST_{i} (NSE_EQ)")).collect();
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 217,
+            instruments_failed: 15,
+            total_candles: 160000,
+            persist_failures: 0,
+            failed_instruments: names,
+            failure_reasons: std::collections::HashMap::new(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("INST_0 (NSE_EQ)"));
+        assert!(msg.contains("INST_9 (NSE_EQ)"));
+        assert!(
+            !msg.contains("INST_10 (NSE_EQ)"),
+            "11th item should be truncated"
+        );
+        assert!(msg.contains("+5 more"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_shows_persist_errors() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 200,
+            instruments_failed: 0,
+            total_candles: 180000,
+            persist_failures: 42,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Persist errors: 42"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_shows_failure_reasons() {
+        let mut reasons = std::collections::HashMap::new();
+        reasons.insert("token_expired".to_string(), 5);
+        reasons.insert("network_or_api".to_string(), 3);
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 224,
+            instruments_failed: 8,
+            total_candles: 168000,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: reasons,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Failure breakdown:"));
+        assert!(msg.contains("token_expired: 5"));
+        assert!(msg.contains("network_or_api: 3"));
+    }
+
+    #[test]
+    fn test_historical_fetch_complete_shows_persist_warnings() {
+        let event = NotificationEvent::HistoricalFetchComplete {
+            instruments_fetched: 232,
+            instruments_skipped: 1050,
+            total_candles: 187458,
+            persist_failures: 42,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Historical candles OK"));
+        assert!(msg.contains("Persist errors: 42"));
     }
 
     #[test]
@@ -505,11 +877,80 @@ mod tests {
         let event = NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
             instruments_with_gaps: 3,
+            timeframe_details: "1m: 78,000 (207 instruments)\n5m: 15,600 (209 instruments)"
+                .to_string(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+            ohlc_details: vec![],
+            data_details: vec![],
+            timestamp_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("verification FAILED"));
         assert!(msg.contains("209"));
-        assert!(msg.contains("3"));
+        assert!(msg.contains("Gaps: 3"));
+        assert!(msg.contains("Timeframes:"));
+        assert!(msg.contains("1m: 78,000"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_shows_ohlc_details() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 232,
+            instruments_with_gaps: 0,
+            timeframe_details: String::new(),
+            ohlc_violations: 2,
+            data_violations: 0,
+            timestamp_violations: 0,
+            ohlc_details: vec![
+                "\u{2022} RELIANCE (NSE_EQ) 1m @ 2026-03-18 10:15 IST\n  H=2440.0 < L=2450.0"
+                    .to_string(),
+            ],
+            data_details: vec![],
+            timestamp_details: vec![],
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("OHLC violations (2)"));
+        assert!(msg.contains("RELIANCE"));
+        assert!(msg.contains("H=2440.0 < L=2450.0"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_shows_all_violations() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 232,
+            instruments_with_gaps: 3,
+            timeframe_details: "1m: 85125 (229 inst)".to_string(),
+            ohlc_violations: 2,
+            data_violations: 5,
+            timestamp_violations: 8,
+            ohlc_details: vec!["ohlc line".to_string()],
+            data_details: vec!["data line".to_string()],
+            timestamp_details: vec!["ts line".to_string()],
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("OHLC violations (2)"));
+        assert!(msg.contains("Data violations (5)"));
+        assert!(msg.contains("Timestamp violations (8)"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_zero_instruments() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 0,
+            instruments_with_gaps: 0,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+            ohlc_details: vec![],
+            data_details: vec![],
+            timestamp_details: vec![],
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Checked: 0"));
+        assert!(msg.contains("No instrument data found"));
     }
 
     #[test]
@@ -517,8 +958,97 @@ mod tests {
         let event = NotificationEvent::CandleVerificationFailed {
             instruments_checked: 209,
             instruments_with_gaps: 3,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+            ohlc_details: vec![],
+            data_details: vec![],
+            timestamp_details: vec![],
         };
         assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_candle_verification_passed_shows_check_marks() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 232,
+            total_candles: 187500,
+            timeframe_details: "1m: 86250 (232 inst)".to_string(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Candle verification OK"));
+        assert!(msg.contains("OHLC"));
+        assert!(msg.contains("Data"));
+        assert!(msg.contains("Timestamps"));
+    }
+
+    #[test]
+    fn test_candle_verification_passed_shows_warnings_if_any() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 232,
+            total_candles: 187500,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 2,
+            timestamp_violations: 1,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Data violations: 2 (non-blocking)"));
+        assert!(msg.contains("Timestamp violations: 1 (non-blocking)"));
+    }
+
+    #[test]
+    fn test_cross_match_passed_message() {
+        let event = NotificationEvent::CandleCrossMatchPassed {
+            timeframes_checked: 5,
+            candles_compared: 187500,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("cross-match OK"));
+        assert!(msg.contains("187500"));
+        assert!(msg.contains("tolerance"));
+    }
+
+    #[test]
+    fn test_cross_match_failed_shows_details() {
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 187500,
+            mismatches: 12,
+            missing_live: 8,
+            mismatch_details: vec![
+                "\u{2022} RELIANCE (NSE_EQ) 1m @ 2026-03-18 10:15 IST\n  Hist: O=2450.0 H=2465.0\n  Live: O=2450.0 H=2463.5\n  Diff: H(-1.5)".to_string(),
+            ],
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("cross-match FAILED"));
+        assert!(msg.contains("Mismatches: 12"));
+        assert!(msg.contains("Missing live: 8"));
+        assert!(msg.contains("RELIANCE"));
+        assert!(msg.contains("H(-1.5)"));
+    }
+
+    #[test]
+    fn test_cross_match_failed_is_high() {
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 187500,
+            mismatches: 12,
+            missing_live: 8,
+            mismatch_details: vec![],
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_cross_match_passed_is_low() {
+        let event = NotificationEvent::CandleCrossMatchPassed {
+            timeframes_checked: 5,
+            candles_compared: 187500,
+        };
+        assert_eq!(event.severity(), Severity::Low);
     }
 
     // -- Severity tests --
@@ -614,6 +1144,7 @@ mod tests {
             instruments_fetched: 50,
             instruments_skipped: 200,
             total_candles: 187500,
+            persist_failures: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("Historical candles OK"));
@@ -629,6 +1160,7 @@ mod tests {
             instruments_fetched: 50,
             instruments_skipped: 200,
             total_candles: 187500,
+            persist_failures: 0,
         };
         assert_eq!(event.severity(), Severity::Low);
     }
@@ -638,11 +1170,18 @@ mod tests {
         let event = NotificationEvent::CandleVerificationPassed {
             instruments_checked: 50,
             total_candles: 187500,
+            timeframe_details: "1m: 18,750 (50 inst)\n5m: 3,750 (50 inst)\n15m: 1,250 (50 inst)\n60m: 312 (50 inst)\n1d: 50 (50 inst)".to_string(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("Candle verification OK"));
         assert!(msg.contains("50"));
         assert!(msg.contains("187500"));
+        assert!(msg.contains("Timeframes:"));
+        assert!(msg.contains("1m: 18,750"));
+        assert!(msg.contains("1d: 50"));
     }
 
     #[test]
@@ -650,6 +1189,10 @@ mod tests {
         let event = NotificationEvent::CandleVerificationPassed {
             instruments_checked: 50,
             total_candles: 187500,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
         };
         assert_eq!(event.severity(), Severity::Low);
     }
@@ -660,5 +1203,345 @@ mod tests {
         assert!(Severity::High > Severity::Medium);
         assert!(Severity::Medium > Severity::Low);
         assert!(Severity::Low > Severity::Info);
+    }
+
+    // -- OMS notification event tests --
+
+    #[test]
+    fn test_order_rejected_message() {
+        let event = NotificationEvent::OrderRejected {
+            correlation_id: "ORD-12345".to_string(),
+            reason: "DH-906: Invalid order quantity".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Order REJECTED"));
+        assert!(msg.contains("ORD-12345"));
+        assert!(msg.contains("DH-906"));
+    }
+
+    #[test]
+    fn test_oms_event_severity() {
+        let rejected = NotificationEvent::OrderRejected {
+            correlation_id: "X".to_string(),
+            reason: "bad".to_string(),
+        };
+        assert_eq!(rejected.severity(), Severity::High);
+
+        let cb_open = NotificationEvent::CircuitBreakerOpened {
+            consecutive_failures: 5,
+        };
+        assert_eq!(cb_open.severity(), Severity::High);
+
+        let cb_close = NotificationEvent::CircuitBreakerClosed;
+        assert_eq!(cb_close.severity(), Severity::Medium);
+
+        let rate_limit = NotificationEvent::RateLimitExhausted {
+            limit_type: "per_second".to_string(),
+        };
+        assert_eq!(rate_limit.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_oms_event_formatting() {
+        let cb = NotificationEvent::CircuitBreakerOpened {
+            consecutive_failures: 3,
+        };
+        let msg = cb.to_message();
+        assert!(msg.contains("Circuit breaker OPENED"));
+        assert!(msg.contains("3"));
+
+        let rl = NotificationEvent::RateLimitExhausted {
+            limit_type: "daily".to_string(),
+        };
+        let msg = rl.to_message();
+        assert!(msg.contains("Rate limit EXHAUSTED"));
+        assert!(msg.contains("daily"));
+    }
+
+    #[test]
+    fn test_circuit_breaker_notify_on_open() {
+        let event = NotificationEvent::CircuitBreakerOpened {
+            consecutive_failures: 5,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("OPENED"));
+        assert!(msg.contains("halted"));
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_risk_halt_notification() {
+        let event = NotificationEvent::RiskHalt {
+            reason: "daily_loss_breach: -25000.00 exceeds threshold".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("RISK HALT"));
+        assert!(msg.contains("daily_loss_breach"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_ws_reconnection_exhausted_notification() {
+        let event = NotificationEvent::WebSocketReconnectionExhausted {
+            connection_index: 2,
+            attempts: 10,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("RECONNECTION EXHAUSTED"));
+        assert!(msg.contains("#2"));
+        assert!(msg.contains("10"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_token_renewal_deadline_missed_notification() {
+        let event = NotificationEvent::TokenRenewalDeadlineMissed {
+            deadline_hour_ist: 14,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("DEADLINE MISSED"));
+        assert!(msg.contains("14:00 IST"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    // =====================================================================
+    // Additional coverage: severity for all remaining variants, boot events,
+    // append_detail_lines helper, edge cases in message formatting
+    // =====================================================================
+
+    #[test]
+    fn test_boot_health_check_message_and_severity() {
+        let event = NotificationEvent::BootHealthCheck {
+            services_healthy: 7,
+            services_total: 8,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Boot health check"));
+        assert!(msg.contains("7/8"));
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_boot_deadline_missed_message_and_severity() {
+        let event = NotificationEvent::BootDeadlineMissed {
+            deadline_secs: 120,
+            step: "QuestDB DDL".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("BOOT DEADLINE MISSED"));
+        assert!(msg.contains("120s"));
+        assert!(msg.contains("QuestDB DDL"));
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_instrument_build_success_severity() {
+        let event = NotificationEvent::InstrumentBuildSuccess {
+            source: "primary".to_string(),
+            derivative_count: 100,
+            underlying_count: 10,
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_instrument_build_failed_severity() {
+        let event = NotificationEvent::InstrumentBuildFailed {
+            reason: "test".to_string(),
+            manual_trigger_url: "http://test".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_ws_connected_severity() {
+        let event = NotificationEvent::WebSocketConnected {
+            connection_index: 0,
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_ws_reconnected_severity() {
+        let event = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+        };
+        assert_eq!(event.severity(), Severity::Medium);
+    }
+
+    #[test]
+    fn test_shutdown_initiated_severity() {
+        assert_eq!(
+            NotificationEvent::ShutdownInitiated.severity(),
+            Severity::Medium
+        );
+    }
+
+    #[test]
+    fn test_token_renewed_severity() {
+        assert_eq!(NotificationEvent::TokenRenewed.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_auth_success_severity() {
+        assert_eq!(
+            NotificationEvent::AuthenticationSuccess.severity(),
+            Severity::Low
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_closed_message() {
+        let event = NotificationEvent::CircuitBreakerClosed;
+        let msg = event.to_message();
+        assert!(msg.contains("Circuit breaker CLOSED"));
+        assert!(msg.contains("resumed"));
+    }
+
+    #[test]
+    fn test_historical_fetch_complete_no_persist_failures() {
+        let event = NotificationEvent::HistoricalFetchComplete {
+            instruments_fetched: 232,
+            instruments_skipped: 1050,
+            total_candles: 187458,
+            persist_failures: 0,
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("Persist errors"));
+    }
+
+    #[test]
+    fn test_historical_fetch_failed_empty_reasons_and_instruments() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 0,
+            instruments_failed: 0,
+            total_candles: 0,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: std::collections::HashMap::new(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("partial failure"));
+        assert!(!msg.contains("Failure breakdown"));
+        assert!(!msg.contains("Failed instruments"));
+    }
+
+    #[test]
+    fn test_cross_match_failed_no_missing_live() {
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 1000,
+            mismatches: 5,
+            missing_live: 0,
+            mismatch_details: vec![],
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("Missing live"));
+    }
+
+    #[test]
+    fn test_cross_match_failed_no_mismatch_details_section() {
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 1000,
+            mismatches: 0,
+            missing_live: 0,
+            mismatch_details: vec![],
+        };
+        let msg = event.to_message();
+        // The header always contains "Mismatches: N", but the details section should be absent
+        assert!(!msg.contains("<b>Mismatches:</b>"));
+    }
+
+    #[test]
+    fn test_candle_verification_passed_empty_timeframe_details() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 10,
+            total_candles: 1000,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 0,
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("Timeframes:"));
+    }
+
+    #[test]
+    fn test_candle_verification_passed_ohlc_violations_only() {
+        let event = NotificationEvent::CandleVerificationPassed {
+            instruments_checked: 10,
+            total_candles: 1000,
+            timeframe_details: String::new(),
+            ohlc_violations: 3,
+            data_violations: 0,
+            timestamp_violations: 0,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("OHLC violations: 3"));
+        assert!(!msg.contains("Data violations"));
+        assert!(!msg.contains("Timestamp violations"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_truncation() {
+        let details: Vec<String> = (0..15).map(|i| format!("line {i}")).collect();
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 15);
+        // Should show first 10 and "+5 more"
+        assert!(msg.contains("line 0"));
+        assert!(msg.contains("line 9"));
+        assert!(!msg.contains("line 10"));
+        assert!(msg.contains("+5 more"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_no_truncation() {
+        let details: Vec<String> = (0..5).map(|i| format!("line {i}")).collect();
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 5);
+        assert!(msg.contains("line 0"));
+        assert!(msg.contains("line 4"));
+        assert!(!msg.contains("more"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_empty() {
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &[], 0);
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn test_severity_equality() {
+        assert_eq!(Severity::Critical, Severity::Critical);
+        assert_ne!(Severity::Critical, Severity::High);
+    }
+
+    #[test]
+    fn test_severity_debug() {
+        let debug = format!("{:?}", Severity::Critical);
+        assert_eq!(debug, "Critical");
+    }
+
+    #[test]
+    fn test_notification_event_clone() {
+        let event = NotificationEvent::TokenRenewed;
+        let cloned = event.clone();
+        assert_eq!(cloned.to_message(), event.to_message());
+    }
+
+    #[test]
+    fn test_cross_match_failed_truncates_long_mismatch_details() {
+        let details: Vec<String> = (0..20).map(|i| format!("mismatch {i}")).collect();
+        let event = NotificationEvent::CandleCrossMatchFailed {
+            candles_compared: 100,
+            mismatches: 20,
+            missing_live: 0,
+            mismatch_details: details,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("mismatch 0"));
+        assert!(msg.contains("mismatch 9"));
+        assert!(!msg.contains("mismatch 10"));
+        assert!(msg.contains("+10 more"));
     }
 }

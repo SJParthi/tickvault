@@ -801,7 +801,7 @@ mod proptest_risk {
         ) {
             let mut engine = RiskEngine::new(2.0, 1000, 1_000_000.0);
             engine.record_fill(1001, lots, price1, 25);
-            engine.record_fill(1001, -lots, price2, 25);
+            engine.record_fill(1001, lots.saturating_neg(), price2, 25);
             let pnl = engine.total_realized_pnl();
             prop_assert!(pnl.is_finite(), "P&L must be finite: {}", pnl);
         }
@@ -975,3 +975,148 @@ mod regression_tests {
 
 // DHAT test target is in tests/dhat_risk_engine.rs (separate file)
 // because DHAT requires #[global_allocator] which conflicts with other tests.
+
+// ===========================================================================
+// Category 7: Proptest — OMS State Machine Transition Invariants
+// ===========================================================================
+
+mod proptest_oms_state_machine {
+    use dhan_live_trader_common::order_types::OrderStatus;
+    use dhan_live_trader_trading::oms::state_machine::{is_valid_transition, parse_order_status};
+    use proptest::prelude::*;
+
+    /// Generate a random OrderStatus for property testing.
+    fn arb_order_status() -> impl Strategy<Value = OrderStatus> {
+        prop_oneof![
+            Just(OrderStatus::Transit),
+            Just(OrderStatus::Pending),
+            Just(OrderStatus::Confirmed),
+            Just(OrderStatus::PartTraded),
+            Just(OrderStatus::Traded),
+            Just(OrderStatus::Cancelled),
+            Just(OrderStatus::Rejected),
+            Just(OrderStatus::Expired),
+            Just(OrderStatus::Closed),
+            Just(OrderStatus::Triggered),
+        ]
+    }
+
+    // Terminal states: once reached, no outgoing transitions are valid.
+    const TERMINAL_STATES: &[OrderStatus] = &[
+        OrderStatus::Traded,
+        OrderStatus::Cancelled,
+        OrderStatus::Rejected,
+        OrderStatus::Expired,
+        OrderStatus::Closed,
+    ];
+
+    proptest! {
+        /// INVARIANT: Terminal states have NO valid outgoing transitions.
+        #[test]
+        fn terminal_states_block_all_outgoing(
+            from in prop_oneof![
+                Just(OrderStatus::Traded),
+                Just(OrderStatus::Cancelled),
+                Just(OrderStatus::Rejected),
+                Just(OrderStatus::Expired),
+                Just(OrderStatus::Closed),
+            ],
+            to in arb_order_status(),
+        ) {
+            prop_assert!(
+                !is_valid_transition(from, to),
+                "Terminal state {:?} must not transition to {:?}",
+                from,
+                to,
+            );
+        }
+
+        /// INVARIANT: Self-transitions are always invalid.
+        #[test]
+        fn self_transitions_always_invalid(
+            status in arb_order_status(),
+        ) {
+            prop_assert!(
+                !is_valid_transition(status, status),
+                "Self-transition {:?} → {:?} must be invalid",
+                status,
+                status,
+            );
+        }
+
+        /// INVARIANT: Every valid transition goes forward in the lifecycle
+        /// (never backward — e.g., Traded→Pending is impossible).
+        #[test]
+        fn valid_transitions_are_forward_only(
+            from in arb_order_status(),
+            to in arb_order_status(),
+        ) {
+            if is_valid_transition(from, to) {
+                // If from→to is valid, then to→from must NOT be valid
+                // (DAG property — no cycles)
+                prop_assert!(
+                    !is_valid_transition(to, from),
+                    "If {:?}→{:?} is valid, reverse must be invalid (DAG)",
+                    from,
+                    to,
+                );
+            }
+        }
+
+        /// INVARIANT: Transit can only reach Pending or Rejected.
+        #[test]
+        fn transit_only_reaches_pending_or_rejected(
+            to in arb_order_status(),
+        ) {
+            let valid = is_valid_transition(OrderStatus::Transit, to);
+            let expected = to == OrderStatus::Pending || to == OrderStatus::Rejected;
+            prop_assert_eq!(
+                valid,
+                expected,
+                "Transit → {:?} should be {}",
+                to,
+                expected,
+            );
+        }
+
+        /// INVARIANT: parse_order_status roundtrips for all known strings.
+        #[test]
+        fn parse_known_status_returns_some(
+            s in prop_oneof![
+                Just("TRANSIT"),
+                Just("PENDING"),
+                Just("CONFIRMED"),
+                Just("PART_TRADED"),
+                Just("PARTIALLY_FILLED"),
+                Just("TRADED"),
+                Just("CANCELLED"),
+                Just("Cancelled"),
+                Just("REJECTED"),
+                Just("EXPIRED"),
+                Just("CLOSED"),
+                Just("TRIGGERED"),
+                Just("CONFIRM"),
+            ],
+        ) {
+            prop_assert!(
+                parse_order_status(s).is_some(),
+                "Known status string '{}' must parse to Some",
+                s,
+            );
+        }
+
+        /// INVARIANT: Random gibberish never parses to a valid status.
+        #[test]
+        fn random_strings_parse_to_none(
+            s in "[a-z]{1,20}",
+        ) {
+            // All valid Dhan statuses are UPPERCASE or specific mixed case
+            // Lowercase random strings should never match
+            prop_assert!(
+                parse_order_status(&s).is_none(),
+                "Random lowercase string '{}' must parse to None",
+                s,
+            );
+        }
+    }
+}

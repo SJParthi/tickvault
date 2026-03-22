@@ -106,3 +106,8 @@ data/instrument-cache/
 # ---- Temporary files ----
 *.tmp
 *.bak
+mutants.out/
+mutants.out.old/
+target/llvm-cov-target/
+.claude/worktrees/
+target2/

@@ -80,14 +80,7 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
     info!(actual_ip_masked = %mask_ip(&actual_ip), "actual public IP detected");
 
     // Step 4: Compare
-    if actual_ip != expected_ip {
-        let reason = format!(
-            "IP MISMATCH — expected {} (SSM), got {} (actual). \
-             Dhan will reject API calls from this IP. \
-             Check: (1) correct network/ISP (2) SSM value is current (3) VPN not active",
-            mask_ip(&expected_ip),
-            mask_ip(&actual_ip),
-        );
+    if let Err(reason) = compare_ips(&expected_ip, &actual_ip) {
         error!(
             expected = %mask_ip(&expected_ip),
             actual = %mask_ip(&actual_ip),
@@ -123,11 +116,8 @@ async fn fetch_expected_ip_from_ssm() -> Result<String, ApplicationError> {
     let secret = fetch_secret(&ssm_client, &path).await?;
     let ip = secret.expose_secret().trim().to_string();
 
-    if ip.is_empty() {
-        return Err(ApplicationError::IpVerificationFailed {
-            reason: format!("SSM parameter '{path}' exists but is empty"),
-        });
-    }
+    validate_ssm_ip_not_empty(&ip, &path)
+        .map_err(|reason| ApplicationError::IpVerificationFailed { reason })?;
 
     Ok(ip)
 }
@@ -158,9 +148,7 @@ async fn detect_public_ip() -> Result<String, String> {
                     "primary IP check failed"
                 );
                 if attempt < PUBLIC_IP_CHECK_MAX_RETRIES {
-                    // Exponential backoff: 1s, 2s, 4s
-                    let delay = Duration::from_secs(1 << (attempt - 1));
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(compute_ip_check_backoff(attempt)).await;
                 }
             }
         }
@@ -181,8 +169,7 @@ async fn detect_public_ip() -> Result<String, String> {
                     "fallback IP check failed"
                 );
                 if attempt < PUBLIC_IP_CHECK_MAX_RETRIES {
-                    let delay = Duration::from_secs(1 << (attempt - 1));
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(compute_ip_check_backoff(attempt)).await;
                 }
             }
         }
@@ -253,6 +240,76 @@ fn mask_ip(ip: &str) -> String {
         format!("{}.{}.XXX.XX", parts[0], parts[1])
     } else {
         "XXX.XXX.XXX.XXX".to_string()
+    }
+}
+
+/// Compares expected and actual IPs, returning an error reason on mismatch.
+///
+/// Pure function — no I/O, no allocation on match.
+fn compare_ips(expected: &str, actual: &str) -> Result<(), String> {
+    if actual != expected {
+        Err(format!(
+            "IP MISMATCH — expected {} (SSM), got {} (actual). \
+             Dhan will reject API calls from this IP. \
+             Check: (1) correct network/ISP (2) SSM value is current (3) VPN not active",
+            mask_ip(expected),
+            mask_ip(actual),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates that an IP string from SSM is not empty.
+///
+/// Pure function — no I/O.
+fn validate_ssm_ip_not_empty(ip: &str, path: &str) -> Result<(), String> {
+    if ip.is_empty() {
+        Err(format!("SSM parameter '{path}' exists but is empty"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Computes exponential backoff delay for retry attempts.
+///
+/// Returns `Duration` = 2^(attempt-1) seconds, capped at the value derived
+/// from `attempt < max_retries` (i.e., no delay on last attempt).
+///
+/// Pure function — no I/O.
+fn compute_ip_check_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(1))
+}
+
+/// Classifies an IP verification error into a category.
+///
+/// Pure function — used for logging and alerting decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpVerificationErrorKind {
+    /// SSM is unreachable or parameter is missing.
+    SsmError,
+    /// SSM returned an invalid/empty IP.
+    InvalidSsmIp,
+    /// Could not detect the machine's public IP.
+    DetectionFailed,
+    /// Detected IP does not match SSM.
+    Mismatch,
+}
+
+/// Classifies an `ApplicationError::IpVerificationFailed` reason string.
+///
+/// Pure function.
+pub fn classify_ip_error(reason: &str) -> IpVerificationErrorKind {
+    // Check mismatch first — mismatch messages may contain "SSM" as context.
+    if reason.contains("IP MISMATCH") {
+        IpVerificationErrorKind::Mismatch
+    } else if reason.contains("SSM") && reason.contains("empty") {
+        IpVerificationErrorKind::InvalidSsmIp
+    } else if reason.contains("SSM") || reason.contains("secret") {
+        IpVerificationErrorKind::SsmError
+    } else {
+        // Covers: detection failures, exhausted retries, and any unknown reason.
+        IpVerificationErrorKind::DetectionFailed
     }
 }
 
@@ -614,5 +671,500 @@ mod tests {
         assert_eq!(response.ip_flag, "PRIMARY");
         assert_eq!(response.modify_date_primary, "2026-01-15");
         assert!(response.modify_date_secondary.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_ips — pure IP comparison
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_ips_match_returns_ok() {
+        assert!(compare_ips("203.0.113.42", "203.0.113.42").is_ok());
+    }
+
+    #[test]
+    fn test_compare_ips_mismatch_returns_error() {
+        let result = compare_ips("203.0.113.42", "10.0.0.1");
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("IP MISMATCH"),
+            "error reason must contain 'IP MISMATCH'"
+        );
+        assert!(
+            reason.contains("203.0.XXX.XX"),
+            "error must mask expected IP"
+        );
+        assert!(reason.contains("10.0.XXX.XX"), "error must mask actual IP");
+    }
+
+    #[test]
+    fn test_compare_ips_mismatch_contains_guidance() {
+        let reason = compare_ips("1.2.3.4", "5.6.7.8").unwrap_err();
+        assert!(reason.contains("correct network/ISP"));
+        assert!(reason.contains("SSM value is current"));
+        assert!(reason.contains("VPN not active"));
+    }
+
+    #[test]
+    fn test_compare_ips_same_prefix_different_suffix() {
+        let result = compare_ips("203.0.113.42", "203.0.113.43");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compare_ips_empty_strings() {
+        // Empty strings are equal, compare_ips returns Ok.
+        // (validate_ipv4_format catches empty before compare_ips runs.)
+        assert!(compare_ips("", "").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_ssm_ip_not_empty
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_ssm_ip_not_empty_valid() {
+        assert!(validate_ssm_ip_not_empty("203.0.113.42", "/dlt/dev/network/static-ip").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ssm_ip_not_empty_empty_string() {
+        let result = validate_ssm_ip_not_empty("", "/dlt/dev/network/static-ip");
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(reason.contains("SSM parameter"));
+        assert!(reason.contains("empty"));
+        assert!(reason.contains("/dlt/dev/network/static-ip"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_ip_check_backoff
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_ip_check_backoff_first_attempt() {
+        let delay = compute_ip_check_backoff(1);
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_second_attempt() {
+        let delay = compute_ip_check_backoff(2);
+        assert_eq!(delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_third_attempt() {
+        let delay = compute_ip_check_backoff(3);
+        assert_eq!(delay, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_zero_attempt() {
+        // attempt=0 → shift by saturating_sub(1)=0 → 2^0 = 1
+        let delay = compute_ip_check_backoff(0);
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_large_attempt() {
+        // Large shift wraps to 1 via unwrap_or
+        let delay = compute_ip_check_backoff(100);
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_ip_error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_ip_error_ssm_empty() {
+        let kind =
+            classify_ip_error("SSM parameter '/dlt/dev/network/static-ip' exists but is empty");
+        assert_eq!(kind, IpVerificationErrorKind::InvalidSsmIp);
+    }
+
+    #[test]
+    fn test_classify_ip_error_ssm_unreachable() {
+        let kind = classify_ip_error("failed to fetch SSM secret: connection refused");
+        assert_eq!(kind, IpVerificationErrorKind::SsmError);
+    }
+
+    #[test]
+    fn test_classify_ip_error_mismatch() {
+        // Real mismatch messages contain "(SSM)" — classifier must check mismatch first.
+        let kind = classify_ip_error(
+            "IP MISMATCH — expected 203.0.XXX.XX (SSM), got 10.0.XXX.XX (actual)",
+        );
+        assert_eq!(kind, IpVerificationErrorKind::Mismatch);
+    }
+
+    #[test]
+    fn test_classify_ip_error_detection_failed() {
+        let kind = classify_ip_error(
+            "all IP detection attempts exhausted — primary and fallback both failed",
+        );
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    #[test]
+    fn test_classify_ip_error_unknown_reason() {
+        let kind = classify_ip_error("something unexpected happened");
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    #[test]
+    fn test_classify_ip_error_secret_keyword() {
+        let kind = classify_ip_error("failed to read secret from parameter store");
+        assert_eq!(kind, IpVerificationErrorKind::SsmError);
+    }
+
+    // -----------------------------------------------------------------------
+    // IpVerificationErrorKind — derive coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_error_kind_debug_and_clone() {
+        let kind = IpVerificationErrorKind::Mismatch;
+        let cloned = kind.clone();
+        assert_eq!(kind, cloned);
+        let debug = format!("{kind:?}");
+        assert!(debug.contains("Mismatch"));
+    }
+
+    #[test]
+    fn test_ip_error_kind_all_variants_distinct() {
+        let variants = [
+            IpVerificationErrorKind::SsmError,
+            IpVerificationErrorKind::InvalidSsmIp,
+            IpVerificationErrorKind::DetectionFailed,
+            IpVerificationErrorKind::Mismatch,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "variants {i} and {j} must be distinct");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_ipv4_format — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ipv4_loopback() {
+        assert!(validate_ipv4_format("127.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn test_ipv4_broadcast() {
+        assert!(validate_ipv4_format("255.255.255.255").is_ok());
+    }
+
+    #[test]
+    fn test_ipv4_with_leading_zeros() {
+        // Rust's Ipv4Addr parser handles leading zeros
+        // "01.01.01.01" may or may not parse depending on implementation
+        let result = validate_ipv4_format("01.01.01.01");
+        // Either ok or err is fine — just ensure no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_ipv4_error_message_contains_input() {
+        let result = validate_ipv4_format("bad-ip");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("bad-ip"),
+            "error should contain the invalid input"
+        );
+    }
+
+    #[test]
+    fn test_ipv4_error_message_is_descriptive() {
+        let result = validate_ipv4_format("not-valid");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("invalid IPv4 address"),
+            "error should describe the issue"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_single_digit_octets() {
+        assert_eq!(mask_ip("1.2.3.4"), "1.2.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_three_digit_octets() {
+        assert_eq!(mask_ip("255.255.255.255"), "255.255.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_five_parts() {
+        // More than 4 parts → invalid → fully masked
+        assert_eq!(mask_ip("1.2.3.4.5"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_three_parts() {
+        assert_eq!(mask_ip("1.2.3"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_two_parts() {
+        assert_eq!(mask_ip("1.2"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_no_dots() {
+        assert_eq!(mask_ip("nodots"), "XXX.XXX.XXX.XXX");
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_ips — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_ips_whitespace_difference() {
+        // Whitespace makes IPs different — caller must trim before comparing
+        let result = compare_ips("1.2.3.4", " 1.2.3.4");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compare_ips_mismatch_error_is_actionable() {
+        let err = compare_ips("10.0.0.1", "192.168.1.1").unwrap_err();
+        // Must contain troubleshooting guidance
+        assert!(err.contains("VPN"));
+        assert!(err.contains("SSM"));
+        assert!(err.contains("ISP"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_ssm_ip_not_empty — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_ssm_ip_not_empty_whitespace_only() {
+        // Whitespace-only is NOT empty — returns Ok
+        // (caller should trim before calling)
+        assert!(validate_ssm_ip_not_empty("  ", "/dlt/dev/network/static-ip").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ssm_ip_not_empty_error_contains_path() {
+        let path = "/dlt/prod/network/static-ip";
+        let err = validate_ssm_ip_not_empty("", path).unwrap_err();
+        assert!(err.contains(path));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_ip_check_backoff — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_ip_check_backoff_doubles_each_attempt() {
+        let d1 = compute_ip_check_backoff(1);
+        let d2 = compute_ip_check_backoff(2);
+        let d3 = compute_ip_check_backoff(3);
+        assert_eq!(d2, d1 * 2);
+        assert_eq!(d3, d2 * 2);
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_u32_max_attempt() {
+        // u32::MAX saturating_sub(1) = u32::MAX - 1; checked_shl will overflow → unwrap_or(1)
+        let delay = compute_ip_check_backoff(u32::MAX);
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_ip_error — additional patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_ip_error_mismatch_priority_over_ssm() {
+        // "IP MISMATCH" should be classified as Mismatch even when "SSM" is present
+        let kind = classify_ip_error("IP MISMATCH — expected from SSM, got different");
+        assert_eq!(kind, IpVerificationErrorKind::Mismatch);
+    }
+
+    #[test]
+    fn test_classify_ip_error_empty_string() {
+        let kind = classify_ip_error("");
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    #[test]
+    fn test_classify_ip_error_ssm_parameter_not_found() {
+        let kind = classify_ip_error("SSM parameter not found: /dlt/dev/network/static-ip");
+        assert_eq!(kind, IpVerificationErrorKind::SsmError);
+    }
+
+    #[test]
+    fn test_classify_ip_error_http_failure() {
+        let kind = classify_ip_error("HTTP request to checkip failed: timeout");
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    // -----------------------------------------------------------------------
+    // IpVerificationResult — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_verification_result_fields() {
+        let result = IpVerificationResult {
+            verified_ip: "10.0.0.1".to_string(),
+        };
+        assert_eq!(result.verified_ip, "10.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // IpVerificationErrorKind — Debug formatting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_error_kind_debug_all_variants() {
+        let variants = [
+            (IpVerificationErrorKind::SsmError, "SsmError"),
+            (IpVerificationErrorKind::InvalidSsmIp, "InvalidSsmIp"),
+            (IpVerificationErrorKind::DetectionFailed, "DetectionFailed"),
+            (IpVerificationErrorKind::Mismatch, "Mismatch"),
+        ];
+        for (variant, expected_str) in variants {
+            let debug = format!("{variant:?}");
+            assert!(
+                debug.contains(expected_str),
+                "debug for {expected_str} should contain the variant name"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_ip_check_backoff — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_ip_check_backoff_attempt_1() {
+        let d = compute_ip_check_backoff(1);
+        assert_eq!(d, Duration::from_secs(1)); // 2^0 = 1
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_attempt_2() {
+        let d = compute_ip_check_backoff(2);
+        assert_eq!(d, Duration::from_secs(2)); // 2^1 = 2
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_attempt_3() {
+        let d = compute_ip_check_backoff(3);
+        assert_eq!(d, Duration::from_secs(4)); // 2^2 = 4
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_attempt_0() {
+        // saturating_sub(1) = 0 for attempt 0, but attempt 0 means shift 0
+        let d = compute_ip_check_backoff(0);
+        assert!(d.as_secs() >= 1, "backoff must be at least 1 second");
+    }
+
+    #[test]
+    fn test_compute_ip_check_backoff_very_large_attempt() {
+        // Should not overflow even with u32-scale attempt
+        let d = compute_ip_check_backoff(100);
+        assert!(d.as_secs() >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_ssm_ip_not_empty — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_ssm_ip_not_empty_ok() {
+        assert!(validate_ssm_ip_not_empty("10.0.0.1", "/dlt/dev/network/static-ip").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ssm_ip_not_empty_err() {
+        let result = validate_ssm_ip_not_empty("", "/dlt/dev/network/static-ip");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("empty"), "error should mention empty: {err}");
+        assert!(err.contains("/dlt/dev/network/static-ip"));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_ip_error — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_ip_error_ssm_and_empty() {
+        let kind = classify_ip_error("SSM parameter is empty");
+        assert_eq!(kind, IpVerificationErrorKind::InvalidSsmIp);
+    }
+
+    #[test]
+    fn test_classify_ip_error_secret_manager() {
+        let kind = classify_ip_error("secret manager unreachable");
+        assert_eq!(kind, IpVerificationErrorKind::SsmError);
+    }
+
+    #[test]
+    fn test_classify_ip_error_mismatch_priority() {
+        // "IP MISMATCH" takes priority even if message also contains "SSM"
+        let kind = classify_ip_error("IP MISMATCH — expected from SSM");
+        assert_eq!(kind, IpVerificationErrorKind::Mismatch);
+    }
+
+    #[test]
+    fn test_classify_ip_error_detection_failed_fallback() {
+        let kind = classify_ip_error("all IP detection attempts exhausted");
+        assert_eq!(kind, IpVerificationErrorKind::DetectionFailed);
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_ips — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_ips_match() {
+        assert!(compare_ips("10.0.0.1", "10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn test_compare_ips_mismatch_contains_masked_ips() {
+        let result = compare_ips("10.0.0.1", "192.168.1.1");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("10.0.XXX.XX"));
+        assert!(err.contains("192.168.XXX.XX"));
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_too_few_octets() {
+        assert_eq!(mask_ip("10.0.0"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_too_many_octets() {
+        assert_eq!(mask_ip("10.0.0.1.2"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_empty_string() {
+        assert_eq!(mask_ip(""), "XXX.XXX.XXX.XXX");
     }
 }

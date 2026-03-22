@@ -23,15 +23,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
 
-use chrono::{FixedOffset, NaiveTime, Utc};
+use chrono::{NaiveTime, Utc};
 
 use dhan_live_trader_common::constants::{
-    IST_UTC_OFFSET_SECONDS, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS,
-    ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS, ORDER_UPDATE_READ_TIMEOUT_SECS,
-    ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
+    ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS,
+    ORDER_UPDATE_READ_TIMEOUT_SECS, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS,
+    ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
 };
 use dhan_live_trader_common::order_types::OrderUpdate;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
@@ -80,38 +80,39 @@ pub async fn run_order_update_connection(
                 info!("order update WebSocket disconnected cleanly — reconnecting");
             }
             Err(err) => {
-                // Off-hours ReadTimeout is expected (no orders outside market hours).
-                // Log at debug level and reset backoff to avoid noise.
-                if matches!(err, OrderUpdateConnectionError::ReadTimeout)
-                    && !is_within_market_hours(&calendar)
-                {
-                    debug!(
-                        "order update WebSocket idle timeout outside market hours — reconnecting"
-                    );
-                    consecutive_failures = 0;
-                } else {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
+                let is_timeout = matches!(err, OrderUpdateConnectionError::ReadTimeout);
+                let within_hours = is_within_market_hours(&calendar);
+                let tentative_failures = consecutive_failures.saturating_add(1);
+
+                match decide_reconnect_action(is_timeout, within_hours, tentative_failures) {
+                    ReconnectAction::ResetAndReconnect => {
+                        debug!(
+                            "order update WebSocket idle timeout outside market hours — reconnecting"
+                        );
+                        consecutive_failures = 0;
+                    }
+                    ReconnectAction::Exhausted => {
+                        consecutive_failures = tentative_failures;
                         error!(
                             attempts = consecutive_failures,
                             "order update WebSocket exhausted reconnection attempts"
                         );
                         return;
                     }
-                    warn!(
-                        ?err,
-                        attempt = consecutive_failures,
-                        "order update WebSocket error — will reconnect"
-                    );
+                    ReconnectAction::IncrementAndRetry => {
+                        consecutive_failures = tentative_failures;
+                        warn!(
+                            ?err,
+                            attempt = consecutive_failures,
+                            "order update WebSocket error — will reconnect"
+                        );
+                    }
                 }
             }
         }
 
         // Exponential backoff: delay_ms = initial * 2^(failures-1), capped at max.
-        let shift = consecutive_failures.saturating_sub(1).min(63);
-        let delay_ms = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
-            .saturating_mul(1_u64 << shift)
-            .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+        let delay_ms = compute_reconnect_backoff_ms(consecutive_failures);
         debug!(delay_ms, "order update WebSocket reconnect backoff");
         time::sleep(Duration::from_millis(delay_ms)).await;
     }
@@ -172,11 +173,7 @@ async fn connect_and_listen(
     debug!("order update WebSocket login sent");
 
     // Use longer timeout outside market hours to avoid reconnect noise.
-    let timeout_secs = if is_within_market_hours(calendar) {
-        ORDER_UPDATE_READ_TIMEOUT_SECS
-    } else {
-        ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
-    };
+    let timeout_secs = select_read_timeout_secs(is_within_market_hours(calendar));
     let read_timeout = Duration::from_secs(timeout_secs);
 
     // Read loop — receive order updates until disconnect.
@@ -255,11 +252,14 @@ fn is_within_market_hours(calendar: &TradingCalendar) -> bool {
         return false;
     }
 
-    #[allow(clippy::expect_used)] // APPROVED: compile-time provable — 19800 always valid
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
-    let now_ist = Utc::now().with_timezone(&ist).time();
+    let now_ist = Utc::now().with_timezone(&ist_offset()).time();
+    is_time_within_data_collection_window(now_ist)
+}
 
+/// Pure function: checks if a given IST time falls within [09:00, 16:00).
+///
+/// Extracted from `is_within_market_hours` for testability.
+fn is_time_within_data_collection_window(ist_time: NaiveTime) -> bool {
     #[allow(clippy::expect_used)] // APPROVED: compile-time provable constants
     let start = NaiveTime::from_hms_opt(DATA_COLLECTION_START.0, DATA_COLLECTION_START.1, 0)
         .expect("09:00:00 is always valid"); // APPROVED: compile-time provable constant
@@ -267,7 +267,60 @@ fn is_within_market_hours(calendar: &TradingCalendar) -> bool {
     let end = NaiveTime::from_hms_opt(DATA_COLLECTION_END.0, DATA_COLLECTION_END.1, 0)
         .expect("16:00:00 is always valid"); // APPROVED: compile-time provable constant
 
-    now_ist >= start && now_ist < end
+    ist_time >= start && ist_time < end
+}
+
+/// Computes exponential backoff delay in milliseconds for order update reconnection.
+///
+/// Formula: `initial * 2^(failures-1)`, capped at `max_delay_ms`.
+/// Pure function — no I/O.
+fn compute_reconnect_backoff_ms(consecutive_failures: u32) -> u64 {
+    let shift = consecutive_failures.saturating_sub(1).min(63);
+    ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
+        .saturating_mul(1_u64 << shift)
+        .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS)
+}
+
+/// Selects the appropriate read timeout based on market hours.
+///
+/// During market hours: shorter timeout to detect dead connections quickly.
+/// Outside market hours: longer timeout to avoid reconnect noise.
+///
+/// Pure function — no I/O.
+fn select_read_timeout_secs(within_market_hours: bool) -> u64 {
+    if within_market_hours {
+        ORDER_UPDATE_READ_TIMEOUT_SECS
+    } else {
+        ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
+    }
+}
+
+/// Result of processing a connection attempt error in the reconnect loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectAction {
+    /// Reset backoff and reconnect (expected idle timeout outside hours).
+    ResetAndReconnect,
+    /// Increment failure counter and retry.
+    IncrementAndRetry,
+    /// Max attempts exhausted — stop reconnecting.
+    Exhausted,
+}
+
+/// Decides the reconnect action based on error type and market hours.
+///
+/// Pure function — no I/O.
+fn decide_reconnect_action(
+    error_is_read_timeout: bool,
+    within_market_hours: bool,
+    consecutive_failures_after_increment: u32,
+) -> ReconnectAction {
+    if error_is_read_timeout && !within_market_hours {
+        ReconnectAction::ResetAndReconnect
+    } else if consecutive_failures_after_increment > ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS {
+        ReconnectAction::Exhausted
+    } else {
+        ReconnectAction::IncrementAndRetry
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +487,355 @@ mod tests {
                 assert_eq!(delay, prev_delay * 2, "backoff should double each attempt");
             }
             prev_delay = delay;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_reconnect_backoff_ms — extracted pure function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_reconnect_backoff_zero_failures() {
+        let delay = compute_reconnect_backoff_ms(0);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_one_failure() {
+        let delay = compute_reconnect_backoff_ms(1);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_two_failures() {
+        let delay = compute_reconnect_backoff_ms(2);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 2);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_three_failures() {
+        let delay = compute_reconnect_backoff_ms(3);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 4);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_capped_at_max() {
+        let delay = compute_reconnect_backoff_ms(50);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_u32_max() {
+        let delay = compute_reconnect_backoff_ms(u32::MAX);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_read_timeout_secs — extracted pure function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_read_timeout_during_market_hours() {
+        let secs = select_read_timeout_secs(true);
+        assert_eq!(secs, ORDER_UPDATE_READ_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_select_read_timeout_outside_market_hours() {
+        let secs = select_read_timeout_secs(false);
+        assert_eq!(secs, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_off_hours_timeout_greater_than_market_hours() {
+        assert!(
+            select_read_timeout_secs(false) > select_read_timeout_secs(true),
+            "off-hours timeout must be longer than market-hours timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_time_within_data_collection_window — extracted pure function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_before_market_open() {
+        let time = NaiveTime::from_hms_opt(8, 59, 59).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_market_open() {
+        let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_during_market_hours() {
+        let time = NaiveTime::from_hms_opt(12, 30, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_just_before_market_close() {
+        let time = NaiveTime::from_hms_opt(15, 59, 59).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_market_close() {
+        // 16:00 is exclusive — should return false
+        let time = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_after_market_close() {
+        let time = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_midnight() {
+        let time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_reconnect_action — extracted pure function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconnect_action_timeout_outside_hours_resets() {
+        let action = decide_reconnect_action(true, false, 5);
+        assert_eq!(action, ReconnectAction::ResetAndReconnect);
+    }
+
+    #[test]
+    fn test_reconnect_action_timeout_during_hours_increments() {
+        let action = decide_reconnect_action(true, true, 3);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_non_timeout_during_hours_increments() {
+        let action = decide_reconnect_action(false, true, 3);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_non_timeout_outside_hours_increments() {
+        let action = decide_reconnect_action(false, false, 3);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_exhausted() {
+        let action = decide_reconnect_action(false, true, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::Exhausted);
+    }
+
+    #[test]
+    fn test_reconnect_action_at_max_not_exhausted() {
+        let action = decide_reconnect_action(false, true, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_timeout_outside_hours_even_at_max() {
+        // Off-hours timeout always resets, even if we're at max attempts
+        let action = decide_reconnect_action(true, false, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::ResetAndReconnect);
+    }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateConnectionError — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_error_is_read_timeout_check() {
+        // Verify the pattern matching used in reconnect logic
+        let timeout = OrderUpdateConnectionError::ReadTimeout;
+        assert!(matches!(timeout, OrderUpdateConnectionError::ReadTimeout));
+
+        let connect = OrderUpdateConnectionError::Connect("test".to_string());
+        assert!(!matches!(connect, OrderUpdateConnectionError::ReadTimeout));
+    }
+
+    #[test]
+    fn test_no_token_error_display() {
+        let err = OrderUpdateConnectionError::NoToken;
+        assert_eq!(err.to_string(), "no authentication token available");
+    }
+
+    #[test]
+    fn test_token_expired_error_display() {
+        let err = OrderUpdateConnectionError::TokenExpired;
+        assert_eq!(err.to_string(), "authentication token expired");
+    }
+
+    #[test]
+    fn test_read_timeout_error_display_contains_timeout_value() {
+        let err = OrderUpdateConnectionError::ReadTimeout;
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&ORDER_UPDATE_READ_TIMEOUT_SECS.to_string()),
+            "ReadTimeout message should contain the timeout value"
+        );
+    }
+
+    #[test]
+    fn test_tls_error_display() {
+        let err = OrderUpdateConnectionError::Tls("cert expired".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("TLS"));
+        assert!(msg.contains("cert expired"));
+    }
+
+    #[test]
+    fn test_send_error_display() {
+        let err = OrderUpdateConnectionError::Send("broken pipe".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("login message"));
+        assert!(msg.contains("broken pipe"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_reconnect_backoff_ms — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_reconnect_backoff_monotonically_increases() {
+        let mut prev = 0_u64;
+        for failures in 0..=10 {
+            let delay = compute_reconnect_backoff_ms(failures);
+            assert!(
+                delay >= prev,
+                "backoff must not decrease: {prev} -> {delay} at failures={failures}"
+            );
+            prev = delay;
+        }
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_always_positive() {
+        for failures in 0..=100 {
+            let delay = compute_reconnect_backoff_ms(failures);
+            assert!(delay > 0, "delay must be positive for failures={failures}");
+        }
+    }
+
+    #[test]
+    fn test_compute_reconnect_backoff_capped_consistently() {
+        // Once capped, all higher failure counts return the same max
+        let max_delay = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
+        let high = compute_reconnect_backoff_ms(30);
+        let higher = compute_reconnect_backoff_ms(50);
+        let highest = compute_reconnect_backoff_ms(u32::MAX);
+        assert_eq!(high, max_delay);
+        assert_eq!(higher, max_delay);
+        assert_eq!(highest, max_delay);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_read_timeout_secs — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_read_timeout_returns_constants() {
+        // Verify the function returns exact constant values
+        assert_eq!(
+            select_read_timeout_secs(true),
+            ORDER_UPDATE_READ_TIMEOUT_SECS
+        );
+        assert_eq!(
+            select_read_timeout_secs(false),
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_time_within_data_collection_window — boundary saturation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_at_0915_is_within_window() {
+        // Pre-open ends at 09:15 IST, continuous trading starts — well within window
+        let time = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_1530_is_within_window() {
+        // 15:30 IST is still within [09:00, 16:00) order data collection window
+        let time = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+        assert!(is_time_within_data_collection_window(time));
+    }
+
+    #[test]
+    fn test_time_at_2359_is_outside_window() {
+        let time = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        assert!(!is_time_within_data_collection_window(time));
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_reconnect_action — exhaustive matrix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconnect_action_exhausted_outside_hours_non_timeout() {
+        // Non-timeout outside hours at max+1 → exhausted (timeout check is first)
+        let action = decide_reconnect_action(false, false, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(action, ReconnectAction::Exhausted);
+    }
+
+    #[test]
+    fn test_reconnect_action_zero_failures_increments() {
+        // First failure (tentative_failures=1) should increment
+        let action = decide_reconnect_action(false, true, 1);
+        assert_eq!(action, ReconnectAction::IncrementAndRetry);
+    }
+
+    #[test]
+    fn test_reconnect_action_timeout_outside_hours_at_zero_failures() {
+        let action = decide_reconnect_action(true, false, 0);
+        assert_eq!(action, ReconnectAction::ResetAndReconnect);
+    }
+
+    // -----------------------------------------------------------------------
+    // DATA_COLLECTION constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_collection_window_constants() {
+        assert_eq!(DATA_COLLECTION_START, (9, 0));
+        assert_eq!(DATA_COLLECTION_END, (16, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // ReconnectAction derive coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconnect_action_debug() {
+        let action = ReconnectAction::ResetAndReconnect;
+        let debug = format!("{action:?}");
+        assert!(debug.contains("ResetAndReconnect"));
+    }
+
+    #[test]
+    fn test_reconnect_action_all_variants_distinct() {
+        let variants = [
+            ReconnectAction::ResetAndReconnect,
+            ReconnectAction::IncrementAndRetry,
+            ReconnectAction::Exhausted,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "variants {i} and {j} must be distinct");
+                }
+            }
         }
     }
 }

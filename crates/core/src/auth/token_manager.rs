@@ -407,6 +407,7 @@ impl TokenManager {
     /// Sleeps until the refresh window (token_validity - refresh_before_expiry),
     /// then renews the token. Retries with exponential backoff on failure.
     /// Runs indefinitely until the task is cancelled.
+    #[instrument(skip_all)]
     pub fn spawn_renewal_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
@@ -2317,12 +2318,8 @@ mod tests {
 
     /// Helper: creates a `TokenState` for testing using `from_cached`.
     fn make_test_token_state(token_value: &str) -> TokenState {
-        let now_ist = chrono::Utc::now().with_timezone(
-            &chrono::FixedOffset::east_opt(
-                dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS,
-            )
-            .expect("IST offset always valid"), // APPROVED: test-only, compile-time constant
-        );
+        let now_ist = chrono::Utc::now()
+            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset());
         let expires_at = now_ist + chrono::Duration::hours(24);
         TokenState::from_cached(
             secrecy::SecretString::from(token_value.to_string()),
@@ -2421,5 +2418,262 @@ mod tests {
             .as_ref()
             .expect("original handle should see clone's update");
         assert_eq!(loaded.access_token().expose_secret(), "shared-jwt-v2");
+    }
+
+    // -----------------------------------------------------------------------
+    // make_test_manager — struct field validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_test_manager_has_correct_urls() {
+        let manager = make_test_manager(None);
+        assert_eq!(manager.rest_api_base_url, "https://api.example.com");
+        assert_eq!(manager.auth_base_url, "https://auth.example.com");
+    }
+
+    #[test]
+    fn test_make_test_manager_has_correct_config() {
+        let manager = make_test_manager(None);
+        assert_eq!(manager.token_config.refresh_before_expiry_hours, 1);
+        assert_eq!(manager.token_config.token_validity_hours, 24);
+        assert_eq!(manager.network_config.request_timeout_ms, 5000);
+        assert_eq!(manager.network_config.retry_max_attempts, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // token_handle() — verify it returns the inner handle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_method_returns_shared_reference() {
+        let data = DhanAuthResponseData {
+            access_token: "method-test-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        let handle = manager.token_handle();
+
+        let guard = handle.load();
+        let state = guard.as_ref().as_ref().expect("should have token");
+        assert_eq!(state.access_token().expose_secret(), "method-test-jwt");
+    }
+
+    // -----------------------------------------------------------------------
+    // time_until_next_refresh — expired token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_time_until_next_refresh_expired_token_returns_zero() {
+        // Create a token with 0 expiry (already expired)
+        let data = DhanAuthResponseData {
+            access_token: "expired-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0, // already expired
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+        let duration = manager.time_until_next_refresh();
+        assert_eq!(duration, Duration::ZERO, "expired token should return ZERO");
+    }
+
+    // -----------------------------------------------------------------------
+    // current_expiry_display — various token states
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_current_expiry_display_short_lived_token() {
+        let data = DhanAuthResponseData {
+            access_token: "short-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 60, // 1 minute
+        };
+        let token_state = TokenState::from_response(&data);
+        let manager = make_test_manager(Some(token_state));
+        let display = manager.current_expiry_display();
+        assert_ne!(display, "no token");
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize — both HTTPS checks
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_initialize_both_http_urls_rejected() {
+        let dhan_config = DhanConfig {
+            websocket_url: "wss://example.com".to_string(),
+            order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
+            rest_api_base_url: "http://api.dhan.co".to_string(),
+            auth_base_url: "http://auth.dhan.co".to_string(),
+            instrument_csv_url: "https://example.com/instruments.csv".to_string(),
+            instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
+            max_instruments_per_connection: 100,
+            max_websocket_connections: 5,
+        };
+        let token_config = TokenConfig {
+            refresh_before_expiry_hours: 1,
+            token_validity_hours: 24,
+        };
+        let network_config = NetworkConfig {
+            request_timeout_ms: 5000,
+            websocket_connect_timeout_ms: 5000,
+            retry_initial_delay_ms: 100,
+            retry_max_delay_ms: 1000,
+            retry_max_attempts: 3,
+        };
+
+        let result = TokenManager::initialize(
+            &dhan_config,
+            &token_config,
+            &network_config,
+            &crate::notification::service::NotificationService::disabled(),
+        )
+        .await;
+        // Should fail on the first check (rest_api_base_url)
+        assert!(result.is_err());
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err_msg.contains("rest_api_base_url"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Token handle — store None after having a token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_handle_store_none_clears_state() {
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(None)));
+        let data = DhanAuthResponseData {
+            access_token: "will-be-cleared".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        handle.store(Arc::new(Some(TokenState::from_response(&data))));
+        assert!(handle.load().as_ref().is_some());
+
+        handle.store(Arc::new(None));
+        assert!(handle.load().as_ref().is_none(), "None store must clear");
+    }
+
+    // -----------------------------------------------------------------------
+    // Error classification — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_permanent_auth_error_invalid_pin() {
+        assert!(is_permanent_auth_error("Dhan auth error: Invalid Pin"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_invalid_client() {
+        assert!(is_permanent_auth_error("Invalid Client ID"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_blocked() {
+        assert!(is_permanent_auth_error(
+            "Account is blocked due to violations"
+        ));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_suspended() {
+        assert!(is_permanent_auth_error("account suspended by admin"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_disabled() {
+        assert!(is_permanent_auth_error("API access disabled"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_case_insensitive() {
+        assert!(is_permanent_auth_error("INVALID PIN"));
+        assert!(is_permanent_auth_error("BLOCKED"));
+        assert!(is_permanent_auth_error("Suspended"));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_transient_not_permanent() {
+        assert!(!is_permanent_auth_error("connection timeout"));
+        assert!(!is_permanent_auth_error("network error"));
+        assert!(!is_permanent_auth_error("rate limit exceeded"));
+        assert!(!is_permanent_auth_error(""));
+    }
+
+    #[test]
+    fn test_is_permanent_auth_error_totp_not_permanent() {
+        // TOTP errors are handled separately by is_totp_error
+        assert!(!is_permanent_auth_error("Invalid TOTP code"));
+    }
+
+    #[test]
+    fn test_is_totp_error_invalid_totp() {
+        assert!(is_totp_error("Dhan auth error: Invalid TOTP"));
+    }
+
+    #[test]
+    fn test_is_totp_error_totp_failed() {
+        assert!(is_totp_error("TOTP verification failed"));
+    }
+
+    #[test]
+    fn test_is_totp_error_case_insensitive() {
+        assert!(is_totp_error("invalid totp code"));
+        assert!(is_totp_error("TOTP INVALID"));
+    }
+
+    #[test]
+    fn test_is_totp_error_requires_both_keywords() {
+        // Must contain both "totp" and ("invalid" or "failed")
+        assert!(!is_totp_error("totp code generated")); // totp without invalid/failed
+        assert!(!is_totp_error("invalid PIN")); // invalid without totp
+    }
+
+    #[test]
+    fn test_is_totp_error_not_other_errors() {
+        assert!(!is_totp_error("connection timeout"));
+        assert!(!is_totp_error("rate limit"));
+        assert!(!is_totp_error(""));
+    }
+
+    #[test]
+    fn test_is_dhan_rate_limited_every_2_minutes() {
+        assert!(is_dhan_rate_limited(
+            "Token can be generated every 2 minutes"
+        ));
+    }
+
+    #[test]
+    fn test_is_dhan_rate_limited_once_every() {
+        assert!(is_dhan_rate_limited("once every 120 seconds"));
+    }
+
+    #[test]
+    fn test_is_dhan_rate_limited_not_other_errors() {
+        assert!(!is_dhan_rate_limited("DH-904 rate limit"));
+        assert!(!is_dhan_rate_limited("connection timeout"));
+        assert!(!is_dhan_rate_limited(""));
+    }
+
+    #[test]
+    fn test_error_classification_mutual_exclusion() {
+        // Verify that typical error messages only match one classifier
+        let pin_error = "Invalid Pin";
+        assert!(is_permanent_auth_error(pin_error));
+        assert!(!is_totp_error(pin_error));
+        assert!(!is_dhan_rate_limited(pin_error));
+
+        let totp_error = "Invalid TOTP code";
+        assert!(!is_permanent_auth_error(totp_error));
+        assert!(is_totp_error(totp_error));
+        assert!(!is_dhan_rate_limited(totp_error));
+
+        let rate_error = "Token can be generated every 2 minutes";
+        assert!(!is_permanent_auth_error(rate_error));
+        assert!(!is_totp_error(rate_error));
+        assert!(is_dhan_rate_limited(rate_error));
     }
 }

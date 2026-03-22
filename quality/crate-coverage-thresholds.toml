@@ -6,17 +6,17 @@
 # All values are line coverage percentages.
 # Any crate not listed uses the default threshold.
 #
-# POLICY: 95% minimum coverage for ALL crates. No exceptions.
+# POLICY: 100% minimum coverage for ALL crates. No exceptions.
 # Mechanical enforcement: CI blocks merge if any crate falls below threshold.
 # =============================================================================
 
 # Default threshold for any crate not explicitly listed
-default = 95.0
+default = 100.0
 
 [crates]
-common  = 95.0
-core    = 95.0
-trading = 95.0
-storage = 95.0
-api     = 95.0
-app     = 95.0
+common  = 100.0
+core    = 100.0
+trading = 100.0
+storage = 100.0
+api     = 100.0
+app     = 100.0

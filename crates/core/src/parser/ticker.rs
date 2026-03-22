@@ -183,6 +183,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ticker_empty_buffer() {
+        let hdr = PacketHeader {
+            response_code: 2,
+            message_length: 16,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_ticker_packet(&[], &hdr, 0).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 16,
+            actual: 0,
+        } = err
+        else {
+            panic!("wrong error variant")
+        };
+    }
+
+    #[test]
     fn test_parse_ticker_extra_bytes_ignored() {
         let (mut buf, hdr) = make_ticker_packet(2, 13, 24500.0, 1772073900);
         buf.extend_from_slice(&[0xFF; 20]); // extra garbage

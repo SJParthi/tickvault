@@ -4,16 +4,17 @@
 //! for lock-free state management. These tests verify correctness under all
 //! possible thread interleavings using the Loom model checker.
 //!
-//! Tests 1-2 use the ACTUAL OrderCircuitBreaker struct (loom-compatible via
-//! `#[cfg(loom)]` conditional imports in circuit_breaker.rs).
-//! Test 3 tests the CAS gate pattern directly (since reaching HalfOpen state
-//! requires elapsed time > reset_timeout, which loom doesn't control).
+//! Tests 1-2 use the ACTUAL OrderCircuitBreaker struct. Thread scheduling is
+//! controlled by loom but the struct's internal std atomics are not intercepted
+//! (loom-compatible conditional imports would require `#[cfg(feature = "loom")]`
+//! in the source, which we avoid to keep production code clean). These tests
+//! still verify that no panics or logic errors occur under all thread
+//! interleavings that loom can control.
+//! Test 3 tests the CAS gate pattern directly with loom atomics.
 //!
-//! Run with: RUSTFLAGS="--cfg loom" cargo test -p dhan-live-trader-trading --test loom_circuit_breaker
+//! Run with: cargo test -p dhan-live-trader-trading --features loom --test loom_circuit_breaker
 
-#![allow(unexpected_cfgs)] // APPROVED: loom cfg is set via RUSTFLAGS, not Cargo features
-
-#[cfg(loom)]
+#[cfg(feature = "loom")]
 mod loom_tests {
     use loom::sync::Arc;
     use loom::thread;
@@ -153,7 +154,7 @@ mod loom_tests {
 }
 
 // Standard (non-loom) concurrency tests that run in normal CI
-#[cfg(not(loom))]
+#[cfg(not(feature = "loom"))]
 mod std_concurrency_tests {
     use std::sync::Arc;
     use std::thread;

@@ -732,14 +732,14 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use chrono::{FixedOffset, Utc};
+    use chrono::Utc;
 
     use dhan_live_trader_common::instrument_types::*;
     use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
     /// Builds a minimal FnoUniverse for testing.
     fn make_test_universe() -> FnoUniverse {
-        let ist = FixedOffset::east_opt(19_800).unwrap();
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
 
         let mut underlyings = HashMap::new();
@@ -1876,7 +1876,7 @@ mod tests {
     #[test]
     fn test_plan_empty_universe() {
         // Completely empty universe — no instruments
-        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let universe = FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),
@@ -1916,7 +1916,7 @@ mod tests {
     fn test_plan_exceeds_capacity_triggers_warning() {
         // Build a universe with > 25,000 stock derivative contracts to trigger
         // the capacity limit (line 316: break) and warning (lines 346-347).
-        let ist = FixedOffset::east_opt(19_800).unwrap();
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
@@ -2290,5 +2290,390 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: IDX_I ticker-only routing — major indices use IdxI segment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_major_index_uses_idx_i_exchange_segment() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // NIFTY (security_id 13) should be subscribed with IDX_I segment
+        let nifty = plan.registry.get(13).unwrap();
+        assert_eq!(
+            nifty.exchange_segment,
+            ExchangeSegment::IdxI,
+            "major index value feed must use IDX_I segment"
+        );
+        assert_eq!(nifty.category, SubscriptionCategory::MajorIndexValue);
+    }
+
+    #[test]
+    fn test_display_index_uses_idx_i_exchange_segment() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // INDIA VIX (security_id 21) should use IDX_I segment
+        let vix = plan.registry.get(21).unwrap();
+        assert_eq!(
+            vix.exchange_segment,
+            ExchangeSegment::IdxI,
+            "display index must use IDX_I segment"
+        );
+        assert_eq!(vix.category, SubscriptionCategory::DisplayIndex);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Stock equity uses NSE_EQ segment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stock_equity_uses_nse_equity_segment() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // RELIANCE equity (security_id 2885) should use NSE_EQ segment
+        let reliance = plan.registry.get(2885).unwrap();
+        assert_eq!(
+            reliance.exchange_segment,
+            ExchangeSegment::NseEquity,
+            "stock equity must use NSE_EQ segment"
+        );
+        assert_eq!(reliance.category, SubscriptionCategory::StockEquity);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Index derivatives use NSE_FNO segment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_index_derivative_uses_nse_fno_segment() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // NIFTY future (50001) should use NSE_FNO segment
+        let nifty_fut = plan.registry.get(50001).unwrap();
+        assert_eq!(
+            nifty_fut.exchange_segment,
+            ExchangeSegment::NseFno,
+            "index derivative must use NSE_FNO segment"
+        );
+        assert_eq!(nifty_fut.category, SubscriptionCategory::IndexDerivative);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Full mode propagates feed_mode to all instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_full_mode_propagates_to_all_instruments() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig {
+            feed_mode: "Full".to_string(),
+            ..Default::default()
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        assert_eq!(plan.summary.feed_mode, FeedMode::Full);
+
+        // Verify every subscribed instrument has Full feed mode
+        for instrument in plan.registry.iter() {
+            assert_eq!(
+                instrument.feed_mode,
+                FeedMode::Full,
+                "instrument {} ({}) should have Full feed mode",
+                instrument.security_id,
+                instrument.display_label
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Ticker mode propagates to all instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ticker_mode_propagates_to_all_instruments() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig {
+            feed_mode: "Ticker".to_string(),
+            ..Default::default()
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        for instrument in plan.registry.iter() {
+            assert_eq!(
+                instrument.feed_mode,
+                FeedMode::Ticker,
+                "instrument {} should have Ticker feed mode",
+                instrument.security_id
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Capacity limit — plan total capped at MAX_TOTAL_SUBSCRIPTIONS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_capacity_limit_stage2_break_path() {
+        // Build a universe with enough stock derivatives to trigger the
+        // `instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS` break in Stage 2.
+        // We need > 25,000 instruments total. The existing capacity test does
+        // this with 50 stocks x 600 options. Here we verify the exact cap behavior.
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let mut underlyings = HashMap::new();
+        let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> = HashMap::new();
+        let mut expiry_calendars = HashMap::new();
+
+        // Create 30 stocks with 1000 options each = 30,000 + 30 futures = 30,030
+        let mut base_id: u32 = 200_000;
+        for stock_idx in 0..30u32 {
+            let symbol = format!("CAP{stock_idx}");
+            let equity_id = 180_000 + stock_idx;
+
+            underlyings.insert(
+                symbol.clone(),
+                FnoUnderlying {
+                    underlying_symbol: symbol.clone(),
+                    underlying_security_id: 190_000 + stock_idx,
+                    price_feed_security_id: equity_id,
+                    price_feed_segment: ExchangeSegment::NseEquity,
+                    derivative_segment: ExchangeSegment::NseFno,
+                    kind: UnderlyingKind::Stock,
+                    lot_size: 100,
+                    contract_count: 1001,
+                },
+            );
+
+            let fut_id = base_id;
+            base_id += 1;
+            derivative_contracts.insert(
+                fut_id,
+                DerivativeContract {
+                    security_id: fut_id,
+                    underlying_symbol: symbol.clone(),
+                    instrument_kind: DhanInstrumentKind::FutureStock,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: expiry,
+                    strike_price: 0.0,
+                    option_type: None,
+                    lot_size: 100,
+                    tick_size: 0.05,
+                    symbol_name: format!("{symbol}-FUT"),
+                    display_name: format!("{symbol} FUT"),
+                },
+            );
+
+            for strike_idx in 0..500u32 {
+                let ce_id = base_id;
+                base_id += 1;
+                let pe_id = base_id;
+                base_id += 1;
+                let strike = 500.0 + (strike_idx as f64) * 5.0;
+
+                derivative_contracts.insert(
+                    ce_id,
+                    DerivativeContract {
+                        security_id: ce_id,
+                        underlying_symbol: symbol.clone(),
+                        instrument_kind: DhanInstrumentKind::OptionStock,
+                        exchange_segment: ExchangeSegment::NseFno,
+                        expiry_date: expiry,
+                        strike_price: strike,
+                        option_type: Some(OptionType::Call),
+                        lot_size: 100,
+                        tick_size: 0.05,
+                        symbol_name: format!("{symbol}-{strike}-CE"),
+                        display_name: format!("{symbol} {strike} CE"),
+                    },
+                );
+                derivative_contracts.insert(
+                    pe_id,
+                    DerivativeContract {
+                        security_id: pe_id,
+                        underlying_symbol: symbol.clone(),
+                        instrument_kind: DhanInstrumentKind::OptionStock,
+                        exchange_segment: ExchangeSegment::NseFno,
+                        expiry_date: expiry,
+                        strike_price: strike,
+                        option_type: Some(OptionType::Put),
+                        lot_size: 100,
+                        tick_size: 0.05,
+                        symbol_name: format!("{symbol}-{strike}-PE"),
+                        display_name: format!("{symbol} {strike} PE"),
+                    },
+                );
+            }
+
+            expiry_calendars.insert(
+                symbol.clone(),
+                ExpiryCalendar {
+                    underlying_symbol: symbol,
+                    expiry_dates: vec![expiry],
+                },
+            );
+        }
+
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts,
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(), // no option chains -> skips ATM filtering
+            expiry_calendars,
+            subscribed_indices: vec![],
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test-cap".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 30,
+                derivative_count: 30030,
+                option_chain_count: 0,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: Utc::now().with_timezone(&ist),
+            },
+        };
+
+        let config = SubscriptionConfig::default();
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // Total must not exceed MAX_TOTAL_SUBSCRIPTIONS
+        assert!(
+            plan.summary.total <= MAX_TOTAL_SUBSCRIPTIONS,
+            "plan total ({}) must be <= {}",
+            plan.summary.total,
+            MAX_TOTAL_SUBSCRIPTIONS
+        );
+
+        // Some stock derivatives should have been skipped
+        assert!(
+            plan.summary.stock_derivatives_skipped > 0,
+            "capacity cap should cause some derivatives to be skipped"
+        );
+
+        // stock_derivatives_available should be larger than what was subscribed
+        assert!(
+            plan.summary.stock_derivatives_available > plan.summary.stock_derivatives,
+            "available ({}) > subscribed ({})",
+            plan.summary.stock_derivatives_available,
+            plan.summary.stock_derivatives
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Quote mode propagates to instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quote_mode_propagates_to_all_instruments() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig {
+            feed_mode: "Quote".to_string(),
+            ..Default::default()
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
+        for instrument in plan.registry.iter() {
+            assert_eq!(
+                instrument.feed_mode,
+                FeedMode::Quote,
+                "instrument {} should have Quote feed mode",
+                instrument.security_id
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Stock derivative category assignment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stock_derivative_category_assignment() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // RELIANCE future (60001) should be StockDerivative
+        let rel_fut = plan.registry.get(60001).unwrap();
+        assert_eq!(rel_fut.category, SubscriptionCategory::StockDerivative);
+
+        // RELIANCE option CE (60100) should be StockDerivative
+        let rel_ce = plan.registry.get(60100).unwrap();
+        assert_eq!(rel_ce.category, SubscriptionCategory::StockDerivative);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: underlying_symbol propagated correctly
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_underlying_symbol_propagated_to_instruments() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // NIFTY index value
+        let nifty = plan.registry.get(13).unwrap();
+        assert_eq!(nifty.underlying_symbol, "NIFTY");
+
+        // RELIANCE equity
+        let reliance = plan.registry.get(2885).unwrap();
+        assert_eq!(reliance.underlying_symbol, "RELIANCE");
+
+        // NIFTY derivative
+        let nifty_fut = plan.registry.get(50001).unwrap();
+        assert_eq!(nifty_fut.underlying_symbol, "NIFTY");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: Index option is classified as IndexDerivative
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_index_option_classified_as_index_derivative() {
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(&universe, &config, today);
+
+        // NIFTY CE option (50100) should be IndexDerivative
+        let nifty_ce = plan.registry.get(50100).unwrap();
+        assert_eq!(nifty_ce.category, SubscriptionCategory::IndexDerivative);
+
+        // NIFTY PE option (50200) should be IndexDerivative
+        let nifty_pe = plan.registry.get(50200).unwrap();
+        assert_eq!(nifty_pe.category, SubscriptionCategory::IndexDerivative);
     }
 }

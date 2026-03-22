@@ -70,6 +70,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_oi_empty_buffer() {
+        let hdr = PacketHeader {
+            response_code: 5,
+            message_length: 12,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_oi_packet(&[], &hdr).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 12,
+            actual: 0,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
+    }
+
+    #[test]
     fn test_parse_oi_truncated() {
         let buf = vec![0u8; 11];
         let hdr = PacketHeader {

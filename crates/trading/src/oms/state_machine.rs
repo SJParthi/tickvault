@@ -375,4 +375,111 @@ mod tests {
         assert_eq!(parse_order_status(""), None);
         assert_eq!(parse_order_status("traded"), None);
     }
+
+    // --- Debug format tests ---
+
+    #[test]
+    fn order_status_debug_all_variants() {
+        let variants = [
+            (OrderStatus::Transit, "Transit"),
+            (OrderStatus::Pending, "Pending"),
+            (OrderStatus::Confirmed, "Confirmed"),
+            (OrderStatus::PartTraded, "PartTraded"),
+            (OrderStatus::Traded, "Traded"),
+            (OrderStatus::Cancelled, "Cancelled"),
+            (OrderStatus::Rejected, "Rejected"),
+            (OrderStatus::Expired, "Expired"),
+            (OrderStatus::Closed, "Closed"),
+            (OrderStatus::Triggered, "Triggered"),
+        ];
+
+        for (status, expected_name) in &variants {
+            let debug = format!("{status:?}");
+            assert!(
+                debug.contains(expected_name),
+                "Debug for {expected_name}: got '{debug}'"
+            );
+        }
+    }
+
+    #[test]
+    fn order_status_debug_all_variants_non_empty() {
+        let all_statuses = [
+            OrderStatus::Transit,
+            OrderStatus::Pending,
+            OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
+            OrderStatus::Traded,
+            OrderStatus::Cancelled,
+            OrderStatus::Rejected,
+            OrderStatus::Expired,
+            OrderStatus::Closed,
+            OrderStatus::Triggered,
+        ];
+        for status in &all_statuses {
+            let debug = format!("{status:?}");
+            assert!(!debug.is_empty(), "Debug must not be empty for {status:?}");
+        }
+    }
+
+    #[test]
+    fn order_status_as_str_all_variants_non_empty() {
+        let all_statuses = [
+            OrderStatus::Transit,
+            OrderStatus::Pending,
+            OrderStatus::Confirmed,
+            OrderStatus::PartTraded,
+            OrderStatus::Traded,
+            OrderStatus::Cancelled,
+            OrderStatus::Rejected,
+            OrderStatus::Expired,
+            OrderStatus::Closed,
+            OrderStatus::Triggered,
+        ];
+        for status in &all_statuses {
+            let s = status.as_str();
+            assert!(!s.is_empty(), "as_str() must not be empty for {status:?}");
+            // as_str returns SCREAMING_SNAKE_CASE
+            assert_eq!(
+                s,
+                s.to_uppercase(),
+                "as_str() must return uppercase for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_status_as_str_matches_parse_roundtrip() {
+        let all_statuses = [
+            OrderStatus::Transit,
+            OrderStatus::Pending,
+            OrderStatus::Confirmed,
+            OrderStatus::Traded,
+            OrderStatus::Cancelled,
+            OrderStatus::Rejected,
+            OrderStatus::Expired,
+            OrderStatus::Closed,
+            OrderStatus::Triggered,
+        ];
+        for status in &all_statuses {
+            let s = status.as_str();
+            let parsed = parse_order_status(s);
+            assert_eq!(
+                parsed,
+                Some(*status),
+                "parse_order_status({s:?}) must roundtrip to {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_status_part_traded_as_str_roundtrips() {
+        // PART_TRADED has an alias PARTIALLY_FILLED, but as_str returns PART_TRADED
+        let status = OrderStatus::PartTraded;
+        let s = status.as_str();
+        assert_eq!(s, "PART_TRADED");
+        assert_eq!(parse_order_status(s), Some(status));
+        // Also verify the alias
+        assert_eq!(parse_order_status("PARTIALLY_FILLED"), Some(status));
+    }
 }

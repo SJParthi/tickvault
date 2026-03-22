@@ -35,6 +35,8 @@ pub struct ApplicationConfig {
     pub historical: HistoricalDataConfig,
     #[serde(default)]
     pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub index_constituency: IndexConstituencyConfig,
 }
 
 /// Strategy and paper-trading configuration.
@@ -77,7 +79,7 @@ const fn default_dry_run() -> bool {
 /// Trading session timing configuration.
 #[derive(Debug, Deserialize)]
 pub struct TradingConfig {
-    /// Market open time in IST (e.g., "09:15:00").
+    /// Market open time in IST (e.g., "09:00:00").
     pub market_open_time: String,
     /// Market close time in IST (e.g., "15:30:00").
     pub market_close_time: String,
@@ -236,6 +238,16 @@ pub struct ApiConfig {
     pub host: String,
     /// HTTP server port.
     pub port: u16,
+    /// Allowed CORS origins. Defaults to localhost dev origins.
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    vec![
+        "http://localhost:3000".to_string(),
+        "http://localhost:3001".to_string(),
+    ]
 }
 
 /// Instrument CSV download and universe build configuration.
@@ -425,7 +437,8 @@ pub struct IndexConstituencyConfig {
     #[serde(default = "default_constituency_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
     /// Delay in milliseconds between batches of concurrent downloads.
-    #[serde(default)]
+    /// Default 200ms to be respectful to niftyindices.com when downloading ~50 indices.
+    #[serde(default = "default_constituency_inter_batch_delay_ms")]
     pub inter_batch_delay_ms: u64,
 }
 
@@ -435,7 +448,7 @@ impl Default for IndexConstituencyConfig {
             enabled: default_constituency_enabled(),
             download_timeout_secs: default_constituency_download_timeout_secs(),
             max_concurrent_downloads: default_constituency_max_concurrent_downloads(),
-            inter_batch_delay_ms: 0,
+            inter_batch_delay_ms: default_constituency_inter_batch_delay_ms(),
         }
     }
 }
@@ -450,6 +463,10 @@ const fn default_constituency_download_timeout_secs() -> u64 {
 
 const fn default_constituency_max_concurrent_downloads() -> usize {
     5
+}
+
+const fn default_constituency_inter_batch_delay_ms() -> u64 {
+    200
 }
 
 // ---------------------------------------------------------------------------
@@ -474,36 +491,37 @@ impl ApplicationConfig {
         }
 
         // Validate time string formats.
-        let time_fields = [
-            ("trading.market_open_time", &self.trading.market_open_time),
-            ("trading.market_close_time", &self.trading.market_close_time),
-            ("trading.order_cutoff_time", &self.trading.order_cutoff_time),
-            (
-                "trading.data_collection_start",
-                &self.trading.data_collection_start,
-            ),
-            (
-                "trading.data_collection_end",
-                &self.trading.data_collection_end,
-            ),
-            (
-                "instrument.daily_download_time",
-                &self.instrument.daily_download_time,
-            ),
-            (
-                "instrument.build_window_start",
-                &self.instrument.build_window_start,
-            ),
-            (
-                "instrument.build_window_end",
-                &self.instrument.build_window_end,
-            ),
-        ];
-        for (field_name, value) in &time_fields {
+        // Helper: parse and validate a single time field.
+        let parse_time = |field_name: &str, value: &str| -> Result<NaiveTime> {
             NaiveTime::parse_from_str(value, "%H:%M:%S").map_err(|_| {
                 anyhow::anyhow!("{} is not a valid HH:MM:SS time: '{}'", field_name, value)
-            })?;
-        }
+            })
+        };
+
+        parse_time("trading.market_open_time", &self.trading.market_open_time)?;
+        parse_time("trading.market_close_time", &self.trading.market_close_time)?;
+        parse_time("trading.order_cutoff_time", &self.trading.order_cutoff_time)?;
+        parse_time(
+            "trading.data_collection_start",
+            &self.trading.data_collection_start,
+        )?;
+        parse_time(
+            "trading.data_collection_end",
+            &self.trading.data_collection_end,
+        )?;
+        parse_time(
+            "instrument.daily_download_time",
+            &self.instrument.daily_download_time,
+        )?;
+        // Parse and retain build window times for the comparison below.
+        let window_start = parse_time(
+            "instrument.build_window_start",
+            &self.instrument.build_window_start,
+        )?;
+        let window_end = parse_time(
+            "instrument.build_window_end",
+            &self.instrument.build_window_end,
+        )?;
 
         // SEBI: max_orders_per_second must not exceed the SEBI limit.
         if self.trading.max_orders_per_second > SEBI_MAX_ORDERS_PER_SECOND {
@@ -550,18 +568,7 @@ impl ApplicationConfig {
         }
 
         // Instrument: build window start must be before end.
-        let window_start =
-            NaiveTime::parse_from_str(&self.instrument.build_window_start, "%H:%M:%S").map_err(
-                |_| {
-                    anyhow::anyhow!(
-                        "instrument.build_window_start already validated above but failed again"
-                    )
-                },
-            )?;
-        let window_end = NaiveTime::parse_from_str(&self.instrument.build_window_end, "%H:%M:%S")
-            .map_err(|_| {
-            anyhow::anyhow!("instrument.build_window_end already validated above but failed again")
-        })?;
+        // `window_start` and `window_end` already parsed above — no redundant re-parse.
         if window_start >= window_end {
             bail!(
                 "instrument.build_window_start ({}) must be before build_window_end ({})",
@@ -664,7 +671,7 @@ mod tests {
     fn make_valid_config() -> ApplicationConfig {
         ApplicationConfig {
             trading: TradingConfig {
-                market_open_time: "09:15:00".to_string(),
+                market_open_time: "09:00:00".to_string(),
                 market_close_time: "15:30:00".to_string(),
                 order_cutoff_time: "15:29:00".to_string(),
                 data_collection_start: "09:00:00".to_string(),
@@ -753,12 +760,14 @@ mod tests {
             api: ApiConfig {
                 host: "0.0.0.0".to_string(),
                 port: 3001,
+                allowed_origins: default_allowed_origins(),
             },
             subscription: SubscriptionConfig::default(),
             notification: NotificationConfig::default(),
             observability: ObservabilityConfig::default(),
             historical: HistoricalDataConfig::default(),
             strategy: StrategyConfig::default(),
+            index_constituency: IndexConstituencyConfig::default(),
         }
     }
 
@@ -1148,6 +1157,140 @@ mod tests {
         assert!(
             config.parsed_feed_mode().is_err(),
             "feed_mode is case-sensitive — 'ticker' should fail"
+        );
+    }
+
+    // =====================================================================
+    // Additional coverage: default impls, edge cases, more validation paths
+    // =====================================================================
+
+    #[test]
+    fn test_strategy_config_default() {
+        let config = StrategyConfig::default();
+        assert_eq!(config.config_path, "config/strategies.toml");
+        assert!((config.capital - 1_000_000.0).abs() < f64::EPSILON);
+        assert!(config.dry_run, "dry_run must default to true");
+    }
+
+    #[test]
+    fn test_notification_config_default() {
+        let config = NotificationConfig::default();
+        assert_eq!(config.telegram_api_base_url, "https://api.telegram.org");
+        assert_eq!(config.send_timeout_ms, 10_000);
+        assert!(!config.sns_enabled);
+    }
+
+    #[test]
+    fn test_observability_config_default() {
+        let config = ObservabilityConfig::default();
+        assert_eq!(config.metrics_port, 9091);
+        assert!(config.metrics_enabled);
+        assert!(config.tracing_enabled);
+        assert!(config.otlp_endpoint.contains("4317"));
+    }
+
+    #[test]
+    fn test_historical_data_config_default() {
+        let config = HistoricalDataConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.lookback_days, 90);
+        assert_eq!(config.request_timeout_secs, 30);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.request_delay_ms, 500);
+    }
+
+    #[test]
+    fn test_index_constituency_config_default() {
+        let config = IndexConstituencyConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.download_timeout_secs, 30);
+        assert_eq!(config.max_concurrent_downloads, 5);
+        assert_eq!(config.inter_batch_delay_ms, 200);
+    }
+
+    #[test]
+    fn test_subscription_config_default() {
+        let config = SubscriptionConfig::default();
+        assert_eq!(config.feed_mode, "Ticker");
+        assert!(config.subscribe_index_derivatives);
+        assert!(config.subscribe_stock_derivatives);
+        assert!(config.subscribe_display_indices);
+        assert!(config.subscribe_stock_equities);
+        assert_eq!(config.stock_atm_strikes_above, 10);
+        assert_eq!(config.stock_atm_strikes_below, 10);
+        assert!(config.stock_default_atm_fallback_enabled);
+    }
+
+    #[test]
+    fn test_default_allowed_origins() {
+        let origins = default_allowed_origins();
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains(&"http://localhost:3000".to_string()));
+        assert!(origins.contains(&"http://localhost:3001".to_string()));
+    }
+
+    #[test]
+    fn test_feed_mode_empty_string_fails() {
+        let config = SubscriptionConfig {
+            feed_mode: String::new(),
+            ..SubscriptionConfig::default()
+        };
+        assert!(config.parsed_feed_mode().is_err());
+    }
+
+    #[test]
+    fn test_invalid_market_close_time_fails() {
+        let mut config = make_valid_config();
+        config.trading.market_close_time = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("market_close_time"));
+    }
+
+    #[test]
+    fn test_invalid_order_cutoff_time_fails() {
+        let mut config = make_valid_config();
+        config.trading.order_cutoff_time = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("order_cutoff_time"));
+    }
+
+    #[test]
+    fn test_invalid_data_collection_start_fails() {
+        let mut config = make_valid_config();
+        config.trading.data_collection_start = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("data_collection_start"));
+    }
+
+    #[test]
+    fn test_invalid_data_collection_end_fails() {
+        let mut config = make_valid_config();
+        config.trading.data_collection_end = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("data_collection_end"));
+    }
+
+    #[test]
+    fn test_invalid_build_window_end_format_fails() {
+        let mut config = make_valid_config();
+        config.instrument.build_window_end = "bad".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("build_window_end"));
+    }
+
+    #[test]
+    fn test_invalid_holiday_date_fails_validation() {
+        // Exercises the TradingCalendar::from_config error propagation (line 638)
+        let mut config = make_valid_config();
+        config.trading.nse_holidays = vec![NseHolidayEntry {
+            date: "not-a-date".to_string(),
+            name: "Bad Holiday".to_string(),
+        }];
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not-a-date"),
+            "error should mention the bad date: {}",
+            err
         );
     }
 }

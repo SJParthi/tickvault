@@ -227,17 +227,19 @@ impl ExchangeSegment {
 
 ---
 
-## 12. Timestamp Format (V2 — all APIs)
+## 12. Timestamp Format (V2)
 
-All Dhan V2 timestamps are **standard UNIX epoch (seconds since Jan 1, 1970 00:00 UTC)**.
+Dhan V2 uses **two different timestamp conventions** depending on the data source:
 
-Cross-verified from 4 sources:
-- Historical Data daily: `1326220200` = IST 2012-01-11 00:00:00 (midnight IST)
-- Historical Data intraday: `1328845500` = IST 09:15:00 (NSE market open)
-- Python SDK `marketfeed.py`: `utc_time()` uses `datetime.utcfromtimestamp()`
-- Python SDK `dhanhq.py`: `convert_to_date_time()` explicitly adds `+5:30` IST offset
+### 12a. Historical REST API — UTC epoch seconds
 
-**To get IST: add +5:30 (19800 seconds) or use timezone-aware parsing.**
+Historical Data endpoints (`/v2/charts/historical`, `/v2/charts/intraday`) return **standard UNIX epoch (seconds since Jan 1, 1970 00:00 UTC)**.
+
+Cross-verified from 2 sources:
+- Historical Data daily: `1326220200` = IST 2012-01-11 00:00:00 (midnight IST) = UTC 2012-01-10 18:30:00
+- Historical Data intraday: `1328845500` = IST 09:15:00 (NSE market open) = UTC 03:45:00
+
+**To get IST from REST timestamps: add +5:30 (19800 seconds) or use timezone-aware parsing.**
 
 ```rust
 use chrono::{FixedOffset, TimeZone};
@@ -245,7 +247,23 @@ let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
 let dt = ist.timestamp_opt(epoch as i64, 0).unwrap();
 ```
 
-> Dhan v1 Historical Data used custom epoch from Jan 1, 1980 IST — v2 uses standard UNIX epoch everywhere.
+### 12b. WebSocket Live Market Feed — IST epoch seconds
+
+WebSocket LTT (Last Trade Time) fields send **IST epoch seconds (seconds since Jan 1, 1970 00:00 IST)**, NOT UTC. The raw u32 value already represents IST. Do NOT add +5:30 — that would double-offset. To convert to UTC for storage, SUBTRACT 19800 seconds.
+
+```rust
+use chrono::{FixedOffset, TimeZone, NaiveDateTime};
+// WebSocket LTT is IST epoch — interpret directly as IST
+let naive = NaiveDateTime::from_timestamp_opt(ltt as i64, 0).unwrap();
+let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+let ist_dt = ist.from_local_datetime(&naive).unwrap();
+// To get UTC: subtract 19800s from the raw value
+let utc_epoch = ltt as i64 - 19800;
+```
+
+> **SDK caveat**: Python SDK `marketfeed.py` `utc_time()` uses `datetime.utcfromtimestamp()` on WebSocket LTT values, which would be incorrect if the values are IST epoch. The SDK's `convert_to_date_time()` in `dhanhq.py` adds `+5:30`, which is correct for REST API timestamps but would double-offset WebSocket LTT. Treat SDK timestamp handling as potentially unreliable for WebSocket data.
+
+> Dhan v1 Historical Data used custom epoch from Jan 1, 1980 IST — v2 uses standard UNIX epoch for REST, IST epoch for WebSocket.
 
 ---
 

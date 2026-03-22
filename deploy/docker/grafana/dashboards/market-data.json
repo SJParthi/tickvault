@@ -9,26 +9,10 @@
         "iconColor": "rgba(0, 211, 255, 1)",
         "name": "Annotations & Alerts",
         "type": "dashboard"
-      },
-      {
-        "datasource": { "type": "postgres", "uid": "questdb" },
-        "enable": true,
-        "hide": false,
-        "iconColor": "#FF5722",
-        "name": "NSE Holidays",
-        "rawQuery": true,
-        "showIn": 0,
-        "target": {
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT ts AS time, name || ' (' || holiday_type || ')' AS text, holiday_type AS tags FROM nse_holidays ORDER BY ts;",
-          "refId": "holidays"
-        }
       }
     ]
   },
-  "description": "dhan-live-trader — Live market data explorer. Pick underlying (index or equity), then contract (spot or derivative) — candlestick charts load automatically.",
+  "description": "dhan-live-trader — Live market data explorer. Ticks, candles, instruments, depth, and trading calendar.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -195,157 +179,6 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
-      "id": 150,
-      "title": "Candlestick Charts",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "description": "Historical OHLCV candlestick chart from Dhan REST API. Pick Underlying → Instrument from dropdowns above. Queries unified historical_candles table with timeframe filter. SMA 20 overlay.",
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false }
-          },
-          "color": { "mode": "fixed" },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "open" },
-            "properties": [
-              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "SMA 20" },
-            "properties": [
-              { "id": "color", "value": { "fixedColor": "#FF9800", "mode": "fixed" } },
-              { "id": "custom.lineWidth", "value": 2 },
-              { "id": "custom.fillOpacity", "value": 0 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "volume" },
-            "properties": [
-              { "id": "unit", "value": "locale" },
-              { "id": "custom.hideFrom", "value": { "legend": false, "tooltip": false, "viz": false } }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 6 },
-      "id": 11,
-      "options": {
-        "mode": "candles+volume",
-        "candleStyle": "candles",
-        "colorStrategy": "open-close",
-        "colors": { "up": "green", "down": "red", "flat": "gray" },
-        "includeAllFields": false
-      },
-      "title": "Historical — ${contract:text}  [${timeframe}]",
-      "type": "candlestick",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM historical_candles\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND timeframe = '${timeframe}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
-          "refId": "OHLCV"
-        },
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM historical_candles\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND timeframe = '${timeframe}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
-          "refId": "SMA",
-          "hide": true
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "description": "Live OHLCV candlestick chart from QuestDB materialized views (candles_1m, 5m, 15m, etc.). Queries pre-aggregated view for selected timeframe directly. SMA 20 overlay. Auto-refreshes every 5s.",
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false }
-          },
-          "color": { "mode": "fixed" },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "open" },
-            "properties": [
-              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "SMA 20" },
-            "properties": [
-              { "id": "color", "value": { "fixedColor": "#2196F3", "mode": "fixed" } },
-              { "id": "custom.lineWidth", "value": 2 },
-              { "id": "custom.fillOpacity", "value": 0 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "volume" },
-            "properties": [
-              { "id": "unit", "value": "locale" },
-              { "id": "custom.hideFrom", "value": { "legend": false, "tooltip": false, "viz": false } }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 22 },
-      "id": 12,
-      "options": {
-        "mode": "candles+volume",
-        "candleStyle": "candles",
-        "colorStrategy": "open-close",
-        "colors": { "up": "green", "down": "red", "flat": "gray" },
-        "includeAllFields": false
-      },
-      "title": "Live (Ticks) — ${contract:text}  [${timeframe}]",
-      "type": "candlestick",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  open,\n  high,\n  low,\n  close,\n  volume\nFROM candles_${timeframe}\nWHERE security_id = ${contract}\n  AND segment = '${segment}'\n  AND ts >= '${__from:date:iso}'\n  AND ts < '${__to:date:iso}'\nORDER BY ts;",
-          "refId": "OHLCV"
-        },
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\"\nFROM (\n  SELECT\n    ts AS time,\n    close\n  FROM candles_${timeframe}\n  WHERE security_id = ${contract}\n    AND segment = '${segment}'\n    AND ts >= '${__from:date:iso}'\n    AND ts < '${__to:date:iso}'\n  ORDER BY ts\n);",
-          "refId": "SMA",
-          "hide": true
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
       "id": 200,
       "title": "Latest Ticks (Live Feed)",
       "type": "row"
@@ -393,7 +226,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 39 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 6 },
       "id": 10,
       "options": {
         "showHeader": true,
@@ -417,7 +250,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
       "id": 300,
       "title": "Historical Candles (All Timeframes)",
       "type": "row"
@@ -466,7 +299,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 52 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 19 },
       "id": 20,
       "options": {
         "showHeader": true,
@@ -490,7 +323,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "id": 400,
       "title": "Live Candles (Aggregated from Ticks)",
       "type": "row"
@@ -539,7 +372,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 65 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 32 },
       "id": 25,
       "options": {
         "showHeader": true,
@@ -563,7 +396,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
       "id": 500,
       "title": "F&O Universe",
       "type": "row"
@@ -583,7 +416,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 78 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 45 },
       "id": 30,
       "options": {
         "showHeader": true,
@@ -625,7 +458,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 88 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 55 },
       "id": 31,
       "options": {
         "showHeader": true,
@@ -649,7 +482,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 100 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
       "id": 600,
       "title": "Subscribed Indices",
       "type": "row"
@@ -669,7 +502,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 101 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 68 },
       "id": 40,
       "options": {
         "showHeader": true,
@@ -693,7 +526,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 },
       "id": 700,
       "title": "Market Depth",
       "type": "row"
@@ -746,7 +579,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 112 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 79 },
       "id": 50,
       "options": {
         "showHeader": true,
@@ -770,7 +603,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 124 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
       "id": 800,
       "title": "Previous Close",
       "type": "row"
@@ -795,7 +628,7 @@
           }
         ]
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 125 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 92 },
       "id": 60,
       "options": {
         "showHeader": true,
@@ -819,7 +652,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 135 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
       "id": 900,
       "title": "Instrument Build Metadata",
       "type": "row"
@@ -844,7 +677,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 136 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 103 },
       "id": 70,
       "options": {
         "showHeader": true,
@@ -868,7 +701,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 144 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
       "id": 1000,
       "title": "NSE Trading Calendar",
       "type": "row"
@@ -910,8 +743,11 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 145 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 112 },
       "id": 80,
+      "timeFrom": "1y",
+      "timeShift": null,
+      "hideTimeOverride": true,
       "options": {
         "showHeader": true,
         "cellHeight": "sm",
@@ -919,7 +755,7 @@
         "sortBy": [{ "desc": false, "displayName": "holiday_date" }]
       },
       "title": "NSE Holidays & Muhurat Trading Sessions (2026)",
-      "description": "Complete NSE trading calendar loaded from config. Holidays (market closed) and Muhurat Trading sessions (special evening hours on Diwali). Source: NSE Circular NSE/CMTR/71775.",
+      "description": "Complete NSE trading calendar loaded from config. Holidays (market closed) and Muhurat Trading sessions (special evening hours on Diwali). Source: NSE Circular NSE/CMTR/71775. Note: Settlement holidays (e.g. Gudi Padwa) are NOT listed here — trading is allowed on settlement holidays.",
       "type": "table",
       "targets": [
         {
@@ -927,7 +763,113 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date\nFROM nse_holidays\nORDER BY ts;",
+          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date,\n  CASE day_of_week(ts)\n    WHEN 1 THEN 'Monday'\n    WHEN 2 THEN 'Tuesday'\n    WHEN 3 THEN 'Wednesday'\n    WHEN 4 THEN 'Thursday'\n    WHEN 5 THEN 'Friday'\n    WHEN 6 THEN 'Saturday'\n    WHEN 7 THEN 'Sunday'\n  END AS day_of_week\nFROM nse_holidays\nWHERE ts >= '2026-01-01' AND ts <= '2026-12-31'\nORDER BY ts;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "index_name" },
+            "properties": [
+              { "id": "custom.width", "value": 250 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "total_stocks" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "with_fno" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 124 },
+      "id": 82,
+      "timeFrom": "1y",
+      "timeShift": null,
+      "hideTimeOverride": true,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": true, "displayName": "total_stocks" }]
+      },
+      "title": "Index Summary — Stocks Per Index",
+      "description": "How many stocks are in each NSE index, and how many of those have F&O derivatives (security_id > 0). Indices with high F&O coverage are most actionable for trading.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  index_name,\n  count(*) AS total_stocks,\n  count(CASE WHEN security_id > 0 THEN 1 END) AS with_fno\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nGROUP BY index_name\nORDER BY total_stocks DESC;",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "weight" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.width", "value": 100 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "index_name" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "symbol" },
+            "properties": [
+              { "id": "custom.width", "value": 150 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 134 },
+      "id": 81,
+      "timeFrom": "1y",
+      "timeShift": null,
+      "hideTimeOverride": true,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
+        "sortBy": [{ "desc": false, "displayName": "index_name" }]
+      },
+      "title": "NSE Index Constituents — All Stocks Tagged To Their Indices",
+      "description": "Every stock tagged to its parent index with security_id. security_id > 0 means the stock has F&O derivatives. Sort by index_name to see stocks per index. Source: niftyindices.com, enriched with Dhan instrument master.",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "questdb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  index_name,\n  symbol,\n  isin,\n  weight,\n  sector,\n  security_id\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nORDER BY index_name, weight DESC;",
           "refId": "A"
         }
       ]
@@ -937,88 +879,12 @@
   "schemaVersion": 40,
   "tags": ["dhan-live-trader", "market-data", "questdb"],
   "templating": {
-    "list": [
-      {
-        "current": { "selected": true, "text": "NIFTY", "value": "13" },
-        "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT DISTINCT symbol AS __text, security_id AS __value FROM subscribed_indices WHERE category = 'FnoUnderlying' UNION ALL SELECT DISTINCT underlying_symbol AS __text, price_feed_security_id AS __value FROM fno_underlyings WHERE kind = 'Stock' ORDER BY 1;",
-        "description": "Pick index or equity underlying — derivatives shown in Contract dropdown",
-        "hide": 0,
-        "includeAll": false,
-        "label": "Underlying",
-        "multi": false,
-        "name": "security_id",
-        "options": [],
-        "query": "SELECT DISTINCT symbol AS __text, security_id AS __value FROM subscribed_indices WHERE category = 'FnoUnderlying' UNION ALL SELECT DISTINCT underlying_symbol AS __text, price_feed_security_id AS __value FROM fno_underlyings WHERE kind = 'Stock' ORDER BY 1;",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "type": "query"
-      },
-      {
-        "current": { "selected": true, "text": "NIFTY (Spot)", "value": "13" },
-        "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT '${security_id:text} (Spot)' AS __text, ${security_id} AS __value UNION ALL SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${security_id:text}' ORDER BY 1;",
-        "description": "Spot/Index or derivative contract for the selected underlying",
-        "hide": 0,
-        "includeAll": false,
-        "label": "Contract",
-        "multi": false,
-        "name": "contract",
-        "options": [],
-        "query": "SELECT '${security_id:text} (Spot)' AS __text, ${security_id} AS __value UNION ALL SELECT display_name AS __text, security_id AS __value FROM derivative_contracts WHERE underlying_symbol = '${security_id:text}' ORDER BY 1;",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "type": "query"
-      },
-      {
-        "current": { "selected": true, "text": "IDX_I", "value": "IDX_I" },
-        "datasource": { "type": "postgres", "uid": "questdb" },
-        "definition": "SELECT 'IDX_I' AS segment FROM subscribed_indices WHERE security_id = ${contract} AND symbol = '${security_id:text}' UNION ALL SELECT price_feed_segment AS segment FROM fno_underlyings WHERE price_feed_security_id = ${contract} AND underlying_symbol = '${security_id:text}' UNION ALL SELECT exchange_segment AS segment FROM derivative_contracts WHERE security_id = ${contract} AND underlying_symbol = '${security_id:text}';",
-        "description": "Auto-derived exchange segment for the selected contract",
-        "hide": 2,
-        "includeAll": false,
-        "label": "Segment",
-        "multi": false,
-        "name": "segment",
-        "options": [],
-        "query": "SELECT 'IDX_I' AS segment FROM subscribed_indices WHERE security_id = ${contract} AND symbol = '${security_id:text}' UNION ALL SELECT price_feed_segment AS segment FROM fno_underlyings WHERE price_feed_security_id = ${contract} AND underlying_symbol = '${security_id:text}' UNION ALL SELECT exchange_segment AS segment FROM derivative_contracts WHERE security_id = ${contract} AND underlying_symbol = '${security_id:text}';",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "type": "query"
-      },
-      {
-        "current": { "selected": true, "text": "1m", "value": "1m" },
-        "description": "Candlestick timeframe — 1m candles aggregated via QuestDB SAMPLE BY",
-        "hide": 0,
-        "includeAll": false,
-        "label": "Timeframe",
-        "multi": false,
-        "name": "timeframe",
-        "options": [
-          { "selected": true, "text": "1m", "value": "1m" },
-          { "selected": false, "text": "5m", "value": "5m" },
-          { "selected": false, "text": "15m", "value": "15m" },
-          { "selected": false, "text": "30m", "value": "30m" },
-          { "selected": false, "text": "1h", "value": "1h" },
-          { "selected": false, "text": "4h", "value": "4h" },
-          { "selected": false, "text": "1d", "value": "1d" }
-        ],
-        "query": "1m,5m,15m,30m,1h,4h,1d",
-        "skipUrlSync": false,
-        "type": "custom"
-      }
-    ]
+    "list": []
   },
   "time": { "from": "now-3d", "to": "now" },
   "timepicker": {},
   "timezone": "utc",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 6
+  "version": 7
 }

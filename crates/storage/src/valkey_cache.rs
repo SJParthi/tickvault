@@ -23,6 +23,58 @@ use dhan_live_trader_common::config::ValkeyConfig;
 const POOL_CHECKOUT_TIMEOUT_MS: u64 = 500;
 
 // ---------------------------------------------------------------------------
+// Pure helper functions (testable without Redis)
+// ---------------------------------------------------------------------------
+
+/// Builds the Redis URL from host and port.
+///
+/// Format: `redis://{host}:{port}` — no auth, no database selection.
+fn build_valkey_url(host: &str, port: u16) -> String {
+    format!("redis://{}:{}", host, port)
+}
+
+/// Builds a Valkey cache key for instrument-related data.
+///
+/// Format: `dlt:instrument:{suffix}` — namespaced to prevent collisions.
+pub fn build_instrument_cache_key(suffix: &str) -> String {
+    format!("dlt:instrument:{}", suffix)
+}
+
+/// Builds a Valkey cache key for token-related data.
+///
+/// Format: `dlt:token:{suffix}` — namespaced to prevent collisions.
+pub fn build_token_cache_key(suffix: &str) -> String {
+    format!("dlt:token:{}", suffix)
+}
+
+/// Builds a Valkey cache key for tick/market data.
+///
+/// Format: `dlt:tick:{security_id}:{suffix}` — per-instrument namespacing.
+pub fn build_tick_cache_key(security_id: u32, suffix: &str) -> String {
+    format!("dlt:tick:{}:{}", security_id, suffix)
+}
+
+/// Computes TTL for instrument cache entries.
+///
+/// Returns TTL in seconds: the time from `current_epoch_secs` until
+/// `target_hour_ist` (next day if already past). Clamps to [60, 86400].
+pub fn compute_instrument_ttl_secs(current_epoch_secs: u64, target_hour_ist: u8) -> u64 {
+    // IST = UTC + 5:30 = UTC + 19800s
+    const IST_OFFSET: u64 = 19_800;
+    let ist_secs_today = (current_epoch_secs + IST_OFFSET) % 86_400;
+    let target_secs = u64::from(target_hour_ist) * 3600;
+
+    let remaining = if ist_secs_today < target_secs {
+        target_secs - ist_secs_today
+    } else {
+        // Past target hour — TTL until target hour tomorrow
+        86_400 - ist_secs_today + target_secs
+    };
+
+    remaining.clamp(60, 86_400)
+}
+
+// ---------------------------------------------------------------------------
 // Pool wrapper
 // ---------------------------------------------------------------------------
 
@@ -39,7 +91,7 @@ impl ValkeyPool {
     /// # Errors
     /// Returns error if the pool builder fails (bad config, not a connection error).
     pub fn new(config: &ValkeyConfig) -> Result<Self> {
-        let url = format!("redis://{}:{}", config.host, config.port);
+        let url = build_valkey_url(&config.host, config.port);
 
         let cfg = Config::from_url(&url);
         let pool = cfg
@@ -306,5 +358,577 @@ mod tests {
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
         let status = pool.pool.status();
         assert_eq!(status.waiting, 0, "no waiters initially");
+    }
+
+    #[test]
+    fn url_format_with_ipv4_host() {
+        let config = ValkeyConfig {
+            host: "192.168.1.100".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        assert_eq!(url, "redis://192.168.1.100:6379");
+    }
+
+    #[test]
+    fn url_format_with_docker_hostname() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let url = format!("redis://{}:{}", config.host, config.port);
+        // Docker DNS hostname must be used, not localhost
+        assert!(
+            !url.contains("localhost"),
+            "production URLs must use Docker DNS, not localhost"
+        );
+        assert_eq!(url, "redis://dlt-valkey:6379");
+    }
+
+    #[test]
+    fn pool_creation_is_lazy_no_immediate_connection() {
+        // Pool must not attempt to connect during construction.
+        // Using a deliberately unreachable host proves this — if it tried
+        // to connect, pool creation would fail or hang.
+        let config = ValkeyConfig {
+            host: "unreachable-host-that-does-not-exist".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::new(&config);
+        assert!(
+            pool.is_ok(),
+            "pool creation must succeed even with unreachable host (lazy connections)"
+        );
+    }
+
+    #[test]
+    fn pool_max_size_boundary_min() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).expect("min pool size must succeed");
+        assert_eq!(pool.pool.status().max_size, 1);
+    }
+
+    #[test]
+    fn pool_max_size_boundary_typical_prod() {
+        // Production config uses max_connections = 16
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let pool = ValkeyPool::new(&config).expect("typical prod pool size must succeed");
+        assert_eq!(pool.pool.status().max_size, 16);
+    }
+
+    #[test]
+    fn pool_checkout_timeout_constant_is_500ms() {
+        // Verify the exact value — changes to this constant affect trading latency
+        assert_eq!(
+            POOL_CHECKOUT_TIMEOUT_MS, 500,
+            "pool checkout timeout must be exactly 500ms"
+        );
+    }
+
+    #[test]
+    fn multiple_pools_can_coexist() {
+        // Different configs should produce independent pools
+        let config_a = ValkeyConfig {
+            host: "host-a".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let config_b = ValkeyConfig {
+            host: "host-b".to_string(),
+            port: 6380,
+            max_connections: 8,
+        };
+        let pool_a = ValkeyPool::new(&config_a).expect("pool A must succeed");
+        let pool_b = ValkeyPool::new(&config_b).expect("pool B must succeed");
+        assert_eq!(pool_a.pool.status().max_size, 4);
+        assert_eq!(pool_b.pool.status().max_size, 8);
+    }
+
+    #[test]
+    fn url_never_contains_password_in_basic_config() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        let url = build_valkey_url(&config.host, config.port);
+        // Basic config URL must not accidentally include auth credentials
+        assert!(!url.contains('@'), "URL must not contain auth separator");
+        assert!(!url.contains("password"), "URL must not contain password");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_valkey_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_valkey_url_default() {
+        let url = build_valkey_url("dlt-valkey", 6379);
+        assert_eq!(url, "redis://dlt-valkey:6379");
+    }
+
+    #[test]
+    fn test_build_valkey_url_custom_port() {
+        let url = build_valkey_url("cache-host", 6380);
+        assert_eq!(url, "redis://cache-host:6380");
+    }
+
+    #[test]
+    fn test_build_valkey_url_ip_address() {
+        let url = build_valkey_url("10.0.0.50", 6379);
+        assert_eq!(url, "redis://10.0.0.50:6379");
+    }
+
+    #[test]
+    fn test_build_valkey_url_starts_with_redis_scheme() {
+        let url = build_valkey_url("host", 1234);
+        assert!(url.starts_with("redis://"));
+    }
+
+    #[test]
+    fn test_build_valkey_url_no_trailing_slash() {
+        let url = build_valkey_url("host", 6379);
+        assert!(!url.ends_with('/'), "URL must not end with slash");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_instrument_cache_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_instrument_cache_key_universe() {
+        let key = build_instrument_cache_key("universe");
+        assert_eq!(key, "dlt:instrument:universe");
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_csv_hash() {
+        let key = build_instrument_cache_key("csv_hash");
+        assert_eq!(key, "dlt:instrument:csv_hash");
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_starts_with_namespace() {
+        let key = build_instrument_cache_key("anything");
+        assert!(key.starts_with("dlt:instrument:"));
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_empty_suffix() {
+        let key = build_instrument_cache_key("");
+        assert_eq!(key, "dlt:instrument:");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_token_cache_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_token_cache_key_access() {
+        let key = build_token_cache_key("access");
+        assert_eq!(key, "dlt:token:access");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_expiry() {
+        let key = build_token_cache_key("expiry");
+        assert_eq!(key, "dlt:token:expiry");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_starts_with_namespace() {
+        let key = build_token_cache_key("any_suffix");
+        assert!(key.starts_with("dlt:token:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tick_cache_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_tick_cache_key_ltp() {
+        let key = build_tick_cache_key(11536, "ltp");
+        assert_eq!(key, "dlt:tick:11536:ltp");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_depth() {
+        let key = build_tick_cache_key(49081, "depth");
+        assert_eq!(key, "dlt:tick:49081:depth");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_zero_security_id() {
+        let key = build_tick_cache_key(0, "ltp");
+        assert_eq!(key, "dlt:tick:0:ltp");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_max_security_id() {
+        let key = build_tick_cache_key(u32::MAX, "ohlc");
+        assert_eq!(key, "dlt:tick:4294967295:ohlc");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_namespace_isolation() {
+        // Different security IDs produce different keys
+        let key_a = build_tick_cache_key(100, "ltp");
+        let key_b = build_tick_cache_key(200, "ltp");
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_suffix_isolation() {
+        // Different suffixes for same security ID produce different keys
+        let key_a = build_tick_cache_key(100, "ltp");
+        let key_b = build_tick_cache_key(100, "depth");
+        assert_ne!(key_a, key_b);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_instrument_ttl_secs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_instrument_ttl_before_target() {
+        // 2024-01-01 00:00:00 UTC = IST 05:30:00
+        // Target hour = 8 (08:00 IST)
+        // Time until target = 2h30m = 9000s
+        let utc_midnight = 1_704_067_200_u64;
+        let ttl = compute_instrument_ttl_secs(utc_midnight, 8);
+        assert_eq!(ttl, 9000);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_after_target_wraps_to_next_day() {
+        // IST 10:00 → target 8:00 → TTL = 22 hours = 79200s
+        // Pick epoch where (epoch + 19800) % 86400 = 36000 (10:00 IST)
+        let epoch = 86_400 - 19_800 + 36_000; // = 102600
+        let ttl = compute_instrument_ttl_secs(epoch, 8);
+        // IST time = (102600 + 19800) % 86400 = 122400 % 86400 = 36000 (10:00)
+        // target = 8 * 3600 = 28800
+        // 36000 > 28800, so wrap: 86400 - 36000 + 28800 = 79200
+        assert_eq!(ttl, 79_200);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_to_min_60() {
+        // If we're very close to target (e.g., 1 second away), still returns at least 60
+        // IST time = target_hour * 3600 - 1 = 21599
+        // Need (epoch + IST_OFFSET) % 86400 = 21599
+        let epoch = 86_400 + 21_599 - 19_800; // = 88199
+        let ttl = compute_instrument_ttl_secs(epoch, 6);
+        // remaining = 21600 - 21599 = 1, clamped to 60
+        assert_eq!(ttl, 60);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_to_max_86400() {
+        // Maximum possible TTL is 86400 (exactly target time → full day wrap)
+        // (epoch + IST_OFFSET) % 86400 = target_secs exactly → wrap to 86400
+        let target_secs: u64 = 8 * 3600; // 28800
+        let epoch = 86_400 + target_secs - 19_800;
+        let ttl = compute_instrument_ttl_secs(epoch, 8);
+        // ist_secs_today = target_secs, so wrap: 86400 - 28800 + 28800 = 86400
+        assert_eq!(ttl, 86_400);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_zero_epoch() {
+        // epoch 0, IST = 05:30:00 (19800s), target = 6 (06:00 IST = 21600s)
+        let ttl = compute_instrument_ttl_secs(0, 6);
+        // remaining = 21600 - 19800 = 1800
+        assert_eq!(ttl, 1800);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_midnight_target() {
+        // target_hour = 0 means midnight IST
+        let ttl = compute_instrument_ttl_secs(0, 0);
+        // IST at epoch 0 = 19800s into the day
+        // target = 0, so past → wrap: 86400 - 19800 + 0 = 66600
+        assert_eq!(ttl, 66_600);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_instrument_ttl_secs — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_instrument_ttl_target_hour_23() {
+        // target_hour = 23 → target_secs = 82800
+        // epoch 0 → IST 05:30 → ist_secs_today = 19800
+        // 19800 < 82800 → remaining = 82800 - 19800 = 63000
+        let ttl = compute_instrument_ttl_secs(0, 23);
+        assert_eq!(ttl, 63_000);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_exactly_at_target() {
+        // When IST time == target → wraps to next day (86400)
+        let target_secs: u64 = 12 * 3600; // 12:00 IST = 43200
+        // Need (epoch + 19800) % 86400 = 43200
+        let epoch = 86_400 + 43_200 - 19_800; // = 109800
+        let ttl = compute_instrument_ttl_secs(epoch, 12);
+        assert_eq!(ttl, 86_400);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_one_second_after_target() {
+        // IST time = target_secs + 1 → wrap to next day minus 1 second
+        let target_secs: u64 = 6 * 3600; // 06:00 IST = 21600
+        // Need (epoch + 19800) % 86400 = 21601
+        let epoch = 86_400 + 21_601 - 19_800;
+        let ttl = compute_instrument_ttl_secs(epoch, 6);
+        // remaining = 86400 - 21601 + 21600 = 86399
+        assert_eq!(ttl, 86_399);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_always_at_least_60() {
+        // Test various inputs — TTL should never be below 60
+        for hour in 0..24_u8 {
+            for epoch_offset in [0_u64, 100, 1000, 86400, 172800] {
+                let ttl = compute_instrument_ttl_secs(epoch_offset, hour);
+                assert!(
+                    ttl >= 60,
+                    "TTL must be >= 60 for hour={hour}, epoch={epoch_offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_always_at_most_86400() {
+        for hour in 0..24_u8 {
+            for epoch_offset in [0_u64, 100, 1000, 86400, 172800] {
+                let ttl = compute_instrument_ttl_secs(epoch_offset, hour);
+                assert!(
+                    ttl <= 86_400,
+                    "TTL must be <= 86400 for hour={hour}, epoch={epoch_offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_large_epoch() {
+        // Far future epoch value
+        let ttl = compute_instrument_ttl_secs(2_000_000_000, 8);
+        assert!(ttl >= 60);
+        assert!(ttl <= 86_400);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_valkey_url — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_valkey_url_min_port() {
+        let url = build_valkey_url("host", 1);
+        assert_eq!(url, "redis://host:1");
+    }
+
+    #[test]
+    fn test_build_valkey_url_max_port() {
+        let url = build_valkey_url("host", u16::MAX);
+        assert_eq!(url, "redis://host:65535");
+    }
+
+    #[test]
+    fn test_build_valkey_url_empty_host() {
+        let url = build_valkey_url("", 6379);
+        assert_eq!(url, "redis://:6379");
+    }
+
+    #[test]
+    fn test_build_valkey_url_localhost() {
+        let url = build_valkey_url("localhost", 6379);
+        assert_eq!(url, "redis://localhost:6379");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_instrument_cache_key — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_instrument_cache_key_long_suffix() {
+        let key = build_instrument_cache_key("binary_cache_2026_03_21");
+        assert_eq!(key, "dlt:instrument:binary_cache_2026_03_21");
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_special_chars() {
+        let key = build_instrument_cache_key("csv:hash:v2");
+        assert_eq!(key, "dlt:instrument:csv:hash:v2");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_token_cache_key — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_token_cache_key_empty_suffix() {
+        let key = build_token_cache_key("");
+        assert_eq!(key, "dlt:token:");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_refresh() {
+        let key = build_token_cache_key("refresh_at");
+        assert_eq!(key, "dlt:token:refresh_at");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tick_cache_key — additional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_tick_cache_key_empty_suffix() {
+        let key = build_tick_cache_key(11536, "");
+        assert_eq!(key, "dlt:tick:11536:");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_complex_suffix() {
+        let key = build_tick_cache_key(42, "ohlcv:1m");
+        assert_eq!(key, "dlt:tick:42:ohlcv:1m");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_one() {
+        let key = build_tick_cache_key(1, "ltp");
+        assert_eq!(key, "dlt:tick:1:ltp");
+    }
+
+    // -----------------------------------------------------------------------
+    // ValkeyPool::new — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pool_new_returns_ok_with_typical_config() {
+        let config = ValkeyConfig {
+            host: "dlt-valkey".to_string(),
+            port: 6379,
+            max_connections: 16,
+        };
+        assert!(ValkeyPool::new(&config).is_ok());
+    }
+
+    #[test]
+    fn test_pool_status_fields() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 8,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+        let status = pool.pool.status();
+        assert_eq!(status.max_size, 8);
+        assert_eq!(status.size, 0);
+        assert_eq!(status.available, 0);
+        assert_eq!(status.waiting, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Async method error path tests (ValkeyPool methods with unreachable host)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.health_check().await;
+        assert!(
+            result.is_err(),
+            "health_check must fail with unreachable host"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.get("test_key").await;
+        assert!(result.is_err(), "get must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_set_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set("key", "value").await;
+        assert!(result.is_err(), "set must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_set_ex_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_ex("key", "value", 60).await;
+        assert!(result.is_err(), "set_ex must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_del_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.del("key").await;
+        assert!(result.is_err(), "del must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_exists_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.exists("key").await;
+        assert!(result.is_err(), "exists must fail with unreachable host");
+    }
+
+    #[tokio::test]
+    async fn test_set_nx_ex_fails_with_unreachable_host() {
+        let config = ValkeyConfig {
+            host: "unreachable-host-99999".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
+        assert!(result.is_err(), "set_nx_ex must fail with unreachable host");
     }
 }

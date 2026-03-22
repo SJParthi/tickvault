@@ -295,6 +295,7 @@ mod tests {
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             constituency,
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         )
     }
 
@@ -452,5 +453,216 @@ mod tests {
         assert_eq!(entry.symbol, "TCS");
         assert_eq!(entry.isin, "INE467B01029");
         assert!((entry.weight - 5.20).abs() < f64::EPSILON);
+    }
+
+    // -------------------------------------------------------------------
+    // Poisoned RwLock: all three handlers must not panic
+    // -------------------------------------------------------------------
+
+    fn poisoned_constituency_map() -> SharedConstituencyMap {
+        let map: SharedConstituencyMap = Arc::new(RwLock::new(None));
+        let map_clone = map.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = map_clone.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err(), "should have panicked");
+        assert!(map.read().is_err(), "lock should be poisoned");
+        map
+    }
+
+    #[tokio::test]
+    async fn test_summary_poisoned_rwlock_returns_unavailable() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_constituency_summary(State(state)).await;
+        assert!(!resp.available);
+        assert_eq!(resp.index_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_constituents_poisoned_rwlock_returns_not_found() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_index_constituents(State(state), Path("Nifty 50".to_string())).await;
+        assert!(!resp.found);
+        assert!(resp.constituents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_stock_indices_poisoned_rwlock_returns_not_found() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_stock_indices(State(state), Path("RELIANCE".to_string())).await;
+        assert!(!resp.found);
+        assert!(resp.indices.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Debug impl coverage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituency_summary_debug_impl() {
+        let resp = ConstituencySummaryResponse {
+            available: true,
+            index_count: 5,
+            stock_count: 200,
+            indices: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("ConstituencySummaryResponse"));
+    }
+
+    #[test]
+    fn test_index_constituents_response_debug_impl() {
+        let resp = IndexConstituentsResponse {
+            found: true,
+            index_name: "Nifty 50".to_string(),
+            constituents: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("IndexConstituentsResponse"));
+    }
+
+    #[test]
+    fn test_stock_indices_response_debug_impl() {
+        let resp = StockIndicesResponse {
+            found: false,
+            symbol: "TEST".to_string(),
+            indices: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("StockIndicesResponse"));
+    }
+
+    #[test]
+    fn test_index_summary_entry_debug_impl() {
+        let entry = IndexSummaryEntry {
+            name: "Nifty 50".to_string(),
+            constituent_count: 50,
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("IndexSummaryEntry"));
+    }
+
+    #[test]
+    fn test_constituent_entry_debug_impl() {
+        let entry = ConstituentEntry {
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.25,
+            sector: "Oil Gas".to_string(),
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("ConstituentEntry"));
+        assert!(debug.contains("RELIANCE"));
+    }
+
+    // -------------------------------------------------------------------
+    // get_index_constituents: unknown index with populated map
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_constituents_unknown_index_with_data() {
+        let state = test_state(shared_map_with_data());
+        let Json(resp) =
+            get_index_constituents(State(state), Path("Nifty Midcap 100".to_string())).await;
+
+        assert!(!resp.found);
+        assert_eq!(resp.index_name, "Nifty Midcap 100");
+        assert!(resp.constituents.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // get_stock_indices: stock in only one index
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_stock_indices_single_index_membership() {
+        let state = test_state(shared_map_with_data());
+        let Json(resp) = get_stock_indices(State(state), Path("RELIANCE".to_string())).await;
+
+        assert!(resp.found);
+        assert_eq!(resp.symbol, "RELIANCE");
+        assert_eq!(resp.indices.len(), 1);
+        assert_eq!(resp.indices[0], "Nifty 50");
+    }
+
+    // -------------------------------------------------------------------
+    // Summary: verify unavailable_summary helper directly
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_unavailable_summary_fields() {
+        let resp = unavailable_summary();
+        assert!(!resp.available);
+        assert_eq!(resp.index_count, 0);
+        assert_eq!(resp.stock_count, 0);
+        assert!(resp.indices.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Constituency entry conversion preserves all fields
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_preserves_sector() {
+        let ic = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "INFY".to_string(),
+            isin: "INE009A01021".to_string(),
+            weight: 7.80,
+            sector: "Information Technology".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert_eq!(entry.sector, "Information Technology");
+        assert_eq!(entry.isin, "INE009A01021");
+    }
+
+    // -------------------------------------------------------------------
+    // Summary with data: verify sorted order + stock_count
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_summary_indices_sorted_alphabetically() {
+        let state = test_state(shared_map_with_data());
+        let Json(resp) = get_constituency_summary(State(state)).await;
+
+        // Verify indices are sorted: "Nifty 50" before "Nifty Bank"
+        assert!(resp.indices.len() >= 2);
+        for i in 0..resp.indices.len() - 1 {
+            assert!(resp.indices[i].name <= resp.indices[i + 1].name);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Serialization: empty constituents response
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_constituents_response_serialization() {
+        let resp = IndexConstituentsResponse {
+            found: false,
+            index_name: "Unknown".to_string(),
+            constituents: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"found\":false"));
+        assert!(json.contains("\"constituents\":[]"));
+    }
+
+    // -------------------------------------------------------------------
+    // Serialization: empty stock indices response
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_stock_indices_response_serialization() {
+        let resp = StockIndicesResponse {
+            found: false,
+            symbol: "UNKNOWN".to_string(),
+            indices: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"found\":false"));
+        assert!(json.contains("\"indices\":[]"));
     }
 }

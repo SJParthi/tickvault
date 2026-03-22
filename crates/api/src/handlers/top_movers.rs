@@ -141,6 +141,7 @@ mod tests {
             },
             snapshot,
             std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
         let Json(result) = get_top_movers(State(state)).await;
         assert!(!result.available);
@@ -168,5 +169,204 @@ mod tests {
         assert!(resp.available);
         assert_eq!(resp.gainers.len(), 1);
         assert_eq!(resp.total_tracked, 50);
+    }
+
+    // -------------------------------------------------------------------
+    // Poisoned RwLock: handler must not panic, returns unavailable
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_top_movers_poisoned_rwlock_returns_unavailable() {
+        use std::sync::{Arc, RwLock};
+
+        let snapshot: dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot =
+            Arc::new(RwLock::new(None));
+
+        // Poison the lock by panicking inside a write guard
+        let snapshot_clone = snapshot.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = snapshot_clone.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err(), "should have panicked");
+        assert!(snapshot.read().is_err(), "lock should be poisoned");
+
+        let state = crate::state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            snapshot,
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
+        );
+
+        let Json(result) = get_top_movers(State(state)).await;
+        assert!(!result.available);
+        assert!(result.gainers.is_empty());
+        assert_eq!(result.total_tracked, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Debug impl coverage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_top_movers_response_debug_impl() {
+        let resp = TopMoversResponse {
+            available: true,
+            gainers: vec![],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: 42,
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("TopMoversResponse"));
+        assert!(debug.contains("42"));
+    }
+
+    // -------------------------------------------------------------------
+    // Handler with populated snapshot — exercises Ok(Some(snapshot)) path
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_top_movers_with_populated_snapshot() {
+        use std::sync::{Arc, RwLock};
+
+        let snapshot_data = TopMoversSnapshot {
+            gainers: vec![
+                MoverEntry {
+                    security_id: 100,
+                    exchange_segment_code: 1,
+                    last_traded_price: 250.0_f32,
+                    change_pct: 8.5_f32,
+                    volume: 100_000,
+                },
+                MoverEntry {
+                    security_id: 200,
+                    exchange_segment_code: 2,
+                    last_traded_price: 500.0_f32,
+                    change_pct: 5.2_f32,
+                    volume: 50_000,
+                },
+            ],
+            losers: vec![MoverEntry {
+                security_id: 300,
+                exchange_segment_code: 1,
+                last_traded_price: 100.0_f32,
+                change_pct: -3.1_f32,
+                volume: 75_000,
+            }],
+            most_active: vec![MoverEntry {
+                security_id: 400,
+                exchange_segment_code: 2,
+                last_traded_price: 1000.0_f32,
+                change_pct: 1.0_f32,
+                volume: 500_000,
+            }],
+            total_tracked: 200,
+        };
+
+        let snapshot: dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot =
+            Arc::new(RwLock::new(Some(snapshot_data)));
+
+        let state = crate::state::SharedAppState::new(
+            dhan_live_trader_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            dhan_live_trader_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+            },
+            dhan_live_trader_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            snapshot,
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
+        );
+
+        let Json(result) = get_top_movers(State(state)).await;
+        assert!(result.available);
+        assert_eq!(result.gainers.len(), 2);
+        assert_eq!(result.losers.len(), 1);
+        assert_eq!(result.most_active.len(), 1);
+        assert_eq!(result.total_tracked, 200);
+        assert_eq!(result.gainers[0].security_id, 100);
+        assert!((result.gainers[0].change_pct - 8.5_f32).abs() < f32::EPSILON);
+    }
+
+    // -------------------------------------------------------------------
+    // TopMoversResponse serialization round-trip with all fields populated
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn response_serialization_round_trip_json_fields() {
+        let resp = TopMoversResponse {
+            available: true,
+            gainers: vec![MoverEntry {
+                security_id: 1,
+                exchange_segment_code: 2,
+                last_traded_price: 100.0_f32,
+                change_pct: 5.0_f32,
+                volume: 10000,
+            }],
+            losers: vec![MoverEntry {
+                security_id: 2,
+                exchange_segment_code: 1,
+                last_traded_price: 50.0_f32,
+                change_pct: -3.0_f32,
+                volume: 5000,
+            }],
+            most_active: vec![MoverEntry {
+                security_id: 3,
+                exchange_segment_code: 2,
+                last_traded_price: 200.0_f32,
+                change_pct: 0.5_f32,
+                volume: 999999,
+            }],
+            total_tracked: 500,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"gainers\""));
+        assert!(json.contains("\"losers\""));
+        assert!(json.contains("\"most_active\""));
+        assert!(json.contains("\"total_tracked\":500"));
+        assert!(json.contains("\"change_pct\""));
+        assert!(json.contains("\"volume\":999999"));
     }
 }
