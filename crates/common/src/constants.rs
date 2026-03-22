@@ -1215,6 +1215,12 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
 pub const TICK_BUFFER_CAPACITY: usize = 300_000;
 
+/// Option Chain API minimum request interval in seconds (Dhan limit: 1 req / 3 sec).
+pub const OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS: u64 = 3;
+
+/// Option Chain API HTTP request timeout in seconds.
+pub const OPTION_CHAIN_REQUEST_TIMEOUT_SECS: u64 = 10;
+
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
