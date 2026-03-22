@@ -75,7 +75,7 @@ tower = { version = "0.5.2", features = ["full"] }
 tower-http = { version = "0.6.5", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "1.0.6"
+toml = "1.0.7"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
