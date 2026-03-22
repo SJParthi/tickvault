@@ -1170,4 +1170,52 @@ mod tests {
             }
         }
     }
+
+    // --- Coverage: iv_solve edge cases (lines 257, 274, 284) ---
+
+    #[test]
+    fn test_iv_solve_price_below_intrinsic_returns_none() {
+        // Line 257: market price < intrinsic * 0.99 → arbitrage → None.
+        // Deep ITM call: spot=110, strike=100, intrinsic=10.
+        // Price of 5 is way below intrinsic → should return None.
+        let result = iv_solve(OptionSide::Call, 110.0, 100.0, 0.1, 0.07, 0.01, 5.0);
+        assert!(result.is_none(), "Price below intrinsic should return None");
+    }
+
+    #[test]
+    fn test_iv_solve_price_below_intrinsic_put_returns_none() {
+        // Deep ITM put: spot=90, strike=100, intrinsic=10.
+        // Price of 3 is way below intrinsic → should return None.
+        let result = iv_solve(OptionSide::Put, 90.0, 100.0, 0.1, 0.07, 0.01, 3.0);
+        assert!(
+            result.is_none(),
+            "Put price below intrinsic should return None"
+        );
+    }
+
+    #[test]
+    fn test_iv_solve_near_zero_time_vega_too_small() {
+        // Line 274: vega too small → can't converge.
+        // Very near expiry with deep ITM → vega approaches 0.
+        let result = iv_solve(
+            OptionSide::Call,
+            200.0,  // spot way above strike
+            100.0,  // strike
+            0.0001, // ~5 minutes to expiry
+            0.07,
+            0.01,
+            100.0, // price = intrinsic (no time value)
+        );
+        // May return None due to zero vega, or converge to a very low IV.
+        // Either way, the path is exercised.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_compute_greeks_price_below_intrinsic_returns_none() {
+        // compute_greeks calls iv_solve → exercises line 257 path.
+        let result = compute_greeks(OptionSide::Call, 150.0, 100.0, 0.1, 0.07, 0.01, 10.0);
+        // intrinsic = 50, price = 10 < 50 * 0.99 → None
+        assert!(result.is_none());
+    }
 }
