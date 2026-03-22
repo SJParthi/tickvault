@@ -766,4 +766,408 @@ mod tests {
             }
         }
     }
+
+    // ===================================================================
+    // COMPREHENSIVE VERIFICATION SUITE
+    // Mathematical invariants, real-world values, edge cases, stress tests
+    // ===================================================================
+
+    // --- Mathematical Invariants (must ALWAYS hold) ---
+
+    #[test]
+    fn test_invariant_put_call_parity_sweep() {
+        // C - P = S*e^(-qT) - K*e^(-rT) must hold for ALL valid inputs.
+        for s in [50.0, 80.0, 100.0, 120.0, 200.0] {
+            for k in [50.0, 80.0, 100.0, 120.0, 200.0] {
+                for t in [0.01, 0.1, 0.5, 1.0, 2.0] {
+                    for sigma in [0.10, 0.30, 0.50, 1.0] {
+                        let call = bs_call_price(s, k, t, R, Q, sigma);
+                        let put = bs_put_price(s, k, t, R, Q, sigma);
+                        let parity = s * (-Q * t).exp() - k * (-R * t).exp();
+                        let diff = (call - put - parity).abs();
+                        assert!(
+                            diff < 0.001,
+                            "Parity violated: S={s} K={k} T={t} σ={sigma} diff={diff}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_call_price_always_positive() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                for t in [0.01, 0.5, 1.0, 5.0] {
+                    for sigma in [0.05, 0.20, 0.50, 1.0] {
+                        let p = bs_call_price(s, k, t, R, Q, sigma);
+                        assert!(p >= 0.0, "Call >= 0: S={s} K={k} T={t} σ={sigma} got {p}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_put_price_always_positive() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                for t in [0.01, 0.5, 1.0, 5.0] {
+                    for sigma in [0.05, 0.20, 0.50, 1.0] {
+                        let p = bs_put_price(s, k, t, R, Q, sigma);
+                        assert!(p >= 0.0, "Put >= 0: S={s} K={k} T={t} σ={sigma} got {p}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_call_delta_bounded() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                for t in [0.01, 0.1, 1.0] {
+                    let price = bs_call_price(s, k, t, R, Q, 0.30);
+                    if let Some(g) = compute_greeks(OptionSide::Call, s, k, t, R, Q, price) {
+                        assert!(
+                            g.delta >= -0.01 && g.delta <= 1.01,
+                            "Call delta ∈ [0,1]: S={s} K={k} T={t} got {}",
+                            g.delta
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_put_delta_bounded() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                for t in [0.01, 0.1, 1.0] {
+                    let price = bs_put_price(s, k, t, R, Q, 0.30);
+                    if let Some(g) = compute_greeks(OptionSide::Put, s, k, t, R, Q, price) {
+                        assert!(
+                            g.delta >= -1.01 && g.delta <= 0.01,
+                            "Put delta ∈ [-1,0]: S={s} K={k} T={t} got {}",
+                            g.delta
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_gamma_always_positive() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                let price = bs_call_price(s, k, T, R, Q, 0.30);
+                if let Some(g) = compute_greeks(OptionSide::Call, s, k, T, R, Q, price) {
+                    assert!(g.gamma >= 0.0, "Gamma >= 0: S={s} K={k} got {}", g.gamma);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_vega_always_positive() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                let price = bs_call_price(s, k, T, R, Q, 0.30);
+                if let Some(g) = compute_greeks(OptionSide::Call, s, k, T, R, Q, price) {
+                    assert!(g.vega >= 0.0, "Vega >= 0: S={s} K={k} got {}", g.vega);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invariant_call_monotone_increasing_in_spot() {
+        let mut prev = 0.0;
+        for s in (50..=150).step_by(5) {
+            let p = bs_call_price(s as f64, K, T, R, Q, SIGMA);
+            assert!(
+                p >= prev,
+                "Call must increase with S: S={s} price={p} prev={prev}"
+            );
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn test_invariant_put_monotone_decreasing_in_spot() {
+        let mut prev = f64::MAX;
+        for s in (50..=150).step_by(5) {
+            let p = bs_put_price(s as f64, K, T, R, Q, SIGMA);
+            assert!(
+                p <= prev,
+                "Put must decrease with S: S={s} price={p} prev={prev}"
+            );
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn test_invariant_price_increases_with_volatility() {
+        let mut prev_c = 0.0;
+        let mut prev_p = 0.0;
+        for sigma_pct in (5..=100).step_by(5) {
+            let sigma = sigma_pct as f64 / 100.0;
+            let c = bs_call_price(S, K, T, R, Q, sigma);
+            let p = bs_put_price(S, K, T, R, Q, sigma);
+            assert!(c >= prev_c, "Call increases with σ: σ={sigma} c={c}");
+            assert!(p >= prev_p, "Put increases with σ: σ={sigma} p={p}");
+            prev_c = c;
+            prev_p = p;
+        }
+    }
+
+    #[test]
+    fn test_invariant_call_bounded_by_spot() {
+        for s in [50.0, 100.0, 200.0] {
+            for k in [50.0, 100.0, 200.0] {
+                let p = bs_call_price(s, k, T, R, Q, SIGMA);
+                assert!(p <= s * 1.01, "Call <= S: S={s} K={k} price={p}");
+            }
+        }
+    }
+
+    // --- IV Solver Stress Tests ---
+
+    #[test]
+    fn test_iv_roundtrip_all_volatilities() {
+        for sigma_pct in (5..=200).step_by(5) {
+            let sigma = sigma_pct as f64 / 100.0;
+            let price = bs_call_price(S, K, T, R, Q, sigma);
+            if price > 0.01 {
+                let iv = iv_solve(OptionSide::Call, S, K, T, R, Q, price);
+                assert!(iv.is_some(), "IV converge for σ={}%", sigma_pct);
+                assert!(
+                    (iv.unwrap() - sigma).abs() < 0.005,
+                    "IV roundtrip σ={}%: got {}",
+                    sigma_pct,
+                    iv.unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_iv_roundtrip_all_moneyness_call() {
+        for strike in (60..=140).step_by(5) {
+            let k = strike as f64;
+            let price = bs_call_price(S, k, T, R, Q, SIGMA);
+            if price > 0.01 {
+                let iv = iv_solve(OptionSide::Call, S, k, T, R, Q, price);
+                assert!(iv.is_some(), "Call IV converge K={k}");
+                assert!(
+                    (iv.unwrap() - SIGMA).abs() < 0.005,
+                    "Call IV K={k}: got {}",
+                    iv.unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_iv_roundtrip_all_moneyness_put() {
+        for strike in (60..=140).step_by(5) {
+            let k = strike as f64;
+            let price = bs_put_price(S, k, T, R, Q, SIGMA);
+            if price > 0.01 {
+                let iv = iv_solve(OptionSide::Put, S, k, T, R, Q, price);
+                assert!(iv.is_some(), "Put IV converge K={k}");
+                assert!(
+                    (iv.unwrap() - SIGMA).abs() < 0.005,
+                    "Put IV K={k}: got {}",
+                    iv.unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_iv_roundtrip_short_expiries() {
+        for days in 1..=7 {
+            let t = days as f64 / 365.25;
+            let price = bs_call_price(S, K, t, R, Q, SIGMA);
+            if price > 0.01 {
+                let iv = iv_solve(OptionSide::Call, S, K, t, R, Q, price);
+                assert!(iv.is_some(), "IV converge T={days}d");
+                assert!(
+                    (iv.unwrap() - SIGMA).abs() < 0.01,
+                    "IV T={days}d: got {}",
+                    iv.unwrap()
+                );
+            }
+        }
+    }
+
+    // --- Real-World NIFTY Values (from Dhan screenshot) ---
+
+    #[test]
+    fn test_real_nifty_greeks_direction() {
+        // NIFTY 50 spot=23114.50, 3 days to expiry, r=6.5%, q=1.2%
+        let spot = 23114.50;
+        let time = 3.0 / 365.25;
+        let rate = 0.065;
+        let div = 0.012;
+
+        // ITM call (23000 CE) — delta should be > 0.5
+        let ce_itm = 296.50;
+        if let Some(g) = compute_greeks(OptionSide::Call, spot, 23000.0, time, rate, div, ce_itm) {
+            assert!(g.delta > 0.5, "ITM CE delta > 0.5: got {}", g.delta);
+            assert!(g.theta < 0.0, "Theta negative: {}", g.theta);
+            assert!(g.gamma > 0.0, "Gamma positive: {}", g.gamma);
+            assert!(g.vega > 0.0, "Vega positive: {}", g.vega);
+            assert!(g.iv > 0.0 && g.iv < 1.0, "IV reasonable: {}", g.iv);
+        }
+
+        // OTM put (23000 PE) — delta should be between -0.5 and 0
+        let pe_otm = 173.75;
+        if let Some(g) = compute_greeks(OptionSide::Put, spot, 23000.0, time, rate, div, pe_otm) {
+            assert!(
+                g.delta < 0.0 && g.delta > -1.0,
+                "OTM PE delta ∈ (-1,0): {}",
+                g.delta
+            );
+        }
+    }
+
+    #[test]
+    fn test_real_nifty_gamma_highest_atm() {
+        let spot = 23114.50;
+        let time = 3.0 / 365.25;
+        let rate = 0.065;
+        let div = 0.012;
+
+        let atm = bs_call_price(spot, 23100.0, time, rate, div, 0.30);
+        let itm = bs_call_price(spot, 22700.0, time, rate, div, 0.30);
+        let otm = bs_call_price(spot, 23500.0, time, rate, div, 0.30);
+
+        let ga = compute_greeks(OptionSide::Call, spot, 23100.0, time, rate, div, atm).unwrap();
+        let gi = compute_greeks(OptionSide::Call, spot, 22700.0, time, rate, div, itm).unwrap();
+        let go = compute_greeks(OptionSide::Call, spot, 23500.0, time, rate, div, otm).unwrap();
+
+        assert!(ga.gamma > gi.gamma, "ATM gamma > ITM gamma");
+        assert!(ga.gamma > go.gamma, "ATM gamma > OTM gamma");
+    }
+
+    // --- Numerical Stability ---
+
+    #[test]
+    fn test_edge_very_small_time() {
+        let t = 1.0 / (365.25 * 24.0 * 60.0); // 1 minute
+        let c = bs_call_price(110.0, 100.0, t, R, Q, SIGMA);
+        assert!(c > 9.0 && c < 11.0, "Near-expiry ITM ≈ intrinsic: got {c}");
+    }
+
+    #[test]
+    fn test_edge_extreme_volatility() {
+        let c = bs_call_price(S, K, T, R, Q, 3.0); // 300%
+        assert!(
+            c.is_finite() && c > 0.0,
+            "300% vol finite positive: got {c}"
+        );
+    }
+
+    #[test]
+    fn test_edge_very_low_volatility() {
+        let c = bs_call_price(110.0, 100.0, T, R, Q, 0.001);
+        let intrinsic = 110.0 - 100.0 * (-R * T).exp();
+        assert!(
+            (c - intrinsic).abs() < 1.0,
+            "Low vol ITM ≈ intrinsic PV: got {c}"
+        );
+    }
+
+    #[test]
+    fn test_edge_deep_itm_1000() {
+        let c = bs_call_price(1000.0, 100.0, T, R, Q, SIGMA);
+        assert!(c > 895.0, "Deep ITM (1000/100): got {c}");
+    }
+
+    #[test]
+    fn test_edge_deep_otm_tiny() {
+        let c = bs_call_price(10.0, 1000.0, T, R, Q, SIGMA);
+        assert!(c < 0.001, "Deep OTM near zero: got {c}");
+    }
+
+    #[test]
+    fn test_edge_zero_rate() {
+        let c = bs_call_price(S, K, T, 0.0, Q, SIGMA);
+        assert!(c > 0.0 && c.is_finite(), "Zero rate valid: got {c}");
+    }
+
+    #[test]
+    fn test_normal_cdf_precision_table() {
+        // Standard normal CDF table values (4 decimal precision).
+        let cases = [
+            (-3.0, 0.0013),
+            (-2.0, 0.0228),
+            (-1.0, 0.1587),
+            (-0.5, 0.3085),
+            (0.0, 0.5000),
+            (0.5, 0.6915),
+            (1.0, 0.8413),
+            (2.0, 0.9772),
+            (3.0, 0.9987),
+        ];
+        for (x, expected) in cases {
+            let got = normal_cdf(x);
+            assert!(
+                (got - expected).abs() < 0.001,
+                "Φ({x}) = {expected}, got {got}"
+            );
+        }
+    }
+
+    // --- Greeks Consistency: call/put gamma/vega match ---
+
+    #[test]
+    fn test_greeks_call_put_gamma_vega_same_sweep() {
+        for k in [80.0, 90.0, 100.0, 110.0, 120.0] {
+            let cp = bs_call_price(S, k, T, R, Q, SIGMA);
+            let pp = bs_put_price(S, k, T, R, Q, SIGMA);
+            if let (Some(cg), Some(pg)) = (
+                compute_greeks(OptionSide::Call, S, k, T, R, Q, cp),
+                compute_greeks(OptionSide::Put, S, k, T, R, Q, pp),
+            ) {
+                assert!(
+                    (cg.gamma - pg.gamma).abs() < 0.0001,
+                    "Gamma K={k}: CE={} PE={}",
+                    cg.gamma,
+                    pg.gamma
+                );
+                assert!(
+                    (cg.vega - pg.vega).abs() < 0.001,
+                    "Vega K={k}: CE={} PE={}",
+                    cg.vega,
+                    pg.vega
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_greeks_delta_call_minus_put() {
+        // delta_call - delta_put = e^(-qT)
+        for k in [80.0, 90.0, 100.0, 110.0, 120.0] {
+            let cp = bs_call_price(S, k, T, R, Q, SIGMA);
+            let pp = bs_put_price(S, k, T, R, Q, SIGMA);
+            if let (Some(cg), Some(pg)) = (
+                compute_greeks(OptionSide::Call, S, k, T, R, Q, cp),
+                compute_greeks(OptionSide::Put, S, k, T, R, Q, pp),
+            ) {
+                let expected = (-Q * T).exp();
+                let actual = cg.delta - pg.delta;
+                assert!(
+                    (actual - expected).abs() < 0.02,
+                    "delta_CE - delta_PE = e^(-qT): K={k} got {actual} expected {expected}"
+                );
+            }
+        }
+    }
 }
