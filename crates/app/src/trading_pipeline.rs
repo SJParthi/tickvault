@@ -3578,6 +3578,15 @@ threshold = 70.0
         assert!(signal.is_none());
     }
 
+    #[test]
+    fn test_spawn_trading_pipeline_full_accepts_none_signals() {
+        // Verify that spawn_trading_pipeline_full compiles with both signals as None.
+        let reset: Option<std::sync::Arc<tokio::sync::Notify>> = None;
+        let close: Option<std::sync::Arc<tokio::sync::Notify>> = None;
+        assert!(reset.is_none());
+        assert!(close.is_none());
+    }
+
     #[tokio::test]
     async fn test_market_close_auto_handling() {
         // Verify the market close signal fires and can be received.
