@@ -15,6 +15,7 @@
 //! the system logs WARN and continues — no data is buffered in memory beyond
 //! the current batch to prevent OOM.
 
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use tracing::{debug, error, info, warn};
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
     DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, QUESTDB_TABLE_MARKET_DEPTH,
-    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE,
+    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_BUFFER_CAPACITY, TICK_FLUSH_BATCH_SIZE,
     TICK_FLUSH_INTERVAL_MS,
 };
 use dhan_live_trader_common::segment::segment_code_to_str;
@@ -61,9 +62,10 @@ const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// - The buffer reaches `TICK_FLUSH_BATCH_SIZE` rows, or
 /// - `flush_if_needed()` detects that `TICK_FLUSH_INTERVAL_MS` has elapsed.
 ///
-/// On write failure, the sender is set to `None` and a reconnection is
-/// attempted on the next write. This prevents tick loss from transient
-/// QuestDB connection drops during a trading session.
+/// On write failure, ticks are held in a bounded ring buffer (`TICK_BUFFER_CAPACITY`)
+/// until QuestDB recovers. When QuestDB comes back, the ring buffer is drained
+/// oldest-first before accepting new ticks. If the buffer fills up (QuestDB down
+/// too long), the oldest ticks are dropped and a CRITICAL alert fires.
 pub struct TickPersistenceWriter {
     sender: Option<Sender>,
     buffer: Buffer,
@@ -71,6 +73,13 @@ pub struct TickPersistenceWriter {
     last_flush_ms: u64,
     /// ILP connection config string, retained for reconnection.
     ilp_conf_string: String,
+    /// Resilience ring buffer: holds ticks when QuestDB is down.
+    /// Drains on recovery (oldest-first). Capacity: `TICK_BUFFER_CAPACITY`.
+    // O(1) EXEMPT: begin — VecDeque allocation bounded by TICK_BUFFER_CAPACITY (~19MB max)
+    tick_buffer: VecDeque<ParsedTick>,
+    // O(1) EXEMPT: end
+    /// Total ticks dropped because the ring buffer was full (QuestDB down too long).
+    ticks_dropped_total: u64,
 }
 
 impl TickPersistenceWriter {
@@ -90,36 +99,49 @@ impl TickPersistenceWriter {
             pending_count: 0,
             last_flush_ms: current_time_ms(),
             ilp_conf_string: conf_string,
+            tick_buffer: VecDeque::new(),
+            ticks_dropped_total: 0,
         })
     }
 
     /// Appends a parsed tick to the ILP buffer.
     ///
     /// Auto-flushes if the buffer reaches `TICK_FLUSH_BATCH_SIZE`.
-    /// On flush failure, the sender is invalidated and a reconnection
-    /// is attempted on the next call.
+    /// When QuestDB is down, ticks are held in a ring buffer (up to
+    /// `TICK_BUFFER_CAPACITY`) and drained on recovery.
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
-    /// Reconnect logic (cold path) only runs on error.
+    /// Ring buffer and reconnect logic (cold path) only run on error.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
         // If sender is None (previous failure), attempt reconnect before writing.
         if self.sender.is_none() {
-            self.try_reconnect_on_error()?;
+            match self.try_reconnect_on_error() {
+                Ok(()) => {
+                    // Reconnected — drain any buffered ticks first.
+                    self.drain_tick_buffer();
+                }
+                Err(_) => {
+                    // Still can't connect — buffer this tick instead of losing it.
+                    self.buffer_tick(*tick);
+                    return Ok(());
+                }
+            }
         }
 
         build_tick_row(&mut self.buffer, tick)?;
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
-            && let Err(err) = self.force_flush()
-        {
-            // Flush failed — sender is now None. Buffer data is lost for
-            // this batch, but the system continues. Ticks are observability
-            // data, not critical path (see module doc).
-            warn!(?err, "tick auto-flush failed, sender invalidated");
-            return Err(err);
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
+            if let Err(err) = self.force_flush() {
+                // Flush failed — sender is now None. Buffer the tick we just
+                // tried to write (it's in the ILP buffer which is now lost).
+                warn!(
+                    ?err,
+                    "tick auto-flush failed — buffering ticks until recovery"
+                );
+            }
         }
 
         Ok(())
@@ -184,10 +206,91 @@ impl TickPersistenceWriter {
         self.pending_count
     }
 
+    /// Returns the number of ticks held in the resilience ring buffer.
+    pub fn buffered_tick_count(&self) -> usize {
+        self.tick_buffer.len()
+    }
+
+    /// Returns the total number of ticks dropped due to ring buffer overflow.
+    pub fn ticks_dropped_total(&self) -> u64 {
+        self.ticks_dropped_total
+    }
+
     /// Returns a mutable reference to the ILP buffer for writing auxiliary rows
     /// (e.g., previous close) that share the same flush lifecycle.
     pub fn buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffer
+    }
+
+    // -----------------------------------------------------------------------
+    // Resilience ring buffer
+    // -----------------------------------------------------------------------
+
+    /// Pushes a tick into the ring buffer. If the buffer is full, drops the
+    /// oldest tick and increments the drop counter.
+    fn buffer_tick(&mut self, tick: ParsedTick) {
+        // O(1) EXEMPT: begin — bounded ring buffer, max TICK_BUFFER_CAPACITY
+        if self.tick_buffer.len() >= TICK_BUFFER_CAPACITY {
+            self.tick_buffer.pop_front();
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            // CRITICAL alert every 1000 drops (triggers Telegram).
+            if self.ticks_dropped_total.is_multiple_of(1000) {
+                error!(
+                    dropped_total = self.ticks_dropped_total,
+                    buffer_size = self.tick_buffer.len(),
+                    capacity = TICK_BUFFER_CAPACITY,
+                    "tick ring buffer full — dropping oldest ticks (QuestDB still down)"
+                );
+            }
+        }
+        self.tick_buffer.push_back(tick);
+        metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        // O(1) EXEMPT: end
+    }
+
+    /// Drains buffered ticks to QuestDB after recovery. Writes in batches
+    /// and stops if a flush fails (remaining ticks stay in the buffer).
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by tick_buffer.len()
+    fn drain_tick_buffer(&mut self) {
+        if self.tick_buffer.is_empty() || self.sender.is_none() {
+            return;
+        }
+
+        let total_buffered = self.tick_buffer.len();
+        let mut drained: usize = 0;
+
+        while let Some(tick) = self.tick_buffer.pop_front() {
+            if build_tick_row(&mut self.buffer, &tick).is_err() {
+                continue; // Skip malformed tick, don't stop drain
+            }
+            self.pending_count = self.pending_count.saturating_add(1);
+            drained += 1;
+
+            // Flush in batches during drain to avoid unbounded ILP buffer growth.
+            if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
+                if let Err(err) = self.force_flush() {
+                    warn!(
+                        ?err,
+                        drained,
+                        remaining = self.tick_buffer.len(),
+                        "flush during buffer drain failed — pausing drain"
+                    );
+                    break; // Stop draining, remaining ticks stay in buffer
+                }
+            }
+        }
+
+        if drained > 0 {
+            info!(
+                drained,
+                remaining = self.tick_buffer.len(),
+                total_buffered,
+                dropped_total = self.ticks_dropped_total,
+                "drained buffered ticks to QuestDB after recovery"
+            );
+        }
+        metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
     }
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.

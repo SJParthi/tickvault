@@ -70,7 +70,7 @@ The system must survive ANY crash scenario — Docker daemon crash, QuestDB cras
 
 ### Phase B: Never Lose a Tick (Buffering + Recovery)
 
-- [ ] B1: In-memory tick ring buffer for QuestDB outages
+- [x] B1: In-memory tick ring buffer for QuestDB outages
   - Files: crates/storage/src/tick_persistence.rs
   - Change: When QuestDB write fails, buffer ticks in a bounded ring buffer
     (capacity: 300,000 ticks = ~5 minutes at 1000 ticks/sec = ~20MB).

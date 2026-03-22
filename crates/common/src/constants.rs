@@ -1210,6 +1210,11 @@ pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
 /// Default tick flush interval in milliseconds.
 pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 
+/// Tick ring buffer capacity for QuestDB outage resilience.
+/// Holds ticks in memory when QuestDB is down, drains on recovery.
+/// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
+pub const TICK_BUFFER_CAPACITY: usize = 300_000;
+
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
