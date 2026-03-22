@@ -246,6 +246,12 @@ request_timeout_secs = 30
 max_retries = 3
 request_delay_ms = 500
 
+[greeks]
+risk_free_rate = 0.068
+dividend_yield = 0.012
+iv_solver_max_iterations = 50
+iv_solver_tolerance = 1e-8
+
 [index_constituency]
 enabled = true
 download_timeout_secs = 30

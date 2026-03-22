@@ -1317,6 +1317,32 @@ pub const MAX_INDICATOR_INSTRUMENTS: usize = 25_000;
 pub const MAX_STRATEGY_INSTANCES: usize = 256;
 
 // ---------------------------------------------------------------------------
+// Options Greeks — Black-Scholes Parameters
+// ---------------------------------------------------------------------------
+
+/// Risk-free interest rate (annualized) for Black-Scholes pricing.
+/// Uses India 91-day T-Bill rate (~6.8% as of Q1 2026).
+/// Update quarterly from RBI T-Bill auction results.
+pub const RISK_FREE_RATE: f64 = 0.068;
+
+/// Continuous dividend yield (annualized) for NIFTY/BANKNIFTY.
+/// ~1.2% for NIFTY 50 (varies; update quarterly).
+pub const DIVIDEND_YIELD: f64 = 0.012;
+
+/// Maximum Newton-Raphson iterations for IV solver.
+/// 50 iterations is sufficient for convergence to 1e-8 tolerance.
+pub const IV_SOLVER_MAX_ITERATIONS: u32 = 50;
+
+/// IV solver convergence tolerance (precision of implied volatility).
+pub const IV_SOLVER_TOLERANCE: f64 = 1e-8;
+
+/// Minimum implied volatility bound (0.1% — prevents zero/negative IV).
+pub const IV_MIN_BOUND: f64 = 0.001;
+
+/// Maximum implied volatility bound (500% — extreme but valid for penny options).
+pub const IV_MAX_BOUND: f64 = 5.0;
+
+// ---------------------------------------------------------------------------
 // Frontend — Tick Broadcast Channel
 // ---------------------------------------------------------------------------
 
@@ -1855,5 +1881,38 @@ mod tests {
     #[test]
     fn test_indicator_ring_buffer_capacity_power_of_two() {
         assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
+    }
+
+    // --- Greeks Constants ---
+
+    #[test]
+    fn test_risk_free_rate_reasonable() {
+        // India T-Bill rate should be between 3% and 12%
+        assert!(RISK_FREE_RATE > 0.03 && RISK_FREE_RATE < 0.12);
+    }
+
+    #[test]
+    fn test_dividend_yield_reasonable() {
+        // NIFTY dividend yield between 0.5% and 3%
+        assert!(DIVIDEND_YIELD > 0.005 && DIVIDEND_YIELD < 0.03);
+    }
+
+    #[test]
+    fn test_iv_solver_max_iterations_positive() {
+        assert!(IV_SOLVER_MAX_ITERATIONS > 0);
+        assert!(IV_SOLVER_MAX_ITERATIONS <= 200);
+    }
+
+    #[test]
+    fn test_iv_solver_tolerance_small_positive() {
+        assert!(IV_SOLVER_TOLERANCE > 0.0);
+        assert!(IV_SOLVER_TOLERANCE < 1e-4);
+    }
+
+    #[test]
+    fn test_iv_bounds_valid_range() {
+        assert!(IV_MIN_BOUND > 0.0);
+        assert!(IV_MAX_BOUND > IV_MIN_BOUND);
+        assert!(IV_MAX_BOUND <= 10.0);
     }
 }

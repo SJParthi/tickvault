@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn test_compute_instrument_ttl_exactly_at_target() {
         // When IST time == target → wraps to next day (86400)
-        let target_secs: u64 = 12 * 3600; // 12:00 IST = 43200
+        let _target_secs: u64 = 12 * 3600; // 12:00 IST = 43200
         // Need (epoch + 19800) % 86400 = 43200
         let epoch = 86_400 + 43_200 - 19_800; // = 109800
         let ttl = compute_instrument_ttl_secs(epoch, 12);
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn test_compute_instrument_ttl_one_second_after_target() {
         // IST time = target_secs + 1 → wrap to next day minus 1 second
-        let target_secs: u64 = 6 * 3600; // 06:00 IST = 21600
+        let _target_secs: u64 = 6 * 3600; // 06:00 IST = 21600
         // Need (epoch + 19800) % 86400 = 21601
         let epoch = 86_400 + 21_601 - 19_800;
         let ttl = compute_instrument_ttl_secs(epoch, 6);

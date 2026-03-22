@@ -37,6 +37,8 @@ pub struct ApplicationConfig {
     pub strategy: StrategyConfig,
     #[serde(default)]
     pub index_constituency: IndexConstituencyConfig,
+    #[serde(default)]
+    pub greeks: GreeksConfig,
 }
 
 /// Strategy and paper-trading configuration.
@@ -475,6 +477,53 @@ const fn default_constituency_inter_batch_delay_ms() -> u64 {
     200
 }
 
+/// Greeks engine configuration.
+///
+/// Controls Black-Scholes pricing parameters and IV solver settings.
+/// Defaults match Indian market conditions (NIFTY/BANKNIFTY).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GreeksConfig {
+    /// Risk-free interest rate (annualized). India 91-day T-Bill rate.
+    #[serde(default = "default_risk_free_rate")]
+    pub risk_free_rate: f64,
+    /// Continuous dividend yield (annualized). ~1.2% for NIFTY 50.
+    #[serde(default = "default_dividend_yield")]
+    pub dividend_yield: f64,
+    /// Maximum Newton-Raphson iterations for IV solver.
+    #[serde(default = "default_iv_solver_max_iterations")]
+    pub iv_solver_max_iterations: u32,
+    /// IV solver convergence tolerance.
+    #[serde(default = "default_iv_solver_tolerance")]
+    pub iv_solver_tolerance: f64,
+}
+
+impl Default for GreeksConfig {
+    fn default() -> Self {
+        Self {
+            risk_free_rate: default_risk_free_rate(),
+            dividend_yield: default_dividend_yield(),
+            iv_solver_max_iterations: default_iv_solver_max_iterations(),
+            iv_solver_tolerance: default_iv_solver_tolerance(),
+        }
+    }
+}
+
+const fn default_risk_free_rate() -> f64 {
+    0.068
+}
+
+const fn default_dividend_yield() -> f64 {
+    0.012
+}
+
+const fn default_iv_solver_max_iterations() -> u32 {
+    50
+}
+
+const fn default_iv_solver_tolerance() -> f64 {
+    1e-8
+}
+
 // ---------------------------------------------------------------------------
 // Configuration Validation
 // ---------------------------------------------------------------------------
@@ -773,6 +822,7 @@ mod tests {
             historical: HistoricalDataConfig::default(),
             strategy: StrategyConfig::default(),
             index_constituency: IndexConstituencyConfig::default(),
+            greeks: GreeksConfig::default(),
         }
     }
 

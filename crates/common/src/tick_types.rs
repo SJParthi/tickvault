@@ -122,6 +122,58 @@ pub struct DeepDepthLevel {
 }
 
 // ---------------------------------------------------------------------------
+// Option Greeks — computed from Black-Scholes in trading crate
+// ---------------------------------------------------------------------------
+
+/// Computed option Greeks snapshot for a single contract.
+///
+/// Lives in `common` so storage, core, and api crates can reference it
+/// without depending on the trading crate. The trading crate's
+/// `greeks::black_scholes::compute_greeks()` produces these values.
+///
+/// `Copy` for zero-allocation on hot path. All values are f64 for precision.
+#[derive(Debug, Clone, Copy)]
+pub struct OptionGreeksSnapshot {
+    /// Implied volatility (annualized, e.g., 0.30 = 30%).
+    pub iv: f64,
+    /// Rate of change of option price w.r.t. underlying price.
+    /// CE: [0, 1], PE: [-1, 0].
+    pub delta: f64,
+    /// Rate of change of delta w.r.t. underlying price.
+    /// Always positive. Highest for ATM options.
+    pub gamma: f64,
+    /// Daily time decay (negative for long options).
+    pub theta: f64,
+    /// Sensitivity to 1% change in IV. Always positive.
+    pub vega: f64,
+    /// Black-Scholes theoretical price.
+    pub bs_price: f64,
+    /// Intrinsic value: max(S-K, 0) for CE, max(K-S, 0) for PE.
+    pub intrinsic: f64,
+    /// Extrinsic (time) value: market_price - intrinsic.
+    pub extrinsic: f64,
+    /// Put-Call Ratio for the underlying at this snapshot time.
+    /// NaN or 0.0 if not computed.
+    pub pcr: f64,
+}
+
+impl Default for OptionGreeksSnapshot {
+    fn default() -> Self {
+        Self {
+            iv: 0.0,
+            delta: 0.0,
+            gamma: 0.0,
+            theta: 0.0,
+            vega: 0.0,
+            bs_price: 0.0,
+            intrinsic: 0.0,
+            extrinsic: 0.0,
+            pcr: 0.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Historical Candle — 1-minute OHLCV from Dhan intraday API
 // ---------------------------------------------------------------------------
 
@@ -651,5 +703,61 @@ mod tests {
             open_interest: vec![5000], // 1 element vs 2 candles
         };
         assert!(!resp.is_consistent());
+    }
+
+    // --- OptionGreeksSnapshot ---
+
+    #[test]
+    fn test_option_greeks_snapshot_default_all_zeros() {
+        let g = OptionGreeksSnapshot::default();
+        assert_eq!(g.iv, 0.0);
+        assert_eq!(g.delta, 0.0);
+        assert_eq!(g.gamma, 0.0);
+        assert_eq!(g.theta, 0.0);
+        assert_eq!(g.vega, 0.0);
+        assert_eq!(g.bs_price, 0.0);
+        assert_eq!(g.intrinsic, 0.0);
+        assert_eq!(g.extrinsic, 0.0);
+        assert_eq!(g.pcr, 0.0);
+    }
+
+    #[test]
+    fn test_option_greeks_snapshot_is_copy() {
+        let g = OptionGreeksSnapshot {
+            iv: 0.25,
+            delta: 0.55,
+            gamma: 0.0013,
+            theta: -15.0,
+            vega: 12.5,
+            bs_price: 350.0,
+            intrinsic: 200.0,
+            extrinsic: 150.0,
+            pcr: 1.2,
+        };
+        let copy = g; // Copy, not move
+        assert_eq!(g.iv, copy.iv);
+        assert_eq!(g.delta, copy.delta);
+        assert_eq!(g.pcr, copy.pcr);
+    }
+
+    #[test]
+    fn test_option_greeks_snapshot_typical_atm_call() {
+        let g = OptionGreeksSnapshot {
+            iv: 0.20,
+            delta: 0.53,
+            gamma: 0.00132,
+            theta: -15.15,
+            vega: 12.18,
+            bs_price: 340.0,
+            intrinsic: 100.0,
+            extrinsic: 240.0,
+            pcr: 0.85,
+        };
+        // ATM call: delta near 0.5
+        assert!(g.delta > 0.4 && g.delta < 0.6);
+        // Theta always negative for long options
+        assert!(g.theta < 0.0);
+        // Vega always positive
+        assert!(g.vega > 0.0);
     }
 }

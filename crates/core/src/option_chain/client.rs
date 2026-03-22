@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use secrecy::ExposeSecret;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use dhan_live_trader_common::constants::{
     OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS, OPTION_CHAIN_REQUEST_TIMEOUT_SECS,
