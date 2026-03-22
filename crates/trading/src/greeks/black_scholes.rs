@@ -735,4 +735,35 @@ mod tests {
         let g2 = g; // Copy
         assert_eq!(g.iv, g2.iv);
     }
+
+    #[test]
+    fn test_bs_price_call_delegates_correctly() {
+        let direct = bs_call_price(S, K, T, R, Q, SIGMA);
+        let via_wrapper = bs_price(OptionSide::Call, S, K, T, R, Q, SIGMA);
+        assert!((direct - via_wrapper).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_bs_price_put_delegates_correctly() {
+        let direct = bs_put_price(S, K, T, R, Q, SIGMA);
+        let via_wrapper = bs_price(OptionSide::Put, S, K, T, R, Q, SIGMA);
+        assert!((direct - via_wrapper).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_iv_solve_various_strikes() {
+        // Test IV convergence across different moneyness levels.
+        for strike in [80.0, 90.0, 100.0, 110.0, 120.0] {
+            let price = bs_call_price(S, strike, T, R, Q, SIGMA);
+            if price > 0.01 {
+                let iv = iv_solve(OptionSide::Call, S, strike, T, R, Q, price);
+                assert!(iv.is_some(), "IV should converge for strike={strike}");
+                assert!(
+                    (iv.unwrap() - SIGMA).abs() < 0.01,
+                    "IV roundtrip failed for strike={strike}: got {}",
+                    iv.unwrap()
+                );
+            }
+        }
+    }
 }
