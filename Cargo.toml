@@ -46,7 +46,7 @@ quanta = "0.12.5"
 # Versions pinned to 0.31.0 to match tracing-opentelemetry 0.32.1 (which depends on opentelemetry 0.31.0)
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "0.1.44"
