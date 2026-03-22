@@ -136,6 +136,8 @@ impl OrderManagementSystem {
     /// - `OmsError::DhanRateLimited` — HTTP 429 from Dhan
     #[instrument(skip_all, fields(security_id = request.security_id))]
     pub async fn place_order(&mut self, request: PlaceOrderRequest) -> Result<String, OmsError> {
+        let start = std::time::Instant::now();
+
         // Step 0: Pre-submission validation gates (before consuming rate limit)
         validate_order_fields(&request)?;
 
@@ -181,6 +183,8 @@ impl OrderManagementSystem {
             self.total_placed = self.total_placed.saturating_add(1);
 
             counter!("dlt_orders_placed_total", "mode" => "paper").increment(1);
+            metrics::histogram!("dlt_order_placement_duration_ns")
+                .record(start.elapsed().as_nanos() as f64);
 
             info!(
                 order_id = %paper_order_id,
@@ -268,6 +272,8 @@ impl OrderManagementSystem {
         self.total_placed = self.total_placed.saturating_add(1);
 
         counter!("dlt_orders_placed_total", "mode" => "live").increment(1);
+        metrics::histogram!("dlt_order_placement_duration_ns")
+            .record(start.elapsed().as_nanos() as f64);
 
         info!(
             order_id = %response.order_id,
@@ -2913,5 +2919,12 @@ mod tests {
             oms.reset_daily();
             assert!(oms.all_orders().is_empty());
         });
+    }
+
+    #[test]
+    fn test_order_latency_metric() {
+        // Verify histogram macro compiles and doesn't panic when invoked.
+        // O(1) atomic call — safe for cold path (order placement).
+        metrics::histogram!("dlt_order_placement_duration_ns").record(1000.0_f64);
     }
 }

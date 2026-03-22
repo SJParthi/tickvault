@@ -12,53 +12,12 @@
 //! - **Boot orchestration** — `load_instruments`, `build_websocket_pool`, `run_shutdown_fast`
 //! - **Persistence consumers** — `run_tick_persistence_consumer`, `run_candle_persistence_consumer`
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use chrono::Timelike;
+use tracing::warn;
 
-use anyhow::{Context, Result};
-use chrono::{Timelike, Utc};
-use figment::Figment;
-use figment::providers::{Format, Toml};
-use secrecy::ExposeSecret;
-use tracing::{error, info, warn};
-
-use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
-use dhan_live_trader_core::auth::secret_manager;
-use dhan_live_trader_core::auth::token_cache;
-use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
-use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 use dhan_live_trader_core::historical::cross_verify::{
-    CrossMatchMismatch, CrossVerificationReport, ViolationDetail, cross_match_historical_vs_live,
-    verify_candle_integrity,
-};
-use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
-use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
-use dhan_live_trader_core::instrument::{
-    InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
-};
-use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
-use dhan_live_trader_core::pipeline::run_tick_processor;
-use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
-use dhan_live_trader_core::websocket::order_update_connection::run_order_update_connection;
-use dhan_live_trader_core::websocket::types::{InstrumentSubscription, WebSocketError};
-
-use dhan_live_trader_storage::calendar_persistence;
-use dhan_live_trader_storage::candle_persistence::{
-    CandlePersistenceWriter, ensure_candle_table_dedup_keys,
-};
-use dhan_live_trader_storage::instrument_persistence::{
-    ensure_instrument_tables, persist_instrument_snapshot,
-};
-use dhan_live_trader_storage::tick_persistence::{
-    DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
-    ensure_tick_table_dedup_keys,
-};
-
-use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::{
-    SharedAppState, SharedConstituencyMap, SharedHealthStatus, SystemHealthStatus,
+    CrossMatchMismatch, CrossVerificationReport, ViolationDetail,
 };
 
 // ---------------------------------------------------------------------------

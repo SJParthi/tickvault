@@ -170,7 +170,7 @@ pub struct QuestDbConfig {
 }
 
 /// Valkey (cache) connection configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ValkeyConfig {
     /// Valkey Docker hostname.
     pub host: String,

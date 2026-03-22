@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
@@ -44,6 +44,13 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// (same security_id can exist on NSE_EQ and BSE_EQ).
 const DEDUP_KEY_TICKS: &str = "security_id, segment";
 
+/// Maximum number of reconnection attempts for QuestDB ILP sender.
+const QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
+/// Initial reconnect delay for QuestDB ILP sender (milliseconds).
+/// Exponential backoff: 1000ms, 2000ms, 4000ms.
+const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -53,11 +60,17 @@ const DEDUP_KEY_TICKS: &str = "security_id, segment";
 /// Accumulates ticks in an ILP buffer and flushes when either:
 /// - The buffer reaches `TICK_FLUSH_BATCH_SIZE` rows, or
 /// - `flush_if_needed()` detects that `TICK_FLUSH_INTERVAL_MS` has elapsed.
+///
+/// On write failure, the sender is set to `None` and a reconnection is
+/// attempted on the next write. This prevents tick loss from transient
+/// QuestDB connection drops during a trading session.
 pub struct TickPersistenceWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     last_flush_ms: u64,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
 }
 
 impl TickPersistenceWriter {
@@ -72,26 +85,41 @@ impl TickPersistenceWriter {
         let buffer = sender.new_buffer();
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             buffer,
             pending_count: 0,
             last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
         })
     }
 
     /// Appends a parsed tick to the ILP buffer.
     ///
     /// Auto-flushes if the buffer reaches `TICK_FLUSH_BATCH_SIZE`.
+    /// On flush failure, the sender is invalidated and a reconnection
+    /// is attempted on the next call.
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
+    /// Reconnect logic (cold path) only runs on error.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
+        // If sender is None (previous failure), attempt reconnect before writing.
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+        }
+
         build_tick_row(&mut self.buffer, tick)?;
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
-            self.force_flush()?;
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+            && let Err(err) = self.force_flush()
+        {
+            // Flush failed — sender is now None. Buffer data is lost for
+            // this batch, but the system continues. Ticks are observability
+            // data, not critical path (see module doc).
+            warn!(?err, "tick auto-flush failed, sender invalidated");
+            return Err(err);
         }
 
         Ok(())
@@ -115,15 +143,35 @@ impl TickPersistenceWriter {
     }
 
     /// Forces an immediate flush of all buffered ticks to QuestDB.
+    ///
+    /// On failure, the sender is set to `None` so that the next write
+    /// attempt triggers a reconnection. Buffered data is lost on
+    /// reconnect — tick persistence is observability data, not critical path.
     pub fn force_flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
+        if self.sender.is_none() {
+            // No active sender — attempt reconnect. This resets
+            // pending_count and buffer (old data is lost).
+            self.try_reconnect_on_error()?;
+            return Ok(());
+        }
+
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush ticks to QuestDB")?;
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in force_flush")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // Sender is broken — set to None for future reconnect.
+            self.sender = None;
+            self.pending_count = 0;
+            self.last_flush_ms = current_time_ms();
+            return Err(err).context("flush ticks to QuestDB");
+        }
         self.pending_count = 0;
         self.last_flush_ms = current_time_ms();
 
@@ -140,6 +188,70 @@ impl TickPersistenceWriter {
     /// (e.g., previous close) that share the same flush lifecycle.
     pub fn buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffer
+    }
+
+    /// Attempts to reconnect to QuestDB by creating a new ILP sender.
+    ///
+    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
+    /// On success, replaces the sender and creates a fresh buffer.
+    /// Any data in the old buffer is lost — tick persistence is observability
+    /// data, not critical path (see module doc).
+    ///
+    /// # Errors
+    /// Returns error if all reconnection attempts fail.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                dropped_ticks = self.pending_count,
+                "attempting QuestDB ILP reconnection for tick writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    self.last_flush_ms = current_time_ms();
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for tick writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for tick writer"
+                    );
+                    // Exponential backoff: double the delay for next attempt.
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for tick writer",
+            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Attempts reconnection only when the sender is `None` (i.e., after a
+    /// previous write failure). This is a cold-path helper — never called
+    /// on the happy path.
+    fn try_reconnect_on_error(&mut self) -> Result<()> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
+        self.reconnect()
     }
 }
 
@@ -376,11 +488,16 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 ///
 /// Writes 5-level market depth snapshots from Full (code 8) and
 /// Market Depth (code 3) packets. Each snapshot = 5 ILP rows (one per level).
+///
+/// On write failure, the sender is set to `None` and a reconnection is
+/// attempted on the next write.
 pub struct DepthPersistenceWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     last_flush_ms: u64,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
 }
 
 impl DepthPersistenceWriter {
@@ -392,10 +509,11 @@ impl DepthPersistenceWriter {
         let buffer = sender.new_buffer();
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             buffer,
             pending_count: 0,
             last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
         })
     }
 
@@ -403,6 +521,7 @@ impl DepthPersistenceWriter {
     ///
     /// # Performance
     /// O(1) — fixed 5-iteration loop, no heap allocation.
+    /// Reconnect logic (cold path) only runs on error.
     pub fn append_depth(
         &mut self,
         security_id: u32,
@@ -410,6 +529,11 @@ impl DepthPersistenceWriter {
         received_at_nanos: i64,
         depth: &[MarketDepthLevel; 5],
     ) -> Result<()> {
+        // If sender is None (previous failure), attempt reconnect before writing.
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+        }
+
         build_depth_rows(
             &mut self.buffer,
             security_id,
@@ -420,8 +544,11 @@ impl DepthPersistenceWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE {
-            self.force_flush()?;
+        if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
+            && let Err(err) = self.force_flush()
+        {
+            warn!(?err, "depth auto-flush failed, sender invalidated");
+            return Err(err);
         }
 
         Ok(())
@@ -442,20 +569,100 @@ impl DepthPersistenceWriter {
     }
 
     /// Forces an immediate flush of all buffered depth rows to QuestDB.
+    ///
+    /// On failure, the sender is set to `None` so that the next write
+    /// attempt triggers a reconnection. Buffered data is lost on
+    /// reconnect — depth persistence is observability data, not critical path.
     pub fn force_flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+            return Ok(());
+        }
+
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush depth to QuestDB")?;
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in force_flush")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            self.sender = None;
+            self.pending_count = 0;
+            self.last_flush_ms = current_time_ms();
+            return Err(err).context("flush depth to QuestDB");
+        }
         self.pending_count = 0;
         self.last_flush_ms = current_time_ms();
 
         debug!(flushed_snapshots = count, "depth batch flushed to QuestDB");
         Ok(())
+    }
+
+    /// Attempts to reconnect to QuestDB by creating a new ILP sender.
+    ///
+    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
+    /// On success, replaces the sender and creates a fresh buffer.
+    /// Any data in the old buffer is lost — depth persistence is observability
+    /// data, not critical path (see module doc).
+    ///
+    /// # Errors
+    /// Returns error if all reconnection attempts fail.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                dropped_snapshots = self.pending_count,
+                "attempting QuestDB ILP reconnection for depth writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    self.last_flush_ms = current_time_ms();
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for depth writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for depth writer"
+                    );
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for depth writer",
+            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Attempts reconnection only when the sender is `None` (i.e., after a
+    /// previous write failure). This is a cold-path helper — never called
+    /// on the happy path.
+    fn try_reconnect_on_error(&mut self) -> Result<()> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
+        self.reconnect()
     }
 }
 
@@ -4051,5 +4258,225 @@ mod tests {
         assert_eq!(writer.pending_count, 1);
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // QuestDB auto-reconnect tests (H2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_questdb_reconnect_on_failure() {
+        // Simulate a connection drop by creating a writer, then setting
+        // the sender to None (as would happen on a flush error).
+        // Then verify that reconnect restores a working sender.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Verify initial state: sender is Some.
+        assert!(writer.sender.is_some(), "sender must be Some after new()");
+        assert_eq!(writer.pending_count(), 0);
+
+        // Append a tick — should succeed with valid sender.
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Flush to verify the sender works.
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+
+        // Simulate connection failure: set sender to None.
+        writer.sender = None;
+
+        // Start a new TCP server for the reconnect attempt
+        // (the original server's connection was consumed).
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // try_reconnect_on_error should detect sender is None and reconnect.
+        writer.try_reconnect_on_error().unwrap();
+        assert!(
+            writer.sender.is_some(),
+            "sender must be Some after successful reconnect"
+        );
+
+        // Verify the writer is functional after reconnect.
+        let tick2 = make_test_tick(42, 25_000.0);
+        writer.append_tick(&tick2).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_questdb_reconnect_skips_when_sender_is_some() {
+        // try_reconnect_on_error should be a no-op when sender is already Some.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Should return Ok immediately — no reconnect needed.
+        writer.try_reconnect_on_error().unwrap();
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_questdb_reconnect_fails_with_unreachable_host() {
+        // When the host is unreachable, all 3 reconnect attempts should fail.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Set sender to None and point to unreachable host.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // Reconnect should fail after 3 attempts.
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_err(), "reconnect to unreachable host must fail");
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None on failure"
+        );
+    }
+
+    #[test]
+    fn test_questdb_reconnect_constants_are_sane() {
+        assert_eq!(QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS, 3);
+        assert_eq!(QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS, 1000);
+        // Exponential backoff: 1s + 2s + 4s = 7s total max wait
+        let total_wait_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS
+            + QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS * 2
+            + QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS * 4;
+        assert!(
+            total_wait_ms <= 10_000,
+            "total reconnect wait must be <= 10s"
+        );
+    }
+
+    #[test]
+    fn test_questdb_tick_writer_stores_ilp_conf_string() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        let expected = format!("tcp::addr=127.0.0.1:{port};");
+        assert_eq!(
+            writer.ilp_conf_string, expected,
+            "writer must store the ILP config string for reconnection"
+        );
+    }
+
+    #[test]
+    fn test_questdb_depth_writer_reconnect_on_failure() {
+        // Same pattern as tick writer: simulate failure, then reconnect.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Verify initial state.
+        assert!(writer.sender.is_some());
+
+        // Simulate connection failure.
+        writer.sender = None;
+
+        // Start a new TCP server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        writer.try_reconnect_on_error().unwrap();
+        assert!(
+            writer.sender.is_some(),
+            "depth sender must be Some after reconnect"
+        );
+
+        // Verify the writer is functional after reconnect.
+        let depth = make_test_depth();
+        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_questdb_force_flush_with_none_sender_triggers_reconnect() {
+        // force_flush with no sender should attempt reconnect.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Append a tick to have pending data.
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Kill the sender — simulate connection drop.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // force_flush should reconnect (old data lost) and return Ok.
+        writer.force_flush().unwrap();
+        // After reconnect, pending_count is reset to 0 (old data lost).
+        assert_eq!(writer.pending_count(), 0);
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_questdb_append_tick_with_none_sender_triggers_reconnect() {
+        // append_tick with no sender should attempt reconnect before writing.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Kill the sender.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // append_tick should reconnect, then write the tick.
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+        assert!(writer.sender.is_some());
     }
 }

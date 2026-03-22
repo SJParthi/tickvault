@@ -3217,4 +3217,14 @@ mod tests {
         drop(frame_tx);
         let _ = handle.await;
     }
+
+    // -----------------------------------------------------------------------
+    // Channel backpressure metric
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_channel_throughput_metric_compiles() {
+        // Verify metric handle creation compiles without a recorder installed.
+        metrics::gauge!("dlt_channel_throughput_tps").set(0.0_f64);
+    }
 }
