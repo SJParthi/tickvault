@@ -427,6 +427,7 @@ mod tests {
                 max_orders_per_second: 10,
                 nse_holidays: vec![],
                 muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
             },
         )
         .unwrap();
@@ -490,6 +491,7 @@ mod tests {
                 max_orders_per_second: 10,
                 nse_holidays: vec![],
                 muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
             },
         )
         .unwrap();
@@ -550,6 +552,7 @@ mod tests {
                 max_orders_per_second: 10,
                 nse_holidays: holidays,
                 muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
             },
         )
         .unwrap();
@@ -601,6 +604,7 @@ mod tests {
                 max_orders_per_second: 10,
                 nse_holidays: vec![],
                 muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
             },
         )
         .unwrap();

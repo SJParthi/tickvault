@@ -100,6 +100,12 @@ pub struct TradingConfig {
     /// Muhurat Trading dates — special sessions on otherwise closed days.
     #[serde(default)]
     pub muhurat_trading_dates: Vec<NseHolidayEntry>,
+    /// NSE mock trading session dates (Saturdays, ~monthly).
+    /// Source: NSE Contingency Drill / Mock Trading Calendar (update annually).
+    /// Mock sessions are NOT real trading days — no real orders, no settlement.
+    /// Used for operational awareness and system testing readiness.
+    #[serde(default)]
+    pub nse_mock_trading_dates: Vec<NseHolidayEntry>,
 }
 
 /// A single NSE holiday or Muhurat trading date with display name.
@@ -692,6 +698,7 @@ mod tests {
                     date: "2026-11-08".to_string(),
                     name: "Diwali 2026".to_string(),
                 }],
+                nse_mock_trading_dates: vec![],
             },
             dhan: DhanConfig {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),

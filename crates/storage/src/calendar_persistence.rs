@@ -386,6 +386,7 @@ mod tests {
                 name: "Republic Day".to_string(),
             }],
             muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
         };
 
         let calendar = TradingCalendar::from_config(&trading_config).unwrap();
@@ -418,6 +419,7 @@ mod tests {
             max_orders_per_second: 10,
             nse_holidays: vec![],
             muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
         };
 
         let calendar = TradingCalendar::from_config(&trading_config).unwrap();
@@ -781,6 +783,7 @@ mod tests {
                 },
             ],
             muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
         };
 
         let calendar = TradingCalendar::from_config(&trading_config).unwrap();
@@ -817,6 +820,7 @@ mod tests {
                 date: "2026-10-21".to_string(),
                 name: "Diwali".to_string(),
             }],
+            nse_mock_trading_dates: vec![],
         };
 
         let calendar = TradingCalendar::from_config(&trading_config).unwrap();

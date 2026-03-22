@@ -213,14 +213,22 @@ async fn main() -> Result<()> {
     // Log trading day status — critical for operational awareness.
     let is_trading = trading_calendar.is_trading_day_today();
     let is_muhurat = trading_calendar.is_muhurat_trading_today();
+    let is_mock_trading = trading_calendar.is_mock_trading_today();
     info!(
         is_trading_day = is_trading,
         is_muhurat_session = is_muhurat,
+        is_mock_trading_session = is_mock_trading,
         holidays_loaded = trading_calendar.holiday_count(),
+        mock_trading_dates_loaded = trading_calendar.mock_trading_count(),
         "NSE trading calendar loaded"
     );
-    if !is_trading {
-        warn!("today is NOT a regular NSE trading day — market data and orders will be limited");
+    if is_mock_trading {
+        info!(
+            "today is an NSE mock trading session (Saturday) — compressed hours, no real settlement"
+        );
+    }
+    if !is_trading && !is_mock_trading {
+        info!("today is NOT a trading day — manual start, all components will load normally");
     }
 
     // -----------------------------------------------------------------------
@@ -331,7 +339,7 @@ async fn main() -> Result<()> {
         }
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
-        let (subscription_plan, fresh_universe) = load_instruments(&config).await;
+        let (subscription_plan, fresh_universe) = load_instruments(&config, is_trading).await;
 
         // --- WebSocket connect: THE ONLY BLOCKING STEP (~400ms) ---
         let (frame_receiver, ws_handles) =
@@ -804,7 +812,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // In slow boot, Docker is already running. FreshBuild persists internally,
     // but CachedPlan (within build window) needs explicit persistence here.
-    let (subscription_plan, slow_boot_universe) = load_instruments(&config).await;
+    let (subscription_plan, slow_boot_universe) = load_instruments(&config, is_trading).await;
     if let Some(ref universe) = slow_boot_universe {
         let _ = persist_instrument_snapshot(universe, &config.questdb).await;
     }
@@ -1108,8 +1116,12 @@ async fn main() -> Result<()> {
 ///
 /// The `FnoUniverse` is returned on fresh builds so the caller can re-persist
 /// instrument data to QuestDB after Docker infra starts (fast boot path).
+///
+/// `is_trading_day` ensures non-trading days (weekends/holidays) always
+/// download fresh instruments instead of using potentially stale cache.
 async fn load_instruments(
     config: &ApplicationConfig,
+    is_trading_day: bool,
 ) -> (Option<SubscriptionPlan>, Option<FnoUniverse>) {
     info!("checking instrument build eligibility");
 
@@ -1119,6 +1131,7 @@ async fn load_instruments(
         &config.instrument,
         &config.questdb,
         &config.subscription,
+        is_trading_day,
     )
     .await
     {

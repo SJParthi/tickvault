@@ -1393,6 +1393,7 @@ mod i_p2_02_trading_day_guard {
                 },
             ],
             muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
         }
     }
 

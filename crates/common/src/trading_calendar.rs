@@ -37,6 +37,11 @@ pub struct TradingCalendar {
     muhurat_dates: HashSet<NaiveDate>,
     /// Muhurat name lookup for display/persistence.
     muhurat_names: HashMap<NaiveDate, String>,
+    /// NSE mock trading session dates (Saturdays, ~monthly).
+    /// NOT real trading days — for system testing awareness only.
+    mock_trading_dates: HashSet<NaiveDate>,
+    /// Mock trading session name lookup for display/logging.
+    mock_trading_names: HashMap<NaiveDate, String>,
 }
 
 impl TradingCalendar {
@@ -75,11 +80,33 @@ impl TradingCalendar {
             muhurat_names.insert(date, entry.name.clone());
         }
 
+        let mut mock_trading_dates = HashSet::new();
+        let mut mock_trading_names = HashMap::new();
+        for entry in &trading.nse_mock_trading_dates {
+            let date = NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d").map_err(|e| {
+                anyhow::anyhow!("invalid NSE mock trading date '{}': {}", entry.date, e)
+            })?;
+
+            // Sanity: mock trading sessions are always on Saturdays.
+            if date.weekday() != Weekday::Sat {
+                bail!(
+                    "NSE mock trading date '{}' ({}) is not a Saturday — mock sessions are Saturday-only",
+                    entry.date,
+                    date.weekday()
+                );
+            }
+
+            mock_trading_dates.insert(date);
+            mock_trading_names.insert(date, entry.name.clone());
+        }
+
         Ok(Self {
             holidays,
             holiday_names,
             muhurat_dates,
             muhurat_names,
+            mock_trading_dates,
+            mock_trading_names,
         })
     }
 
@@ -119,6 +146,24 @@ impl TradingCalendar {
         self.holidays.contains(&date)
     }
 
+    /// Returns `true` if the given date is an NSE mock trading session.
+    ///
+    /// Mock trading sessions are Saturdays (~monthly) for system testing.
+    /// NOT real trading days — no settlement, no pay-in/pay-out.
+    pub fn is_mock_trading_day(&self, date: NaiveDate) -> bool {
+        self.mock_trading_dates.contains(&date)
+    }
+
+    /// Returns `true` if today (IST) is an NSE mock trading session.
+    pub fn is_mock_trading_today(&self) -> bool {
+        self.is_mock_trading_day(today_ist())
+    }
+
+    /// Returns the name of the mock trading session for display/logging, if any.
+    pub fn mock_trading_name(&self, date: NaiveDate) -> Option<&str> {
+        self.mock_trading_names.get(&date).map(|s| s.as_str())
+    }
+
     /// Returns the next regular trading day on or after the given date.
     ///
     /// Useful for scheduling: "when is the next day we should start up?"
@@ -142,6 +187,11 @@ impl TradingCalendar {
     /// Total number of Muhurat trading dates loaded.
     pub fn muhurat_count(&self) -> usize {
         self.muhurat_dates.len()
+    }
+
+    /// Total number of NSE mock trading session dates loaded.
+    pub fn mock_trading_count(&self) -> usize {
+        self.mock_trading_dates.len()
     }
 
     /// Returns all holiday and Muhurat entries for persistence/display.
@@ -221,6 +271,16 @@ mod tests {
                 date: "2026-11-08".to_string(),
                 name: "Diwali 2026".to_string(),
             }],
+            nse_mock_trading_dates: vec![
+                NseHolidayEntry {
+                    date: "2026-01-03".to_string(),
+                    name: "Mock Trading Session 1".to_string(),
+                },
+                NseHolidayEntry {
+                    date: "2026-03-07".to_string(),
+                    name: "Mock Trading Session 3".to_string(),
+                },
+            ],
         }
     }
 
@@ -803,5 +863,102 @@ mod tests {
         let tuesday = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
         assert!(cal.is_trading_day(tuesday));
         assert_eq!(cal.next_trading_day(tuesday), tuesday);
+    }
+
+    // =====================================================================
+    // Mock Trading Session Tests
+    // =====================================================================
+
+    #[test]
+    fn test_mock_trading_day_detected() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // 2026-01-03 Saturday — in mock trading dates
+        let mock_day = NaiveDate::from_ymd_opt(2026, 1, 3).unwrap();
+        assert!(cal.is_mock_trading_day(mock_day));
+    }
+
+    #[test]
+    fn test_non_mock_saturday_not_mock_day() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // 2026-01-10 Saturday — NOT in mock trading dates
+        let normal_sat = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        assert!(!cal.is_mock_trading_day(normal_sat));
+    }
+
+    #[test]
+    fn test_mock_trading_day_is_not_regular_trading_day() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // Mock trading Saturday is still NOT a regular trading day
+        let mock_day = NaiveDate::from_ymd_opt(2026, 1, 3).unwrap();
+        assert!(cal.is_mock_trading_day(mock_day));
+        assert!(!cal.is_trading_day(mock_day)); // Saturday → false
+    }
+
+    #[test]
+    fn test_mock_trading_count() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        assert_eq!(cal.mock_trading_count(), 2);
+    }
+
+    #[test]
+    fn test_mock_trading_name_returns_name() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let mock_day = NaiveDate::from_ymd_opt(2026, 1, 3).unwrap();
+        assert_eq!(
+            cal.mock_trading_name(mock_day),
+            Some("Mock Trading Session 1")
+        );
+    }
+
+    #[test]
+    fn test_mock_trading_name_returns_none_for_non_mock() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let normal_day = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        assert!(cal.mock_trading_name(normal_day).is_none());
+    }
+
+    #[test]
+    fn test_mock_trading_non_saturday_rejected() {
+        let mut config = make_test_config();
+        config.nse_mock_trading_dates.push(NseHolidayEntry {
+            date: "2026-03-09".to_string(), // Monday
+            name: "Bad Mock".to_string(),
+        });
+        let err = TradingCalendar::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("not a Saturday"));
+    }
+
+    #[test]
+    fn test_mock_trading_invalid_date_rejected() {
+        let mut config = make_test_config();
+        config.nse_mock_trading_dates.push(NseHolidayEntry {
+            date: "garbage".to_string(),
+            name: "Bad Date".to_string(),
+        });
+        let err = TradingCalendar::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("invalid NSE mock trading date"));
+    }
+
+    #[test]
+    fn test_mock_trading_empty_config() {
+        let mut config = make_test_config();
+        config.nse_mock_trading_dates.clear();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        assert_eq!(cal.mock_trading_count(), 0);
+        assert!(!cal.is_mock_trading_day(NaiveDate::from_ymd_opt(2026, 1, 3).unwrap()));
+    }
+
+    #[test]
+    fn test_is_mock_trading_today_returns_bool() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // Just verify it doesn't panic
+        let _is_mock = cal.is_mock_trading_today();
     }
 }

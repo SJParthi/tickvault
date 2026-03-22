@@ -167,6 +167,7 @@ fn make_trading_config_with_holidays() -> TradingConfig {
             holiday("2026-09-14", "Ganesh Chaturthi"),
         ],
         muhurat_trading_dates: vec![],
+        nse_mock_trading_dates: vec![],
     }
 }
 

@@ -1,8 +1,8 @@
 # Implementation Plan: Weekend/Holiday Boot Fix + NSE Mock Trading Calendar
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-03-22
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Context
 
@@ -17,27 +17,27 @@ awareness of these dates.
 
 ## Plan Items
 
-- [ ] Item 1: Pass `is_trading_day` into `load_or_build_instruments()` so non-trading days always download fresh
+- [x] Item 1: Pass `is_trading_day` into `load_or_build_instruments()` so non-trading days always download fresh
   - Files: crates/core/src/instrument/instrument_loader.rs, crates/app/src/main.rs
   - Tests: test_non_trading_day_bypasses_build_window, test_trading_day_respects_build_window
   - Logic: Add `is_trading_day: bool` parameter. When `!is_trading_day`, always take the download-fresh path (same as outside-market-hours), regardless of time-of-day.
 
-- [ ] Item 2: Add `nse_mock_trading_dates` config section to TradingConfig and base.toml
+- [x] Item 2: Add `nse_mock_trading_dates` config section to TradingConfig and base.toml
   - Files: crates/common/src/config.rs, config/base.toml
   - Tests: test_mock_trading_config_deserialized
   - Logic: New `Vec<NseHolidayEntry>` field with 2026 NSE mock trading dates. Same format as holidays/muhurat.
 
-- [ ] Item 3: Add `is_mock_trading_day()` to TradingCalendar
+- [x] Item 3: Add `is_mock_trading_day()` to TradingCalendar
   - Files: crates/common/src/trading_calendar.rs
   - Tests: test_mock_trading_day_detected, test_non_mock_saturday_not_mock_day, test_mock_trading_day_is_not_regular_trading_day
   - Logic: New `mock_trading_dates: HashSet<NaiveDate>` + `is_mock_trading_day()` + `is_mock_trading_today()`. Mock trading days are NOT regular trading days (no real orders), but the system should be aware of them for operational context.
 
-- [ ] Item 4: Update `load_instruments()` wrapper in main.rs to pass `is_trading_day`
+- [x] Item 4: Update `load_instruments()` wrapper in main.rs to pass `is_trading_day`
   - Files: crates/app/src/main.rs
   - Tests: (covered by Item 1 tests — the wrapper just passes the flag through)
   - Logic: Both fast boot and slow boot paths need the trading calendar's `is_trading_day_today()` result passed to the instrument loader.
 
-- [ ] Item 5: Log mock trading day status at boot
+- [x] Item 5: Log mock trading day status at boot
   - Files: crates/app/src/main.rs
   - Tests: (log output — no unit test needed, verified by code review)
   - Logic: At lines 214–224 where trading day status is logged, also log `is_mock_trading_day` status. On mock trading Saturdays, log INFO that it's a mock trading session with compressed hours.

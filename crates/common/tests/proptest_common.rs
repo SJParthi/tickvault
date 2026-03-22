@@ -43,6 +43,7 @@ fn make_minimal_trading_config() -> TradingConfig {
             },
         ],
         muhurat_trading_dates: vec![],
+        nse_mock_trading_dates: vec![],
     }
 }
 
@@ -239,6 +240,7 @@ proptest! {
                 name: "Test".to_string(),
             }],
             muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
         };
 
         // Must never panic — returns Result

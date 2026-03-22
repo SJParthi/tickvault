@@ -87,6 +87,7 @@ fn build_calendar() -> TradingCalendar {
             date: "2026-11-08".to_string(),
             name: "Diwali 2026".to_string(),
         }],
+        nse_mock_trading_dates: vec![],
     };
     // APPROVED: test/bench setup — calendar construction is cold path only.
     TradingCalendar::from_config(&config).unwrap()

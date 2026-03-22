@@ -88,6 +88,62 @@ name = "Christmas"
 date = "2026-11-08"
 name = "Diwali 2026 (Sunday — special session)"
 
+# ---------------------------------------------------------------------------
+# NSE Mock Trading Sessions — Contingency Drill Calendar 2026
+# ---------------------------------------------------------------------------
+# Source: https://www.nseindia.com/static/resources/exchange-communication-contingency-drill-calendar
+# All Saturdays, ~monthly. Compressed hours (typically 9:00–10:30 AM or 10:15 AM–2:00 PM).
+# NOT real trading days — no settlement, no pay-in/pay-out. For system testing only.
+# Update annually when NSE publishes the next calendar year's schedule.
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-01-03"
+name = "Mock Trading Session 1"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-02-07"
+name = "Mock Trading Session 2"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-03-07"
+name = "Mock Trading Session 3"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-04-11"
+name = "Mock Trading Session 4"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-05-09"
+name = "Mock Trading Session 5"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-06-06"
+name = "Mock Trading Session 6"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-07-04"
+name = "Mock Trading Session 7"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-08-01"
+name = "Mock Trading Session 8"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-09-05"
+name = "Mock Trading Session 9"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-10-10"
+name = "Mock Trading Session 10"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-11-14"
+name = "Mock Trading Session 11"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-12-05"
+name = "Mock Trading Session 12"
+
 [dhan]
 websocket_url = "wss://api-feed.dhan.co"
 order_update_websocket_url = "wss://api-order-update.dhan.co"

@@ -119,6 +119,7 @@ fn test_trading_config() -> dhan_live_trader_common::config::TradingConfig {
             date: "2026-11-08".to_string(),
             name: "Diwali 2026".to_string(),
         }],
+        nse_mock_trading_dates: vec![],
     }
 }
 

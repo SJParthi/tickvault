@@ -1,14 +1,16 @@
 //! Market-hours-aware instrument loader with rkyv binary cache.
 //!
 //! # Semantics
-//! - **Market hours** `[09:00, 15:30)` IST — cache first, emergency download
-//!   as last resort (I-P0-06). Load order:
+//! - **Trading day + market hours** `[09:00, 15:30)` IST — cache first,
+//!   emergency download as last resort (I-P0-06). Load order:
 //!   1. rkyv zero-copy binary cache (sub-0.5ms via `MappedUniverse`)
 //!   2. CSV file cache fallback (~400ms, then writes rkyv for next restart)
 //!   3. Emergency download (all caches missing — logs CRITICAL)
 //!   4. `Unavailable` — all sources exhausted
-//! - **Outside market hours** — ALWAYS download fresh CSV (ignores freshness
-//!   marker). On download failure, falls back to rkyv → CSV → error.
+//! - **Non-trading day (weekend/holiday)** — ALWAYS download fresh CSV
+//!   regardless of time-of-day. No live market to protect from download.
+//! - **Outside market hours (trading day)** — ALWAYS download fresh CSV
+//!   (ignores freshness marker). On download failure, falls back to cache.
 //! - **Manual API** — `POST /api/instruments/rebuild`. Bypasses market hours
 //!   check, always downloads, respects freshness marker (idempotent).
 //!
@@ -118,22 +120,34 @@ pub fn write_freshness_marker(cache_dir: &str) {
 
 /// Main entry: market-hours-aware instrument loading.
 ///
+/// The `is_trading_day` flag ensures non-trading days (weekends, holidays)
+/// always download fresh instruments regardless of time-of-day. The build
+/// window cache-only path exists to protect live trading from download
+/// disruption — on non-trading days there is no live market to protect.
+///
 /// Returns:
-/// - `InstrumentLoadResult::FreshBuild(universe)` — outside market hours, full download+build
-/// - `InstrumentLoadResult::CachedPlan(plan)` — market hours, zero-copy rkyv or CSV fallback
-/// - `InstrumentLoadResult::Unavailable` — market hours, no cache available
+/// - `InstrumentLoadResult::FreshBuild(universe)` — outside market hours or non-trading day
+/// - `InstrumentLoadResult::CachedPlan(plan)` — market hours on trading day, zero-copy cache
+/// - `InstrumentLoadResult::Unavailable` — market hours on trading day, no cache available
 pub async fn load_or_build_instruments(
     dhan_csv_url: &str,
     dhan_csv_fallback_url: &str,
     instrument_config: &InstrumentConfig,
     questdb_config: &QuestDbConfig,
     subscription_config: &SubscriptionConfig,
+    is_trading_day: bool,
 ) -> Result<InstrumentLoadResult> {
-    if is_within_build_window(
-        &instrument_config.build_window_start,
-        &instrument_config.build_window_end,
-    ) {
-        // ----- MARKET HOURS: cache first, emergency download if both miss -----
+    // Cache-only path ONLY when BOTH conditions met:
+    //   1. Today is a regular NSE trading day (not weekend/holiday)
+    //   2. Current IST time is within the build window (09:00–15:30)
+    // On non-trading days, always download fresh — no live market to protect.
+    if is_trading_day
+        && is_within_build_window(
+            &instrument_config.build_window_start,
+            &instrument_config.build_window_end,
+        )
+    {
+        // ----- TRADING DAY + MARKET HOURS: cache first, emergency download if both miss -----
         // I-P0-06: Emergency Download Override
         return load_from_cache_or_emergency_download(
             dhan_csv_url,
@@ -145,7 +159,11 @@ pub async fn load_or_build_instruments(
         .await;
     }
 
-    // ----- OUTSIDE MARKET HOURS: always download fresh -----
+    if !is_trading_day {
+        info!("non-trading day: downloading fresh instruments (build window check bypassed)");
+    }
+
+    // ----- OUTSIDE MARKET HOURS OR NON-TRADING DAY: always download fresh -----
     load_with_download(
         dhan_csv_url,
         dhan_csv_fallback_url,
@@ -649,7 +667,7 @@ mod tests {
         let universe = test_universe();
         write_binary_cache(&universe, cache_dir).unwrap();
 
-        // Window = always inside (00:00 to 23:59)
+        // Window = always inside (00:00 to 23:59), trading day
         let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
         let result = load_or_build_instruments(
             "http://127.0.0.1:1/fake",
@@ -657,6 +675,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day + within build window → cache path
         )
         .await;
 
@@ -690,6 +709,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day + within build window → cache path
         )
         .await;
 
@@ -723,6 +743,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day + within build window → cache path
         )
         .await;
 
@@ -754,6 +775,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day + within build window → cache path → emergency download
         )
         .await;
 
@@ -787,6 +809,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day — but outside build window, so downloads fresh
         )
         .await;
 
@@ -821,6 +844,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day — but outside build window, so downloads fresh
         )
         .await;
 
@@ -828,6 +852,87 @@ mod tests {
             result.is_err(),
             "outside hours with no sources should error"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-trading day bypasses build window → downloads fresh (not cache path)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_non_trading_day_bypasses_build_window() {
+        let dir = unique_temp_dir("ntd-bypass-window");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.to_str().unwrap();
+
+        // Pre-write rkyv cache (normally used during market hours)
+        let universe = test_universe();
+        write_binary_cache(&universe, cache_dir).unwrap();
+
+        // Window = always inside (00:00 to 23:59), but NOT a trading day
+        // On non-trading days, should bypass cache and try to download fresh.
+        // Download fails (fake URLs) → falls back to rkyv cache → FreshBuild
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+            false, // NOT trading day → bypasses build window → download path
+        )
+        .await;
+
+        // Should take download path (fails), fall back to rkyv → FreshBuild
+        // NOT CachedPlan (which would mean it used the cache-only path)
+        match result.unwrap() {
+            InstrumentLoadResult::FreshBuild(loaded) => {
+                assert_eq!(loaded.build_metadata.csv_source, "test");
+            }
+            other => panic!(
+                "non-trading day should bypass cache path, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_trading_day_uses_cache_path_within_build_window() {
+        let dir = unique_temp_dir("td-cache-window");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.to_str().unwrap();
+
+        // Pre-write rkyv cache
+        let universe = test_universe();
+        write_binary_cache(&universe, cache_dir).unwrap();
+
+        // Window = always inside (00:00 to 23:59), IS a trading day
+        let config = test_instrument_config(cache_dir, "00:00:00", "23:59:59");
+        let result = load_or_build_instruments(
+            "http://127.0.0.1:1/fake",
+            "http://127.0.0.1:1/fake",
+            &config,
+            &test_questdb_config(),
+            &test_subscription_config(),
+            true, // trading day + within build window → cache path → CachedPlan
+        )
+        .await;
+
+        // Should use cache path → CachedPlan (not download path)
+        match result.unwrap() {
+            InstrumentLoadResult::CachedPlan(_) => {
+                // Correct: trading day uses cache during market hours
+            }
+            other => panic!(
+                "trading day within window should use cache path, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1047,6 +1152,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day — but outside build window, so downloads fresh
         )
         .await;
 
@@ -1081,6 +1187,7 @@ mod tests {
             &config,
             &test_questdb_config(),
             &test_subscription_config(),
+            true, // trading day + within build window → cache path → Unavailable
         )
         .await;
 
