@@ -66,10 +66,9 @@ Target: MacBook local dev + future AWS instance.
   - Files: crates/storage/src/valkey_cache.rs
   - Tests: test_valkey_reconnect_on_failure
 
-- [ ] M3: Stale LTP detection (per-instrument last-update tracking, alert if frozen >10 min)
-  - Files: crates/trading/src/risk/tick_gap_tracker.rs
-  - Tests: test_stale_ltp_detection
-  - **Status: NOT IMPLEMENTED**
+- [x] M3: Stale LTP detection (per-instrument last-update tracking, alert if frozen >10 min)
+  - Files: crates/trading/src/risk/tick_gap_tracker.rs, crates/common/src/constants.rs
+  - Tests: test_stale_ltp_detection, stale_ltp_warmup_instruments_skipped, stale_ltp_alert_only_once_per_episode, stale_ltp_resets_on_new_tick, stale_ltp_multiple_instruments_independent, stale_ltp_reset_clears_stale_counter, stale_ltp_threshold_constant_is_600_seconds, stale_ltp_counter_saturates_at_u64_max
 
 ### Batch 4 — Observability Metrics (7 items)
 
@@ -107,10 +106,9 @@ Target: MacBook local dev + future AWS instance.
   - Files: crates/app/src/boot_helpers.rs
   - Tests: test_clock_drift_check
 
-- [ ] M6: Channel backpressure metrics (tick channel occupancy gauge)
+- [x] M6: Channel backpressure metrics (tick channel occupancy gauge)
   - Files: crates/core/src/pipeline/tick_processor.rs
   - Tests: test_channel_occupancy_metric
-  - **Status: PARTIAL — comment/structure in place, no metric emission**
 
 - [x] M7: Await JoinHandles on shutdown with timeout instead of abort
   - Files: crates/app/src/main.rs
@@ -128,16 +126,14 @@ Target: MacBook local dev + future AWS instance.
   - Files: crates/app/src/infra.rs
   - Tests: test_memory_monitoring
 
-- [ ] L4: System metrics export (open FDs, thread count via process collector)
-  - Files: crates/app/src/observability.rs
-  - Tests: test_system_metrics_exported
-  - **Status: NOT IMPLEMENTED**
+- [x] L4: System metrics export (open FDs, thread count via process collector)
+  - Files: crates/app/src/infra.rs, crates/app/src/boot_helpers.rs
+  - Tests: test_system_metrics_exported, test_export_system_metrics_no_panic
 
 ## Summary
 
-- **Implemented:** 24/27
-- **Not implemented:** M3 (stale LTP detection), L4 (system metrics export)
-- **Partial:** M6 (channel backpressure — structure only, no metric)
+- **Implemented:** 27/27
+- All items complete.
 
 ## Constraints
 

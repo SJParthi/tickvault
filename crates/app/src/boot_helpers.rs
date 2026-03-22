@@ -286,6 +286,9 @@ pub fn spawn_heartbeat_watchdog(
                     "WATCHDOG: tick broadcast has 0 receivers — tick processor may have crashed"
                 );
             }
+
+            // L4: Export system metrics (open FDs, thread count) every watchdog cycle.
+            crate::infra::export_system_metrics();
         }
     })
 }

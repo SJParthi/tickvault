@@ -470,6 +470,11 @@ pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 /// (which routes to Telegram alert). 120 seconds suggests feed disconnection.
 pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 120;
 
+/// Stale LTP threshold in seconds. If no tick arrives for a security within
+/// this window (wall-clock time), it is considered stale/frozen. 600s = 10 min.
+/// Checked periodically by `TickGapTracker::detect_stale_instruments()`.
+pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
+
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
 // ---------------------------------------------------------------------------

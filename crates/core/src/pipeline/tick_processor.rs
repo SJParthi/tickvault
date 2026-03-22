@@ -250,6 +250,8 @@ pub async fn run_tick_processor(
     let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
     let m_crossed_market = counter!("dlt_crossed_market_total");
     let m_outside_hours = counter!("dlt_outside_hours_filtered_total");
+    let m_channel_occupancy = gauge!("dlt_tick_channel_occupancy");
+    let m_channel_capacity = gauge!("dlt_tick_channel_capacity");
 
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
@@ -265,6 +267,8 @@ pub async fn run_tick_processor(
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
     m_pipeline_active.set(1.0);
+    // Record channel capacity once at startup (65536 for SPSC buffer).
+    m_channel_capacity.set(frame_receiver.max_capacity() as f64);
     info!("tick processor started");
 
     while let Some(raw_frame) = frame_receiver.recv().await {
@@ -675,6 +679,10 @@ pub async fn run_tick_processor(
                 }
                 last_snapshot_check = Instant::now();
             }
+
+            // M6: Channel backpressure — sample occupancy every flush cycle (~100ms).
+            // O(1): mpsc::Receiver::len() is an atomic load.
+            m_channel_occupancy.set(frame_receiver.len() as f64);
 
             last_flush_check = Instant::now();
         }
@@ -3219,8 +3227,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Channel backpressure metric
+    // Channel backpressure metric (M6)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_channel_occupancy_metric() {
+        // Verify metric handle creation compiles without a recorder installed.
+        metrics::gauge!("dlt_tick_channel_occupancy").set(0.0_f64);
+        metrics::gauge!("dlt_tick_channel_capacity").set(65536.0_f64);
+    }
 
     #[test]
     fn test_channel_throughput_metric_compiles() {
