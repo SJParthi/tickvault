@@ -4877,4 +4877,70 @@ mod tests {
             "ticks should remain when no sender"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // B2: Recovery flag + gap check tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_take_recovery_flag_initially_false() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert!(!writer.take_recovery_flag(), "should be false initially");
+    }
+
+    #[test]
+    fn test_take_recovery_flag_clears_after_read() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Manually set the flag (simulating drain_tick_buffer setting it).
+        writer.just_recovered = true;
+        assert!(writer.take_recovery_flag(), "should be true after recovery");
+        assert!(!writer.take_recovery_flag(), "should be false after take");
+    }
+
+    #[test]
+    fn test_drain_sets_recovery_flag() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Buffer a tick, then drain with sender present.
+        writer.buffer_tick(make_test_tick(1, 100.0));
+        assert!(!writer.just_recovered);
+
+        writer.drain_tick_buffer();
+        assert!(writer.just_recovered, "drain should set recovery flag");
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_after_recovery_handles_unreachable_questdb() {
+        // Point to a port where no HTTP server is running.
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: 1,
+            http_port: 1, // unreachable
+            pg_port: 1,
+        };
+        // Should not panic — logs a warning and returns gracefully.
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
 }
