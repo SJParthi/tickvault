@@ -157,11 +157,11 @@ services:
       - dlt-loki-data:/loki
       - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
     command: ["-config.file=/etc/loki/loki-config.yml"]
-    # Loki 3.6.6 minimal image: no wget/curl. Use the loki binary itself
-    # which is always available. --version confirms the binary is functional.
-    # For readiness, the dependent service condition uses service_started (not service_healthy).
+    # Loki 3.6.6 uses a distroless image (no wget/curl/shell).
+    # The `loki -health` subcommand (added in 3.6.x via grafana/loki#20590)
+    # hits /ready internally — a real readiness check, not just binary existence.
     healthcheck:
-      test: ["CMD", "/usr/bin/loki", "--version"]
+      test: ["CMD", "/usr/bin/loki", "-health"]
       interval: 15s
       timeout: 5s
       retries: 10

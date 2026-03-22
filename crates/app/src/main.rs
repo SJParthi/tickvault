@@ -70,6 +70,7 @@ use dhan_live_trader_storage::calendar_persistence;
 use dhan_live_trader_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
+use dhan_live_trader_storage::greeks_persistence::ensure_greeks_tables;
 use dhan_live_trader_storage::instrument_persistence::{
     ensure_instrument_tables, persist_instrument_snapshot,
 };
@@ -414,6 +415,7 @@ async fn main() -> Result<()> {
                     dhan_live_trader_storage::materialized_views::ensure_candle_views(
                         &config.questdb
                     ),
+                    ensure_greeks_tables(&config.questdb),
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
                 let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
@@ -759,7 +761,7 @@ async fn main() -> Result<()> {
     // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!(
-        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views)"
+        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views + greeks)"
     );
 
     // All table creation queries are independent — run in parallel for faster boot.
@@ -773,6 +775,7 @@ async fn main() -> Result<()> {
             &config.questdb
         ),
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
+        ensure_greeks_tables(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
