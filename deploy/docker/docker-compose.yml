@@ -157,10 +157,11 @@ services:
       - dlt-loki-data:/loki
       - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
     command: ["-config.file=/etc/loki/loki-config.yml"]
-    # Loki 3.6.6 Alpine image includes wget. Check the /ready endpoint
-    # to verify Loki is actually accepting log pushes, not just binary exists.
+    # Loki 3.6.6 minimal image: no wget/curl. Use the loki binary itself
+    # which is always available. --version confirms the binary is functional.
+    # For readiness, the dependent service condition uses service_started (not service_healthy).
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      test: ["CMD", "/usr/bin/loki", "--version"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -196,7 +197,7 @@ services:
     command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
     depends_on:
       dlt-loki:
-        condition: service_healthy
+        condition: service_started
     logging:
       driver: json-file
       options:
@@ -279,7 +280,7 @@ services:
       dlt-prometheus:
         condition: service_healthy
       dlt-loki:
-        condition: service_healthy
+        condition: service_started
     logging:
       driver: json-file
       options:
