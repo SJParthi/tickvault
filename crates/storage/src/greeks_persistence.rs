@@ -12,10 +12,8 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 
@@ -486,5 +484,131 @@ mod tests {
         assert_eq!(TABLE_OPTION_GREEKS, "option_greeks");
         assert_eq!(TABLE_PCR_SNAPSHOTS, "pcr_snapshots");
         assert_eq!(TABLE_GREEKS_VERIFICATION, "greeks_verification");
+    }
+
+    // --- Async HTTP tests for ensure_greeks_tables + execute_ddl ---
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_unreachable_no_panic() {
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Must not panic — best-effort DDL.
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_http_200() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises success path through all 4 DDL calls.
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_http_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises non-success warn path through all 4 DDL calls.
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_send_error() {
+        // Server that immediately drops connection → Err branch in execute_ddl.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream); // Force connection reset
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises Err(err) branch in execute_ddl.
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_success() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let base_url = format!("http://127.0.0.1:{}/exec", port);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        execute_ddl(&client, &base_url, "SELECT 1", "test_success").await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_non_success() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let base_url = format!("http://127.0.0.1:{}/exec", port);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        execute_ddl(&client, &base_url, "INVALID SQL", "test_non_success").await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_send_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let base_url = format!("http://127.0.0.1:{}/exec", port);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        execute_ddl(&client, &base_url, "SELECT 1", "test_send_error").await;
     }
 }
