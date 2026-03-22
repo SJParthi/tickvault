@@ -912,7 +912,7 @@ mod tests {
     fn test_feed_mode_clone_copy_eq() {
         let a = FeedMode::Ticker;
         let b = a; // Copy
-        let c = a.clone(); // Clone (same as Copy for Copy types)
+        let c = a; // Copy (FeedMode is Copy)
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert_ne!(FeedMode::Ticker, FeedMode::Quote);
