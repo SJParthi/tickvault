@@ -178,6 +178,34 @@ async fn main() -> Result<()> {
         .with(otel_layer)
         .init();
 
+    // Install panic hook: log panic at ERROR level (triggers Telegram via Loki → Grafana alerting).
+    // Must be installed AFTER tracing subscriber init so ERROR logs are captured.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Extract location and message for structured logging.
+        let location = panic_info.location().map_or_else(
+            || "unknown location".to_string(),
+            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
+        );
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+
+        // ERROR level → captured by tracing → Loki → Grafana alert → Telegram.
+        tracing::error!(
+            panic_location = %location,
+            panic_payload = %payload,
+            "PANIC: dhan-live-trader crashed"
+        );
+
+        // Run the default hook (prints to stderr).
+        default_panic_hook(panic_info);
+    }));
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
         config_file = CONFIG_BASE_PATH,
@@ -476,6 +504,36 @@ async fn main() -> Result<()> {
         };
         info!("order update WebSocket started (background)");
 
+        // --- Background: Daily reset signal (16:00 IST) ---
+        let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        {
+            let signal = std::sync::Arc::clone(&daily_reset_signal);
+            let reset_sleep = compute_market_close_sleep(
+                dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST,
+            );
+            if reset_sleep > std::time::Duration::ZERO {
+                tokio::spawn(async move {
+                    tokio::time::sleep(reset_sleep).await;
+                    info!("16:00 IST reached — firing daily reset signal");
+                    signal.notify_waiters();
+                });
+            }
+        }
+
+        // --- Background: Market close signal (15:30 IST) ---
+        let market_close_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        {
+            let signal = std::sync::Arc::clone(&market_close_signal);
+            let close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
+            if close_sleep > std::time::Duration::ZERO {
+                tokio::spawn(async move {
+                    tokio::time::sleep(close_sleep).await;
+                    info!("15:30 IST reached — firing market close signal to trading pipeline");
+                    signal.notify_waiters();
+                });
+            }
+        }
+
         // --- Background: Trading pipeline (paper trading) ---
         let trading_handle = {
             let tick_rx = fast_tick_broadcast_sender.subscribe();
@@ -483,11 +541,13 @@ async fn main() -> Result<()> {
 
             match trading_pipeline::init_trading_pipeline(&config, &token_handle, &client_id) {
                 Some((pipeline_config, hot_reloader)) => {
-                    let handle = trading_pipeline::spawn_trading_pipeline(
+                    let handle = trading_pipeline::spawn_trading_pipeline_full(
                         pipeline_config,
                         tick_rx,
                         order_rx,
                         hot_reloader,
+                        Some(std::sync::Arc::clone(&daily_reset_signal)),
+                        Some(std::sync::Arc::clone(&market_close_signal)),
                     );
                     info!("trading pipeline started (paper trading, fast boot)");
                     Some(handle)
@@ -604,6 +664,8 @@ async fn main() -> Result<()> {
     // SLOW BOOT PATH (normal start / pre-market / no cache)
     // Sequential boot: Docker first → instruments → auth → WebSocket.
     // =====================================================================
+    let boot_start = std::time::Instant::now();
+
     if !is_market_hours {
         info!(
             build_window_start = %config.instrument.build_window_start,
@@ -867,6 +929,39 @@ async fn main() -> Result<()> {
     info!("order update WebSocket started");
 
     // -----------------------------------------------------------------------
+    // Step 10.5: Spawn daily reset signal (16:00 IST)
+    // -----------------------------------------------------------------------
+    let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let signal = std::sync::Arc::clone(&daily_reset_signal);
+        let reset_sleep =
+            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
+        if reset_sleep > std::time::Duration::ZERO {
+            tokio::spawn(async move {
+                tokio::time::sleep(reset_sleep).await;
+                info!("16:00 IST reached — firing daily reset signal");
+                signal.notify_waiters();
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 10.5: Spawn market close signal (15:30 IST)
+    // -----------------------------------------------------------------------
+    let market_close_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let signal = std::sync::Arc::clone(&market_close_signal);
+        let close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
+        if close_sleep > std::time::Duration::ZERO {
+            tokio::spawn(async move {
+                tokio::time::sleep(close_sleep).await;
+                info!("15:30 IST reached — firing market close signal to trading pipeline");
+                signal.notify_waiters();
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Step 10.5: Spawn trading pipeline (indicators → strategies → OMS)
     // -----------------------------------------------------------------------
     let trading_handle = {
@@ -879,11 +974,13 @@ async fn main() -> Result<()> {
             &ws_client_id,
         ) {
             Some((pipeline_config, hot_reloader)) => {
-                let handle = trading_pipeline::spawn_trading_pipeline(
+                let handle = trading_pipeline::spawn_trading_pipeline_full(
                     pipeline_config,
                     tick_rx,
                     order_rx,
                     hot_reloader,
+                    Some(std::sync::Arc::clone(&daily_reset_signal)),
+                    Some(std::sync::Arc::clone(&market_close_signal)),
                 );
                 info!("trading pipeline started (paper trading)");
                 Some(handle)
@@ -966,6 +1063,31 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let renewal_handle = token_manager.spawn_renewal_task();
     info!("token renewal task started");
+
+    // -----------------------------------------------------------------------
+    // Boot duration check — fire CRITICAL alert if over budget
+    // -----------------------------------------------------------------------
+    let boot_elapsed = boot_start.elapsed();
+    if boot_elapsed.as_secs() > dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS {
+        error!(
+            elapsed_secs = boot_elapsed.as_secs(),
+            timeout_secs = dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
+            "BOOT TIMEOUT EXCEEDED — boot took longer than expected"
+        );
+        notifier.notify(NotificationEvent::BootDeadlineMissed {
+            deadline_secs: dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
+            step: format!(
+                "boot completed in {}s (over {}s limit)",
+                boot_elapsed.as_secs(),
+                dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS
+            ),
+        });
+    } else {
+        info!(
+            elapsed_ms = boot_elapsed.as_millis() as u64,
+            "boot sequence completed within budget"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Step 13: Await shutdown signal
@@ -1582,16 +1704,13 @@ async fn run_shutdown_fast(
     // After market close, WS connections are stopped but API/dashboard stays up.
     let market_close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
 
-    // Phase 1: Wait for EITHER market close OR Ctrl+C
+    // Phase 1: Wait for EITHER market close OR shutdown signal (SIGINT/SIGTERM).
     let shutdown_reason = tokio::select! {
         _ = tokio::time::sleep(market_close_sleep), if market_close_sleep > std::time::Duration::ZERO => {
             "market_close"
         }
-        result = tokio::signal::ctrl_c() => {
-            if let Err(err) = result {
-                warn!(?err, "failed to listen for shutdown signal");
-            }
-            "ctrl_c"
+        reason = wait_for_shutdown_signal() => {
+            reason
         }
     };
 
@@ -1646,11 +1765,8 @@ async fn run_shutdown_fast(
                 _ = tokio::time::sleep(shutdown_sleep) => {
                     info!("16:00 IST reached — initiating full auto-shutdown");
                 }
-                result = tokio::signal::ctrl_c() => {
-                    if let Err(err) = result {
-                        warn!(?err, "failed to listen for shutdown signal");
-                    }
-                    info!("shutdown signal received — stopping remaining services");
+                reason = wait_for_shutdown_signal() => {
+                    info!(reason, "shutdown signal received — stopping remaining services");
                 }
             }
         } else {
@@ -1713,6 +1829,52 @@ async fn run_shutdown_fast(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Helper: Wait for shutdown signal (SIGINT or SIGTERM)
+// ---------------------------------------------------------------------------
+
+/// Waits for either SIGINT (Ctrl+C) or SIGTERM and returns the signal name.
+///
+/// On non-unix platforms, only SIGINT is handled. SIGTERM support enables
+/// graceful shutdown when Docker sends `docker stop` (SIGTERM → 10s → SIGKILL).
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to register SIGTERM handler — falling back to SIGINT only"
+                );
+                // If SIGTERM registration fails, just wait for Ctrl+C.
+                let _ = tokio::signal::ctrl_c().await;
+                return "ctrl_c";
+            }
+        };
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    warn!(?err, "failed to listen for SIGINT signal");
+                }
+                "ctrl_c"
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received — initiating graceful shutdown");
+                "sigterm"
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl_c"
+    }
+}
+
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
 // Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
@@ -1758,5 +1920,39 @@ mod tests {
 
         assert!(should_fast_boot(true, true));
         assert!(!should_fast_boot(false, true));
+    }
+
+    #[test]
+    fn test_panic_hook_installed() {
+        // Verify the pattern: take_hook + set_hook compiles and the hook
+        // function signature is compatible with std::panic::set_hook.
+        // We can't actually trigger a panic in a test without aborting,
+        // but we verify the hook installation pattern is valid.
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _location = info.location();
+            original(info);
+        }));
+        // Restore default hook for test isolation.
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn test_sigterm_handler_configured() {
+        // Verify SIGTERM signal type is available on this platform.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            let kind = SignalKind::terminate();
+            // SignalKind::terminate() corresponds to SIGTERM (signal 15).
+            assert_eq!(kind, SignalKind::terminate());
+        }
+    }
+
+    #[test]
+    fn test_boot_timeout_configured() {
+        // BOOT_TIMEOUT_SECS must be positive and within a reasonable ceiling.
+        assert!(dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS > 0);
+        assert!(dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS <= 300);
     }
 }

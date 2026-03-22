@@ -425,6 +425,11 @@ pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// Maximum reconnect delay for order update WebSocket (milliseconds).
 pub const ORDER_UPDATE_RECONNECT_MAX_DELAY_MS: u64 = 60000;
 
+/// Timeout for the order update WebSocket auth response (seconds).
+/// After sending the LoginReq (MsgCode 42), the server should respond
+/// within this window. 10 seconds is generous for a JSON auth handshake.
+pub const ORDER_UPDATE_AUTH_TIMEOUT_SECS: u64 = 10;
+
 // ---------------------------------------------------------------------------
 // SEBI Compliance
 // ---------------------------------------------------------------------------
@@ -1250,6 +1255,11 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 /// Prevents indefinite hang if Dhan API is unreachable on boot.
 pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 300;
 
+/// Maximum acceptable boot time in seconds. If exceeded, a CRITICAL Telegram
+/// alert is sent via `BootDeadlineMissed`. Individual steps have their own
+/// timeouts; this guards the aggregate slow boot path.
+pub const BOOT_TIMEOUT_SECS: u64 = 120;
+
 /// Maximum consecutive renewal circuit-breaker cycles before the renewal loop
 /// halts and raises a critical alert. Prevents infinite retry with expired token.
 pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
@@ -1811,6 +1821,12 @@ mod tests {
     #[test]
     fn test_order_update_login_msg_code_is_42() {
         assert_eq!(ORDER_UPDATE_LOGIN_MSG_CODE, 42);
+    }
+
+    #[test]
+    fn test_order_update_auth_timeout_is_reasonable() {
+        const { assert!(ORDER_UPDATE_AUTH_TIMEOUT_SECS >= 5) };
+        const { assert!(ORDER_UPDATE_AUTH_TIMEOUT_SECS <= 30) };
     }
 
     #[test]

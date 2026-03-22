@@ -26,9 +26,9 @@ use tracing::{debug, error, info, warn};
 use chrono::{NaiveTime, Utc};
 
 use dhan_live_trader_common::constants::{
-    ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS,
-    ORDER_UPDATE_READ_TIMEOUT_SECS, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS,
-    ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
+    ORDER_UPDATE_AUTH_TIMEOUT_SECS, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS,
+    ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS, ORDER_UPDATE_READ_TIMEOUT_SECS,
+    ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
 };
 use dhan_live_trader_common::order_types::OrderUpdate;
 use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
@@ -172,6 +172,43 @@ async fn connect_and_listen(
 
     debug!("order update WebSocket login sent");
 
+    // Wait for the server's auth response before entering the main read loop.
+    let auth_timeout = Duration::from_secs(ORDER_UPDATE_AUTH_TIMEOUT_SECS);
+    match time::timeout(auth_timeout, read.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => match classify_auth_response(&text) {
+            AuthResponseKind::Success => {
+                info!("order update WebSocket auth succeeded");
+            }
+            AuthResponseKind::Failed(reason) => {
+                error!(reason = %reason, "order update WebSocket auth failed");
+                return Err(OrderUpdateConnectionError::AuthFailed(reason));
+            }
+        },
+        Ok(Some(Ok(Message::Close(frame)))) => {
+            warn!(?frame, "order update WebSocket closed during auth");
+            return Err(OrderUpdateConnectionError::AuthFailed(
+                "server closed connection during auth handshake".to_string(), // O(1) EXEMPT: cold error path
+            ));
+        }
+        Ok(Some(Err(err))) => {
+            return Err(OrderUpdateConnectionError::Read(err.to_string())); // O(1) EXEMPT: cold error path
+        }
+        Ok(None) => {
+            return Err(OrderUpdateConnectionError::AuthFailed(
+                "stream ended before auth response".to_string(), // O(1) EXEMPT: cold error path
+            ));
+        }
+        Err(_) => {
+            return Err(OrderUpdateConnectionError::AuthTimeout);
+        }
+        // Ping/Pong/Binary — skip and treat as no auth response.
+        Ok(Some(Ok(_))) => {
+            warn!(
+                "order update WebSocket received non-text message during auth — treating as success"
+            );
+        }
+    }
+
     // Use longer timeout outside market hours to avoid reconnect noise.
     let timeout_secs = select_read_timeout_secs(is_within_market_hours(calendar));
     let read_timeout = Duration::from_secs(timeout_secs);
@@ -295,6 +332,102 @@ fn select_read_timeout_secs(within_market_hours: bool) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auth response classification
+// ---------------------------------------------------------------------------
+
+/// Result of classifying the server's auth response.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthResponseKind {
+    /// Auth handshake succeeded (no error indicators found).
+    Success,
+    /// Auth handshake failed with the given reason.
+    Failed(String),
+}
+
+/// Classifies the server's first text response after sending the LoginReq.
+///
+/// The Dhan order update WebSocket sends JSON responses. An auth failure
+/// typically contains `"error"` or `"errorCode"` fields. If none are found,
+/// the response is treated as a success (could be an ack or the first order update).
+///
+/// Pure function — no I/O, no allocation on success path when response is valid.
+fn classify_auth_response(response_text: &str) -> AuthResponseKind {
+    // Try to parse as JSON to inspect for error fields.
+    match serde_json::from_str::<serde_json::Value>(response_text) {
+        Ok(value) => classify_auth_json(&value),
+        Err(_) => {
+            // Non-JSON text response — check for error keywords.
+            let lower = response_text.to_lowercase(); // O(1) EXEMPT: cold auth path, runs once per connect
+            if lower.contains("error") || lower.contains("unauthorized") || lower.contains("denied")
+            {
+                AuthResponseKind::Failed(
+                    truncate_for_log(response_text, 200).to_string(), // O(1) EXEMPT: cold error path
+                )
+            } else {
+                // Non-JSON, non-error text — treat as success.
+                AuthResponseKind::Success
+            }
+        }
+    }
+}
+
+/// Classifies a parsed JSON auth response.
+///
+/// Checks for common Dhan error patterns:
+/// - Top-level `errorCode` or `errorType` fields (Dhan REST error format)
+/// - Nested `error` field
+/// - `status` field containing failure indicators
+///
+/// Pure function — no I/O.
+fn classify_auth_json(value: &serde_json::Value) -> AuthResponseKind {
+    // Check for Dhan REST-style error response: {"errorType": "...", "errorCode": "...", "errorMessage": "..."}
+    if let Some(error_code) = value.get("errorCode").and_then(|v| v.as_str()) {
+        let error_msg = value
+            .get("errorMessage")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"); // O(1) EXEMPT: cold error path
+        return AuthResponseKind::Failed(format!("{error_code}: {error_msg}")); // O(1) EXEMPT: cold error path
+    }
+
+    // Check for a generic "error" field.
+    if let Some(error_val) = value.get("error") {
+        let reason = if let Some(s) = error_val.as_str() {
+            s.to_string() // O(1) EXEMPT: cold error path
+        } else {
+            error_val.to_string() // O(1) EXEMPT: cold error path
+        };
+        return AuthResponseKind::Failed(reason);
+    }
+
+    // Check for status field with failure indication.
+    if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+        let lower = status.to_lowercase(); // O(1) EXEMPT: cold auth path
+        if lower.contains("error") || lower.contains("fail") || lower.contains("denied") {
+            return AuthResponseKind::Failed(format!("status: {status}")); // O(1) EXEMPT: cold error path
+        }
+    }
+
+    // No error indicators found — treat as success.
+    AuthResponseKind::Success
+}
+
+/// Truncates a string for safe logging (avoids unbounded log messages).
+///
+/// Pure function — returns a slice, no allocation.
+fn truncate_for_log(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        // Find a valid UTF-8 boundary at or before max_len.
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+}
+
 /// Result of processing a connection attempt error in the reconnect loop.
 #[derive(Debug, PartialEq, Eq)]
 enum ReconnectAction {
@@ -345,6 +478,12 @@ enum OrderUpdateConnectionError {
     #[error("failed to send login message: {0}")]
     Send(String),
 
+    #[error("auth response indicates failure: {0}")]
+    AuthFailed(String),
+
+    #[error("no auth response within {ORDER_UPDATE_AUTH_TIMEOUT_SECS}s")]
+    AuthTimeout,
+
     #[error("read error: {0}")]
     Read(String),
 
@@ -376,6 +515,13 @@ mod tests {
 
         let err = OrderUpdateConnectionError::Send("broken pipe".to_string());
         assert!(err.to_string().contains("login message"));
+
+        let err = OrderUpdateConnectionError::AuthFailed("bad token".to_string());
+        assert!(err.to_string().contains("auth response indicates failure"));
+        assert!(err.to_string().contains("bad token"));
+
+        let err = OrderUpdateConnectionError::AuthTimeout;
+        assert!(err.to_string().contains("no auth response"));
 
         let err = OrderUpdateConnectionError::Read("reset".to_string());
         assert!(err.to_string().contains("read error"));
@@ -451,6 +597,8 @@ mod tests {
             OrderUpdateConnectionError::Tls("x".to_string()).to_string(),
             OrderUpdateConnectionError::Connect("x".to_string()).to_string(),
             OrderUpdateConnectionError::Send("x".to_string()).to_string(),
+            OrderUpdateConnectionError::AuthFailed("x".to_string()).to_string(),
+            OrderUpdateConnectionError::AuthTimeout.to_string(),
             OrderUpdateConnectionError::Read("x".to_string()).to_string(),
             OrderUpdateConnectionError::ReadTimeout.to_string(),
         ];
@@ -837,5 +985,288 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_auth_response — auth validation (H3)
+    // -----------------------------------------------------------------------
+
+    /// Tests auth validation logic for the order update WebSocket.
+    ///
+    /// After sending LoginReq (MsgCode 42), the server responds with JSON.
+    /// `classify_auth_response` classifies the response as success or failure.
+    #[test]
+    fn test_order_update_ws_auth_validation() {
+        // Dhan REST-style error response — auth failure with errorCode.
+        let dhan_error = r#"{"errorType":"AUTHENTICATION_ERROR","errorCode":"DH-901","errorMessage":"Invalid access token"}"#;
+        let result = classify_auth_response(dhan_error);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("DH-901: Invalid access token".to_string())
+        );
+
+        // Valid order update message — should be treated as success (auth passed).
+        let order_update = r#"{"Data":{"OrderNo":"123","Status":"TRADED"},"Type":"order_alert"}"#;
+        let result = classify_auth_response(order_update);
+        assert_eq!(result, AuthResponseKind::Success);
+
+        // Empty JSON object — no error fields, treat as success (ack).
+        let empty_json = "{}";
+        let result = classify_auth_response(empty_json);
+        assert_eq!(result, AuthResponseKind::Success);
+
+        // Non-JSON error text from server.
+        let text_error = "Unauthorized: invalid token";
+        let result = classify_auth_response(text_error);
+        assert!(matches!(result, AuthResponseKind::Failed(_)));
+
+        // Non-JSON non-error text — treat as success.
+        let text_ok = "connected";
+        let result = classify_auth_response(text_ok);
+        assert_eq!(result, AuthResponseKind::Success);
+    }
+
+    #[test]
+    fn test_classify_auth_response_dhan_error_code() {
+        // Dhan REST error format: {"errorType": "...", "errorCode": "...", "errorMessage": "..."}
+        let json = r#"{"errorType":"DATA_API_ERROR","errorCode":"DH-904","errorMessage":"Rate limit exceeded"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("DH-904: Rate limit exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_response_error_code_without_message() {
+        let json = r#"{"errorCode":"DH-901"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("DH-901: unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_response_generic_error_field_string() {
+        let json = r#"{"error":"authentication failed"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("authentication failed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_response_generic_error_field_object() {
+        let json = r#"{"error":{"code":401,"message":"unauthorized"}}"#;
+        let result = classify_auth_response(json);
+        match result {
+            AuthResponseKind::Failed(reason) => {
+                assert!(reason.contains("401"));
+                assert!(reason.contains("unauthorized"));
+            }
+            AuthResponseKind::Success => panic!("expected failure"),
+        }
+    }
+
+    #[test]
+    fn test_classify_auth_response_status_field_failure() {
+        let json = r#"{"status":"error","message":"token expired"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("status: error".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_response_status_field_failed() {
+        let json = r#"{"status":"failed"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("status: failed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_response_status_field_denied() {
+        let json = r#"{"status":"access denied"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("status: access denied".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_response_status_field_success() {
+        // Status that does NOT indicate failure should be treated as success.
+        let json = r#"{"status":"ok"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(result, AuthResponseKind::Success);
+    }
+
+    #[test]
+    fn test_classify_auth_response_non_json_error_keywords() {
+        let inputs_and_expected = [
+            ("Error: connection refused", true),
+            ("unauthorized access", true),
+            ("access denied by server", true),
+            ("welcome to the server", false),
+            ("pong", false),
+            ("", false),
+        ];
+
+        for (input, should_fail) in inputs_and_expected {
+            let result = classify_auth_response(input);
+            if should_fail {
+                assert!(
+                    matches!(result, AuthResponseKind::Failed(_)),
+                    "expected failure for: {input}"
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    AuthResponseKind::Success,
+                    "expected success for: {input}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_auth_response_valid_order_update_is_success() {
+        // If the first message after login is already an order update, auth succeeded.
+        let json = r#"{
+            "Data": {
+                "OrderNo": "999",
+                "Status": "PENDING",
+                "Symbol": "NIFTY"
+            },
+            "Type": "order_alert"
+        }"#;
+        let result = classify_auth_response(json);
+        assert_eq!(result, AuthResponseKind::Success);
+    }
+
+    #[test]
+    fn test_classify_auth_response_error_code_takes_precedence_over_status() {
+        // errorCode should be detected before status field.
+        let json = r#"{"errorCode":"DH-901","errorMessage":"bad token","status":"ok"}"#;
+        let result = classify_auth_response(json);
+        assert_eq!(
+            result,
+            AuthResponseKind::Failed("DH-901: bad token".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // truncate_for_log — pure function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_for_log_short_string() {
+        let s = "hello";
+        assert_eq!(truncate_for_log(s, 200), "hello");
+    }
+
+    #[test]
+    fn test_truncate_for_log_exact_length() {
+        let s = "abcde";
+        assert_eq!(truncate_for_log(s, 5), "abcde");
+    }
+
+    #[test]
+    fn test_truncate_for_log_long_string() {
+        let s = "a".repeat(300);
+        let truncated = truncate_for_log(&s, 200);
+        assert_eq!(truncated.len(), 200);
+    }
+
+    #[test]
+    fn test_truncate_for_log_empty_string() {
+        assert_eq!(truncate_for_log("", 200), "");
+    }
+
+    #[test]
+    fn test_truncate_for_log_multibyte_boundary() {
+        // Multi-byte character that would be split at max_len.
+        let s = "abc\u{00E9}def"; // 'e' with accent = 2 bytes in UTF-8
+        // "abc" = 3 bytes, "\u{00E9}" = 2 bytes (bytes 3-4), "def" = 3 bytes
+        // Truncate at 4 would split the multi-byte char — should back up to 3.
+        let truncated = truncate_for_log(s, 4);
+        assert!(truncated.len() <= 4);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthResponseKind — derive coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auth_response_kind_debug() {
+        let success = AuthResponseKind::Success;
+        assert!(format!("{success:?}").contains("Success"));
+
+        let failed = AuthResponseKind::Failed("reason".to_string());
+        assert!(format!("{failed:?}").contains("Failed"));
+        assert!(format!("{failed:?}").contains("reason"));
+    }
+
+    #[test]
+    fn test_auth_response_kind_eq() {
+        assert_eq!(AuthResponseKind::Success, AuthResponseKind::Success);
+        assert_eq!(
+            AuthResponseKind::Failed("a".to_string()),
+            AuthResponseKind::Failed("a".to_string())
+        );
+        assert_ne!(
+            AuthResponseKind::Success,
+            AuthResponseKind::Failed("a".to_string())
+        );
+        assert_ne!(
+            AuthResponseKind::Failed("a".to_string()),
+            AuthResponseKind::Failed("b".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthFailed / AuthTimeout error variants — display coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auth_failed_error_display() {
+        let err = OrderUpdateConnectionError::AuthFailed("DH-901: bad token".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("auth response indicates failure"));
+        assert!(msg.contains("DH-901: bad token"));
+    }
+
+    #[test]
+    fn test_auth_timeout_error_display() {
+        let err = OrderUpdateConnectionError::AuthTimeout;
+        let msg = err.to_string();
+        assert!(msg.contains("no auth response"));
+        assert!(
+            msg.contains(&ORDER_UPDATE_AUTH_TIMEOUT_SECS.to_string()),
+            "AuthTimeout message should contain the timeout value"
+        );
+    }
+
+    #[test]
+    fn test_auth_failed_debug_formatting() {
+        let err = OrderUpdateConnectionError::AuthFailed("test reason".to_string());
+        let debug = format!("{err:?}");
+        assert!(debug.contains("AuthFailed"));
+        assert!(debug.contains("test reason"));
+    }
+
+    #[test]
+    fn test_auth_timeout_debug_formatting() {
+        let err = OrderUpdateConnectionError::AuthTimeout;
+        let debug = format!("{err:?}");
+        assert!(debug.contains("AuthTimeout"));
     }
 }

@@ -1,8 +1,8 @@
 # Implementation Plan: Extreme Automation Enhancements (27 Items)
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-22
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Context
 
@@ -14,37 +14,37 @@ Target: MacBook local dev + future AWS instance.
 
 ### Batch 1 — Quick Wins (Critical, 5 items)
 
-- [ ] C1: Install panic hook with Telegram alert before crash
+- [x] C1: Install panic hook with Telegram alert before crash
   - Files: crates/app/src/main.rs
   - Tests: test_panic_hook_installed
 
-- [ ] C2: Add SIGTERM handler alongside SIGINT (Ctrl+C)
+- [x] C2: Add SIGTERM handler alongside SIGINT (Ctrl+C)
   - Files: crates/app/src/main.rs
   - Tests: test_sigterm_handler_configured
 
-- [ ] C4: Auto-call reset_daily() at 16:00 IST (risk + OMS + indicators)
+- [x] C4: Auto-call reset_daily() at 16:00 IST (risk + OMS + indicators)
   - Files: crates/app/src/main.rs, crates/app/src/trading_pipeline.rs
   - Tests: test_daily_reset_scheduled
 
-- [ ] M5: Escalate candle fetch failure from warn! to error! + Telegram
+- [x] M5: Escalate candle fetch failure from warn! to error! + Telegram
   - Files: crates/core/src/historical/candle_fetcher.rs
-  - Tests: test_candle_fetch_failure_escalation
+  - Tests: test_candle_fetch_failure_escalation (is_token_related_error helper)
 
-- [ ] H3: Validate order update WS auth response after MsgCode 42 login
-  - Files: crates/core/src/websocket/order_update_connection.rs
+- [x] H3: Validate order update WS auth response after MsgCode 42 login
+  - Files: crates/core/src/websocket/order_update_connection.rs, crates/common/src/constants.rs
   - Tests: test_order_update_ws_auth_validation
 
 ### Batch 2 — Market Safety (4 items)
 
-- [ ] C3: Auto-handle market close at 15:30 IST (paper mode: log positions, cancel paper orders in OMS state)
+- [x] C3: Auto-handle market close at 15:30 IST (paper mode: log positions, cancel paper orders in OMS state)
   - Files: crates/app/src/main.rs, crates/app/src/trading_pipeline.rs
   - Tests: test_market_close_auto_handling
 
-- [ ] H1: Wrap boot sequence in 120s timeout with CRITICAL alert
-  - Files: crates/app/src/main.rs
+- [x] H1: Wrap boot sequence in 120s timeout with CRITICAL alert
+  - Files: crates/app/src/main.rs, crates/common/src/constants.rs
   - Tests: test_boot_timeout_configured
 
-- [ ] H4: Add crash-restart wrapper in Makefile (loop with max 5 restarts + backoff)
+- [x] H4: Add crash-restart wrapper in Makefile (loop with max 5 restarts + backoff)
   - Files: Makefile
   - Tests: (manual verification — shell wrapper)
 

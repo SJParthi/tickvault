@@ -5,7 +5,7 @@
 # Run `make help` to see all available targets.
 # =============================================================================
 
-.PHONY: help run stop build test check fmt clippy clean \
+.PHONY: help run run-supervised stop build test check fmt clippy clean \
         docker-up docker-down docker-restart docker-status docker-logs \
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
@@ -56,6 +56,28 @@ stop: ## Stop running app
 restart: stop ## Restart app (stop + run)
 	@sleep 1
 	@$(MAKE) run
+
+run-supervised: docker-up ## Run with crash supervision (max 5 restarts, exponential backoff)
+	@echo "Starting $(APP_NAME) with crash supervision (max 5 restarts)..."
+	@attempt=0; \
+	max_restarts=5; \
+	while [ $$attempt -lt $$max_restarts ]; do \
+		attempt=$$((attempt + 1)); \
+		echo "[supervisor] Attempt $$attempt/$$max_restarts"; \
+		cargo run --release 2>&1; \
+		exit_code=$$?; \
+		if [ $$exit_code -eq 0 ]; then \
+			echo "[supervisor] Clean exit (code 0) — not restarting"; \
+			break; \
+		fi; \
+		if [ $$attempt -lt $$max_restarts ]; then \
+			backoff=$$((2 ** attempt)); \
+			echo "[supervisor] Crashed (exit code $$exit_code) — restarting in $${backoff}s..."; \
+			sleep $$backoff; \
+		else \
+			echo "[supervisor] Max restarts reached — giving up"; \
+		fi; \
+	done
 
 build: ## Build release binary
 	@echo "🔨 Building release..."

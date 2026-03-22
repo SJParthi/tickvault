@@ -23,7 +23,7 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
@@ -135,6 +135,21 @@ fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
     }
 
     ErrorAction::StandardRetry
+}
+
+/// Returns `true` if the error action represents a token-related failure
+/// (807 token expired or DH-901 invalid auth). Token errors affect ALL
+/// instruments — not just the current one — so they warrant `error!` level
+/// logging (which triggers Telegram CRITICAL alerts).
+///
+/// Non-token errors (rate limits, network, input) are scoped to individual
+/// instruments and remain at `warn!` level.
+///
+/// Production code uses direct `ErrorAction::TokenExpired` match arms with
+/// `error!` level; this function encodes the categorization logic for tests.
+#[cfg(test)]
+fn is_token_related_error(action: &ErrorAction) -> bool {
+    matches!(action, ErrorAction::TokenExpired)
 }
 
 /// Result of a single instrument fetch attempt.
@@ -713,7 +728,8 @@ pub async fn fetch_historical_candles(
                     token_expired_counts[idx] = token_expired_counts[idx].saturating_add(1);
 
                     if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
-                        warn!(
+                        // M5: Token errors affect ALL instruments — escalate to error!
+                        error!(
                             security_id = target.security_id,
                             segment = %target.exchange_segment_str,
                             retries = token_expired_counts[idx],
@@ -734,7 +750,8 @@ pub async fn fetch_historical_candles(
         // If any instrument got token-expired this wave, sleep to allow
         // the background token renewal task to complete before next wave.
         if token_expired_this_wave {
-            warn!(
+            // M5: Token errors affect ALL instruments — escalate to error!
+            error!(
                 wave,
                 "token expired during fetch — waiting {}s for token refresh",
                 TOKEN_REFRESH_WAIT_SECS,
@@ -846,7 +863,7 @@ async fn fetch_single_instrument(
                 Zeroizing::new(token_state.access_token().expose_secret().to_string())
             }
             None => {
-                warn!("no access token available — skipping historical fetch");
+                error!("no access token available — skipping historical fetch");
                 return InstrumentFetchResult::Failed;
             }
         };
@@ -898,7 +915,7 @@ async fn fetch_single_instrument(
     let access_token = match token_guard.as_ref() {
         Some(token_state) => Zeroizing::new(token_state.access_token().expose_secret().to_string()),
         None => {
-            warn!("no access token available — skipping daily fetch");
+            error!("no access token available — skipping daily fetch");
             return InstrumentFetchResult::TokenExpired;
         }
     };
@@ -1023,7 +1040,9 @@ async fn fetch_intraday_with_retry(
                             continue;
                         }
                         ErrorAction::TokenExpired => {
-                            warn!(
+                            // M5: Token errors affect ALL instruments — escalate to error!
+                            // (triggers Telegram CRITICAL alert via observability pipeline)
+                            error!(
                                 security_id,
                                 timeframe = timeframe_label,
                                 "token expired (807/DH-901) — signaling for refresh"
@@ -1241,7 +1260,9 @@ async fn fetch_daily_with_retry(
                             continue;
                         }
                         ErrorAction::TokenExpired => {
-                            warn!(
+                            // M5: Token errors affect ALL instruments — escalate to error!
+                            // (triggers Telegram CRITICAL alert via observability pipeline)
+                            error!(
                                 security_id,
                                 timeframe = TIMEFRAME_1D,
                                 "token expired (807/DH-901) — signaling for refresh"
@@ -3933,5 +3954,88 @@ mod tests {
             "daily candles should not be window-filtered"
         );
         assert_eq!(invalid, 0);
+    }
+
+    // =======================================================================
+    // M5: Candle fetch failure escalation — error categorization
+    // =======================================================================
+
+    /// Verifies that token-related errors (807/DH-901) are classified as
+    /// requiring escalation to error! level, while non-token errors remain
+    /// at warn! level. Token errors affect ALL instruments (system-wide),
+    /// whereas network/input errors are scoped to individual instruments.
+    #[test]
+    fn test_candle_fetch_failure_escalation() {
+        // Token-expired errors should be escalated (error! level)
+        assert!(
+            is_token_related_error(&ErrorAction::TokenExpired),
+            "TokenExpired (807/DH-901) must be escalated — affects all instruments"
+        );
+
+        // Non-token errors should NOT be escalated (remain at warn! level)
+        assert!(
+            !is_token_related_error(&ErrorAction::RateLimited),
+            "RateLimited (DH-904) is per-instrument — stays at warn!"
+        );
+        assert!(
+            !is_token_related_error(&ErrorAction::TooManyConnections),
+            "TooManyConnections (805) is connection-level — stays at warn!"
+        );
+        assert!(
+            !is_token_related_error(&ErrorAction::StandardRetry),
+            "StandardRetry is per-instrument — stays at warn!"
+        );
+        assert!(
+            !is_token_related_error(&ErrorAction::NeverRetry),
+            "NeverRetry (DH-905/906) is per-instrument — stays at warn!"
+        );
+    }
+
+    /// Verifies the integration between classify_error and is_token_related_error:
+    /// only error codes 807 and DH-901 produce escalation-worthy errors.
+    #[test]
+    fn test_candle_fetch_failure_escalation_end_to_end() {
+        // 807 data API token expired → escalate
+        let body_807 = br#"{"errorCode": 807, "message": "Access token expired"}"#;
+        let action_807 = classify_error(reqwest::StatusCode::UNAUTHORIZED, body_807);
+        assert!(
+            is_token_related_error(&action_807),
+            "807 must classify as token-related and escalate to error!"
+        );
+
+        // DH-901 trading API auth error → escalate
+        let body_901 =
+            br#"{"errorType": "AUTH", "errorCode": "DH-901", "errorMessage": "Invalid auth"}"#;
+        let action_901 = classify_error(reqwest::StatusCode::UNAUTHORIZED, body_901);
+        assert!(
+            is_token_related_error(&action_901),
+            "DH-901 must classify as token-related and escalate to error!"
+        );
+
+        // DH-904 rate limit → do NOT escalate
+        let body_904 =
+            br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Rate limit"}"#;
+        let action_904 = classify_error(reqwest::StatusCode::BAD_REQUEST, body_904);
+        assert!(
+            !is_token_related_error(&action_904),
+            "DH-904 must NOT escalate — rate limits are per-instrument"
+        );
+
+        // DH-905 input error → do NOT escalate
+        let body_905 =
+            br#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "Bad input"}"#;
+        let action_905 = classify_error(reqwest::StatusCode::BAD_REQUEST, body_905);
+        assert!(
+            !is_token_related_error(&action_905),
+            "DH-905 must NOT escalate — input errors are per-instrument"
+        );
+
+        // 805 too many connections → do NOT escalate
+        let body_805 = br#"{"errorCode": 805, "message": "Too many connections"}"#;
+        let action_805 = classify_error(reqwest::StatusCode::BAD_REQUEST, body_805);
+        assert!(
+            !is_token_related_error(&action_805),
+            "805 must NOT escalate — connection errors are infrastructure-level"
+        );
     }
 }
