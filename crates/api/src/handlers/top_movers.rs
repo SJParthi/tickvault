@@ -369,4 +369,187 @@ mod tests {
         assert!(json.contains("\"change_pct\""));
         assert!(json.contains("\"volume\":999999"));
     }
+
+    // -------------------------------------------------------------------
+    // From<&TopMoversSnapshot>: all fields preserved
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn from_snapshot_conversion_preserves_all_fields() {
+        let gainer = MoverEntry {
+            security_id: 10,
+            exchange_segment_code: 1,
+            last_traded_price: 250.5_f32,
+            change_pct: 12.3_f32,
+            volume: 100_000,
+        };
+        let loser = MoverEntry {
+            security_id: 20,
+            exchange_segment_code: 2,
+            last_traded_price: 80.0_f32,
+            change_pct: -7.5_f32,
+            volume: 50_000,
+        };
+        let active = MoverEntry {
+            security_id: 30,
+            exchange_segment_code: 1,
+            last_traded_price: 500.0_f32,
+            change_pct: 0.1_f32,
+            volume: 1_000_000,
+        };
+
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![gainer],
+            losers: vec![loser],
+            most_active: vec![active],
+            total_tracked: 999,
+        };
+
+        let resp = TopMoversResponse::from(&snapshot);
+        assert!(resp.available);
+        assert_eq!(resp.total_tracked, 999);
+
+        // Gainers
+        assert_eq!(resp.gainers.len(), 1);
+        assert_eq!(resp.gainers[0].security_id, 10);
+        assert_eq!(resp.gainers[0].exchange_segment_code, 1);
+        assert!((resp.gainers[0].last_traded_price - 250.5_f32).abs() < f32::EPSILON);
+        assert!((resp.gainers[0].change_pct - 12.3_f32).abs() < f32::EPSILON);
+        assert_eq!(resp.gainers[0].volume, 100_000);
+
+        // Losers
+        assert_eq!(resp.losers.len(), 1);
+        assert_eq!(resp.losers[0].security_id, 20);
+        assert!((resp.losers[0].change_pct - (-7.5_f32)).abs() < f32::EPSILON);
+
+        // Most active
+        assert_eq!(resp.most_active.len(), 1);
+        assert_eq!(resp.most_active[0].security_id, 30);
+        assert_eq!(resp.most_active[0].volume, 1_000_000);
+    }
+
+    #[test]
+    fn from_snapshot_conversion_empty_lists() {
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: 0,
+        };
+
+        let resp = TopMoversResponse::from(&snapshot);
+        assert!(resp.available); // available is always true when converted from a snapshot
+        assert!(resp.gainers.is_empty());
+        assert!(resp.losers.is_empty());
+        assert!(resp.most_active.is_empty());
+        assert_eq!(resp.total_tracked, 0);
+    }
+
+    #[test]
+    fn from_snapshot_conversion_multiple_entries() {
+        let entries: Vec<MoverEntry> = (0..5)
+            .map(|i| MoverEntry {
+                security_id: i as u32,
+                exchange_segment_code: 1,
+                last_traded_price: 100.0_f32 + i as f32,
+                change_pct: i as f32,
+                volume: (i as u32) * 1000,
+            })
+            .collect();
+
+        let snapshot = TopMoversSnapshot {
+            gainers: entries.clone(),
+            losers: entries[..2].to_vec(),
+            most_active: entries[..3].to_vec(),
+            total_tracked: 500,
+        };
+
+        let resp = TopMoversResponse::from(&snapshot);
+        assert_eq!(resp.gainers.len(), 5);
+        assert_eq!(resp.losers.len(), 2);
+        assert_eq!(resp.most_active.len(), 3);
+        assert_eq!(resp.total_tracked, 500);
+    }
+
+    // -------------------------------------------------------------------
+    // From conversion: available is always true regardless of content
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn from_snapshot_always_sets_available_true() {
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: 0,
+        };
+        let resp = TopMoversResponse::from(&snapshot);
+        assert!(resp.available);
+    }
+
+    // -------------------------------------------------------------------
+    // From conversion: negative change_pct preserved
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn from_snapshot_preserves_negative_change_pct() {
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![],
+            losers: vec![MoverEntry {
+                security_id: 99,
+                exchange_segment_code: 1,
+                last_traded_price: 45.0_f32,
+                change_pct: -15.75_f32,
+                volume: 200,
+            }],
+            most_active: vec![],
+            total_tracked: 1,
+        };
+        let resp = TopMoversResponse::from(&snapshot);
+        assert_eq!(resp.losers.len(), 1);
+        assert!((resp.losers[0].change_pct - (-15.75_f32)).abs() < f32::EPSILON);
+    }
+
+    // -------------------------------------------------------------------
+    // From conversion: large total_tracked preserved
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn from_snapshot_preserves_large_total_tracked() {
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: usize::MAX,
+        };
+        let resp = TopMoversResponse::from(&snapshot);
+        assert_eq!(resp.total_tracked, usize::MAX);
+    }
+
+    // -------------------------------------------------------------------
+    // From conversion: cloned data is independent of source
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn from_snapshot_clones_data_independently() {
+        let entry = MoverEntry {
+            security_id: 77,
+            exchange_segment_code: 2,
+            last_traded_price: 300.0_f32,
+            change_pct: 2.5_f32,
+            volume: 50_000,
+        };
+        let snapshot = TopMoversSnapshot {
+            gainers: vec![entry],
+            losers: vec![],
+            most_active: vec![],
+            total_tracked: 10,
+        };
+        let resp = TopMoversResponse::from(&snapshot);
+        // Verify the response has its own copy
+        assert_eq!(resp.gainers[0].security_id, 77);
+        assert_eq!(resp.gainers[0].volume, 50_000);
+        // Original snapshot is still intact (not moved)
+        assert_eq!(snapshot.gainers[0].security_id, 77);
+    }
 }

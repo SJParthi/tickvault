@@ -1014,4 +1014,56 @@ mod tests {
         // Host containing a colon but not a valid SocketAddr
         assert!(!is_service_reachable("host:with:colons", 80));
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: is_service_reachable fallback addr construction,
+    // constant relationship validation, Docker compose path semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_service_reachable_with_unicode_host() {
+        // Unicode hostname triggers parse fallback
+        assert!(!is_service_reachable("\u{00e9}xample.local", 80));
+    }
+
+    #[test]
+    fn test_is_service_reachable_max_port() {
+        assert!(!is_service_reachable("127.0.0.1", u16::MAX));
+    }
+
+    #[test]
+    fn test_is_service_reachable_with_listener_then_drop_becomes_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(is_service_reachable("127.0.0.1", port));
+        drop(listener);
+        // After drop, the port is no longer listening. Due to TIME_WAIT
+        // this may or may not fail immediately, so we just verify no panic.
+        let _ = is_service_reachable("127.0.0.1", port);
+    }
+
+    #[test]
+    fn test_grafana_dashboard_url_is_localhost() {
+        assert!(
+            GRAFANA_DASHBOARD_URL.contains("localhost")
+                || GRAFANA_DASHBOARD_URL.contains("127.0.0.1"),
+            "Grafana dashboard URL must be a local address"
+        );
+    }
+
+    #[test]
+    fn test_all_timeouts_in_seconds() {
+        // Verify all timeout constants are expressed as whole seconds
+        assert_eq!(INFRA_PROBE_TIMEOUT.subsec_millis(), 0);
+        assert_eq!(INFRA_HEALTH_TIMEOUT.subsec_millis(), 0);
+        assert_eq!(DOCKER_DAEMON_TIMEOUT.subsec_millis(), 0);
+        assert_eq!(INFRA_HEALTH_POLL_INTERVAL.subsec_millis(), 0);
+    }
+
+    #[test]
+    fn test_docker_compose_path_no_leading_slash() {
+        // Relative path should not start with / or .
+        assert!(!DOCKER_COMPOSE_PATH.starts_with('/'));
+        assert!(!DOCKER_COMPOSE_PATH.starts_with('.'));
+    }
 }

@@ -502,4 +502,163 @@ mod tests {
         health.set_boot_epoch_secs(1_700_000_000);
         assert_eq!(health.boot_epoch_secs(), 1_700_000_000);
     }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus::default() field-by-field verification
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_default_all_fields_zero_or_false() {
+        let health = SystemHealthStatus::default();
+        assert_eq!(health.websocket_connections(), 0);
+        assert!(!health.pipeline_active());
+        assert!(!health.questdb_reachable());
+        assert!(!health.token_valid());
+        assert_eq!(health.boot_epoch_secs(), 0);
+    }
+
+    #[test]
+    fn test_system_health_status_default_overall_status_is_degraded() {
+        let health = SystemHealthStatus::default();
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    // -------------------------------------------------------------------
+    // overall_status priority: token checked first, then ws, then questdb
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_overall_status_token_invalid_is_degraded_regardless() {
+        let health = SystemHealthStatus::default();
+        health.set_websocket_connections(5);
+        health.set_questdb_reachable(true);
+        // token_valid stays false
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    #[test]
+    fn test_overall_status_ws_zero_is_degraded_even_with_valid_token() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+        // websocket_connections stays 0
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    #[test]
+    fn test_overall_status_questdb_down_is_degraded_even_with_token_and_ws() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_websocket_connections(3);
+        // questdb_reachable stays false
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    #[test]
+    fn test_overall_status_all_conditions_met_is_healthy() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_websocket_connections(1); // minimum 1 is enough
+        health.set_questdb_reachable(true);
+        assert_eq!(health.overall_status(), "healthy");
+    }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus: set_websocket_connections to various values
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_websocket_connections_range() {
+        let health = SystemHealthStatus::default();
+        for count in [0, 1, 2, 3, 4, 5] {
+            health.set_websocket_connections(count);
+            assert_eq!(health.websocket_connections(), count);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus: pipeline_active does not affect overall_status
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_pipeline_active_does_not_affect_overall_status() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_websocket_connections(3);
+        health.set_questdb_reachable(true);
+        // pipeline_active is false but status should still be healthy
+        assert!(!health.pipeline_active());
+        assert_eq!(health.overall_status(), "healthy");
+    }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus: transition from healthy back to degraded
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_healthy_to_degraded_on_token_invalidation() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_websocket_connections(3);
+        health.set_questdb_reachable(true);
+        assert_eq!(health.overall_status(), "healthy");
+
+        // Invalidate token → degraded
+        health.set_token_valid(false);
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    #[test]
+    fn test_system_health_status_healthy_to_degraded_on_ws_disconnect() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_websocket_connections(3);
+        health.set_questdb_reachable(true);
+        assert_eq!(health.overall_status(), "healthy");
+
+        // All WS connections lost → degraded
+        health.set_websocket_connections(0);
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    #[test]
+    fn test_system_health_status_healthy_to_degraded_on_questdb_down() {
+        let health = SystemHealthStatus::default();
+        health.set_token_valid(true);
+        health.set_websocket_connections(3);
+        health.set_questdb_reachable(true);
+        assert_eq!(health.overall_status(), "healthy");
+
+        // QuestDB goes down → degraded
+        health.set_questdb_reachable(false);
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus::default() via Default trait object
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_default_via_default_trait() {
+        let health: SystemHealthStatus = Default::default();
+        assert_eq!(health.websocket_connections(), 0);
+        assert!(!health.pipeline_active());
+        assert!(!health.questdb_reachable());
+        assert!(!health.token_valid());
+        assert_eq!(health.boot_epoch_secs(), 0);
+        assert_eq!(health.overall_status(), "degraded");
+    }
+
+    // -------------------------------------------------------------------
+    // SystemHealthStatus: boot_epoch_secs can be overwritten
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_boot_epoch_secs_overwrite() {
+        let health = SystemHealthStatus::default();
+        health.set_boot_epoch_secs(1_000_000);
+        assert_eq!(health.boot_epoch_secs(), 1_000_000);
+        health.set_boot_epoch_secs(2_000_000);
+        assert_eq!(health.boot_epoch_secs(), 2_000_000);
+    }
 }

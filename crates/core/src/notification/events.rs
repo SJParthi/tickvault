@@ -1544,4 +1544,247 @@ mod tests {
         assert!(!msg.contains("mismatch 10"));
         assert!(msg.contains("+10 more"));
     }
+
+    // =====================================================================
+    // Additional coverage: Severity Copy/Clone, Debug impls, event Debug,
+    // append_detail_lines total_count > details.len(), edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_severity_is_copy() {
+        let s = Severity::High;
+        let copy = s;
+        // Both should be usable after copy (Copy trait)
+        assert_eq!(s, copy);
+        assert_eq!(s, Severity::High);
+    }
+
+    #[test]
+    fn test_severity_clone() {
+        let s = Severity::Medium;
+        #[allow(clippy::clone_on_copy)]
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+    }
+
+    #[test]
+    fn test_severity_all_variants_debug() {
+        let variants = [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ];
+        let expected = ["Info", "Low", "Medium", "High", "Critical"];
+        for (variant, name) in variants.iter().zip(expected.iter()) {
+            assert_eq!(format!("{variant:?}"), *name);
+        }
+    }
+
+    #[test]
+    fn test_severity_ord_covers_all_pairs() {
+        let ordered = [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ];
+        for i in 0..ordered.len() {
+            for j in (i + 1)..ordered.len() {
+                assert!(
+                    ordered[i] < ordered[j],
+                    "{:?} should be < {:?}",
+                    ordered[i],
+                    ordered[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_notification_event_debug_impl() {
+        let event = NotificationEvent::TokenRenewed;
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("TokenRenewed"));
+    }
+
+    #[test]
+    fn test_notification_event_debug_with_fields() {
+        let event = NotificationEvent::WebSocketDisconnected {
+            connection_index: 3,
+            reason: "timeout".to_string(),
+        };
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("WebSocketDisconnected"));
+        assert!(debug_str.contains("3"));
+        assert!(debug_str.contains("timeout"));
+    }
+
+    #[test]
+    fn test_notification_event_clone_with_complex_fields() {
+        let event = NotificationEvent::HistoricalFetchFailed {
+            instruments_fetched: 100,
+            instruments_failed: 5,
+            total_candles: 50000,
+            persist_failures: 2,
+            failed_instruments: vec!["RELIANCE".to_string(), "TCS".to_string()],
+            failure_reasons: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("network".to_string(), 3);
+                m.insert("timeout".to_string(), 2);
+                m
+            },
+        };
+        let cloned = event.clone();
+        assert_eq!(event.to_message(), cloned.to_message());
+        assert_eq!(event.severity(), cloned.severity());
+    }
+
+    #[test]
+    fn test_append_detail_lines_total_greater_than_details_len() {
+        // total_count=50 but only 3 detail strings provided
+        // Should show all 3 lines and "+47 more"
+        let details = vec![
+            "line A".to_string(),
+            "line B".to_string(),
+            "line C".to_string(),
+        ];
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 50);
+        assert!(msg.contains("line A"));
+        assert!(msg.contains("line B"));
+        assert!(msg.contains("line C"));
+        assert!(msg.contains("+47 more"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_exactly_10_no_truncation() {
+        let details: Vec<String> = (0..10).map(|i| format!("detail {i}")).collect();
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 10);
+        assert!(msg.contains("detail 0"));
+        assert!(msg.contains("detail 9"));
+        assert!(!msg.contains("more"));
+    }
+
+    #[test]
+    fn test_append_detail_lines_11_triggers_truncation() {
+        let details: Vec<String> = (0..11).map(|i| format!("detail {i}")).collect();
+        let mut msg = String::new();
+        super::append_detail_lines(&mut msg, &details, 11);
+        assert!(msg.contains("detail 0"));
+        assert!(msg.contains("detail 9"));
+        assert!(!msg.contains("detail 10"));
+        assert!(msg.contains("+1 more"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_data_violations_only() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 50,
+            instruments_with_gaps: 0,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 7,
+            timestamp_violations: 0,
+            ohlc_details: vec![],
+            data_details: vec!["bad data line".to_string()],
+            timestamp_details: vec![],
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Data violations (7)"));
+        assert!(msg.contains("bad data line"));
+        assert!(!msg.contains("OHLC violations"));
+        assert!(!msg.contains("Timestamp violations"));
+    }
+
+    #[test]
+    fn test_candle_verification_failed_timestamp_violations_only() {
+        let event = NotificationEvent::CandleVerificationFailed {
+            instruments_checked: 50,
+            instruments_with_gaps: 0,
+            timeframe_details: String::new(),
+            ohlc_violations: 0,
+            data_violations: 0,
+            timestamp_violations: 4,
+            ohlc_details: vec![],
+            data_details: vec![],
+            timestamp_details: vec!["ts violation".to_string()],
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Timestamp violations (4)"));
+        assert!(msg.contains("ts violation"));
+        assert!(!msg.contains("OHLC violations"));
+        assert!(!msg.contains("Data violations"));
+    }
+
+    #[test]
+    fn test_risk_halt_severity_is_critical() {
+        let event = NotificationEvent::RiskHalt {
+            reason: "position_limit".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_ws_reconnection_exhausted_severity_is_critical() {
+        let event = NotificationEvent::WebSocketReconnectionExhausted {
+            connection_index: 0,
+            attempts: 5,
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_token_renewal_deadline_missed_severity_is_critical() {
+        let event = NotificationEvent::TokenRenewalDeadlineMissed {
+            deadline_hour_ist: 10,
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_rate_limit_exhausted_message_format() {
+        let event = NotificationEvent::RateLimitExhausted {
+            limit_type: "per_second".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Rate limit EXHAUSTED"));
+        assert!(msg.contains("per_second"));
+    }
+
+    #[test]
+    fn test_risk_halt_message_format() {
+        let event = NotificationEvent::RiskHalt {
+            reason: "position_limit_breach".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("RISK HALT"));
+        assert!(msg.contains("position_limit_breach"));
+    }
+
+    #[test]
+    fn test_every_severity_variant_is_reachable() {
+        // Verify each severity level is returned by at least one event variant
+        let info_event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        assert_eq!(info_event.severity(), Severity::Info);
+
+        let low_event = NotificationEvent::TokenRenewed;
+        assert_eq!(low_event.severity(), Severity::Low);
+
+        let medium_event = NotificationEvent::ShutdownInitiated;
+        assert_eq!(medium_event.severity(), Severity::Medium);
+
+        let high_event = NotificationEvent::Custom {
+            message: "x".to_string(),
+        };
+        assert_eq!(high_event.severity(), Severity::High);
+
+        let critical_event = NotificationEvent::RiskHalt {
+            reason: "x".to_string(),
+        };
+        assert_eq!(critical_event.severity(), Severity::Critical);
+    }
 }

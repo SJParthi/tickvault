@@ -690,6 +690,104 @@ mod tests {
     }
 
     #[test]
+    fn test_build_view_sql_all_views_idempotent() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("IF NOT EXISTS"),
+                "view {} SQL must contain IF NOT EXISTS for idempotency",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_view_sources_from_itself() {
+        for def in VIEW_DEFS {
+            assert_ne!(
+                def.name, def.source,
+                "view {} must not source from itself",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_idempotent() {
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("IF NOT EXISTS"),
+            "base table DDL must contain IF NOT EXISTS for idempotent startup"
+        );
+    }
+
+    #[test]
+    fn test_view_chain_5s_to_1m_all_from_1s() {
+        let sub_minute = [
+            "candles_5s",
+            "candles_10s",
+            "candles_15s",
+            "candles_30s",
+            "candles_1m",
+        ];
+        for name in &sub_minute {
+            let def = VIEW_DEFS.iter().find(|d| d.name == *name).unwrap();
+            assert_eq!(
+                def.source, "candles_1s",
+                "sub-minute view {} must source from candles_1s",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_view_chain_2m_3m_5m_from_1m() {
+        let minute_views = ["candles_2m", "candles_3m", "candles_5m"];
+        for name in &minute_views {
+            let def = VIEW_DEFS.iter().find(|d| d.name == *name).unwrap();
+            assert_eq!(
+                def.source, "candles_1m",
+                "minute view {} must source from candles_1m",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_view_intervals_non_empty() {
+        for def in VIEW_DEFS {
+            assert!(
+                !def.interval.is_empty(),
+                "view {} must have a non-empty interval",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_security_id_in_select() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("security_id"),
+                "view {} must include security_id in SELECT",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_ts_in_select() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("ts"),
+                "view {} must include ts in SELECT",
+                def.name
+            );
+        }
+    }
+
+    #[test]
     fn test_ddl_timeout_is_reasonable() {
         assert!((5..=30).contains(&DDL_TIMEOUT_SECS));
     }
