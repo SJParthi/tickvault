@@ -216,6 +216,23 @@ fn is_outside_intraday_window(utc_epoch_secs: i64) -> bool {
     ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST
 }
 
+/// Returns true if the given UTC epoch timestamp falls on a weekend (Saturday or Sunday).
+///
+/// Converts UTC epoch to IST date, then checks day-of-week. Used to reject candles
+/// that should never exist — NSE is closed on weekends (mock trading excluded from
+/// historical candle storage by design).
+fn is_weekend_timestamp(utc_epoch_secs: i64) -> bool {
+    use chrono::{Datelike, TimeZone, Weekday};
+    let ist_datetime = Utc
+        .timestamp_opt(utc_epoch_secs, 0)
+        .single()
+        .map(|dt| dt.with_timezone(&ist_offset()));
+    match ist_datetime {
+        Some(dt) => matches!(dt.weekday(), Weekday::Sat | Weekday::Sun),
+        None => false, // invalid timestamp — let other validators catch it
+    }
+}
+
 /// Extracts open interest from the response array, returning 0 if index is out of bounds.
 /// OI array may be empty for equity instruments — this handles that gracefully.
 fn extract_oi(open_interest: &[i64], index: usize) -> i64 {
@@ -380,6 +397,13 @@ fn build_valid_intraday_candles(
             continue;
         }
 
+        // Reject candles on weekends — NSE is closed on Sat/Sun.
+        // Dhan normally returns empty for weekends, but this is defense-in-depth.
+        if is_weekend_timestamp(data.timestamp[i]) {
+            invalid_count = invalid_count.saturating_add(1);
+            continue;
+        }
+
         candles.push(build_intraday_candle(
             data,
             i,
@@ -395,6 +419,7 @@ fn build_valid_intraday_candles(
 /// - Candles with non-finite prices (NaN/Inf)
 /// - Candles with non-positive prices (zero or negative)
 /// - Candles with high < low
+/// - Candles on weekends (Saturday/Sunday — NSE closed)
 ///
 /// Returns a vector of valid `HistoricalCandle` structs, plus counts of
 /// `(valid_candle_count, invalid_candle_count)`.
@@ -419,6 +444,12 @@ fn build_valid_daily_candles(
                 invalid_count = invalid_count.saturating_add(1);
                 continue;
             }
+        }
+
+        // Reject daily candles on weekends — NSE is closed on Sat/Sun.
+        if is_weekend_timestamp(data.timestamp[i]) {
+            invalid_count = invalid_count.saturating_add(1);
+            continue;
         }
 
         candles.push(build_daily_candle(data, i, security_id, segment_code));
@@ -4036,6 +4067,71 @@ mod tests {
         assert!(
             !is_token_related_error(&action_805),
             "805 must NOT escalate — connection errors are infrastructure-level"
+        );
+    }
+
+    // =======================================================================
+    // is_weekend_timestamp — weekend candle rejection
+    // =======================================================================
+
+    #[test]
+    fn test_is_weekend_timestamp_saturday_detected() {
+        // 2026-03-21 09:30 IST = Saturday (the exact issue the user found)
+        // IST 09:30 = UTC 04:00 = epoch 1774008000
+        let sat_ist_0930 = chrono::NaiveDate::from_ymd_opt(2026, 3, 21)
+            .unwrap()
+            .and_hms_opt(4, 0, 0) // UTC 04:00 = IST 09:30
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            is_weekend_timestamp(sat_ist_0930),
+            "Saturday 09:30 IST must be detected as weekend"
+        );
+    }
+
+    #[test]
+    fn test_is_weekend_timestamp_sunday_detected() {
+        // 2026-03-22 10:00 IST = Sunday
+        let sun_ist_1000 = chrono::NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(4, 30, 0) // UTC 04:30 = IST 10:00
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            is_weekend_timestamp(sun_ist_1000),
+            "Sunday must be detected as weekend"
+        );
+    }
+
+    #[test]
+    fn test_is_weekend_timestamp_monday_not_weekend() {
+        // 2026-03-23 09:15 IST = Monday (trading day)
+        let mon_ist_0915 = chrono::NaiveDate::from_ymd_opt(2026, 3, 23)
+            .unwrap()
+            .and_hms_opt(3, 45, 0) // UTC 03:45 = IST 09:15
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            !is_weekend_timestamp(mon_ist_0915),
+            "Monday must NOT be detected as weekend"
+        );
+    }
+
+    #[test]
+    fn test_is_weekend_timestamp_friday_not_weekend() {
+        // 2026-03-20 15:29 IST = Friday (last trading minute)
+        let fri_ist_1529 = chrono::NaiveDate::from_ymd_opt(2026, 3, 20)
+            .unwrap()
+            .and_hms_opt(9, 59, 0) // UTC 09:59 = IST 15:29
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            !is_weekend_timestamp(fri_ist_1529),
+            "Friday must NOT be detected as weekend"
         );
     }
 }

@@ -330,6 +330,8 @@ mod tests {
             data_details: vec![],
             timestamp_violations: 0,
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
             passed: true,
         }
     }
@@ -1259,6 +1261,8 @@ mod tests {
             data_details: vec![],
             timestamp_violations: 0,
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
             passed: true,
         };
         let result = format_timeframe_details(&report);

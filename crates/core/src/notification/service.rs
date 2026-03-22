@@ -692,6 +692,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec![],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -857,6 +859,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec![],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         });
     }
 

@@ -1427,6 +1427,7 @@ fn spawn_historical_candle_fetch(
                 ohlc_violations: verify_report.ohlc_violations,
                 data_violations: verify_report.data_violations,
                 timestamp_violations: verify_report.timestamp_violations,
+                weekend_violations: verify_report.weekend_violations,
             });
         } else {
             bg_notifier.notify(NotificationEvent::CandleVerificationFailed {
@@ -1439,6 +1440,8 @@ fn spawn_historical_candle_fetch(
                 ohlc_details: format_violation_details(&verify_report.ohlc_details),
                 data_details: format_violation_details(&verify_report.data_details),
                 timestamp_details: format_violation_details(&verify_report.timestamp_details),
+                weekend_violations: verify_report.weekend_violations,
+                weekend_details: format_violation_details(&verify_report.weekend_details),
             });
         }
 

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
@@ -133,6 +133,10 @@ pub struct CrossVerificationReport {
     pub timestamp_violations: usize,
     /// Detailed timestamp violation records (capped at 20).
     pub timestamp_details: Vec<ViolationDetail>,
+    /// Number of candles on weekends (Saturday/Sunday — NSE closed).
+    pub weekend_violations: usize,
+    /// Detailed weekend violation records (capped at 20).
+    pub weekend_details: Vec<ViolationDetail>,
     /// Whether the verification passed overall.
     pub passed: bool,
 }
@@ -293,12 +297,14 @@ fn determine_verification_passed(
     ohlc_violations: usize,
     data_violations: usize,
     timestamp_violations: usize,
+    weekend_violations: usize,
 ) -> bool {
     instruments_checked > 0
         && instruments_with_gaps == 0
         && ohlc_violations == 0
         && data_violations == 0
         && timestamp_violations == 0
+        && weekend_violations == 0
 }
 
 /// Detects whether a price mismatch exists between historical and live OHLC values.
@@ -687,6 +693,8 @@ fn failed_report() -> CrossVerificationReport {
         data_details: Vec::new(),
         timestamp_violations: 0,
         timestamp_details: Vec::new(),
+        weekend_violations: 0,
+        weekend_details: Vec::new(),
         passed: false,
     }
 }
@@ -903,6 +911,46 @@ pub async fn verify_candle_integrity(
         );
     }
 
+    // --- Step 5b: Weekend candle check ---
+    // Candles on Saturday (day_of_week=6) or Sunday (day_of_week=7) should NEVER exist.
+    // NSE is closed on weekends — no trading, no settlement, no data.
+    let weekend_count_query = format!(
+        "SELECT count() FROM {} \
+         WHERE ts > dateadd('d', -3, now()) \
+         AND (day_of_week(ts) = 6 OR day_of_week(ts) = 7)",
+        QUESTDB_TABLE_HISTORICAL_CANDLES
+    );
+
+    let weekend_violations = extract_count(&client, &base_url, &weekend_count_query).await;
+
+    let weekend_details = if weekend_violations > 0 {
+        let weekend_detail_query = format!(
+            "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
+             FROM {} \
+             WHERE ts > dateadd('d', -3, now()) \
+             AND (day_of_week(ts) = 6 OR day_of_week(ts) = 7) \
+             LIMIT {}",
+            QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
+        );
+        parse_violation_rows(
+            &client,
+            &base_url,
+            &weekend_detail_query,
+            registry,
+            "weekend candle (Saturday/Sunday — NSE closed)",
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
+    if weekend_violations > 0 {
+        error!(
+            weekend_violations,
+            "CRITICAL: candles found on weekends — NSE is closed on Sat/Sun"
+        );
+    }
+
     // --- Step 6: Determine pass/fail ---
     // FAIL if: zero instruments OR any gaps OR any violations of any type
     let passed = determine_verification_passed(
@@ -911,6 +959,7 @@ pub async fn verify_candle_integrity(
         ohlc_violations,
         data_violations,
         timestamp_violations,
+        weekend_violations,
     );
 
     // Log per-timeframe summary
@@ -931,6 +980,7 @@ pub async fn verify_candle_integrity(
         ohlc_violations,
         data_violations,
         timestamp_violations,
+        weekend_violations,
         passed,
         "multi-timeframe cross-verification complete"
     );
@@ -947,6 +997,8 @@ pub async fn verify_candle_integrity(
         data_details,
         timestamp_violations,
         timestamp_details,
+        weekend_violations,
+        weekend_details,
         passed,
     }
 }
@@ -1292,6 +1344,8 @@ mod tests {
             data_details: vec![],
             timestamp_violations: 0,
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
             passed: false,
         };
         assert!(!report.passed);
@@ -1353,6 +1407,8 @@ mod tests {
             data_details: vec![],
             timestamp_violations: 0,
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
             passed: false,
         };
 
@@ -1389,12 +1445,14 @@ mod tests {
         let ohlc_violations = 0;
         let data_violations = 0;
         let timestamp_violations = 0;
+        let weekend_violations = 0;
 
         let passed = instruments_checked > 0
             && instruments_with_gaps == 0
             && ohlc_violations == 0
             && data_violations == 0
-            && timestamp_violations == 0;
+            && timestamp_violations == 0
+            && weekend_violations == 0;
 
         assert!(!passed, "zero instruments must FAIL verification");
     }
@@ -1866,37 +1924,42 @@ mod tests {
 
     #[test]
     fn test_determine_verification_passed_all_good() {
-        assert!(determine_verification_passed(100, 0, 0, 0, 0));
+        assert!(determine_verification_passed(100, 0, 0, 0, 0, 0));
     }
 
     #[test]
     fn test_determine_verification_passed_zero_instruments() {
-        assert!(!determine_verification_passed(0, 0, 0, 0, 0));
+        assert!(!determine_verification_passed(0, 0, 0, 0, 0, 0));
     }
 
     #[test]
     fn test_determine_verification_passed_with_gaps() {
-        assert!(!determine_verification_passed(100, 5, 0, 0, 0));
+        assert!(!determine_verification_passed(100, 5, 0, 0, 0, 0));
     }
 
     #[test]
     fn test_determine_verification_passed_with_ohlc() {
-        assert!(!determine_verification_passed(100, 0, 3, 0, 0));
+        assert!(!determine_verification_passed(100, 0, 3, 0, 0, 0));
     }
 
     #[test]
     fn test_determine_verification_passed_with_data_violations() {
-        assert!(!determine_verification_passed(100, 0, 0, 2, 0));
+        assert!(!determine_verification_passed(100, 0, 0, 2, 0, 0));
     }
 
     #[test]
     fn test_determine_verification_passed_with_timestamp_violations() {
-        assert!(!determine_verification_passed(100, 0, 0, 0, 1));
+        assert!(!determine_verification_passed(100, 0, 0, 0, 1, 0));
+    }
+
+    #[test]
+    fn test_determine_verification_passed_with_weekend_violations() {
+        assert!(!determine_verification_passed(100, 0, 0, 0, 0, 1));
     }
 
     #[test]
     fn test_determine_verification_passed_all_violations() {
-        assert!(!determine_verification_passed(100, 1, 2, 3, 4));
+        assert!(!determine_verification_passed(100, 1, 2, 3, 4, 5));
     }
 
     // -----------------------------------------------------------------------

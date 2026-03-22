@@ -132,6 +132,8 @@ pub enum NotificationEvent {
         data_violations: usize,
         /// Timestamp violations (outside market hours).
         timestamp_violations: usize,
+        /// Weekend violations (candles on Saturday/Sunday).
+        weekend_violations: usize,
     },
 
     /// Candle cross-verification found gaps in stored data.
@@ -154,6 +156,10 @@ pub enum NotificationEvent {
         data_details: Vec<String>,
         /// Pre-formatted timestamp violation detail lines for Telegram.
         timestamp_details: Vec<String>,
+        /// Weekend violations (candles on Saturday/Sunday).
+        weekend_violations: usize,
+        /// Pre-formatted weekend violation detail lines for Telegram.
+        weekend_details: Vec<String>,
     },
 
     /// Historical vs Live candle cross-match passed — all OHLCV values match.
@@ -362,6 +368,7 @@ impl NotificationEvent {
                 ohlc_violations,
                 data_violations,
                 timestamp_violations,
+                weekend_violations,
             } => {
                 let mut msg = format!(
                     "<b>Candle verification OK</b>\nInstruments: {instruments_checked}\nTotal candles: {total_candles}"
@@ -370,8 +377,12 @@ impl NotificationEvent {
                     msg.push_str("\n\n<b>Timeframes:</b>\n");
                     msg.push_str(timeframe_details);
                 }
-                if *ohlc_violations == 0 && *data_violations == 0 && *timestamp_violations == 0 {
-                    msg.push_str("\n\nChecks: OHLC \u{2713} | Data \u{2713} | Timestamps \u{2713}");
+                if *ohlc_violations == 0
+                    && *data_violations == 0
+                    && *timestamp_violations == 0
+                    && *weekend_violations == 0
+                {
+                    msg.push_str("\n\nChecks: OHLC \u{2713} | Data \u{2713} | Timestamps \u{2713} | Weekends \u{2713}");
                 } else {
                     if *ohlc_violations > 0 {
                         msg.push_str(&format!("\nOHLC violations: {ohlc_violations}"));
@@ -384,6 +395,11 @@ impl NotificationEvent {
                     if *timestamp_violations > 0 {
                         msg.push_str(&format!(
                             "\nTimestamp violations: {timestamp_violations} (non-blocking)"
+                        ));
+                    }
+                    if *weekend_violations > 0 {
+                        msg.push_str(&format!(
+                            "\nWeekend violations: {weekend_violations} (CRITICAL)"
                         ));
                     }
                 }
@@ -399,6 +415,8 @@ impl NotificationEvent {
                 ohlc_details,
                 data_details,
                 timestamp_details,
+                weekend_violations,
+                weekend_details,
             } => {
                 let mut msg = if *instruments_checked == 0 {
                     "<b>Candle verification FAILED</b>\nChecked: 0\n\nNo instrument data found \u{2014} fetch may have completely failed".to_string()
@@ -426,6 +444,14 @@ impl NotificationEvent {
                         "\n\n<b>Timestamp violations ({timestamp_violations}):</b>"
                     ));
                     append_detail_lines(&mut msg, timestamp_details, *timestamp_violations);
+                }
+
+                // Weekend violations with details (CRITICAL — NSE closed on Sat/Sun)
+                if *weekend_violations > 0 {
+                    msg.push_str(&format!(
+                        "\n\n<b>WEEKEND violations ({weekend_violations}) — CRITICAL:</b>"
+                    ));
+                    append_detail_lines(&mut msg, weekend_details, *weekend_violations);
                 }
 
                 if *instruments_checked > 0 && !timeframe_details.is_empty() {
@@ -885,6 +911,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec![],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("verification FAILED"));
@@ -909,6 +937,8 @@ mod tests {
             ],
             data_details: vec![],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("OHLC violations (2)"));
@@ -928,6 +958,8 @@ mod tests {
             ohlc_details: vec!["ohlc line".to_string()],
             data_details: vec!["data line".to_string()],
             timestamp_details: vec!["ts line".to_string()],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("OHLC violations (2)"));
@@ -947,6 +979,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec![],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("Checked: 0"));
@@ -965,6 +999,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec![],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         assert_eq!(event.severity(), Severity::High);
     }
@@ -978,6 +1014,7 @@ mod tests {
             ohlc_violations: 0,
             data_violations: 0,
             timestamp_violations: 0,
+            weekend_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("Candle verification OK"));
@@ -995,6 +1032,7 @@ mod tests {
             ohlc_violations: 0,
             data_violations: 2,
             timestamp_violations: 1,
+            weekend_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("Data violations: 2 (non-blocking)"));
@@ -1174,6 +1212,7 @@ mod tests {
             ohlc_violations: 0,
             data_violations: 0,
             timestamp_violations: 0,
+            weekend_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("Candle verification OK"));
@@ -1193,6 +1232,7 @@ mod tests {
             ohlc_violations: 0,
             data_violations: 0,
             timestamp_violations: 0,
+            weekend_violations: 0,
         };
         assert_eq!(event.severity(), Severity::Low);
     }
@@ -1460,6 +1500,7 @@ mod tests {
             ohlc_violations: 0,
             data_violations: 0,
             timestamp_violations: 0,
+            weekend_violations: 0,
         };
         let msg = event.to_message();
         assert!(!msg.contains("Timeframes:"));
@@ -1474,6 +1515,7 @@ mod tests {
             ohlc_violations: 3,
             data_violations: 0,
             timestamp_violations: 0,
+            weekend_violations: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("OHLC violations: 3"));
@@ -1692,6 +1734,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec!["bad data line".to_string()],
             timestamp_details: vec![],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("Data violations (7)"));
@@ -1712,6 +1756,8 @@ mod tests {
             ohlc_details: vec![],
             data_details: vec![],
             timestamp_details: vec!["ts violation".to_string()],
+            weekend_violations: 0,
+            weekend_details: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("Timestamp violations (4)"));
