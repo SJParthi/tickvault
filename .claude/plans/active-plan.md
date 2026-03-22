@@ -1,243 +1,159 @@
-# Implementation Plan: 100% Test Coverage Across All 6 Crates
+# Implementation Plan: Extreme Automation Enhancements (27 Items)
 
-**Status:** VERIFIED
-**Date:** 2026-03-20
-**Approved by:** Parthiban
+**Status:** DRAFT
+**Date:** 2026-03-22
+**Approved by:** pending
 
 ## Context
 
-Current coverage: 88.69% overall. Target: 100% on all 6 crates.
-Total uncovered lines: ~3,781. Estimated new tests: ~300.
-Organized into 10 batches by crate and priority.
+All enhancements for fully automated monitoring, self-healing, and observability.
+Paper trading only (dry_run=true) until June end. No real orders.
+Target: MacBook local dev + future AWS instance.
 
----
+## Plan Items
 
-## Batch 1: Common Crate — instrument_types.rs (80% → 100%)
+### Batch 1 — Quick Wins (Critical, 5 items)
 
-- [x] Add tests for all rkyv serialization roundtrips (NaiveDateAsI32, DateTimeFixedOffsetAsI64, DurationAsMillis)
-  - Files: crates/common/src/instrument_types.rs
-  - Tests: test_rkyv_naive_date_roundtrip, test_rkyv_datetime_roundtrip, test_rkyv_duration_roundtrip
+- [ ] C1: Install panic hook with Telegram alert before crash
+  - Files: crates/app/src/main.rs
+  - Tests: test_panic_hook_installed
 
-- [x] Add Display impl tests for all enum variants (UnderlyingKind, DhanInstrumentKind, IndexCategory, IndexSubcategory)
-  - Files: crates/common/src/instrument_types.rs
-  - Tests: test_underlying_kind_display_all, test_dhan_instrument_kind_display_all, test_index_category_display_all, test_index_subcategory_display_all
+- [ ] C2: Add SIGTERM handler alongside SIGINT (Ctrl+C)
+  - Files: crates/app/src/main.rs
+  - Tests: test_sigterm_handler_configured
 
-- [x] Add tests for NaiveDateRkyvError and DateTimeRkyvError Display/Error impls
-  - Files: crates/common/src/instrument_types.rs
-  - Tests: test_naive_date_rkyv_error_display, test_datetime_rkyv_error_display
+- [ ] C4: Auto-call reset_daily() at 16:00 IST (risk + OMS + indicators)
+  - Files: crates/app/src/main.rs, crates/app/src/trading_pipeline.rs
+  - Tests: test_daily_reset_scheduled
 
-- [x] Add tests for archived From conversions and ConstituencyBuildMetadata::default
-  - Files: crates/common/src/instrument_types.rs
-  - Tests: test_archived_underlying_kind_from, test_archived_instrument_kind_from, test_constituency_build_metadata_default
+- [ ] M5: Escalate candle fetch failure from warn! to error! + Telegram
+  - Files: crates/core/src/historical/candle_fetcher.rs
+  - Tests: test_candle_fetch_failure_escalation
 
-- [x] Add test for FnoUniverse::derivative_security_ids_for_symbol
-  - Files: crates/common/src/instrument_types.rs
-  - Tests: test_derivative_security_ids_for_symbol_filters_correctly
-
-## Batch 2: Common Crate — types.rs, trading_calendar.rs, instrument_registry.rs (92-95% → 100%)
-
-- [x] Add tests for InstrumentType::dhan_api_instrument_type all 6 combinations
-  - Files: crates/common/src/types.rs
-  - Tests: test_dhan_api_instrument_type_futidx, test_dhan_api_instrument_type_futstk, test_dhan_api_instrument_type_optidx, test_dhan_api_instrument_type_optstk
-
-- [x] Add tests for archived From conversions (Exchange, ExchangeSegment, OptionType)
-  - Files: crates/common/src/types.rs
-  - Tests: test_archived_exchange_from, test_archived_exchange_segment_from, test_archived_option_type_from
-
-- [x] Add test for TradingCalendar::all_entries with holidays and muhurat
-  - Files: crates/common/src/trading_calendar.rs
-  - Tests: test_all_entries_mixed_holidays_muhurat, test_all_entries_sorted_by_date
-
-- [x] Add tests for InstrumentRegistry category counting and archived instrument builders
-  - Files: crates/common/src/instrument_registry.rs
-  - Tests: test_category_counts_multiple_categories, test_make_stock_equity_from_archived, test_make_derivative_from_archived
-
-## Batch 3: API Crate (95% → 100%)
-
-- [x] Add instruments handler tests: concurrent rebuild guard, error paths, diagnostic endpoint
-  - Files: crates/api/src/handlers/instruments.rs
-  - Tests: test_rebuild_concurrent_rejection, test_rebuild_error_response, test_rebuild_already_built_today, test_instrument_diagnostic_success
-
-- [x] Add quote handler tests: QuestDB reachability, JSON parsing edge cases, client build error
-  - Files: crates/api/src/handlers/quote.rs
-  - Tests: test_quote_questdb_unreachable, test_quote_empty_dataset, test_quote_missing_fields_defaults, test_quote_client_build_error
-
-- [x] Add middleware auth tests: disabled auth, invalid token, missing header, malformed header
-  - Files: crates/api/src/middleware.rs
-  - Tests: test_auth_disabled_allows_request, test_auth_invalid_token_401, test_auth_missing_header_401, test_auth_malformed_header_401
-
-- [x] Add lib.rs CORS fallback test and remaining handler edge cases
-  - Files: crates/api/src/lib.rs, crates/api/src/handlers/top_movers.rs, crates/api/src/handlers/index_constituency.rs
-  - Tests: test_cors_invalid_origins_fallback, test_top_movers_from_snapshot, test_constituency_unknown_index_404
-
-## Batch 4: Trading Crate — OMS (89-98% → 100%)
-
-- [x] Add api_client.rs HTTP error matrix: 400, 401, 403, 429, 500, 502, 503 for all endpoints
-  - Files: crates/trading/src/oms/api_client.rs
-  - Tests: test_place_order_http_400, test_place_order_http_429_rate_limit, test_modify_order_http_500, test_cancel_order_transport_error, test_get_positions_http_401, test_exit_all_malformed_json, test_margin_calc_error, test_fund_limit_error
-
-- [x] Add engine.rs live mode tests, order update re-indexing, disclosed qty boundary
-  - Files: crates/trading/src/oms/engine.rs
-  - Tests: test_place_order_live_mode, test_order_update_reindexing, test_disclosed_qty_30_percent_boundary, test_rate_limit_cb_interaction, test_validate_sl_trigger
-
-- [x] Add circuit_breaker.rs recovery logging, CAS race, HalfOpen timing
-  - Files: crates/trading/src/oms/circuit_breaker.rs
-  - Tests: test_cb_recovery_log_emitted, test_cb_half_open_probe_gate, test_cb_concurrent_failures
-
-- [x] Add reconciliation.rs warning branches (unknown status, ghost orders, missing from OMS)
-  - Files: crates/trading/src/oms/reconciliation.rs
-  - Tests: test_reconcile_unknown_dhan_status, test_reconcile_ghost_order, test_reconcile_missing_from_oms
-
-## Batch 5: Trading Crate — Strategy & Risk (88-99% → 100%)
-
-- [x] Add hot_reload.rs error paths: watcher init failure, invalid TOML recovery, receiver dropped
-  - Files: crates/trading/src/strategy/hot_reload.rs
-  - Tests: test_hot_reload_invalid_toml_keeps_old, test_hot_reload_file_deleted_during_watch, test_hot_reload_receiver_dropped
-
-- [x] Add evaluator.rs FSM edge cases: bounds check, trailing stop math, zero ATR, dual entry
-  - Files: crates/trading/src/strategy/evaluator.rs
-  - Tests: test_eval_out_of_bounds_security_id, test_eval_trailing_stop_crossing, test_eval_zero_atr, test_eval_dual_entry_conditions
-
-- [x] Add config.rs validation boundaries: position_size_fraction bounds, empty entry conditions
-  - Files: crates/trading/src/strategy/config.rs
-  - Tests: test_config_position_size_zero, test_config_position_size_above_one, test_config_no_entry_conditions
-
-- [x] Add risk engine edge cases: halt idempotency, NaN price rejection, position reversal
-  - Files: crates/trading/src/risk/engine.rs, crates/trading/src/risk/tick_gap_tracker.rs
-  - Tests: test_halt_idempotent, test_nan_price_rejected, test_position_reversal_boundary, test_warmup_boundary_exact, test_counter_saturation
-
-- [x] Add indicator engine edge cases: out-of-bounds security_id, warmup saturation, zero volume
-  - Files: crates/trading/src/indicator/engine.rs
-  - Tests: test_indicator_out_of_bounds, test_warmup_saturation, test_zero_volume_vwap_skip
-
-## Batch 6: Core Crate — Parsers & Pipeline (92-99% → 100%)
-
-- [x] Add tick_processor.rs tests: dedup ring, junk filtering, persist window, broadcast, metrics
-  - Files: crates/core/src/pipeline/tick_processor.rs
-  - Tests: test_dedup_ring_first_not_dup, test_dedup_ring_identical_dup, test_junk_tick_nan_ltp, test_junk_tick_negative_ltp, test_persist_window_outside_hours, test_parse_error_cap_at_100, test_depth_prices_finite
-
-- [x] Add parser edge case tests for all parsers with <100% coverage
-  - Files: crates/core/src/parser/header.rs, parser/ticker.rs, parser/quote.rs, parser/full_packet.rs, parser/market_depth.rs, parser/deep_depth.rs, parser/oi.rs, parser/previous_close.rs, parser/disconnect.rs, parser/types.rs, parser/market_status.rs, parser/dispatcher.rs
-  - Tests: test_header_unknown_exchange_byte, test_ticker_nan_ltp, test_quote_max_values, test_full_all_depth_invalid, test_dispatcher_stacked_frames
-
-- [x] Add top_movers edge cases and connection_pool capacity exceeded
-  - Files: crates/core/src/pipeline/top_movers.rs, crates/core/src/websocket/connection_pool.rs
-  - Tests: test_top_movers_invalid_day_close, test_connection_pool_capacity_exceeded, test_total_instruments_sums
-
-## Batch 7: Core Crate — WebSocket & Network (50-96% → 100%)
-
-- [x] Add order_update_connection.rs tests: error paths, reconnection, market hours, token states
+- [ ] H3: Validate order update WS auth response after MsgCode 42 login
   - Files: crates/core/src/websocket/order_update_connection.rs
-  - Tests: test_order_update_no_token, test_order_update_tls_error, test_order_update_connect_refused, test_order_update_read_timeout, test_order_update_non_text_ignored, test_is_within_market_hours
+  - Tests: test_order_update_ws_auth_validation
 
-- [x] Add ip_verifier.rs tests: all error paths, fallback, SSM whitespace, invalid IPv4
-  - Files: crates/core/src/network/ip_verifier.rs
-  - Tests: test_ssm_whitespace_fails, test_primary_fails_fallback, test_both_exhausted, test_http_error_status, test_invalid_ip_response
+### Batch 2 — Market Safety (4 items)
 
-- [x] Add ip_monitor.rs tests: background loop, check pass/fail, fetch errors
-  - Files: crates/core/src/network/ip_monitor.rs
-  - Tests: test_monitor_check_passes, test_monitor_mismatch_alert, test_fetch_ip_fails, test_fetch_ip_non_success
+- [ ] C3: Auto-handle market close at 15:30 IST (paper mode: log positions, cancel paper orders in OMS state)
+  - Files: crates/app/src/main.rs, crates/app/src/trading_pipeline.rs
+  - Tests: test_market_close_auto_handling
 
-- [x] Add connection.rs tests: IDX_I partition, clean shutdown, error variants, reconnection
-  - Files: crates/core/src/websocket/connection.rs
-  - Tests: test_connection_idx_partition, test_connection_clean_shutdown, test_connection_non_reconnectable, test_connection_reconnect_retry
+- [ ] H1: Wrap boot sequence in 120s timeout with CRITICAL alert
+  - Files: crates/app/src/main.rs
+  - Tests: test_boot_timeout_configured
 
-- [x] Add tls.rs error path and notification/service.rs error paths
-  - Files: crates/core/src/websocket/tls.rs, crates/core/src/notification/service.rs
-  - Tests: test_tls_no_root_ca, test_notification_bot_token_missing, test_notification_send_error_logged
+- [ ] H4: Add crash-restart wrapper in Makefile (loop with max 5 restarts + backoff)
+  - Files: Makefile
+  - Tests: (manual verification — shell wrapper)
 
-## Batch 8: Core Crate — Instruments (92-97% → 100%)
+- [ ] H5: Internal heartbeat/watchdog task checking tick processor + token + WS liveness
+  - Files: crates/app/src/main.rs
+  - Tests: test_heartbeat_watchdog_spawned
 
-- [x] Add validation.rs tests for all 6 checks (must-exist indices/equities/stocks, stock count, non-empty, orphans)
-  - Files: crates/core/src/instrument/validation.rs
-  - Tests: test_validate_indices_missing, test_validate_indices_price_id_mismatch, test_validate_equities_wrong_variant, test_validate_fno_stocks_missing, test_validate_stock_count_bounds, test_validate_empty_underlyings, test_validate_orphan_derivatives
+### Batch 3 — Data Resilience (4 items)
 
-- [x] Add universe_builder.rs tests for 5-pass pipeline edge cases
-  - Files: crates/core/src/instrument/universe_builder.rs
-  - Tests: test_build_index_lookup_filters, test_build_equity_lookup_filters, test_discover_fno_skips_test, test_discover_fno_skips_bse_futstk, test_discover_fno_dedup_first_wins
-
-- [x] Add subscription_planner.rs routing and capacity tests
-  - Files: crates/core/src/instrument/subscription_planner.rs
-  - Tests: test_plan_idx_i_ticker_only, test_plan_respects_capacity, test_plan_full_mode_depth
-
-## Batch 9: Storage Crate (37-94% → 100%)
-
-- [x] Add candle_persistence.rs tests: writer new/append/flush, LiveCandleWriter, DDL
-  - Files: crates/storage/src/candle_persistence.rs
-  - Tests: test_candle_writer_new_unreachable, test_append_candle_batch_flush, test_force_flush_resets, test_live_candle_oi_zero, test_live_candle_all_segments, test_ensure_candle_table_create, test_ensure_candle_table_dedup
-
-- [x] Add constituency_persistence.rs tests: DDL, persist retry, inner logic
-  - Files: crates/storage/src/constituency_persistence.rs
-  - Tests: test_ensure_constituency_table_create, test_ensure_constituency_table_dedup, test_persist_constituency_retry, test_persist_constituency_all_fail_ok, test_persist_inner_security_id_zero
-
-- [x] Add calendar_persistence.rs tests: DDL, persist retry, inner logic
-  - Files: crates/storage/src/calendar_persistence.rs
-  - Tests: test_ensure_calendar_table_create, test_persist_calendar_retry, test_persist_inner_holiday_vs_muhurat, test_persist_inner_midnight_timestamp
-
-- [x] Add valkey_cache.rs tests: all async methods with mock or real Valkey
-  - Files: crates/storage/src/valkey_cache.rs
-  - Tests: test_valkey_health_check, test_valkey_get_missing, test_valkey_set_get_roundtrip, test_valkey_set_ex_ttl, test_valkey_del, test_valkey_exists, test_valkey_set_nx_ex
-
-- [x] Add materialized_views.rs tests: DDL execution, view creation, partial failure
-  - Files: crates/storage/src/materialized_views.rs
-  - Tests: test_ensure_views_creates_base_table, test_ensure_views_enables_dedup, test_execute_ddl_success, test_execute_ddl_http_400
-
-- [x] Add tick_persistence.rs remaining tests: build_tick_row, depth rows, prev_close, DDL
+- [ ] H2: QuestDB auto-reconnect with circuit breaker pattern
   - Files: crates/storage/src/tick_persistence.rs
-  - Tests: test_build_tick_row_timestamps, test_build_tick_row_f32_to_f64, test_build_depth_rows_5_levels, test_build_prev_close_row, test_ensure_tick_table_ddl, test_ensure_depth_prev_close_tables
+  - Tests: test_questdb_reconnect_on_failure
 
-- [x] Add instrument_persistence.rs remaining tests: DDL, write functions, timestamps
-  - Files: crates/storage/src/instrument_persistence.rs
-  - Tests: test_ensure_instrument_tables_4_created, test_build_snapshot_timestamp, test_write_build_metadata, test_write_underlyings, test_write_derivative_contracts, test_write_subscribed_indices
+- [ ] M1: Mid-session candle backfill after WS reconnect
+  - Files: crates/core/src/websocket/connection.rs, crates/core/src/historical/candle_fetcher.rs
+  - Tests: test_mid_session_backfill_triggered
 
-## Batch 10: App Crate (8% → 100%)
+- [ ] M2: Valkey auto-reconnect with health check
+  - Files: crates/storage/src/valkey_cache.rs
+  - Tests: test_valkey_reconnect_on_failure
 
-- [x] Add pure helper function tests: format_timeframe_details, format_violation_details, format_cross_match_details, create_log_file_writer, compute_market_close_sleep remaining branches
+- [ ] M3: Stale LTP detection (per-instrument last-update tracking, alert if frozen >10 min)
+  - Files: crates/trading/src/risk/tick_gap_tracker.rs
+  - Tests: test_stale_ltp_detection
+
+### Batch 4 — Observability Metrics (7 items)
+
+- [ ] O1: Export P&L metrics to Prometheus (realized + unrealized gauges)
+  - Files: crates/trading/src/risk/engine.rs
+  - Tests: test_pnl_metrics_exported
+
+- [ ] O2: Add DH-901..910 error code counters to Prometheus
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: test_error_code_counters
+
+- [ ] O3: Circuit breaker state gauge (0=Closed, 1=Open, 2=HalfOpen)
+  - Files: crates/trading/src/oms/circuit_breaker.rs
+  - Tests: test_circuit_breaker_metric
+
+- [ ] O4: Rate limiter usage gauge (orders/sec, violations count)
+  - Files: crates/trading/src/oms/rate_limiter.rs
+  - Tests: test_rate_limiter_metrics
+
+- [ ] O5: Valkey operation metrics (latency, errors, hit/miss counters)
+  - Files: crates/storage/src/valkey_cache.rs
+  - Tests: test_valkey_metrics_emitted
+
+- [ ] O6: Verify Grafana alert contact point wired to Telegram via SSM
+  - Files: scripts/setup-observability.sh
+  - Tests: (infra script — manual verification)
+
+- [ ] O7: OMS order placement latency histogram
+  - Files: crates/trading/src/oms/engine.rs
+  - Tests: test_order_latency_metric
+
+### Batch 5 — Polish (7 items)
+
+- [ ] M4: Clock drift check at boot (compare system time vs HTTP Date header)
   - Files: crates/app/src/main.rs
-  - Tests: test_format_timeframe_details, test_format_violation_details, test_format_cross_match_details, test_create_log_file_writer_success, test_create_log_file_writer_permission_denied, test_compute_market_close_sleep_all_branches
+  - Tests: test_clock_drift_check
 
-- [x] Add TokenHandleBridge tests and init_trading_pipeline tests
-  - Files: crates/app/src/trading_pipeline.rs
-  - Tests: test_token_bridge_valid, test_token_bridge_empty, test_token_bridge_none, test_init_pipeline_no_config, test_init_pipeline_invalid_toml, test_init_pipeline_valid
+- [ ] M6: Channel backpressure metrics (tick channel occupancy gauge)
+  - Files: crates/core/src/pipeline/tick_processor.rs
+  - Tests: test_channel_occupancy_metric
 
-- [x] Add observability init tests: metrics disabled/enabled, tracing disabled/enabled
+- [ ] M7: Await JoinHandles on shutdown with timeout instead of abort
+  - Files: crates/app/src/main.rs
+  - Tests: test_graceful_join_on_shutdown
+
+- [ ] L1: Log rotation config (max 50MB per file, 7 files retention)
+  - Files: crates/app/src/main.rs
+  - Tests: test_log_rotation_configured
+
+- [ ] L2: Disk space monitoring (alert when <5% free)
+  - Files: crates/app/src/infra.rs
+  - Tests: test_disk_space_check
+
+- [ ] L3: Memory RSS monitoring + alert at configurable threshold
+  - Files: crates/app/src/infra.rs
+  - Tests: test_memory_monitoring
+
+- [ ] L4: System metrics export (open FDs, thread count via process collector)
   - Files: crates/app/src/observability.rs
-  - Tests: test_init_metrics_disabled, test_init_metrics_enabled, test_init_tracing_disabled, test_init_tracing_invalid_endpoint
+  - Tests: test_system_metrics_exported
 
-- [x] Add infra.rs tests: is_service_reachable, wait_for_service_healthy, run_docker_compose_up, open_in_browser, is_docker_daemon_running
-  - Files: crates/app/src/infra.rs
-  - Tests: test_service_reachable_loopback, test_service_unreachable, test_wait_healthy_immediate, test_wait_healthy_timeout, test_docker_compose_success, test_docker_compose_failure, test_open_in_browser_platform
+## Constraints
 
-- [x] Add load_instruments tests with mocked instrument loader
-  - Files: crates/app/src/main.rs
-  - Tests: test_load_instruments_fresh_build, test_load_instruments_cached_plan, test_load_instruments_unavailable
-
-- [x] Add main.rs boot path tests with comprehensive service mocking
-  - Files: crates/app/src/main.rs
-  - Tests: test_fast_boot_valid_cache, test_slow_boot_sequence, test_two_phase_boot_decision
-
-- [x] Add consumer tests: tick persistence consumer, candle persistence consumer
-  - Files: crates/app/src/main.rs
-  - Tests: test_tick_consumer_flush_on_batch, test_tick_consumer_shutdown, test_candle_consumer_aggregation, test_candle_consumer_flush
-
-- [x] Add shutdown orchestration tests and historical candle fetch tests
-  - Files: crates/app/src/main.rs
-  - Tests: test_shutdown_ctrl_c, test_shutdown_market_close, test_historical_fetch_trading_day, test_historical_fetch_non_trading_day
-
-- [x] Add run_trading_pipeline tests with full mocked subsystems
-  - Files: crates/app/src/trading_pipeline.rs
-  - Tests: test_pipeline_tick_to_order, test_pipeline_order_update, test_pipeline_strategy_hot_reload, test_pipeline_shutdown
-
-- [x] Add ensure_infra_running integration test with mocked SSM and Docker
-  - Files: crates/app/src/infra.rs
-  - Tests: test_ensure_infra_questdb_already_up, test_ensure_infra_docker_not_running, test_ensure_infra_ssm_fails
+- dry_run=true ALWAYS enforced. No real orders until June end.
+- C3 (market close): paper mode only — log positions, cancel paper OMS state only, never call Dhan exit-all API
+- All OMS metrics track paper orders only
+- MacBook dev primary, AWS future target
+- All new code must pass cargo fmt + clippy + existing tests
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | cargo llvm-cov --workspace | All 6 crates at 100% line coverage |
-| 2 | cargo test --workspace | All existing + new tests pass |
-| 3 | cargo clippy --workspace -- -D warnings | No new warnings |
-| 4 | cargo fmt --check | Formatted correctly |
-| 5 | make quality | Full CI pipeline passes |
+| 1 | App panics in any tokio task | Telegram CRITICAL alert sent, panic info logged before exit |
+| 2 | Docker sends SIGTERM | Graceful shutdown identical to Ctrl+C |
+| 3 | 15:30 IST market close | Paper orders logged, pending cancelled in OMS state only |
+| 4 | 16:00 IST daily reset | Risk/OMS/indicator counters zeroed automatically |
+| 5 | Boot hangs >120s | CRITICAL Telegram alert + process exits |
+| 6 | QuestDB drops mid-session | Auto-reconnect with backoff, resume tick persistence |
+| 7 | Binary crashes during market hours | Makefile wrapper auto-restarts (max 5, with backoff) |
+| 8 | Tick processor hangs 30s | Watchdog detects, Telegram CRITICAL alert |
+| 9 | All candle fetch instruments fail | ERROR + Telegram CRITICAL (not just WARN) |
+| 10 | LTP frozen >10 min for instrument | Stale data alert via Telegram |
+| 11 | Valkey connection drops | Auto-reconnect, cache operations resume |
+| 12 | WS reconnects mid-session | Missed candles auto-backfilled from REST |
+| 13 | System clock drifted >2s | WARN at boot, logged for awareness |
+| 14 | Disk space <5% | Telegram alert, logged at ERROR |
+| 15 | Memory RSS >configured threshold | Telegram alert, logged at ERROR |
