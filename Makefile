@@ -57,7 +57,7 @@ restart: stop ## Restart app (stop + run)
 	@sleep 1
 	@$(MAKE) run
 
-run-supervised: docker-up ## Run with crash supervision (max 5 restarts, exponential backoff)
+run-supervised: docker-up ## Supervised run: restarts on crash up to 5 times with exponential backoff
 	@echo "Starting $(APP_NAME) with crash supervision (max 5 restarts)..."
 	@attempt=0; \
 	max_restarts=5; \

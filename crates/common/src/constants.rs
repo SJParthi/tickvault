@@ -829,6 +829,10 @@ pub const SECONDS_PER_DAY: u32 = 86_400;
 /// before the WebSocket read loop is killed.
 pub const MARKET_CLOSE_DRAIN_BUFFER_SECS: u64 = 2;
 
+/// Maximum acceptable boot time in seconds. If exceeded, CRITICAL Telegram alert fires.
+/// Individual boot steps have their own timeouts; this is the overall ceiling.
+pub const BOOT_TIMEOUT_SECS: u64 = 120;
+
 // ---------------------------------------------------------------------------
 // Authentication — TOTP Configuration
 // ---------------------------------------------------------------------------
@@ -1254,11 +1258,6 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 /// Maximum time to wait for initial token acquisition at startup (seconds).
 /// Prevents indefinite hang if Dhan API is unreachable on boot.
 pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 300;
-
-/// Maximum acceptable boot time in seconds. If exceeded, a CRITICAL Telegram
-/// alert is sent via `BootDeadlineMissed`. Individual steps have their own
-/// timeouts; this guards the aggregate slow boot path.
-pub const BOOT_TIMEOUT_SECS: u64 = 120;
 
 /// Maximum consecutive renewal circuit-breaker cycles before the renewal loop
 /// halts and raises a critical alert. Prevents infinite retry with expired token.

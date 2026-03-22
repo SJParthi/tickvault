@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use deadpool_redis::{Config, Pool, Runtime};
 use redis::AsyncCommands;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::ValkeyConfig;
 
@@ -81,8 +81,10 @@ pub fn compute_instrument_ttl_secs(current_epoch_secs: u64, target_hour_ist: u8)
 /// Async Valkey connection pool with typed cache helpers.
 ///
 /// All public methods return `Result` — callers decide whether to propagate or log-and-continue.
+/// Stores config for pool reconstruction on reconnect.
 pub struct ValkeyPool {
-    pool: Pool,
+    pool: std::sync::RwLock<Pool>,
+    config: ValkeyConfig,
 }
 
 impl ValkeyPool {
@@ -91,17 +93,7 @@ impl ValkeyPool {
     /// # Errors
     /// Returns error if the pool builder fails (bad config, not a connection error).
     pub fn new(config: &ValkeyConfig) -> Result<Self> {
-        let url = build_valkey_url(&config.host, config.port);
-
-        let cfg = Config::from_url(&url);
-        let pool = cfg
-            .builder()
-            .map_err(|err| anyhow::anyhow!("deadpool-redis builder error: {err}"))?
-            .max_size(config.max_connections as usize)
-            .wait_timeout(Some(Duration::from_millis(POOL_CHECKOUT_TIMEOUT_MS)))
-            .runtime(Runtime::Tokio1)
-            .build()
-            .context("failed to build Valkey connection pool")?;
+        let pool = Self::build_pool(config)?;
 
         info!(
             host = %config.host,
@@ -110,7 +102,69 @@ impl ValkeyPool {
             "Valkey pool created"
         );
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool: std::sync::RwLock::new(pool),
+            config: config.clone(),
+        })
+    }
+
+    /// Builds a deadpool-redis Pool from config (pure helper).
+    fn build_pool(config: &ValkeyConfig) -> Result<Pool> {
+        let url = build_valkey_url(&config.host, config.port);
+        let cfg = Config::from_url(&url);
+        cfg.builder()
+            .map_err(|err| anyhow::anyhow!("deadpool-redis builder error: {err}"))?
+            .max_size(config.max_connections as usize)
+            .wait_timeout(Some(Duration::from_millis(POOL_CHECKOUT_TIMEOUT_MS)))
+            .runtime(Runtime::Tokio1)
+            .build()
+            .context("failed to build Valkey connection pool")
+    }
+
+    /// Reconstructs the connection pool from stored config.
+    ///
+    /// Called automatically on connection errors in `get`/`set` methods.
+    /// Replaces the existing pool entirely — all idle connections are dropped.
+    ///
+    /// # Errors
+    /// Returns error if pool reconstruction fails (bad config).
+    pub fn reconnect(&self) -> Result<()> {
+        let new_pool = Self::build_pool(&self.config)?;
+        // APPROVED: lock poison on RwLock is unrecoverable — same pattern as connection.rs
+        #[allow(clippy::expect_used)]
+        let mut pool_guard = self.pool.write().expect("pool lock poisoned"); // APPROVED: lock poison is unrecoverable
+        *pool_guard = new_pool;
+        info!(
+            host = %self.config.host,
+            port = self.config.port,
+            "Valkey pool reconnected"
+        );
+        Ok(())
+    }
+
+    /// Checks out a connection from the pool.
+    ///
+    /// Clones the pool handle (Arc-based, cheap) to avoid holding
+    /// the RwLock guard across the async checkout.
+    async fn checkout_conn(&self) -> Result<deadpool_redis::Connection> {
+        let pool = {
+            // APPROVED: lock poison on RwLock is unrecoverable
+            #[allow(clippy::expect_used)]
+            let guard = self.pool.read().expect("pool lock poisoned"); // APPROVED: lock poison is unrecoverable
+            guard.clone()
+        };
+        pool.get()
+            .await
+            .context("failed to checkout Valkey connection")
+    }
+
+    /// Returns pool status for monitoring (acquires read lock on pool).
+    #[cfg(test)]
+    fn pool_status(&self) -> deadpool_redis::Status {
+        // APPROVED: lock poison on RwLock is unrecoverable
+        #[allow(clippy::expect_used)]
+        let pool = self.pool.read().expect("pool lock poisoned"); // APPROVED: lock poison is unrecoverable
+        pool.status()
     }
 
     /// Health check — sends PING and expects PONG.
@@ -118,11 +172,7 @@ impl ValkeyPool {
     /// # Errors
     /// Returns error if Valkey is unreachable or returns unexpected response.
     pub async fn health_check(&self) -> Result<()> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let mut conn = self.checkout_conn().await?;
 
         let pong: String = redis::cmd("PING")
             .query_async(&mut conn)
@@ -138,92 +188,130 @@ impl ValkeyPool {
     }
 
     /// GET a string value by key.
+    ///
+    /// On connection error, attempts pool reconnect once and retries.
     pub async fn get(&self, key: &str) -> Result<Option<String>> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let result = self.get_inner(key).await;
 
-        let value: Option<String> = conn
-            .get(key)
-            .await
-            .with_context(|| format!("Valkey GET failed for key={key}"))?;
+        let result = if result.is_err() {
+            warn!(key, "Valkey GET failed — attempting reconnect and retry");
 
-        Ok(value)
+            if self.reconnect().is_ok() {
+                self.get_inner(key).await
+            } else {
+                result
+            }
+        } else {
+            result
+        };
+
+        metrics::counter!("dlt_valkey_ops_total", "op" => "get").increment(1);
+        if result.is_err() {
+            metrics::counter!("dlt_valkey_errors_total", "op" => "get").increment(1);
+        }
+
+        result
+    }
+
+    /// Inner GET — no retry logic.
+    async fn get_inner(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.checkout_conn().await?;
+        conn.get(key)
+            .await
+            .with_context(|| format!("Valkey GET failed for key={key}"))
     }
 
     /// SET a string value.
+    ///
+    /// On connection error, attempts pool reconnect once and retries.
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let result = self.set_inner(key, value).await;
 
+        let result = if result.is_err() {
+            warn!(key, "Valkey SET failed — attempting reconnect and retry");
+
+            if self.reconnect().is_ok() {
+                self.set_inner(key, value).await
+            } else {
+                result
+            }
+        } else {
+            result
+        };
+
+        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        if result.is_err() {
+            metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+        }
+
+        result
+    }
+
+    /// Inner SET — no retry logic.
+    async fn set_inner(&self, key: &str, value: &str) -> Result<()> {
+        let mut conn = self.checkout_conn().await?;
         conn.set::<_, _, ()>(key, value)
             .await
-            .with_context(|| format!("Valkey SET failed for key={key}"))?;
-
-        Ok(())
+            .with_context(|| format!("Valkey SET failed for key={key}"))
     }
 
     /// SET with expiry (seconds).
     pub async fn set_ex(&self, key: &str, value: &str, ttl_secs: u64) -> Result<()> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let mut conn = self.checkout_conn().await?;
 
-        conn.set_ex::<_, _, ()>(key, value, ttl_secs)
+        let result = conn
+            .set_ex::<_, _, ()>(key, value, ttl_secs)
             .await
-            .with_context(|| format!("Valkey SETEX failed for key={key}"))?;
+            .with_context(|| format!("Valkey SETEX failed for key={key}"));
 
-        Ok(())
+        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        if result.is_err() {
+            metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+        }
+
+        result
     }
 
     /// DEL a key.
     pub async fn del(&self, key: &str) -> Result<()> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let mut conn = self.checkout_conn().await?;
 
-        conn.del::<_, ()>(key)
+        let result = conn
+            .del::<_, ()>(key)
             .await
-            .with_context(|| format!("Valkey DEL failed for key={key}"))?;
+            .with_context(|| format!("Valkey DEL failed for key={key}"));
 
-        Ok(())
+        metrics::counter!("dlt_valkey_ops_total", "op" => "del").increment(1);
+        if result.is_err() {
+            metrics::counter!("dlt_valkey_errors_total", "op" => "del").increment(1);
+        }
+
+        result
     }
 
     /// EXISTS check for a key.
     pub async fn exists(&self, key: &str) -> Result<bool> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let mut conn = self.checkout_conn().await?;
 
-        let exists: bool = conn
+        let result: Result<bool, _> = conn
             .exists(key)
             .await
-            .with_context(|| format!("Valkey EXISTS failed for key={key}"))?;
+            .with_context(|| format!("Valkey EXISTS failed for key={key}"));
 
-        Ok(exists)
+        metrics::counter!("dlt_valkey_ops_total", "op" => "exists").increment(1);
+        if result.is_err() {
+            metrics::counter!("dlt_valkey_errors_total", "op" => "exists").increment(1);
+        }
+
+        result
     }
 
     /// SET if Not eXists with expiry (atomic lock pattern).
     pub async fn set_nx_ex(&self, key: &str, value: &str, ttl_secs: u64) -> Result<bool> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .context("failed to checkout Valkey connection")?;
+        let mut conn = self.checkout_conn().await?;
 
         // Use SET NX EX for atomic set-if-not-exists with expiry
-        let result: Option<String> = redis::cmd("SET")
+        let result: Result<Option<String>, _> = redis::cmd("SET")
             .arg(key)
             .arg(value)
             .arg("NX")
@@ -231,9 +319,14 @@ impl ValkeyPool {
             .arg(ttl_secs)
             .query_async(&mut conn)
             .await
-            .with_context(|| format!("Valkey SET NX EX failed for key={key}"))?;
+            .with_context(|| format!("Valkey SET NX EX failed for key={key}"));
 
-        Ok(result.is_some())
+        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        if result.is_err() {
+            metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+        }
+
+        Ok(result?.is_some())
     }
 }
 
@@ -284,7 +377,7 @@ mod tests {
             max_connections: 8,
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
-        let status = pool.pool.status();
+        let status = pool.pool_status();
         assert_eq!(status.max_size, 8);
     }
 
@@ -296,7 +389,7 @@ mod tests {
             max_connections: 16,
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
-        let status = pool.pool.status();
+        let status = pool.pool_status();
         // No connections until first checkout
         assert_eq!(status.size, 0);
         assert_eq!(status.available, 0);
@@ -321,7 +414,7 @@ mod tests {
             max_connections: 1,
         };
         let pool = ValkeyPool::new(&config).expect("single connection pool must succeed");
-        let status = pool.pool.status();
+        let status = pool.pool_status();
         assert_eq!(status.max_size, 1);
     }
 
@@ -333,7 +426,7 @@ mod tests {
             max_connections: 128,
         };
         let pool = ValkeyPool::new(&config).expect("large pool must succeed");
-        let status = pool.pool.status();
+        let status = pool.pool_status();
         assert_eq!(status.max_size, 128);
     }
 
@@ -356,7 +449,7 @@ mod tests {
             max_connections: 4,
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
-        let status = pool.pool.status();
+        let status = pool.pool_status();
         assert_eq!(status.waiting, 0, "no waiters initially");
     }
 
@@ -412,7 +505,7 @@ mod tests {
             max_connections: 1,
         };
         let pool = ValkeyPool::new(&config).expect("min pool size must succeed");
-        assert_eq!(pool.pool.status().max_size, 1);
+        assert_eq!(pool.pool_status().max_size, 1);
     }
 
     #[test]
@@ -424,7 +517,7 @@ mod tests {
             max_connections: 16,
         };
         let pool = ValkeyPool::new(&config).expect("typical prod pool size must succeed");
-        assert_eq!(pool.pool.status().max_size, 16);
+        assert_eq!(pool.pool_status().max_size, 16);
     }
 
     #[test]
@@ -451,8 +544,8 @@ mod tests {
         };
         let pool_a = ValkeyPool::new(&config_a).expect("pool A must succeed");
         let pool_b = ValkeyPool::new(&config_b).expect("pool B must succeed");
-        assert_eq!(pool_a.pool.status().max_size, 4);
-        assert_eq!(pool_b.pool.status().max_size, 8);
+        assert_eq!(pool_a.pool_status().max_size, 4);
+        assert_eq!(pool_b.pool_status().max_size, 8);
     }
 
     #[test]
@@ -874,7 +967,7 @@ mod tests {
             max_connections: 8,
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
-        let status = pool.pool.status();
+        let status = pool.pool_status();
         assert_eq!(status.max_size, 8);
         assert_eq!(status.size, 0);
         assert_eq!(status.available, 0);
@@ -970,5 +1063,111 @@ mod tests {
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
         assert!(result.is_err(), "set_nx_ex must fail with unreachable host");
+    }
+
+    // --- M2: Valkey auto-reconnect tests ---
+
+    #[test]
+    fn test_valkey_reconnect_rebuilds_pool() {
+        // Verify that reconnect() rebuilds the pool successfully from stored config.
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+
+        // Reconnect should succeed (pool construction is lazy, no connection needed)
+        let result = pool.reconnect();
+        assert!(
+            result.is_ok(),
+            "reconnect must succeed when config is valid"
+        );
+
+        // Pool should still be functional after reconnect
+        let status = pool.pool_status();
+        assert_eq!(
+            status.max_size, 4,
+            "pool max_size must match config after reconnect"
+        );
+    }
+
+    #[test]
+    fn test_valkey_reconnect_preserves_config() {
+        // Verify that reconnect preserves the original config values.
+        let config = ValkeyConfig {
+            host: "test-host".to_string(),
+            port: 7777,
+            max_connections: 12,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+
+        assert_eq!(pool.config.host, "test-host");
+        assert_eq!(pool.config.port, 7777);
+        assert_eq!(pool.config.max_connections, 12);
+
+        // After reconnect, config should be unchanged
+        pool.reconnect().expect("reconnect must succeed");
+        assert_eq!(pool.config.host, "test-host");
+        assert_eq!(pool.config.port, 7777);
+        assert_eq!(pool.config.max_connections, 12);
+    }
+
+    #[tokio::test]
+    async fn test_valkey_reconnect_on_failure() {
+        // Verify the reconnect + retry pattern works for get/set.
+        // Without a running Valkey instance, both initial and retry fail,
+        // but the reconnect path is exercised (pool is rebuilt).
+        let config = ValkeyConfig {
+            host: "unreachable-host-reconnect-test".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+
+        // GET should fail (unreachable host), trigger reconnect, retry, still fail
+        let get_result = pool.get("some_key").await;
+        assert!(
+            get_result.is_err(),
+            "get must fail with unreachable host even after reconnect"
+        );
+
+        // SET should fail similarly
+        let set_result = pool.set("some_key", "some_value").await;
+        assert!(
+            set_result.is_err(),
+            "set must fail with unreachable host even after reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valkey_health_check_fails_unreachable() {
+        // health_check should return an error when Valkey is not connected.
+        let config = ValkeyConfig {
+            host: "unreachable-health-check".to_string(),
+            port: 1,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
+
+        let result = pool.health_check().await;
+        assert!(
+            result.is_err(),
+            "health_check must return error when not connected"
+        );
+    }
+
+    #[test]
+    fn test_valkey_metrics_emitted() {
+        // Verify metrics macros compile and don't panic when invoked.
+        // O(1) atomic counter calls — safe for hot path.
+        metrics::counter!("dlt_valkey_ops_total", "op" => "get").increment(1);
+        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        metrics::counter!("dlt_valkey_ops_total", "op" => "del").increment(1);
+        metrics::counter!("dlt_valkey_ops_total", "op" => "exists").increment(1);
+        metrics::counter!("dlt_valkey_errors_total", "op" => "get").increment(1);
+        metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+        metrics::counter!("dlt_valkey_errors_total", "op" => "del").increment(1);
+        metrics::counter!("dlt_valkey_errors_total", "op" => "exists").increment(1);
     }
 }

@@ -1311,6 +1311,7 @@ dependencies = [
  "deadpool-redis",
  "dhan-live-trader-common",
  "dhat",
+ "metrics",
  "questdb-rs",
  "redis",
  "reqwest",

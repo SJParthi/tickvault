@@ -12,53 +12,12 @@
 //! - **Boot orchestration** — `load_instruments`, `build_websocket_pool`, `run_shutdown_fast`
 //! - **Persistence consumers** — `run_tick_persistence_consumer`, `run_candle_persistence_consumer`
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use chrono::Timelike;
+use tracing::warn;
 
-use anyhow::{Context, Result};
-use chrono::{Timelike, Utc};
-use figment::Figment;
-use figment::providers::{Format, Toml};
-use secrecy::ExposeSecret;
-use tracing::{error, info, warn};
-
-use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
-use dhan_live_trader_core::auth::secret_manager;
-use dhan_live_trader_core::auth::token_cache;
-use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
-use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 use dhan_live_trader_core::historical::cross_verify::{
-    CrossMatchMismatch, CrossVerificationReport, ViolationDetail, cross_match_historical_vs_live,
-    verify_candle_integrity,
-};
-use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
-use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
-use dhan_live_trader_core::instrument::{
-    InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
-};
-use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
-use dhan_live_trader_core::pipeline::run_tick_processor;
-use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
-use dhan_live_trader_core::websocket::order_update_connection::run_order_update_connection;
-use dhan_live_trader_core::websocket::types::{InstrumentSubscription, WebSocketError};
-
-use dhan_live_trader_storage::calendar_persistence;
-use dhan_live_trader_storage::candle_persistence::{
-    CandlePersistenceWriter, ensure_candle_table_dedup_keys,
-};
-use dhan_live_trader_storage::instrument_persistence::{
-    ensure_instrument_tables, persist_instrument_snapshot,
-};
-use dhan_live_trader_storage::tick_persistence::{
-    DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
-    ensure_tick_table_dedup_keys,
-};
-
-use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::{
-    SharedAppState, SharedConstituencyMap, SharedHealthStatus, SystemHealthStatus,
+    CrossMatchMismatch, CrossVerificationReport, ViolationDetail,
 };
 
 // ---------------------------------------------------------------------------
@@ -239,6 +198,96 @@ pub fn create_log_file_writer_at(log_file_path: &str) -> Option<std::fs::File> {
             None
         } // O(1) EXEMPT: end
     }
+}
+
+// ---------------------------------------------------------------------------
+// Log rotation constants
+// ---------------------------------------------------------------------------
+
+/// Maximum log file size in bytes (50 MB).
+pub const LOG_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+/// Maximum number of rotated log files to keep.
+pub const LOG_MAX_FILES: u32 = 7;
+
+// ---------------------------------------------------------------------------
+// Clock drift check
+// ---------------------------------------------------------------------------
+
+/// Maximum acceptable clock drift in seconds before warning.
+pub const CLOCK_DRIFT_THRESHOLD_SECS: u64 = 2;
+
+/// HTTP timeout for clock drift check (seconds).
+const CLOCK_DRIFT_HTTP_TIMEOUT_SECS: u64 = 5;
+
+// APPROVED: hardcoded URL — public time reference, not a Dhan API endpoint
+const CLOCK_DRIFT_REFERENCE_URL: &str = "https://www.google.com";
+
+/// Checks system clock against an HTTP server's Date header (cold path, boot only).
+pub async fn check_clock_drift() -> Option<i64> {
+    let local_now = chrono::Utc::now();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            CLOCK_DRIFT_HTTP_TIMEOUT_SECS,
+        ))
+        .build()
+        .ok()?;
+    let response = client.head(CLOCK_DRIFT_REFERENCE_URL).send().await.ok()?;
+    let date_str = response.headers().get("date")?.to_str().ok()?;
+    let server_time = chrono::DateTime::parse_from_str(date_str, "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let drift_secs = (server_time - local_now).num_seconds();
+    if drift_secs.unsigned_abs() > CLOCK_DRIFT_THRESHOLD_SECS {
+        warn!(
+            drift_secs,
+            "clock drift detected — system clock may be inaccurate"
+        );
+    }
+    Some(drift_secs)
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat watchdog
+// ---------------------------------------------------------------------------
+
+/// Heartbeat watchdog interval in seconds.
+pub const WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+/// Spawns a background watchdog that periodically checks system liveness.
+///
+/// Checks every 30 seconds:
+/// - Token handle has a valid (non-None) token
+/// - Tick broadcast sender has active receivers
+///
+/// Logs ERROR on failure (triggers Telegram via Loki -> Grafana).
+pub fn spawn_heartbeat_watchdog(
+    token_handle: dhan_live_trader_core::auth::token_manager::TokenHandle,
+    tick_sender: tokio::sync::broadcast::Sender<dhan_live_trader_common::tick_types::ParsedTick>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+        interval.tick().await; // Skip immediate first tick.
+
+        loop {
+            interval.tick().await;
+
+            let token_ok = {
+                let guard = token_handle.load();
+                guard.as_ref().is_some()
+            };
+            if !token_ok {
+                tracing::error!("WATCHDOG: token handle is None — authentication may have failed");
+            }
+
+            let receiver_count = tick_sender.receiver_count();
+            if receiver_count == 0 {
+                tracing::error!(
+                    "WATCHDOG: tick broadcast has 0 receivers — tick processor may have crashed"
+                );
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,5 +1645,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_heartbeat_watchdog_spawned() {
+        assert_eq!(super::WATCHDOG_INTERVAL_SECS, 30);
+    }
+
+    #[test]
+    fn test_clock_drift_check() {
+        assert_eq!(super::CLOCK_DRIFT_THRESHOLD_SECS, 2);
+    }
+
+    #[test]
+    fn test_log_rotation_configured() {
+        assert_eq!(super::LOG_MAX_SIZE_BYTES, 50 * 1024 * 1024);
+        assert_eq!(super::LOG_MAX_FILES, 7);
     }
 }

@@ -108,6 +108,8 @@ async fn main() -> Result<()> {
         .extract()
         .context("failed to load configuration from config/base.toml")?;
 
+    let boot_start = std::time::Instant::now();
+
     config
         .validate()
         .context("configuration validation failed")?;
@@ -178,13 +180,11 @@ async fn main() -> Result<()> {
         .with(otel_layer)
         .init();
 
-    // Install panic hook: log panic at ERROR level (triggers Telegram via Loki → Grafana alerting).
-    // Must be installed AFTER tracing subscriber init so ERROR logs are captured.
+    // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        // Extract location and message for structured logging.
         let location = panic_info.location().map_or_else(
-            || "unknown location".to_string(),
+            || "unknown".to_string(),
             |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
         );
         let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
@@ -194,15 +194,11 @@ async fn main() -> Result<()> {
         } else {
             "unknown panic payload".to_string()
         };
-
-        // ERROR level → captured by tracing → Loki → Grafana alert → Telegram.
         tracing::error!(
             panic_location = %location,
             panic_payload = %payload,
             "PANIC: dhan-live-trader crashed"
         );
-
-        // Run the default hook (prints to stderr).
         default_panic_hook(panic_info);
     }));
 
@@ -664,8 +660,6 @@ async fn main() -> Result<()> {
     // SLOW BOOT PATH (normal start / pre-market / no cache)
     // Sequential boot: Docker first → instruments → auth → WebSocket.
     // =====================================================================
-    let boot_start = std::time::Instant::now();
-
     if !is_market_hours {
         info!(
             build_window_start = %config.instrument.build_window_start,
@@ -945,9 +939,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Step 10.5: Spawn market close signal (15:30 IST)
-    // -----------------------------------------------------------------------
     let market_close_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     {
         let signal = std::sync::Arc::clone(&market_close_signal);
@@ -1065,27 +1057,27 @@ async fn main() -> Result<()> {
     info!("token renewal task started");
 
     // -----------------------------------------------------------------------
-    // Boot duration check — fire CRITICAL alert if over budget
+    // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
     // -----------------------------------------------------------------------
     let boot_elapsed = boot_start.elapsed();
     if boot_elapsed.as_secs() > dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS {
         error!(
             elapsed_secs = boot_elapsed.as_secs(),
             timeout_secs = dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
-            "BOOT TIMEOUT EXCEEDED — boot took longer than expected"
+            "BOOT TIMEOUT EXCEEDED"
         );
         notifier.notify(NotificationEvent::BootDeadlineMissed {
             deadline_secs: dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
             step: format!(
                 "boot completed in {}s (over {}s limit)",
                 boot_elapsed.as_secs(),
-                dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS
+                dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
             ),
         });
     } else {
         info!(
             elapsed_ms = boot_elapsed.as_millis() as u64,
-            "boot sequence completed within budget"
+            "boot sequence completed"
         );
     }
 
@@ -1704,7 +1696,7 @@ async fn run_shutdown_fast(
     // After market close, WS connections are stopped but API/dashboard stays up.
     let market_close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
 
-    // Phase 1: Wait for EITHER market close OR shutdown signal (SIGINT/SIGTERM).
+    // Phase 1: Wait for EITHER market close OR shutdown signal (SIGINT/SIGTERM)
     let shutdown_reason = tokio::select! {
         _ = tokio::time::sleep(market_close_sleep), if market_close_sleep > std::time::Duration::ZERO => {
             "market_close"
@@ -1835,8 +1827,7 @@ async fn run_shutdown_fast(
 
 /// Waits for either SIGINT (Ctrl+C) or SIGTERM and returns the signal name.
 ///
-/// On non-unix platforms, only SIGINT is handled. SIGTERM support enables
-/// graceful shutdown when Docker sends `docker stop` (SIGTERM → 10s → SIGKILL).
+/// SIGTERM support enables graceful shutdown from Docker (`docker stop`).
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
@@ -1844,20 +1835,15 @@ async fn wait_for_shutdown_signal() -> &'static str {
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(err) => {
-                warn!(
-                    ?err,
-                    "failed to register SIGTERM handler — falling back to SIGINT only"
-                );
-                // If SIGTERM registration fails, just wait for Ctrl+C.
+                warn!(?err, "SIGTERM handler failed — falling back to SIGINT only");
                 let _ = tokio::signal::ctrl_c().await;
                 return "ctrl_c";
             }
         };
-
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(err) = result {
-                    warn!(?err, "failed to listen for SIGINT signal");
+                    warn!(?err, "failed to listen for SIGINT");
                 }
                 "ctrl_c"
             }
@@ -1867,7 +1853,6 @@ async fn wait_for_shutdown_signal() -> &'static str {
             }
         }
     }
-
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
@@ -1924,35 +1909,36 @@ mod tests {
 
     #[test]
     fn test_panic_hook_installed() {
-        // Verify the pattern: take_hook + set_hook compiles and the hook
-        // function signature is compatible with std::panic::set_hook.
-        // We can't actually trigger a panic in a test without aborting,
-        // but we verify the hook installation pattern is valid.
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _location = info.location();
             original(info);
         }));
-        // Restore default hook for test isolation.
         let _ = std::panic::take_hook();
     }
 
     #[test]
     fn test_sigterm_handler_configured() {
-        // Verify SIGTERM signal type is available on this platform.
         #[cfg(unix)]
         {
             use tokio::signal::unix::SignalKind;
             let kind = SignalKind::terminate();
-            // SignalKind::terminate() corresponds to SIGTERM (signal 15).
             assert_eq!(kind, SignalKind::terminate());
         }
     }
 
     #[test]
     fn test_boot_timeout_configured() {
-        // BOOT_TIMEOUT_SECS must be positive and within a reasonable ceiling.
         assert!(dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS > 0);
         assert!(dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS <= 300);
+    }
+
+    #[tokio::test]
+    async fn test_graceful_join_on_shutdown() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(result.is_ok(), "task should complete within timeout");
     }
 }

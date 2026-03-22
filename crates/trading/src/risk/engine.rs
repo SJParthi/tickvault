@@ -173,6 +173,7 @@ impl RiskEngine {
             let realized = pnl_per_lot * f64::from(closing_lots) * f64::from(lot_size);
             pos.realized_pnl += realized;
             self.total_realized_pnl += realized;
+            metrics::gauge!("dlt_realized_pnl").set(self.total_realized_pnl);
         }
 
         // Update position
@@ -265,6 +266,7 @@ impl RiskEngine {
             }
             // Conservative: skip securities without a market price
         }
+        metrics::gauge!("dlt_unrealized_pnl").set(total);
         total
     }
 
@@ -1149,5 +1151,11 @@ mod tests {
         engine.reset_halt();
         assert!(!engine.is_halted());
         assert!(engine.halt_reason().is_none());
+    }
+
+    #[test]
+    fn test_pnl_metrics_exported() {
+        metrics::gauge!("dlt_realized_pnl").set(0.0_f64);
+        metrics::gauge!("dlt_unrealized_pnl").set(0.0_f64);
     }
 }

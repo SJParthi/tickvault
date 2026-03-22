@@ -15,6 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+metrics = { workspace = true }
 redis = { workspace = true }
 deadpool-redis = { workspace = true }
 questdb-rs = { workspace = true }
@@ -30,4 +31,4 @@ name = "tick_persistence"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "deadpool-redis", "questdb-rs", "redis", "serde", "serde_json", "thiserror"]
+ignored = ["chrono-tz", "deadpool-redis", "metrics", "questdb-rs", "redis", "serde", "serde_json", "thiserror"]

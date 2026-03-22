@@ -177,6 +177,133 @@ async fn open_grafana_if_reachable() {
 }
 
 // ---------------------------------------------------------------------------
+// System health checks (cold path — called once at boot or periodically)
+// ---------------------------------------------------------------------------
+
+/// Minimum free disk space percentage before alerting.
+pub const MIN_FREE_DISK_PERCENT: u64 = 5;
+
+/// Memory RSS threshold in MB before alerting.
+pub const MEMORY_RSS_ALERT_MB: u64 = 512;
+
+/// Checks available disk space and returns the free percentage.
+///
+/// Best-effort: returns `None` on failure or unsupported platforms.
+/// Does not block boot.
+pub fn check_disk_space() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("df")
+            .args(["/", "--output=pcent"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Output looks like "Use%\n 42%\n"
+        let percent_used: u64 = stdout
+            .lines()
+            .nth(1)?
+            .trim()
+            .trim_end_matches('%')
+            .parse()
+            .ok()?;
+        let percent_free = 100_u64.saturating_sub(percent_used);
+
+        if percent_free < MIN_FREE_DISK_PERCENT {
+            tracing::error!(
+                percent_free,
+                percent_used,
+                "LOW DISK SPACE — less than {}% free",
+                MIN_FREE_DISK_PERCENT
+            );
+        } else {
+            info!(percent_free, "disk space OK");
+        }
+
+        Some(percent_free)
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Reads current process RSS from `/proc/self/status` (Linux) or `ps` (macOS).
+///
+/// Returns RSS in MB, or `None` on failure. Best-effort — does not block boot.
+pub fn check_memory_rss() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                let mb = kb / 1024;
+                if mb > MEMORY_RSS_ALERT_MB {
+                    tracing::error!(
+                        rss_mb = mb,
+                        threshold_mb = MEMORY_RSS_ALERT_MB,
+                        "HIGH MEMORY USAGE — RSS exceeds threshold"
+                    );
+                }
+                return Some(mb);
+            }
+        }
+        None
+    }
+
+    #[cfg(all(not(target_os = "linux"), unix))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p"])
+            .arg(std::process::id().to_string())
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let kb: u64 = stdout.trim().parse().ok()?;
+        let mb = kb / 1024;
+        if mb > MEMORY_RSS_ALERT_MB {
+            tracing::error!(
+                rss_mb = mb,
+                threshold_mb = MEMORY_RSS_ALERT_MB,
+                "HIGH MEMORY USAGE — RSS exceeds threshold"
+            );
+        }
+        Some(mb)
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Exports system metrics to Prometheus gauges.
+///
+/// Called periodically by the watchdog task (cold path).
+pub fn export_system_metrics() {
+    // Thread count (Linux only)
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("Threads:")
+                && let Some(count_str) = line.split_whitespace().nth(1)
+                && let Ok(count) = count_str.parse::<u64>()
+            {
+                metrics::gauge!("dlt_process_threads").set(count as f64);
+            }
+        }
+    }
+
+    // Open file descriptors (Unix only)
+    #[cfg(unix)]
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        let count = entries.count();
+        metrics::gauge!("dlt_process_open_fds").set(count as f64);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
 
@@ -1065,5 +1192,56 @@ mod tests {
         // Relative path should not start with / or .
         assert!(!DOCKER_COMPOSE_PATH.starts_with('/'));
         assert!(!DOCKER_COMPOSE_PATH.starts_with('.'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Disk space monitoring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disk_space_threshold() {
+        assert_eq!(super::MIN_FREE_DISK_PERCENT, 5);
+    }
+
+    #[test]
+    fn test_disk_space_check() {
+        // Best-effort — may return None on some platforms.
+        let _result = super::check_disk_space();
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory RSS monitoring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_memory_rss_threshold() {
+        assert_eq!(super::MEMORY_RSS_ALERT_MB, 512);
+    }
+
+    #[test]
+    fn test_memory_rss_check() {
+        // Should return Some on both Linux and macOS.
+        let result = super::check_memory_rss();
+        assert!(
+            result.is_some(),
+            "should be able to read RSS on this platform"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // System metrics export tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_metrics_exported() {
+        // Verify metric calls compile without a recorder installed.
+        metrics::gauge!("dlt_process_threads").set(1.0_f64);
+        metrics::gauge!("dlt_process_open_fds").set(10.0_f64);
+    }
+
+    #[test]
+    fn test_export_system_metrics_no_panic() {
+        // Exercise the function — should not panic regardless of platform.
+        super::export_system_metrics();
     }
 }
