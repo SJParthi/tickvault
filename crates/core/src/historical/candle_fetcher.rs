@@ -2757,7 +2757,7 @@ mod tests {
             low: vec![195.0, 196.0],
             close: vec![205.0, 206.0],
             volume: vec![10_000, 20_000],
-            timestamp: vec![1_772_928_000, 1_773_014_400],
+            timestamp: vec![1_772_582_400, 1_773_014_400],
             open_interest: vec![],
         }
     }
@@ -3674,7 +3674,7 @@ mod tests {
             low: vec![100.0, 100.0],
             close: vec![150.0, 150.0],
             volume: vec![1000, 2000],
-            timestamp: vec![1_772_928_000, 1_773_014_400],
+            timestamp: vec![1_772_582_400, 1_773_014_400],
             open_interest: vec![],
         };
         let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
@@ -3781,14 +3781,14 @@ mod tests {
             low: vec![95.0],
             close: vec![105.0],
             volume: vec![50000],
-            timestamp: vec![1_772_928_000],
+            timestamp: vec![1_772_582_400],
             open_interest: vec![12000],
         };
         let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
         assert_eq!(invalid, 0);
         assert_eq!(candles.len(), 1);
         assert_eq!(candles[0].open_interest, 12000);
-        assert_eq!(candles[0].timestamp_utc_secs, 1_772_928_000);
+        assert_eq!(candles[0].timestamp_utc_secs, 1_772_582_400);
     }
 
     #[test]
@@ -3922,7 +3922,7 @@ mod tests {
             low: vec![195.0],
             close: vec![205.0],
             volume: vec![10000],
-            timestamp: vec![1_772_928_000],
+            timestamp: vec![1_772_582_400],
             open_interest: vec![],
         };
         let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
@@ -3938,7 +3938,7 @@ mod tests {
             low: vec![195.0, 196.0],
             close: vec![205.0, 206.0],
             volume: vec![10000, 20000],
-            timestamp: vec![1_772_928_000, 1_773_014_400],
+            timestamp: vec![1_772_582_400, 1_773_014_400],
             open_interest: vec![],
         };
         let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
