@@ -75,6 +75,22 @@ else
   echo "Network check: cached (last check <1hr ago)" >&2
 fi
 
+# Check 5: Quick cargo check (catches broken state before Claude starts coding)
+# Only runs on fresh sessions (startup), not resume/compact (already checked)
+INPUT=$(echo "$@" 2>/dev/null || echo "")
+if echo "$INPUT" | grep -q "startup" 2>/dev/null || [ -z "$INPUT" ]; then
+  echo "Running cargo check..." >&2
+  CARGO_CHECK=$(cd "$CWD" && cargo check --workspace 2>&1)
+  CARGO_EXIT=$?
+  if [ $CARGO_EXIT -ne 0 ]; then
+    echo "WARNING: cargo check FAILED — workspace has compile errors" >&2
+    echo "$CARGO_CHECK" | grep '^error' | head -5 >&2
+    echo "" >&2
+  else
+    echo "cargo check: PASS" >&2
+  fi
+fi
+
 # Remind about principles and phase
 echo "" >&2
 echo "Three principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned" >&2
