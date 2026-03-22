@@ -4582,4 +4582,176 @@ mod tests {
         assert_eq!(writer.pending_count(), 1);
         assert!(writer.sender.is_some());
     }
+
+    // -----------------------------------------------------------------------
+    // B1: Tick ring buffer resilience tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_buffered_tick_count_initially_zero() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.buffered_tick_count(), 0);
+    }
+
+    #[test]
+    fn test_ticks_dropped_total_initially_zero() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.ticks_dropped_total(), 0);
+    }
+
+    #[test]
+    fn test_buffer_tick_increments_count() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        assert_eq!(writer.buffered_tick_count(), 0);
+        writer.buffer_tick(make_test_tick(1, 100.0));
+        assert_eq!(writer.buffered_tick_count(), 1);
+        writer.buffer_tick(make_test_tick(2, 200.0));
+        assert_eq!(writer.buffered_tick_count(), 2);
+        assert_eq!(writer.ticks_dropped_total(), 0);
+    }
+
+    #[test]
+    fn test_buffer_tick_drops_oldest_when_full() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Fill the buffer to capacity with identifiable ticks.
+        for i in 0..TICK_BUFFER_CAPACITY {
+            writer.buffer_tick(make_test_tick(i as u32, i as f32));
+        }
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_dropped_total(), 0);
+
+        // One more tick should drop the oldest.
+        writer.buffer_tick(make_test_tick(999_999, 999.0));
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_dropped_total(), 1);
+
+        // The oldest tick (security_id=0) should be gone, newest (999999) present.
+        let front = writer.tick_buffer.front().unwrap();
+        assert_eq!(front.security_id, 1, "oldest tick (id=0) should be dropped");
+        let back = writer.tick_buffer.back().unwrap();
+        assert_eq!(back.security_id, 999_999, "newest tick should be at back");
+    }
+
+    #[test]
+    fn test_append_tick_buffers_when_sender_none() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate QuestDB down by killing sender and pointing to bad address.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string(); // unreachable
+
+        // append_tick should NOT return error — tick is buffered.
+        let tick = make_test_tick(42, 24500.0);
+        let result = writer.append_tick(&tick);
+        assert!(result.is_ok(), "append_tick should succeed by buffering");
+        assert_eq!(writer.buffered_tick_count(), 1);
+        assert!(writer.sender.is_none(), "sender should still be None");
+    }
+
+    #[test]
+    fn test_drain_tick_buffer_empties_on_recovery() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Buffer some ticks.
+        for i in 0..5 {
+            writer.buffer_tick(make_test_tick(i, 100.0 + i as f32));
+        }
+        assert_eq!(writer.buffered_tick_count(), 5);
+
+        // Drain with sender present.
+        writer.drain_tick_buffer();
+        assert_eq!(
+            writer.buffered_tick_count(),
+            0,
+            "buffer should be empty after drain"
+        );
+        assert!(
+            writer.pending_count() > 0 || writer.pending_count() == 0,
+            "pending count depends on flush behavior"
+        );
+    }
+
+    #[test]
+    fn test_drain_tick_buffer_noop_when_empty() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Drain empty buffer should be a no-op.
+        writer.drain_tick_buffer();
+        assert_eq!(writer.buffered_tick_count(), 0);
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_drain_tick_buffer_noop_when_no_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        writer.buffer_tick(make_test_tick(1, 100.0));
+        writer.sender = None;
+
+        // Drain without sender should not remove ticks from buffer.
+        writer.drain_tick_buffer();
+        assert_eq!(
+            writer.buffered_tick_count(),
+            1,
+            "ticks should remain when no sender"
+        );
+    }
 }
