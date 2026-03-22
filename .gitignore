@@ -33,6 +33,7 @@ service-account*.json
 *-secret*.json
 
 # ---- Config overrides (personal machine-specific, not committed) ----
+config/local.toml
 config/local-overrides.toml
 .claude/settings.local.json
 

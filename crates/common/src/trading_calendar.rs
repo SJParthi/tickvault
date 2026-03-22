@@ -21,6 +21,8 @@ pub struct HolidayInfo {
     pub name: String,
     /// Whether this is a Muhurat Trading session (not a regular holiday).
     pub is_muhurat: bool,
+    /// Whether this is an NSE mock trading session (Saturday, ~monthly).
+    pub is_mock: bool,
 }
 
 /// Pre-built trading calendar with O(1) holiday lookups.
@@ -167,16 +169,25 @@ impl TradingCalendar {
     /// Returns the next regular trading day on or after the given date.
     ///
     /// Useful for scheduling: "when is the next day we should start up?"
+    ///
+    /// Bounded to 14 iterations (covers worst case: long weekend + consecutive
+    /// holidays). Returns the starting date if no trading day found within the
+    /// window — this should never happen with a valid NSE calendar.
     pub fn next_trading_day(&self, from: NaiveDate) -> NaiveDate {
+        const MAX_LOOKAHEAD_DAYS: u32 = 14;
         let mut candidate = from;
-        // Safety: loop will terminate within a few days (max consecutive
-        // non-trading days is ~4 for long weekends + holidays).
-        loop {
+        for _ in 0..MAX_LOOKAHEAD_DAYS {
             if self.is_trading_day(candidate) {
                 return candidate;
             }
-            candidate = candidate.succ_opt().unwrap_or(candidate);
+            candidate = match candidate.succ_opt() {
+                Some(next) => next,
+                None => return from, // date overflow — return original
+            };
         }
+        // Exhausted lookahead — should never happen with valid calendar.
+        // Return the last candidate rather than looping forever.
+        candidate
     }
 
     /// Total number of holidays loaded.
@@ -194,17 +205,22 @@ impl TradingCalendar {
         self.mock_trading_dates.len()
     }
 
-    /// Returns all holiday and Muhurat entries for persistence/display.
+    /// Returns all holiday, Muhurat, and mock trading entries for persistence/display.
     /// Sorted by date ascending.
     pub fn all_entries(&self) -> Vec<HolidayInfo> {
-        let mut entries: Vec<HolidayInfo> =
-            Vec::with_capacity(self.holidays.len().saturating_add(self.muhurat_dates.len()));
+        let total_capacity = self
+            .holidays
+            .len()
+            .saturating_add(self.muhurat_dates.len())
+            .saturating_add(self.mock_trading_dates.len());
+        let mut entries: Vec<HolidayInfo> = Vec::with_capacity(total_capacity);
 
         for (&date, name) in &self.holiday_names {
             entries.push(HolidayInfo {
                 date,
                 name: name.clone(),
                 is_muhurat: false,
+                is_mock: false,
             });
         }
 
@@ -213,6 +229,16 @@ impl TradingCalendar {
                 date,
                 name: name.clone(),
                 is_muhurat: true,
+                is_mock: false,
+            });
+        }
+
+        for (&date, name) in &self.mock_trading_names {
+            entries.push(HolidayInfo {
+                date,
+                name: name.clone(),
+                is_muhurat: false,
+                is_mock: true,
             });
         }
 
@@ -418,18 +444,18 @@ mod tests {
         let config = make_test_config();
         let cal = TradingCalendar::from_config(&config).unwrap();
         let entries = cal.all_entries();
-        // 3 holidays + 1 muhurat = 4 entries
-        assert_eq!(entries.len(), 4);
+        // 3 holidays + 1 muhurat + 2 mock = 6 entries
+        assert_eq!(entries.len(), 6);
         // Should be sorted by date
         for window in entries.windows(2) {
             assert!(window[0].date <= window[1].date);
         }
-        // Republic Day is first
-        assert_eq!(entries[0].name, "Republic Day");
-        assert!(!entries[0].is_muhurat);
-        // Last should be Diwali muhurat
-        assert_eq!(entries[3].name, "Diwali 2026");
-        assert!(entries[3].is_muhurat);
+        // First is Mock Trading Session 1 (Jan 3)
+        assert_eq!(entries[0].name, "Mock Trading Session 1");
+        assert!(entries[0].is_mock);
+        // Last should be Diwali muhurat (Nov 8)
+        assert_eq!(entries[5].name, "Diwali 2026");
+        assert!(entries[5].is_muhurat);
     }
 
     // =====================================================================
@@ -516,6 +542,7 @@ mod tests {
         let mut config = make_test_config();
         config.nse_holidays.clear();
         config.muhurat_trading_dates.clear();
+        config.nse_mock_trading_dates.clear();
         let cal = TradingCalendar::from_config(&config).unwrap();
         assert!(cal.all_entries().is_empty());
     }
@@ -527,6 +554,7 @@ mod tests {
         // Create a config with muhurat dates interleaved between holidays.
         // This tests that all_entries correctly merges and sorts both sets.
         let mut config = make_test_config();
+        config.nse_mock_trading_dates.clear(); // isolate holiday/muhurat test
         config.nse_holidays = vec![
             NseHolidayEntry {
                 date: "2026-08-19".to_string(), // Wed
@@ -608,6 +636,7 @@ mod tests {
     fn test_all_entries_only_muhurat_dates() {
         let mut config = make_test_config();
         config.nse_holidays.clear();
+        config.nse_mock_trading_dates.clear();
         config.muhurat_trading_dates = vec![
             NseHolidayEntry {
                 date: "2026-11-08".to_string(),
@@ -634,6 +663,7 @@ mod tests {
     fn test_all_entries_only_holidays() {
         let mut config = make_test_config();
         config.muhurat_trading_dates.clear();
+        config.nse_mock_trading_dates.clear();
         let cal = TradingCalendar::from_config(&config).unwrap();
         let entries = cal.all_entries();
 
@@ -652,6 +682,7 @@ mod tests {
         // Edge case: a date is both a holiday and has muhurat trading
         // (e.g., Diwali is a holiday but has evening muhurat session)
         let mut config = make_test_config();
+        config.nse_mock_trading_dates.clear();
         config.nse_holidays = vec![NseHolidayEntry {
             date: "2026-11-09".to_string(), // Mon
             name: "Diwali".to_string(),
@@ -685,6 +716,7 @@ mod tests {
         // Holidays inserted in reverse chronological order to verify
         // all_entries still returns sorted output regardless of insertion order.
         let mut config = make_test_config();
+        config.nse_mock_trading_dates.clear();
         config.nse_holidays = vec![
             NseHolidayEntry {
                 date: "2026-12-25".to_string(), // Fri
@@ -822,8 +854,9 @@ mod tests {
         let cal = TradingCalendar::from_config(&config).unwrap();
         assert_eq!(cal.holiday_count(), 5);
         assert_eq!(cal.muhurat_count(), 3);
-        // all_entries has both sets
-        assert_eq!(cal.all_entries().len(), 8);
+        assert_eq!(cal.mock_trading_count(), 2);
+        // all_entries has all three sets
+        assert_eq!(cal.all_entries().len(), 10);
     }
 
     #[test]
@@ -842,15 +875,20 @@ mod tests {
 
     #[test]
     fn test_all_entries_is_muhurat_flag_correct() {
-        // Verify is_muhurat flag is set only for muhurat entries, not holidays
+        // Verify is_muhurat flag is set only for muhurat entries, not holidays/mock
         let config = make_test_config();
         let cal = TradingCalendar::from_config(&config).unwrap();
         let entries = cal.all_entries();
 
         let muhurat_entries: Vec<&HolidayInfo> = entries.iter().filter(|e| e.is_muhurat).collect();
-        let holiday_entries: Vec<&HolidayInfo> = entries.iter().filter(|e| !e.is_muhurat).collect();
+        let mock_entries: Vec<&HolidayInfo> = entries.iter().filter(|e| e.is_mock).collect();
+        let holiday_entries: Vec<&HolidayInfo> = entries
+            .iter()
+            .filter(|e| !e.is_muhurat && !e.is_mock)
+            .collect();
 
         assert_eq!(muhurat_entries.len(), 1);
+        assert_eq!(mock_entries.len(), 2);
         assert_eq!(holiday_entries.len(), 3);
         assert_eq!(muhurat_entries[0].name, "Diwali 2026");
     }

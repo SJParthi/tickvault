@@ -271,6 +271,12 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Two-Phase Boot: fast path ONLY during market hours on trading days.
     // Outside market hours or non-trading days → always slow boot.
+    //
+    // INTENTIONAL: Mock trading Saturdays (is_mock_trading_today()) are
+    // excluded from fast boot. Mock sessions have different hours, are not
+    // real market sessions, and should always take the slow boot path
+    // which downloads fresh instruments. This is a safety decision —
+    // is_mock_trading is for logging/awareness only, never for trading gates.
     // -----------------------------------------------------------------------
     let fast_cache = token_cache::load_token_cache_fast();
     let is_market_hours = trading_calendar.is_trading_day_today()

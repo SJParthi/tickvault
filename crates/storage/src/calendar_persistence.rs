@@ -61,9 +61,13 @@ fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
     format!("tcp::addr={}:{};", host, ilp_port)
 }
 
-/// Classifies a calendar entry as either "Muhurat Trading" or "Holiday".
-fn classify_holiday_type(is_muhurat: bool) -> &'static str {
-    if is_muhurat {
+/// Classifies a calendar entry as "Holiday", "Muhurat Trading", or "Mock Trading Session".
+fn classify_holiday_type(
+    entry: &dhan_live_trader_common::trading_calendar::HolidayInfo,
+) -> &'static str {
+    if entry.is_mock {
+        "Mock Trading Session"
+    } else if entry.is_muhurat {
         "Muhurat Trading"
     } else {
         "Holiday"
@@ -229,7 +233,7 @@ fn persist_inner(calendar: &TradingCalendar, questdb_config: &QuestDbConfig) -> 
     let count = entries.len();
 
     for entry in &entries {
-        let holiday_type = classify_holiday_type(entry.is_muhurat);
+        let holiday_type = classify_holiday_type(entry);
 
         // Store holiday date as IST midnight directly (IST-as-UTC convention).
         // QuestDB will display 2026-03-09T00:00:00Z for an IST date of 2026-03-09.
@@ -531,12 +535,38 @@ mod tests {
 
     #[test]
     fn test_classify_holiday_type_regular() {
-        assert_eq!(classify_holiday_type(false), "Holiday");
+        use dhan_live_trader_common::trading_calendar::HolidayInfo;
+        let entry = HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
+            name: "Republic Day".to_string(),
+            is_muhurat: false,
+            is_mock: false,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Holiday");
     }
 
     #[test]
     fn test_classify_holiday_type_muhurat() {
-        assert_eq!(classify_holiday_type(true), "Muhurat Trading");
+        use dhan_live_trader_common::trading_calendar::HolidayInfo;
+        let entry = HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap(),
+            name: "Diwali".to_string(),
+            is_muhurat: true,
+            is_mock: false,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Muhurat Trading");
+    }
+
+    #[test]
+    fn test_classify_holiday_type_mock() {
+        use dhan_live_trader_common::trading_calendar::HolidayInfo;
+        let entry = HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(),
+            name: "Mock Trading Session 1".to_string(),
+            is_muhurat: false,
+            is_mock: true,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Mock Trading Session");
     }
 
     // -----------------------------------------------------------------------

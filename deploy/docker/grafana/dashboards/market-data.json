@@ -725,7 +725,7 @@
             "properties": [
               { "id": "custom.cellOptions", "value": { "type": "color-text" } },
               { "id": "mappings", "value": [
-                { "type": "value", "options": { "Holiday": { "color": "red", "index": 0, "text": "Holiday" }, "Muhurat Trading": { "color": "orange", "index": 1, "text": "Muhurat Trading" } } }
+                { "type": "value", "options": { "Holiday": { "color": "red", "index": 0, "text": "Holiday" }, "Muhurat Trading": { "color": "orange", "index": 1, "text": "Muhurat Trading" }, "Mock Trading Session": { "color": "blue", "index": 2, "text": "Mock Trading Session" } } }
               ] }
             ]
           },
@@ -754,8 +754,8 @@
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
         "sortBy": [{ "desc": false, "displayName": "holiday_date" }]
       },
-      "title": "NSE Holidays & Muhurat Trading Sessions (2026)",
-      "description": "Complete NSE trading calendar loaded from config. Holidays (market closed) and Muhurat Trading sessions (special evening hours on Diwali). Source: NSE Circular NSE/CMTR/71775. Note: Settlement holidays (e.g. Gudi Padwa) are NOT listed here — trading is allowed on settlement holidays.",
+      "title": "NSE Trading Calendar (2026)",
+      "description": "Complete NSE trading calendar: Holidays (red, market closed), Muhurat Trading (orange, special Diwali session), Mock Trading Sessions (blue, Saturday system tests — no real settlement). Source: NSE Circular NSE/CMTR/71775 + NSE Contingency Drill Calendar.",
       "type": "table",
       "targets": [
         {
