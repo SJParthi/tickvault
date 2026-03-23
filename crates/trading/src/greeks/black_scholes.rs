@@ -1296,4 +1296,55 @@ mod tests {
         // intrinsic = 50, price = 10 < 50 * 0.99 → None
         assert!(result.is_none());
     }
+
+    // --- compute_greeks_from_iv tests ---
+
+    #[test]
+    fn test_compute_greeks_from_iv_matches_solver_path() {
+        // Feed the SAME IV that our solver would find → Greeks must match exactly.
+        let solver_result = compute_greeks(OptionSide::Call, S, K, T, R, Q, 10.4506).unwrap();
+        let from_iv = compute_greeks_from_iv(
+            OptionSide::Call,
+            S,
+            K,
+            T,
+            R,
+            Q,
+            solver_result.iv,
+            10.4506,
+            DEFAULT_DAY_COUNT,
+        );
+        assert!(
+            (from_iv.delta - solver_result.delta).abs() < 1e-10,
+            "delta mismatch: {} vs {}",
+            from_iv.delta,
+            solver_result.delta
+        );
+        assert!(
+            (from_iv.gamma - solver_result.gamma).abs() < 1e-10,
+            "gamma mismatch"
+        );
+        assert!(
+            (from_iv.vega - solver_result.vega).abs() < 1e-10,
+            "vega mismatch"
+        );
+    }
+
+    #[test]
+    fn test_compute_greeks_from_iv_different_day_count() {
+        // Same IV but different day_count → theta changes, everything else stays.
+        let dc_365 = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        let dc_252 = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 252.0);
+        // Delta, gamma, vega should be identical.
+        assert!((dc_365.delta - dc_252.delta).abs() < 1e-12);
+        assert!((dc_365.gamma - dc_252.gamma).abs() < 1e-12);
+        assert!((dc_365.vega - dc_252.vega).abs() < 1e-12);
+        // Theta should differ: 365 gives smaller daily theta than 252.
+        assert!(dc_252.theta.abs() > dc_365.theta.abs());
+    }
+
+    #[test]
+    fn test_default_day_count_value() {
+        assert!((DEFAULT_DAY_COUNT - 365.0).abs() < f64::EPSILON);
+    }
 }
