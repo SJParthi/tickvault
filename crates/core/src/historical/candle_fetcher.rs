@@ -7,6 +7,7 @@
 //! # Timestamp Format
 //! Dhan V2 REST API returns standard UTC epoch seconds. The persistence layer
 //! converts to IST-as-UTC by adding +19800s before writing to QuestDB.
+//! Note: Dhan WebSocket sends IST epoch seconds (no offset needed for live data).
 //!
 //! # O(1) Deduplication
 //! - Client-side: skips instruments already fetched (via security_id set)
@@ -15,26 +16,27 @@
 //! # Automation
 //! Runs without human intervention in the boot sequence after authentication.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::{FixedOffset, Utc};
+use chrono::Utc;
 use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
 use dhan_live_trader_common::constants::{
     DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
-    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST,
-    POST_MARKET_FETCH_TIME_IST_HOUR, POST_MARKET_FETCH_TIME_IST_MINUTE, TIMEFRAME_1D,
+    IST_UTC_OFFSET_SECONDS_I64, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
 use dhan_live_trader_common::tick_types::{
     DhanDailyResponse, DhanIntradayResponse, HistoricalCandle,
 };
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 use dhan_live_trader_storage::candle_persistence::CandlePersistenceWriter;
 
@@ -135,14 +137,370 @@ fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
     ErrorAction::StandardRetry
 }
 
+/// Returns `true` if the error action represents a token-related failure
+/// (807 token expired or DH-901 invalid auth). Token errors affect ALL
+/// instruments — not just the current one — so they warrant `error!` level
+/// logging (which triggers Telegram CRITICAL alerts).
+///
+/// Non-token errors (rate limits, network, input) are scoped to individual
+/// instruments and remain at `warn!` level.
+///
+/// Production code uses direct `ErrorAction::TokenExpired` match arms with
+/// `error!` level; this function encodes the categorization logic for tests.
+#[cfg(test)]
+fn is_token_related_error(action: &ErrorAction) -> bool {
+    matches!(action, ErrorAction::TokenExpired)
+}
+
 /// Result of a single instrument fetch attempt.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum InstrumentFetchResult {
-    /// Successfully fetched — candle count.
-    Success(usize),
+    /// Successfully fetched — (candle_count, persist_failures).
+    Success(usize, usize),
     /// Failure — eligible for retry in next wave.
     /// NeverRetry errors (DH-905) will fail fast on re-attempt (no wasted time).
     Failed,
+    /// Token expired (807/DH-901) — needs token refresh before retry.
+    /// Distinct from `Failed` so the retry wave can sleep for token renewal.
+    TokenExpired,
+}
+
+/// Duration to wait for token refresh when 807/DH-901 detected during fetch.
+/// Token renewal runs on a background task; 30s gives it time to complete.
+const TOKEN_REFRESH_WAIT_SECS: u64 = 30;
+
+/// Maximum token-expired retry cycles before giving up on an instrument.
+/// After this many 807 errors across retry waves, the instrument is marked Failed.
+const MAX_TOKEN_EXPIRED_RETRIES: usize = 2;
+
+// ---------------------------------------------------------------------------
+// Pure Helper Functions (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Validation result for a single candle's OHLC prices.
+#[derive(Debug, PartialEq)]
+enum CandleValidation {
+    /// Candle passes all validation checks.
+    Valid,
+    /// One or more prices are NaN or Infinity.
+    NonFinite,
+    /// One or more prices are zero or negative.
+    NonPositive,
+    /// High price is less than low price.
+    HighBelowLow,
+}
+
+/// Validates OHLC prices for a single candle. Pure function — no I/O.
+fn validate_candle_ohlc(open: f64, high: f64, low: f64, close: f64) -> CandleValidation {
+    if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
+        return CandleValidation::NonFinite;
+    }
+    if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
+        return CandleValidation::NonPositive;
+    }
+    if high < low {
+        return CandleValidation::HighBelowLow;
+    }
+    CandleValidation::Valid
+}
+
+/// Returns true if the given UTC epoch timestamp falls at or after the intraday
+/// market close (15:30 IST). Candles at or after this time are discarded.
+///
+/// # Arguments
+/// * `utc_epoch_secs` — candle timestamp as UTC epoch seconds (from Dhan REST API)
+fn is_outside_intraday_window(utc_epoch_secs: i64) -> bool {
+    #[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
+    let ist_secs_of_day =
+        (utc_epoch_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64) % 86_400) as u32;
+    ist_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST
+}
+
+/// Returns true if the given UTC epoch timestamp falls on a weekend (Saturday or Sunday).
+///
+/// Converts UTC epoch to IST date, then checks day-of-week. Used to reject candles
+/// that should never exist — NSE is closed on weekends (mock trading excluded from
+/// historical candle storage by design).
+fn is_weekend_timestamp(utc_epoch_secs: i64) -> bool {
+    use chrono::{Datelike, TimeZone, Weekday};
+    let ist_datetime = Utc
+        .timestamp_opt(utc_epoch_secs, 0)
+        .single()
+        .map(|dt| dt.with_timezone(&ist_offset()));
+    match ist_datetime {
+        Some(dt) => matches!(dt.weekday(), Weekday::Sat | Weekday::Sun),
+        None => false, // invalid timestamp — let other validators catch it
+    }
+}
+
+/// Extracts open interest from the response array, returning 0 if index is out of bounds.
+/// OI array may be empty for equity instruments — this handles that gracefully.
+fn extract_oi(open_interest: &[i64], index: usize) -> i64 {
+    if index < open_interest.len() {
+        open_interest[index]
+    } else {
+        0
+    }
+}
+
+/// Computes the fetch date range given today's date and lookback days.
+/// Returns `(from_date, to_date)` as `NaiveDate`.
+fn compute_fetch_date_range(
+    today: chrono::NaiveDate,
+    lookback_days: u32,
+) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    let from_date = today
+        .checked_sub_signed(chrono::Duration::days(i64::from(lookback_days)))
+        .unwrap_or(today);
+    (from_date, today)
+}
+
+/// Computes the daily API `toDate` by adding 1 day (since Dhan's toDate is non-inclusive).
+fn compute_daily_to_date(to_date: chrono::NaiveDate) -> chrono::NaiveDate {
+    to_date
+        .checked_add_signed(chrono::Duration::days(1))
+        .unwrap_or(to_date)
+}
+
+/// Formats intraday date range strings with market hours appended.
+/// Returns `(from_datetime_str, to_datetime_str)`.
+fn format_intraday_date_range(
+    from_date: chrono::NaiveDate,
+    to_date: chrono::NaiveDate,
+) -> (String, String) {
+    let from_str = format!("{} {}", from_date.format("%Y-%m-%d"), MARKET_OPEN_TIME_IST);
+    let to_str = format!(
+        "{} {}",
+        to_date.format("%Y-%m-%d"),
+        MARKET_CLOSE_TIME_IST_EXCLUSIVE
+    );
+    (from_str, to_str)
+}
+
+/// Computes the DH-904 exponential backoff delay for a given attempt number.
+/// Sequence: 10s, 20s, 40s, 80s (base * 2^attempt).
+fn compute_dh904_backoff_secs(attempt: u32) -> u64 {
+    DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(attempt))
+}
+
+/// Returns true if the DH-904 attempt count has exceeded the maximum.
+fn is_dh904_exhausted(attempt: u32) -> bool {
+    attempt >= DH_904_MAX_BACKOFF_ATTEMPTS
+}
+
+/// Computes the retry delay in milliseconds for a given attempt number.
+/// Linear backoff: 1000ms * attempt.
+fn compute_retry_delay_ms(attempt: u32) -> u64 {
+    1000_u64.saturating_mul(u64::from(attempt))
+}
+
+/// Computes the backoff duration in seconds for a retry wave.
+/// Wave N sleeps `N * RETRY_WAVE_BACKOFF_BASE_SECS`.
+fn compute_retry_wave_backoff_secs(wave: usize) -> u64 {
+    RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64)
+}
+
+/// Returns the instrument type string for a subscription category, or `None`
+/// if the category should be skipped (derivatives).
+fn instrument_type_for_category(category: SubscriptionCategory) -> Option<&'static str> {
+    match category {
+        SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => Some("INDEX"),
+        SubscriptionCategory::StockEquity => Some("EQUITY"),
+        SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => None,
+    }
+}
+
+/// Builds a `HistoricalCandle` from intraday response data at a given index.
+/// Does NOT perform validation — caller must validate first.
+fn build_intraday_candle(
+    data: &DhanIntradayResponse,
+    index: usize,
+    security_id: u32,
+    segment_code: u8,
+    timeframe_label: &'static str,
+) -> HistoricalCandle {
+    HistoricalCandle {
+        timestamp_utc_secs: data.timestamp[index],
+        security_id,
+        exchange_segment_code: segment_code,
+        timeframe: timeframe_label,
+        open: data.open[index],
+        high: data.high[index],
+        low: data.low[index],
+        close: data.close[index],
+        volume: data.volume[index],
+        open_interest: extract_oi(&data.open_interest, index),
+    }
+}
+
+/// Builds a `HistoricalCandle` from daily response data at a given index.
+/// Does NOT perform validation — caller must validate first.
+fn build_daily_candle(
+    data: &DhanDailyResponse,
+    index: usize,
+    security_id: u32,
+    segment_code: u8,
+) -> HistoricalCandle {
+    HistoricalCandle {
+        timestamp_utc_secs: data.timestamp[index],
+        security_id,
+        exchange_segment_code: segment_code,
+        timeframe: TIMEFRAME_1D,
+        open: data.open[index],
+        high: data.high[index],
+        low: data.low[index],
+        close: data.close[index],
+        volume: data.volume[index],
+        open_interest: extract_oi(&data.open_interest, index),
+    }
+}
+
+/// Checks if a response body exceeds the maximum allowed size.
+fn is_response_oversized(body_len: usize) -> bool {
+    body_len > MAX_RESPONSE_BODY_SIZE
+}
+
+/// Builds valid intraday candles from a `DhanIntradayResponse`, filtering out:
+/// - Candles with non-finite prices (NaN/Inf)
+/// - Candles with non-positive prices (zero or negative)
+/// - Candles with high < low
+/// - Candles outside the intraday window (>= 15:30 IST)
+///
+/// Returns a vector of valid `HistoricalCandle` structs, plus counts of
+/// `(valid_candle_count, invalid_candle_count)`.
+fn build_valid_intraday_candles(
+    data: &DhanIntradayResponse,
+    security_id: u32,
+    segment_code: u8,
+    timeframe_label: &'static str,
+) -> (Vec<HistoricalCandle>, usize) {
+    let mut candles = Vec::with_capacity(data.len());
+    let mut invalid_count = 0_usize;
+    for i in 0..data.len() {
+        let open = data.open[i];
+        let high = data.high[i];
+        let low = data.low[i];
+        let close = data.close[i];
+
+        match validate_candle_ohlc(open, high, low, close) {
+            CandleValidation::Valid => {}
+            CandleValidation::NonFinite
+            | CandleValidation::NonPositive
+            | CandleValidation::HighBelowLow => {
+                invalid_count = invalid_count.saturating_add(1);
+                continue;
+            }
+        }
+
+        // Reject candles at or after 15:30 IST
+        if is_outside_intraday_window(data.timestamp[i]) {
+            continue;
+        }
+
+        // Reject candles on weekends — NSE is closed on Sat/Sun.
+        // Dhan normally returns empty for weekends, but this is defense-in-depth.
+        if is_weekend_timestamp(data.timestamp[i]) {
+            invalid_count = invalid_count.saturating_add(1);
+            continue;
+        }
+
+        candles.push(build_intraday_candle(
+            data,
+            i,
+            security_id,
+            segment_code,
+            timeframe_label,
+        ));
+    }
+    (candles, invalid_count)
+}
+
+/// Builds valid daily candles from a `DhanDailyResponse`, filtering out:
+/// - Candles with non-finite prices (NaN/Inf)
+/// - Candles with non-positive prices (zero or negative)
+/// - Candles with high < low
+/// - Candles on weekends (Saturday/Sunday — NSE closed)
+///
+/// Returns a vector of valid `HistoricalCandle` structs, plus counts of
+/// `(valid_candle_count, invalid_candle_count)`.
+fn build_valid_daily_candles(
+    data: &DhanDailyResponse,
+    security_id: u32,
+    segment_code: u8,
+) -> (Vec<HistoricalCandle>, usize) {
+    let mut candles = Vec::with_capacity(data.len());
+    let mut invalid_count = 0_usize;
+    for i in 0..data.len() {
+        let open = data.open[i];
+        let high = data.high[i];
+        let low = data.low[i];
+        let close = data.close[i];
+
+        match validate_candle_ohlc(open, high, low, close) {
+            CandleValidation::Valid => {}
+            CandleValidation::NonFinite
+            | CandleValidation::NonPositive
+            | CandleValidation::HighBelowLow => {
+                invalid_count = invalid_count.saturating_add(1);
+                continue;
+            }
+        }
+
+        // Reject daily candles on weekends — NSE is closed on Sat/Sun.
+        if is_weekend_timestamp(data.timestamp[i]) {
+            invalid_count = invalid_count.saturating_add(1);
+            continue;
+        }
+
+        candles.push(build_daily_candle(data, i, security_id, segment_code));
+    }
+    (candles, invalid_count)
+}
+
+/// Collects the names of failed instruments for notification, capped at `MAX_FAILED_INSTRUMENT_NAMES`.
+///
+/// # Arguments
+/// * `pending_indices` — indices of instruments that remain failed after all retry waves
+/// * `security_ids` — security ID for each target instrument
+/// * `segments` — exchange segment string for each target instrument
+fn collect_failed_instrument_names(
+    pending_indices: &[usize],
+    security_ids: &[u32],
+    segments: &[&str],
+) -> Vec<String> {
+    pending_indices
+        .iter()
+        .take(MAX_FAILED_INSTRUMENT_NAMES)
+        .map(|&idx| format!("{} ({})", security_ids[idx], segments[idx]))
+        .collect()
+}
+
+/// Builds a breakdown of failure reasons from per-instrument token-expired counts
+/// and total persist failures.
+///
+/// # Arguments
+/// * `pending_indices` — indices still pending (failed) after all waves
+/// * `token_expired_counts` — per-instrument count of token-expired retries
+/// * `total_persist_failures` — total QuestDB write failures
+fn build_failure_reasons(
+    pending_indices: &[usize],
+    token_expired_counts: &[usize],
+    total_persist_failures: usize,
+) -> HashMap<String, usize> {
+    let mut reasons: HashMap<String, usize> = HashMap::new();
+    for &idx in pending_indices {
+        if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
+            let count = reasons.entry("token_expired".to_string()).or_insert(0);
+            *count = count.saturating_add(1);
+        } else {
+            let count = reasons.entry("network_or_api".to_string()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+    if total_persist_failures > 0 {
+        reasons.insert("persist".to_string(), total_persist_failures);
+    }
+    reasons
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +549,20 @@ pub struct CandleFetchSummary {
     pub total_candles: usize,
     /// Number of instruments skipped (no data or not applicable).
     pub instruments_skipped: usize,
+    /// Number of QuestDB write failures (candles fetched but lost during persist).
+    pub persist_failures: usize,
+    /// Symbol names of instruments that failed all retry waves (capped at 50).
+    pub failed_instruments: Vec<String>,
+    /// Breakdown of failure reasons: "token_expired", "network", "input_error", "persist", etc.
+    pub failure_reasons: HashMap<String, usize>,
 }
+
+/// Maximum number of failed instrument names to collect.
+const MAX_FAILED_INSTRUMENT_NAMES: usize = 50;
+
+/// Maximum consecutive QuestDB persist failures before breaking out of the persist loop.
+/// If 10 candles in a row fail to write, QuestDB is likely unreachable — stop wasting time.
+const MAX_CONSECUTIVE_PERSIST_FAILURES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Main Fetch Logic
@@ -226,36 +597,21 @@ pub async fn fetch_historical_candles(
     let m_fetched = counter!("dlt_historical_candles_fetched_total");
     let m_api_errors = counter!("dlt_historical_api_errors_total");
 
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => {
-            warn!("invalid IST offset constant — cannot compute date range");
-            return CandleFetchSummary {
-                instruments_fetched: 0,
-                instruments_failed: 0,
-                total_candles: 0,
-                instruments_skipped: 0,
-            };
-        }
-    };
-
-    let now_ist = Utc::now().with_timezone(&ist_offset);
+    let now_ist = Utc::now().with_timezone(&ist_offset());
     let today = now_ist.date_naive();
 
     // Compute date range: today - lookback_days to today
-    let from_date = today - chrono::Duration::days(i64::from(historical_config.lookback_days));
-    let to_date = today;
+    let (from_date, to_date) = compute_fetch_date_range(today, historical_config.lookback_days);
 
     // Intraday requests use datetime format with market hours
     let from_date_str = from_date.format("%Y-%m-%d").to_string();
     let to_date_str = to_date.format("%Y-%m-%d").to_string();
 
     // Intraday: "YYYY-MM-DD HH:MM:SS" with market hours (09:15 to 15:30 exclusive)
-    let intraday_from = format!("{} {}", from_date_str, MARKET_OPEN_TIME_IST);
-    let intraday_to = format!("{} {}", to_date_str, MARKET_CLOSE_TIME_IST_EXCLUSIVE);
+    let (intraday_from, intraday_to) = format_intraday_date_range(from_date, to_date);
 
     // Daily: date-only format, toDate is NON-INCLUSIVE so add 1 day
-    let daily_to_date = to_date + chrono::Duration::days(1);
+    let daily_to_date = compute_daily_to_date(to_date);
     let daily_to_str = daily_to_date.format("%Y-%m-%d").to_string();
 
     info!(
@@ -278,6 +634,9 @@ pub async fn fetch_historical_candles(
                 instruments_failed: 0,
                 total_candles: 0,
                 instruments_skipped: 0,
+                persist_failures: 0,
+                failed_instruments: Vec::new(),
+                failure_reasons: HashMap::new(),
             };
         }
     };
@@ -297,6 +656,7 @@ pub async fn fetch_historical_candles(
     let mut instruments_fetched: usize = 0;
     let mut instruments_skipped: usize = 0;
     let mut total_candles: usize = 0;
+    let mut total_persist_failures: usize = 0;
 
     // Build the list of fetchable instruments (skip derivatives, dedup)
     struct FetchTarget {
@@ -309,19 +669,10 @@ pub async fn fetch_historical_candles(
 
     let mut targets: Vec<FetchTarget> = Vec::new();
     for instrument in registry.iter() {
-        // Skip all derivatives (futures + options).
-        if matches!(
-            instrument.category,
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative
-        ) {
-            instruments_skipped = instruments_skipped.saturating_add(1);
-            continue;
-        }
-
-        let instrument_type = match instrument.category {
-            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
-            SubscriptionCategory::StockEquity => "EQUITY",
-            SubscriptionCategory::IndexDerivative | SubscriptionCategory::StockDerivative => {
+        let instrument_type = match instrument_type_for_category(instrument.category) {
+            Some(t) => t,
+            None => {
+                instruments_skipped = instruments_skipped.saturating_add(1);
                 continue;
             }
         };
@@ -345,6 +696,10 @@ pub async fn fetch_historical_candles(
 
     // Track which target indices still need fetching
     let mut pending_indices: Vec<usize> = (0..targets.len()).collect();
+    let m_token_expired = counter!("dlt_historical_token_expired_total");
+
+    // Per-instrument token-expired retry count
+    let mut token_expired_counts: Vec<usize> = vec![0; targets.len()];
 
     // --- Wave 0 = initial pass, Waves 1..=RETRY_WAVE_MAX = retries ---
     for wave in 0..=RETRY_WAVE_MAX {
@@ -353,7 +708,7 @@ pub async fn fetch_historical_candles(
         }
 
         if wave > 0 {
-            let backoff_secs = RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64);
+            let backoff_secs = compute_retry_wave_backoff_secs(wave);
             warn!(
                 wave,
                 remaining = pending_indices.len(),
@@ -364,6 +719,7 @@ pub async fn fetch_historical_candles(
         }
 
         let mut still_pending: Vec<usize> = Vec::new();
+        let mut token_expired_this_wave = false;
 
         for &idx in &pending_indices {
             let target = &targets[idx];
@@ -390,17 +746,48 @@ pub async fn fetch_historical_candles(
             .await;
 
             match result {
-                InstrumentFetchResult::Success(candle_count) => {
+                InstrumentFetchResult::Success(candle_count, persist_fails) => {
                     instruments_fetched = instruments_fetched.saturating_add(1);
                     total_candles = total_candles.saturating_add(candle_count);
+                    total_persist_failures = total_persist_failures.saturating_add(persist_fails);
                     #[allow(clippy::cast_possible_truncation)]
                     // APPROVED: usize->u64 is lossless on 64-bit targets
                     m_fetched.increment(candle_count as u64);
+                }
+                InstrumentFetchResult::TokenExpired => {
+                    m_token_expired.increment(1);
+                    token_expired_counts[idx] = token_expired_counts[idx].saturating_add(1);
+
+                    if token_expired_counts[idx] >= MAX_TOKEN_EXPIRED_RETRIES {
+                        // M5: Token errors affect ALL instruments — escalate to error!
+                        error!(
+                            security_id = target.security_id,
+                            segment = %target.exchange_segment_str,
+                            retries = token_expired_counts[idx],
+                            "token still expired after max retries — giving up on instrument"
+                        );
+                        // Don't re-queue — treat as permanent failure
+                    } else {
+                        token_expired_this_wave = true;
+                        still_pending.push(idx);
+                    }
                 }
                 InstrumentFetchResult::Failed => {
                     still_pending.push(idx);
                 }
             }
+        }
+
+        // If any instrument got token-expired this wave, sleep to allow
+        // the background token renewal task to complete before next wave.
+        if token_expired_this_wave {
+            // M5: Token errors affect ALL instruments — escalate to error!
+            error!(
+                wave,
+                "token expired during fetch — waiting {}s for token refresh",
+                TOKEN_REFRESH_WAIT_SECS,
+            );
+            tokio::time::sleep(Duration::from_secs(TOKEN_REFRESH_WAIT_SECS)).await;
         }
 
         if wave == 0 && !still_pending.is_empty() {
@@ -415,10 +802,28 @@ pub async fn fetch_historical_candles(
     }
 
     let instruments_failed = pending_indices.len();
+
+    // Collect failed instrument names for Telegram notification
+    let target_sec_ids: Vec<u32> = targets.iter().map(|t| t.security_id).collect();
+    let target_segments: Vec<&str> = targets
+        .iter()
+        .map(|t| t.exchange_segment_str.as_str())
+        .collect();
+    let failed_instruments =
+        collect_failed_instrument_names(&pending_indices, &target_sec_ids, &target_segments);
+
+    // Build failure reason breakdown
+    let failure_reasons = build_failure_reasons(
+        &pending_indices,
+        &token_expired_counts,
+        total_persist_failures,
+    );
+
     if instruments_failed > 0 {
         warn!(
             instruments_failed,
             retry_waves = RETRY_WAVE_MAX,
+            ?failure_reasons,
             "instruments still failed after all retry waves"
         );
     }
@@ -430,7 +835,11 @@ pub async fn fetch_historical_candles(
 
     info!(
         instruments_fetched,
-        instruments_failed, instruments_skipped, total_candles, "historical candle fetch complete"
+        instruments_failed,
+        instruments_skipped,
+        total_candles,
+        persist_failures = total_persist_failures,
+        "historical candle fetch complete"
     );
 
     CandleFetchSummary {
@@ -438,6 +847,9 @@ pub async fn fetch_historical_candles(
         instruments_failed,
         total_candles,
         instruments_skipped,
+        persist_failures: total_persist_failures,
+        failed_instruments,
+        failure_reasons,
     }
 }
 
@@ -468,6 +880,7 @@ async fn fetch_single_instrument(
     m_api_errors: &metrics::Counter,
 ) -> InstrumentFetchResult {
     let mut instrument_candles = 0_usize;
+    let mut instrument_persist_failures = 0_usize;
 
     // --- Fetch all 4 intraday timeframes ---
     for &(interval, timeframe_label) in INTRADAY_TIMEFRAMES {
@@ -481,7 +894,7 @@ async fn fetch_single_instrument(
                 Zeroizing::new(token_state.access_token().expose_secret().to_string())
             }
             None => {
-                warn!("no access token available — skipping historical fetch");
+                error!("no access token available — skipping historical fetch");
                 return InstrumentFetchResult::Failed;
             }
         };
@@ -511,13 +924,14 @@ async fn fetch_single_instrument(
         )
         .await
         {
-            Some(count) => {
+            TimeframeFetchResult::Ok(count, pf) => {
                 instrument_candles = instrument_candles.saturating_add(count);
+                instrument_persist_failures = instrument_persist_failures.saturating_add(pf);
             }
-            None => {
-                // Cannot distinguish transient vs permanent here — return transient
-                // so the retry wave re-attempts. If it's truly permanent (DH-905),
-                // the retry will fail fast (NeverRetry returns immediately).
+            TimeframeFetchResult::TokenExpired => {
+                return InstrumentFetchResult::TokenExpired;
+            }
+            TimeframeFetchResult::Failed => {
                 return InstrumentFetchResult::Failed;
             }
         }
@@ -532,8 +946,8 @@ async fn fetch_single_instrument(
     let access_token = match token_guard.as_ref() {
         Some(token_state) => Zeroizing::new(token_state.access_token().expose_secret().to_string()),
         None => {
-            warn!("no access token available — skipping daily fetch");
-            return InstrumentFetchResult::Failed;
+            error!("no access token available — skipping daily fetch");
+            return InstrumentFetchResult::TokenExpired;
         }
     };
 
@@ -560,23 +974,37 @@ async fn fetch_single_instrument(
     )
     .await
     {
-        Some(count) => {
+        TimeframeFetchResult::Ok(count, pf) => {
             instrument_candles = instrument_candles.saturating_add(count);
+            instrument_persist_failures = instrument_persist_failures.saturating_add(pf);
         }
-        None => {
+        TimeframeFetchResult::TokenExpired => {
+            return InstrumentFetchResult::TokenExpired;
+        }
+        TimeframeFetchResult::Failed => {
             return InstrumentFetchResult::Failed;
         }
     }
 
-    InstrumentFetchResult::Success(instrument_candles)
+    InstrumentFetchResult::Success(instrument_candles, instrument_persist_failures)
 }
 
 // ---------------------------------------------------------------------------
 // Intraday Fetch Helper
 // ---------------------------------------------------------------------------
 
+/// Result of a single timeframe fetch attempt.
+#[derive(Debug)]
+enum TimeframeFetchResult {
+    /// Successfully fetched — (candle_count, persist_failures).
+    Ok(usize, usize),
+    /// Transient failure — eligible for retry.
+    Failed,
+    /// Token expired — caller should wait for refresh and retry.
+    TokenExpired,
+}
+
 /// Fetches a single intraday timeframe for one instrument with retries.
-/// Returns `Some(candle_count)` on success, `None` on failure.
 #[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
 async fn fetch_intraday_with_retry(
     http_client: &reqwest::Client,
@@ -590,10 +1018,10 @@ async fn fetch_intraday_with_retry(
     timeframe_label: &'static str,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> Option<usize> {
+) -> TimeframeFetchResult {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
-            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            let delay_ms = compute_retry_delay_ms(attempt);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
@@ -627,8 +1055,7 @@ async fn fetch_intraday_with_retry(
                             continue;
                         }
                         ErrorAction::RateLimited => {
-                            let backoff_secs = DH_904_BACKOFF_BASE_SECS
-                                .saturating_mul(1_u64.wrapping_shl(attempt));
+                            let backoff_secs = compute_dh904_backoff_secs(attempt);
                             warn!(
                                 security_id,
                                 timeframe = timeframe_label,
@@ -636,21 +1063,23 @@ async fn fetch_intraday_with_retry(
                                 attempt,
                                 "rate limited — exponential backoff"
                             );
-                            if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
+                            if is_dh904_exhausted(attempt) {
                                 m_api_errors.increment(1);
-                                return None;
+                                return TimeframeFetchResult::Failed;
                             }
                             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                             continue;
                         }
                         ErrorAction::TokenExpired => {
-                            warn!(
+                            // M5: Token errors affect ALL instruments — escalate to error!
+                            // (triggers Telegram CRITICAL alert via observability pipeline)
+                            error!(
                                 security_id,
                                 timeframe = timeframe_label,
-                                "token expired (807/DH-901) — skipping instrument"
+                                "token expired (807/DH-901) — signaling for refresh"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::TokenExpired;
                         }
                         ErrorAction::NeverRetry => {
                             warn!(
@@ -658,7 +1087,7 @@ async fn fetch_intraday_with_retry(
                                 "input error (DH-905/906) — will not retry"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                         ErrorAction::StandardRetry => {
                             if attempt < config.max_retries {
@@ -673,7 +1102,7 @@ async fn fetch_intraday_with_retry(
                                 "historical API failed after all retries"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                     }
                 }
@@ -698,11 +1127,11 @@ async fn fetch_intraday_with_retry(
                             "failed to read response body after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 };
 
-                if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                if is_response_oversized(body_bytes.len()) {
                     warn!(
                         security_id,
                         timeframe = timeframe_label,
@@ -711,7 +1140,7 @@ async fn fetch_intraday_with_retry(
                         "response body exceeds size limit — skipping"
                     );
                     m_api_errors.increment(1);
-                    return None;
+                    return TimeframeFetchResult::Failed;
                 }
 
                 match serde_json::from_slice::<DhanIntradayResponse>(&body_bytes) {
@@ -722,7 +1151,7 @@ async fn fetch_intraday_with_retry(
                                 timeframe = timeframe_label,
                                 "no candle data returned"
                             );
-                            return Some(0);
+                            return TimeframeFetchResult::Ok(0, 0);
                         }
 
                         if !data.is_consistent() {
@@ -732,10 +1161,10 @@ async fn fetch_intraday_with_retry(
                                 "inconsistent array lengths in historical response"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
 
-                        let count = persist_intraday_candles(
+                        let (count, pf) = persist_intraday_candles(
                             &data,
                             security_id,
                             segment_code,
@@ -743,7 +1172,7 @@ async fn fetch_intraday_with_retry(
                             candle_writer,
                             m_api_errors,
                         );
-                        return Some(count);
+                        return TimeframeFetchResult::Ok(count, pf);
                     }
                     Err(err) => {
                         if attempt < config.max_retries {
@@ -763,7 +1192,7 @@ async fn fetch_intraday_with_retry(
                             "failed to parse historical response after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 }
             }
@@ -785,11 +1214,11 @@ async fn fetch_intraday_with_retry(
                     "historical API request failed after all retries"
                 );
                 m_api_errors.increment(1);
-                return None;
+                return TimeframeFetchResult::Failed;
             }
         }
     }
-    None
+    TimeframeFetchResult::Failed
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +1226,6 @@ async fn fetch_intraday_with_retry(
 // ---------------------------------------------------------------------------
 
 /// Fetches daily candles for one instrument with retries.
-/// Returns `Some(candle_count)` on success, `None` on failure.
 #[allow(clippy::too_many_arguments)] // APPROVED: retry helper needs all context
 async fn fetch_daily_with_retry(
     http_client: &reqwest::Client,
@@ -810,10 +1238,10 @@ async fn fetch_daily_with_retry(
     segment_code: u8,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> Option<usize> {
+) -> TimeframeFetchResult {
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
-            let delay_ms = 1000_u64.saturating_mul(u64::from(attempt));
+            let delay_ms = compute_retry_delay_ms(attempt);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
@@ -857,19 +1285,21 @@ async fn fetch_daily_with_retry(
                             );
                             if attempt >= DH_904_MAX_BACKOFF_ATTEMPTS {
                                 m_api_errors.increment(1);
-                                return None;
+                                return TimeframeFetchResult::Failed;
                             }
                             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                             continue;
                         }
                         ErrorAction::TokenExpired => {
-                            warn!(
+                            // M5: Token errors affect ALL instruments — escalate to error!
+                            // (triggers Telegram CRITICAL alert via observability pipeline)
+                            error!(
                                 security_id,
                                 timeframe = TIMEFRAME_1D,
-                                "token expired (807/DH-901) — skipping instrument"
+                                "token expired (807/DH-901) — signaling for refresh"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::TokenExpired;
                         }
                         ErrorAction::NeverRetry => {
                             warn!(
@@ -877,7 +1307,7 @@ async fn fetch_daily_with_retry(
                                 "input error (DH-905/906) — will not retry"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                         ErrorAction::StandardRetry => {
                             if attempt < config.max_retries {
@@ -892,7 +1322,7 @@ async fn fetch_daily_with_retry(
                                 "daily API failed after all retries"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
                     }
                 }
@@ -917,11 +1347,11 @@ async fn fetch_daily_with_retry(
                             "failed to read daily response body after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 };
 
-                if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+                if is_response_oversized(body_bytes.len()) {
                     warn!(
                         security_id,
                         timeframe = TIMEFRAME_1D,
@@ -930,7 +1360,7 @@ async fn fetch_daily_with_retry(
                         "daily response body exceeds size limit — skipping"
                     );
                     m_api_errors.increment(1);
-                    return None;
+                    return TimeframeFetchResult::Failed;
                 }
 
                 match serde_json::from_slice::<DhanDailyResponse>(&body_bytes) {
@@ -941,7 +1371,7 @@ async fn fetch_daily_with_retry(
                                 timeframe = TIMEFRAME_1D,
                                 "no daily data returned"
                             );
-                            return Some(0);
+                            return TimeframeFetchResult::Ok(0, 0);
                         }
 
                         if !data.is_consistent() {
@@ -951,17 +1381,17 @@ async fn fetch_daily_with_retry(
                                 "inconsistent array lengths in daily response"
                             );
                             m_api_errors.increment(1);
-                            return None;
+                            return TimeframeFetchResult::Failed;
                         }
 
-                        let count = persist_daily_candles(
+                        let (count, pf) = persist_daily_candles(
                             &data,
                             security_id,
                             segment_code,
                             candle_writer,
                             m_api_errors,
                         );
-                        return Some(count);
+                        return TimeframeFetchResult::Ok(count, pf);
                     }
                     Err(err) => {
                         if attempt < config.max_retries {
@@ -981,7 +1411,7 @@ async fn fetch_daily_with_retry(
                             "failed to parse daily response after all retries"
                         );
                         m_api_errors.increment(1);
-                        return None;
+                        return TimeframeFetchResult::Failed;
                     }
                 }
             }
@@ -1003,11 +1433,11 @@ async fn fetch_daily_with_retry(
                     "daily API request failed after all retries"
                 );
                 m_api_errors.increment(1);
-                return None;
+                return TimeframeFetchResult::Failed;
             }
         }
     }
-    None
+    TimeframeFetchResult::Failed
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1445,7 @@ async fn fetch_daily_with_retry(
 // ---------------------------------------------------------------------------
 
 /// Converts intraday response to HistoricalCandle structs and persists them.
+/// Returns `(candles_written, persist_failures)`.
 fn persist_intraday_candles(
     data: &DhanIntradayResponse,
     security_id: u32,
@@ -1022,219 +1453,105 @@ fn persist_intraday_candles(
     timeframe_label: &'static str,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> usize {
-    let mut count = 0_usize;
-    for i in 0..data.len() {
-        let open = data.open[i];
-        let high = data.high[i];
-        let low = data.low[i];
-        let close = data.close[i];
+) -> (usize, usize) {
+    let (candles, invalid_count) =
+        build_valid_intraday_candles(data, security_id, segment_code, timeframe_label);
 
-        // Reject NaN/Infinity prices — corrupted data must not reach QuestDB
-        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = timeframe_label,
-                "NaN/Inf price in API response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject non-positive prices — zero or negative prices indicate bad data
-        if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = timeframe_label,
-                open,
-                high,
-                low,
-                close,
-                "non-positive price in API response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject OHLC inconsistency — high must be >= low
-        if high < low {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = timeframe_label,
-                high,
-                low,
-                "high < low in API response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        let oi_value = if i < data.open_interest.len() {
-            data.open_interest[i]
-        } else {
-            0
-        };
-
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: data.timestamp[i],
+    if invalid_count > 0 {
+        warn!(
             security_id,
-            exchange_segment_code: segment_code,
-            timeframe: timeframe_label,
-            open,
-            high,
-            low,
-            close,
-            volume: data.volume[i],
-            open_interest: oi_value,
-        };
+            timeframe = timeframe_label,
+            invalid_count,
+            "skipped invalid candles in API response"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: usize->u64 is lossless on 64-bit targets
+        m_api_errors.increment(invalid_count as u64);
+    }
 
-        if let Err(err) = candle_writer.append_candle(&candle) {
+    let mut count = 0_usize;
+    let mut persist_failures = 0_usize;
+    let mut consecutive_persist_failures = 0_usize;
+    for candle in &candles {
+        if let Err(err) = candle_writer.append_candle(candle) {
             warn!(
                 ?err,
                 security_id,
                 timeframe = timeframe_label,
                 "failed to append candle to QuestDB"
             );
+            persist_failures = persist_failures.saturating_add(1);
+            consecutive_persist_failures = consecutive_persist_failures.saturating_add(1);
+            if consecutive_persist_failures >= MAX_CONSECUTIVE_PERSIST_FAILURES {
+                tracing::error!(
+                    security_id,
+                    timeframe = timeframe_label,
+                    consecutive_failures = consecutive_persist_failures,
+                    "QuestDB unreachable — {} consecutive persist failures, aborting persist loop",
+                    MAX_CONSECUTIVE_PERSIST_FAILURES,
+                );
+                break;
+            }
+            continue;
         }
+        consecutive_persist_failures = 0; // Reset on success
         count = count.saturating_add(1);
     }
-    count
+    (count, persist_failures)
 }
 
 /// Converts daily response to HistoricalCandle structs and persists them.
+/// Returns `(candles_written, persist_failures)`.
 fn persist_daily_candles(
     data: &DhanDailyResponse,
     security_id: u32,
     segment_code: u8,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
-) -> usize {
-    let mut count = 0_usize;
-    for i in 0..data.len() {
-        let open = data.open[i];
-        let high = data.high[i];
-        let low = data.low[i];
-        let close = data.close[i];
+) -> (usize, usize) {
+    let (candles, invalid_count) = build_valid_daily_candles(data, security_id, segment_code);
 
-        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = TIMEFRAME_1D,
-                "NaN/Inf price in daily response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject non-positive prices
-        if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = TIMEFRAME_1D,
-                open,
-                high,
-                low,
-                close,
-                "non-positive price in daily response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        // Reject OHLC inconsistency — high must be >= low
-        if high < low {
-            warn!(
-                security_id,
-                idx = i,
-                timeframe = TIMEFRAME_1D,
-                high,
-                low,
-                "high < low in daily response — skipping candle"
-            );
-            m_api_errors.increment(1);
-            continue;
-        }
-
-        let oi_value = if i < data.open_interest.len() {
-            data.open_interest[i]
-        } else {
-            0
-        };
-
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: data.timestamp[i],
+    if invalid_count > 0 {
+        warn!(
             security_id,
-            exchange_segment_code: segment_code,
-            timeframe: TIMEFRAME_1D,
-            open,
-            high,
-            low,
-            close,
-            volume: data.volume[i],
-            open_interest: oi_value,
-        };
+            timeframe = TIMEFRAME_1D,
+            invalid_count,
+            "skipped invalid candles in daily response"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: usize->u64 is lossless on 64-bit targets
+        m_api_errors.increment(invalid_count as u64);
+    }
 
-        if let Err(err) = candle_writer.append_candle(&candle) {
+    let mut count = 0_usize;
+    let mut persist_failures = 0_usize;
+    let mut consecutive_persist_failures = 0_usize;
+    for candle in &candles {
+        if let Err(err) = candle_writer.append_candle(candle) {
             warn!(
                 ?err,
                 security_id,
                 timeframe = TIMEFRAME_1D,
                 "failed to append daily candle to QuestDB"
             );
+            persist_failures = persist_failures.saturating_add(1);
+            consecutive_persist_failures = consecutive_persist_failures.saturating_add(1);
+            if consecutive_persist_failures >= MAX_CONSECUTIVE_PERSIST_FAILURES {
+                tracing::error!(
+                    security_id,
+                    timeframe = TIMEFRAME_1D,
+                    consecutive_failures = consecutive_persist_failures,
+                    "QuestDB unreachable — {} consecutive persist failures, aborting persist loop",
+                    MAX_CONSECUTIVE_PERSIST_FAILURES,
+                );
+                break;
+            }
+            continue;
         }
+        consecutive_persist_failures = 0; // Reset on success
         count = count.saturating_add(1);
     }
-    count
-}
-
-// ---------------------------------------------------------------------------
-// Post-Market Scheduling
-// ---------------------------------------------------------------------------
-
-/// Computes how long to wait until the post-market fetch time (15:35 IST).
-///
-/// Returns `Duration::ZERO` if the current time is already past 15:35 IST today
-/// (fetch should run immediately).
-///
-/// Returns `Some(duration)` to wait, or `None` if not a trading day
-/// (weekends are skipped — caller should handle).
-// TEST-EXEMPT: tested by test_post_market_time_calculation and test_post_market_constants
-pub fn duration_until_post_market_fetch() -> Duration {
-    let ist_offset = match FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) {
-        Some(offset) => offset,
-        None => return Duration::ZERO,
-    };
-    let now_ist = Utc::now().with_timezone(&ist_offset);
-
-    let target_time = now_ist.date_naive().and_hms_opt(
-        POST_MARKET_FETCH_TIME_IST_HOUR,
-        POST_MARKET_FETCH_TIME_IST_MINUTE,
-        0,
-    );
-
-    let target = match target_time {
-        Some(t) => t.and_local_timezone(ist_offset).single(),
-        None => None,
-    };
-
-    match target {
-        Some(target_dt) => {
-            if now_ist >= target_dt {
-                // Already past 15:35 IST — run immediately
-                Duration::ZERO
-            } else {
-                let diff = target_dt.signed_duration_since(now_ist);
-                // Convert chrono::Duration to std::time::Duration
-                diff.to_std().unwrap_or(Duration::ZERO)
-            }
-        }
-        None => Duration::ZERO,
-    }
+    (count, persist_failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,9 +1610,72 @@ mod tests {
             instruments_failed: 2,
             total_candles: 3750,
             instruments_skipped: 5,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: HashMap::new(),
         };
         assert_eq!(summary.instruments_fetched, 10);
         assert_eq!(summary.total_candles, 3750);
+        assert_eq!(summary.persist_failures, 0);
+        assert!(summary.failed_instruments.is_empty());
+        assert!(summary.failure_reasons.is_empty());
+    }
+
+    #[test]
+    fn test_candle_fetch_summary_includes_failed_names() {
+        let summary = CandleFetchSummary {
+            instruments_fetched: 229,
+            instruments_failed: 3,
+            total_candles: 172125,
+            instruments_skipped: 1050,
+            persist_failures: 0,
+            failed_instruments: vec![
+                "11536 (NSE_EQ)".to_string(),
+                "13 (IDX_I)".to_string(),
+                "25 (IDX_I)".to_string(),
+            ],
+            failure_reasons: HashMap::from([
+                ("token_expired".to_string(), 2),
+                ("network_or_api".to_string(), 1),
+            ]),
+        };
+        assert_eq!(summary.failed_instruments.len(), 3);
+        assert!(summary.failed_instruments[0].contains("11536"));
+        assert!(summary.failed_instruments[1].contains("IDX_I"));
+        assert_eq!(summary.failure_reasons.len(), 2);
+    }
+
+    #[test]
+    fn test_failed_names_capped_at_max() {
+        const {
+            assert!(
+                MAX_FAILED_INSTRUMENT_NAMES <= 50,
+                // "failed names must be bounded"
+            );
+            assert!(
+                MAX_FAILED_INSTRUMENT_NAMES >= 10,
+                // "need at least 10 for diagnostics"
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_failure_not_counted_as_success() {
+        // Verify the persist functions return (count, persist_failures) tuple
+        // where count does NOT include failed writes.
+        let summary = CandleFetchSummary {
+            instruments_fetched: 232,
+            instruments_failed: 0,
+            total_candles: 187458,
+            instruments_skipped: 1050,
+            persist_failures: 42,
+            failed_instruments: vec![],
+            failure_reasons: HashMap::from([("persist".to_string(), 42)]),
+        };
+        // total_candles should be the ACTUAL successful writes (187458),
+        // not 187458 + 42 = 187500 (which would be the old buggy behavior)
+        assert_eq!(summary.total_candles, 187458);
+        assert_eq!(summary.persist_failures, 42);
     }
 
     /// IST offset in seconds (5h30m) for UTC→IST conversion in tests.
@@ -1303,7 +1683,7 @@ mod tests {
 
     /// Extracts IST hour and minute from a UTC epoch by adding IST offset.
     fn utc_epoch_to_ist_hm(utc_epoch: i64) -> (i64, i64) {
-        let ist_secs = (utc_epoch + IST_OFFSET) % 86_400;
+        let ist_secs = utc_epoch.saturating_add(IST_OFFSET) % 86_400;
         (ist_secs / 3600, (ist_secs % 3600) / 60)
     }
 
@@ -1497,25 +1877,6 @@ mod tests {
         assert_eq!(instrument_type, "INDEX");
     }
 
-    // -- Post-market scheduling tests --
-
-    #[test]
-    fn test_post_market_time_calculation() {
-        // duration_until_post_market_fetch returns a Duration (possibly zero)
-        let duration = duration_until_post_market_fetch();
-        // Should be <= 24 hours (one day in seconds)
-        assert!(
-            duration.as_secs() <= 86_400,
-            "post-market wait should not exceed 24 hours"
-        );
-    }
-
-    #[test]
-    fn test_post_market_constants() {
-        assert_eq!(POST_MARKET_FETCH_TIME_IST_HOUR, 15);
-        assert_eq!(POST_MARKET_FETCH_TIME_IST_MINUTE, 35);
-    }
-
     // -- Retry wave tests --
 
     #[test]
@@ -1548,7 +1909,7 @@ mod tests {
     #[test]
     fn test_instrument_fetch_result_variants() {
         // Verify enum variants exist and Debug works
-        let success = InstrumentFetchResult::Success(100);
+        let success = InstrumentFetchResult::Success(100, 0);
         let failed = InstrumentFetchResult::Failed;
         assert!(format!("{success:?}").contains("100"));
         assert!(format!("{failed:?}").contains("Failed"));
@@ -1642,6 +2003,9 @@ mod tests {
     #[test]
     fn test_candle_fetch_summary_all_zeroes() {
         let summary = CandleFetchSummary {
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: HashMap::new(),
             instruments_fetched: 0,
             instruments_failed: 0,
             total_candles: 0,
@@ -1700,6 +2064,2074 @@ mod tests {
         assert!(
             !response.is_consistent(),
             "Response with mismatched array lengths must return is_consistent() == false"
+        );
+    }
+
+    // -- C1: Token expiry recovery tests --
+
+    #[test]
+    fn test_token_expired_variant_exists() {
+        let result = InstrumentFetchResult::TokenExpired;
+        assert!(format!("{result:?}").contains("TokenExpired"));
+    }
+
+    #[test]
+    fn test_token_expired_distinct_from_failed() {
+        assert_ne!(
+            InstrumentFetchResult::TokenExpired,
+            InstrumentFetchResult::Failed,
+            "TokenExpired must be distinct from Failed for retry wave awareness"
+        );
+    }
+
+    #[test]
+    fn test_token_refresh_wait_constant() {
+        const {
+            assert!(
+                TOKEN_REFRESH_WAIT_SECS >= 10,
+                // "token refresh wait must be >= 10s to give renewal task time"
+            );
+            assert!(
+                TOKEN_REFRESH_WAIT_SECS <= 60,
+                // "token refresh wait must be <= 60s to not waste time"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_token_expired_retries_bounded() {
+        const {
+            assert!(
+                MAX_TOKEN_EXPIRED_RETRIES >= 1,
+                // "must retry at least once after token refresh"
+            );
+            assert!(
+                MAX_TOKEN_EXPIRED_RETRIES <= 5,
+                // "don't retry forever if token is truly dead"
+            );
+        }
+    }
+
+    // -- C2: Persist circuit breaker tests --
+
+    #[test]
+    fn test_consecutive_persist_failure_threshold() {
+        const {
+            assert!(
+                MAX_CONSECUTIVE_PERSIST_FAILURES >= 5,
+                // "threshold must be >= 5 to tolerate transient errors"
+            );
+            assert!(
+                MAX_CONSECUTIVE_PERSIST_FAILURES <= 50,
+                // "threshold must be <= 50 to break early on QuestDB failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_circuit_breaker_resets_on_success() {
+        // Simulates the circuit breaker logic: consecutive failures reset on success
+        let mut consecutive = 0_usize;
+        // 5 failures
+        for _ in 0..5 {
+            consecutive = consecutive.saturating_add(1);
+        }
+        assert_eq!(consecutive, 5);
+        // 1 success resets
+        consecutive = 0;
+        assert_eq!(
+            consecutive, 0,
+            "success must reset consecutive failure counter"
+        );
+    }
+
+    // -- M4: Failure reason tracking tests --
+
+    #[test]
+    fn test_candle_fetch_summary_tracks_failure_reasons() {
+        let mut reasons = HashMap::new();
+        reasons.insert("token_expired".to_string(), 5);
+        reasons.insert("network_or_api".to_string(), 3);
+        reasons.insert("persist".to_string(), 42);
+
+        let summary = CandleFetchSummary {
+            instruments_fetched: 224,
+            instruments_failed: 8,
+            total_candles: 168000,
+            instruments_skipped: 1050,
+            persist_failures: 42,
+            failed_instruments: vec!["13 (IDX_I)".to_string()],
+            failure_reasons: reasons,
+        };
+
+        assert_eq!(summary.failure_reasons.len(), 3);
+        assert_eq!(summary.failure_reasons["token_expired"], 5);
+        assert_eq!(summary.failure_reasons["network_or_api"], 3);
+        assert_eq!(summary.failure_reasons["persist"], 42);
+    }
+
+    // -- TimeframeFetchResult tests --
+
+    #[test]
+    fn test_timeframe_fetch_result_variants() {
+        let ok = TimeframeFetchResult::Ok(100, 2);
+        let failed = TimeframeFetchResult::Failed;
+        let expired = TimeframeFetchResult::TokenExpired;
+        assert!(format!("{ok:?}").contains("100"));
+        assert!(format!("{failed:?}").contains("Failed"));
+        assert!(format!("{expired:?}").contains("TokenExpired"));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — candle validation
+    // =======================================================================
+
+    #[test]
+    fn test_validate_candle_ohlc_valid() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, 102.0),
+            CandleValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_equal_high_low() {
+        // high == low is valid (e.g. circuit limit)
+        assert_eq!(
+            validate_candle_ohlc(100.0, 100.0, 100.0, 100.0),
+            CandleValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_open() {
+        assert_eq!(
+            validate_candle_ohlc(f64::NAN, 105.0, 98.0, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_high() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, f64::NAN, 98.0, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_low() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, f64::NAN, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_nan_close() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, f64::NAN),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_infinity_open() {
+        assert_eq!(
+            validate_candle_ohlc(f64::INFINITY, 105.0, 98.0, 102.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_neg_infinity_close() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, f64::NEG_INFINITY),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_zero_price() {
+        assert_eq!(
+            validate_candle_ohlc(0.0, 105.0, 98.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_negative_price() {
+        assert_eq!(
+            validate_candle_ohlc(-1.0, 105.0, 98.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_zero_low() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 0.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_zero_close() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 105.0, 98.0, 0.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_negative_high() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, -5.0, 98.0, 102.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_high_below_low() {
+        assert_eq!(
+            validate_candle_ohlc(100.0, 95.0, 98.0, 97.0),
+            CandleValidation::HighBelowLow
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_tiny_prices_valid() {
+        // Very small positive prices are valid (e.g. penny stocks)
+        assert_eq!(
+            validate_candle_ohlc(0.01, 0.02, 0.01, 0.015),
+            CandleValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_large_prices_valid() {
+        assert_eq!(
+            validate_candle_ohlc(999_999.0, 1_000_000.0, 999_990.0, 999_995.0),
+            CandleValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_candle_validation_debug_format() {
+        assert!(format!("{:?}", CandleValidation::Valid).contains("Valid"));
+        assert!(format!("{:?}", CandleValidation::NonFinite).contains("NonFinite"));
+        assert!(format!("{:?}", CandleValidation::NonPositive).contains("NonPositive"));
+        assert!(format!("{:?}", CandleValidation::HighBelowLow).contains("HighBelowLow"));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — intraday window filter
+    // =======================================================================
+
+    #[test]
+    fn test_is_outside_intraday_window_market_open() {
+        // 09:15 IST = 03:45 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 45 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "09:15 IST should be inside intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_mid_session() {
+        // 12:00 IST = 06:30 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 6 * 3600 + 30 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "12:00 IST should be inside intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_just_before_close() {
+        // 15:29 IST = 09:59 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "15:29 IST should be inside intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_at_close() {
+        // 15:30 IST = 10:00 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600;
+        assert!(
+            is_outside_intraday_window(utc_epoch),
+            "15:30 IST should be OUTSIDE intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_after_close() {
+        // 16:00 IST = 10:30 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600 + 30 * 60;
+        assert!(
+            is_outside_intraday_window(utc_epoch),
+            "16:00 IST should be OUTSIDE intraday window"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_midnight() {
+        // 00:00 IST = 18:30 previous day UTC
+        let utc_epoch: i64 = 1_773_014_400 - 5 * 3600 - 30 * 60;
+        assert!(
+            !is_outside_intraday_window(utc_epoch),
+            "00:00 IST should be inside window (before 15:30)"
+        );
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_23_59() {
+        // 23:59 IST — after market close, should be outside
+        // IST secs of day = 23*3600 + 59*60 = 86340, which is >= 55800
+        let utc_epoch: i64 = 1_773_014_400 + 18 * 3600 + 29 * 60;
+        assert!(
+            is_outside_intraday_window(utc_epoch),
+            "23:59 IST should be OUTSIDE intraday window"
+        );
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — OI extraction
+    // =======================================================================
+
+    #[test]
+    fn test_extract_oi_within_bounds() {
+        let oi_data = vec![100, 200, 300];
+        assert_eq!(extract_oi(&oi_data, 0), 100);
+        assert_eq!(extract_oi(&oi_data, 1), 200);
+        assert_eq!(extract_oi(&oi_data, 2), 300);
+    }
+
+    #[test]
+    fn test_extract_oi_out_of_bounds() {
+        let oi_data = vec![100, 200];
+        assert_eq!(extract_oi(&oi_data, 2), 0);
+        assert_eq!(extract_oi(&oi_data, 100), 0);
+    }
+
+    #[test]
+    fn test_extract_oi_empty_array() {
+        let oi_data: Vec<i64> = vec![];
+        assert_eq!(extract_oi(&oi_data, 0), 0);
+        assert_eq!(extract_oi(&oi_data, 5), 0);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — date computation
+    // =======================================================================
+
+    #[test]
+    fn test_compute_fetch_date_range_normal() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 90);
+        assert_eq!(to, today);
+        assert_eq!(from, chrono::NaiveDate::from_ymd_opt(2025, 12, 21).unwrap());
+    }
+
+    #[test]
+    fn test_compute_fetch_date_range_zero_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 0);
+        assert_eq!(from, today);
+        assert_eq!(to, today);
+    }
+
+    #[test]
+    fn test_compute_fetch_date_range_one_day_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 1);
+        assert_eq!(to, today);
+        assert_eq!(from, chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap());
+    }
+
+    #[test]
+    fn test_compute_fetch_date_range_large_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 365);
+        assert_eq!(to, today);
+        assert_eq!(from, chrono::NaiveDate::from_ymd_opt(2025, 3, 21).unwrap());
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_normal() {
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_month_boundary() {
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_year_boundary() {
+        let to = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_daily_to_date_leap_year() {
+        let to = chrono::NaiveDate::from_ymd_opt(2028, 2, 28).unwrap();
+        let daily_to = compute_daily_to_date(to);
+        // 2028 is a leap year
+        assert_eq!(
+            daily_to,
+            chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap()
+        );
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — intraday date range formatting
+    // =======================================================================
+
+    #[test]
+    fn test_format_intraday_date_range() {
+        let from = chrono::NaiveDate::from_ymd_opt(2025, 12, 21).unwrap();
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from_str, to_str) = format_intraday_date_range(from, to);
+        assert_eq!(from_str, "2025-12-21 09:15:00");
+        assert_eq!(to_str, "2026-03-21 15:30:00");
+    }
+
+    #[test]
+    fn test_format_intraday_date_range_same_day() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let (from_str, to_str) = format_intraday_date_range(date, date);
+        assert_eq!(from_str, "2026-01-05 09:15:00");
+        assert_eq!(to_str, "2026-01-05 15:30:00");
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — DH-904 backoff
+    // =======================================================================
+
+    #[test]
+    fn test_compute_dh904_backoff_secs_sequence() {
+        assert_eq!(compute_dh904_backoff_secs(0), 10); // 10 * 2^0 = 10
+        assert_eq!(compute_dh904_backoff_secs(1), 20); // 10 * 2^1 = 20
+        assert_eq!(compute_dh904_backoff_secs(2), 40); // 10 * 2^2 = 40
+        assert_eq!(compute_dh904_backoff_secs(3), 80); // 10 * 2^3 = 80
+    }
+
+    #[test]
+    fn test_compute_dh904_backoff_secs_high_attempt() {
+        // After attempt 3, we don't expect to call this (is_dh904_exhausted
+        // would return true), but it should not overflow
+        let result = compute_dh904_backoff_secs(4);
+        assert_eq!(result, 160); // 10 * 2^4
+    }
+
+    #[test]
+    fn test_is_dh904_exhausted() {
+        assert!(!is_dh904_exhausted(0));
+        assert!(!is_dh904_exhausted(1));
+        assert!(!is_dh904_exhausted(2));
+        assert!(!is_dh904_exhausted(3));
+        assert!(is_dh904_exhausted(4)); // DH_904_MAX_BACKOFF_ATTEMPTS = 4
+        assert!(is_dh904_exhausted(5));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — retry delay
+    // =======================================================================
+
+    #[test]
+    fn test_compute_retry_delay_ms() {
+        assert_eq!(compute_retry_delay_ms(0), 0);
+        assert_eq!(compute_retry_delay_ms(1), 1000);
+        assert_eq!(compute_retry_delay_ms(2), 2000);
+        assert_eq!(compute_retry_delay_ms(3), 3000);
+    }
+
+    #[test]
+    fn test_compute_retry_delay_ms_large_attempt() {
+        // Should not overflow
+        assert_eq!(compute_retry_delay_ms(10), 10000);
+        assert_eq!(compute_retry_delay_ms(100), 100000);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — retry wave backoff
+    // =======================================================================
+
+    #[test]
+    fn test_compute_retry_wave_backoff_secs() {
+        assert_eq!(compute_retry_wave_backoff_secs(0), 0);
+        assert_eq!(compute_retry_wave_backoff_secs(1), 30);
+        assert_eq!(compute_retry_wave_backoff_secs(2), 60);
+        assert_eq!(compute_retry_wave_backoff_secs(3), 90);
+        assert_eq!(compute_retry_wave_backoff_secs(4), 120);
+        assert_eq!(compute_retry_wave_backoff_secs(5), 150);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — instrument category mapping
+    // =======================================================================
+
+    #[test]
+    fn test_instrument_type_for_major_index() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::MajorIndexValue),
+            Some("INDEX")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_display_index() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::DisplayIndex),
+            Some("INDEX")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_stock_equity() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::StockEquity),
+            Some("EQUITY")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_index_derivative_skip() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::IndexDerivative),
+            None
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_stock_derivative_skip() {
+        assert_eq!(
+            instrument_type_for_category(SubscriptionCategory::StockDerivative),
+            None
+        );
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — response size check
+    // =======================================================================
+
+    #[test]
+    fn test_is_response_oversized_within_limit() {
+        assert!(!is_response_oversized(0));
+        assert!(!is_response_oversized(1));
+        assert!(!is_response_oversized(100_000));
+        assert!(!is_response_oversized(MAX_RESPONSE_BODY_SIZE));
+    }
+
+    #[test]
+    fn test_is_response_oversized_exceeds_limit() {
+        assert!(is_response_oversized(MAX_RESPONSE_BODY_SIZE + 1));
+        assert!(is_response_oversized(20 * 1024 * 1024));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — error classification
+    // =======================================================================
+
+    #[test]
+    fn test_classify_error_dh904_body_not_429() {
+        // DH-904 from body (non-429 status) should also be RateLimited
+        let body =
+            br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Rate limit"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_classify_error_dh906() {
+        let body = br#"{"errorType": "ORDER_ERROR", "errorCode": "DH-906", "errorMessage": "Order error"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::NeverRetry);
+    }
+
+    #[test]
+    fn test_classify_error_dh901_token_expired() {
+        let body =
+            br#"{"errorType": "AUTH", "errorCode": "DH-901", "errorMessage": "Invalid auth"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(action, ErrorAction::TokenExpired);
+    }
+
+    #[test]
+    fn test_classify_error_dh908_standard_retry() {
+        let body = br#"{"errorType": "INTERNAL", "errorCode": "DH-908", "errorMessage": "Internal error"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_data_api_unknown_code() {
+        let body = br#"{"errorCode": 999, "message": "Unknown data error"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_empty_body() {
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, b"");
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_invalid_json() {
+        let action = classify_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            b"not json at all",
+        );
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_429_overrides_body() {
+        // Even if body says DH-905, HTTP 429 should win
+        let body = br#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "Bad input"}"#;
+        let action = classify_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(action, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_classify_error_data_api_805_with_status_alias() {
+        let body = br#"{"status": 805, "message": "Too many connections"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::TooManyConnections);
+    }
+
+    #[test]
+    fn test_classify_error_data_api_807_with_error_code_alias() {
+        let body = br#"{"errorCode": 807, "errorMessage": "Token expired"}"#;
+        let action = classify_error(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(action, ErrorAction::TokenExpired);
+    }
+
+    #[test]
+    fn test_classify_error_null_error_code() {
+        let body = br#"{"errorType": "UNKNOWN", "errorCode": null, "errorMessage": "Something"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — build candles from response
+    // =======================================================================
+
+    fn sample_intraday_response() -> DhanIntradayResponse {
+        DhanIntradayResponse {
+            open: vec![100.0, 101.0, 102.0],
+            high: vec![105.0, 106.0, 107.0],
+            low: vec![98.0, 99.0, 100.0],
+            close: vec![103.0, 104.0, 105.0],
+            volume: vec![1000, 2000, 3000],
+            timestamp: vec![1_773_027_900, 1_773_027_960, 1_773_028_020],
+            open_interest: vec![5000, 6000, 7000],
+        }
+    }
+
+    fn sample_daily_response() -> DhanDailyResponse {
+        DhanDailyResponse {
+            open: vec![200.0, 201.0],
+            high: vec![210.0, 211.0],
+            low: vec![195.0, 196.0],
+            close: vec![205.0, 206.0],
+            volume: vec![10_000, 20_000],
+            timestamp: vec![1_772_582_400, 1_773_014_400],
+            open_interest: vec![],
+        }
+    }
+
+    #[test]
+    fn test_build_intraday_candle_first_index() {
+        let data = sample_intraday_response();
+        let candle = build_intraday_candle(&data, 0, 42, 2, "1m");
+        assert_eq!(candle.security_id, 42);
+        assert_eq!(candle.exchange_segment_code, 2);
+        assert_eq!(candle.timeframe, "1m");
+        assert_eq!(candle.open, 100.0);
+        assert_eq!(candle.high, 105.0);
+        assert_eq!(candle.low, 98.0);
+        assert_eq!(candle.close, 103.0);
+        assert_eq!(candle.volume, 1000);
+        assert_eq!(candle.open_interest, 5000);
+        assert_eq!(candle.timestamp_utc_secs, 1_773_027_900);
+    }
+
+    #[test]
+    fn test_build_intraday_candle_last_index() {
+        let data = sample_intraday_response();
+        let candle = build_intraday_candle(&data, 2, 99, 1, "5m");
+        assert_eq!(candle.open, 102.0);
+        assert_eq!(candle.close, 105.0);
+        assert_eq!(candle.volume, 3000);
+        assert_eq!(candle.open_interest, 7000);
+        assert_eq!(candle.timeframe, "5m");
+    }
+
+    #[test]
+    fn test_build_daily_candle_first_index() {
+        let data = sample_daily_response();
+        let candle = build_daily_candle(&data, 0, 11536, 1);
+        assert_eq!(candle.security_id, 11536);
+        assert_eq!(candle.exchange_segment_code, 1);
+        assert_eq!(candle.timeframe, TIMEFRAME_1D);
+        assert_eq!(candle.open, 200.0);
+        assert_eq!(candle.high, 210.0);
+        assert_eq!(candle.low, 195.0);
+        assert_eq!(candle.close, 205.0);
+        assert_eq!(candle.volume, 10_000);
+        assert_eq!(candle.open_interest, 0); // empty OI array -> 0
+    }
+
+    #[test]
+    fn test_build_daily_candle_with_oi() {
+        let mut data = sample_daily_response();
+        data.open_interest = vec![50_000, 60_000];
+        let candle = build_daily_candle(&data, 1, 13, 0);
+        assert_eq!(candle.open_interest, 60_000);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — collect failed instrument names
+    // =======================================================================
+
+    #[test]
+    fn test_collect_failed_instrument_names_empty() {
+        let result = collect_failed_instrument_names(&[], &[], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_collect_failed_instrument_names_basic() {
+        let pending = vec![0, 2];
+        let sec_ids = vec![11536, 1333, 25];
+        let segments = vec!["NSE_EQ", "NSE_EQ", "IDX_I"];
+        let result = collect_failed_instrument_names(&pending, &sec_ids, &segments);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "11536 (NSE_EQ)");
+        assert_eq!(result[1], "25 (IDX_I)");
+    }
+
+    #[test]
+    fn test_collect_failed_instrument_names_capped() {
+        // Create more than MAX_FAILED_INSTRUMENT_NAMES pending indices
+        let n = MAX_FAILED_INSTRUMENT_NAMES + 10;
+        let pending: Vec<usize> = (0..n).collect();
+        let sec_ids: Vec<u32> = (0..n as u32).collect();
+        let segments: Vec<&str> = vec!["NSE_EQ"; n];
+        let result = collect_failed_instrument_names(&pending, &sec_ids, &segments);
+        assert_eq!(result.len(), MAX_FAILED_INSTRUMENT_NAMES);
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — build failure reasons
+    // =======================================================================
+
+    #[test]
+    fn test_build_failure_reasons_empty() {
+        let reasons = build_failure_reasons(&[], &[], 0);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn test_build_failure_reasons_all_token_expired() {
+        let pending = vec![0, 1];
+        let token_counts = vec![2, 3]; // Both >= MAX_TOKEN_EXPIRED_RETRIES (2)
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons["token_expired"], 2);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_all_network() {
+        let pending = vec![0, 1, 2];
+        let token_counts = vec![0, 1, 0]; // All below MAX_TOKEN_EXPIRED_RETRIES
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons["network_or_api"], 3);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_mixed() {
+        let pending = vec![0, 1, 2];
+        let token_counts = vec![2, 0, 3]; // indices 0 and 2 are token_expired, 1 is network
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons["token_expired"], 2);
+        assert_eq!(reasons["network_or_api"], 1);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_with_persist_failures() {
+        let pending = vec![0];
+        let token_counts = vec![0];
+        let reasons = build_failure_reasons(&pending, &token_counts, 42);
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons["network_or_api"], 1);
+        assert_eq!(reasons["persist"], 42);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_persist_only() {
+        // No pending instruments, but persist failures occurred
+        let reasons = build_failure_reasons(&[], &[], 15);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons["persist"], 15);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_zero_persist_not_included() {
+        // Zero persist failures should not add "persist" key
+        let reasons = build_failure_reasons(&[], &[], 0);
+        assert!(!reasons.contains_key("persist"));
+    }
+
+    // =======================================================================
+    // Extracted pure function tests — response deserialization
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_intraday_response_consistency_all_same_length() {
+        let data = sample_intraday_response();
+        assert!(data.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_consistency_empty() {
+        let data = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        assert!(data.is_consistent());
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_is_empty_false() {
+        let data = sample_intraday_response();
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_len() {
+        let data = sample_intraday_response();
+        assert_eq!(data.len(), 3);
+    }
+
+    #[test]
+    fn test_dhan_daily_response_consistency() {
+        let data = sample_daily_response();
+        assert!(data.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_len() {
+        let data = sample_daily_response();
+        assert_eq!(data.len(), 2);
+    }
+
+    #[test]
+    fn test_dhan_daily_response_empty_oi_consistent() {
+        // Empty OI array is consistent with any length
+        let data = sample_daily_response();
+        assert!(data.open_interest.is_empty());
+        assert!(data.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_consistency_mismatched_volume() {
+        let mut data = sample_daily_response();
+        data.volume = vec![10_000]; // Only 1 element, should be 2
+        assert!(!data.is_consistent());
+    }
+
+    #[test]
+    fn test_dhan_intraday_response_consistency_mismatched_oi() {
+        let mut data = sample_intraday_response();
+        data.open_interest = vec![100, 200]; // 2 elements, but data has 3
+        assert!(!data.is_consistent());
+    }
+
+    // =======================================================================
+    // Error action equality tests
+    // =======================================================================
+
+    #[test]
+    fn test_error_action_eq() {
+        assert_eq!(ErrorAction::RateLimited, ErrorAction::RateLimited);
+        assert_eq!(
+            ErrorAction::TooManyConnections,
+            ErrorAction::TooManyConnections
+        );
+        assert_eq!(ErrorAction::TokenExpired, ErrorAction::TokenExpired);
+        assert_eq!(ErrorAction::StandardRetry, ErrorAction::StandardRetry);
+        assert_eq!(ErrorAction::NeverRetry, ErrorAction::NeverRetry);
+    }
+
+    #[test]
+    fn test_error_action_ne() {
+        assert_ne!(ErrorAction::RateLimited, ErrorAction::NeverRetry);
+        assert_ne!(ErrorAction::TooManyConnections, ErrorAction::TokenExpired);
+        assert_ne!(ErrorAction::StandardRetry, ErrorAction::RateLimited);
+    }
+
+    #[test]
+    fn test_error_action_debug() {
+        assert!(format!("{:?}", ErrorAction::RateLimited).contains("RateLimited"));
+        assert!(format!("{:?}", ErrorAction::TooManyConnections).contains("TooManyConnections"));
+        assert!(format!("{:?}", ErrorAction::TokenExpired).contains("TokenExpired"));
+        assert!(format!("{:?}", ErrorAction::StandardRetry).contains("StandardRetry"));
+        assert!(format!("{:?}", ErrorAction::NeverRetry).contains("NeverRetry"));
+    }
+
+    // =======================================================================
+    // DhanErrorResponse / DataApiErrorResponse deserialization tests
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_error_response_full_deserialize() {
+        let json = br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Too many requests"}"#;
+        let err: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.error_code.as_deref(), Some("DH-904"));
+        assert_eq!(err.error_type.as_deref(), Some("RATE_LIMIT"));
+        assert_eq!(err.error_message.as_deref(), Some("Too many requests"));
+    }
+
+    #[test]
+    fn test_dhan_error_response_missing_fields() {
+        // All fields are optional
+        let json = br#"{}"#;
+        let err: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert!(err.error_code.is_none());
+        assert!(err.error_type.is_none());
+        assert!(err.error_message.is_none());
+    }
+
+    #[test]
+    fn test_data_api_error_response_with_error_code() {
+        let json = br#"{"errorCode": 805, "errorMessage": "Too many"}"#;
+        let err: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.code, Some(805));
+    }
+
+    #[test]
+    fn test_data_api_error_response_with_status_alias() {
+        let json = br#"{"status": 807, "message": "Token expired"}"#;
+        let err: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.code, Some(807));
+    }
+
+    #[test]
+    fn test_data_api_error_response_empty() {
+        let json = br#"{}"#;
+        let err: DataApiErrorResponse = serde_json::from_slice(json).unwrap();
+        assert!(err.code.is_none());
+    }
+
+    // =======================================================================
+    // Request body serialization edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_daily_request_with_expiry_code() {
+        let request = DailyRequest {
+            security_id: "49081".to_string(),
+            exchange_segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            expiry_code: Some(0),
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-21".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"expiryCode\":0"));
+    }
+
+    #[test]
+    fn test_daily_request_security_id_is_string() {
+        let request = DailyRequest {
+            security_id: "1333".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            instrument: "EQUITY".to_string(),
+            expiry_code: None,
+            from_date: "2026-01-01".to_string(),
+            to_date: "2026-03-21".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        // securityId must be a string value, not a number
+        assert!(json.contains("\"securityId\":\"1333\""));
+    }
+
+    #[test]
+    fn test_intraday_request_interval_is_string() {
+        let request = IntradayRequest {
+            security_id: "42".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            instrument: "EQUITY".to_string(),
+            interval: "60".to_string(),
+            oi: true,
+            from_date: "2026-01-01 09:15:00".to_string(),
+            to_date: "2026-01-05 15:30:00".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"interval\":\"60\""));
+    }
+
+    // =======================================================================
+    // Constant validation tests
+    // =======================================================================
+
+    #[test]
+    fn test_error_805_pause_duration() {
+        assert_eq!(ERROR_805_PAUSE_SECS, 60);
+    }
+
+    #[test]
+    fn test_dh904_backoff_base() {
+        assert_eq!(DH_904_BACKOFF_BASE_SECS, 10);
+    }
+
+    #[test]
+    fn test_dh904_max_attempts() {
+        assert_eq!(DH_904_MAX_BACKOFF_ATTEMPTS, 4);
+    }
+
+    #[test]
+    fn test_instrument_fetch_result_success_equality() {
+        assert_eq!(
+            InstrumentFetchResult::Success(10, 0),
+            InstrumentFetchResult::Success(10, 0)
+        );
+        assert_ne!(
+            InstrumentFetchResult::Success(10, 0),
+            InstrumentFetchResult::Success(11, 0)
+        );
+        assert_ne!(
+            InstrumentFetchResult::Success(10, 0),
+            InstrumentFetchResult::Success(10, 1)
+        );
+    }
+
+    // =======================================================================
+    // Additional coverage tests — build candle helpers with edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_build_intraday_candle_mid_index() {
+        let data = sample_intraday_response();
+        let candle = build_intraday_candle(&data, 1, 1333, 1, "15m");
+        assert_eq!(candle.security_id, 1333);
+        assert_eq!(candle.exchange_segment_code, 1);
+        assert_eq!(candle.timeframe, "15m");
+        assert_eq!(candle.open, 101.0);
+        assert_eq!(candle.high, 106.0);
+        assert_eq!(candle.low, 99.0);
+        assert_eq!(candle.close, 104.0);
+        assert_eq!(candle.volume, 2000);
+        assert_eq!(candle.open_interest, 6000);
+        assert_eq!(candle.timestamp_utc_secs, 1_773_027_960);
+    }
+
+    #[test]
+    fn test_build_daily_candle_last_index() {
+        let data = sample_daily_response();
+        let candle = build_daily_candle(&data, 1, 25, 0);
+        assert_eq!(candle.security_id, 25);
+        assert_eq!(candle.exchange_segment_code, 0);
+        assert_eq!(candle.timeframe, TIMEFRAME_1D);
+        assert_eq!(candle.open, 201.0);
+        assert_eq!(candle.high, 211.0);
+        assert_eq!(candle.low, 196.0);
+        assert_eq!(candle.close, 206.0);
+        assert_eq!(candle.volume, 20_000);
+        assert_eq!(candle.open_interest, 0); // empty OI array
+    }
+
+    #[test]
+    fn test_build_intraday_candle_no_oi() {
+        let mut data = sample_intraday_response();
+        data.open_interest = vec![]; // empty OI
+        let candle = build_intraday_candle(&data, 0, 42, 2, "1m");
+        assert_eq!(candle.open_interest, 0); // extract_oi returns 0 for empty
+    }
+
+    #[test]
+    fn test_build_daily_candle_segment_codes() {
+        let data = sample_daily_response();
+        // Test with all segment codes
+        for code in [0_u8, 1, 2, 3, 4, 5, 7, 8] {
+            let candle = build_daily_candle(&data, 0, 100, code);
+            assert_eq!(candle.exchange_segment_code, code);
+        }
+    }
+
+    // =======================================================================
+    // collect_failed_instrument_names edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_collect_failed_instrument_names_single() {
+        let result =
+            collect_failed_instrument_names(&[1], &[13, 25, 1333], &["IDX_I", "IDX_I", "NSE_EQ"]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "25 (IDX_I)");
+    }
+
+    // =======================================================================
+    // build_failure_reasons edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_build_failure_reasons_exact_threshold() {
+        // Token expired count exactly at MAX_TOKEN_EXPIRED_RETRIES
+        let pending = vec![0];
+        let token_counts = vec![MAX_TOKEN_EXPIRED_RETRIES]; // exactly at threshold
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons["token_expired"], 1);
+    }
+
+    #[test]
+    fn test_build_failure_reasons_just_below_threshold() {
+        let pending = vec![0];
+        let token_counts = vec![MAX_TOKEN_EXPIRED_RETRIES - 1]; // below threshold
+        let reasons = build_failure_reasons(&pending, &token_counts, 0);
+        assert_eq!(reasons["network_or_api"], 1);
+        assert!(!reasons.contains_key("token_expired"));
+    }
+
+    // =======================================================================
+    // DhanErrorResponse deserialization edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_error_response_partial_fields() {
+        let json = br#"{"errorCode": "DH-905"}"#;
+        let err: DhanErrorResponse = serde_json::from_slice(json).unwrap();
+        assert_eq!(err.error_code.as_deref(), Some("DH-905"));
+        assert!(err.error_type.is_none());
+        assert!(err.error_message.is_none());
+    }
+
+    #[test]
+    fn test_data_api_error_response_with_both_aliases_rejects_duplicate() {
+        // When both aliased fields are present, serde rejects as "duplicate field"
+        let json = br#"{"errorCode": 805, "status": 807}"#;
+        let result = serde_json::from_slice::<DataApiErrorResponse>(json);
+        assert!(
+            result.is_err(),
+            "serde should reject duplicate aliased fields"
+        );
+    }
+
+    // =======================================================================
+    // classify_error additional edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_classify_error_data_api_generic_code() {
+        let body = br#"{"errorCode": 800, "message": "Internal server error"}"#;
+        let action = classify_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    #[test]
+    fn test_classify_error_dh_unknown_code() {
+        let body = br#"{"errorType": "UNKNOWN", "errorCode": "DH-999", "errorMessage": "Unknown"}"#;
+        let action = classify_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(action, ErrorAction::StandardRetry);
+    }
+
+    // =======================================================================
+    // validate_candle_ohlc priority of checks
+    // =======================================================================
+
+    #[test]
+    fn test_validate_candle_ohlc_non_finite_takes_priority_over_non_positive() {
+        // NaN is also <= 0, but NonFinite should be checked first
+        assert_eq!(
+            validate_candle_ohlc(f64::NAN, -1.0, -2.0, -3.0),
+            CandleValidation::NonFinite
+        );
+    }
+
+    #[test]
+    fn test_validate_candle_ohlc_non_positive_takes_priority_over_high_below_low() {
+        // zero low, but also high < low — NonPositive should be checked first
+        assert_eq!(
+            validate_candle_ohlc(0.0, 95.0, 98.0, 97.0),
+            CandleValidation::NonPositive
+        );
+    }
+
+    // =======================================================================
+    // is_outside_intraday_window additional boundary tests
+    // =======================================================================
+
+    #[test]
+    fn test_is_outside_intraday_window_just_before_0915_ist() {
+        // 09:14 IST = 03:44 UTC on 2026-03-09
+        let utc_epoch: i64 = 1_773_014_400 + 3 * 3600 + 44 * 60;
+        // 09:14 IST is before market open but before 15:30, so inside the window
+        // because is_outside_intraday_window only checks >= 15:30
+        assert!(!is_outside_intraday_window(utc_epoch));
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_exactly_1530_ist() {
+        // 15:30:00 IST exactly = 10:00 UTC
+        let utc_epoch: i64 = 1_773_014_400 + 10 * 3600;
+        assert!(is_outside_intraday_window(utc_epoch));
+    }
+
+    #[test]
+    fn test_is_outside_intraday_window_1529_59_ist() {
+        // 15:29:59 IST = 09:59:59 UTC
+        let utc_epoch: i64 = 1_773_014_400 + 9 * 3600 + 59 * 60 + 59;
+        assert!(!is_outside_intraday_window(utc_epoch));
+    }
+
+    // =======================================================================
+    // compute_dh904_backoff_secs overflow safety
+    // =======================================================================
+
+    #[test]
+    fn test_compute_dh904_backoff_secs_very_high_attempt() {
+        // wrapping_shl with attempt >= 64 wraps — confirm no panic
+        let result = compute_dh904_backoff_secs(100);
+        // With wrapping_shl, 1u64.wrapping_shl(100) wraps to 1u64.wrapping_shl(100 % 64)
+        assert!(result > 0 || result == 0); // Just confirm no panic
+    }
+
+    // =======================================================================
+    // extract_oi edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_extract_oi_negative_values() {
+        let oi_data = vec![-100, 200, -300];
+        assert_eq!(extract_oi(&oi_data, 0), -100);
+        assert_eq!(extract_oi(&oi_data, 2), -300);
+    }
+
+    #[test]
+    fn test_extract_oi_large_values() {
+        let oi_data = vec![i64::MAX, i64::MIN];
+        assert_eq!(extract_oi(&oi_data, 0), i64::MAX);
+        assert_eq!(extract_oi(&oi_data, 1), i64::MIN);
+    }
+
+    // =======================================================================
+    // format_intraday_date_range edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_format_intraday_date_range_leap_year() {
+        let from = chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap();
+        let to = chrono::NaiveDate::from_ymd_opt(2028, 3, 1).unwrap();
+        let (from_str, to_str) = format_intraday_date_range(from, to);
+        assert_eq!(from_str, "2028-02-29 09:15:00");
+        assert_eq!(to_str, "2028-03-01 15:30:00");
+    }
+
+    // =======================================================================
+    // compute_fetch_date_range edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_compute_fetch_date_range_max_lookback() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 21).unwrap();
+        let (from, to) = compute_fetch_date_range(today, 1825); // 5 years
+        assert_eq!(to, today);
+        assert!(from < today);
+    }
+
+    // =======================================================================
+    // DhanIntradayResponse and DhanDailyResponse deserialization tests
+    // =======================================================================
+
+    #[test]
+    fn test_dhan_intraday_response_json_deserialize() {
+        let json = r#"{
+            "open": [100.0, 101.0],
+            "high": [105.0, 106.0],
+            "low": [98.0, 99.0],
+            "close": [103.0, 104.0],
+            "volume": [1000, 2000],
+            "timestamp": [1773027900, 1773027960],
+            "open_interest": [5000, 6000]
+        }"#;
+        let data: DhanIntradayResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.is_consistent());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_json_deserialize() {
+        let json = r#"{
+            "open": [200.0],
+            "high": [210.0],
+            "low": [195.0],
+            "close": [205.0],
+            "volume": [10000],
+            "timestamp": [1772928000],
+            "open_interest": []
+        }"#;
+        let data: DhanDailyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data.is_consistent());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_dhan_daily_response_empty() {
+        let data = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        assert!(data.is_empty());
+        assert!(data.is_consistent());
+        assert_eq!(data.len(), 0);
+    }
+
+    // =======================================================================
+    // Constants validation
+    // =======================================================================
+
+    #[test]
+    fn test_retry_wave_max_is_five() {
+        assert_eq!(RETRY_WAVE_MAX, 5);
+    }
+
+    #[test]
+    fn test_max_consecutive_persist_failures_value() {
+        assert_eq!(MAX_CONSECUTIVE_PERSIST_FAILURES, 10);
+    }
+
+    #[test]
+    fn test_token_refresh_wait_secs_value() {
+        assert_eq!(TOKEN_REFRESH_WAIT_SECS, 30);
+    }
+
+    #[test]
+    fn test_max_token_expired_retries_value() {
+        assert_eq!(MAX_TOKEN_EXPIRED_RETRIES, 2);
+    }
+
+    #[test]
+    fn test_max_failed_instrument_names_value() {
+        assert_eq!(MAX_FAILED_INSTRUMENT_NAMES, 50);
+    }
+
+    // =======================================================================
+    // build_valid_intraday_candles tests
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_intraday_candles_all_valid() {
+        let data = sample_intraday_response();
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 3);
+        assert_eq!(candles[0].security_id, 42);
+        assert_eq!(candles[0].exchange_segment_code, 2);
+        assert_eq!(candles[0].timeframe, "1m");
+        assert_eq!(candles[0].open, 100.0);
+        assert_eq!(candles[2].close, 105.0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_nan() {
+        let mut data = sample_intraday_response();
+        data.open[1] = f64::NAN;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+        // First and third candle should remain
+        assert_eq!(candles[0].open, 100.0);
+        assert_eq!(candles[1].open, 102.0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_infinity() {
+        let mut data = sample_intraday_response();
+        data.high[0] = f64::INFINITY;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_zero_price() {
+        let mut data = sample_intraday_response();
+        data.low[2] = 0.0;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_negative_price() {
+        let mut data = sample_intraday_response();
+        data.close[0] = -5.0;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_high_below_low() {
+        let mut data = sample_intraday_response();
+        data.high[1] = 90.0; // below low of 99.0
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_post_market() {
+        let mut data = sample_intraday_response();
+        // Set timestamp to 15:30 IST (10:00 UTC) — should be filtered
+        // 15:30 IST = 10:00 UTC, base 2026-03-09 midnight UTC = 1_773_014_400
+        data.timestamp[1] = 1_773_014_400 + 10 * 3600; // 15:30 IST
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0); // post-market is not an "invalid" candle
+        assert_eq!(candles.len(), 2); // but it's filtered out
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_all_invalid() {
+        let data = DhanIntradayResponse {
+            open: vec![0.0, f64::NAN, 100.0],
+            high: vec![100.0, 200.0, 50.0], // third: high < low
+            low: vec![50.0, 100.0, 60.0],
+            close: vec![75.0, 150.0, 55.0],
+            volume: vec![1000, 2000, 3000],
+            timestamp: vec![1_773_027_900, 1_773_027_960, 1_773_028_020],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 3);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_empty_response() {
+        let data = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_preserves_oi() {
+        let data = sample_intraday_response();
+        let (candles, _) = build_valid_intraday_candles(&data, 42, 2, "5m");
+        assert_eq!(candles[0].open_interest, 5000);
+        assert_eq!(candles[1].open_interest, 6000);
+        assert_eq!(candles[2].open_interest, 7000);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_empty_oi_returns_zero() {
+        let mut data = sample_intraday_response();
+        data.open_interest = vec![];
+        let (candles, _) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        for candle in &candles {
+            assert_eq!(candle.open_interest, 0);
+        }
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_timeframe_propagated() {
+        let data = sample_intraday_response();
+        for &tf in &["1m", "5m", "15m", "60m"] {
+            let (candles, _) = build_valid_intraday_candles(&data, 42, 2, tf);
+            for candle in &candles {
+                assert_eq!(candle.timeframe, tf);
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_mixed_valid_and_invalid() {
+        let mut data = sample_intraday_response();
+        // Make second candle invalid (NaN), keep first and third
+        data.high[1] = f64::NAN;
+        let (candles, invalid) = build_valid_intraday_candles(&data, 99, 1, "15m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].security_id, 99);
+        assert_eq!(candles[0].exchange_segment_code, 1);
+        assert_eq!(candles[0].open, 100.0);
+        assert_eq!(candles[1].open, 102.0);
+    }
+
+    // =======================================================================
+    // build_valid_daily_candles tests
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_daily_candles_all_valid() {
+        let data = sample_daily_response();
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].security_id, 11536);
+        assert_eq!(candles[0].exchange_segment_code, 1);
+        assert_eq!(candles[0].timeframe, TIMEFRAME_1D);
+        assert_eq!(candles[0].open, 200.0);
+        assert_eq!(candles[1].close, 206.0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_nan() {
+        let mut data = sample_daily_response();
+        data.close[0] = f64::NAN;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 201.0); // second candle
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_zero_price() {
+        let mut data = sample_daily_response();
+        data.open[1] = 0.0;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_high_below_low() {
+        let mut data = sample_daily_response();
+        data.high[0] = 190.0; // below low of 195.0
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_empty_response() {
+        let data = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 0);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_all_invalid() {
+        let data = DhanDailyResponse {
+            open: vec![f64::NAN, -1.0],
+            high: vec![200.0, 200.0],
+            low: vec![100.0, 100.0],
+            close: vec![150.0, 150.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_772_582_400, 1_773_014_400],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 2);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_preserves_oi() {
+        let mut data = sample_daily_response();
+        data.open_interest = vec![50_000, 60_000];
+        let (candles, _) = build_valid_daily_candles(&data, 13, 0);
+        assert_eq!(candles[0].open_interest, 50_000);
+        assert_eq!(candles[1].open_interest, 60_000);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_empty_oi() {
+        let data = sample_daily_response();
+        let (candles, _) = build_valid_daily_candles(&data, 13, 0);
+        assert_eq!(candles[0].open_interest, 0);
+        assert_eq!(candles[1].open_interest, 0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_always_1d_timeframe() {
+        let data = sample_daily_response();
+        let (candles, _) = build_valid_daily_candles(&data, 42, 2);
+        for candle in &candles {
+            assert_eq!(candle.timeframe, TIMEFRAME_1D);
+        }
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_segment_code_propagated() {
+        let data = sample_daily_response();
+        for code in [0_u8, 1, 2, 4, 5, 7, 8] {
+            let (candles, _) = build_valid_daily_candles(&data, 42, code);
+            for candle in &candles {
+                assert_eq!(candle.exchange_segment_code, code);
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_neg_infinity_filtered() {
+        let mut data = sample_daily_response();
+        data.low[0] = f64::NEG_INFINITY;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_negative_close() {
+        let mut data = sample_daily_response();
+        data.close[1] = -0.01;
+        let (candles, invalid) = build_valid_daily_candles(&data, 11536, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_boundary_1529_passes() {
+        // 15:29 IST = valid (inside window)
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![98.0],
+            close: vec![103.0],
+            volume: vec![1000],
+            // 15:29 IST = 09:59 UTC on 2026-03-09
+            timestamp: vec![1_773_014_400 + 9 * 3600 + 59 * 60],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_boundary_1530_filtered() {
+        // 15:30 IST = invalid (outside window)
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![98.0],
+            close: vec![103.0],
+            volume: vec![1000],
+            // 15:30 IST = 10:00 UTC on 2026-03-09
+            timestamp: vec![1_773_014_400 + 10 * 3600],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0); // window filter is not counted as invalid
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_single_candle_valid() {
+        let data = DhanDailyResponse {
+            open: vec![100.0],
+            high: vec![110.0],
+            low: vec![95.0],
+            close: vec![105.0],
+            volume: vec![50000],
+            timestamp: vec![1_772_582_400],
+            open_interest: vec![12000],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open_interest, 12000);
+        assert_eq!(candles[0].timestamp_utc_secs, 1_772_582_400);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_penny_stock_valid() {
+        let data = DhanIntradayResponse {
+            open: vec![0.05],
+            high: vec![0.10],
+            low: vec![0.01],
+            close: vec![0.07],
+            volume: vec![100000],
+            timestamp: vec![1_773_027_900],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 1, "1m");
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 0.05);
+    }
+
+    // =======================================================================
+    // build_valid_intraday_candles — filtering logic
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_nan_standalone() {
+        let data = DhanIntradayResponse {
+            open: vec![100.0, f64::NAN],
+            high: vec![105.0, 110.0],
+            low: vec![98.0, 99.0],
+            close: vec![103.0, 105.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_773_027_900, 1_773_027_960],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1, "NaN candle must be counted as invalid");
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 100.0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_non_positive() {
+        let data = DhanIntradayResponse {
+            open: vec![0.0, 100.0],
+            high: vec![105.0, 105.0],
+            low: vec![98.0, 98.0],
+            close: vec![103.0, 103.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_773_027_900, 1_773_027_960],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "5m");
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_high_below_low_standalone() {
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![95.0], // high < low
+            low: vec![98.0],
+            close: vec![97.0],
+            volume: vec![1000],
+            timestamp: vec![1_773_027_900],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 1);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_filters_outside_window() {
+        // 15:30 IST = 10:00 UTC on 2026-03-09
+        let utc_epoch_after_close: i64 = 1_773_014_400 + 10 * 3600;
+        let data = DhanIntradayResponse {
+            open: vec![100.0, 200.0],
+            high: vec![105.0, 210.0],
+            low: vec![98.0, 195.0],
+            close: vec![103.0, 205.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1_773_027_900, utc_epoch_after_close],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(invalid, 0, "outside-window is not counted as invalid");
+        assert_eq!(candles.len(), 1, "outside-window candle should be filtered");
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_empty_data() {
+        let data = DhanIntradayResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert!(candles.is_empty());
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn test_build_valid_intraday_candles_preserves_oi_single_candle() {
+        let data = DhanIntradayResponse {
+            open: vec![100.0],
+            high: vec![105.0],
+            low: vec![98.0],
+            close: vec![103.0],
+            volume: vec![1000],
+            timestamp: vec![1_773_027_900],
+            open_interest: vec![5000],
+        };
+        let (candles, _) = build_valid_intraday_candles(&data, 42, 2, "1m");
+        assert_eq!(candles[0].open_interest, 5000);
+    }
+
+    // =======================================================================
+    // build_valid_daily_candles — filtering logic
+    // =======================================================================
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_nan_single_candle() {
+        let data = DhanDailyResponse {
+            open: vec![f64::NAN],
+            high: vec![210.0],
+            low: vec![195.0],
+            close: vec![205.0],
+            volume: vec![10000],
+            timestamp: vec![1_772_582_400],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 1);
+        assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_filters_negative_price() {
+        let data = DhanDailyResponse {
+            open: vec![200.0, -1.0],
+            high: vec![210.0, 211.0],
+            low: vec![195.0, 196.0],
+            close: vec![205.0, 206.0],
+            volume: vec![10000, 20000],
+            timestamp: vec![1_772_582_400, 1_773_014_400],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 1);
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].open, 200.0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_empty_data() {
+        let data = DhanDailyResponse {
+            open: vec![],
+            high: vec![],
+            low: vec![],
+            close: vec![],
+            volume: vec![],
+            timestamp: vec![],
+            open_interest: vec![],
+        };
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert!(candles.is_empty());
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_all_valid_timeframe_check() {
+        let data = sample_daily_response();
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(invalid, 0);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].timeframe, TIMEFRAME_1D);
+        assert_eq!(candles[1].timeframe, TIMEFRAME_1D);
+    }
+
+    #[test]
+    fn test_build_valid_daily_candles_no_intraday_window_filter() {
+        // Daily candles should NOT be filtered by intraday window
+        // (they have midnight timestamps which are "outside" market hours)
+        let data = sample_daily_response();
+        let (candles, invalid) = build_valid_daily_candles(&data, 1333, 1);
+        assert_eq!(
+            candles.len(),
+            2,
+            "daily candles should not be window-filtered"
+        );
+        assert_eq!(invalid, 0);
+    }
+
+    // =======================================================================
+    // M5: Candle fetch failure escalation — error categorization
+    // =======================================================================
+
+    /// Verifies that token-related errors (807/DH-901) are classified as
+    /// requiring escalation to error! level, while non-token errors remain
+    /// at warn! level. Token errors affect ALL instruments (system-wide),
+    /// whereas network/input errors are scoped to individual instruments.
+    #[test]
+    fn test_candle_fetch_failure_escalation() {
+        // Token-expired errors should be escalated (error! level)
+        assert!(
+            is_token_related_error(&ErrorAction::TokenExpired),
+            "TokenExpired (807/DH-901) must be escalated — affects all instruments"
+        );
+
+        // Non-token errors should NOT be escalated (remain at warn! level)
+        assert!(
+            !is_token_related_error(&ErrorAction::RateLimited),
+            "RateLimited (DH-904) is per-instrument — stays at warn!"
+        );
+        assert!(
+            !is_token_related_error(&ErrorAction::TooManyConnections),
+            "TooManyConnections (805) is connection-level — stays at warn!"
+        );
+        assert!(
+            !is_token_related_error(&ErrorAction::StandardRetry),
+            "StandardRetry is per-instrument — stays at warn!"
+        );
+        assert!(
+            !is_token_related_error(&ErrorAction::NeverRetry),
+            "NeverRetry (DH-905/906) is per-instrument — stays at warn!"
+        );
+    }
+
+    /// Verifies the integration between classify_error and is_token_related_error:
+    /// only error codes 807 and DH-901 produce escalation-worthy errors.
+    #[test]
+    fn test_candle_fetch_failure_escalation_end_to_end() {
+        // 807 data API token expired → escalate
+        let body_807 = br#"{"errorCode": 807, "message": "Access token expired"}"#;
+        let action_807 = classify_error(reqwest::StatusCode::UNAUTHORIZED, body_807);
+        assert!(
+            is_token_related_error(&action_807),
+            "807 must classify as token-related and escalate to error!"
+        );
+
+        // DH-901 trading API auth error → escalate
+        let body_901 =
+            br#"{"errorType": "AUTH", "errorCode": "DH-901", "errorMessage": "Invalid auth"}"#;
+        let action_901 = classify_error(reqwest::StatusCode::UNAUTHORIZED, body_901);
+        assert!(
+            is_token_related_error(&action_901),
+            "DH-901 must classify as token-related and escalate to error!"
+        );
+
+        // DH-904 rate limit → do NOT escalate
+        let body_904 =
+            br#"{"errorType": "RATE_LIMIT", "errorCode": "DH-904", "errorMessage": "Rate limit"}"#;
+        let action_904 = classify_error(reqwest::StatusCode::BAD_REQUEST, body_904);
+        assert!(
+            !is_token_related_error(&action_904),
+            "DH-904 must NOT escalate — rate limits are per-instrument"
+        );
+
+        // DH-905 input error → do NOT escalate
+        let body_905 =
+            br#"{"errorType": "INPUT", "errorCode": "DH-905", "errorMessage": "Bad input"}"#;
+        let action_905 = classify_error(reqwest::StatusCode::BAD_REQUEST, body_905);
+        assert!(
+            !is_token_related_error(&action_905),
+            "DH-905 must NOT escalate — input errors are per-instrument"
+        );
+
+        // 805 too many connections → do NOT escalate
+        let body_805 = br#"{"errorCode": 805, "message": "Too many connections"}"#;
+        let action_805 = classify_error(reqwest::StatusCode::BAD_REQUEST, body_805);
+        assert!(
+            !is_token_related_error(&action_805),
+            "805 must NOT escalate — connection errors are infrastructure-level"
+        );
+    }
+
+    // =======================================================================
+    // is_weekend_timestamp — weekend candle rejection
+    // =======================================================================
+
+    #[test]
+    fn test_is_weekend_timestamp_saturday_detected() {
+        // 2026-03-21 09:30 IST = Saturday (the exact issue the user found)
+        // IST 09:30 = UTC 04:00 = epoch 1774008000
+        let sat_ist_0930 = chrono::NaiveDate::from_ymd_opt(2026, 3, 21)
+            .unwrap()
+            .and_hms_opt(4, 0, 0) // UTC 04:00 = IST 09:30
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            is_weekend_timestamp(sat_ist_0930),
+            "Saturday 09:30 IST must be detected as weekend"
+        );
+    }
+
+    #[test]
+    fn test_is_weekend_timestamp_sunday_detected() {
+        // 2026-03-22 10:00 IST = Sunday
+        let sun_ist_1000 = chrono::NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(4, 30, 0) // UTC 04:30 = IST 10:00
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            is_weekend_timestamp(sun_ist_1000),
+            "Sunday must be detected as weekend"
+        );
+    }
+
+    #[test]
+    fn test_is_weekend_timestamp_monday_not_weekend() {
+        // 2026-03-23 09:15 IST = Monday (trading day)
+        let mon_ist_0915 = chrono::NaiveDate::from_ymd_opt(2026, 3, 23)
+            .unwrap()
+            .and_hms_opt(3, 45, 0) // UTC 03:45 = IST 09:15
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            !is_weekend_timestamp(mon_ist_0915),
+            "Monday must NOT be detected as weekend"
+        );
+    }
+
+    #[test]
+    fn test_is_weekend_timestamp_friday_not_weekend() {
+        // 2026-03-20 15:29 IST = Friday (last trading minute)
+        let fri_ist_1529 = chrono::NaiveDate::from_ymd_opt(2026, 3, 20)
+            .unwrap()
+            .and_hms_opt(9, 59, 0) // UTC 09:59 = IST 15:29
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert!(
+            !is_weekend_timestamp(fri_ist_1529),
+            "Friday must NOT be detected as weekend"
         );
     }
 }

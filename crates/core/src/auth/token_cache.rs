@@ -13,15 +13,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::DateTime;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use super::types::TokenState;
-use dhan_live_trader_common::constants::{
-    IST_UTC_OFFSET_SECONDS, TOKEN_CACHE_FILE_PATH, TOKEN_CACHE_MIN_REMAINING_HOURS,
-};
+use dhan_live_trader_common::constants::{TOKEN_CACHE_FILE_PATH, TOKEN_CACHE_MIN_REMAINING_HOURS};
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 // ---------------------------------------------------------------------------
 // Cache File Format
@@ -86,6 +85,14 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
 
     let tmp_path = format!("{TOKEN_CACHE_FILE_PATH}.tmp");
 
+    // Ensure parent directory exists (data/cache/ may not exist on first run).
+    if let Some(parent) = std::path::Path::new(TOKEN_CACHE_FILE_PATH).parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(?err, "failed to create token cache directory");
+        return;
+    }
+
     // Write to temp file first (atomic write pattern)
     let write_result = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -148,10 +155,7 @@ pub fn load_token_cache(client_id: &SecretString) -> Option<TokenState> {
     }
 
     // Parse timestamps back to IST DateTime
-    // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800), always valid
-    #[allow(clippy::expect_used)]
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+    let ist = ist_offset();
 
     let expires_at = match DateTime::from_timestamp(entry.expires_at_epoch_secs, 0) {
         Some(dt) => dt.with_timezone(&ist),
@@ -246,10 +250,7 @@ pub fn load_token_cache_fast() -> Option<FastCacheResult> {
     };
 
     // Parse timestamps back to IST DateTime
-    // APPROVED: IST_UTC_OFFSET_SECONDS is a compile-time constant (19800), always valid
-    #[allow(clippy::expect_used)]
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset 19800s is always valid"); // APPROVED: compile-time provable constant
+    let ist = ist_offset();
 
     let expires_at = match DateTime::from_timestamp(entry.expires_at_epoch_secs, 0) {
         Some(dt) => dt.with_timezone(&ist),
@@ -338,7 +339,18 @@ mod tests {
     /// Cargo runs tests in the same binary in parallel threads; without
     /// serialization, one test's `save` can be overwritten by another before
     /// the matching `load`, causing spurious failures.
+    ///
+    /// Uses `unwrap_or_else(|e| e.into_inner())` to recover from poisoned
+    /// mutex (if a prior test panicked while holding the lock). Safe in tests —
+    /// the lock only protects a cache file, not critical invariants.
     static CACHE_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquires the cache file lock, recovering from poison if a prior test panicked.
+    fn acquire_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_FILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn test_hash_client_id_deterministic() {
@@ -356,8 +368,7 @@ mod tests {
 
     #[test]
     fn test_load_token_cache_missing_file() {
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
         let id = SecretString::from("test-client".to_string());
         let result = load_token_cache(&id);
@@ -368,13 +379,10 @@ mod tests {
     fn test_save_and_load_roundtrip() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -400,13 +408,10 @@ mod tests {
     fn test_load_rejects_wrong_client_id() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -430,13 +435,10 @@ mod tests {
     fn test_load_rejects_expired_token() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -458,13 +460,10 @@ mod tests {
     fn test_load_rejects_nearly_expired_token() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         // Token expires in 30 minutes — less than MIN_REMAINING_HOURS (1h)
@@ -488,8 +487,7 @@ mod tests {
 
     #[test]
     fn test_corrupt_cache_file_returns_none() {
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         std::fs::write(TOKEN_CACHE_FILE_PATH, "not valid json {{{").ok();
@@ -531,13 +529,10 @@ mod tests {
     fn test_load_token_cache_fast_roundtrip() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -560,8 +555,7 @@ mod tests {
 
     #[test]
     fn test_load_token_cache_fast_missing_file() {
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
         let result = load_token_cache_fast();
@@ -575,13 +569,10 @@ mod tests {
     fn test_load_token_cache_fast_old_format_without_client_id() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         // Write old-format cache (no client_id field)
@@ -606,13 +597,10 @@ mod tests {
     fn test_load_token_cache_fast_expired_token() {
         use chrono::{Duration, Utc};
 
-        #[allow(clippy::expect_used)]
-        let _guard = CACHE_FILE_LOCK.lock().expect("test lock"); // APPROVED: test code
+        let _guard = acquire_cache_lock();
         delete_cache_file();
 
-        #[allow(clippy::expect_used)]
-        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-            .expect("IST offset 19800s is always valid"); // APPROVED: test code
+        let ist = ist_offset();
         let now_ist = Utc::now().with_timezone(&ist);
 
         let token = TokenState::from_cached(
@@ -626,6 +614,270 @@ mod tests {
 
         let result = load_token_cache_fast();
         assert!(result.is_none(), "fast cache should reject expired token");
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — empty client_id field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_empty_client_id_field() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+
+        // Write cache with client_id = "" (empty string)
+        let entry = serde_json::json!({
+            "access_token": "empty-cid-jwt",
+            "expires_at_epoch_secs": (now_ist + Duration::hours(23)).timestamp(),
+            "issued_at_epoch_secs": now_ist.timestamp(),
+            "client_id_hash": 12345u64,
+            "client_id": "",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "fast cache should return None for empty client_id field"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — nearly expired token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_nearly_expired_token() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+
+        // Token expires in 30 min — less than TOKEN_CACHE_MIN_REMAINING_HOURS
+        let token = TokenState::from_cached(
+            SecretString::from("nearly-expired-fast-jwt".to_string()),
+            now_ist + Duration::minutes(30),
+            now_ist - Duration::hours(23) - Duration::minutes(30),
+        );
+
+        let client_id = SecretString::from("nearly-expired-fast-client".to_string());
+        save_token_cache(&token, &client_id);
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "fast cache should reject nearly expired token"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — corrupt JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_corrupt_json() {
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        std::fs::write(TOKEN_CACHE_FILE_PATH, "{{invalid json").ok();
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "fast cache should return None for corrupt JSON"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache — invalid expires_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_invalid_expires_at_timestamp() {
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let client_id = SecretString::from("test-invalid-ts".to_string());
+        let entry = serde_json::json!({
+            "access_token": "test-jwt",
+            "expires_at_epoch_secs": i64::MAX,
+            "issued_at_epoch_secs": 0i64,
+            "client_id_hash": hash_client_id(&client_id),
+            "client_id": "test-invalid-ts",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache(&client_id);
+        // i64::MAX may fail DateTime::from_timestamp or the token may be expired
+        // Either way, it should not panic
+        let _ = result;
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — invalid issued_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_invalid_issued_at_timestamp() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+
+        // Valid expires_at but invalid issued_at (i64::MAX overflows DateTime)
+        let entry = serde_json::json!({
+            "access_token": "test-jwt",
+            "expires_at_epoch_secs": (now_ist + Duration::hours(23)).timestamp(),
+            "issued_at_epoch_secs": i64::MAX,
+            "client_id_hash": 0u64,
+            "client_id": "test-invalid-issued",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache_fast();
+        // Either None (invalid timestamp) or valid — must not panic
+        let _ = result;
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_client_id — empty string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_client_id_empty_string() {
+        let id1 = SecretString::from(String::new());
+        let id2 = SecretString::from(String::new());
+        assert_eq!(hash_client_id(&id1), hash_client_id(&id2));
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_cache_file — idempotent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_cache_file_idempotent() {
+        let _guard = acquire_cache_lock();
+        // Delete twice — second call should not panic
+        delete_cache_file();
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenCacheEntry serde — backward compatibility (missing client_id)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_cache_entry_deserialize_without_client_id() {
+        let json = r#"{
+            "access_token": "test-jwt",
+            "expires_at_epoch_secs": 1700000000,
+            "issued_at_epoch_secs": 1699900000,
+            "client_id_hash": 12345
+        }"#;
+        let entry: TokenCacheEntry = serde_json::from_str(json).expect("should deserialize"); // APPROVED: test
+        assert!(
+            entry.client_id.is_none(),
+            "missing client_id should default to None"
+        );
+    }
+
+    #[test]
+    fn test_token_cache_entry_serialize_roundtrip() {
+        let entry = TokenCacheEntry {
+            access_token: "roundtrip-jwt".to_string(),
+            expires_at_epoch_secs: 1_700_000_000,
+            issued_at_epoch_secs: 1_699_900_000,
+            client_id_hash: 42,
+            client_id: Some("test-client".to_string()),
+        };
+        let json = serde_json::to_string(&entry).expect("should serialize"); // APPROVED: test
+        let parsed: TokenCacheEntry = serde_json::from_str(&json).expect("should deserialize"); // APPROVED: test
+        assert_eq!(parsed.access_token, "roundtrip-jwt");
+        assert_eq!(parsed.client_id_hash, 42);
+        assert_eq!(parsed.client_id.as_deref(), Some("test-client"));
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache — invalid issued_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_invalid_issued_at_timestamp() {
+        use chrono::{Duration, Utc};
+
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        let ist = ist_offset();
+        let now_ist = Utc::now().with_timezone(&ist);
+        let client_id = SecretString::from("test-invalid-issued-at".to_string());
+
+        // Valid expires_at but invalid issued_at (i64::MAX overflows DateTime)
+        let entry = serde_json::json!({
+            "access_token": "test-jwt-invalid-issued",
+            "expires_at_epoch_secs": (now_ist + Duration::hours(23)).timestamp(),
+            "issued_at_epoch_secs": i64::MAX,
+            "client_id_hash": hash_client_id(&client_id),
+            "client_id": "test-invalid-issued-at",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache(&client_id);
+        assert!(
+            result.is_none(),
+            "invalid issued_at timestamp should return None"
+        );
+
+        delete_cache_file();
+    }
+
+    // -----------------------------------------------------------------------
+    // load_token_cache_fast — invalid expires_at timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_token_cache_fast_invalid_expires_at_timestamp() {
+        let _guard = acquire_cache_lock();
+        delete_cache_file();
+
+        // Invalid expires_at (i64::MAX), valid issued_at, with client_id
+        let entry = serde_json::json!({
+            "access_token": "test-jwt-invalid-expires",
+            "expires_at_epoch_secs": i64::MAX,
+            "issued_at_epoch_secs": 0i64,
+            "client_id_hash": 0u64,
+            "client_id": "test-fast-invalid-expires",
+        });
+        std::fs::write(TOKEN_CACHE_FILE_PATH, entry.to_string()).ok();
+
+        let result = load_token_cache_fast();
+        assert!(
+            result.is_none(),
+            "invalid expires_at timestamp should return None in fast path"
+        );
 
         delete_cache_file();
     }

@@ -425,6 +425,11 @@ pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// Maximum reconnect delay for order update WebSocket (milliseconds).
 pub const ORDER_UPDATE_RECONNECT_MAX_DELAY_MS: u64 = 60000;
 
+/// Timeout for the order update WebSocket auth response (seconds).
+/// After sending the LoginReq (MsgCode 42), the server should respond
+/// within this window. 10 seconds is generous for a JSON auth handshake.
+pub const ORDER_UPDATE_AUTH_TIMEOUT_SECS: u64 = 10;
+
 // ---------------------------------------------------------------------------
 // SEBI Compliance
 // ---------------------------------------------------------------------------
@@ -464,6 +469,11 @@ pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 /// Error-level gap threshold in seconds. Gaps >= this trigger an ERROR log
 /// (which routes to Telegram alert). 120 seconds suggests feed disconnection.
 pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 120;
+
+/// Stale LTP threshold in seconds. If no tick arrives for a security within
+/// this window (wall-clock time), it is considered stale/frozen. 600s = 10 min.
+/// Checked periodically by `TickGapTracker::detect_stale_instruments()`.
+pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
@@ -784,6 +794,9 @@ pub const QUESTDB_TABLE_SUBSCRIBED_INDICES: &str = "subscribed_indices";
 /// QuestDB table: NSE trading calendar (holidays + Muhurat sessions).
 pub const QUESTDB_TABLE_NSE_HOLIDAYS: &str = "nse_holidays";
 
+/// QuestDB table: NSE index constituency (daily snapshot from niftyindices.com).
+pub const QUESTDB_TABLE_INDEX_CONSTITUENTS: &str = "index_constituents";
+
 // ---------------------------------------------------------------------------
 // QuestDB ILP — Ingestion Configuration
 // ---------------------------------------------------------------------------
@@ -820,6 +833,10 @@ pub const SECONDS_PER_DAY: u32 = 86_400;
 /// Allows in-flight ticks (last 15:29 candle) to reach the tick processor channel
 /// before the WebSocket read loop is killed.
 pub const MARKET_CLOSE_DRAIN_BUFFER_SECS: u64 = 2;
+
+/// Maximum acceptable boot time in seconds. If exceeded, CRITICAL Telegram alert fires.
+/// Individual boot steps have their own timeouts; this is the overall ceiling.
+pub const BOOT_TIMEOUT_SECS: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // Authentication — TOTP Configuration
@@ -947,7 +964,14 @@ pub const DHAN_CANDLE_INTERVAL_60MIN: &str = "60";
 /// Maximum days of intraday data per API request (Dhan limit: 90 days).
 pub const DHAN_INTRADAY_MAX_DAYS_PER_REQUEST: u32 = 90;
 
-/// NSE F&O market open time as HH:MM:SS in IST.
+/// NSE continuous trading session start time as HH:MM:SS in IST.
+///
+/// Used for Dhan historical API `fromDate` and cross-verification baseline.
+/// Dhan's historical intraday API returns candles starting from 09:15 (continuous
+/// trading). Pre-market data (09:00–09:14) is only available via live WebSocket.
+///
+/// For live data collection start, see `data_collection_start` in config (09:00).
+/// For tick/candle persistence window, see `TICK_PERSIST_START_SECS_OF_DAY_IST` (09:00).
 pub const MARKET_OPEN_TIME_IST: &str = "09:15:00";
 
 /// NSE F&O last 1-minute candle start time as HH:MM:SS in IST.
@@ -959,17 +983,19 @@ pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 /// meaning the last candle returned starts at 15:29.
 pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 
-/// Post-market historical data fetch trigger time — 5 minutes after market close.
-/// At 15:35 IST, all market data for the day is finalized and available via REST API.
-pub const POST_MARKET_FETCH_TIME_IST_HOUR: u32 = 15;
-/// Post-market fetch minute component (15:35 IST).
-pub const POST_MARKET_FETCH_TIME_IST_MINUTE: u32 = 35;
+/// Full application auto-shutdown time (IST). After market close at 15:30,
+/// historical re-fetch + cross-verification runs. At 16:00 IST the entire
+/// application shuts down — matching the target AWS instance lifecycle.
+pub const APP_SHUTDOWN_TIME_IST: &str = "16:00:00";
 
-/// Buffer time (seconds) after post-market WebSocket disconnect before re-fetching
-/// historical data. Allows Dhan to finalize end-of-day data.
-pub const POST_MARKET_DATA_FINALIZATION_SECS: u64 = 300;
-
-/// Number of 1-minute candles in a full NSE trading day (09:15 to 15:29 = 375 minutes).
+/// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
+///
+/// Used by `cross_verify.rs` to validate historical vs live candle coverage.
+/// This covers only the continuous trading session (09:15–15:29) because Dhan's
+/// historical intraday API returns data starting from 09:15.
+///
+/// Live WebSocket data is collected and stored from 09:00 (pre-market), but
+/// pre-market candles (09:00–09:14) have no historical counterpart for comparison.
 /// Each candle covers [HH:MM:00, HH:MM:59]. Last candle at 15:29.
 pub const CANDLES_PER_TRADING_DAY: usize = 375;
 
@@ -1159,11 +1185,6 @@ pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
 /// QuestDB table: previous close reference data from code 6 packets.
 pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 
-/// QuestDB table: 1-minute OHLCV candles from Dhan historical API (legacy).
-/// Kept for backward compatibility with existing tests and cross-verify.
-/// New code should use `QUESTDB_TABLE_HISTORICAL_CANDLES`.
-pub const QUESTDB_TABLE_CANDLES_1M: &str = "historical_candles_1m";
-
 /// QuestDB table: multi-timeframe OHLCV candles from Dhan historical API.
 /// Stores 1m, 5m, 15m, 60m intraday candles and daily candles in a single table.
 /// Discriminated by `timeframe` SYMBOL column. DEDUP on `(ts, security_id, timeframe)`.
@@ -1174,9 +1195,9 @@ pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";
 
 /// Calendar alignment offset for QuestDB materialized views.
 ///
-/// All timestamps are stored as IST-as-UTC (UTC epoch + 19800s), so QuestDB
-/// displays IST wall-clock time directly. No offset needed — midnight "UTC"
-/// in our convention IS midnight IST.
+/// All timestamps are stored as IST epoch values. Live WebSocket data arrives
+/// as IST epoch seconds (stored directly). Historical REST data has +19800s
+/// applied. No offset needed — midnight "UTC" in our convention IS midnight IST.
 pub const QUESTDB_IST_ALIGN_OFFSET: &str = "00:00";
 
 // ---------------------------------------------------------------------------
@@ -1188,6 +1209,17 @@ pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
 
 /// Default tick flush interval in milliseconds.
 pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
+
+/// Tick ring buffer capacity for QuestDB outage resilience.
+/// Holds ticks in memory when QuestDB is down, drains on recovery.
+/// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
+pub const TICK_BUFFER_CAPACITY: usize = 300_000;
+
+/// Option Chain API minimum request interval in seconds (Dhan limit: 1 req / 3 sec).
+pub const OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS: u64 = 3;
+
+/// Option Chain API HTTP request timeout in seconds.
+pub const OPTION_CHAIN_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
@@ -1206,11 +1238,14 @@ pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 // IST Timezone Offset (i64)
 // ---------------------------------------------------------------------------
 
-/// IST offset from UTC in seconds (5 hours 30 minutes) as i64 for tick timestamp conversion.
+/// IST offset from UTC in seconds (5 hours 30 minutes) as i64.
+/// Used for: (1) converting Historical REST API UTC timestamps to IST,
+/// (2) converting `received_at_nanos` (system clock UTC) to IST basis.
+/// NOT needed for WebSocket `exchange_timestamp` which is already IST.
 pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 
 /// IST offset from UTC in nanoseconds (5h 30m = 19,800,000,000,000 ns).
-/// Used for converting `received_at_nanos` (system clock UTC) to IST-as-UTC.
+/// Used for converting `received_at_nanos` (system clock UTC) to IST basis.
 pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 
 // ---------------------------------------------------------------------------
@@ -1282,6 +1317,32 @@ pub const MAX_INDICATOR_INSTRUMENTS: usize = 25_000;
 pub const MAX_STRATEGY_INSTANCES: usize = 256;
 
 // ---------------------------------------------------------------------------
+// Options Greeks — Black-Scholes Parameters
+// ---------------------------------------------------------------------------
+
+/// Risk-free interest rate (annualized) for Black-Scholes pricing.
+/// Uses India 91-day T-Bill rate (~6.8% as of Q1 2026).
+/// Update quarterly from RBI T-Bill auction results.
+pub const RISK_FREE_RATE: f64 = 0.068;
+
+/// Continuous dividend yield (annualized) for NIFTY/BANKNIFTY.
+/// ~1.2% for NIFTY 50 (varies; update quarterly).
+pub const DIVIDEND_YIELD: f64 = 0.012;
+
+/// Maximum Newton-Raphson iterations for IV solver.
+/// 50 iterations is sufficient for convergence to 1e-8 tolerance.
+pub const IV_SOLVER_MAX_ITERATIONS: u32 = 50;
+
+/// IV solver convergence tolerance (precision of implied volatility).
+pub const IV_SOLVER_TOLERANCE: f64 = 1e-8;
+
+/// Minimum implied volatility bound (0.1% — prevents zero/negative IV).
+pub const IV_MIN_BOUND: f64 = 0.001;
+
+/// Maximum implied volatility bound (500% — extreme but valid for penny options).
+pub const IV_MAX_BOUND: f64 = 5.0;
+
+// ---------------------------------------------------------------------------
 // Frontend — Tick Broadcast Channel
 // ---------------------------------------------------------------------------
 
@@ -1294,7 +1355,10 @@ pub const MAX_STRATEGY_INSTANCES: usize = 256;
 /// `/tmp` is ephemeral on container restart but survives process crashes
 /// within the same container — exactly the right lifetime for crash recovery.
 /// Security: file permissions 0600, container isolation, 24h TTL token.
-pub const TOKEN_CACHE_FILE_PATH: &str = "/tmp/dlt-token-cache";
+/// Token cache file path. Uses `data/cache/` (persistent filesystem) instead of `/tmp`
+/// which may be tmpfs on Linux (wiped on reboot). The `data/` directory is the app's
+/// persistent data root, also used by rkyv instrument cache and log files.
+pub const TOKEN_CACHE_FILE_PATH: &str = "data/cache/dlt-token-cache";
 
 /// Minimum remaining token validity (hours) to accept a cached token.
 ///
@@ -1509,14 +1573,14 @@ const _: () = assert!(DISCONNECT_PACKET_SIZE == 10, "disconnect total = 10");
 
 /// Base URL for NSE index constituent CSV downloads.
 // O(1) EXEMPT: compile-time constant, not runtime allocation
-pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://niftyindices.com/IndexConstituent/";
+pub const INDEX_CONSTITUENCY_BASE_URL: &str = "https://www.niftyindices.com/IndexConstituent/";
 
 /// Cache filename for the serialized constituency map.
 pub const INDEX_CONSTITUENCY_CSV_CACHE_FILENAME: &str = "constituency-map.json";
 
 /// Minimum number of indices that must download successfully.
 /// Below this threshold, a warning is emitted (map may be incomplete).
-pub const INDEX_CONSTITUENCY_MIN_INDICES: usize = 3;
+pub const INDEX_CONSTITUENCY_MIN_INDICES: usize = 15;
 
 /// Retry: minimum backoff delay in seconds between download attempts.
 pub const INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS: u64 = 1;
@@ -1527,15 +1591,81 @@ pub const INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS: u64 = 10;
 /// Retry: maximum number of retry attempts per CSV download.
 pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
 
+/// User-Agent header for niftyindices.com requests.
+/// niftyindices.com returns 403 Forbidden without a browser-like User-Agent.
+pub const INDEX_CONSTITUENCY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 /// NSE index slugs: `(display_name, csv_slug)`.
 /// URL = `{INDEX_CONSTITUENCY_BASE_URL}{slug}.csv`
+///
+/// Comprehensive list covering all broad-based, sectoral, and thematic NSE indices.
+/// Source: niftyindices.com public CSV endpoints.
+/// Individual download failures are handled gracefully (logged + skipped).
 pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
+    // -----------------------------------------------------------------------
+    // Broad-Based Indices (16)
+    // -----------------------------------------------------------------------
     ("Nifty 50", "ind_nifty50list"),
     ("Nifty Next 50", "ind_niftynext50list"),
-    ("Nifty Bank", "ind_niftybanklist"),
-    ("Nifty IT", "ind_niftyitlist"),
-    ("Nifty Financial Services", "ind_niftyfinancelist"),
+    ("Nifty 100", "ind_nifty100list"),
+    ("Nifty 200", "ind_nifty200list"),
+    ("Nifty 500", "ind_nifty500list"),
     ("Nifty Midcap 50", "ind_niftymidcap50list"),
+    ("Nifty Midcap 100", "ind_niftymidcap100list"),
+    ("Nifty Midcap 150", "ind_niftymidcap150list"),
+    ("Nifty Midcap Select", "ind_niftymidcap_selectlist"),
+    ("Nifty Smallcap 50", "ind_niftysmallcap50list"),
+    ("Nifty Smallcap 100", "ind_niftysmallcap100list"),
+    ("Nifty Smallcap 250", "ind_niftysmallcap250list"),
+    ("Nifty LargeMidcap 250", "ind_niftylargemidcap250list"),
+    ("Nifty MidSmallcap 400", "ind_niftymidsmallcap400list"),
+    ("Nifty Microcap 250", "ind_niftymicrocap250_list"),
+    ("Nifty Total Market", "ind_niftytotalmarket_list"),
+    // -----------------------------------------------------------------------
+    // Sectoral Indices (15)
+    // -----------------------------------------------------------------------
+    ("Nifty Auto", "ind_niftyautolist"),
+    ("Nifty Bank", "ind_niftybanklist"),
+    ("Nifty Financial Services", "ind_niftyfinancelist"),
+    (
+        "Nifty Financial Services 25/50",
+        "ind_niftyfinancialservices25_50list",
+    ),
+    ("Nifty FMCG", "ind_niftyfmcglist"),
+    ("Nifty Healthcare", "ind_niftyhealthcarelist"),
+    ("Nifty IT", "ind_niftyitlist"),
+    ("Nifty Media", "ind_niftymedialist"),
+    ("Nifty Metal", "ind_niftymetallist"),
+    ("Nifty Pharma", "ind_niftypharmalist"),
+    ("Nifty PSU Bank", "ind_niftypsubanklist"),
+    ("Nifty Private Bank", "ind_niftypvtbanklist"),
+    ("Nifty Realty", "ind_niftyrealtylist"),
+    ("Nifty Consumer Durables", "ind_niftyconsumerdurablelist"),
+    ("Nifty Oil & Gas", "ind_niftyoilandgaslist"),
+    // -----------------------------------------------------------------------
+    // Thematic / Strategy Indices (18)
+    // -----------------------------------------------------------------------
+    ("Nifty Commodities", "ind_niftycommoditieslist"),
+    ("Nifty India Consumption", "ind_niftyindiaconsumptionlist"),
+    ("Nifty CPSE", "ind_niftycpselist"),
+    ("Nifty Energy", "ind_niftyenergylist"),
+    ("Nifty Infrastructure", "ind_niftyinfrastructurelist"),
+    ("Nifty MNC", "ind_niftymnclist"),
+    ("Nifty PSE", "ind_niftypselist"),
+    ("Nifty Growth Sectors 15", "ind_niftyGrowthSectors15list"),
+    ("Nifty100 Quality 30", "ind_nifty100_Quality30list"),
+    ("Nifty50 Value 20", "ind_nifty50_value20list"),
+    ("Nifty Alpha 50", "ind_niftyAlpha50list"),
+    ("Nifty High Beta 50", "ind_niftyHighBeta50list"),
+    ("Nifty Low Volatility 50", "ind_niftyLowVolatility50list"),
+    ("Nifty India Digital", "ind_niftyIndiaDigital_list"),
+    ("Nifty India Defence", "ind_niftyIndiaDefence_list"),
+    ("Nifty India Manufacturing", "ind_niftyIndiaMfg_list"),
+    ("Nifty Mobility", "ind_niftymobility_list"),
+    (
+        "Nifty500 Multicap 50:25:25",
+        "ind_nifty500Multicap502525_list",
+    ),
 ];
 
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
@@ -1738,6 +1868,12 @@ mod tests {
     }
 
     #[test]
+    fn test_order_update_auth_timeout_is_reasonable() {
+        const { assert!(ORDER_UPDATE_AUTH_TIMEOUT_SECS >= 5) };
+        const { assert!(ORDER_UPDATE_AUTH_TIMEOUT_SECS <= 30) };
+    }
+
+    #[test]
     fn test_indicator_warmup_ticks_positive() {
         const { assert!(MAX_INDICATOR_WARMUP_TICKS > 0) };
     }
@@ -1745,5 +1881,38 @@ mod tests {
     #[test]
     fn test_indicator_ring_buffer_capacity_power_of_two() {
         assert!(INDICATOR_RING_BUFFER_CAPACITY.is_power_of_two());
+    }
+
+    // --- Greeks Constants ---
+
+    #[test]
+    fn test_risk_free_rate_reasonable() {
+        // India T-Bill rate should be between 3% and 12%
+        assert!(RISK_FREE_RATE > 0.03 && RISK_FREE_RATE < 0.12);
+    }
+
+    #[test]
+    fn test_dividend_yield_reasonable() {
+        // NIFTY dividend yield between 0.5% and 3%
+        assert!(DIVIDEND_YIELD > 0.005 && DIVIDEND_YIELD < 0.03);
+    }
+
+    #[test]
+    fn test_iv_solver_max_iterations_positive() {
+        assert!(IV_SOLVER_MAX_ITERATIONS > 0);
+        assert!(IV_SOLVER_MAX_ITERATIONS <= 200);
+    }
+
+    #[test]
+    fn test_iv_solver_tolerance_small_positive() {
+        assert!(IV_SOLVER_TOLERANCE > 0.0);
+        assert!(IV_SOLVER_TOLERANCE < 1e-4);
+    }
+
+    #[test]
+    fn test_iv_bounds_valid_range() {
+        assert!(IV_MIN_BOUND > 0.0);
+        assert!(IV_MAX_BOUND > IV_MIN_BOUND);
+        assert!(IV_MAX_BOUND <= 10.0);
     }
 }

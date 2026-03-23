@@ -8,11 +8,9 @@
 //! These tests verify correctness under all possible thread interleavings
 //! using the Loom model checker.
 //!
-//! Run with: RUSTFLAGS="--cfg loom" cargo test -p dhan-live-trader-core --test loom_tick_dedup
+//! Run with: cargo test -p dhan-live-trader-core --features loom --test loom_tick_dedup
 
-#![allow(unexpected_cfgs)] // APPROVED: loom cfg is set via RUSTFLAGS, not Cargo features
-
-#[cfg(loom)]
+#[cfg(feature = "loom")]
 mod loom_tests {
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::{Arc, Mutex};
@@ -225,7 +223,7 @@ mod loom_tests {
 }
 
 // Standard (non-loom) concurrency tests that run in normal CI.
-#[cfg(not(loom))]
+#[cfg(not(feature = "loom"))]
 mod std_concurrency_tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};

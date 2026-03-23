@@ -18,6 +18,7 @@ pub mod instrument_registry;
 pub mod instrument_types;
 pub mod order_types;
 pub mod sanitize;
+pub mod segment;
 pub mod tick_types;
 pub mod trading_calendar;
 pub mod types;

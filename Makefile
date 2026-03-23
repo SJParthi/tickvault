@@ -5,13 +5,12 @@
 # Run `make help` to see all available targets.
 # =============================================================================
 
-.PHONY: help run stop build test check fmt clippy clean \
-        docker-up docker-down docker-restart docker-status docker-logs \
+.PHONY: help run run-supervised stop build test check fmt clippy clean \
+        docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap \
-        install-autostart uninstall-autostart autostart-status
 
 # ---- Configuration ----
 APP_NAME       := dhan-live-trader
@@ -37,9 +36,6 @@ help: ## Show this help
 	@echo "  OBSERVABILITY:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(obs)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "  AUTOSTART (macOS):"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(autostart)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
-	@echo ""
 	@echo "  MONITORING:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(grafana|questdb|jaeger|prometheus|traefik|alloy|loki)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
@@ -60,6 +56,28 @@ stop: ## Stop running app
 restart: stop ## Restart app (stop + run)
 	@sleep 1
 	@$(MAKE) run
+
+run-supervised: docker-up ## Supervised run: restarts on crash up to 5 times with exponential backoff
+	@echo "Starting $(APP_NAME) with crash supervision (max 5 restarts)..."
+	@attempt=0; \
+	max_restarts=5; \
+	while [ $$attempt -lt $$max_restarts ]; do \
+		attempt=$$((attempt + 1)); \
+		echo "[supervisor] Attempt $$attempt/$$max_restarts"; \
+		cargo run --release 2>&1; \
+		exit_code=$$?; \
+		if [ $$exit_code -eq 0 ]; then \
+			echo "[supervisor] Clean exit (code 0) — not restarting"; \
+			break; \
+		fi; \
+		if [ $$attempt -lt $$max_restarts ]; then \
+			backoff=$$((2 ** attempt)); \
+			echo "[supervisor] Crashed (exit code $$exit_code) — restarting in $${backoff}s..."; \
+			sleep $$backoff; \
+		else \
+			echo "[supervisor] Max restarts reached — giving up"; \
+		fi; \
+	done
 
 build: ## Build release binary
 	@echo "🔨 Building release..."
@@ -97,22 +115,26 @@ clean: ## Clean build artifacts
 # DOCKER INFRASTRUCTURE
 # =============================================================================
 
-docker-up: ## Start all Docker infrastructure (8 services)
+docker-up: ## Start all Docker infrastructure (8 services) + auto-init QuestDB schema
 	@echo "🐳 Starting Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ""
 	@$(MAKE) docker-status
+	@echo "🗄️  Initializing QuestDB schema (15 tables + 18 views)..."
+	@bash scripts/questdb-init.sh
 
 docker-down: ## Stop all Docker infrastructure
 	@echo "🐳 Stopping Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) down
 
-docker-restart: ## Restart all Docker infrastructure
+docker-restart: ## Restart all Docker infrastructure + re-init QuestDB schema
 	@echo "🐳 Restarting Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) down
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ""
 	@$(MAKE) docker-status
+	@echo "🗄️  Initializing QuestDB schema (15 tables + 18 views)..."
+	@bash scripts/questdb-init.sh
 
 docker-status: ## Show Docker container health
 	@echo ""
@@ -123,6 +145,9 @@ docker-status: ## Show Docker container health
 
 docker-logs: ## Tail Docker logs (all services)
 	docker compose -f $(COMPOSE_FILE) logs -f --tail 50
+
+questdb-init: ## Create all QuestDB tables + materialized views (idempotent)
+	@bash scripts/questdb-init.sh
 
 # =============================================================================
 # HEALTH & STATUS
@@ -261,15 +286,3 @@ alloy: ## Open Alloy UI (localhost:12345)
 loki: ## Open Loki status (localhost:3100/ready)
 	@open http://localhost:3100/ready 2>/dev/null || xdg-open http://localhost:3100/ready 2>/dev/null || echo "  Open: http://localhost:3100/ready"
 
-# =============================================================================
-# AUTOSTART — macOS launchd automation (zero-touch daily trading)
-# =============================================================================
-
-install-autostart: ## Install auto-start + watchdog (macOS, zero-touch)
-	@bash scripts/mac/install-autostart.sh
-
-uninstall-autostart: ## Uninstall auto-start + watchdog (clean removal)
-	@bash scripts/mac/install-autostart.sh --uninstall
-
-autostart-status: ## Show auto-start self-test dashboard
-	@bash scripts/mac/dlt-selftest.sh --quick 2>/dev/null || bash "$(HOME)/.dlt/dlt-selftest.sh" --quick

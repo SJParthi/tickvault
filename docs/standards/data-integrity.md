@@ -22,7 +22,7 @@ Every write operation must be idempotent — running it twice produces the same 
 - **Orders:** Deduplicate by idempotency key. On API timeout: CHECK status before retrying. Assume order WENT THROUGH until confirmed otherwise.
 
 ## Reconciliation
-**End-of-day (15:35 IST):** Fetch all Dhan orders → compare with OMS → flag mismatches (orders in Dhan not OMS = CRITICAL alert, fill quantity mismatch = CRITICAL). Store report in QuestDB.
+**End-of-day (immediately after WebSocket disconnect at 15:30 IST):** Fetch all Dhan orders → compare with OMS → flag mismatches (orders in Dhan not OMS = CRITICAL alert, fill quantity mismatch = CRITICAL). Store report in QuestDB.
 
 **Position reconciliation:** Run after every fill. Mismatch = halt trading + alert immediately.
 

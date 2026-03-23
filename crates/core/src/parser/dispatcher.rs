@@ -726,4 +726,250 @@ mod tests {
         let packets = split_stacked_depth_packets(&buf).unwrap();
         assert_eq!(packets.len(), 1);
     }
+
+    // --- Mutant-killing tests for split_stacked_depth_packets boundary conditions ---
+
+    #[test]
+    fn test_split_stacked_zero_msg_length_stops_splitting() {
+        // A packet with message_length=0 in header must stop the splitter.
+        // Kills mutant: `msg_len == 0` → `msg_len == 1`.
+        let mut buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        // Append a 12-byte "header" with message_length = 0
+        let mut zero_header = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        zero_header[2] = DEEP_DEPTH_FEED_CODE_BID;
+        buf.extend_from_slice(&zero_header);
+        let packets = split_stacked_depth_packets(&buf).unwrap();
+        assert_eq!(
+            packets.len(),
+            1,
+            "zero msg_length header must stop splitting"
+        );
+    }
+
+    #[test]
+    fn test_split_stacked_exact_fit_packet_included() {
+        // A packet whose message_length exactly matches remaining bytes must be included.
+        // Kills mutant: `remaining.len() < msg_len` → `remaining.len() <= msg_len`.
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_ASK, 42, TWENTY_DEPTH_LEVELS);
+        // The single packet's message_length == buf.len(), so remaining.len() == msg_len exactly.
+        let packets = split_stacked_depth_packets(&buf).unwrap();
+        assert_eq!(packets.len(), 1, "exact-fit packet must be included");
+        assert_eq!(packets[0].len(), buf.len());
+    }
+
+    #[test]
+    fn test_split_stacked_exactly_header_size_trailing_parsed() {
+        // Exactly DEEP_DEPTH_HEADER_SIZE trailing bytes form a valid header
+        // but with msg_len=12 (header only, no depth levels). The splitter should
+        // include it as a packet since remaining.len() >= msg_len.
+        // Kills mutant: `remaining.len() < DEEP_DEPTH_HEADER_SIZE` → `... <= ...`.
+        let bid = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        let mut stacked = bid.clone();
+        // Build a 12-byte header-only packet with msg_len = 12
+        let mut tiny_header = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        tiny_header[0..2].copy_from_slice(&(DEEP_DEPTH_HEADER_SIZE as u16).to_le_bytes());
+        tiny_header[2] = DEEP_DEPTH_FEED_CODE_BID;
+        stacked.extend_from_slice(&tiny_header);
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(
+            packets.len(),
+            2,
+            "12-byte header-only packet with msg_len=12 should be included"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional dispatcher coverage: deep depth received_at propagation,
+    // split_stacked truncated mid-packet, market depth variant fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dispatch_deep_depth_received_at_nanos_propagated() {
+        let buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 42, TWENTY_DEPTH_LEVELS);
+        let nanos = 1_234_567_890_123_456_789_i64;
+        let frame = dispatch_deep_depth_frame(&buf, nanos).unwrap();
+        match frame {
+            ParsedFrame::DeepDepth {
+                received_at_nanos, ..
+            } => {
+                assert_eq!(received_at_nanos, nanos);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_deep_depth_message_sequence_propagated() {
+        let mut buf = make_depth_packet(DEEP_DEPTH_FEED_CODE_ASK, 42, TWENTY_DEPTH_LEVELS);
+        // Set sequence number in header bytes 8-11
+        buf[8..12].copy_from_slice(&777u32.to_le_bytes());
+        let frame = dispatch_deep_depth_frame(&buf, 0).unwrap();
+        match frame {
+            ParsedFrame::DeepDepth {
+                message_sequence, ..
+            } => {
+                assert_eq!(message_sequence, 777);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_split_stacked_truncated_mid_packet_stops() {
+        // First packet is valid, second packet has msg_len > remaining bytes
+        let valid_bid = make_depth_packet(DEEP_DEPTH_FEED_CODE_BID, 1, TWENTY_DEPTH_LEVELS);
+        let valid_len = valid_bid.len();
+        let mut stacked = valid_bid;
+        // Append a header claiming 500 bytes but only provide 12
+        let mut truncated = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        truncated[0..2].copy_from_slice(&500u16.to_le_bytes());
+        truncated[2] = DEEP_DEPTH_FEED_CODE_ASK;
+        stacked.extend_from_slice(&truncated);
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(
+            packets.len(),
+            1,
+            "truncated second packet should be ignored"
+        );
+        assert_eq!(packets[0].len(), valid_len);
+    }
+
+    #[test]
+    fn test_dispatch_market_depth_has_correct_tick_fields() {
+        let mut buf = make_minimal_packet(RESPONSE_CODE_MARKET_DEPTH, MARKET_DEPTH_PACKET_SIZE);
+        // Set LTP at offset 8-11
+        buf[8..12].copy_from_slice(&1500.5_f32.to_le_bytes());
+        let (tick, depth) = unwrap_tick_with_depth(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.security_id, 42);
+        assert_eq!(tick.exchange_segment_code, 2);
+        // Depth should have 5 levels
+        assert_eq!(depth.len(), 5);
+    }
+
+    #[test]
+    fn test_dispatch_all_unknown_response_codes() {
+        // Test several codes that are not valid response codes
+        for code in [9, 10, 11, 12, 13, 14, 15, 20, 30, 40, 100, 255] {
+            let buf = make_minimal_packet(code, 8);
+            let err = dispatch_frame(&buf, 0).unwrap_err();
+            assert!(
+                matches!(err, ParseError::UnknownResponseCode(c) if c == code),
+                "code {code} should be unknown"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: stacked frames with correct instrument extraction,
+    // header unknown exchange byte propagation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dispatch_header_unknown_exchange_byte_propagated() {
+        // Exchange segment byte 6 (the gap in Dhan's enum) is passed through
+        // by the dispatcher into the parsed frame.
+        let mut buf = make_minimal_packet(RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE);
+        buf[3] = 6; // Unknown segment byte
+        let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.exchange_segment_code, 6);
+    }
+
+    #[test]
+    fn test_dispatch_header_exchange_byte_255_propagated() {
+        // Byte 255 is also unknown but must parse without panic
+        let mut buf = make_minimal_packet(RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE);
+        buf[3] = 255;
+        let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.exchange_segment_code, 255);
+    }
+
+    #[test]
+    fn test_split_stacked_frames_correct_security_ids() {
+        // Stack 3 bid packets for different instruments and verify each
+        // packet's security_id is decoded correctly after splitting.
+        let ids = [52432u32, 2885, 99999];
+        let mut stacked = Vec::new();
+        for &id in &ids {
+            stacked.extend_from_slice(&make_depth_packet(
+                DEEP_DEPTH_FEED_CODE_BID,
+                id,
+                TWENTY_DEPTH_LEVELS,
+            ));
+        }
+
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(packets.len(), 3);
+
+        for (i, &id) in ids.iter().enumerate() {
+            let frame = dispatch_deep_depth_frame(packets[i], 0).unwrap();
+            match frame {
+                ParsedFrame::DeepDepth { security_id, .. } => {
+                    assert_eq!(
+                        security_id, id,
+                        "stacked packet {i} should have security_id={id}"
+                    );
+                }
+                other => panic!("expected DeepDepth, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_stacked_interleaved_bid_ask_security_ids() {
+        // Bid + Ask for instrument A, then Bid + Ask for instrument B
+        let mut stacked = Vec::new();
+        stacked.extend_from_slice(&make_depth_packet(
+            DEEP_DEPTH_FEED_CODE_BID,
+            1000,
+            TWENTY_DEPTH_LEVELS,
+        ));
+        stacked.extend_from_slice(&make_depth_packet(
+            DEEP_DEPTH_FEED_CODE_ASK,
+            1000,
+            TWENTY_DEPTH_LEVELS,
+        ));
+        stacked.extend_from_slice(&make_depth_packet(
+            DEEP_DEPTH_FEED_CODE_BID,
+            2000,
+            TWENTY_DEPTH_LEVELS,
+        ));
+        stacked.extend_from_slice(&make_depth_packet(
+            DEEP_DEPTH_FEED_CODE_ASK,
+            2000,
+            TWENTY_DEPTH_LEVELS,
+        ));
+
+        let packets = split_stacked_depth_packets(&stacked).unwrap();
+        assert_eq!(packets.len(), 4);
+
+        // Verify sides alternate and security_ids match
+        let expected = [
+            (1000u32, DepthSide::Bid),
+            (1000, DepthSide::Ask),
+            (2000, DepthSide::Bid),
+            (2000, DepthSide::Ask),
+        ];
+        for (i, (expected_id, expected_side)) in expected.iter().enumerate() {
+            let frame = dispatch_deep_depth_frame(packets[i], 0).unwrap();
+            match frame {
+                ParsedFrame::DeepDepth {
+                    security_id, side, ..
+                } => {
+                    assert_eq!(security_id, *expected_id, "packet {i} security_id");
+                    assert_eq!(side, *expected_side, "packet {i} side");
+                }
+                other => panic!("expected DeepDepth, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_dispatch_ticker_nan_ltp_parsed() {
+        // Ticker packet with NaN LTP: parser reads NaN without panic,
+        // downstream tick_processor will filter it.
+        let mut buf = make_minimal_packet(RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE);
+        buf[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
+        assert!(tick.last_traded_price.is_nan());
+    }
 }

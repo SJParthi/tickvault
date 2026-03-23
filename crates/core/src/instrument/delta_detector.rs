@@ -278,7 +278,7 @@ pub fn detect_universe_delta(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, NaiveDate, Utc};
+    use chrono::{NaiveDate, Utc};
     use dhan_live_trader_common::instrument_types::{
         DerivativeContract, DhanInstrumentKind, FnoUnderlying, FnoUniverse, UnderlyingKind,
         UniverseBuildMetadata,
@@ -324,7 +324,7 @@ mod tests {
         contracts: Vec<DerivativeContract>,
         underlyings: Vec<FnoUnderlying>,
     ) -> FnoUniverse {
-        let ist = FixedOffset::east_opt(19_800).expect("valid offset");
+        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
         let derivative_contracts: HashMap<SecurityId, DerivativeContract> =
             contracts.into_iter().map(|c| (c.security_id, c)).collect();
         let underlying_map: HashMap<String, FnoUnderlying> = underlyings
@@ -350,7 +350,6 @@ mod tests {
                 build_duration: Duration::from_millis(1),
                 build_timestamp: Utc::now().with_timezone(&ist),
             },
-            index_constituency: None,
         }
     }
 

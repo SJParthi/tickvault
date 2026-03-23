@@ -11,7 +11,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::SharedAppState;
+use dhan_live_trader_api::state::{SharedAppState, SystemHealthStatus};
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
 // ---------------------------------------------------------------------------
@@ -48,11 +48,12 @@ fn test_state() -> SharedAppState {
         },
         Arc::new(RwLock::new(None)),
         Arc::new(RwLock::new(None)),
+        Arc::new(SystemHealthStatus::new()),
     )
 }
 
 fn test_app() -> axum::Router {
-    build_router(test_state())
+    build_router(test_state(), &[], true)
 }
 
 // ---------------------------------------------------------------------------
@@ -93,10 +94,19 @@ async fn contract_health_response_schema() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    // Schema contract: must have "status" and "version" fields
+    // Schema contract: must have "status", "version", and "subsystems" fields
     assert!(json.get("status").is_some(), "missing 'status' field");
     assert!(json.get("version").is_some(), "missing 'version' field");
-    assert_eq!(json["status"], "ok");
+    assert!(
+        json.get("subsystems").is_some(),
+        "missing 'subsystems' field"
+    );
+    // Status can be "healthy" or "degraded" depending on subsystem state
+    let status = json["status"].as_str().unwrap();
+    assert!(
+        status == "healthy" || status == "degraded",
+        "status must be 'healthy' or 'degraded', got: {status}"
+    );
     assert!(
         !json["version"].as_str().unwrap().is_empty(),
         "version must not be empty"

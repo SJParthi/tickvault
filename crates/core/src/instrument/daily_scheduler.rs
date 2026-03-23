@@ -18,17 +18,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
-
-// I-P1-01: IST offset for daily scheduling
-const IST_OFFSET_SECS: i32 = IST_UTC_OFFSET_SECONDS;
+use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
 
 // I-P1-01: Full day in seconds for next-day wrapping
 const SECS_PER_DAY: i64 = 86_400;
-
-// I-P1-01: Retry interval when IST offset construction fails (should never happen)
-const IST_OFFSET_RETRY_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // DailyRefreshConfig
@@ -91,14 +84,14 @@ pub fn compute_next_trigger_time(
     // I-P1-01: seconds from now until target, within the same day
     let now_secs = i64::from(now_time.num_seconds_from_midnight());
     let target_secs = i64::from(target_time.num_seconds_from_midnight());
-    let delta_secs = target_secs - now_secs;
+    let delta_secs = target_secs.saturating_sub(now_secs);
 
     let sleep_secs = if delta_secs > 0 {
         // Target is in the future today
         delta_secs
     } else {
         // Target has passed today (or is exactly now) → wrap to tomorrow
-        delta_secs + SECS_PER_DAY
+        delta_secs.saturating_add(SECS_PER_DAY)
     };
 
     // Safety: sleep_secs is always positive (1..=86400)
@@ -162,16 +155,7 @@ pub fn spawn_daily_refresh_task(
 
         loop {
             // I-P1-01: Compute IST "now" for scheduling
-            let now_ist = match FixedOffset::east_opt(IST_OFFSET_SECS) {
-                Some(offset) => Utc::now().with_timezone(&offset),
-                None => {
-                    warn!("failed to construct IST offset — retrying in {IST_OFFSET_RETRY_SECS}s");
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(IST_OFFSET_RETRY_SECS)) => continue,
-                        _ = shutdown_rx.changed() => return,
-                    }
-                }
-            };
+            let now_ist = Utc::now().with_timezone(&ist_offset());
 
             let sleep_duration = compute_next_trigger_time(now_ist, config.download_time);
 
@@ -191,13 +175,7 @@ pub fn spawn_daily_refresh_task(
             }
 
             // I-P1-01: Check if today is a trading day
-            let today_ist = match FixedOffset::east_opt(IST_OFFSET_SECS) {
-                Some(offset) => Utc::now().with_timezone(&offset).date_naive(),
-                None => {
-                    warn!("failed to construct IST offset for trading day check");
-                    continue;
-                }
-            };
+            let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
 
             if !calendar.is_trading_day(today_ist) {
                 info!(
@@ -240,7 +218,7 @@ mod tests {
         min: u32,
         sec: u32,
     ) -> DateTime<FixedOffset> {
-        let offset = FixedOffset::east_opt(IST_OFFSET_SECS).expect("IST offset is valid"); // APPROVED: test helper — constant always valid
+        let offset = ist_offset();
         let naive_date = NaiveDate::from_ymd_opt(year, month, day).expect("valid test date"); // APPROVED: test helper
         let naive_time = NaiveTime::from_hms_opt(hour, min, sec).expect("valid test time"); // APPROVED: test helper
         let naive_dt = naive_date.and_time(naive_time);
@@ -341,5 +319,315 @@ mod tests {
         let config = DailyRefreshConfig::default();
         assert!(!config.enabled, "scheduler must be disabled by default");
         assert_eq!(config.download_time, hms(8, 55, 0));
+    }
+
+    // I-P1-01: Target time 00:00, now is 23:59:59 → 1 second
+    #[test]
+    fn test_compute_next_trigger_one_second_before_midnight() {
+        let now = ist_datetime(2026, 3, 11, 23, 59, 59);
+        let target = hms(0, 0, 0);
+        let duration = compute_next_trigger_time(now, target);
+        // 00:00 tomorrow - 23:59:59 today = 1 second
+        assert_eq!(duration.as_secs(), 1);
+    }
+
+    // I-P1-01: Target time 23:59:59, now is 00:00:00 → ~23h59m59s
+    #[test]
+    fn test_compute_next_trigger_near_end_of_day() {
+        let now = ist_datetime(2026, 3, 11, 0, 0, 0);
+        let target = hms(23, 59, 59);
+        let duration = compute_next_trigger_time(now, target);
+        let expected = 23 * 3600 + 59 * 60 + 59;
+        assert_eq!(duration.as_secs(), expected);
+    }
+
+    // I-P1-01: Target 1 second in the future
+    #[test]
+    fn test_compute_next_trigger_one_second_ahead() {
+        let now = ist_datetime(2026, 3, 11, 12, 0, 0);
+        let target = hms(12, 0, 1);
+        let duration = compute_next_trigger_time(now, target);
+        assert_eq!(duration.as_secs(), 1);
+    }
+
+    // I-P1-01: Target 1 second in the past → wraps to next day
+    #[test]
+    fn test_compute_next_trigger_one_second_past() {
+        let now = ist_datetime(2026, 3, 11, 12, 0, 1);
+        let target = hms(12, 0, 0);
+        let duration = compute_next_trigger_time(now, target);
+        // Wraps to next day: 86400 - 1 = 86399
+        assert_eq!(duration.as_secs(), 86_399);
+    }
+
+    // I-P1-01: Result is always positive (1..=86400)
+    #[test]
+    fn test_compute_next_trigger_always_positive() {
+        // Test multiple combinations
+        for hour in [0, 6, 9, 12, 15, 20, 23] {
+            for target_hour in [0, 6, 9, 12, 15, 20, 23] {
+                let now = ist_datetime(2026, 3, 11, hour, 30, 0);
+                let target = hms(target_hour, 15, 0);
+                let duration = compute_next_trigger_time(now, target);
+                assert!(
+                    duration.as_secs() >= 1 && duration.as_secs() <= 86_400,
+                    "duration must be 1..=86400, got {} for now={}:30 target={}:15",
+                    duration.as_secs(),
+                    hour,
+                    target_hour
+                );
+            }
+        }
+    }
+
+    // GAP-CFG-01: Parse various valid time strings
+    #[test]
+    fn test_parse_daily_download_time_midnight() {
+        let result = parse_daily_download_time("00:00:00");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), hms(0, 0, 0));
+    }
+
+    #[test]
+    fn test_parse_daily_download_time_end_of_day() {
+        let result = parse_daily_download_time("23:59:59");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), hms(23, 59, 59));
+    }
+
+    // GAP-CFG-01: Invalid formats
+    #[test]
+    fn test_parse_daily_download_time_invalid_hour() {
+        assert!(parse_daily_download_time("25:00:00").is_err());
+    }
+
+    #[test]
+    fn test_parse_daily_download_time_empty_string() {
+        assert!(parse_daily_download_time("").is_err());
+    }
+
+    #[test]
+    fn test_parse_daily_download_time_extra_fields() {
+        // "08:55:00:00" has an extra field
+        assert!(parse_daily_download_time("08:55:00:00").is_err());
+    }
+
+    // I-P1-01: spawn_daily_refresh_task — disabled config exits on shutdown
+    #[tokio::test]
+    async fn test_spawn_daily_refresh_task_disabled_exits_on_shutdown() {
+        let config = DailyRefreshConfig::default(); // disabled
+        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
+            &dhan_live_trader_common::config::TradingConfig {
+                market_open_time: "09:00:00".to_string(),
+                market_close_time: "15:30:00".to_string(),
+                order_cutoff_time: "15:29:00".to_string(),
+                data_collection_start: "09:00:00".to_string(),
+                data_collection_end: "16:00:00".to_string(),
+                timezone: "Asia/Kolkata".to_string(),
+                max_orders_per_second: 10,
+                nse_holidays: vec![],
+                muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
+            },
+        )
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_trigger_tx, _trigger_rx) = mpsc::channel::<()>(1);
+        let handle = spawn_daily_refresh_task(config, calendar, shutdown_rx, _trigger_tx);
+
+        // Send shutdown
+        let _ = shutdown_tx.send(true);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("disabled task should exit within 2s")
+            .expect("task should not panic");
+    }
+
+    // I-P1-01: SECS_PER_DAY constant is correct
+    #[test]
+    fn test_secs_per_day_constant() {
+        assert_eq!(SECS_PER_DAY, 86_400);
+    }
+
+    // GAP-CFG-01: DailyRefreshConfig debug
+    #[test]
+    fn test_daily_refresh_config_debug() {
+        let config = DailyRefreshConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("download_time"));
+        assert!(debug.contains("enabled"));
+    }
+
+    // GAP-CFG-01: DailyRefreshConfig clone
+    #[test]
+    fn test_daily_refresh_config_clone() {
+        let config = DailyRefreshConfig {
+            download_time: hms(7, 30, 0),
+            enabled: true,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.download_time, hms(7, 30, 0));
+        assert!(cloned.enabled);
+    }
+
+    // I-P1-01: Enabled scheduler shuts down cleanly before firing
+    #[tokio::test]
+    async fn test_spawn_daily_refresh_task_enabled_shutdown_before_fire() {
+        // Set download_time far in the future so it sleeps, then shutdown immediately
+        let config = DailyRefreshConfig {
+            download_time: hms(23, 59, 59),
+            enabled: true,
+        };
+        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
+            &dhan_live_trader_common::config::TradingConfig {
+                market_open_time: "09:00:00".to_string(),
+                market_close_time: "15:30:00".to_string(),
+                order_cutoff_time: "15:29:00".to_string(),
+                data_collection_start: "09:00:00".to_string(),
+                data_collection_end: "16:00:00".to_string(),
+                timezone: "Asia/Kolkata".to_string(),
+                max_orders_per_second: 10,
+                nse_holidays: vec![],
+                muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
+            },
+        )
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (trigger_tx, _trigger_rx) = mpsc::channel::<()>(1);
+        let handle = spawn_daily_refresh_task(config, calendar, shutdown_rx, trigger_tx);
+
+        // Let it start sleeping, then shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(true);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("enabled task should exit within 3s after shutdown") // APPROVED: test
+            .expect("task should not panic"); // APPROVED: test
+    }
+
+    // I-P1-01: Enabled scheduler fires on non-trading day (holiday)
+    #[tokio::test]
+    async fn test_spawn_daily_refresh_task_enabled_fires_on_non_trading_day() {
+        // Use tokio time pause to fast-forward
+        tokio::time::pause();
+
+        // Set target time 1 second from now so it fires quickly
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let target = now_ist.time() + chrono::Duration::seconds(1);
+        let target_naive = NaiveTime::from_hms_opt(target.hour(), target.minute(), target.second())
+            .unwrap_or(hms(12, 0, 0));
+
+        let config = DailyRefreshConfig {
+            download_time: target_naive,
+            enabled: true,
+        };
+
+        // Calendar that treats today as non-trading.
+        // On weekdays: add today as a holiday. On weekends: it's already non-trading.
+        use chrono::Datelike;
+        use dhan_live_trader_common::config::NseHolidayEntry;
+        let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
+        let is_weekday = today_ist.weekday().num_days_from_monday() < 5;
+        let holidays = if is_weekday {
+            vec![NseHolidayEntry {
+                date: today_ist.to_string(),
+                name: "Test Holiday".to_string(),
+            }]
+        } else {
+            vec![]
+        };
+        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
+            &dhan_live_trader_common::config::TradingConfig {
+                market_open_time: "09:00:00".to_string(),
+                market_close_time: "15:30:00".to_string(),
+                order_cutoff_time: "15:29:00".to_string(),
+                data_collection_start: "09:00:00".to_string(),
+                data_collection_end: "16:00:00".to_string(),
+                timezone: "Asia/Kolkata".to_string(),
+                max_orders_per_second: 10,
+                nse_holidays: holidays,
+                muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
+            },
+        )
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (trigger_tx, _trigger_rx) = mpsc::channel::<()>(1);
+        let handle = spawn_daily_refresh_task(config, calendar, shutdown_rx, trigger_tx);
+
+        // Fast-forward time past the target
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+
+        // Let the scheduler run through its holiday check
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    // I-P1-01: Enabled scheduler fires on a trading day and sends trigger
+    #[tokio::test]
+    async fn test_spawn_daily_refresh_task_enabled_fires_on_trading_day() {
+        tokio::time::pause();
+
+        // Set target time 1 second from now
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let target = now_ist.time() + chrono::Duration::seconds(1);
+        let target_naive = NaiveTime::from_hms_opt(target.hour(), target.minute(), target.second())
+            .unwrap_or(hms(12, 0, 0));
+
+        let config = DailyRefreshConfig {
+            download_time: target_naive,
+            enabled: true,
+        };
+
+        // No holidays — today is a trading day (if weekday)
+        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
+            &dhan_live_trader_common::config::TradingConfig {
+                market_open_time: "09:00:00".to_string(),
+                market_close_time: "15:30:00".to_string(),
+                order_cutoff_time: "15:29:00".to_string(),
+                data_collection_start: "09:00:00".to_string(),
+                data_collection_end: "16:00:00".to_string(),
+                timezone: "Asia/Kolkata".to_string(),
+                max_orders_per_second: 10,
+                nse_holidays: vec![],
+                muhurat_trading_dates: vec![],
+                nse_mock_trading_dates: vec![],
+            },
+        )
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (trigger_tx, mut trigger_rx) = mpsc::channel::<()>(1);
+        let handle = spawn_daily_refresh_task(config, calendar, shutdown_rx, trigger_tx);
+
+        // Fast-forward time past the target
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        // On trading days, the trigger should fire. On weekends, it skips.
+        // Either way, no panic.
+        let received = trigger_rx.try_recv();
+        // On weekdays: Ok(()), on weekends: Err(Empty)
+        let _ = received;
+
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 }

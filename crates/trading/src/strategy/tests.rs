@@ -1,4 +1,5 @@
 //! Tests for the strategy evaluator FSM.
+// O(1) EXEMPT: begin — test-only module, no production hot path
 
 use crate::indicator::IndicatorSnapshot;
 use crate::strategy::evaluator::StrategyInstance;
@@ -383,6 +384,112 @@ fn indicator_field_reads_correct_values() {
 }
 
 // -----------------------------------------------------------------------
+// Remaining IndicatorField read variants
+// -----------------------------------------------------------------------
+
+#[test]
+fn indicator_field_reads_remaining_variants() {
+    let snap = IndicatorSnapshot {
+        security_id: 1,
+        macd_signal: 2.5,
+        macd_histogram: 1.5,
+        sma: 99.0,
+        bollinger_upper: 110.0,
+        bollinger_middle: 100.0,
+        bollinger_lower: 90.0,
+        supertrend: 97.0,
+        last_traded_price: 101.5,
+        volume: 25000.0,
+        day_high: 105.0,
+        day_low: 96.0,
+        is_warm: true,
+        ..Default::default()
+    };
+
+    assert!((IndicatorField::MacdSignal.read(&snap) - 2.5).abs() < f64::EPSILON);
+    assert!((IndicatorField::MacdHistogram.read(&snap) - 1.5).abs() < f64::EPSILON);
+    assert!((IndicatorField::Sma.read(&snap) - 99.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::BollingerUpper.read(&snap) - 110.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::BollingerMiddle.read(&snap) - 100.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::BollingerLower.read(&snap) - 90.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::Supertrend.read(&snap) - 97.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::LastTradedPrice.read(&snap) - 101.5).abs() < f64::EPSILON);
+    assert!((IndicatorField::Volume.read(&snap) - 25000.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::DayHigh.read(&snap) - 105.0).abs() < f64::EPSILON);
+    assert!((IndicatorField::DayLow.read(&snap) - 96.0).abs() < f64::EPSILON);
+}
+
+// -----------------------------------------------------------------------
+// Remaining ComparisonOp variants
+// -----------------------------------------------------------------------
+
+#[test]
+fn condition_gte_evaluates_correctly() {
+    let cond = Condition {
+        field: IndicatorField::Rsi,
+        operator: ComparisonOp::Gte,
+        threshold: 50.0,
+    };
+
+    let snap = make_snapshot(1, 50.0, 100.0, 5.0); // equal
+    assert!(cond.evaluate(&snap));
+
+    let snap = make_snapshot(1, 51.0, 100.0, 5.0); // above
+    assert!(cond.evaluate(&snap));
+
+    let snap = make_snapshot(1, 49.0, 100.0, 5.0); // below
+    assert!(!cond.evaluate(&snap));
+}
+
+#[test]
+fn condition_lte_evaluates_correctly() {
+    let cond = Condition {
+        field: IndicatorField::Rsi,
+        operator: ComparisonOp::Lte,
+        threshold: 50.0,
+    };
+
+    let snap = make_snapshot(1, 50.0, 100.0, 5.0); // equal
+    assert!(cond.evaluate(&snap));
+
+    let snap = make_snapshot(1, 49.0, 100.0, 5.0); // below
+    assert!(cond.evaluate(&snap));
+
+    let snap = make_snapshot(1, 51.0, 100.0, 5.0); // above
+    assert!(!cond.evaluate(&snap));
+}
+
+#[test]
+fn condition_cross_above_evaluates_as_gt() {
+    let cond = Condition {
+        field: IndicatorField::Rsi,
+        operator: ComparisonOp::CrossAbove,
+        threshold: 50.0,
+    };
+
+    let snap = make_snapshot(1, 51.0, 100.0, 5.0);
+    assert!(cond.evaluate(&snap));
+
+    let snap = make_snapshot(1, 50.0, 100.0, 5.0);
+    assert!(!cond.evaluate(&snap));
+}
+
+#[test]
+fn condition_cross_below_evaluates_as_lt() {
+    let cond = Condition {
+        field: IndicatorField::Rsi,
+        operator: ComparisonOp::CrossBelow,
+        threshold: 50.0,
+    };
+
+    let snap = make_snapshot(1, 49.0, 100.0, 5.0);
+    assert!(cond.evaluate(&snap));
+
+    let snap = make_snapshot(1, 50.0, 100.0, 5.0);
+    assert!(!cond.evaluate(&snap));
+}
+
+// -----------------------------------------------------------------------
 // StrategyState Default Tests
 // -----------------------------------------------------------------------
 
@@ -405,3 +512,4 @@ fn out_of_bounds_sid_holds() {
     let signal = instance.evaluate(&snap);
     assert_eq!(signal, Signal::Hold);
 }
+// O(1) EXEMPT: end

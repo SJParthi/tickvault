@@ -93,7 +93,6 @@ use dhan_live_trader_common::constants::{
     PREV_CLOSE_OFFSET_OI,
     PREV_CLOSE_OFFSET_PRICE,
     PREVIOUS_CLOSE_PACKET_SIZE,
-    QUESTDB_TABLE_CANDLES_1M,
     // QuestDB tables
     QUESTDB_TABLE_CANDLES_1S,
     QUESTDB_TABLE_HISTORICAL_CANDLES,
@@ -740,7 +739,6 @@ fn test_ist_offset_is_5h30m() {
 #[test]
 fn test_questdb_table_names_are_stable() {
     assert_eq!(QUESTDB_TABLE_TICKS, "ticks");
-    assert_eq!(QUESTDB_TABLE_CANDLES_1M, "historical_candles_1m");
     assert_eq!(QUESTDB_TABLE_HISTORICAL_CANDLES, "historical_candles");
     assert_eq!(QUESTDB_TABLE_CANDLES_1S, "candles_1s");
     assert_eq!(QUESTDB_TABLE_MARKET_DEPTH, "market_depth");

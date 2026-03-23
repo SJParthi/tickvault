@@ -17,7 +17,7 @@ use dhan_live_trader_common::trading_calendar::TradingCalendar;
 /// Mirrors `config/base.toml` structure with reduced holiday list (10 = minimum).
 const VALID_CONFIG_TOML: &str = r#"
 [trading]
-market_open_time = "09:15:00"
+market_open_time = "09:00:00"
 market_close_time = "15:30:00"
 order_cutoff_time = "15:29:00"
 data_collection_start = "09:00:00"
@@ -147,7 +147,7 @@ fn holiday(date: &str, name: &str) -> NseHolidayEntry {
 /// Builds a TradingConfig with 10 holidays (minimum required).
 fn make_trading_config_with_holidays() -> TradingConfig {
     TradingConfig {
-        market_open_time: "09:15:00".to_string(),
+        market_open_time: "09:00:00".to_string(),
         market_close_time: "15:30:00".to_string(),
         order_cutoff_time: "15:29:00".to_string(),
         data_collection_start: "09:00:00".to_string(),
@@ -167,6 +167,7 @@ fn make_trading_config_with_holidays() -> TradingConfig {
             holiday("2026-09-14", "Ganesh Chaturthi"),
         ],
         muhurat_trading_dates: vec![],
+        nse_mock_trading_dates: vec![],
     }
 }
 

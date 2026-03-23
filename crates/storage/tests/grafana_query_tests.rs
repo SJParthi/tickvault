@@ -228,26 +228,6 @@ async fn schema_previous_close_table() {
 
 #[tokio::test]
 #[ignore = "requires live QuestDB"]
-async fn schema_historical_candles_1m_table() {
-    validate_table_schema(
-        "historical_candles_1m",
-        &[
-            ("segment", "SYMBOL"),
-            ("security_id", "LONG"),
-            ("open", "DOUBLE"),
-            ("high", "DOUBLE"),
-            ("low", "DOUBLE"),
-            ("close", "DOUBLE"),
-            ("volume", "LONG"),
-            ("oi", "LONG"),
-            ("ts", "TIMESTAMP"),
-        ],
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires live QuestDB"]
 async fn schema_historical_candles_table() {
     validate_table_schema(
         "historical_candles",
@@ -384,6 +364,24 @@ async fn schema_nse_holidays_table() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
+async fn schema_index_constituents_table() {
+    validate_table_schema(
+        "index_constituents",
+        &[
+            ("index_name", "SYMBOL"),
+            ("symbol", "SYMBOL"),
+            ("isin", "STRING"),
+            ("weight", "DOUBLE"),
+            ("sector", "STRING"),
+            ("security_id", "LONG"),
+            ("ts", "TIMESTAMP"),
+        ],
+    )
+    .await;
+}
+
 // =========================================================================
 // 2. FUNCTIONAL — exact Grafana panel queries execute without error
 // =========================================================================
@@ -505,8 +503,8 @@ async fn functional_historical_ohlcv_candlestick() {
     // Exact query from market-data.json line 260
     let sql = "\
         SELECT ts AS time, open, high, low, close, volume \
-        FROM historical_candles_1m \
-        WHERE security_id = 13 AND segment = 'IDX_I' \
+        FROM historical_candles \
+        WHERE timeframe = '1m' AND security_id = 13 AND segment = 'IDX_I' \
           AND ts >= '2026-01-01T00:00:00Z' AND ts < '2026-12-31T23:59:59Z' \
         ORDER BY ts;";
     let response = execute_query(sql).await;
@@ -657,8 +655,8 @@ async fn functional_sma_overlay_historical() {
         SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\" \
         FROM ( \
           SELECT ts AS time, close \
-          FROM historical_candles_1m \
-          WHERE security_id = 13 AND segment = 'IDX_I' \
+          FROM historical_candles \
+          WHERE timeframe = '1m' AND security_id = 13 AND segment = 'IDX_I' \
             AND ts >= '2026-01-01T00:00:00Z' AND ts < '2026-12-31T23:59:59Z' \
           ORDER BY ts \
         );";
@@ -729,8 +727,8 @@ async fn functional_historical_candle_table() {
     let sql = "\
         SELECT segment, security_id, open, high, low, close, volume, oi, \
         ts AS candle_time \
-        FROM historical_candles_1m \
-        WHERE ts >= '2026-01-01T00:00:00Z' AND ts < '2026-12-31T23:59:59Z' \
+        FROM historical_candles \
+        WHERE timeframe = '1m' AND ts >= '2026-01-01T00:00:00Z' AND ts < '2026-12-31T23:59:59Z' \
         ORDER BY ts DESC LIMIT 500;";
     let response = execute_query(sql).await;
     assert_columns_present(
@@ -959,6 +957,53 @@ async fn functional_nse_holiday_annotations() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 2h. Index constituency panels
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
+async fn functional_index_constituents_table() {
+    // Exact query from market-data.json — detailed table
+    let sql = "\
+        SELECT index_name, symbol, isin, weight, sector, security_id \
+        FROM index_constituents \
+        WHERE ts = (SELECT max(ts) FROM index_constituents) \
+        ORDER BY index_name, weight DESC;";
+    let response = execute_query(sql).await;
+    assert_columns_present(
+        &response,
+        &[
+            "index_name",
+            "symbol",
+            "isin",
+            "weight",
+            "sector",
+            "security_id",
+        ],
+        "table:index_constituents",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live QuestDB"]
+async fn functional_index_constituency_summary() {
+    // Exact query from market-data.json — per-index summary
+    let sql = "\
+        SELECT index_name, count(*) AS total_stocks, \
+        count(CASE WHEN security_id > 0 THEN 1 END) AS with_fno \
+        FROM index_constituents \
+        WHERE ts = (SELECT max(ts) FROM index_constituents) \
+        GROUP BY index_name \
+        ORDER BY total_stocks DESC;";
+    let response = execute_query(sql).await;
+    assert_columns_present(
+        &response,
+        &["index_name", "total_stocks", "with_fno"],
+        "summary:index_constituency",
+    );
+}
+
 // =========================================================================
 // 3. REGRESSION — edge cases that must not break Grafana
 // =========================================================================
@@ -969,8 +1014,8 @@ async fn regression_empty_time_range_historical_candles() {
     // A time range with no data should return 0 rows, not an error.
     let sql = "\
         SELECT ts AS time, open, high, low, close, volume \
-        FROM historical_candles_1m \
-        WHERE security_id = 13 AND segment = 'IDX_I' \
+        FROM historical_candles \
+        WHERE timeframe = '1m' AND security_id = 13 AND segment = 'IDX_I' \
           AND ts >= '2020-01-01T00:00:00Z' AND ts < '2020-01-01T00:00:01Z' \
         ORDER BY ts;";
     let response = execute_query(sql).await;
@@ -1007,8 +1052,8 @@ async fn regression_nonexistent_security_id_returns_zero_rows() {
     // security_id 999999999 does not exist — query must succeed with 0 rows.
     let sql = "\
         SELECT ts AS time, open, high, low, close, volume \
-        FROM historical_candles_1m \
-        WHERE security_id = 999999999 AND segment = 'IDX_I' \
+        FROM historical_candles \
+        WHERE timeframe = '1m' AND security_id = 999999999 AND segment = 'IDX_I' \
         ORDER BY ts;";
     let response = execute_query(sql).await;
     assert_eq!(
@@ -1023,8 +1068,8 @@ async fn regression_future_timestamp_range() {
     // Far-future range — no data, no error.
     let sql = "\
         SELECT ts AS time, open, high, low, close, volume \
-        FROM historical_candles_1m \
-        WHERE security_id = 13 AND segment = 'IDX_I' \
+        FROM historical_candles \
+        WHERE timeframe = '1m' AND security_id = 13 AND segment = 'IDX_I' \
           AND ts >= '2099-01-01T00:00:00Z' AND ts < '2099-12-31T23:59:59Z' \
         ORDER BY ts;";
     let response = execute_query(sql).await;
@@ -1055,8 +1100,8 @@ async fn regression_sma_window_on_empty_data() {
         SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\" \
         FROM ( \
           SELECT ts AS time, close \
-          FROM historical_candles_1m \
-          WHERE security_id = 999999999 AND segment = 'IDX_I' \
+          FROM historical_candles \
+          WHERE timeframe = '1m' AND security_id = 999999999 AND segment = 'IDX_I' \
           ORDER BY ts \
         );";
     let response = execute_query(sql).await;
@@ -1114,8 +1159,8 @@ async fn stress_historical_ohlcv_full_year() {
     // Full year of data — must complete within bound.
     let sql = "\
         SELECT ts AS time, open, high, low, close, volume \
-        FROM historical_candles_1m \
-        WHERE security_id = 13 AND segment = 'IDX_I' \
+        FROM historical_candles \
+        WHERE timeframe = '1m' AND security_id = 13 AND segment = 'IDX_I' \
           AND ts >= '2026-01-01T00:00:00Z' AND ts < '2027-01-01T00:00:00Z' \
         ORDER BY ts;";
     let (response, elapsed) = execute_query_timed(sql).await;
@@ -1189,8 +1234,8 @@ async fn stress_sma_window_function() {
         SELECT time, avg(close) OVER (ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS \"SMA 20\" \
         FROM ( \
           SELECT ts AS time, close \
-          FROM historical_candles_1m \
-          WHERE security_id = 13 AND segment = 'IDX_I' \
+          FROM historical_candles \
+          WHERE timeframe = '1m' AND security_id = 13 AND segment = 'IDX_I' \
             AND ts >= '2026-01-01T00:00:00Z' AND ts < '2027-01-01T00:00:00Z' \
           ORDER BY ts \
         );";
@@ -1244,7 +1289,7 @@ async fn stress_all_stat_counters() {
     // All 6 stat panels must complete within bound (run sequentially to measure total).
     let queries = [
         "SELECT count() AS total FROM ticks;",
-        "SELECT count() AS total FROM historical_candles_1m;",
+        "SELECT count() AS total FROM historical_candles WHERE timeframe = '1m';",
         "SELECT count() AS total FROM fno_underlyings;",
         "SELECT count() AS total FROM derivative_contracts;",
         "SELECT count() AS total FROM subscribed_indices;",

@@ -11,33 +11,33 @@
 http:
   # -- Routers ----------------------------------------------------------------
   routers:
-    # Grafana: http://localhost/grafana
+    # Grafana: http://localhost/grafana (basicAuth protected)
     grafana:
       rule: "PathPrefix(`/grafana`)"
       service: grafana
       entryPoints: [web]
-      middlewares: [grafana-stripprefix]
+      middlewares: [dev-basic-auth, grafana-stripprefix]
 
-    # Prometheus: http://localhost/prometheus
+    # Prometheus: http://localhost/prometheus (basicAuth protected)
     prometheus:
       rule: "PathPrefix(`/prometheus`)"
       service: prometheus
       entryPoints: [web]
-      middlewares: [prometheus-stripprefix]
+      middlewares: [dev-basic-auth, prometheus-stripprefix]
 
-    # QuestDB Console: http://localhost/questdb
+    # QuestDB Console: http://localhost/questdb (basicAuth protected)
     questdb:
       rule: "PathPrefix(`/questdb`)"
       service: questdb
       entryPoints: [web]
-      middlewares: [questdb-stripprefix]
+      middlewares: [dev-basic-auth, questdb-stripprefix]
 
-    # Jaeger UI: http://localhost/jaeger
+    # Jaeger UI: http://localhost/jaeger (basicAuth protected)
     jaeger:
       rule: "PathPrefix(`/jaeger`)"
       service: jaeger
       entryPoints: [web]
-      middlewares: [jaeger-stripprefix]
+      middlewares: [dev-basic-auth, jaeger-stripprefix]
 
     # Application API: http://localhost/api
     app-api:
@@ -107,3 +107,12 @@ http:
     alloy-stripprefix:
       stripPrefix:
         prefixes: ["/alloy"]
+
+    # BasicAuth for dev-mode dashboard protection.
+    # Credentials: admin / dlt-dev-2026 (htpasswd bcrypt).
+    # Override via DLT_TRAEFIK_BASIC_AUTH env var in production.
+    # Generate new hash: htpasswd -nB admin
+    dev-basic-auth:
+      basicAuth:
+        users:
+          - "admin:$2y$05$YJHzDHRFfG1S.j.Jl0wMhOK3fLUf3m3HqmIVV3Dd0RZoFQq3lKqWy"

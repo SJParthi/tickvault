@@ -151,6 +151,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_market_depth_empty_buffer() {
+        let hdr = PacketHeader {
+            response_code: 3,
+            message_length: 112,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_market_depth_packet(&[], &hdr, 0).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 112,
+            actual: 0,
+        } = err
+        else {
+            panic!("wrong error variant")
+        };
+    }
+
+    #[test]
     fn test_parse_market_depth_truncated() {
         let buf = vec![0u8; 111]; // one byte short
         let hdr = PacketHeader {

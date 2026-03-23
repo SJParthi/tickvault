@@ -185,4 +185,121 @@ mod tests {
         let is_rustls = matches!(connector, Connector::Rustls(_));
         assert!(is_rustls, "Must return Rustls variant, not Plain");
     }
+
+    // -----------------------------------------------------------------------
+    // TLS error variant coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tls_configuration_failed_error_debug_format() {
+        let err = WebSocketError::TlsConfigurationFailed {
+            reason: "no native root CA certificates found".to_string(),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("TlsConfigurationFailed"));
+        assert!(debug.contains("no native root CA certificates found"));
+    }
+
+    #[test]
+    fn test_tls_configuration_failed_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WebSocketError>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Verify ALPN protocol is exactly HTTP/1.1 (not HTTP/2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_websocket_tls_connector_alpn_only_http11() {
+        install_crypto_provider();
+        let connector = build_websocket_tls_connector().unwrap();
+        let config = unwrap_rustls_config(connector);
+        // Exactly one ALPN protocol
+        assert_eq!(config.alpn_protocols.len(), 1);
+        // Must be http/1.1
+        assert_eq!(config.alpn_protocols[0], b"http/1.1");
+        // Must NOT contain h2
+        assert!(!config.alpn_protocols.contains(&b"h2".to_vec()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple sequential builds produce independent configs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_websocket_tls_connector_produces_independent_configs() {
+        install_crypto_provider();
+        let c1 = build_websocket_tls_connector().unwrap();
+        let c2 = build_websocket_tls_connector().unwrap();
+        let cfg1 = unwrap_rustls_config(c1);
+        let cfg2 = unwrap_rustls_config(c2);
+        // They should be different Arc instances (not sharing state)
+        assert!(!Arc::ptr_eq(&cfg1, &cfg2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Error path — TlsConfigurationFailed variant exercises
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tls_configuration_failed_error_matches_pattern() {
+        let err = WebSocketError::TlsConfigurationFailed {
+            reason: "no native root CA certificates found".to_string(),
+        };
+        assert!(matches!(err, WebSocketError::TlsConfigurationFailed { .. }));
+    }
+
+    #[test]
+    fn test_tls_configuration_failed_error_reason_preserved() {
+        let reason = "test reason for TLS failure";
+        let err = WebSocketError::TlsConfigurationFailed {
+            reason: reason.to_string(),
+        };
+        if let WebSocketError::TlsConfigurationFailed { reason: r } = err {
+            assert_eq!(r, reason);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn test_tls_configuration_failed_empty_reason() {
+        let err = WebSocketError::TlsConfigurationFailed {
+            reason: String::new(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("TLS configuration failed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS connector — root cert store is populated
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_websocket_tls_connector_root_certs_loaded() {
+        install_crypto_provider();
+        // If the function succeeds, it means root certs were found and added > 0.
+        // If it returns Err, it means 0 root certs were found.
+        let result = build_websocket_tls_connector();
+        assert!(
+            result.is_ok(),
+            "TLS connector should succeed on any system with root CAs"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS connector — ALPN is http/1.1 not h2 (WebSocket compatibility)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_websocket_tls_connector_no_h2_alpn_even_if_called_twice() {
+        install_crypto_provider();
+        for _ in 0..3 {
+            let connector = build_websocket_tls_connector().unwrap();
+            let config = unwrap_rustls_config(connector);
+            assert_eq!(config.alpn_protocols.len(), 1);
+            assert_eq!(config.alpn_protocols[0], b"http/1.1");
+        }
+    }
 }

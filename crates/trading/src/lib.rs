@@ -6,17 +6,19 @@
 #![deny(clippy::dbg_macro)]
 #![allow(missing_docs)] // TODO: enforce after adding docs to all public items
 
-//! Trading engine: O(1) indicators, FSM strategies, OMS, and risk controls.
+//! Trading engine: O(1) indicators, FSM strategies, OMS, Greeks, and risk controls.
 //!
 //! # Modules
+//! - `greeks` — Options Greeks engine: Black-Scholes, IV solver, PCR, Buildup classification
 //! - `indicator` — O(1) per-tick indicator engine (EMA, RSI, MACD, ATR, Bollinger, etc.)
 //! - `strategy` — FSM-based strategy evaluator with declarative conditions
 //! - `risk` — Risk engine: max daily loss, position limits, P&L tracking, auto-halt
 //! - `oms` — Order Management System: lifecycle FSM, rate limiting, circuit breaker, reconciliation
 //!
 //! # Pipeline Position
-//! ParsedTick → **IndicatorEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
+//! ParsedTick → **IndicatorEngine → GreeksEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
 
+pub mod greeks;
 pub mod indicator;
 pub mod oms;
 pub mod risk;

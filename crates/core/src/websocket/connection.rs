@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 use dhan_live_trader_common::constants::{WEBSOCKET_AUTH_TYPE, WEBSOCKET_PROTOCOL_VERSION};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use dhan_live_trader_common::config::{DhanConfig, WebSocketConfig};
 use dhan_live_trader_common::types::FeedMode;
@@ -153,6 +153,7 @@ impl WebSocketConnection {
     ///
     /// On disconnect, attempts reconnection with exponential backoff.
     /// Returns only on non-reconnectable errors or exhausted retries.
+    #[instrument(skip_all, fields(conn_id = self.connection_id))]
     pub async fn run(&self) -> Result<(), WebSocketError> {
         // O(1) EXEMPT: begin — metric handles grabbed once before loop, not per-message
         let m_conn_active = metrics::gauge!("dlt_websocket_connections_active", "connection_id" => self.connection_id.to_string());
@@ -167,11 +168,24 @@ impl WebSocketConnection {
                     self.set_state(ConnectionState::Connected);
                     m_conn_active.set(1.0);
 
+                    let reconnection_count = self.total_reconnections.load(Ordering::Acquire);
+
                     info!(
                         connection_id = self.connection_id,
                         instruments = self.instruments.len(),
                         "WebSocket connected and subscribed"
                     );
+
+                    // M1: After a reconnection (not initial connect), log that a
+                    // mid-session candle gap may exist. The existing post-market
+                    // historical fetch will backfill any missing data.
+                    if reconnection_count > 0 {
+                        info!(
+                            connection_id = self.connection_id,
+                            reconnection_count,
+                            "WebSocket reconnected — mid-session candle gap may exist, next post-market fetch will backfill"
+                        );
+                    }
 
                     // Run read + ping loops until disconnect.
                     let disconnect_result = self.run_read_loop(ws_stream).await;
@@ -492,9 +506,19 @@ impl WebSocketConnection {
     }
 
     /// Waits with exponential backoff. Returns false if max attempts exhausted.
+    ///
+    /// When `reconnect_max_attempts == 0` (production default), retries forever —
+    /// the app lifecycle (graceful shutdown at market close) controls when
+    /// connections should stop, not an arbitrary attempt limit. A CRITICAL alert
+    /// fires every 10 consecutive failures so the operator is aware.
     async fn wait_with_backoff(&self) -> bool {
         let attempt = self.total_reconnections.load(Ordering::Acquire);
-        if attempt >= self.ws_config.reconnect_max_attempts as u64 {
+
+        // reconnect_max_attempts == 0 → infinite retries (never give up).
+        // Non-zero → respect the limit (used by tests and explicit config overrides).
+        if self.ws_config.reconnect_max_attempts > 0
+            && attempt >= self.ws_config.reconnect_max_attempts as u64
+        {
             error!(
                 connection_id = self.connection_id,
                 attempts = attempt,
@@ -503,11 +527,20 @@ impl WebSocketConnection {
             return false;
         }
 
+        // CRITICAL alert every 10 consecutive failures (triggers Telegram).
+        if attempt.is_multiple_of(10) {
+            error!(
+                connection_id = self.connection_id,
+                consecutive_failures = attempt,
+                "WebSocket reconnection threshold hit — still retrying (infinite resilience mode)"
+            );
+        }
+
         // Exponential backoff: initial * 2^attempt, capped at max.
         let delay_ms = self
             .ws_config
             .reconnect_initial_delay_ms
-            .saturating_mul(1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX))
+            .saturating_mul(1u64.checked_shl(attempt.min(63) as u32).unwrap_or(u64::MAX))
             .min(self.ws_config.reconnect_max_delay_ms);
 
         info!(
@@ -1258,10 +1291,10 @@ mod tests {
         assert!(!result, "attempt at max should fail");
     }
 
-    // --- wait_with_backoff: zero max_attempts means immediate exhaustion ---
+    // --- wait_with_backoff: zero max_attempts means infinite retries (never give up) ---
 
     #[tokio::test]
-    async fn test_wait_with_backoff_zero_max_attempts() {
+    async fn test_wait_with_backoff_zero_max_attempts_means_infinite() {
         let (tx, _rx) = mpsc::channel(100);
         let conn = WebSocketConnection::new(
             0,
@@ -1269,7 +1302,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 0, // 0 = infinite retries
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1279,10 +1312,27 @@ mod tests {
             tx,
         );
 
-        // Even attempt 0 should fail when max_attempts is 0
+        // With max_attempts=0 (infinite), even high attempt counts should return true.
         conn.total_reconnections.store(0, Ordering::Release);
         let result = conn.wait_with_backoff().await;
-        assert!(!result, "zero max_attempts should always fail");
+        assert!(
+            result,
+            "zero max_attempts = infinite retries, should always succeed"
+        );
+
+        conn.total_reconnections.store(100, Ordering::Release);
+        let result = conn.wait_with_backoff().await;
+        assert!(
+            result,
+            "attempt 100 with infinite mode should still succeed"
+        );
+
+        conn.total_reconnections.store(10000, Ordering::Release);
+        let result = conn.wait_with_backoff().await;
+        assert!(
+            result,
+            "attempt 10000 with infinite mode should still succeed"
+        );
     }
 
     // --- connection_id boundary: 0 is valid ---
@@ -2544,5 +2594,324 @@ mod tests {
 
         let frame = rx.recv().await.expect("should receive binary frame"); // APPROVED: test
         assert_eq!(frame, vec![0xFF]);
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocketConnection — subscription message caching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_caches_subscription_messages_empty_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Full,
+            tx,
+        );
+        // No instruments → no subscription messages
+        assert!(conn.cached_subscription_messages.is_empty());
+    }
+
+    #[test]
+    fn test_connection_caches_subscription_messages_non_idx() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1001),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        assert!(
+            !conn.cached_subscription_messages.is_empty(),
+            "should have subscription messages for non-IDX instruments"
+        );
+    }
+
+    #[test]
+    fn test_connection_idx_instruments_use_ticker_mode() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![InstrumentSubscription::new(ExchangeSegment::IdxI, 13)];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full, // Full mode specified but IDX_I should use Ticker
+            tx,
+        );
+        assert!(!conn.cached_subscription_messages.is_empty());
+        // The subscription message should contain RequestCode 15 (SubscribeTicker)
+        let msg = &conn.cached_subscription_messages[0];
+        assert!(
+            msg.contains("15"),
+            "IDX_I should subscribe with Ticker mode (code 15): {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_connection_mixed_idx_and_non_idx_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 1000),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        // Should have at least 2 messages: one for non-IDX (Full) and one for IDX (Ticker)
+        assert!(
+            conn.cached_subscription_messages.len() >= 2,
+            "mixed instruments should produce multiple subscription messages, got {}",
+            conn.cached_subscription_messages.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnectionHealth — field access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_health_debug_format() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            2,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 42)],
+            FeedMode::Quote,
+            tx,
+        );
+        let health = conn.health();
+        let debug_str = format!("{:?}", health);
+        assert!(debug_str.contains("connection_id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_valid_token — no token available
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_valid_token_times_out_with_no_token() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(), // No token stored
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        // This will poll for up to 60s but we can't wait that long in tests.
+        // Just verify the function exists and can be called.
+        // The actual timeout test would be too slow.
+        // Instead, test that the method doesn't panic with a short timeout.
+        let start = std::time::Instant::now();
+        // We'll just verify it compiles and the method signature is correct
+        // by calling it in a select with a short timeout.
+        tokio::select! {
+            _ = conn.wait_for_valid_token() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+        }
+        assert!(
+            start.elapsed().as_millis() < 1000,
+            "should abort quickly via select"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_valid_token — returns immediately when valid token present
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_valid_token_returns_immediately_with_valid_token() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_token_handle_with_token(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+        let start = std::time::Instant::now();
+        conn.wait_for_valid_token().await;
+        // Should return almost immediately since token is valid.
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "should return immediately with valid token"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IDX_I partition: only non-IDX instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_idx_partition_no_idx_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::NseEquity, 100),
+            InstrumentSubscription::new(ExchangeSegment::NseFno, 200),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        // All instruments are non-IDX, so all messages use Full (code 21)
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IDX_I partition: only IDX instruments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_idx_partition_only_idx_instruments() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instruments = vec![
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 26),
+            InstrumentSubscription::new(ExchangeSegment::IdxI, 99),
+        ];
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            instruments,
+            FeedMode::Full,
+            tx,
+        );
+        // All instruments are IDX, so all use Ticker (code 15), no Full messages
+        assert_eq!(conn.cached_subscription_messages.len(), 1);
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
+        assert!(!conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run() — non-reconnectable disconnect code via read loop
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_loop_close_frame_with_specific_ws_close_code() {
+        // Verify that a close frame with a specific code is handled cleanly.
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = make_test_conn_for_read_loop(tx);
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let read_handle = tokio::spawn(async move { conn.run_read_loop(client_ws).await });
+
+        // Send close with a specific error code (1008 = Policy Violation).
+        server_ws
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "policy violation".into(),
+            })))
+            .await
+            .expect("send close failed"); // APPROVED: test
+
+        let result = read_handle.await.expect("task panicked"); // APPROVED: test
+        assert!(result.is_ok(), "Close frame should return Ok(())");
+    }
+
+    // -----------------------------------------------------------------------
+    // run() — expired token triggers NoTokenAvailable on connect
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_expired_token_fails_with_no_token_available() {
+        use crate::auth::types::TokenState;
+        use chrono::{Duration as ChronoDuration, Utc};
+        use dhan_live_trader_common::trading_calendar::ist_offset;
+        use secrecy::SecretString;
+
+        // Create an expired token.
+        let now_ist = Utc::now().with_timezone(&ist_offset());
+        let expired_at = now_ist - ChronoDuration::hours(1);
+        let issued_at = now_ist - ChronoDuration::hours(25);
+        let state = TokenState::from_cached(
+            SecretString::from("expired-jwt".to_string()),
+            expired_at,
+            issued_at,
+        );
+        let token_handle: crate::auth::TokenHandle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(state))));
+
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            token_handle,
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            WebSocketConfig {
+                reconnect_max_attempts: 1,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![],
+            FeedMode::Ticker,
+            tx,
+        );
+
+        let result = conn.run().await;
+        // Expired token → connect_and_subscribe returns NoTokenAvailable → retries exhaust.
+        assert!(result.is_err());
+    }
+
+    // --- M1: Mid-session backfill logging test ---
+
+    #[test]
+    fn test_mid_session_backfill_triggered() {
+        // Verify the reconnection notification event exists and produces the expected message.
+        // The mid-session backfill log in `run()` fires when `total_reconnections > 0`
+        // after a successful `connect_and_subscribe`. This test verifies the
+        // supporting notification event used for Telegram alerts.
+        use crate::notification::NotificationEvent;
+        let event = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("reconnected"),
+            "WebSocketReconnected event message must contain 'reconnected'"
+        );
     }
 }

@@ -348,3 +348,44 @@ groups:
           description: "No active WebSocket connections to Dhan feed for 2+ minutes. Market data is stale."
         labels:
           severity: critical
+
+  # -- Loki-based log alerts (GAP-1 fix: ERROR logs → Telegram) ---------------
+  - orgId: 1
+    name: dlt-log-alerts
+    folder: dhan-live-trader
+    interval: 1m
+    rules:
+      - uid: dlt-error-logs
+        title: "Application ERROR Logs Detected"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: loki
+            model:
+              expr: "count_over_time({job=\"dlt-docker\", container=\"dlt-app\"} |~ \"(?i)(ERROR|PANIC|FATAL)\" [2m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "ERROR/PANIC/FATAL logs detected in dlt-app"
+          description: "Application produced ERROR-level logs in the last 2 minutes. Check Grafana Logs dashboard for details."
+        labels:
+          severity: critical

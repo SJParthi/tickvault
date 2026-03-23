@@ -17,7 +17,7 @@ use dhan_live_trader_common::config::IndexConstituencyConfig;
 use dhan_live_trader_common::constants::{
     INDEX_CONSTITUENCY_BASE_URL, INDEX_CONSTITUENCY_MIN_INDICES,
     INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS, INDEX_CONSTITUENCY_RETRY_MAX_TIMES,
-    INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS,
+    INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS, INDEX_CONSTITUENCY_USER_AGENT,
 };
 
 /// Download index constituency CSVs concurrently.
@@ -34,6 +34,7 @@ pub async fn download_constituency_csvs(
 
     let client = match Client::builder()
         .timeout(Duration::from_secs(config.download_timeout_secs))
+        .user_agent(INDEX_CONSTITUENCY_USER_AGENT)
         .build()
     {
         Ok(c) => c,
@@ -160,7 +161,7 @@ mod tests {
         let url = build_download_url("ind_nifty50list");
         assert_eq!(
             url,
-            "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv"
+            "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv"
         );
     }
 
@@ -169,5 +170,143 @@ mod tests {
         let config = IndexConstituencyConfig::default();
         let result = download_constituency_csvs(&config, &[]).await;
         assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: build_download_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_download_url_includes_csv_extension() {
+        let url = build_download_url("test_slug");
+        assert!(url.ends_with(".csv"), "URL must end with .csv");
+    }
+
+    #[test]
+    fn test_download_url_empty_slug() {
+        let url = build_download_url("");
+        assert_eq!(url, "https://www.niftyindices.com/IndexConstituent/.csv");
+    }
+
+    #[test]
+    fn test_download_url_special_characters_in_slug() {
+        let url = build_download_url("ind_nifty%20next50list");
+        assert!(url.contains("ind_nifty%20next50list.csv"));
+    }
+
+    #[test]
+    fn test_download_url_uses_correct_base_url() {
+        let url = build_download_url("anything");
+        assert!(
+            url.starts_with(INDEX_CONSTITUENCY_BASE_URL),
+            "URL must start with base URL constant"
+        );
+    }
+
+    #[test]
+    fn test_download_url_various_slugs() {
+        let slugs = [
+            "ind_nifty50list",
+            "ind_niftybanklist",
+            "ind_niftyfinancelist",
+            "ind_niftyITlist",
+        ];
+        for slug in slugs {
+            let url = build_download_url(slug);
+            assert!(url.contains(slug));
+            assert!(url.ends_with(".csv"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: download_constituency_csvs with unreachable URLs
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_unreachable_urls_returns_empty() {
+        let config = IndexConstituencyConfig {
+            enabled: true,
+            download_timeout_secs: 1,
+            max_concurrent_downloads: 2,
+            inter_batch_delay_ms: 0,
+        };
+        // Use URLs that will fail immediately (unreachable port)
+        let slugs: &[(&str, &str)] = &[
+            ("Test1", "http://127.0.0.1:1/fake1"),
+            ("Test2", "http://127.0.0.1:1/fake2"),
+        ];
+        // Note: build_download_url won't be called here as slugs are full URLs
+        // but the download will attempt them anyway. Actually, the function builds
+        // URLs from slugs, so the real URL would be
+        // INDEX_CONSTITUENCY_BASE_URL + slug + ".csv" which won't resolve.
+        let result = download_constituency_csvs(&config, slugs).await;
+        assert!(
+            result.is_empty(),
+            "unreachable URLs should return empty results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_single_slug_unreachable() {
+        let config = IndexConstituencyConfig {
+            enabled: true,
+            download_timeout_secs: 1,
+            max_concurrent_downloads: 1,
+            inter_batch_delay_ms: 0,
+        };
+        let slugs: &[(&str, &str)] = &[("Nifty 50", "nonexistent_slug_xyz")];
+        let result = download_constituency_csvs(&config, slugs).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_download_with_inter_batch_delay() {
+        let config = IndexConstituencyConfig {
+            enabled: true,
+            download_timeout_secs: 1,
+            max_concurrent_downloads: 1,
+            inter_batch_delay_ms: 50, // Non-zero delay
+        };
+        let slugs: &[(&str, &str)] = &[("Test", "nonexistent_slug_delay")];
+        let start = std::time::Instant::now();
+        let result = download_constituency_csvs(&config, slugs).await;
+        // Should still complete despite delay (download fails fast)
+        assert!(result.is_empty());
+        // The delay is applied after the download, so total time should be reasonable
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "should complete within 30 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_with_zero_delay() {
+        let config = IndexConstituencyConfig {
+            enabled: true,
+            download_timeout_secs: 1,
+            max_concurrent_downloads: 2,
+            inter_batch_delay_ms: 0, // Zero delay
+        };
+        let slugs: &[(&str, &str)] = &[("A", "slug_a"), ("B", "slug_b")];
+        let result = download_constituency_csvs(&config, slugs).await;
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: URL construction determinism
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_download_url_deterministic() {
+        let url1 = build_download_url("test");
+        let url2 = build_download_url("test");
+        assert_eq!(url1, url2, "URL construction must be deterministic");
+    }
+
+    #[test]
+    fn test_download_url_different_slugs_different_urls() {
+        let url1 = build_download_url("slug_a");
+        let url2 = build_download_url("slug_b");
+        assert_ne!(url1, url2, "different slugs must produce different URLs");
     }
 }

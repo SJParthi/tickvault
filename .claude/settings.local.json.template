@@ -1,0 +1,7 @@
+{
+  "env": {
+    "GITHUB_TOKEN": "<your-github-personal-access-token>",
+    "GRAFANA_API_KEY": "<your-grafana-api-key-if-needed>",
+    "QUESTDB_PG_URL": "postgresql://admin:quest@localhost:8812/qdb"
+  }
+}

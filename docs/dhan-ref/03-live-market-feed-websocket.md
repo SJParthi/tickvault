@@ -132,7 +132,7 @@ Smallest packet. LTP + LTT only.
 |---------------|---------|--------------|------------------------------------|
 | `0-8`         | array   | 8            | Response Header (code `2`)         |
 | `9-12`        | float32 | 4            | Last Traded Price (LTP)            |
-| `13-16`       | uint32  | 4            | Last Trade Time (LTT) — UNIX EPOCH |
+| `13-16`       | uint32  | 4            | Last Trade Time (LTT) — IST epoch seconds (see Section 10 note 1) |
 
 **Total: 16 bytes**
 
@@ -163,7 +163,7 @@ Complete trade data without market depth.
 | `0-8`         | array   | 8            | Response Header (code `4`)                         |
 | `9-12`        | float32 | 4            | Last Traded Price (LTP)                            |
 | `13-14`       | uint16  | 2            | Last Traded Quantity                                |
-| `15-18`       | uint32  | 4            | Last Trade Time (LTT) — UNIX EPOCH                 |
+| `15-18`       | uint32  | 4            | Last Trade Time (LTT) — IST epoch seconds (see Section 10 note 1) |
 | `19-22`       | float32 | 4            | Average Trade Price (ATP)                           |
 | `23-26`       | uint32  | 4            | Volume                                              |
 | `27-30`       | uint32  | 4            | Total Sell Quantity                                 |
@@ -201,7 +201,7 @@ Everything: trade data + OI + 5-level market depth in a single packet.
 | `0-8`         | array                 | 8            | Response Header (code `8`)                          |
 | `9-12`        | float32               | 4            | Last Traded Price (LTP)                             |
 | `13-14`       | uint16                | 2            | Last Traded Quantity                                 |
-| `15-18`       | uint32                | 4            | Last Trade Time (LTT) — UNIX EPOCH                  |
+| `15-18`       | uint32                | 4            | Last Trade Time (LTT) — IST epoch seconds (see Section 10 note 1) |
 | `19-22`       | float32               | 4            | Average Trade Price (ATP)                            |
 | `23-26`       | uint32                | 4            | Volume                                               |
 | `27-30`       | uint32                | 4            | Total Sell Quantity                                  |
@@ -372,7 +372,7 @@ pub struct ResponseHeader {
 pub struct TickerPacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12, float32 LE
-    pub ltt: u32,                      // bytes 13-16, uint32 LE (UNIX epoch UTC)
+    pub ltt: u32,                      // bytes 13-16, uint32 LE (IST epoch seconds — NOT UTC)
 }
 
 // ─── Prev Close Packet (16 bytes total) ───
@@ -391,7 +391,7 @@ pub struct QuotePacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12
     pub ltq: u16,                      // bytes 13-14 (unsigned — quantity cannot be negative)
-    pub ltt: u32,                      // bytes 15-18 (UNIX epoch UTC)
+    pub ltt: u32,                      // bytes 15-18 (IST epoch seconds — NOT UTC)
     pub atp: f32,                      // bytes 19-22
     pub volume: u32,                   // bytes 23-26
     pub total_sell_qty: u32,           // bytes 27-30
@@ -417,7 +417,7 @@ pub struct FullPacket {
     pub header: ResponseHeader,
     pub ltp: f32,                      // bytes 9-12
     pub ltq: u16,                      // bytes 13-14 (unsigned — quantity cannot be negative)
-    pub ltt: u32,                      // bytes 15-18 (UNIX epoch UTC)
+    pub ltt: u32,                      // bytes 15-18 (IST epoch seconds — NOT UTC)
     pub atp: f32,                      // bytes 19-22
     pub volume: u32,                   // bytes 23-26
     pub total_sell_qty: u32,           // bytes 27-30
@@ -457,12 +457,17 @@ pub struct DisconnectPacket {
 
 ## 10. Critical Implementation Notes
 
-1. **LTT timestamps are standard UNIX epoch (UTC-based).** You MUST add +5:30 (19800s) to get IST. See 08-annexure Section 12 for full verification.
+1. **LTT timestamps from WebSocket are IST epoch seconds (seconds since 1970-01-01 00:00 IST), NOT UTC.** The raw u32 value already represents IST. To get a correct IST datetime, interpret the epoch as IST directly (treat it as if the epoch started at IST midnight). Do NOT add +5:30 — that would double-offset. To convert to UTC for storage, SUBTRACT 19800 seconds.
    ```rust
-   use chrono::{FixedOffset, TimeZone};
+   use chrono::{FixedOffset, TimeZone, NaiveDateTime};
+   // WebSocket LTT is IST epoch — interpret directly as IST
+   let naive = NaiveDateTime::from_timestamp_opt(ltt as i64, 0).unwrap();
    let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
-   let dt = ist.timestamp_opt(ltt as i64, 0).unwrap();
+   let ist_dt = ist.from_local_datetime(&naive).unwrap();
+   // To get UTC: subtract 19800s from the raw value
+   let utc_epoch = ltt as i64 - 19800;
    ```
+   > **WARNING**: This differs from Historical REST API timestamps, which ARE standard UTC epoch. See 08-annexure Section 12 for the distinction.
 
 2. **Byte ordering is Little Endian** — all multi-byte fields (uint16, uint32, float32) must be read as LE. In Rust: `f32::from_le_bytes()`, `u32::from_le_bytes()`, etc.
 
@@ -562,7 +567,7 @@ Expected:
   - exchange_segment = 1 (NSE_EQ)
   - security_id = 1333
   - ltp = parsed float32 LE
-  - ltt = parsed uint32 LE epoch (convert to IST with +5:30)
+  - ltt = parsed uint32 LE (IST epoch seconds — do NOT add +5:30; subtract 19800 for UTC)
 ```
 
 ### Test: Subscribe 100+ instruments

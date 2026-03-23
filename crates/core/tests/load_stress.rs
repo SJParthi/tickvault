@@ -167,3 +167,219 @@ fn stress_candle_aggregator_50k_ticks() {
     let total_completed = agg.completed_slice().len();
     assert!(total_completed > 0, "should produce completed candles");
 }
+
+// ---------------------------------------------------------------------------
+// Stress: parse 1 million ticker packets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_parser_throughput_1m_packets() {
+    let start = Instant::now();
+    let mut success_count = 0_u64;
+
+    for i in 0..1_000_000_u32 {
+        let packet = make_ticker(
+            50000 + (i % 25000),
+            100.0 + (i as f32 * 0.001),
+            1_700_000_000 + (i / 100),
+        );
+        if dhan_live_trader_core::parser::dispatch_frame(&packet, 0).is_ok() {
+            success_count += 1;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    assert_eq!(
+        success_count, 1_000_000,
+        "all 1M packets must parse successfully"
+    );
+
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "1M ticker parses took {elapsed:?} — too slow (budget: 10s)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stress: concurrent registry access — 8 threads × 100K lookups
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_concurrent_registry_access() {
+    use dhan_live_trader_common::instrument_registry::{
+        InstrumentRegistry, SubscribedInstrument, SubscriptionCategory,
+    };
+    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
+    use std::sync::Arc;
+
+    // Build a registry with 5000 instruments (max per connection).
+    let instruments: Vec<SubscribedInstrument> = (0..5000_u32)
+        .map(|i| SubscribedInstrument {
+            security_id: 50000 + i,
+            exchange_segment: ExchangeSegment::NseFno,
+            category: SubscriptionCategory::StockDerivative,
+            display_label: format!("INST_{i}"),
+            underlying_symbol: "TEST".to_string(),
+            instrument_kind: None,
+            expiry_date: None,
+            strike_price: None,
+            option_type: None,
+            feed_mode: FeedMode::Ticker,
+        })
+        .collect();
+
+    let registry = Arc::new(InstrumentRegistry::from_instruments(instruments));
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..8)
+        .map(|thread_idx| {
+            let reg = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let mut found = 0_u64;
+                for i in 0..100_000_u32 {
+                    let security_id = 50000 + ((i + thread_idx * 12345) % 5000);
+                    if reg.get(security_id).is_some() {
+                        found += 1;
+                    }
+                }
+                found
+            })
+        })
+        .collect();
+
+    let total_found: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    let elapsed = start.elapsed();
+
+    // All 800K lookups should succeed (all IDs are in range).
+    assert_eq!(total_found, 800_000, "all lookups must succeed");
+
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "800K concurrent registry lookups took {elapsed:?} — too slow (budget: 5s)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stress: candle aggregator burst — 10K ticks in rapid succession
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_candle_aggregator_burst() {
+    use dhan_live_trader_common::tick_types::ParsedTick;
+    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+
+    let mut agg = CandleAggregator::new();
+    let start = Instant::now();
+
+    // Feed 10K ticks across 50 securities × 200 ticks each, spanning 20 seconds.
+    for i in 0..10_000_u32 {
+        let security_id = 50000 + (i % 50);
+        let timestamp = 1_700_000_000 + (i / 500); // New second every 500 ticks
+        let tick = ParsedTick {
+            security_id,
+            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
+            last_traded_price: 100.0 + (i as f32 * 0.01),
+            exchange_timestamp: timestamp,
+            volume: i * 10,
+            ..Default::default()
+        };
+        agg.update(&tick);
+    }
+
+    let elapsed = start.elapsed();
+
+    // Verify candle correctness: 10K ticks / 500 per second = 20 seconds.
+    // 50 securities × (20-1) completed transitions = 950 completed candles.
+    let completed_count = agg.total_completed();
+    assert!(
+        completed_count > 0,
+        "should produce completed candles from burst traffic"
+    );
+    // Each security has 20 seconds, so 19 completed candles per security × 50 = 950.
+    assert_eq!(
+        completed_count, 950,
+        "expected 950 completed candles (50 securities × 19 second transitions)"
+    );
+    // 50 securities still have active candles for the last second.
+    assert_eq!(
+        agg.active_count(),
+        50,
+        "50 securities should have active candles"
+    );
+
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "10K candle burst took {elapsed:?} — too slow (budget: 500ms)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stress: subscription builder max load — 5000 instruments
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stress_subscription_builder_max_load() {
+    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
+    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
+    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+
+    // Build 5000 instruments (max per connection).
+    let instruments: Vec<InstrumentSubscription> = (0..5000_u32)
+        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 50000 + i))
+        .collect();
+
+    let start = Instant::now();
+    let messages = build_subscription_messages(&instruments, FeedMode::Full, 100);
+    let elapsed = start.elapsed();
+
+    // 5000 / 100 = 50 messages.
+    assert_eq!(
+        messages.len(),
+        50,
+        "5000 instruments at batch 100 = 50 messages"
+    );
+
+    // Verify all messages are valid JSON.
+    for (idx, msg) in messages.iter().enumerate() {
+        let parsed: serde_json::Value = serde_json::from_str(msg)
+            .unwrap_or_else(|e| panic!("message {idx} is not valid JSON: {e}"));
+        let instrument_count = parsed["InstrumentCount"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("message {idx} missing InstrumentCount"));
+        assert!(
+            instrument_count <= 100,
+            "message {idx} has {instrument_count} instruments (max 100)"
+        );
+        assert_eq!(
+            parsed["RequestCode"].as_u64().unwrap(),
+            21,
+            "message {idx} must use Full mode RequestCode 21"
+        );
+    }
+
+    // Total instruments across all messages should be 5000.
+    let total_instruments: u64 = messages
+        .iter()
+        .map(|msg| {
+            let parsed: serde_json::Value = serde_json::from_str(msg).unwrap();
+            parsed["InstrumentCount"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(
+        total_instruments, 5000,
+        "total instruments across all messages must be 5000"
+    );
+
+    if !skip_perf_assertions() {
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "building 50 subscription messages took {elapsed:?} — too slow (budget: 1s)"
+        );
+    }
+}

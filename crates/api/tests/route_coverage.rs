@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::SharedAppState;
+use dhan_live_trader_api::state::{SharedAppState, SystemHealthStatus};
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
 fn test_state() -> SharedAppState {
@@ -39,6 +39,7 @@ fn test_state() -> SharedAppState {
         },
         std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(std::sync::RwLock::new(None)),
+        std::sync::Arc::new(SystemHealthStatus::new()),
     )
 }
 
@@ -46,7 +47,7 @@ fn test_state() -> SharedAppState {
 /// when QuestDB is unreachable — it never 5xx on connection failure).
 #[tokio::test]
 async fn test_get_stats_returns_200() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/api/stats")
         .body(Body::empty())
@@ -62,7 +63,7 @@ async fn test_get_stats_returns_200() {
 /// when the snapshot is empty — never errors).
 #[tokio::test]
 async fn test_get_top_movers_returns_200() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/api/top-movers")
         .body(Body::empty())
@@ -78,7 +79,7 @@ async fn test_get_top_movers_returns_200() {
 /// `available: false` when the constituency map is empty — never errors).
 #[tokio::test]
 async fn test_get_index_constituency_returns_200() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/api/index-constituency")
         .body(Body::empty())
@@ -94,7 +95,7 @@ async fn test_get_index_constituency_returns_200() {
 /// when the constituency map is empty (no data loaded).
 #[tokio::test]
 async fn test_get_stock_indices_returns_200_or_404() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
     let request = Request::builder()
         .uri("/api/stock-indices/RELIANCE")
         .body(Body::empty())
@@ -120,7 +121,7 @@ async fn test_get_stock_indices_returns_200_or_404() {
 /// be updated to verify 401 without auth and 200 with valid bearer token.
 #[tokio::test]
 async fn test_post_rebuild_returns_200() {
-    let router = build_router(test_state());
+    let router = build_router(test_state(), &[], true);
 
     let request = Request::builder()
         .method("POST")

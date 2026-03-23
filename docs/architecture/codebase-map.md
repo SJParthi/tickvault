@@ -118,7 +118,7 @@ dhan-live-trader/
 ## Config Shape (config/base.toml)
 
 ```toml
-[trading]     # market_open "09:15", market_close "15:30", timezone "Asia/Kolkata"
+[trading]     # market_open "09:00", market_close "15:30", timezone "Asia/Kolkata"
 [dhan]        # websocket_url, rest_api_base_url, auth_base_url, instrument_csv_urls, max_instruments
 [questdb]     # host "dlt-questdb", http_port 9000, pg_port 8812, ilp_port 9009
 [valkey]      # host "dlt-valkey", port 6379, max_connections 16
@@ -315,7 +315,7 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 10. Order update WebSocket connection (separate feed)
 11. axum API server on 0.0.0.0:3001 (health, stats, portal, top-movers, instruments)
 12. Token renewal background task
-13. Await Ctrl+C → graceful shutdown
+13. Market close (15:30) → WS disconnect → historical re-fetch → cross-verify → auto-shutdown at 16:00 IST
 ```
 
 ## Completed Blocks

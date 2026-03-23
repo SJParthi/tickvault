@@ -437,6 +437,191 @@ mod tests {
 
     // -- Display tests ------------------------------------------------------
 
+    // -- effective_prefix tests -------------------------------------------------
+
+    #[test]
+    fn test_effective_prefix_whitespace_only_defaults_to_instruments() {
+        let config = S3BackupConfig {
+            bucket: "my-bucket".to_owned(),
+            prefix: "   ".to_owned(),
+            region: "ap-south-1".to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2025, 6, 15).expect("valid date"); // APPROVED: test constant
+        assert_eq!(
+            s3_key_for_date(&config, date, S3_RKYV_FILENAME),
+            "instruments/2025-06-15/universe.rkyv"
+        );
+    }
+
+    #[test]
+    fn test_effective_prefix_with_trailing_spaces_trimmed() {
+        let config = S3BackupConfig {
+            bucket: "my-bucket".to_owned(),
+            prefix: "  custom  ".to_owned(),
+            region: "ap-south-1".to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2025, 6, 15).expect("valid date"); // APPROVED: test constant
+        assert_eq!(
+            s3_key_for_date(&config, date, S3_RKYV_FILENAME),
+            "custom/2025-06-15/universe.rkyv"
+        );
+    }
+
+    // -- backup_instrument_cache — files exist but S3 not wired ---------------
+
+    #[tokio::test]
+    async fn test_backup_with_existing_files_returns_upload_failed() {
+        let config = S3BackupConfig {
+            bucket: "test-bucket".to_owned(),
+            prefix: "instruments".to_owned(),
+            region: "ap-south-1".to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2025, 6, 15).expect("valid date"); // APPROVED: test constant
+
+        // Create temp dir with the expected files
+        let dir = std::env::temp_dir().join(format!(
+            "dlt-s3-test-backup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(dhan_live_trader_common::constants::BINARY_CACHE_FILENAME),
+            b"fake rkyv data",
+        )
+        .unwrap();
+        std::fs::write(dir.join("test.csv"), b"fake csv data").unwrap();
+
+        let cache_dir = dir.to_str().unwrap(); // APPROVED: test
+        let result = backup_instrument_cache(cache_dir, "test.csv", date, &config).await;
+
+        // S3 not wired → UploadFailed (stub implementation)
+        match result {
+            Err(S3BackupError::UploadFailed { key, reason }) => {
+                assert!(key.contains("universe.rkyv"));
+                assert!(reason.contains("stub"));
+            }
+            other => panic!("expected UploadFailed, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- backup_instrument_cache — CSV missing ---
+
+    #[tokio::test]
+    async fn test_backup_missing_csv_returns_io_error() {
+        let config = S3BackupConfig {
+            bucket: "my-bucket".to_owned(),
+            prefix: "instruments".to_owned(),
+            region: "ap-south-1".to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2025, 6, 15).expect("valid date"); // APPROVED: test constant
+
+        // Create temp dir with rkyv but NO csv
+        let dir = std::env::temp_dir().join(format!(
+            "dlt-s3-test-nocsv-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(dhan_live_trader_common::constants::BINARY_CACHE_FILENAME),
+            b"fake rkyv data",
+        )
+        .unwrap();
+
+        let cache_dir = dir.to_str().unwrap(); // APPROVED: test
+        let result = backup_instrument_cache(cache_dir, "missing.csv", date, &config).await;
+
+        match result {
+            Err(S3BackupError::IoError(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected IoError(NotFound), got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- restore_instrument_cache — creates directory if missing ---------------
+
+    #[tokio::test]
+    async fn test_restore_creates_cache_dir_if_missing() {
+        let config = S3BackupConfig {
+            bucket: "my-bucket".to_owned(),
+            prefix: "instruments".to_owned(),
+            region: "ap-south-1".to_owned(),
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "dlt-s3-test-restore-mkdir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+
+        let cache_dir = dir.to_str().unwrap(); // APPROVED: test
+        let result = restore_instrument_cache(cache_dir, &config).await;
+
+        // S3 not wired → DownloadFailed (stub), but the dir should exist now
+        assert!(result.is_err());
+        assert!(dir.exists(), "restore should create cache dir");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- S3BackupConfig — Clone + Debug ----------------------------------------
+
+    #[test]
+    fn test_s3_backup_config_clone() {
+        let config = S3BackupConfig {
+            bucket: "test-bucket".to_owned(),
+            prefix: "test-prefix".to_owned(),
+            region: "us-east-1".to_owned(),
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.bucket, "test-bucket");
+        assert_eq!(cloned.prefix, "test-prefix");
+        assert_eq!(cloned.region, "us-east-1");
+    }
+
+    #[test]
+    fn test_s3_backup_config_debug() {
+        let config = S3BackupConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("bucket"));
+        assert!(debug.contains("prefix"));
+        assert!(debug.contains("region"));
+    }
+
+    // -- S3BackupError — Debug ------------------------------------------------
+
+    #[test]
+    fn test_s3_backup_error_debug() {
+        let err = S3BackupError::NotConfigured;
+        let debug = format!("{err:?}");
+        assert!(debug.contains("NotConfigured"));
+    }
+
+    // -- whitespace region not configured ------------------------------------
+
+    #[test]
+    fn test_s3_backup_config_whitespace_region_not_configured() {
+        let config = S3BackupConfig {
+            bucket: "my-bucket".to_owned(),
+            prefix: "instruments".to_owned(),
+            region: "   ".to_owned(),
+        };
+        assert!(
+            !is_s3_backup_configured(&config),
+            "whitespace-only region should not be configured"
+        );
+    }
+
     #[test]
     fn test_s3_backup_error_display() {
         let not_configured = S3BackupError::NotConfigured;

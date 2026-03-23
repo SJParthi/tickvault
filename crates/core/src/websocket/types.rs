@@ -834,4 +834,289 @@ mod tests {
         assert!(json.contains("\"SecurityId\":\"2885\""));
         assert!(!json.contains("\"SecurityId\":2885"));
     }
+
+    // --- DisconnectCode Display exact strings ---
+
+    #[test]
+    fn test_disconnect_code_display_exact_all_known() {
+        assert_eq!(
+            DisconnectCode::InternalServerError.to_string(),
+            "800: Internal server error"
+        );
+        assert_eq!(
+            DisconnectCode::InstrumentsExceedLimit.to_string(),
+            "804: Instruments exceed limit"
+        );
+        assert_eq!(
+            DisconnectCode::ExceededActiveConnections.to_string(),
+            "805: Active connections exceeded"
+        );
+        assert_eq!(
+            DisconnectCode::DataApiSubscriptionRequired.to_string(),
+            "806: Data API subscription required"
+        );
+        assert_eq!(
+            DisconnectCode::AccessTokenExpired.to_string(),
+            "807: Access token expired"
+        );
+        assert_eq!(
+            DisconnectCode::InvalidExpiryDate.to_string(),
+            "811: Invalid expiry date"
+        );
+        assert_eq!(
+            DisconnectCode::InvalidDateFormat.to_string(),
+            "812: Invalid date format"
+        );
+        assert_eq!(
+            DisconnectCode::InvalidSecurityId.to_string(),
+            "813: Invalid security ID"
+        );
+        assert_eq!(
+            DisconnectCode::InvalidRequest.to_string(),
+            "814: Invalid request"
+        );
+    }
+
+    #[test]
+    fn test_disconnect_code_display_unknown_shows_raw_code() {
+        assert_eq!(
+            DisconnectCode::Unknown(42).to_string(),
+            "42: Unknown disconnect"
+        );
+        assert_eq!(
+            DisconnectCode::Unknown(0).to_string(),
+            "0: Unknown disconnect"
+        );
+        assert_eq!(
+            DisconnectCode::Unknown(u16::MAX).to_string(),
+            "65535: Unknown disconnect"
+        );
+    }
+
+    // --- ConnectionState Display ---
+
+    #[test]
+    fn test_connection_state_display_via_format_macro() {
+        // Exercises Display through format! (different code path than .to_string())
+        assert_eq!(
+            format!("state={}", ConnectionState::Disconnected),
+            "state=Disconnected"
+        );
+        assert_eq!(
+            format!("state={}", ConnectionState::Connecting),
+            "state=Connecting"
+        );
+        assert_eq!(
+            format!("state={}", ConnectionState::Connected),
+            "state=Connected"
+        );
+        assert_eq!(
+            format!("state={}", ConnectionState::Reconnecting),
+            "state=Reconnecting"
+        );
+    }
+
+    // --- ConnectionState Debug ---
+
+    #[test]
+    fn test_connection_state_debug_all_variants() {
+        assert_eq!(
+            format!("{:?}", ConnectionState::Disconnected),
+            "Disconnected"
+        );
+        assert_eq!(format!("{:?}", ConnectionState::Connecting), "Connecting");
+        assert_eq!(format!("{:?}", ConnectionState::Connected), "Connected");
+        assert_eq!(
+            format!("{:?}", ConnectionState::Reconnecting),
+            "Reconnecting"
+        );
+    }
+
+    // --- DisconnectCode as_u16 for Unknown preserves value ---
+
+    #[test]
+    fn test_disconnect_code_unknown_as_u16_preserves_arbitrary_values() {
+        for code in [1, 100, 801, 802, 803, 815, 900, 1000, u16::MAX] {
+            let dc = DisconnectCode::from_u16(code);
+            assert_eq!(dc, DisconnectCode::Unknown(code));
+            assert_eq!(dc.as_u16(), code);
+        }
+    }
+
+    // --- WebSocketError TlsConfigurationFailed display ---
+
+    #[test]
+    fn test_websocket_error_tls_configuration_failed_display() {
+        let err = WebSocketError::TlsConfigurationFailed {
+            reason: "missing CA cert".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("TLS configuration failed"));
+        assert!(msg.contains("missing CA cert"));
+    }
+
+    // --- ConnectionState Display: f.write_str path ---
+
+    #[test]
+    fn test_connection_state_display_write_str_all_variants() {
+        // Exercises Display via std::fmt::Write on a String buffer
+        use std::fmt::Write;
+        let variants = [
+            (ConnectionState::Disconnected, "Disconnected"),
+            (ConnectionState::Connecting, "Connecting"),
+            (ConnectionState::Connected, "Connected"),
+            (ConnectionState::Reconnecting, "Reconnecting"),
+        ];
+        for (state, expected) in variants {
+            let mut buf = String::new();
+            write!(buf, "{state}").unwrap();
+            assert_eq!(buf, expected);
+        }
+    }
+
+    // --- DisconnectCode Display: all 12 + Unknown via write! ---
+
+    #[test]
+    fn test_disconnect_code_display_all_variants_via_write() {
+        use std::fmt::Write;
+        let known = [
+            (
+                DisconnectCode::InternalServerError,
+                "800: Internal server error",
+            ),
+            (
+                DisconnectCode::InstrumentsExceedLimit,
+                "804: Instruments exceed limit",
+            ),
+            (
+                DisconnectCode::ExceededActiveConnections,
+                "805: Active connections exceeded",
+            ),
+            (
+                DisconnectCode::DataApiSubscriptionRequired,
+                "806: Data API subscription required",
+            ),
+            (
+                DisconnectCode::AccessTokenExpired,
+                "807: Access token expired",
+            ),
+            (
+                DisconnectCode::AuthenticationFailed,
+                "808: Authentication failed",
+            ),
+            (
+                DisconnectCode::AccessTokenInvalid,
+                "809: Access token invalid",
+            ),
+            (DisconnectCode::ClientIdInvalid, "810: Client ID invalid"),
+            (
+                DisconnectCode::InvalidExpiryDate,
+                "811: Invalid expiry date",
+            ),
+            (
+                DisconnectCode::InvalidDateFormat,
+                "812: Invalid date format",
+            ),
+            (
+                DisconnectCode::InvalidSecurityId,
+                "813: Invalid security ID",
+            ),
+            (DisconnectCode::InvalidRequest, "814: Invalid request"),
+            (DisconnectCode::Unknown(123), "123: Unknown disconnect"),
+        ];
+        for (code, expected) in known {
+            let mut buf = String::new();
+            write!(buf, "{code}").unwrap();
+            assert_eq!(buf, expected);
+        }
+    }
+
+    // --- ConnectionHealth Debug ---
+
+    #[test]
+    fn test_connection_health_debug_format() {
+        let health = ConnectionHealth {
+            connection_id: 4,
+            state: ConnectionState::Reconnecting,
+            subscribed_count: 1000,
+            total_reconnections: 7,
+        };
+        let debug = format!("{health:?}");
+        assert!(debug.contains("ConnectionHealth"));
+        assert!(debug.contains("Reconnecting"));
+        assert!(debug.contains("1000"));
+        assert!(debug.contains("7"));
+    }
+
+    // --- InstrumentSubscription Debug + Clone ---
+
+    #[test]
+    fn test_instrument_subscription_debug_format() {
+        let sub = InstrumentSubscription::new(ExchangeSegment::NseFno, 52432);
+        let debug = format!("{sub:?}");
+        assert!(debug.contains("InstrumentSubscription"));
+        assert!(debug.contains("NSE_FNO"));
+        assert!(debug.contains("52432"));
+    }
+
+    #[test]
+    fn test_instrument_subscription_clone() {
+        let sub = InstrumentSubscription::new(ExchangeSegment::NseEquity, 1333);
+        let cloned = sub.clone();
+        assert_eq!(cloned.exchange_segment, "NSE_EQ");
+        assert_eq!(cloned.security_id, "1333");
+    }
+
+    // --- DisconnectCode Debug ---
+
+    #[test]
+    fn test_disconnect_code_debug_known_variant() {
+        let code = DisconnectCode::AccessTokenExpired;
+        let debug = format!("{code:?}");
+        assert_eq!(debug, "AccessTokenExpired");
+    }
+
+    #[test]
+    fn test_disconnect_code_debug_unknown_variant() {
+        let code = DisconnectCode::Unknown(42);
+        let debug = format!("{code:?}");
+        assert!(debug.contains("Unknown"));
+        assert!(debug.contains("42"));
+    }
+
+    // --- WebSocketError Debug ---
+
+    #[test]
+    fn test_websocket_error_no_token_debug() {
+        let err = WebSocketError::NoTokenAvailable;
+        let debug = format!("{err:?}");
+        assert!(debug.contains("NoTokenAvailable"));
+    }
+
+    // --- TwoHundredDepthSubscriptionRequest Clone + Debug ---
+
+    #[test]
+    fn test_two_hundred_depth_subscription_clone() {
+        let request = TwoHundredDepthSubscriptionRequest {
+            request_code: 23,
+            exchange_segment: "NSE_EQ".to_string(),
+            security_id: "1333".to_string(),
+        };
+        let cloned = request.clone();
+        assert_eq!(cloned.request_code, 23);
+        assert_eq!(cloned.exchange_segment, "NSE_EQ");
+        assert_eq!(cloned.security_id, "1333");
+    }
+
+    #[test]
+    fn test_two_hundred_depth_subscription_debug() {
+        let request = TwoHundredDepthSubscriptionRequest {
+            request_code: 23,
+            exchange_segment: "NSE_FNO".to_string(),
+            security_id: "52432".to_string(),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("TwoHundredDepthSubscriptionRequest"));
+        assert!(debug.contains("NSE_FNO"));
+    }
 }

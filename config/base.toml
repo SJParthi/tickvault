@@ -6,7 +6,7 @@
 # =============================================================================
 
 [trading]
-market_open_time = "09:15:00"
+market_open_time = "09:00:00"
 market_close_time = "15:30:00"
 order_cutoff_time = "15:29:00"
 data_collection_start = "09:00:00"
@@ -88,6 +88,62 @@ name = "Christmas"
 date = "2026-11-08"
 name = "Diwali 2026 (Sunday — special session)"
 
+# ---------------------------------------------------------------------------
+# NSE Mock Trading Sessions — Contingency Drill Calendar 2026
+# ---------------------------------------------------------------------------
+# Source: https://www.nseindia.com/static/resources/exchange-communication-contingency-drill-calendar
+# All Saturdays, ~monthly. Compressed hours (typically 9:00–10:30 AM or 10:15 AM–2:00 PM).
+# NOT real trading days — no settlement, no pay-in/pay-out. For system testing only.
+# Update annually when NSE publishes the next calendar year's schedule.
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-01-03"
+name = "Mock Trading Session 1"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-02-07"
+name = "Mock Trading Session 2"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-03-07"
+name = "Mock Trading Session 3"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-04-11"
+name = "Mock Trading Session 4"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-05-09"
+name = "Mock Trading Session 5"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-06-06"
+name = "Mock Trading Session 6"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-07-04"
+name = "Mock Trading Session 7"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-08-01"
+name = "Mock Trading Session 8"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-09-05"
+name = "Mock Trading Session 9"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-10-10"
+name = "Mock Trading Session 10"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-11-14"
+name = "Mock Trading Session 11"
+
+[[trading.nse_mock_trading_dates]]
+date = "2026-12-05"
+name = "Mock Trading Session 12"
+
 [dhan]
 websocket_url = "wss://api-feed.dhan.co"
 order_update_websocket_url = "wss://api-order-update.dhan.co"
@@ -118,8 +174,10 @@ ping_interval_secs = 10
 pong_timeout_secs = 10
 max_consecutive_pong_failures = 2
 reconnect_initial_delay_ms = 500
-reconnect_max_delay_ms = 30000
-reconnect_max_attempts = 10
+reconnect_max_delay_ms = 60000
+# 0 = infinite retries (never give up). App lifecycle controls shutdown.
+# Non-zero = hard limit (used for testing). CRITICAL alert fires every 10 failures.
+reconnect_max_attempts = 0
 subscription_batch_size = 100
 connection_stagger_ms = 10000
 
@@ -148,16 +206,17 @@ level = "info"
 format = "json"
 
 [instrument]
-daily_download_time = "08:45:00"
+daily_download_time = "08:00:00"
 csv_cache_directory = "/app/data/instrument-cache"
 csv_cache_filename = "api-scrip-master-detailed.csv"
 csv_download_timeout_secs = 120
-build_window_start = "08:45:00"
-build_window_end = "16:00:00"
+build_window_start = "09:00:00"
+build_window_end = "15:30:00"
 
 [api]
 host = "0.0.0.0"
 port = 3001
+allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 
 [subscription]
 feed_mode = "Full"
@@ -186,3 +245,17 @@ lookback_days = 90
 request_timeout_secs = 30
 max_retries = 3
 request_delay_ms = 500
+
+[greeks]
+enabled = true
+fetch_interval_secs = 60
+risk_free_rate = 0.068
+dividend_yield = 0.012
+iv_solver_max_iterations = 50
+iv_solver_tolerance = 1e-8
+
+[index_constituency]
+enabled = true
+download_timeout_secs = 30
+max_concurrent_downloads = 5
+inter_batch_delay_ms = 0

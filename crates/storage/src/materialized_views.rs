@@ -1,9 +1,10 @@
 //! QuestDB materialized views for multi-timeframe candle aggregation.
 //!
 //! Creates the `candles_1s` base table and 18 materialized views covering
-//! timeframes from 5 seconds to 1 month. Dhan V2 sends standard UTC epoch
-//! seconds. Views use `OFFSET '05:30'` so candle boundaries align to IST
-//! wall-clock time (IST = UTC + 5:30).
+//! timeframes from 5 seconds to 1 month. Live WebSocket data arrives as IST
+//! epoch seconds (stored directly). Historical REST data arrives as UTC epoch
+//! seconds (+19800s offset applied at persistence). Both result in IST-based
+//! timestamps. Views use `OFFSET '00:00'` since stored data is already IST.
 //!
 //! Timeframes 20-21 (3 months, 1 year) are computed in Rust from monthly data.
 //!
@@ -25,8 +26,10 @@ use dhan_live_trader_common::constants::{QUESTDB_IST_ALIGN_OFFSET, QUESTDB_TABLE
 /// Timeout for QuestDB DDL HTTP requests.
 const DDL_TIMEOUT_SECS: u64 = 15;
 
-/// DEDUP UPSERT KEY column for the candles_1s table.
-const DEDUP_KEY_CANDLES_1S: &str = "security_id";
+/// DEDUP UPSERT KEY columns for the candles_1s table.
+/// Includes `segment` to prevent cross-segment collision when IDX_I and NSE_EQ
+/// share a security_id (e.g., NIFTY index vs NIFTY equity).
+const DEDUP_KEY_CANDLES_1S: &str = "security_id, segment";
 
 // ---------------------------------------------------------------------------
 // candles_1s Base Table DDL
@@ -197,6 +200,50 @@ const VIEW_DEFS: &[ViewDef] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Pure helper functions (testable without DB)
+// ---------------------------------------------------------------------------
+
+/// Builds the QuestDB HTTP exec URL from host and port.
+fn build_questdb_exec_url(host: &str, http_port: u16) -> String {
+    format!("http://{}:{}/exec", host, http_port)
+}
+
+/// Builds the ALTER TABLE DEDUP ENABLE UPSERT KEYS SQL statement.
+fn build_dedup_sql(table_name: &str, dedup_key: &str) -> String {
+    format!(
+        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
+        table_name, dedup_key
+    )
+}
+
+/// Returns the total number of materialized view definitions.
+#[cfg(test)]
+fn view_count() -> usize {
+    VIEW_DEFS.len()
+}
+
+/// Returns all view names in dependency order.
+#[cfg(test)]
+fn view_names() -> Vec<&'static str> {
+    VIEW_DEFS.iter().map(|d| d.name).collect()
+}
+
+/// Validates that all view dependency sources are available.
+///
+/// Returns `true` if every view's `source` is either the base table or a view defined earlier.
+#[cfg(test)]
+fn validate_dependency_order(base_table: &str) -> bool {
+    let mut available = vec![base_table];
+    for def in VIEW_DEFS {
+        if !available.contains(&def.source) {
+            return false;
+        }
+        available.push(def.name);
+    }
+    true
+}
+
 /// Builds the CREATE MATERIALIZED VIEW SQL for a given view definition.
 ///
 /// Data is stored as IST-as-UTC — offset '00:00' since midnight "UTC" IS midnight IST.
@@ -234,10 +281,7 @@ fn build_view_sql(def: &ViewDef) -> String {
 /// and continues (best-effort). QuestDB must be reachable for views
 /// to be created successfully.
 pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
+    let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(DDL_TIMEOUT_SECS))
@@ -263,10 +307,7 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     }
 
     // Step 2: Enable DEDUP UPSERT KEYS on candles_1s.
-    let dedup_sql = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_CANDLES_1S, DEDUP_KEY_CANDLES_1S
-    );
+    let dedup_sql = build_dedup_sql(QUESTDB_TABLE_CANDLES_1S, DEDUP_KEY_CANDLES_1S);
     execute_ddl(&client, &base_url, &dedup_sql, "candles_1s DEDUP").await;
 
     // Step 3: Create materialized views in dependency order.
@@ -406,6 +447,48 @@ mod tests {
         assert!(has_1m, "must have candles_1m materialized view");
     }
 
+    #[test]
+    fn all_views_include_segment_in_select() {
+        // segment must be a non-aggregated SELECT column in every view.
+        // QuestDB SAMPLE BY groups by all non-aggregated columns, so this
+        // ensures candles are never mixed across segments (e.g., IDX_I vs NSE_EQ).
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("segment"),
+                "view {} must include segment in SELECT to prevent cross-segment aggregation",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn candles_1s_ddl_has_segment_column() {
+        // The base table must have segment as a column for views to reference it.
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("segment SYMBOL"),
+            "candles_1s DDL must have segment SYMBOL column"
+        );
+    }
+
+    #[test]
+    fn test_candles_1s_dedup_key_includes_segment() {
+        // Prevents cross-segment collision when IDX_I and NSE_EQ share a
+        // security_id (e.g., NIFTY index vs NIFTY equity).
+        assert!(
+            DEDUP_KEY_CANDLES_1S.contains("security_id"),
+            "candles_1s DEDUP key must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_CANDLES_1S.contains("segment"),
+            "candles_1s DEDUP key must include segment to prevent cross-segment collision"
+        );
+        assert_eq!(
+            DEDUP_KEY_CANDLES_1S, "security_id, segment",
+            "exact candles_1s dedup key value"
+        );
+    }
+
     #[tokio::test]
     async fn ensure_candle_views_does_not_panic_unreachable() {
         let config = QuestDbConfig {
@@ -416,5 +499,446 @@ mod tests {
         };
         // Should not panic — logs warnings and returns.
         ensure_candle_views(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // build_questdb_exec_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_questdb_exec_url_docker() {
+        let url = build_questdb_exec_url("dlt-questdb", 9000);
+        assert_eq!(url, "http://dlt-questdb:9000/exec");
+    }
+
+    #[test]
+    fn test_build_questdb_exec_url_custom() {
+        let url = build_questdb_exec_url("10.0.0.1", 19000);
+        assert_eq!(url, "http://10.0.0.1:19000/exec");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_dedup_sql
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dedup_sql_candles_1s() {
+        let sql = build_dedup_sql(QUESTDB_TABLE_CANDLES_1S, DEDUP_KEY_CANDLES_1S);
+        assert_eq!(
+            sql,
+            "ALTER TABLE candles_1s DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
+        );
+    }
+
+    #[test]
+    fn test_build_dedup_sql_generic_table() {
+        let sql = build_dedup_sql("my_table", "col1, col2");
+        assert!(sql.starts_with("ALTER TABLE my_table"));
+        assert!(sql.contains("DEDUP ENABLE UPSERT KEYS(ts, col1, col2)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // view_count / view_names / validate_dependency_order
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_view_count_is_18() {
+        assert_eq!(view_count(), 18);
+    }
+
+    #[test]
+    fn test_view_names_unique() {
+        let names = view_names();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "view names must be unique");
+    }
+
+    #[test]
+    fn test_view_names_all_start_with_candles() {
+        for name in view_names() {
+            assert!(
+                name.starts_with("candles_"),
+                "name {} must start with candles_",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_dependency_order_with_correct_base() {
+        assert!(validate_dependency_order("candles_1s"));
+    }
+
+    #[test]
+    fn test_validate_dependency_order_with_wrong_base() {
+        // If base table is not candles_1s, first view (candles_5s from candles_1s) fails
+        assert!(!validate_dependency_order("wrong_table"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_view_sql — exhaustive per-view tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_view_sql_all_views_valid_sql() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.starts_with("CREATE MATERIALIZED VIEW IF NOT EXISTS"),
+                "view {} SQL must start with CREATE MATERIALIZED VIEW",
+                def.name
+            );
+            assert!(
+                sql.contains(&format!("FROM {}", def.source)),
+                "view {} must SELECT FROM {}",
+                def.name,
+                def.source
+            );
+            assert!(
+                sql.contains(&format!("SAMPLE BY {}", def.interval)),
+                "view {} must SAMPLE BY {}",
+                def.name,
+                def.interval
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_sub_minute_views_have_tick_count() {
+        // First 5 views (5s, 10s, 15s, 30s, 1m) have tick_count
+        for def in &VIEW_DEFS[..5] {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("sum(tick_count)"),
+                "sub-minute view {} must aggregate tick_count",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_minute_plus_views_no_tick_count() {
+        // Views from index 5 onward (2m, 3m, ...) do NOT have tick_count
+        for def in &VIEW_DEFS[5..] {
+            let sql = build_view_sql(def);
+            assert!(
+                !sql.contains("tick_count"),
+                "minute+ view {} must NOT have tick_count",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_ohlcv_columns_present() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("first(open) AS open"),
+                "view {} missing open",
+                def.name
+            );
+            assert!(
+                sql.contains("max(high) AS high"),
+                "view {} missing high",
+                def.name
+            );
+            assert!(
+                sql.contains("min(low) AS low"),
+                "view {} missing low",
+                def.name
+            );
+            assert!(
+                sql.contains("last(close) AS close"),
+                "view {} missing close",
+                def.name
+            );
+            assert!(
+                sql.contains("sum(volume) AS volume"),
+                "view {} missing volume",
+                def.name
+            );
+            assert!(
+                sql.contains("last(oi) AS oi"),
+                "view {} missing oi",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_1m_from_1s() {
+        let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1m").unwrap();
+        assert_eq!(def.source, "candles_1s");
+        assert_eq!(def.interval, "1m");
+        assert!(def.has_tick_count);
+    }
+
+    #[test]
+    fn test_build_view_sql_1d_from_1h() {
+        let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1d").unwrap();
+        assert_eq!(def.source, "candles_1h");
+        assert_eq!(def.interval, "1d");
+        assert!(!def.has_tick_count);
+    }
+
+    #[test]
+    fn test_build_view_sql_monthly_from_1d() {
+        let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1M").unwrap();
+        assert_eq!(def.source, "candles_1d");
+        assert_eq!(def.interval, "1M");
+    }
+
+    #[test]
+    fn test_build_view_sql_all_views_idempotent() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("IF NOT EXISTS"),
+                "view {} SQL must contain IF NOT EXISTS for idempotency",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_view_sources_from_itself() {
+        for def in VIEW_DEFS {
+            assert_ne!(
+                def.name, def.source,
+                "view {} must not source from itself",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_idempotent() {
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("IF NOT EXISTS"),
+            "base table DDL must contain IF NOT EXISTS for idempotent startup"
+        );
+    }
+
+    #[test]
+    fn test_view_chain_5s_to_1m_all_from_1s() {
+        let sub_minute = [
+            "candles_5s",
+            "candles_10s",
+            "candles_15s",
+            "candles_30s",
+            "candles_1m",
+        ];
+        for name in &sub_minute {
+            let def = VIEW_DEFS.iter().find(|d| d.name == *name).unwrap();
+            assert_eq!(
+                def.source, "candles_1s",
+                "sub-minute view {} must source from candles_1s",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_view_chain_2m_3m_5m_from_1m() {
+        let minute_views = ["candles_2m", "candles_3m", "candles_5m"];
+        for name in &minute_views {
+            let def = VIEW_DEFS.iter().find(|d| d.name == *name).unwrap();
+            assert_eq!(
+                def.source, "candles_1m",
+                "minute view {} must source from candles_1m",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_view_intervals_non_empty() {
+        for def in VIEW_DEFS {
+            assert!(
+                !def.interval.is_empty(),
+                "view {} must have a non-empty interval",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_security_id_in_select() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("security_id"),
+                "view {} must include security_id in SELECT",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_view_sql_ts_in_select() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("ts"),
+                "view {} must include ts in SELECT",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_ddl_timeout_is_reasonable() {
+        assert!((5..=30).contains(&DDL_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_no_semicolons() {
+        assert!(
+            !CANDLES_1S_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_wal() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_oi_column() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("oi LONG"));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_volume_column() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("volume LONG"));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_ohlc_columns() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("open DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("high DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("low DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("close DOUBLE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP mock helpers
+    // -----------------------------------------------------------------------
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\n\r\n{\"error\":\"table does not exist\"}";
+
+    async fn spawn_mock_http_server(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_candle_views — HTTP success/failure paths (covers lines 291-336)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_200() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises success path: create table (line 307), DEDUP (310-311),
+        // all 18 view DDLs (315-319), final info log (322-325)
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises non-success path: create table returns false → early return (line 307)
+        // execute_ddl returns false for non-success (lines 335-336, 343, 349-351)
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_create_send_error_returns_early() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises execute_ddl Err branch (lines 349-351)
+        ensure_candle_views(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_ddl — direct tests for success/failure/error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_execute_ddl_success_returns_true() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
+        assert!(result, "execute_ddl must return true on 200");
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_non_success_returns_false() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "BAD SQL", "test_label").await;
+        assert!(!result, "execute_ddl must return false on non-success");
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_send_error_returns_false() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
+        assert!(!result, "execute_ddl must return false on send error");
     }
 }

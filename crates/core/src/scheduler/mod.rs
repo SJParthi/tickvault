@@ -450,4 +450,206 @@ mod tests {
             SchedulePhase::PostMarket
         );
     }
+
+    // -----------------------------------------------------------------------
+    // SchedulePhase Display via .to_string()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_phase_display_to_string() {
+        assert_eq!(SchedulePhase::PreConnect.to_string(), "PreConnect");
+        assert_eq!(SchedulePhase::PreMarketWarm.to_string(), "PreMarketWarm");
+        assert_eq!(SchedulePhase::MarketOpen.to_string(), "MarketOpen");
+        assert_eq!(SchedulePhase::PostMarket.to_string(), "PostMarket");
+        assert_eq!(SchedulePhase::NonTradingDay.to_string(), "NonTradingDay");
+    }
+
+    // -----------------------------------------------------------------------
+    // SchedulePhase Debug output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_phase_debug_all_variants() {
+        assert_eq!(format!("{:?}", SchedulePhase::PreConnect), "PreConnect");
+        assert_eq!(
+            format!("{:?}", SchedulePhase::PreMarketWarm),
+            "PreMarketWarm"
+        );
+        assert_eq!(format!("{:?}", SchedulePhase::MarketOpen), "MarketOpen");
+        assert_eq!(format!("{:?}", SchedulePhase::PostMarket), "PostMarket");
+        assert_eq!(
+            format!("{:?}", SchedulePhase::NonTradingDay),
+            "NonTradingDay"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SchedulePhase Copy + Clone + Eq
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_phase_copy_clone_eq() {
+        let phase = SchedulePhase::MarketOpen;
+        let copied = phase; // Copy
+        let cloned = phase.clone(); // Clone
+        assert_eq!(phase, copied);
+        assert_eq!(phase, cloned);
+        assert_ne!(SchedulePhase::MarketOpen, SchedulePhase::PostMarket);
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageGate default() values are identical to new()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_gate_default_identical_to_new() {
+        let from_new = StorageGate::new();
+        let from_default = StorageGate::default();
+        assert_eq!(from_new.is_open(), from_default.is_open());
+        assert!(!from_default.is_open());
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageGate: open then close then open again
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_gate_toggle_multiple_times() {
+        let gate = StorageGate::default();
+        assert!(!gate.is_open());
+        gate.open();
+        assert!(gate.is_open());
+        gate.close();
+        assert!(!gate.is_open());
+        gate.open();
+        assert!(gate.is_open());
+        gate.open(); // idempotent
+        assert!(gate.is_open());
+        gate.close();
+        gate.close(); // idempotent
+        assert!(!gate.is_open());
+    }
+
+    // -----------------------------------------------------------------------
+    // duration_until: midnight to just after midnight
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_duration_until_midnight_to_one_second() {
+        let d = duration_until(t(0, 0, 0), t(0, 0, 1));
+        assert_eq!(d.as_secs(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // SchedulePhase Display inside format string with context
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_phase_display_in_format_context() {
+        let phase = SchedulePhase::PreMarketWarm;
+        let msg = format!("Current phase: {phase}");
+        assert_eq!(msg, "Current phase: PreMarketWarm");
+    }
+
+    // -----------------------------------------------------------------------
+    // SchedulePhase Display via std::fmt::Write
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_phase_display_via_write() {
+        use std::fmt::Write;
+        let variants = [
+            (SchedulePhase::PreConnect, "PreConnect"),
+            (SchedulePhase::PreMarketWarm, "PreMarketWarm"),
+            (SchedulePhase::MarketOpen, "MarketOpen"),
+            (SchedulePhase::PostMarket, "PostMarket"),
+            (SchedulePhase::NonTradingDay, "NonTradingDay"),
+        ];
+        for (phase, expected) in variants {
+            let mut buf = String::new();
+            write!(buf, "{phase}").unwrap();
+            assert_eq!(buf, expected);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageGate Debug impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_gate_debug_format() {
+        let gate = StorageGate::new();
+        let debug = format!("{gate:?}");
+        assert!(debug.contains("StorageGate"));
+    }
+
+    #[test]
+    fn test_storage_gate_debug_after_open() {
+        let gate = StorageGate::default();
+        gate.open();
+        let debug = format!("{gate:?}");
+        assert!(debug.contains("StorageGate"));
+        assert!(debug.contains("true"));
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageGate: default and new produce identical initial behavior
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_gate_default_then_open_close_cycle() {
+        let gate = StorageGate::default();
+        assert!(!gate.is_open());
+        gate.open();
+        assert!(gate.is_open());
+        gate.close();
+        assert!(!gate.is_open());
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_phase: custom schedule times
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_phase_custom_schedule_narrow_window() {
+        // Custom schedule: WS at 09:00, data at 09:15, end at 09:30
+        let ws = t(9, 0, 0);
+        let ds = t(9, 15, 0);
+        let de = t(9, 30, 0);
+
+        assert_eq!(
+            determine_phase(t(8, 59, 59), true, ws, ds, de),
+            SchedulePhase::PreConnect
+        );
+        assert_eq!(
+            determine_phase(t(9, 0, 0), true, ws, ds, de),
+            SchedulePhase::PreMarketWarm
+        );
+        assert_eq!(
+            determine_phase(t(9, 14, 59), true, ws, ds, de),
+            SchedulePhase::PreMarketWarm
+        );
+        assert_eq!(
+            determine_phase(t(9, 15, 0), true, ws, ds, de),
+            SchedulePhase::MarketOpen
+        );
+        assert_eq!(
+            determine_phase(t(9, 29, 59), true, ws, ds, de),
+            SchedulePhase::MarketOpen
+        );
+        assert_eq!(
+            determine_phase(t(9, 30, 0), true, ws, ds, de),
+            SchedulePhase::PostMarket
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // duration_until: large gap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_duration_until_large_gap_hours() {
+        let d = duration_until(t(1, 0, 0), t(23, 0, 0));
+        assert_eq!(d.as_secs(), 22 * 3600);
+    }
 }

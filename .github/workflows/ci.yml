@@ -259,13 +259,10 @@ jobs:
         with:
           tool: cargo-audit
 
-      - name: Audit (yanked crates check)
+      - name: Audit (yanked crates check — HARD FAIL)
         run: |
-          cargo audit --deny yanked 2>&1 | tee /tmp/audit-yanked.txt || true
-          if grep -qi 'yanked\|warning' /tmp/audit-yanked.txt; then
-            echo "::warning::Yanked crate(s) detected — update Cargo.lock"
-            cat /tmp/audit-yanked.txt
-          fi
+          set -o pipefail
+          cargo audit --deny yanked 2>&1 | tee /tmp/audit-yanked.txt
 
       - name: Audit advisories (warn only — CVEs already checked by cargo deny)
         run: |
@@ -389,7 +386,7 @@ jobs:
                       crate_lines[c]['count'] += s.get('count', 0)
                       crate_lines[c]['covered'] += s.get('covered', 0)
           print('## Coverage Report')
-          print(f'**Workspace: {ws_pct:.1f}%** (threshold: 60.0%)')
+          print(f'**Workspace: {ws_pct:.1f}%** (threshold: 95.0%)')
           print('')
           print('| Crate | Coverage | Threshold | Status |')
           print('|-------|----------|-----------|--------|')

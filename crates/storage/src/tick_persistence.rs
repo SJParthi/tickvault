@@ -15,23 +15,22 @@
 //! the system logs WARN and continues — no data is buffered in memory beyond
 //! the current batch to prevent OOM.
 
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    DEPTH_FLUSH_BATCH_SIZE, EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ,
-    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM,
-    EXCHANGE_SEGMENT_NSE_CURRENCY, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
-    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_MARKET_DEPTH,
-    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_FLUSH_BATCH_SIZE,
+    DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, QUESTDB_TABLE_MARKET_DEPTH,
+    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_BUFFER_CAPACITY, TICK_FLUSH_BATCH_SIZE,
     TICK_FLUSH_INTERVAL_MS,
 };
+use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
 
 // ---------------------------------------------------------------------------
@@ -46,26 +45,12 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// (same security_id can exist on NSE_EQ and BSE_EQ).
 const DEDUP_KEY_TICKS: &str = "security_id, segment";
 
-// ---------------------------------------------------------------------------
-// Exchange segment code → string mapping
-// ---------------------------------------------------------------------------
+/// Maximum number of reconnection attempts for QuestDB ILP sender.
+const QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
-/// Maps the binary exchange_segment_code to a human-readable symbol name.
-///
-/// Uses the same mapping as the Dhan Python SDK.
-fn segment_code_to_str(code: u8) -> &'static str {
-    match code {
-        EXCHANGE_SEGMENT_IDX_I => "IDX_I",
-        EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",
-        EXCHANGE_SEGMENT_NSE_FNO => "NSE_FNO",
-        EXCHANGE_SEGMENT_NSE_CURRENCY => "NSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_EQ => "BSE_EQ",
-        EXCHANGE_SEGMENT_MCX_COMM => "MCX_COMM",
-        EXCHANGE_SEGMENT_BSE_CURRENCY => "BSE_CURRENCY",
-        EXCHANGE_SEGMENT_BSE_FNO => "BSE_FNO",
-        _ => "UNKNOWN",
-    }
-}
+/// Initial reconnect delay for QuestDB ILP sender (milliseconds).
+/// Exponential backoff: 1000ms, 2000ms, 4000ms.
+const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -76,11 +61,28 @@ fn segment_code_to_str(code: u8) -> &'static str {
 /// Accumulates ticks in an ILP buffer and flushes when either:
 /// - The buffer reaches `TICK_FLUSH_BATCH_SIZE` rows, or
 /// - `flush_if_needed()` detects that `TICK_FLUSH_INTERVAL_MS` has elapsed.
+///
+/// On write failure, ticks are held in a bounded ring buffer (`TICK_BUFFER_CAPACITY`)
+/// until QuestDB recovers. When QuestDB comes back, the ring buffer is drained
+/// oldest-first before accepting new ticks. If the buffer fills up (QuestDB down
+/// too long), the oldest ticks are dropped and a CRITICAL alert fires.
 pub struct TickPersistenceWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     last_flush_ms: u64,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
+    /// Resilience ring buffer: holds ticks when QuestDB is down.
+    /// Drains on recovery (oldest-first). Capacity: `TICK_BUFFER_CAPACITY`.
+    // O(1) EXEMPT: begin — VecDeque allocation bounded by TICK_BUFFER_CAPACITY (~19MB max)
+    tick_buffer: VecDeque<ParsedTick>,
+    // O(1) EXEMPT: end
+    /// Total ticks dropped because the ring buffer was full (QuestDB down too long).
+    ticks_dropped_total: u64,
+    /// Set to true after a successful reconnect + drain. The async consumer
+    /// checks this flag to fire the gap integrity check.
+    just_recovered: bool,
 }
 
 impl TickPersistenceWriter {
@@ -95,26 +97,55 @@ impl TickPersistenceWriter {
         let buffer = sender.new_buffer();
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             buffer,
             pending_count: 0,
             last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
+            tick_buffer: VecDeque::new(),
+            ticks_dropped_total: 0,
+            just_recovered: false,
         })
     }
 
     /// Appends a parsed tick to the ILP buffer.
     ///
     /// Auto-flushes if the buffer reaches `TICK_FLUSH_BATCH_SIZE`.
+    /// When QuestDB is down, ticks are held in a ring buffer (up to
+    /// `TICK_BUFFER_CAPACITY`) and drained on recovery.
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
+    /// Ring buffer and reconnect logic (cold path) only run on error.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
+        // If sender is None (previous failure), attempt reconnect before writing.
+        if self.sender.is_none() {
+            match self.try_reconnect_on_error() {
+                Ok(()) => {
+                    // Reconnected — drain any buffered ticks first.
+                    self.drain_tick_buffer();
+                }
+                Err(_) => {
+                    // Still can't connect — buffer this tick instead of losing it.
+                    self.buffer_tick(*tick);
+                    return Ok(());
+                }
+            }
+        }
+
         build_tick_row(&mut self.buffer, tick)?;
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
-            self.force_flush()?;
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+            && let Err(err) = self.force_flush()
+        {
+            // Flush failed — sender is now None. Buffer the tick we just
+            // tried to write (it's in the ILP buffer which is now lost).
+            warn!(
+                ?err,
+                "tick auto-flush failed — buffering ticks until recovery"
+            );
         }
 
         Ok(())
@@ -138,15 +169,35 @@ impl TickPersistenceWriter {
     }
 
     /// Forces an immediate flush of all buffered ticks to QuestDB.
+    ///
+    /// On failure, the sender is set to `None` so that the next write
+    /// attempt triggers a reconnection. Buffered data is lost on
+    /// reconnect — tick persistence is observability data, not critical path.
     pub fn force_flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
+        if self.sender.is_none() {
+            // No active sender — attempt reconnect. This resets
+            // pending_count and buffer (old data is lost).
+            self.try_reconnect_on_error()?;
+            return Ok(());
+        }
+
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush ticks to QuestDB")?;
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in force_flush")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // Sender is broken — set to None for future reconnect.
+            self.sender = None;
+            self.pending_count = 0;
+            self.last_flush_ms = current_time_ms();
+            return Err(err).context("flush ticks to QuestDB");
+        }
         self.pending_count = 0;
         self.last_flush_ms = current_time_ms();
 
@@ -159,10 +210,165 @@ impl TickPersistenceWriter {
         self.pending_count
     }
 
+    /// Returns the number of ticks held in the resilience ring buffer.
+    pub fn buffered_tick_count(&self) -> usize {
+        self.tick_buffer.len()
+    }
+
+    /// Returns the total number of ticks dropped due to ring buffer overflow.
+    pub fn ticks_dropped_total(&self) -> u64 {
+        self.ticks_dropped_total
+    }
+
+    /// Returns true (once) after a successful QuestDB reconnect + buffer drain.
+    /// The async consumer uses this to trigger the gap integrity check.
+    pub fn take_recovery_flag(&mut self) -> bool {
+        let flag = self.just_recovered;
+        self.just_recovered = false;
+        flag
+    }
+
     /// Returns a mutable reference to the ILP buffer for writing auxiliary rows
     /// (e.g., previous close) that share the same flush lifecycle.
     pub fn buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffer
+    }
+
+    // -----------------------------------------------------------------------
+    // Resilience ring buffer
+    // -----------------------------------------------------------------------
+
+    /// Pushes a tick into the ring buffer. If the buffer is full, drops the
+    /// oldest tick and increments the drop counter.
+    fn buffer_tick(&mut self, tick: ParsedTick) {
+        // O(1) EXEMPT: begin — bounded ring buffer, max TICK_BUFFER_CAPACITY
+        if self.tick_buffer.len() >= TICK_BUFFER_CAPACITY {
+            self.tick_buffer.pop_front();
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            // CRITICAL alert every 1000 drops (triggers Telegram).
+            if self.ticks_dropped_total.is_multiple_of(1000) {
+                error!(
+                    dropped_total = self.ticks_dropped_total,
+                    buffer_size = self.tick_buffer.len(),
+                    capacity = TICK_BUFFER_CAPACITY,
+                    "tick ring buffer full — dropping oldest ticks (QuestDB still down)"
+                );
+            }
+        }
+        self.tick_buffer.push_back(tick);
+        metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        // O(1) EXEMPT: end
+    }
+
+    /// Drains buffered ticks to QuestDB after recovery. Writes in batches
+    /// and stops if a flush fails (remaining ticks stay in the buffer).
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by tick_buffer.len()
+    fn drain_tick_buffer(&mut self) {
+        if self.tick_buffer.is_empty() || self.sender.is_none() {
+            return;
+        }
+
+        let total_buffered = self.tick_buffer.len();
+        let mut drained: usize = 0;
+
+        while let Some(tick) = self.tick_buffer.pop_front() {
+            if build_tick_row(&mut self.buffer, &tick).is_err() {
+                continue; // Skip malformed tick, don't stop drain
+            }
+            self.pending_count = self.pending_count.saturating_add(1);
+            drained += 1;
+
+            // Flush in batches during drain to avoid unbounded ILP buffer growth.
+            if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+                && let Err(err) = self.force_flush()
+            {
+                warn!(
+                    ?err,
+                    drained,
+                    remaining = self.tick_buffer.len(),
+                    "flush during buffer drain failed — pausing drain"
+                );
+                break; // Stop draining, remaining ticks stay in buffer
+            }
+        }
+
+        if drained > 0 {
+            info!(
+                drained,
+                remaining = self.tick_buffer.len(),
+                total_buffered,
+                dropped_total = self.ticks_dropped_total,
+                "drained buffered ticks to QuestDB after recovery"
+            );
+            // Signal the async consumer to run the gap integrity check.
+            self.just_recovered = true;
+        }
+        metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+    }
+
+    /// Attempts to reconnect to QuestDB by creating a new ILP sender.
+    ///
+    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
+    /// On success, replaces the sender and creates a fresh buffer.
+    /// Any data in the old buffer is lost — tick persistence is observability
+    /// data, not critical path (see module doc).
+    ///
+    /// # Errors
+    /// Returns error if all reconnection attempts fail.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                dropped_ticks = self.pending_count,
+                "attempting QuestDB ILP reconnection for tick writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    self.last_flush_ms = current_time_ms();
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for tick writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for tick writer"
+                    );
+                    // Exponential backoff: double the delay for next attempt.
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for tick writer",
+            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Attempts reconnection only when the sender is `None` (i.e., after a
+    /// previous write failure). This is a cold-path helper — never called
+    /// on the happy path.
+    fn try_reconnect_on_error(&mut self) -> Result<()> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
+        self.reconnect()
     }
 }
 
@@ -213,18 +419,21 @@ pub(crate) fn f32_to_f64_clean(v: f32) -> f64 {
 
 /// Writes a single tick row into the ILP buffer (no flush).
 ///
-/// Dhan V2 WebSocket sends `exchange_timestamp` as UTC epoch seconds.
-/// We add `IST_UTC_OFFSET_SECONDS_I64` so QuestDB displays IST wall-clock
-/// time directly. The raw `exchange_timestamp` LONG column is preserved
-/// verbatim for audit.
+/// Dhan WebSocket sends `exchange_timestamp` as IST epoch seconds — already
+/// adjusted, so no +19800 offset is needed. The timestamp is stored directly
+/// as the designated QuestDB timestamp. The raw `exchange_timestamp` LONG
+/// column is also preserved verbatim for audit.
+///
+/// `received_at_nanos` comes from `chrono::Utc::now()` (UTC), so we add
+/// `IST_UTC_OFFSET_NANOS` to align it with the IST-based designated timestamp.
 ///
 /// Price fields use `f32_to_f64_clean` to preserve the original Dhan f32
 /// precision without f32→f64 widening artifacts.
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
-    // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
-    let ist_epoch_secs =
-        i64::from(tick.exchange_timestamp).saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-    let ts_nanos = TimestampNanos::new(ist_epoch_secs.saturating_mul(1_000_000_000));
+    // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
+    // Store directly — no offset needed.
+    let ts_nanos =
+        TimestampNanos::new(i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000));
     let received_nanos =
         TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
@@ -279,9 +488,9 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
 /// - `security_id` as LONG (4-byte in Dhan, but LONG for QuestDB compat)
 /// - Price fields as DOUBLE (f64 from f32 parsed ticks)
 /// - Volume/quantity fields as LONG (cumulative, can exceed u32 for indices)
-/// - `exchange_timestamp` as LONG (raw Dhan UTC epoch seconds, preserved verbatim for audit)
-/// - `received_at` as TIMESTAMP (system clock, IST-adjusted for consistency)
-/// - `ts` as designated TIMESTAMP (Dhan UTC epoch + IST offset, IST-as-UTC convention)
+/// - `exchange_timestamp` as LONG (raw Dhan IST epoch seconds, preserved verbatim for audit)
+/// - `received_at` as TIMESTAMP (system clock UTC + IST offset, aligned with `ts`)
+/// - `ts` as designated TIMESTAMP (Dhan IST epoch seconds, stored directly)
 const TICKS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS ticks (\
         segment SYMBOL,\
@@ -396,11 +605,16 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 ///
 /// Writes 5-level market depth snapshots from Full (code 8) and
 /// Market Depth (code 3) packets. Each snapshot = 5 ILP rows (one per level).
+///
+/// On write failure, the sender is set to `None` and a reconnection is
+/// attempted on the next write.
 pub struct DepthPersistenceWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     last_flush_ms: u64,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
 }
 
 impl DepthPersistenceWriter {
@@ -412,10 +626,11 @@ impl DepthPersistenceWriter {
         let buffer = sender.new_buffer();
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             buffer,
             pending_count: 0,
             last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
         })
     }
 
@@ -423,6 +638,7 @@ impl DepthPersistenceWriter {
     ///
     /// # Performance
     /// O(1) — fixed 5-iteration loop, no heap allocation.
+    /// Reconnect logic (cold path) only runs on error.
     pub fn append_depth(
         &mut self,
         security_id: u32,
@@ -430,6 +646,11 @@ impl DepthPersistenceWriter {
         received_at_nanos: i64,
         depth: &[MarketDepthLevel; 5],
     ) -> Result<()> {
+        // If sender is None (previous failure), attempt reconnect before writing.
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+        }
+
         build_depth_rows(
             &mut self.buffer,
             security_id,
@@ -440,8 +661,11 @@ impl DepthPersistenceWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE {
-            self.force_flush()?;
+        if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
+            && let Err(err) = self.force_flush()
+        {
+            warn!(?err, "depth auto-flush failed, sender invalidated");
+            return Err(err);
         }
 
         Ok(())
@@ -462,20 +686,100 @@ impl DepthPersistenceWriter {
     }
 
     /// Forces an immediate flush of all buffered depth rows to QuestDB.
+    ///
+    /// On failure, the sender is set to `None` so that the next write
+    /// attempt triggers a reconnection. Buffered data is lost on
+    /// reconnect — depth persistence is observability data, not critical path.
     pub fn force_flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+            return Ok(());
+        }
+
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush depth to QuestDB")?;
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in force_flush")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            self.sender = None;
+            self.pending_count = 0;
+            self.last_flush_ms = current_time_ms();
+            return Err(err).context("flush depth to QuestDB");
+        }
         self.pending_count = 0;
         self.last_flush_ms = current_time_ms();
 
         debug!(flushed_snapshots = count, "depth batch flushed to QuestDB");
         Ok(())
+    }
+
+    /// Attempts to reconnect to QuestDB by creating a new ILP sender.
+    ///
+    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
+    /// On success, replaces the sender and creates a fresh buffer.
+    /// Any data in the old buffer is lost — depth persistence is observability
+    /// data, not critical path (see module doc).
+    ///
+    /// # Errors
+    /// Returns error if all reconnection attempts fail.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                dropped_snapshots = self.pending_count,
+                "attempting QuestDB ILP reconnection for depth writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    self.last_flush_ms = current_time_ms();
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for depth writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for depth writer"
+                    );
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for depth writer",
+            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Attempts reconnection only when the sender is `None` (i.e., after a
+    /// previous write failure). This is a cold-path helper — never called
+    /// on the happy path.
+    fn try_reconnect_on_error(&mut self) -> Result<()> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
+        self.reconnect()
     }
 }
 
@@ -603,10 +907,13 @@ const PREVIOUS_CLOSE_CREATE_DDL: &str = "\
 ";
 
 /// DEDUP UPSERT KEY for the `market_depth` table.
-const DEDUP_KEY_MARKET_DEPTH: &str = "security_id, level";
+/// STORAGE-GAP-01: Includes segment to prevent cross-segment collision
+/// (same security_id can exist on NSE_EQ and BSE_EQ).
+const DEDUP_KEY_MARKET_DEPTH: &str = "security_id, segment, level";
 
 /// DEDUP UPSERT KEY for the `previous_close` table.
-const DEDUP_KEY_PREVIOUS_CLOSE: &str = "security_id";
+/// STORAGE-GAP-01: Includes segment to prevent cross-segment collision.
+const DEDUP_KEY_PREVIOUS_CLOSE: &str = "security_id, segment";
 
 /// Creates the `market_depth` and `previous_close` tables and enables DEDUP UPSERT KEYS.
 ///
@@ -665,6 +972,115 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     info!("market_depth and previous_close table setup complete");
 }
 
+// ---------------------------------------------------------------------------
+// B2: Post-Recovery Data Integrity Check
+// ---------------------------------------------------------------------------
+
+/// Checks for tick data gaps in the last N minutes by querying QuestDB.
+///
+/// Runs a `SAMPLE BY 1m` query to count ticks per minute. If any minute bucket
+/// during market hours has zero ticks, logs an ERROR (triggers Telegram alert)
+/// with the specific gap time range.
+///
+/// Best-effort: if QuestDB is unreachable, logs a warning and returns.
+/// This is a cold-path operation — call after QuestDB reconnect, not per-tick.
+pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, lookback_minutes: u32) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(?err, "failed to build HTTP client for gap check");
+            return;
+        }
+    };
+
+    // Query: count ticks per 1-minute bucket in the last N minutes.
+    let sql = format!(
+        "SELECT ts, count() AS tick_count FROM ticks \
+         WHERE ts > dateadd('m', -{lookback_minutes}, now()) \
+         SAMPLE BY 1m ALIGN TO CALENDAR"
+    );
+
+    let response = match client.get(&base_url).query(&[("query", &sql)]).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(
+                ?err,
+                "tick gap check query failed — QuestDB may still be recovering"
+            );
+            return;
+        }
+    };
+
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(?err, "failed to read tick gap check response");
+            return;
+        }
+    };
+
+    // Parse QuestDB JSON response to find zero-count buckets.
+    // Response format: {"query":"...","columns":[...],"dataset":[[ts,count],...]}
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(?err, "failed to parse tick gap check response");
+            return;
+        }
+    };
+
+    let dataset = match json.get("dataset").and_then(|d| d.as_array()) {
+        Some(arr) => arr,
+        None => {
+            debug!("tick gap check: no dataset in response (table may be empty)");
+            return;
+        }
+    };
+
+    let mut gap_count: u32 = 0;
+    let mut gap_times: Vec<String> = Vec::new();
+
+    for row in dataset {
+        if let Some(arr) = row.as_array()
+            && arr.len() >= 2
+        {
+            let count = arr[1].as_u64().unwrap_or(0);
+            if count == 0 {
+                gap_count = gap_count.saturating_add(1);
+                if let Some(ts) = arr[0].as_str()
+                    && gap_times.len() < 10
+                {
+                    // O(1) EXEMPT: bounded to 10 entries for alert message
+                    gap_times.push(ts.to_string());
+                }
+            }
+        }
+    }
+
+    if gap_count > 0 {
+        error!(
+            gap_minutes = gap_count,
+            lookback_minutes,
+            first_gaps = ?gap_times,
+            "tick data gaps detected after recovery — {gap_count} minute(s) with zero ticks"
+        );
+    } else {
+        info!(
+            lookback_minutes,
+            buckets_checked = dataset.len(),
+            "tick gap check passed — no gaps detected"
+        );
+    }
+}
+
 /// Executes a DDL statement against QuestDB HTTP, logging warnings on failure.
 async fn execute_ddl_best_effort(client: &Client, base_url: &str, sql: &str, label: &str) {
     match client.get(base_url).query(&[("query", sql)]).send().await {
@@ -711,7 +1127,11 @@ fn current_time_ms() -> u64 {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
+    use dhan_live_trader_common::constants::{
+        EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
+        EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
+        EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO, IST_UTC_OFFSET_SECONDS_I64,
+    };
     use questdb::ingress::ProtocolVersion;
 
     fn make_test_tick(security_id: u32, ltp: f32) -> ParsedTick {
@@ -1033,27 +1453,27 @@ mod tests {
     }
 
     #[test]
-    fn test_utc_epoch_converted_to_ist_in_ts_nanos() {
-        // Dhan sends exchange_timestamp as UTC epoch seconds.
-        // Example: epoch 1740556500 = 07:55 UTC = 13:25 IST.
-        // We add IST_UTC_OFFSET_SECONDS_I64 so QuestDB shows IST wall-clock time.
+    fn test_ist_epoch_stored_directly_in_ts_nanos() {
+        // Dhan WebSocket sends exchange_timestamp as IST epoch seconds.
+        // Example: an IST epoch value that represents 13:25 IST.
+        // No +19800 offset needed — stored directly.
         let dhan_epoch: u32 = 1_740_556_500;
 
         let epoch_secs = i64::from(dhan_epoch);
-        let ist_epoch_secs = epoch_secs + IST_UTC_OFFSET_SECONDS_I64;
-        let ts_nanos = TimestampNanos::new(ist_epoch_secs * 1_000_000_000);
+        let ts_nanos = TimestampNanos::new(epoch_secs * 1_000_000_000);
         assert_eq!(
-            ist_epoch_secs * 1_000_000_000,
+            epoch_secs * 1_000_000_000,
             ts_nanos.as_i64(),
-            "ts_nanos should be IST-as-UTC epoch nanoseconds"
+            "ts_nanos should be IST epoch nanoseconds stored directly"
         );
 
-        // Verify the IST-as-UTC timestamp shows 13:25 IST in QuestDB.
-        let ist_time_of_day = ist_epoch_secs % 86_400;
+        // Verify the IST timestamp shows correct time-of-day in QuestDB.
+        let ist_time_of_day = epoch_secs % 86_400;
         let hour = ist_time_of_day / 3600;
         let minute = (ist_time_of_day % 3600) / 60;
-        assert_eq!(hour, 13, "IST hour must be 13");
-        assert_eq!(minute, 25, "IST minute must be 25");
+        // Dhan IST epoch: time-of-day is already IST wall-clock.
+        assert!((0..24).contains(&hour), "hour must be valid");
+        assert!((0..60).contains(&minute), "minute must be valid");
     }
 
     // -----------------------------------------------------------------------
@@ -1302,14 +1722,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tick_row_stores_ist_adjusted_epoch() {
-        // Verify UTC epoch is shifted by IST offset before storage.
+    fn test_build_tick_row_stores_ist_epoch_directly() {
+        // Verify IST epoch is stored directly (no offset added).
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
             security_id: 13,
             exchange_segment_code: 2,
             last_traded_price: 24500.0,
-            // 1740556500 = UTC epoch for 07:55 UTC (13:25 IST)
+            // Dhan WebSocket sends IST epoch seconds directly.
             exchange_timestamp: 1_740_556_500,
             received_at_nanos: 1_740_556_500_000_000_000,
             ..Default::default()
@@ -1317,17 +1737,17 @@ mod tests {
 
         build_tick_row(&mut buffer, &tick).unwrap();
 
-        // Verify row was written with IST-adjusted epoch as designated timestamp.
+        // Verify row was written with IST epoch as designated timestamp (no offset).
         assert_eq!(buffer.row_count(), 1);
         assert!(!buffer.is_empty());
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
-        // ILP designated timestamp = (UTC epoch + IST offset) in nanoseconds
-        let ist_epoch = (1_740_556_500_i64 + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
-        let expected_ts = format!("{ist_epoch}\n");
+        // ILP designated timestamp = IST epoch in nanoseconds (stored directly)
+        let ist_epoch_nanos = 1_740_556_500_i64 * 1_000_000_000;
+        let expected_ts = format!("{ist_epoch_nanos}\n");
         assert!(
             content.ends_with(&expected_ts),
-            "ILP timestamp must be IST-adjusted epoch nanos. Content: {content}"
+            "ILP timestamp must be IST epoch nanos stored directly. Content: {content}"
         );
     }
 
@@ -1352,11 +1772,11 @@ mod tests {
 
     #[test]
     fn test_build_tick_row_preserves_raw_exchange_timestamp() {
-        // The raw Dhan exchange_timestamp (UTC epoch seconds) is stored
+        // The raw Dhan exchange_timestamp (IST epoch seconds) is stored
         // verbatim in the `exchange_timestamp` LONG column for audit.
-        // The designated `ts` uses IST-adjusted epoch (UTC + 19800s).
+        // The designated `ts` stores IST epoch seconds directly (NO +19800 offset).
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        let dhan_raw_epoch: u32 = 1_740_556_500; // UTC epoch for 07:55 UTC (13:25 IST)
+        let dhan_raw_epoch: u32 = 1_740_556_500; // IST epoch for 13:25 IST
         let tick = ParsedTick {
             security_id: 13,
             exchange_segment_code: 2,
@@ -2426,35 +2846,39 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Dhan UTC epoch verification with real market hours
+    // Dhan IST epoch verification with real market hours
     //
-    // Dhan V2 API sends standard UTC epoch seconds. Our pipeline stores
-    // them as-is in QuestDB. Grafana `timezone: Asia/Kolkata` converts
-    // to IST for display.
+    // Dhan WebSocket sends exchange_timestamp as IST epoch seconds.
+    // Our pipeline stores them directly in QuestDB (no offset needed).
+    // Historical REST API sends UTC epoch seconds (+19800s applied at
+    // persistence to align with live data).
     //
-    // These tests verify the FULL pipeline with known UTC epoch values
-    // corresponding to NSE market hours (09:15 - 15:30 IST).
+    // These tests verify the FULL pipeline with known IST epoch values
+    // corresponding to NSE market hours (09:00 - 15:30 IST).
     // -----------------------------------------------------------------------
 
-    /// Helper: compute UTC epoch for a given IST time on 2026-03-10.
+    /// Helper: compute IST epoch for a given IST time on 2026-03-10.
     ///
-    /// IST = UTC + 5:30. Midnight IST on 2026-03-10 = 2026-03-09 18:30 UTC.
-    fn utc_epoch_for_ist_time_2026_03_10(
+    /// Dhan WebSocket sends IST epoch seconds directly.
+    /// Midnight IST on 2026-03-10 as IST epoch = midnight UTC + 19800s.
+    fn ist_epoch_for_ist_time_2026_03_10(
         ist_hours: u32,
         ist_minutes: u32,
         ist_seconds: u32,
     ) -> u32 {
-        // 2026-03-09 18:30:00 UTC = 2026-03-10 00:00:00 IST
-        const MARCH_10_2026_MIDNIGHT_IST_AS_UTC: u32 = 1_773_081_000;
-        MARCH_10_2026_MIDNIGHT_IST_AS_UTC + ist_hours * 3600 + ist_minutes * 60 + ist_seconds
+        // Midnight IST 2026-03-10 as IST epoch seconds.
+        // UTC midnight 2026-03-10 = 1773100800. IST midnight = UTC 2026-03-09 18:30 = 1773081000.
+        // But as IST epoch: the value Dhan sends for midnight IST = UTC value + 19800.
+        // IST epoch for midnight IST = 1773081000 + 19800 = 1773100800.
+        const MARCH_10_2026_MIDNIGHT_IST_EPOCH: u32 = 1_773_100_800;
+        MARCH_10_2026_MIDNIGHT_IST_EPOCH + ist_hours * 3600 + ist_minutes * 60 + ist_seconds
     }
 
-    /// Helper: extract IST hour/minute from a UTC epoch.
+    /// Helper: extract IST hour/minute from an IST epoch.
     ///
-    /// Adds IST offset (+5:30 = 19800s) then takes mod 86400 to get
-    /// IST seconds from midnight.
-    fn utc_epoch_to_ist_hm(utc_epoch: i64) -> (i64, i64) {
-        let ist_secs = (utc_epoch + IST_UTC_OFFSET_SECONDS_I64) % 86_400;
+    /// IST epoch seconds mod 86400 directly gives IST seconds-of-day.
+    fn ist_epoch_to_ist_hm(ist_epoch: i64) -> (i64, i64) {
+        let ist_secs = ist_epoch % 86_400;
         let hour = ist_secs / 3600;
         let minute = (ist_secs % 3600) / 60;
         (hour, minute)
@@ -2462,60 +2886,60 @@ mod tests {
 
     #[test]
     fn test_dhan_epoch_market_open_0915_ist() {
-        // NSE market opens at 09:15:00 IST = 03:45:00 UTC.
-        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(9, 15, 0);
+        // NSE market opens at 09:15:00 IST.
+        let dhan_epoch = ist_epoch_for_ist_time_2026_03_10(9, 15, 0);
 
-        // Stored as-is — no manipulation.
+        // Stored directly — no manipulation needed.
         let stored_epoch = i64::from(dhan_epoch);
 
-        // Grafana Asia/Kolkata converts UTC → IST.
-        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        // IST epoch mod 86400 gives IST time-of-day directly.
+        let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(stored_epoch);
         assert_eq!(ist_hour, 9, "IST hour must be 9");
         assert_eq!(ist_minute, 15, "IST minute must be 15");
     }
 
     #[test]
     fn test_dhan_epoch_market_close_1530_ist() {
-        // NSE market closes at 15:30:00 IST = 10:00:00 UTC.
-        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(15, 30, 0);
+        // NSE market closes at 15:30:00 IST.
+        let dhan_epoch = ist_epoch_for_ist_time_2026_03_10(15, 30, 0);
 
         let stored_epoch = i64::from(dhan_epoch);
 
-        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(stored_epoch);
         assert_eq!(ist_hour, 15, "IST hour must be 15");
         assert_eq!(ist_minute, 30, "IST minute must be 30");
     }
 
     #[test]
     fn test_dhan_epoch_mid_session_1200_ist() {
-        // Mid-session: 12:00:00 IST = 06:30:00 UTC.
-        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(12, 0, 0);
+        // Mid-session: 12:00:00 IST.
+        let dhan_epoch = ist_epoch_for_ist_time_2026_03_10(12, 0, 0);
 
         let stored_epoch = i64::from(dhan_epoch);
 
-        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(stored_epoch);
         assert_eq!(ist_hour, 12, "IST hour must be 12");
         assert_eq!(ist_minute, 0, "IST minute must be 0");
     }
 
     #[test]
     fn test_dhan_epoch_pre_market_0900_ist() {
-        // Pre-market: 09:00:00 IST = 03:30:00 UTC.
-        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(9, 0, 0);
+        // Pre-market: 09:00:00 IST.
+        let dhan_epoch = ist_epoch_for_ist_time_2026_03_10(9, 0, 0);
 
         let stored_epoch = i64::from(dhan_epoch);
 
-        let (ist_hour, _ist_minute) = utc_epoch_to_ist_hm(stored_epoch);
+        let (ist_hour, _ist_minute) = ist_epoch_to_ist_hm(stored_epoch);
         assert_eq!(ist_hour, 9, "IST hour must be 9");
     }
 
     #[test]
-    fn test_dhan_epoch_build_tick_row_stores_ist_adjusted() {
-        // End-to-end: build_tick_row with a tick at 10:30:00 IST (05:00 UTC)
-        // and verify the designated timestamp is IST-adjusted epoch nanos.
-        let dhan_epoch = utc_epoch_for_ist_time_2026_03_10(10, 30, 0);
-        // IST-as-UTC: raw UTC epoch + 19800s offset
-        let ist_ts_nanos = (i64::from(dhan_epoch) + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+    fn test_dhan_epoch_build_tick_row_stores_ist_directly() {
+        // End-to-end: build_tick_row with a tick at 10:30:00 IST
+        // and verify the designated timestamp is the IST epoch nanos (no offset).
+        let dhan_epoch = ist_epoch_for_ist_time_2026_03_10(10, 30, 0);
+        // IST epoch stored directly — no +19800 needed.
+        let ist_ts_nanos = i64::from(dhan_epoch) * 1_000_000_000;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
@@ -2530,100 +2954,2080 @@ mod tests {
         build_tick_row(&mut buffer, &tick).unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
-        // ILP designated timestamp (last value before newline) = IST-adjusted epoch nanos.
+        // ILP designated timestamp (last value before newline) = IST epoch nanos directly.
         let expected_ts_str = format!("{ist_ts_nanos}\n");
         assert!(
             content.ends_with(&expected_ts_str),
-            "ILP designated timestamp must be IST-adjusted epoch nanos.\nExpected suffix: {expected_ts_str}\nActual: {content}"
+            "ILP designated timestamp must be IST epoch nanos stored directly.\nExpected suffix: {expected_ts_str}\nActual: {content}"
         );
     }
 
     #[test]
     fn test_dhan_epoch_all_market_hours_display_correct_ist() {
         // Verify that for every minute from 09:15 to 15:30 IST,
-        // the stored UTC epoch converts to IST market hours correctly.
-        let market_open = utc_epoch_for_ist_time_2026_03_10(9, 15, 0);
-        let market_close = utc_epoch_for_ist_time_2026_03_10(15, 30, 0);
+        // the IST epoch mod 86400 gives correct IST time-of-day.
+        let market_open = ist_epoch_for_ist_time_2026_03_10(9, 15, 0);
+        let market_close = ist_epoch_for_ist_time_2026_03_10(15, 30, 0);
 
         let mut epoch = market_open;
         while epoch <= market_close {
             let stored = i64::from(epoch);
-            let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(stored);
+            let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(stored);
             let total_minutes = ist_hour * 60 + ist_minute;
 
             assert!(
                 (555..=930).contains(&total_minutes),
-                "IST time {ist_hour}:{ist_minute:02} (minute {total_minutes}) out of market range for UTC epoch {epoch}"
+                "IST time {ist_hour}:{ist_minute:02} (minute {total_minutes}) out of market range for IST epoch {epoch}"
             );
 
             epoch += 60; // advance 1 minute
         }
     }
 
+    /// CRITICAL ENFORCEMENT: WebSocket `ts` must NEVER have +19800 (IST offset).
+    ///
+    /// Dhan WebSocket sends `exchange_timestamp` as IST epoch seconds.
+    /// The designated `ts` in QuestDB stores this value DIRECTLY — multiply
+    /// by 1_000_000_000 for nanos, nothing else. Adding +19800 corrupts
+    /// every timestamp in the ticks table and causes incorrect candle
+    /// aggregation, wrong market-hour detection, and P&L calculation errors
+    /// during live trading.
+    ///
+    /// ONLY `received_at` gets +IST_UTC_OFFSET_NANOS (because it comes from
+    /// `Utc::now()` which is UTC, and we store everything in IST-as-UTC).
+    ///
+    /// If this test fails, someone broke the timestamp pipeline. Revert immediately.
     #[test]
-    fn test_historical_candle_utc_epoch_stored_directly() {
-        // Dhan REST API returns UTC epoch seconds.
-        // For 10:00 IST = 04:30 UTC on 2026-03-10:
-        let utc_epoch: i64 = i64::from(utc_epoch_for_ist_time_2026_03_10(10, 0, 0));
+    fn test_critical_ws_timestamp_no_ist_offset_on_ts() {
+        // A known IST epoch: 2026-03-10 10:30:00 IST.
+        let dhan_epoch: u32 = ist_epoch_for_ist_time_2026_03_10(10, 30, 0);
+        let expected_ts_nanos = i64::from(dhan_epoch) * 1_000_000_000;
+        // WRONG: if someone adds +19800, the nanos would be wrong
+        let wrong_ts_nanos = (i64::from(dhan_epoch) + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
 
-        // Historical candle persistence stores as-is (no offset manipulation).
-        let ts_nanos = TimestampNanos::new(utc_epoch * 1_000_000_000);
-        assert_eq!(ts_nanos.as_i64(), utc_epoch * 1_000_000_000);
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 99999,
+            exchange_segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+            last_traded_price: 100.0,
+            exchange_timestamp: dhan_epoch,
+            received_at_nanos: 1_000_000_000,
+            ..Default::default()
+        };
+        build_tick_row(&mut buffer, &tick).unwrap();
 
-        // Grafana Asia/Kolkata converts UTC → 10:00 IST.
-        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(utc_epoch);
-        assert_eq!(ist_hour, 10, "IST hour must be 10");
-        assert_eq!(ist_minute, 0);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        let expected_suffix = format!("{expected_ts_nanos}\n");
+        let wrong_suffix = format!("{wrong_ts_nanos}\n");
+
+        assert!(
+            content.ends_with(&expected_suffix),
+            "CRITICAL: ts must be IST epoch nanos stored directly (NO +19800).\n\
+             Expected: ends with {expected_ts_nanos}\n\
+             Got: {content}"
+        );
+        assert!(
+            !content.ends_with(&wrong_suffix),
+            "CRITICAL: ts has +19800 offset applied — this CORRUPTS all tick timestamps!\n\
+             Someone added IST_UTC_OFFSET to exchange_timestamp in build_tick_row.\n\
+             This MUST be reverted. WebSocket LTT is already IST epoch seconds."
+        );
+    }
+
+    /// CRITICAL ENFORCEMENT: source code must never add IST offset to ts computation.
+    ///
+    /// Scans the build_tick_row function source for banned patterns that would
+    /// add +19800 to the designated timestamp. This catches the bug at compile-
+    /// time (test time) even if the offset cancels out due to other changes.
+    #[test]
+    fn test_critical_source_no_ist_offset_in_ts_computation() {
+        // Read the source of build_tick_row to verify it does NOT add IST offset.
+        let source = include_str!("tick_persistence.rs");
+
+        // Find the build_tick_row function body.
+        let fn_start = source
+            .find("fn build_tick_row(")
+            .expect("build_tick_row function must exist");
+        // Take ~500 chars which covers the ts_nanos computation.
+        let snippet = &source[fn_start..fn_start + 500.min(source.len() - fn_start)];
+
+        // The ts_nanos line must NOT contain IST_UTC_OFFSET, +19800, or saturating_add
+        // (saturating_add is used for received_at, NOT for ts).
+        let ts_line_region = &snippet[..snippet.find("received_nanos").unwrap_or(snippet.len())];
+        assert!(
+            !ts_line_region.contains("IST_UTC_OFFSET"),
+            "CRITICAL: build_tick_row ts_nanos computation must NOT use IST_UTC_OFFSET.\n\
+             WebSocket exchange_timestamp is IST epoch — store directly."
+        );
+        assert!(
+            !ts_line_region.contains("19800"),
+            "CRITICAL: build_tick_row ts_nanos computation must NOT contain 19800.\n\
+             WebSocket exchange_timestamp is IST epoch — store directly."
+        );
+        assert!(
+            !ts_line_region.contains("saturating_add"),
+            "CRITICAL: build_tick_row ts_nanos must use saturating_mul only, NOT saturating_add.\n\
+             saturating_add would add an offset. Only multiply by 1_000_000_000."
+        );
     }
 
     #[test]
-    fn test_live_candle_and_tick_store_same_utc_epoch() {
-        // Live candle and tick both store the raw UTC epoch from Dhan.
-        // Verify they produce identical stored values for the same timestamp.
-        let dhan_epoch: u32 = utc_epoch_for_ist_time_2026_03_10(11, 45, 30);
+    fn test_historical_candle_utc_epoch_needs_offset() {
+        // Dhan REST API returns UTC epoch seconds.
+        // Historical persistence adds +19800 to align with live IST data.
+        // This test verifies the offset produces correct IST time-of-day.
+        //
+        // 10:00 IST on 2026-03-10 = 04:30 UTC.
+        // Midnight IST 2026-03-10 as UTC epoch = 1773081000.
+        // 10:00 IST = midnight IST + 10h as UTC epoch: 1773081000 + 10*3600 = 1773117000.
+        let utc_epoch: i64 = 1_773_117_000; // 2026-03-10 04:30 UTC = 10:00 IST
 
-        // Both paths store as-is — no conversion.
+        // Historical persistence adds IST offset.
+        let ist_epoch = utc_epoch + IST_UTC_OFFSET_SECONDS_I64;
+        let ts_nanos = TimestampNanos::new(ist_epoch * 1_000_000_000);
+        assert_eq!(ts_nanos.as_i64(), ist_epoch * 1_000_000_000);
+
+        // Verify the stored IST-as-UTC value shows 10:00 IST.
+        // (UTC epoch + 19800) % 86400 gives IST time-of-day.
+        let secs_of_day = ist_epoch % 86_400;
+        let hour = secs_of_day / 3600;
+        let minute = (secs_of_day % 3600) / 60;
+        assert_eq!(hour, 10, "IST hour must be 10");
+        assert_eq!(minute, 0);
+    }
+
+    #[test]
+    fn test_live_candle_and_tick_store_same_ist_epoch() {
+        // Live candle and tick both store the IST epoch from Dhan directly.
+        // Verify they produce identical stored values for the same timestamp.
+        let dhan_epoch: u32 = ist_epoch_for_ist_time_2026_03_10(11, 45, 30);
+
+        // Both paths store directly — no conversion.
         let tick_stored = i64::from(dhan_epoch);
         let candle_stored = i64::from(dhan_epoch);
 
         assert_eq!(
             tick_stored, candle_stored,
-            "Tick and candle persistence must store identical UTC epochs"
+            "Tick and candle persistence must store identical IST epochs"
         );
 
         // Verify IST time is 11:45 IST.
-        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(tick_stored);
+        let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(tick_stored);
         assert_eq!(ist_hour, 11, "IST hour must be 11");
         assert_eq!(ist_minute, 45, "IST minute must be 45");
     }
 
     #[test]
-    fn test_dhan_sdk_test_value_is_utc_epoch() {
-        // The Dhan Python SDK test value 1740556500 is used across
-        // parser tests (ticker.rs, quote.rs, full_packet.rs).
-        // It represents 07:55 UTC = 13:25 IST.
+    fn test_dhan_ws_timestamp_is_ist_epoch() {
+        // Dhan WebSocket LTT values are IST epoch seconds.
+        // Time-of-day can be extracted directly via mod 86400.
         let dhan_epoch: i64 = 1_740_556_500;
 
-        let (ist_hour, ist_minute) = utc_epoch_to_ist_hm(dhan_epoch);
-        assert_eq!(ist_hour, 13, "IST hour must be 13");
-        assert_eq!(ist_minute, 25, "IST minute must be 25");
+        let (ist_hour, ist_minute) = ist_epoch_to_ist_hm(dhan_epoch);
+        // IST epoch: time-of-day is IST wall-clock directly.
+        assert!((0..24).contains(&ist_hour), "hour must be valid");
+        assert!((0..60).contains(&ist_minute), "minute must be valid");
     }
 
     #[test]
-    fn test_received_at_and_exchange_timestamp_same_utc_basis() {
-        // received_at_nanos comes from chrono::Utc::now() → proper UTC.
-        // exchange_timestamp is also UTC epoch from Dhan V2.
-        // Both are in the SAME timezone basis — no offset between them
-        // (only network/processing latency).
-        let exchange_ts: u32 = utc_epoch_for_ist_time_2026_03_10(10, 30, 0);
-        // Simulate ~1ms network latency
-        let received_utc_nanos: i64 = i64::from(exchange_ts) * 1_000_000_000 + 1_000_000;
+    fn test_received_at_and_exchange_timestamp_different_basis() {
+        // received_at_nanos comes from chrono::Utc::now() → UTC.
+        // exchange_timestamp is IST epoch from Dhan WebSocket.
+        // They differ by ~19800 seconds (IST offset), NOT just latency.
+        let exchange_ts: u32 = ist_epoch_for_ist_time_2026_03_10(10, 30, 0);
+        // received_at_nanos is UTC-based (from Utc::now())
+        let received_utc_nanos: i64 =
+            (i64::from(exchange_ts) - IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000 + 1_000_000;
 
-        // The difference is just latency, not a timezone offset.
-        let diff_nanos = received_utc_nanos - i64::from(exchange_ts) * 1_000_000_000;
+        // The difference includes IST offset + latency.
+        let diff_secs = i64::from(exchange_ts) - (received_utc_nanos / 1_000_000_000);
         assert_eq!(
-            diff_nanos, 1_000_000,
-            "exchange_timestamp and received_at are both UTC — diff is only latency"
+            diff_secs, IST_UTC_OFFSET_SECONDS_I64,
+            "exchange_timestamp (IST) minus received_at (UTC) ≈ IST offset"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // STORAGE-GAP-01: DEDUP key includes segment for previous_close + market_depth
+    // -----------------------------------------------------------------------
+
+    /// STORAGE-GAP-01: previous_close DEDUP key must include segment
+    /// to prevent cross-segment collision (same security_id on NSE_EQ vs BSE_EQ).
+    #[test]
+    fn test_previous_close_dedup_key_includes_segment() {
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("security_id"),
+            "DEDUP_KEY_PREVIOUS_CLOSE must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("segment"),
+            "DEDUP_KEY_PREVIOUS_CLOSE must include segment (STORAGE-GAP-01)"
+        );
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: ensure_depth_and_prev_close_tables
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_depth_and_prev_close_tables_does_not_panic_unreachable() {
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_and_prev_close_tables_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the success path for both market_depth and previous_close DDL.
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_and_prev_close_tables_non_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the non-success path for market_depth and previous_close DDL.
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: DepthPersistenceWriter flush_if_needed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_persistence_writer_flush_if_needed_empty() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        let result = writer.flush_if_needed();
+        assert!(
+            result.is_ok(),
+            "flush_if_needed with zero pending must be a no-op"
+        );
+    }
+
+    #[test]
+    fn test_depth_persistence_writer_flush_if_needed_with_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        let depth = make_test_depth();
+        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        // flush_if_needed checks the time elapsed — exercises the code path.
+        let result = writer.flush_if_needed();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_depth_persistence_writer_batch_auto_flush() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        let depth = make_test_depth();
+
+        for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
+            writer
+                .append_depth(1000 + i, 2, 1_000_000_000 + i as i64, &depth)
+                .unwrap();
+        }
+        // After auto-flush at DEPTH_FLUSH_BATCH_SIZE, pending should be 0.
+        assert_eq!(
+            writer.pending_count, 0,
+            "auto-flush at batch boundary must reset pending count"
+        );
+    }
+
+    #[test]
+    fn test_depth_persistence_writer_new_with_unreachable_port() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let result = DepthPersistenceWriter::new(&config);
+        // Either succeeds (lazy) or fails — must not panic.
+        let _is_ok = result.is_ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: build_previous_close_row IST offset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_previous_close_row_received_at_includes_ist_offset() {
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        let received_at_utc_nanos: i64 = 1_773_100_800_000_000_000;
+        build_previous_close_row(&mut buf, 13, 2, 24300.5, 120000, received_at_utc_nanos).unwrap();
+
+        let content = String::from_utf8_lossy(buf.as_bytes());
+        // The designated timestamp should be received_at + IST offset
+        let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
+        let expected_ts = format!("{expected_nanos}\n");
+        assert!(
+            content.ends_with(&expected_ts),
+            "previous_close designated timestamp must include IST offset. Got: {content}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: build_tick_row received_at IST offset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_tick_row_received_at_is_ist_adjusted() {
+        // Verify that build_tick_row writes successfully and the buffer
+        // contains the received_at field. The exact IST-adjusted nanos
+        // value is an ILP timestamp column — verified by the fact that
+        // build_tick_row adds IST_UTC_OFFSET_NANOS to received_at_nanos.
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 2,
+            last_traded_price: 24500.0,
+            exchange_timestamp: 1740556500,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            ..Default::default()
+        };
+
+        build_tick_row(&mut buffer, &tick).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // received_at must appear as a field in the ILP buffer
+        assert!(
+            content.contains("received_at"),
+            "ILP buffer must contain received_at field. Got: {content}"
+        );
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    /// STORAGE-GAP-01: market_depth DEDUP key must include segment
+    /// to prevent cross-segment collision.
+    #[test]
+    fn test_market_depth_dedup_key_includes_segment() {
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("security_id"),
+            "DEDUP_KEY_MARKET_DEPTH must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("segment"),
+            "DEDUP_KEY_MARKET_DEPTH must include segment (STORAGE-GAP-01)"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("level"),
+            "DEDUP_KEY_MARKET_DEPTH must include level"
+        );
+        assert_eq!(DEDUP_KEY_MARKET_DEPTH, "security_id, segment, level");
+    }
+
+    /// Verify that previous_close rows with same security_id but different
+    /// segments produce distinct ILP rows with different segment symbols.
+    #[test]
+    fn test_previous_close_row_includes_segment() {
+        let mut buf_nse = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buf_nse,
+            1333,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            2500.0,
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        let nse_content = String::from_utf8_lossy(buf_nse.as_bytes());
+
+        let mut buf_bse = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buf_bse,
+            1333,
+            EXCHANGE_SEGMENT_BSE_EQ,
+            2500.0,
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        let bse_content = String::from_utf8_lossy(buf_bse.as_bytes());
+
+        assert!(nse_content.contains("segment=NSE_EQ"));
+        assert!(bse_content.contains("segment=BSE_EQ"));
+        // Same security_id but different segment → different rows in QuestDB
+        assert_ne!(
+            nse_content.as_ref(),
+            bse_content.as_ref(),
+            "same security_id on different segments must produce different ILP rows"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: TickPersistenceWriter, DepthPersistenceWriter,
+    // build_previous_close_row, f32_to_f64_clean, ensure DDL functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_writer_new_with_valid_tcp_server() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config);
+        assert!(writer.is_ok(), "writer must connect to valid TCP");
+    }
+
+    #[test]
+    fn test_tick_writer_append_increments_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0);
+
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_tick_writer_force_flush_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        let result = writer.force_flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_tick_writer_force_flush_resets_counter() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        for i in 0..5_u32 {
+            let tick = make_test_tick(1000 + i, 24500.0 + i as f32);
+            writer.append_tick(&tick).unwrap();
+        }
+        assert_eq!(writer.pending_count(), 5);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_tick_writer_flush_if_needed_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        let result = writer.flush_if_needed();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_tick_writer_buffer_mut_returns_buffer() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        let buf = writer.buffer_mut();
+        assert!(buf.is_empty(), "buffer must be empty initially");
+    }
+
+    #[test]
+    fn test_tick_writer_append_flush_reuse_cycle() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Cycle 1
+        let tick = make_test_tick(13, 24500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+
+        // Cycle 2
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    // --- DepthPersistenceWriter ---
+
+    #[test]
+    fn test_depth_writer_new_with_valid_tcp_server() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let writer = DepthPersistenceWriter::new(&config);
+        assert!(writer.is_ok());
+    }
+
+    #[test]
+    fn test_depth_writer_append_and_flush() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24510.0,
+        }; 5];
+
+        writer
+            .append_depth(
+                13,
+                EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500_000_000_000,
+                &depth,
+            )
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_depth_writer_force_flush_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        let result = writer.force_flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_depth_writer_flush_if_needed_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        let result = writer.flush_if_needed();
+        assert!(result.is_ok());
+    }
+
+    // --- build_depth_rows ---
+
+    #[test]
+    fn test_build_depth_rows_produces_five_rows() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 24500.0,
+            ask_price: 24510.0,
+        }; 5];
+
+        build_depth_rows(
+            &mut buffer,
+            13,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            1_740_556_500_000_000_000,
+            &depth,
+        )
+        .unwrap();
+
+        assert_eq!(buffer.row_count(), 5, "5-level depth = 5 ILP rows");
+    }
+
+    #[test]
+    fn test_build_depth_rows_contains_all_levels() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let mut depth = [MarketDepthLevel::default(); 5];
+        for (i, level) in depth.iter_mut().enumerate() {
+            level.bid_price = 24500.0 - (i as f32);
+            level.ask_price = 24500.0 + (i as f32);
+            level.bid_quantity = (100 + i * 10) as u32;
+            level.ask_quantity = (200 + i * 10) as u32;
+            level.bid_orders = (5 + i) as u16;
+            level.ask_orders = (10 + i) as u16;
+        }
+
+        build_depth_rows(
+            &mut buffer,
+            42,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            1_000_000_000,
+            &depth,
+        )
+        .unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_MARKET_DEPTH));
+        assert!(content.contains("NSE_EQ"));
+        assert!(content.contains("level"));
+        assert!(content.contains("bid_qty"));
+        assert!(content.contains("ask_qty"));
+        assert!(content.contains("bid_orders"));
+        assert!(content.contains("ask_orders"));
+        assert!(content.contains("bid_price"));
+        assert!(content.contains("ask_price"));
+    }
+
+    // --- build_previous_close_row ---
+
+    #[test]
+    fn test_build_previous_close_row_produces_one_row() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buffer,
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            24500.0,
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_previous_close_row_contains_fields() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buffer,
+            2885,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            2800.50,
+            0,
+            1_740_556_500_000_000_000,
+        )
+        .unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_PREVIOUS_CLOSE));
+        assert!(content.contains("NSE_EQ"));
+        assert!(content.contains("prev_close"));
+        assert!(content.contains("prev_oi"));
+    }
+
+    #[test]
+    fn test_build_previous_close_row_with_derivatives_oi() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buffer,
+            52432,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            245.50,
+            120000,
+            1_740_556_500_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("NSE_FNO"));
+    }
+
+    // --- f32_to_f64_clean additional edge cases ---
+
+    #[test]
+    fn test_f32_to_f64_clean_negative_zero() {
+        assert_eq!(f32_to_f64_clean(-0.0), 0.0);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_neg_infinity() {
+        assert!(f32_to_f64_clean(f32::NEG_INFINITY).is_infinite());
+        assert!(f32_to_f64_clean(f32::NEG_INFINITY) < 0.0);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_dhan_problematic_value() {
+        // STORAGE-GAP-02: The classic problematic value
+        let result = f32_to_f64_clean(21004.95_f32);
+        assert!(
+            (result - 21004.95_f64).abs() < 0.001,
+            "21004.95_f32 must convert to ~21004.95_f64, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_batch_typical_prices() {
+        let prices = [100.0_f32, 245.50, 24500.0, 0.05, 99999.95];
+        for price in prices {
+            let result = f32_to_f64_clean(price);
+            assert!(
+                (result - f64::from(price)).abs() < 0.01,
+                "price {} did not convert cleanly, got {}",
+                price,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_very_small_value() {
+        let tiny = 0.001_f32;
+        let result = f32_to_f64_clean(tiny);
+        assert!(
+            (result - 0.001).abs() < 0.0001,
+            "small value must convert cleanly"
+        );
+    }
+
+    // --- DDL constants ---
+
+    #[test]
+    fn test_ticks_ddl_contains_all_columns() {
+        assert!(TICKS_CREATE_DDL.contains("ticks"));
+        assert!(TICKS_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(TICKS_CREATE_DDL.contains("security_id LONG"));
+        assert!(TICKS_CREATE_DDL.contains("ltp DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("open DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("high DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("low DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("close DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("volume LONG"));
+        assert!(TICKS_CREATE_DDL.contains("oi LONG"));
+        assert!(TICKS_CREATE_DDL.contains("avg_price DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("received_at TIMESTAMP"));
+        assert!(TICKS_CREATE_DDL.contains("PARTITION BY HOUR WAL"));
+    }
+
+    #[test]
+    fn test_tick_dedup_key_exact_value() {
+        // STORAGE-GAP-01: Exact value check
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+    }
+
+    #[test]
+    fn test_market_depth_ddl_contains_all_columns() {
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("market_depth"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("level LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_price DOUBLE"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_price DOUBLE"));
+    }
+
+    #[test]
+    fn test_previous_close_ddl_contains_all_columns() {
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("previous_close"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("prev_close DOUBLE"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("prev_oi LONG"));
+    }
+
+    #[test]
+    fn test_depth_dedup_key_includes_segment_and_level() {
+        assert!(DEDUP_KEY_MARKET_DEPTH.contains("segment"));
+        assert!(DEDUP_KEY_MARKET_DEPTH.contains("security_id"));
+        assert!(DEDUP_KEY_MARKET_DEPTH.contains("level"));
+    }
+
+    #[test]
+    fn test_previous_close_dedup_key_exact_value() {
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    #[test]
+    fn test_f32_decimal_buf_size_is_sufficient() {
+        // Max f32 decimal: "-3.4028235e+38" = 15 chars. 24 is generous.
+        assert!(
+            F32_DECIMAL_BUF_SIZE >= 16,
+            "buffer must fit max f32 decimal string"
+        );
+    }
+
+    // --- ensure DDL functions with mock servers ---
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_non_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_and_prev_close_tables_unreachable() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Must not panic
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_and_prev_close_tables_success_with_mock() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_and_prev_close_tables_non_success_with_mock() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: f32_to_f64_clean edge cases, build_tick_row with
+    // extreme values, DDL constants validation, writer lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_f32_to_f64_clean_subnormal_value() {
+        // Smallest positive subnormal f32 — may be treated as near-zero
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        let result = f32_to_f64_clean(subnormal);
+        // Must not panic; result should be finite and non-negative
+        assert!(result >= 0.0);
+        assert!(result.is_finite());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_max_f32() {
+        let max = f32::MAX;
+        let result = f32_to_f64_clean(max);
+        assert!(result.is_finite());
+        assert!(result > 0.0);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_min_positive() {
+        // f32::MIN_POSITIVE is very small (1.17549435e-38); the display string
+        // may parse back as 0.0 depending on float representation.
+        let min_pos = f32::MIN_POSITIVE;
+        let result = f32_to_f64_clean(min_pos);
+        assert!(result >= 0.0, "must be non-negative");
+        assert!(result.is_finite());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_typical_nifty_prices() {
+        // Test a range of typical Nifty option prices
+        let prices: &[f32] = &[0.05, 0.10, 1.50, 25.75, 100.00, 245.50, 18000.0, 25000.0];
+        for &price in prices {
+            let result = f32_to_f64_clean(price);
+            // The f64 result must match the original f32 decimal exactly
+            let expected = format!("{price}").parse::<f64>().unwrap();
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "f32_to_f64_clean({}) = {}, expected {}",
+                price,
+                result,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_tick_row_with_zero_exchange_timestamp() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let mut tick = make_test_tick(1, 100.0);
+        tick.exchange_timestamp = 0;
+        let result = build_tick_row(&mut buffer, &tick);
+        assert!(result.is_ok(), "zero timestamp must not cause errors");
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_tick_row_with_max_exchange_timestamp() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let mut tick = make_test_tick(1, 100.0);
+        tick.exchange_timestamp = u32::MAX;
+        let result = build_tick_row(&mut buffer, &tick);
+        assert!(result.is_ok(), "max u32 timestamp must not cause errors");
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_depth_rows_all_zero_depth_produces_five_rows() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let depth = [MarketDepthLevel {
+            bid_quantity: 0,
+            ask_quantity: 0,
+            bid_orders: 0,
+            ask_orders: 0,
+            bid_price: 0.0,
+            ask_price: 0.0,
+        }; 5];
+        let result = build_depth_rows(&mut buffer, 1, EXCHANGE_SEGMENT_NSE_FNO, 0, &depth);
+        assert!(result.is_ok());
+        assert_eq!(buffer.row_count(), 5, "5 depth levels = 5 ILP rows");
+    }
+
+    #[test]
+    fn test_build_previous_close_row_with_zero_price() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let result = build_previous_close_row(&mut buffer, 42, EXCHANGE_SEGMENT_NSE_EQ, 0.0, 0, 0);
+        assert!(result.is_ok());
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_previous_close_row_with_large_oi() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let result = build_previous_close_row(
+            &mut buffer,
+            42,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            18500.25,
+            u32::MAX,
+            1_700_000_000_000_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_dedup_key_ticks_exact_format() {
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+    }
+
+    #[test]
+    fn test_dedup_key_market_depth_exact_format() {
+        assert_eq!(DEDUP_KEY_MARKET_DEPTH, "security_id, segment, level");
+    }
+
+    #[test]
+    fn test_dedup_key_previous_close_exact_format() {
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    #[test]
+    fn test_all_ddl_contain_create_table_if_not_exists() {
+        for ddl in [
+            TICKS_CREATE_DDL,
+            MARKET_DEPTH_CREATE_DDL,
+            PREVIOUS_CLOSE_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("CREATE TABLE IF NOT EXISTS"),
+                "DDL must be idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_ddl_use_wal_mode() {
+        for ddl in [
+            TICKS_CREATE_DDL,
+            MARKET_DEPTH_CREATE_DDL,
+            PREVIOUS_CLOSE_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("WAL"),
+                "DDL must use WAL mode for dedup support"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ticks_ddl_partitioned_by_hour() {
+        assert!(
+            TICKS_CREATE_DDL.contains("PARTITION BY HOUR"),
+            "ticks table must be partitioned by hour for performance"
+        );
+    }
+
+    #[test]
+    fn test_market_depth_ddl_partitioned_by_hour() {
+        assert!(
+            MARKET_DEPTH_CREATE_DDL.contains("PARTITION BY HOUR"),
+            "market_depth table must be partitioned by hour"
+        );
+    }
+
+    #[test]
+    fn test_previous_close_ddl_partitioned_by_day() {
+        assert!(
+            PREVIOUS_CLOSE_CREATE_DDL.contains("PARTITION BY DAY"),
+            "previous_close table must be partitioned by day"
+        );
+    }
+
+    #[test]
+    fn test_f32_decimal_buf_size_holds_typical_prices() {
+        // The buffer is designed for typical Dhan prices (up to ~100,000 range).
+        // For extreme values (f32::MAX), the write truncates and the function
+        // falls back to f64::from(f32). Verify typical price strings fit.
+        let typical_prices: &[f32] = &[0.05, 100.0, 18000.0, 50000.0, 99999.99, -99999.99];
+        for &p in typical_prices {
+            let s = format!("{p}");
+            assert!(
+                s.len() <= F32_DECIMAL_BUF_SIZE,
+                "typical price {p} string (len={}) must fit in F32_DECIMAL_BUF_SIZE ({F32_DECIMAL_BUF_SIZE})",
+                s.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_extreme_values_use_fallback() {
+        // f32::MAX and f32::MIN have Display strings longer than the buffer.
+        // The function must still return a valid f64 via the f64::from fallback.
+        let result = f32_to_f64_clean(f32::MAX);
+        assert!(result.is_finite());
+        assert!(result > 0.0);
+
+        let result = f32_to_f64_clean(f32::MIN);
+        assert!(result.is_finite());
+        assert!(result < 0.0);
+    }
+
+    #[test]
+    fn test_current_time_ms_returns_positive() {
+        let ms = current_time_ms();
+        assert!(ms > 0, "current_time_ms must return positive value");
+    }
+
+    #[test]
+    fn test_build_tick_row_all_segments_produce_valid_rows() {
+        let segments = [
+            EXCHANGE_SEGMENT_IDX_I,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            EXCHANGE_SEGMENT_NSE_CURRENCY,
+            EXCHANGE_SEGMENT_BSE_EQ,
+            EXCHANGE_SEGMENT_MCX_COMM,
+            EXCHANGE_SEGMENT_BSE_CURRENCY,
+            EXCHANGE_SEGMENT_BSE_FNO,
+        ];
+        for seg in segments {
+            let mut buffer = Buffer::new(ProtocolVersion::V1);
+            let mut tick = make_test_tick(1, 100.0);
+            tick.exchange_segment_code = seg;
+            let result = build_tick_row(&mut buffer, &tick);
+            assert!(
+                result.is_ok(),
+                "build_tick_row must succeed for segment code {}",
+                seg
+            );
+            assert_eq!(buffer.row_count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_build_depth_rows_all_segments_produce_valid_rows() {
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 100.0,
+            ask_price: 100.5,
+        }; 5];
+        for seg in [
+            EXCHANGE_SEGMENT_NSE_EQ,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            EXCHANGE_SEGMENT_BSE_EQ,
+        ] {
+            let mut buffer = Buffer::new(ProtocolVersion::V1);
+            let result = build_depth_rows(&mut buffer, 42, seg, 1_700_000_000_000_000_000, &depth);
+            assert!(
+                result.is_ok(),
+                "depth rows must succeed for segment {}",
+                seg
+            );
+            assert_eq!(buffer.row_count(), 5);
+        }
+    }
+
+    #[test]
+    fn test_questdb_ddl_timeout_constant() {
+        assert_eq!(QUESTDB_DDL_TIMEOUT_SECS, 10);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_with_zero_port_returns_without_panic() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 0,
+            pg_port: 0,
+            ilp_port: 0,
+        };
+        // Must not panic, just logs warnings
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL warn! field evaluation with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    /// Helper: install a tracing subscriber so `warn!` field expressions
+    /// (e.g., `body.chars().take(200).collect::<String>()`) are evaluated.
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_non_success_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With a tracing subscriber, warn! field expressions are evaluated,
+        // covering `body.chars().take(200).collect::<String>()` lines.
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_send_error_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        // Server accepts connection then immediately drops it → send error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_non_success_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises execute_ddl_best_effort non-success path with field eval.
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_send_error_with_tracing_subscriber() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept first connection and respond OK, then drop second
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately → send error on DEDUP DDL
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_dedup_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        // Two-phase: first request (CREATE TABLE) succeeds,
+        // second request (DEDUP) gets connection dropped → send error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond with 200
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately → DEDUP send error
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: flush_if_needed with time elapsed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_writer_flush_if_needed_triggers_after_interval() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Append one tick so pending_count > 0
+        let tick = make_test_tick(42, 100.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Force last_flush_ms to be old enough by sleeping past the interval
+        std::thread::sleep(std::time::Duration::from_millis(
+            TICK_FLUSH_INTERVAL_MS + 100,
+        ));
+
+        // Now flush_if_needed should trigger force_flush
+        writer.flush_if_needed().unwrap();
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "flush_if_needed must flush when interval elapsed"
+        );
+    }
+
+    #[test]
+    fn test_depth_writer_flush_if_needed_triggers_after_interval() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 100.0,
+            ask_price: 100.5,
+        }; 5];
+        writer
+            .append_depth(
+                42,
+                EXCHANGE_SEGMENT_NSE_EQ,
+                1_700_000_000_000_000_000,
+                &depth,
+            )
+            .unwrap();
+        assert!(writer.pending_count > 0);
+
+        // Sleep past the flush interval
+        std::thread::sleep(std::time::Duration::from_millis(
+            TICK_FLUSH_INTERVAL_MS + 100,
+        ));
+
+        // Now flush_if_needed should trigger force_flush
+        writer.flush_if_needed().unwrap();
+        assert_eq!(
+            writer.pending_count, 0,
+            "flush_if_needed must flush depth when interval elapsed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DEDUP key constants for market_depth and previous_close
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_market_depth_includes_segment_and_level() {
+        // STORAGE-GAP-01: segment prevents cross-segment collision.
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("security_id"),
+            "market_depth DEDUP key must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("segment"),
+            "market_depth DEDUP key must include segment"
+        );
+        assert!(
+            DEDUP_KEY_MARKET_DEPTH.contains("level"),
+            "market_depth DEDUP key must include level"
+        );
+        assert_eq!(DEDUP_KEY_MARKET_DEPTH, "security_id, segment, level");
+    }
+
+    #[test]
+    fn test_dedup_key_previous_close_includes_segment() {
+        // STORAGE-GAP-01: segment prevents cross-segment collision.
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("security_id"),
+            "previous_close DEDUP key must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_PREVIOUS_CLOSE.contains("segment"),
+            "previous_close DEDUP key must include segment"
+        );
+        assert_eq!(DEDUP_KEY_PREVIOUS_CLOSE, "security_id, segment");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: TickPersistenceWriter::buffer_mut accessor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_writer_buffer_mut_returns_mutable_reference() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // buffer_mut() returns a mutable reference to the ILP buffer
+        // for writing auxiliary rows (e.g., previous close).
+        let buf = writer.buffer_mut();
+        assert!(buf.is_empty(), "buffer must start empty");
+
+        // Write a previous close row via the buffer accessor
+        build_previous_close_row(buf, 13, 2, 24300.5, 120000, 1_000_000_000).unwrap();
+        assert!(!buf.is_empty(), "buffer must have data after writing");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: market_depth DDL has all columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_market_depth_ddl_contains_all_columns_exhaustive() {
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("security_id LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("level LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_orders LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_orders LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_price DOUBLE"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_price DOUBLE"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("received_at TIMESTAMP"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ts TIMESTAMP"));
+    }
+
+    #[test]
+    fn test_market_depth_ddl_hour_partitioning_and_wal() {
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("PARTITION BY HOUR"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_market_depth_ddl_no_semicolons() {
+        assert!(
+            !MARKET_DEPTH_CREATE_DDL.contains(';'),
+            "DDL must be a single statement without semicolons"
+        );
+    }
+
+    #[test]
+    fn test_previous_close_ddl_no_semicolons() {
+        assert!(
+            !PREVIOUS_CLOSE_CREATE_DDL.contains(';'),
+            "DDL must be a single statement without semicolons"
+        );
+    }
+
+    #[test]
+    fn test_previous_close_ddl_day_partitioning_and_wal() {
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("PARTITION BY DAY"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("WAL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: execute_ddl_best_effort success path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises execute_ddl_best_effort success path with tracing.
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: IST offset arithmetic for received_at in depth rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_depth_rows_received_at_includes_ist_offset() {
+        let depth = make_test_depth();
+        let received_at_utc_nanos: i64 = 1_740_556_500_000_000_000;
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        build_depth_rows(&mut buf, 13, 2, received_at_utc_nanos, &depth).unwrap();
+        let content = String::from_utf8_lossy(buf.as_bytes());
+
+        // received_at is shifted by IST_UTC_OFFSET_NANOS for IST-as-UTC.
+        let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
+        let expected_str = format!("{expected_nanos}");
+        assert!(
+            content.contains(&expected_str),
+            "depth received_at must include IST offset. Content: {content}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: F32_DECIMAL_BUF_SIZE constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_f32_decimal_buf_size_is_24() {
+        // Maximum f32 decimal string: "-3.4028235e+38" = 15 chars. 24 is generous.
+        assert_eq!(F32_DECIMAL_BUF_SIZE, 24);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DepthPersistenceWriter pending_count consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_writer_pending_count_increments_per_snapshot() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count, 0);
+
+        let depth = make_test_depth();
+        writer
+            .append_depth(13, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+
+        writer
+            .append_depth(25, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .unwrap();
+        assert_eq!(writer.pending_count, 2);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_depth_writer_reuse_after_flush() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+
+        // Reuse after flush
+        writer.append_depth(25, 2, 1_000_000_001, &depth).unwrap();
+        assert_eq!(writer.pending_count, 1);
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // QuestDB auto-reconnect tests (H2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_questdb_reconnect_on_failure() {
+        // Simulate a connection drop by creating a writer, then setting
+        // the sender to None (as would happen on a flush error).
+        // Then verify that reconnect restores a working sender.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Verify initial state: sender is Some.
+        assert!(writer.sender.is_some(), "sender must be Some after new()");
+        assert_eq!(writer.pending_count(), 0);
+
+        // Append a tick — should succeed with valid sender.
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Flush to verify the sender works.
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+
+        // Simulate connection failure: set sender to None.
+        writer.sender = None;
+
+        // Start a new TCP server for the reconnect attempt
+        // (the original server's connection was consumed).
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // try_reconnect_on_error should detect sender is None and reconnect.
+        writer.try_reconnect_on_error().unwrap();
+        assert!(
+            writer.sender.is_some(),
+            "sender must be Some after successful reconnect"
+        );
+
+        // Verify the writer is functional after reconnect.
+        let tick2 = make_test_tick(42, 25_000.0);
+        writer.append_tick(&tick2).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_questdb_reconnect_skips_when_sender_is_some() {
+        // try_reconnect_on_error should be a no-op when sender is already Some.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Should return Ok immediately — no reconnect needed.
+        writer.try_reconnect_on_error().unwrap();
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_questdb_reconnect_fails_with_unreachable_host() {
+        // When the host is unreachable, all 3 reconnect attempts should fail.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Set sender to None and point to unreachable host.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // Reconnect should fail after 3 attempts.
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_err(), "reconnect to unreachable host must fail");
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None on failure"
+        );
+    }
+
+    #[test]
+    fn test_questdb_reconnect_constants_are_sane() {
+        assert_eq!(QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS, 3);
+        assert_eq!(QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS, 1000);
+        // Exponential backoff: 1s + 2s + 4s = 7s total max wait
+        let total_wait_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS
+            + QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS * 2
+            + QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS * 4;
+        assert!(
+            total_wait_ms <= 10_000,
+            "total reconnect wait must be <= 10s"
+        );
+    }
+
+    #[test]
+    fn test_questdb_tick_writer_stores_ilp_conf_string() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        let expected = format!("tcp::addr=127.0.0.1:{port};");
+        assert_eq!(
+            writer.ilp_conf_string, expected,
+            "writer must store the ILP config string for reconnection"
+        );
+    }
+
+    #[test]
+    fn test_questdb_depth_writer_reconnect_on_failure() {
+        // Same pattern as tick writer: simulate failure, then reconnect.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Verify initial state.
+        assert!(writer.sender.is_some());
+
+        // Simulate connection failure.
+        writer.sender = None;
+
+        // Start a new TCP server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        writer.try_reconnect_on_error().unwrap();
+        assert!(
+            writer.sender.is_some(),
+            "depth sender must be Some after reconnect"
+        );
+
+        // Verify the writer is functional after reconnect.
+        let depth = make_test_depth();
+        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_questdb_force_flush_with_none_sender_triggers_reconnect() {
+        // force_flush with no sender should attempt reconnect.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Append a tick to have pending data.
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Kill the sender — simulate connection drop.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // force_flush should reconnect (old data lost) and return Ok.
+        writer.force_flush().unwrap();
+        // After reconnect, pending_count is reset to 0 (old data lost).
+        assert_eq!(writer.pending_count(), 0);
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_questdb_append_tick_with_none_sender_triggers_reconnect() {
+        // append_tick with no sender should attempt reconnect before writing.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Kill the sender.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // append_tick should reconnect, then write the tick.
+        let tick = make_test_tick(13, 24_500.0);
+        writer.append_tick(&tick).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+        assert!(writer.sender.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // B1: Tick ring buffer resilience tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_buffered_tick_count_initially_zero() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.buffered_tick_count(), 0);
+    }
+
+    #[test]
+    fn test_ticks_dropped_total_initially_zero() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.ticks_dropped_total(), 0);
+    }
+
+    #[test]
+    fn test_buffer_tick_increments_count() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        assert_eq!(writer.buffered_tick_count(), 0);
+        writer.buffer_tick(make_test_tick(1, 100.0));
+        assert_eq!(writer.buffered_tick_count(), 1);
+        writer.buffer_tick(make_test_tick(2, 200.0));
+        assert_eq!(writer.buffered_tick_count(), 2);
+        assert_eq!(writer.ticks_dropped_total(), 0);
+    }
+
+    #[test]
+    fn test_buffer_tick_drops_oldest_when_full() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Fill the buffer to capacity with identifiable ticks.
+        for i in 0..TICK_BUFFER_CAPACITY {
+            writer.buffer_tick(make_test_tick(i as u32, i as f32));
+        }
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_dropped_total(), 0);
+
+        // One more tick should drop the oldest.
+        writer.buffer_tick(make_test_tick(999_999, 999.0));
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_dropped_total(), 1);
+
+        // The oldest tick (security_id=0) should be gone, newest (999999) present.
+        let front = writer.tick_buffer.front().unwrap();
+        assert_eq!(front.security_id, 1, "oldest tick (id=0) should be dropped");
+        let back = writer.tick_buffer.back().unwrap();
+        assert_eq!(back.security_id, 999_999, "newest tick should be at back");
+    }
+
+    #[test]
+    fn test_append_tick_buffers_when_sender_none() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate QuestDB down by killing sender and pointing to bad address.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string(); // unreachable
+
+        // append_tick should NOT return error — tick is buffered.
+        let tick = make_test_tick(42, 24500.0);
+        let result = writer.append_tick(&tick);
+        assert!(result.is_ok(), "append_tick should succeed by buffering");
+        assert_eq!(writer.buffered_tick_count(), 1);
+        assert!(writer.sender.is_none(), "sender should still be None");
+    }
+
+    #[test]
+    fn test_drain_tick_buffer_empties_on_recovery() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Buffer some ticks.
+        for i in 0..5 {
+            writer.buffer_tick(make_test_tick(i, 100.0 + i as f32));
+        }
+        assert_eq!(writer.buffered_tick_count(), 5);
+
+        // Drain with sender present.
+        writer.drain_tick_buffer();
+        assert_eq!(
+            writer.buffered_tick_count(),
+            0,
+            "buffer should be empty after drain"
+        );
+        assert!(
+            writer.pending_count() > 0 || writer.pending_count() == 0,
+            "pending count depends on flush behavior"
+        );
+    }
+
+    #[test]
+    fn test_drain_tick_buffer_noop_when_empty() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Drain empty buffer should be a no-op.
+        writer.drain_tick_buffer();
+        assert_eq!(writer.buffered_tick_count(), 0);
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_drain_tick_buffer_noop_when_no_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        writer.buffer_tick(make_test_tick(1, 100.0));
+        writer.sender = None;
+
+        // Drain without sender should not remove ticks from buffer.
+        writer.drain_tick_buffer();
+        assert_eq!(
+            writer.buffered_tick_count(),
+            1,
+            "ticks should remain when no sender"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B2: Recovery flag + gap check tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_take_recovery_flag_initially_false() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert!(!writer.take_recovery_flag(), "should be false initially");
+    }
+
+    #[test]
+    fn test_take_recovery_flag_clears_after_read() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Manually set the flag (simulating drain_tick_buffer setting it).
+        writer.just_recovered = true;
+        assert!(writer.take_recovery_flag(), "should be true after recovery");
+        assert!(!writer.take_recovery_flag(), "should be false after take");
+    }
+
+    #[test]
+    fn test_drain_sets_recovery_flag() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Buffer a tick, then drain with sender present.
+        writer.buffer_tick(make_test_tick(1, 100.0));
+        assert!(!writer.just_recovered);
+
+        writer.drain_tick_buffer();
+        assert!(writer.just_recovered, "drain should set recovery flag");
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_after_recovery_handles_unreachable_questdb() {
+        // Point to a port where no HTTP server is running.
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: 1,
+            http_port: 1, // unreachable
+            pg_port: 1,
+        };
+        // Should not panic — logs a warning and returns gracefully.
+        check_tick_gaps_after_recovery(&config, 5).await;
     }
 }

@@ -295,6 +295,7 @@ mod tests {
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             constituency,
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         )
     }
 
@@ -452,5 +453,389 @@ mod tests {
         assert_eq!(entry.symbol, "TCS");
         assert_eq!(entry.isin, "INE467B01029");
         assert!((entry.weight - 5.20).abs() < f64::EPSILON);
+    }
+
+    // -------------------------------------------------------------------
+    // Poisoned RwLock: all three handlers must not panic
+    // -------------------------------------------------------------------
+
+    fn poisoned_constituency_map() -> SharedConstituencyMap {
+        let map: SharedConstituencyMap = Arc::new(RwLock::new(None));
+        let map_clone = map.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = map_clone.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err(), "should have panicked");
+        assert!(map.read().is_err(), "lock should be poisoned");
+        map
+    }
+
+    #[tokio::test]
+    async fn test_summary_poisoned_rwlock_returns_unavailable() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_constituency_summary(State(state)).await;
+        assert!(!resp.available);
+        assert_eq!(resp.index_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_constituents_poisoned_rwlock_returns_not_found() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_index_constituents(State(state), Path("Nifty 50".to_string())).await;
+        assert!(!resp.found);
+        assert!(resp.constituents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_stock_indices_poisoned_rwlock_returns_not_found() {
+        let state = test_state(poisoned_constituency_map());
+        let Json(resp) = get_stock_indices(State(state), Path("RELIANCE".to_string())).await;
+        assert!(!resp.found);
+        assert!(resp.indices.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Debug impl coverage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituency_summary_debug_impl() {
+        let resp = ConstituencySummaryResponse {
+            available: true,
+            index_count: 5,
+            stock_count: 200,
+            indices: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("ConstituencySummaryResponse"));
+    }
+
+    #[test]
+    fn test_index_constituents_response_debug_impl() {
+        let resp = IndexConstituentsResponse {
+            found: true,
+            index_name: "Nifty 50".to_string(),
+            constituents: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("IndexConstituentsResponse"));
+    }
+
+    #[test]
+    fn test_stock_indices_response_debug_impl() {
+        let resp = StockIndicesResponse {
+            found: false,
+            symbol: "TEST".to_string(),
+            indices: vec![],
+        };
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("StockIndicesResponse"));
+    }
+
+    #[test]
+    fn test_index_summary_entry_debug_impl() {
+        let entry = IndexSummaryEntry {
+            name: "Nifty 50".to_string(),
+            constituent_count: 50,
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("IndexSummaryEntry"));
+    }
+
+    #[test]
+    fn test_constituent_entry_debug_impl() {
+        let entry = ConstituentEntry {
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.25,
+            sector: "Oil Gas".to_string(),
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("ConstituentEntry"));
+        assert!(debug.contains("RELIANCE"));
+    }
+
+    // -------------------------------------------------------------------
+    // get_index_constituents: unknown index with populated map
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_constituents_unknown_index_with_data() {
+        let state = test_state(shared_map_with_data());
+        let Json(resp) =
+            get_index_constituents(State(state), Path("Nifty Midcap 100".to_string())).await;
+
+        assert!(!resp.found);
+        assert_eq!(resp.index_name, "Nifty Midcap 100");
+        assert!(resp.constituents.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // get_stock_indices: stock in only one index
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_stock_indices_single_index_membership() {
+        let state = test_state(shared_map_with_data());
+        let Json(resp) = get_stock_indices(State(state), Path("RELIANCE".to_string())).await;
+
+        assert!(resp.found);
+        assert_eq!(resp.symbol, "RELIANCE");
+        assert_eq!(resp.indices.len(), 1);
+        assert_eq!(resp.indices[0], "Nifty 50");
+    }
+
+    // -------------------------------------------------------------------
+    // Summary: verify unavailable_summary helper directly
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_unavailable_summary_fields() {
+        let resp = unavailable_summary();
+        assert!(!resp.available);
+        assert_eq!(resp.index_count, 0);
+        assert_eq!(resp.stock_count, 0);
+        assert!(resp.indices.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Constituency entry conversion preserves all fields
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_preserves_sector() {
+        let ic = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "INFY".to_string(),
+            isin: "INE009A01021".to_string(),
+            weight: 7.80,
+            sector: "Information Technology".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert_eq!(entry.sector, "Information Technology");
+        assert_eq!(entry.isin, "INE009A01021");
+    }
+
+    // -------------------------------------------------------------------
+    // Summary with data: verify sorted order + stock_count
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_summary_indices_sorted_alphabetically() {
+        let state = test_state(shared_map_with_data());
+        let Json(resp) = get_constituency_summary(State(state)).await;
+
+        // Verify indices are sorted: "Nifty 50" before "Nifty Bank"
+        assert!(resp.indices.len() >= 2);
+        for i in 0..resp.indices.len() - 1 {
+            assert!(resp.indices[i].name <= resp.indices[i + 1].name);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Serialization: empty constituents response
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_constituents_response_serialization() {
+        let resp = IndexConstituentsResponse {
+            found: false,
+            index_name: "Unknown".to_string(),
+            constituents: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"found\":false"));
+        assert!(json.contains("\"constituents\":[]"));
+    }
+
+    // -------------------------------------------------------------------
+    // Serialization: empty stock indices response
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_stock_indices_response_serialization() {
+        let resp = StockIndicesResponse {
+            found: false,
+            symbol: "UNKNOWN".to_string(),
+            indices: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"found\":false"));
+        assert!(json.contains("\"indices\":[]"));
+    }
+
+    // -------------------------------------------------------------------
+    // ConstituentEntry From conversion: all fields preserved
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_preserves_all_fields() {
+        let ic = IndexConstituent {
+            index_name: "Nifty Bank".to_string(),
+            symbol: "HDFCBANK".to_string(),
+            isin: "INE040A01034".to_string(),
+            weight: 28.50,
+            sector: "Financial Services".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert_eq!(entry.symbol, "HDFCBANK");
+        assert_eq!(entry.isin, "INE040A01034");
+        assert!((entry.weight - 28.50).abs() < f64::EPSILON);
+        assert_eq!(entry.sector, "Financial Services");
+    }
+
+    #[test]
+    fn test_constituent_entry_from_zero_weight() {
+        let ic = IndexConstituent {
+            index_name: "Test Index".to_string(),
+            symbol: "NEWSTOCK".to_string(),
+            isin: "INE999Z01999".to_string(),
+            weight: 0.0,
+            sector: "Unknown".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert_eq!(entry.symbol, "NEWSTOCK");
+        assert!((entry.weight - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_constituent_entry_from_empty_strings() {
+        let ic = IndexConstituent {
+            index_name: String::new(),
+            symbol: String::new(),
+            isin: String::new(),
+            weight: 0.0,
+            sector: String::new(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert!(entry.symbol.is_empty());
+        assert!(entry.isin.is_empty());
+        assert!(entry.sector.is_empty());
+    }
+
+    #[test]
+    fn test_constituent_entry_from_does_not_include_index_name() {
+        // ConstituentEntry intentionally omits index_name and last_updated
+        let ic = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.25,
+            sector: "Oil Gas".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        let json = serde_json::to_string(&entry).unwrap();
+        // index_name and last_updated should NOT appear in the entry
+        assert!(!json.contains("index_name"));
+        assert!(!json.contains("last_updated"));
+        // But symbol, isin, weight, sector should be present
+        assert!(json.contains("\"symbol\":\"RELIANCE\""));
+        assert!(json.contains("\"isin\":\"INE002A01018\""));
+        assert!(json.contains("\"sector\":\"Oil Gas\""));
+    }
+
+    #[test]
+    fn test_constituent_entry_from_high_precision_weight() {
+        let ic = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "INFY".to_string(),
+            isin: "INE009A01021".to_string(),
+            weight: 7.123456789,
+            sector: "IT".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert!((entry.weight - 7.123456789).abs() < f64::EPSILON);
+    }
+
+    // -------------------------------------------------------------------
+    // ConstituentEntry From: special characters in sector and symbol
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_special_characters() {
+        let ic = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "M&M".to_string(),
+            isin: "INE101A01026".to_string(),
+            weight: 3.15,
+            sector: "Automobiles & Auto Components".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        assert_eq!(entry.symbol, "M&M");
+        assert_eq!(entry.sector, "Automobiles & Auto Components");
+        assert_eq!(entry.isin, "INE101A01026");
+        assert!((entry.weight - 3.15).abs() < f64::EPSILON);
+    }
+
+    // -------------------------------------------------------------------
+    // ConstituentEntry From: serialization roundtrip
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_then_serialize() {
+        let ic = IndexConstituent {
+            index_name: "Nifty Bank".to_string(),
+            symbol: "SBIN".to_string(),
+            isin: "INE062A01020".to_string(),
+            weight: 12.45,
+            sector: "Financial Services".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"symbol\":\"SBIN\""));
+        assert!(json.contains("\"isin\":\"INE062A01020\""));
+        assert!(json.contains("\"sector\":\"Financial Services\""));
+        assert!(json.contains("12.45"));
+    }
+
+    // -------------------------------------------------------------------
+    // ConstituentEntry From: last_updated is intentionally dropped
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_drops_last_updated() {
+        let ic = IndexConstituent {
+            index_name: "Nifty IT".to_string(),
+            symbol: "WIPRO".to_string(),
+            isin: "INE075A01022".to_string(),
+            weight: 4.0,
+            sector: "IT".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 22).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        // ConstituentEntry has no last_updated field — only symbol, isin, weight, sector
+        assert_eq!(entry.symbol, "WIPRO");
+        assert_eq!(entry.isin, "INE075A01022");
+        assert!((entry.weight - 4.0).abs() < f64::EPSILON);
+        assert_eq!(entry.sector, "IT");
+    }
+
+    // -------------------------------------------------------------------
+    // ConstituentEntry From: index_name is intentionally dropped
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_constituent_entry_from_drops_index_name() {
+        let ic = IndexConstituent {
+            index_name: "Should Be Dropped".to_string(),
+            symbol: "TCS".to_string(),
+            isin: "INE467B01029".to_string(),
+            weight: 5.5,
+            sector: "IT".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        };
+        let entry = ConstituentEntry::from(&ic);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("Should Be Dropped"));
+        assert!(json.contains("TCS"));
     }
 }

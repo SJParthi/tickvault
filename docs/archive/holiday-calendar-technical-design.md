@@ -229,7 +229,7 @@ Timestamp: IST midnight as epoch nanoseconds (IST-as-UTC convention).
 
 ```toml
 [trading]
-market_open_time = "09:15:00"
+market_open_time = "09:00:00"
 market_close_time = "15:30:00"
 order_cutoff_time = "15:29:00"
 data_collection_start = "09:00:00"

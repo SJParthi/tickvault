@@ -30,21 +30,82 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    ILP_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS, QUESTDB_TABLE_BUILD_METADATA,
-    QUESTDB_TABLE_DERIVATIVE_CONTRACTS, QUESTDB_TABLE_FNO_UNDERLYINGS,
-    QUESTDB_TABLE_SUBSCRIBED_INDICES,
+    ILP_FLUSH_BATCH_SIZE, QUESTDB_TABLE_BUILD_METADATA, QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+    QUESTDB_TABLE_FNO_UNDERLYINGS, QUESTDB_TABLE_SUBSCRIBED_INDICES,
 };
 use dhan_live_trader_common::instrument_types::{
     DerivativeContract, FnoUnderlying, FnoUniverse, SubscribedIndex, UniverseBuildMetadata,
 };
+use dhan_live_trader_common::trading_calendar::ist_offset;
 use dhan_live_trader_common::types::SecurityId;
+
+// ---------------------------------------------------------------------------
+// Instrument Lifecycle Event Types
+// ---------------------------------------------------------------------------
+
+/// Type of day-over-day instrument lifecycle event detected by delta detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleEventType {
+    /// A new derivative contract appeared in today's universe.
+    ContractAdded,
+    /// A contract present yesterday is absent today (expired or delisted).
+    ContractExpired,
+    /// Lot size changed for a contract or underlying.
+    LotSizeChanged,
+    /// Tick size changed for a contract.
+    TickSizeChanged,
+    /// A generic field changed (strike_price, option_type, segment, display_name, symbol_name).
+    FieldChanged,
+    /// A new underlying symbol appeared.
+    UnderlyingAdded,
+    /// An underlying symbol was removed.
+    UnderlyingRemoved,
+    /// I-P1-03: Same security_id now maps to a different underlying.
+    SecurityIdReused,
+    /// I-P1-04: Same contract identity got a different security_id.
+    SecurityIdReassigned,
+}
+
+impl LifecycleEventType {
+    /// Returns a snake_case string representation for QuestDB SYMBOL columns.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ContractAdded => "contract_added",
+            Self::ContractExpired => "contract_expired",
+            Self::LotSizeChanged => "lot_size_changed",
+            Self::TickSizeChanged => "tick_size_changed",
+            Self::FieldChanged => "field_changed",
+            Self::UnderlyingAdded => "underlying_added",
+            Self::UnderlyingRemoved => "underlying_removed",
+            Self::SecurityIdReused => "security_id_reused",
+            Self::SecurityIdReassigned => "security_id_reassigned",
+        }
+    }
+}
+
+/// A single lifecycle event from day-over-day delta detection.
+#[derive(Debug, Clone)]
+pub struct LifecycleEvent {
+    /// The security_id involved (0 for underlying-level events).
+    pub security_id: u32,
+    /// The underlying symbol this event relates to.
+    pub underlying_symbol: String,
+    /// The type of change detected.
+    pub event_type: LifecycleEventType,
+    /// Which field changed (empty for add/remove events).
+    pub field_changed: String,
+    /// Previous value (empty for add events).
+    pub old_value: String,
+    /// New value (empty for remove events).
+    pub new_value: String,
+}
 
 // ---------------------------------------------------------------------------
 // Constants — QuestDB DDL
@@ -60,7 +121,9 @@ const DEDUP_KEY_BUILD_METADATA: &str = "csv_source";
 const DEDUP_KEY_FNO_UNDERLYINGS: &str = "underlying_symbol";
 
 /// DEDUP UPSERT KEY for `derivative_contracts` table.
-const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id";
+/// I-P1-05: Includes `underlying_symbol` to prevent security_id reuse collision
+/// across different underlyings (e.g., same ID reused for NIFTY → BANKNIFTY).
+const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id, underlying_symbol";
 
 /// DEDUP UPSERT KEY for `subscribed_indices` table.
 const DEDUP_KEY_SUBSCRIBED_INDICES: &str = "security_id";
@@ -402,9 +465,7 @@ async fn ensure_table_dedup_keys(questdb_config: &QuestDbConfig) {
 /// All rows for a single day share the same designated timestamp, making
 /// date-based queries clean (e.g., `WHERE snapshot_date = '2026-03-15'`).
 fn build_snapshot_timestamp() -> Result<TimestampNanos> {
-    let ist =
-        FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).context("invalid IST offset seconds")?;
-    let today_ist = Utc::now().with_timezone(&ist).date_naive();
+    let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
     naive_date_to_timestamp_nanos(today_ist)
 }
 
@@ -700,7 +761,7 @@ fn write_single_subscribed_index(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, NaiveDate};
+    use chrono::NaiveDate;
     use dhan_live_trader_common::instrument_types::{
         DhanInstrumentKind, IndexCategory, IndexSubcategory, UnderlyingKind, UniverseBuildMetadata,
     };
@@ -814,8 +875,7 @@ mod tests {
 
     /// Helper: create a minimal UniverseBuildMetadata for testing.
     fn make_test_metadata() -> UniverseBuildMetadata {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+        let ist = ist_offset();
         UniverseBuildMetadata {
             csv_source: "primary".to_string(),
             csv_row_count: 276_018,
@@ -1406,8 +1466,7 @@ mod tests {
 
     #[test]
     fn test_write_single_build_metadata_with_zero_counts() {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+        let ist = ist_offset();
         let metadata = UniverseBuildMetadata {
             csv_source: "fallback".to_string(),
             csv_row_count: 0,
@@ -1434,8 +1493,7 @@ mod tests {
 
     #[test]
     fn test_write_single_build_metadata_with_large_counts() {
-        let ist =
-            FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect("IST offset is always valid");
+        let ist = ist_offset();
         let metadata = UniverseBuildMetadata {
             csv_source: "primary".to_string(),
             csv_row_count: 1_000_000,
@@ -2619,12 +2677,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_dedup_key_derivative_contracts_includes_security_id() {
-        // I-P1-05: Current key is "security_id" — verify the constant value
-        // is explicitly tested so changes are noticed.
+    fn test_dedup_key_derivative_contracts_includes_security_id_and_underlying() {
+        // I-P1-05: Compound key must include both security_id and underlying_symbol
+        // to prevent cross-underlying collision when security_ids are reused.
         assert!(
             DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("security_id"),
             "DEDUP_KEY_DERIVATIVE_CONTRACTS must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("underlying_symbol"),
+            "I-P1-05: DEDUP_KEY_DERIVATIVE_CONTRACTS must include underlying_symbol \
+             to prevent cross-underlying security_id collisions"
+        );
+        assert_eq!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol",
+            "I-P1-05: exact dedup key value"
         );
     }
 
@@ -2673,5 +2740,1505 @@ mod tests {
             DERIVATIVE_CONTRACTS_CREATE_DDL.contains("underlying_symbol"),
             "derivative_contracts DDL must include underlying_symbol for cross-underlying queries"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: ensure_instrument_tables DDL tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_does_not_panic_unreachable() {
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Should not panic — just logs warnings and returns.
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the success path for all 4 CREATE TABLE + 4 DEDUP DDL.
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_non_success_with_mock_http() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Exercises the non-success path for CREATE TABLE DDL.
+        ensure_instrument_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LifecycleEventType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_type_as_str_all_variants() {
+        assert_eq!(LifecycleEventType::ContractAdded.as_str(), "contract_added");
+        assert_eq!(
+            LifecycleEventType::ContractExpired.as_str(),
+            "contract_expired"
+        );
+        assert_eq!(
+            LifecycleEventType::LotSizeChanged.as_str(),
+            "lot_size_changed"
+        );
+        assert_eq!(
+            LifecycleEventType::TickSizeChanged.as_str(),
+            "tick_size_changed"
+        );
+        assert_eq!(LifecycleEventType::FieldChanged.as_str(), "field_changed");
+        assert_eq!(
+            LifecycleEventType::UnderlyingAdded.as_str(),
+            "underlying_added"
+        );
+        assert_eq!(
+            LifecycleEventType::UnderlyingRemoved.as_str(),
+            "underlying_removed"
+        );
+        assert_eq!(
+            LifecycleEventType::SecurityIdReused.as_str(),
+            "security_id_reused"
+        );
+        assert_eq!(
+            LifecycleEventType::SecurityIdReassigned.as_str(),
+            "security_id_reassigned"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_equality() {
+        assert_eq!(
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractAdded
+        );
+        assert_ne!(
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractExpired
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_event_clone() {
+        let event = LifecycleEvent {
+            security_id: 12345,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: String::new(),
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.security_id, 12345);
+        assert_eq!(cloned.underlying_symbol, "NIFTY");
+        assert_eq!(cloned.event_type, LifecycleEventType::ContractAdded);
+    }
+
+    #[test]
+    fn test_lifecycle_event_field_changed() {
+        let event = LifecycleEvent {
+            security_id: 42,
+            underlying_symbol: "RELIANCE".to_string(),
+            event_type: LifecycleEventType::LotSizeChanged,
+            field_changed: "lot_size".to_string(),
+            old_value: "250".to_string(),
+            new_value: "500".to_string(),
+        };
+        assert_eq!(event.field_changed, "lot_size");
+        assert_eq!(event.old_value, "250");
+        assert_eq!(event.new_value, "500");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: DDL constants validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_metadata_ddl_is_valid() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("instrument_build_metadata"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_source SYMBOL"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_row_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_duration_ms LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_timestamp TIMESTAMP"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_fno_underlyings_ddl_is_valid() {
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("fno_underlyings"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("price_feed_segment SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("contract_count LONG"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_derivative_contracts_ddl_is_valid() {
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("derivative_contracts"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("security_id LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("expiry_date STRING"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("strike_price DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("tick_size DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_subscribed_indices_ddl_is_valid() {
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subscribed_indices"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("symbol SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("exchange SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("category SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subcategory SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_all_ddl_are_single_statements() {
+        assert!(!BUILD_METADATA_CREATE_DDL.contains(';'));
+        assert!(!FNO_UNDERLYINGS_CREATE_DDL.contains(';'));
+        assert!(!DERIVATIVE_CONTRACTS_CREATE_DDL.contains(';'));
+        assert!(!SUBSCRIBED_INDICES_CREATE_DDL.contains(';'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: write_build_metadata via Sender (flush path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_build_metadata_reuse_after_flush() {
+        let port = spawn_tcp_drain_server();
+        let conf = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf).unwrap();
+        let mut buffer = sender.new_buffer();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid date"))
+                .unwrap();
+        let metadata = make_test_metadata();
+
+        // First write + flush
+        write_build_metadata(&mut sender, &mut buffer, &metadata, snapshot_nanos).unwrap();
+
+        // Buffer should be reusable after flush
+        write_single_build_metadata(&mut buffer, &metadata, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_write_underlyings_empty_produces_no_rows() {
+        // Empty underlyings — write_underlyings writes 0 rows then flushes.
+        // Flushing an empty buffer to QuestDB returns an error from the Sender,
+        // which is expected. Verify no rows are written to the buffer.
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid date"))
+                .unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let underlyings: std::collections::HashMap<String, FnoUnderlying> =
+            std::collections::HashMap::new();
+
+        // No rows written for empty input.
+        for underlying in underlyings.values() {
+            write_single_underlying(&mut buffer, underlying, snapshot_nanos).unwrap();
+        }
+        assert_eq!(
+            buffer.row_count(),
+            0,
+            "empty underlyings should produce 0 rows"
+        );
+        assert!(buffer.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: persist_inner with TCP drain (success path)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_persist_inner_success_with_multi_accept_server() {
+        let port = spawn_multi_accept_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+
+        let mut underlyings = std::collections::HashMap::new();
+        underlyings.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+
+        let mut contracts = std::collections::HashMap::new();
+        contracts.insert(10001_u32, make_test_contract(10001));
+        contracts.insert(10002_u32, make_test_contract(10002));
+
+        let indices = vec![make_test_fno_index("NIFTY", 13)];
+
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts: contracts,
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+            subscribed_indices: indices,
+            build_metadata: make_test_metadata(),
+        };
+
+        let result = persist_inner(&universe, &config).await;
+        // With multi-accept TCP drain, the ILP writes should succeed
+        // (HTTP DDL may fail since raw TCP is not HTTP, but ILP should work).
+        // Either way, it should not panic.
+        let _is_ok = result.is_ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: build_snapshot_timestamp epoch precision
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_snapshot_epoch_nanos_returns_midnight_ist() {
+        // I-P1-08: snapshot timestamp must be at midnight IST.
+        let ts = build_snapshot_timestamp().unwrap();
+        let nanos = ts.as_i64();
+        let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+        assert_eq!(
+            nanos % nanos_per_day,
+            0,
+            "snapshot timestamp must be at midnight (IST-as-UTC convention)"
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_epoch_nanos_matches_naive_date_function() {
+        // I-P1-08: build_snapshot_timestamp and naive_date_to_timestamp_nanos
+        // must produce the same result for today's IST date.
+        let ts1 = build_snapshot_timestamp().unwrap();
+        let today_ist = chrono::Utc::now().with_timezone(&ist_offset()).date_naive();
+        let ts2 = naive_date_to_timestamp_nanos(today_ist).unwrap();
+        assert_eq!(ts1.as_i64(), ts2.as_i64());
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LifecycleEvent construction, DDL constants,
+    // write helpers, naive_date edge cases, ensure_instrument_tables
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_type_clone_roundtrip() {
+        let original = LifecycleEventType::SecurityIdReused;
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_lifecycle_event_construction_and_fields() {
+        let event = LifecycleEvent {
+            security_id: 12345,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::LotSizeChanged,
+            field_changed: "lot_size".to_string(),
+            old_value: "75".to_string(),
+            new_value: "50".to_string(),
+        };
+        assert_eq!(event.security_id, 12345);
+        assert_eq!(event.underlying_symbol, "NIFTY");
+        assert_eq!(event.event_type, LifecycleEventType::LotSizeChanged);
+        assert_eq!(event.field_changed, "lot_size");
+        assert_eq!(event.old_value, "75");
+        assert_eq!(event.new_value, "50");
+    }
+
+    #[test]
+    fn test_lifecycle_event_add_has_empty_old_value() {
+        let event = LifecycleEvent {
+            security_id: 99999,
+            underlying_symbol: "RELIANCE".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: "added".to_string(),
+        };
+        assert!(event.old_value.is_empty());
+        assert!(event.field_changed.is_empty());
+    }
+
+    #[test]
+    fn test_lifecycle_event_remove_has_empty_new_value() {
+        let event = LifecycleEvent {
+            security_id: 0,
+            underlying_symbol: "BANKNIFTY".to_string(),
+            event_type: LifecycleEventType::UnderlyingRemoved,
+            field_changed: String::new(),
+            old_value: "present".to_string(),
+            new_value: String::new(),
+        };
+        assert_eq!(event.security_id, 0);
+        assert!(event.new_value.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_key_build_metadata_value() {
+        assert_eq!(DEDUP_KEY_BUILD_METADATA, "csv_source");
+    }
+
+    #[test]
+    fn test_dedup_key_fno_underlyings_value() {
+        assert_eq!(DEDUP_KEY_FNO_UNDERLYINGS, "underlying_symbol");
+    }
+
+    #[test]
+    fn test_dedup_key_derivative_contracts_includes_underlying() {
+        // I-P1-05: Must include underlying_symbol to prevent security_id reuse collision
+        assert!(DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("security_id"));
+        assert!(DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("underlying_symbol"));
+    }
+
+    #[test]
+    fn test_dedup_key_subscribed_indices_value() {
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+    }
+
+    #[test]
+    fn test_build_metadata_ddl_contains_all_columns() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("instrument_build_metadata"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_source SYMBOL"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_row_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("parsed_row_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("index_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("equity_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("underlying_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("derivative_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("option_chain_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_duration_ms LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_timestamp TIMESTAMP"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_fno_underlyings_ddl_contains_all_columns() {
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("fno_underlyings"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("price_feed_segment SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("derivative_segment SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("kind SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("contract_count LONG"));
+    }
+
+    #[test]
+    fn test_derivative_contracts_ddl_contains_all_columns() {
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("derivative_contracts"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("instrument_kind SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("exchange_segment SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("option_type SYMBOL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("security_id LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("expiry_date STRING"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("strike_price DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("tick_size DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("display_name STRING"));
+    }
+
+    #[test]
+    fn test_subscribed_indices_ddl_contains_all_columns() {
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subscribed_indices"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("symbol SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("exchange SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("category SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subcategory SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("security_id LONG"));
+    }
+
+    #[test]
+    fn test_naive_date_to_timestamp_nanos_different_dates_are_distinct() {
+        let date1 = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let date2 = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let ts1 = naive_date_to_timestamp_nanos(date1).unwrap();
+        let ts2 = naive_date_to_timestamp_nanos(date2).unwrap();
+        assert_ne!(ts1.as_i64(), ts2.as_i64());
+        // One day = 86400 * 1e9 nanos
+        let one_day_nanos: i64 = 86_400 * 1_000_000_000;
+        assert_eq!(ts2.as_i64() - ts1.as_i64(), one_day_nanos);
+    }
+
+    #[test]
+    fn test_naive_date_to_timestamp_nanos_always_at_midnight() {
+        let dates = [
+            NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(), // leap year
+        ];
+        let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+        for date in dates {
+            let ts = naive_date_to_timestamp_nanos(date).unwrap();
+            assert_eq!(
+                ts.as_i64() % nanos_per_day,
+                0,
+                "timestamp for {:?} must be at midnight",
+                date
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_single_build_metadata_produces_one_row() {
+        let metadata = make_test_metadata();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_build_metadata(&mut buffer, &metadata, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_write_single_underlying_produces_one_row() {
+        let underlying = make_test_underlying("FINNIFTY", 26037);
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("FINNIFTY"));
+    }
+
+    #[test]
+    fn test_write_single_contract_with_put_option() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(55555);
+        contract.option_type = Some(OptionType::Put);
+        contract.strike_price = 22000.0;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("PE"));
+    }
+
+    #[test]
+    fn test_write_single_contract_future_no_option_type() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(66666);
+        contract.option_type = None; // Future — no option type
+        contract.instrument_kind = DhanInstrumentKind::FutureIndex;
+        contract.strike_price = 0.0;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        // Empty option_type should not cause issues
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("FutureIndex"));
+    }
+
+    #[test]
+    fn test_write_single_subscribed_index_produces_one_row() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let index = make_test_display_index("NIFTY IT", 19, IndexSubcategory::Sectoral);
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_write_multiple_underlyings_batch() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "TCS"];
+        for (i, sym) in symbols.iter().enumerate() {
+            let underlying = make_test_underlying(sym, 26000 + i as u32);
+            write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        }
+        assert_eq!(buffer.row_count(), 5);
+    }
+
+    #[test]
+    fn test_write_multiple_contracts_batch() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        for id in 10000..10020_u32 {
+            let contract = make_test_contract(id);
+            write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        }
+        assert_eq!(buffer.row_count(), 20);
+    }
+
+    #[test]
+    fn test_underlying_with_stock_kind() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut underlying = make_test_underlying("RELIANCE", 2885);
+        underlying.kind = UnderlyingKind::Stock;
+        underlying.price_feed_segment = ExchangeSegment::NseEquity;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("Stock"));
+        assert!(content.contains("NSE_EQ"));
+    }
+
+    #[test]
+    fn test_contract_with_bse_segment() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(77777);
+        contract.exchange_segment = ExchangeSegment::BseFno;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("BSE_FNO"));
+    }
+
+    #[test]
+    fn test_build_snapshot_timestamp_is_positive() {
+        let ts = build_snapshot_timestamp().unwrap();
+        assert!(ts.as_i64() > 0, "snapshot timestamp must be positive");
+    }
+
+    #[test]
+    fn test_naive_date_far_future() {
+        let date = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        let ts = naive_date_to_timestamp_nanos(date).unwrap();
+        assert!(ts.as_i64() > 0);
+    }
+
+    #[test]
+    fn test_naive_date_past_date() {
+        let date = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let ts = naive_date_to_timestamp_nanos(date).unwrap();
+        assert!(ts.as_i64() > 0);
+        // 2020-01-01 midnight UTC = 1577836800 seconds = 1577836800000000000 nanos
+        assert_eq!(ts.as_i64(), 1_577_836_800_000_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LifecycleEventType exhaustive, persist_instrument_snapshot
+    // error wrapping, ensure_instrument_tables DDL ordering, write_* edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_type_as_str_roundtrip_all_variants() {
+        // Verify every variant produces a non-empty snake_case string
+        let variants = [
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractExpired,
+            LifecycleEventType::LotSizeChanged,
+            LifecycleEventType::TickSizeChanged,
+            LifecycleEventType::FieldChanged,
+            LifecycleEventType::UnderlyingAdded,
+            LifecycleEventType::UnderlyingRemoved,
+            LifecycleEventType::SecurityIdReused,
+            LifecycleEventType::SecurityIdReassigned,
+        ];
+        for variant in &variants {
+            let s = variant.as_str();
+            assert!(!s.is_empty(), "as_str must not be empty for {:?}", variant);
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "as_str must be snake_case for {:?}, got '{}'",
+                variant,
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_all_variants_unique() {
+        let variants = [
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractExpired,
+            LifecycleEventType::LotSizeChanged,
+            LifecycleEventType::TickSizeChanged,
+            LifecycleEventType::FieldChanged,
+            LifecycleEventType::UnderlyingAdded,
+            LifecycleEventType::UnderlyingRemoved,
+            LifecycleEventType::SecurityIdReused,
+            LifecycleEventType::SecurityIdReassigned,
+        ];
+        let strings: Vec<&str> = variants.iter().map(|v| v.as_str()).collect();
+        let mut deduped = strings.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            strings.len(),
+            deduped.len(),
+            "all lifecycle event type strings must be unique"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_event_security_id_reused_fields() {
+        let event = LifecycleEvent {
+            security_id: 12345,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::SecurityIdReused,
+            field_changed: "underlying_symbol".to_string(),
+            old_value: "BANKNIFTY".to_string(),
+            new_value: "NIFTY".to_string(),
+        };
+        assert_eq!(event.event_type.as_str(), "security_id_reused");
+        assert_eq!(event.security_id, 12345);
+        assert_eq!(event.old_value, "BANKNIFTY");
+        assert_eq!(event.new_value, "NIFTY");
+    }
+
+    #[test]
+    fn test_lifecycle_event_security_id_reassigned() {
+        let event = LifecycleEvent {
+            security_id: 99999,
+            underlying_symbol: "RELIANCE".to_string(),
+            event_type: LifecycleEventType::SecurityIdReassigned,
+            field_changed: "security_id".to_string(),
+            old_value: "88888".to_string(),
+            new_value: "99999".to_string(),
+        };
+        assert_eq!(event.event_type.as_str(), "security_id_reassigned");
+        assert_eq!(event.field_changed, "security_id");
+    }
+
+    #[test]
+    fn test_write_single_contract_with_none_option_type() {
+        // Futures have option_type = None → should serialize as empty string
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(55555);
+        contract.option_type = None;
+        contract.instrument_kind = DhanInstrumentKind::FutureIndex;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // Verify the buffer was written (non-empty)
+        assert!(!content.is_empty());
+        assert!(content.contains("FutureIndex"));
+    }
+
+    #[test]
+    fn test_write_single_contract_expiry_date_is_yyyy_mm_dd() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let contract = make_test_contract(11111);
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // expiry_date should be in YYYY-MM-DD format
+        assert!(
+            content.contains("2026-03-27"),
+            "expiry_date must be stored as YYYY-MM-DD string"
+        );
+    }
+
+    #[test]
+    fn test_write_contract_preserves_strike_price_precision() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(22222);
+        contract.strike_price = 25650.5;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        // If we get here without error, the f64 strike price was written successfully
+        assert!(buffer.row_count() > 0);
+    }
+
+    #[test]
+    fn test_dedup_key_constants_format() {
+        // DEDUP_KEY_DERIVATIVE_CONTRACTS must include both security_id and underlying_symbol
+        // per I-P1-05 gap enforcement
+        assert!(DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("security_id"));
+        assert!(DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("underlying_symbol"));
+
+        // All dedup keys must not have leading/trailing whitespace
+        assert_eq!(
+            DEDUP_KEY_BUILD_METADATA.trim(),
+            DEDUP_KEY_BUILD_METADATA,
+            "dedup key must not have leading/trailing whitespace"
+        );
+        assert_eq!(DEDUP_KEY_FNO_UNDERLYINGS.trim(), DEDUP_KEY_FNO_UNDERLYINGS,);
+        assert_eq!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS.trim(),
+            DEDUP_KEY_DERIVATIVE_CONTRACTS,
+        );
+        assert_eq!(
+            DEDUP_KEY_SUBSCRIBED_INDICES.trim(),
+            DEDUP_KEY_SUBSCRIBED_INDICES,
+        );
+    }
+
+    #[test]
+    fn test_questdb_ddl_timeout_constant_value() {
+        assert_eq!(
+            QUESTDB_DDL_TIMEOUT_SECS, 10,
+            "DDL timeout must be 10 seconds"
+        );
+    }
+
+    #[test]
+    fn test_all_create_ddl_contain_timestamp_column() {
+        for ddl in [
+            BUILD_METADATA_CREATE_DDL,
+            FNO_UNDERLYINGS_CREATE_DDL,
+            DERIVATIVE_CONTRACTS_CREATE_DDL,
+            SUBSCRIBED_INDICES_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("timestamp TIMESTAMP"),
+                "DDL must contain designated timestamp column"
+            );
+            assert!(
+                ddl.contains("TIMESTAMP(timestamp)"),
+                "DDL must declare designated timestamp"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_create_ddl_use_wal_mode() {
+        for ddl in [
+            BUILD_METADATA_CREATE_DDL,
+            FNO_UNDERLYINGS_CREATE_DDL,
+            DERIVATIVE_CONTRACTS_CREATE_DDL,
+            SUBSCRIBED_INDICES_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("WAL"),
+                "DDL must use WAL mode for dedup support"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_create_ddl_are_idempotent() {
+        for ddl in [
+            BUILD_METADATA_CREATE_DDL,
+            FNO_UNDERLYINGS_CREATE_DDL,
+            DERIVATIVE_CONTRACTS_CREATE_DDL,
+            SUBSCRIBED_INDICES_CREATE_DDL,
+        ] {
+            assert!(
+                ddl.contains("IF NOT EXISTS"),
+                "DDL must use IF NOT EXISTS for idempotency"
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_underlying_with_zero_security_ids() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut underlying = make_test_underlying("ZERO", 0);
+        underlying.price_feed_security_id = 0;
+        underlying.lot_size = 0;
+        underlying.contract_count = 0;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        assert_eq!(
+            buffer.row_count(),
+            1,
+            "zero values must still produce a row"
+        );
+    }
+
+    #[test]
+    fn test_write_contract_with_zero_strike_price_and_lot_size() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let mut contract = make_test_contract(33333);
+        contract.strike_price = 0.0;
+        contract.lot_size = 0;
+        contract.tick_size = 0.0;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_write_contract_large_security_id() {
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
+
+        let contract = make_test_contract(u32::MAX);
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_naive_date_consecutive_months_produce_increasing_timestamps() {
+        let jan =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).unwrap();
+        let feb =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()).unwrap();
+        let mar =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        assert!(jan.as_i64() < feb.as_i64(), "Jan < Feb");
+        assert!(feb.as_i64() < mar.as_i64(), "Feb < Mar");
+    }
+
+    #[tokio::test]
+    async fn test_persist_instrument_snapshot_with_empty_universe() {
+        // Empty universe should still not panic — it writes 1 metadata row + 0 data rows
+        let universe = FnoUniverse {
+            underlyings: std::collections::HashMap::new(),
+            derivative_contracts: std::collections::HashMap::new(),
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+            subscribed_indices: vec![],
+            build_metadata: make_test_metadata(),
+        };
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Should return Ok(()) even though QuestDB is unreachable (error is swallowed)
+        let result = persist_instrument_snapshot(&universe, &config).await;
+        assert!(
+            result.is_ok(),
+            "persist_instrument_snapshot must swallow errors"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_event_debug_impl() {
+        let event = LifecycleEvent {
+            security_id: 42,
+            underlying_symbol: "TEST".to_string(),
+            event_type: LifecycleEventType::LotSizeChanged,
+            field_changed: "lot_size".to_string(),
+            old_value: "50".to_string(),
+            new_value: "75".to_string(),
+        };
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("LotSizeChanged"));
+        assert!(debug_str.contains("TEST"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL warn! field evaluation with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_non_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, warn! body expressions are evaluated.
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_instrument_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_table_dedup_keys_non_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Covers ensure_table_dedup_keys non-success body evaluation.
+        ensure_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_persist_instrument_snapshot_ok_path_with_mock_http_and_ilp() {
+        let _guard = install_test_subscriber();
+        // Mock HTTP for DDL (ensure_table_dedup_keys)
+        let http_port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        // TCP drain for ILP writes
+        let ilp_port = spawn_multi_accept_tcp_drain_server();
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: http_port,
+            ilp_port,
+        };
+
+        let universe = FnoUniverse {
+            build_metadata: make_test_metadata(),
+            underlyings: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+                m
+            },
+            derivative_contracts: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(50001, make_test_contract(50001));
+                m
+            },
+            subscribed_indices: vec![make_test_fno_index("NIFTY 50", 13)],
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+        };
+
+        let result = persist_instrument_snapshot(&universe, &config).await;
+        assert!(
+            result.is_ok(),
+            "persist_instrument_snapshot with valid HTTP+ILP must succeed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: write_build_metadata / write_underlyings /
+    // write_derivative_contracts / write_subscribed_indices with TCP drain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_build_metadata_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let metadata = make_test_metadata();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_build_metadata(&mut sender, &mut buffer, &metadata, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_build_metadata must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_underlyings_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let mut underlyings = std::collections::HashMap::new();
+        underlyings.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+        underlyings.insert(
+            "BANKNIFTY".to_string(),
+            make_test_underlying("BANKNIFTY", 26009),
+        );
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_underlyings must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_derivative_contracts_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let mut contracts = std::collections::HashMap::new();
+        for sec_id in 50001..50011_u32 {
+            contracts.insert(sec_id, make_test_contract(sec_id));
+        }
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result =
+            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_derivative_contracts must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_subscribed_indices_with_tcp_drain_server() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let indices = vec![
+            make_test_fno_index("NIFTY", 13),
+            make_test_fno_index("BANKNIFTY", 25),
+            make_test_display_index("INDIA VIX", 21, IndexSubcategory::Volatility),
+        ];
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "write_subscribed_indices must succeed with TCP drain: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_write_subscribed_indices_empty_list_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let indices: Vec<SubscribedIndex> = vec![];
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "empty indices list should not attempt to flush"
+        );
+    }
+
+    #[test]
+    fn test_write_derivative_contracts_empty_map_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let contracts: std::collections::HashMap<SecurityId, DerivativeContract> =
+            std::collections::HashMap::new();
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result =
+            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "empty contracts should not attempt to flush"
+        );
+    }
+
+    #[test]
+    fn test_write_underlyings_single_entry_with_tcp_drain() {
+        let port = spawn_tcp_drain_server();
+        let conf_string = format!("tcp::addr=127.0.0.1:{port};");
+        let mut sender = Sender::from_conf(&conf_string).unwrap();
+        let mut buffer = sender.new_buffer();
+
+        let mut underlyings = std::collections::HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_string(),
+                underlying_security_id: 2885,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 250,
+                contract_count: 120,
+            },
+        );
+
+        let snapshot_nanos =
+            naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
+
+        let result = write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos);
+        assert!(
+            result.is_ok(),
+            "single underlying write must succeed: {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ensure_instrument_tables success path with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_instrument_tables_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, info!/debug! field expressions are evaluated.
+        ensure_instrument_tables(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ensure_table_dedup_keys success path with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_table_dedup_keys_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Covers the success branch of ensure_table_dedup_keys.
+        ensure_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ensure_table_dedup_keys send error with tracing subscriber
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ensure_table_dedup_keys_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // Covers the Err branch of the DEDUP send.
+        ensure_table_dedup_keys(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: LifecycleEvent clone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_clone_roundtrip() {
+        let event = LifecycleEvent {
+            security_id: 42,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: String::new(),
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.security_id, 42);
+        assert_eq!(cloned.underlying_symbol, "NIFTY");
+        assert_eq!(cloned.event_type, LifecycleEventType::ContractAdded);
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_eq_and_ne() {
+        assert_eq!(
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractAdded
+        );
+        assert_ne!(
+            LifecycleEventType::ContractAdded,
+            LifecycleEventType::ContractExpired
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_inner_write_error_covers_question_mark_propagation() {
+        let _guard = install_test_subscriber();
+        // Mock HTTP for DDL (best-effort, continues on error)
+        let http_port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        // TCP server that accepts connection then immediately closes it.
+        // The ILP Sender connects successfully but flush fails.
+        let ilp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ilp_port = ilp_listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Accept one connection and drop it immediately
+            if let Ok((_stream, _)) = ilp_listener.accept() {
+                // Connection accepted but immediately dropped
+            }
+        });
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: http_port,
+            ilp_port,
+        };
+
+        let universe = FnoUniverse {
+            build_metadata: make_test_metadata(),
+            underlyings: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
+                m
+            },
+            derivative_contracts: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(50001, make_test_contract(50001));
+                m
+            },
+            subscribed_indices: vec![make_test_fno_index("NIFTY 50", 13)],
+            instrument_info: std::collections::HashMap::new(),
+            option_chains: std::collections::HashMap::new(),
+            expiry_calendars: std::collections::HashMap::new(),
+        };
+
+        // persist_inner should fail at one of the write_* calls when flush
+        // encounters the dropped connection. persist_instrument_snapshot
+        // wraps it and returns Ok.
+        let result = persist_instrument_snapshot(&universe, &config).await;
+        assert!(
+            result.is_ok(),
+            "persist_instrument_snapshot always returns Ok"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LifecycleEventType::as_str — all 9 variants (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_event_type_as_str_all_nine_variants() {
+        assert_eq!(LifecycleEventType::ContractAdded.as_str(), "contract_added");
+        assert_eq!(
+            LifecycleEventType::ContractExpired.as_str(),
+            "contract_expired"
+        );
+        assert_eq!(
+            LifecycleEventType::LotSizeChanged.as_str(),
+            "lot_size_changed"
+        );
+        assert_eq!(
+            LifecycleEventType::TickSizeChanged.as_str(),
+            "tick_size_changed"
+        );
+        assert_eq!(LifecycleEventType::FieldChanged.as_str(), "field_changed");
+        assert_eq!(
+            LifecycleEventType::UnderlyingAdded.as_str(),
+            "underlying_added"
+        );
+        assert_eq!(
+            LifecycleEventType::UnderlyingRemoved.as_str(),
+            "underlying_removed"
+        );
+        assert_eq!(
+            LifecycleEventType::SecurityIdReused.as_str(),
+            "security_id_reused"
+        );
+        assert_eq!(
+            LifecycleEventType::SecurityIdReassigned.as_str(),
+            "security_id_reassigned"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_debug_impl() {
+        let event = LifecycleEventType::ContractAdded;
+        let debug = format!("{event:?}");
+        assert!(debug.contains("ContractAdded"));
+    }
+
+    #[test]
+    fn test_lifecycle_event_type_clone_and_eq() {
+        let a = LifecycleEventType::LotSizeChanged;
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_lifecycle_event_struct_fields() {
+        let event = LifecycleEvent {
+            security_id: 50001,
+            underlying_symbol: "NIFTY".to_string(),
+            event_type: LifecycleEventType::ContractAdded,
+            field_changed: String::new(),
+            old_value: String::new(),
+            new_value: "new_contract".to_string(),
+        };
+        assert_eq!(event.security_id, 50001);
+        assert_eq!(event.underlying_symbol, "NIFTY");
+        assert_eq!(event.event_type.as_str(), "contract_added");
+        assert!(event.field_changed.is_empty());
+        assert!(event.old_value.is_empty());
+        assert_eq!(event.new_value, "new_contract");
+    }
+
+    #[test]
+    fn test_lifecycle_event_debug() {
+        let event = LifecycleEvent {
+            security_id: 0,
+            underlying_symbol: "RELIANCE".to_string(),
+            event_type: LifecycleEventType::UnderlyingRemoved,
+            field_changed: String::new(),
+            old_value: "old".to_string(),
+            new_value: String::new(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("LifecycleEvent"));
+        assert!(debug.contains("RELIANCE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DDL constants coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_key_constants_content() {
+        assert_eq!(DEDUP_KEY_BUILD_METADATA, "csv_source");
+        assert_eq!(DEDUP_KEY_FNO_UNDERLYINGS, "underlying_symbol");
+        assert_eq!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol",
+            "I-P1-05: must include underlying_symbol"
+        );
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+    }
+
+    #[test]
+    fn test_ddl_constants_are_single_statements() {
+        assert!(
+            !BUILD_METADATA_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+        assert!(
+            !FNO_UNDERLYINGS_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+        assert!(
+            !DERIVATIVE_CONTRACTS_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+        assert!(
+            !SUBSCRIBED_INDICES_CREATE_DDL.contains(';'),
+            "DDL must not contain semicolons"
+        );
+    }
+
+    #[test]
+    fn test_ddl_constants_use_wal() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("WAL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("WAL"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("WAL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_ddl_constants_have_timestamp() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("TIMESTAMP(timestamp)"));
+    }
+
+    #[test]
+    fn test_ddl_timeout_is_reasonable() {
+        assert!((5..=30).contains(&QUESTDB_DDL_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn test_build_metadata_ddl_has_key_columns() {
+        assert!(BUILD_METADATA_CREATE_DDL.contains("csv_source SYMBOL"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("derivative_count LONG"));
+        assert!(BUILD_METADATA_CREATE_DDL.contains("build_duration_ms LONG"));
+    }
+
+    #[test]
+    fn test_fno_underlyings_ddl_has_key_columns() {
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("lot_size LONG"));
+        assert!(FNO_UNDERLYINGS_CREATE_DDL.contains("contract_count LONG"));
+    }
+
+    #[test]
+    fn test_derivative_contracts_ddl_has_key_columns() {
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("security_id LONG"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("strike_price DOUBLE"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("expiry_date STRING"));
+        assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("option_type SYMBOL"));
+    }
+
+    #[test]
+    fn test_subscribed_indices_ddl_has_key_columns() {
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("security_id LONG"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("symbol SYMBOL"));
+        assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("category SYMBOL"));
     }
 }

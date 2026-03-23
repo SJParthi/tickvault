@@ -2,6 +2,7 @@
   "env": {
     "CLAUDE_CODE_EFFORT_LEVEL": "high",
     "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE": "85",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "BASH_DEFAULT_TIMEOUT_MS": "300000",
     "BASH_MAX_TIMEOUT_MS": "600000"
   },
@@ -10,6 +11,11 @@
       "Read",
       "Edit",
       "Write",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
       "Bash(cargo check *)",
       "Bash(cargo check)",
       "Bash(cargo test *)",
@@ -38,6 +44,10 @@
       "Bash(git stash *)",
       "Bash(git merge *)",
       "Bash(git tag *)",
+      "Bash(git rev-parse *)",
+      "Bash(git ls-remote *)",
+      "Bash(git show *)",
+      "Bash(git rev-list *)",
       "Bash(docker compose *)",
       "Bash(docker build *)",
       "Bash(docker ps *)",
@@ -54,7 +64,17 @@
       "Bash(tail *)",
       "Bash(find *)",
       "Bash(docker exec *)",
-      "Bash(chmod *)"
+      "Bash(chmod *)",
+      "Bash(make *)",
+      "Bash(make)",
+      "Bash(date *)",
+      "Bash(date)",
+      "Bash(pwd)",
+      "Bash(echo *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Bash(bash *)"
     ],
     "deny": [
       "Bash(cargo update *)",
@@ -100,25 +120,34 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-push-sync.sh",
-            "timeout": 10,
-            "statusMessage": "Syncing to integration branch..."
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop-grill-reminder.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop-auto-verify.sh",
+            "timeout": 60,
+            "statusMessage": "Auto-verifying changed Rust files..."
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "rate_limit|authentication_failed|billing_error|invalid_request|server_error|max_output_tokens",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop-failure-alert.sh",
             "timeout": 5
           }
         ]
@@ -134,13 +163,93 @@
         ]
       }
     ],
-    "SubagentStart": [],
+    "SessionEnd": [
+      {
+        "matcher": "clear|logout|prompt_input_exit|other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-end-save.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"SUBAGENT SPAWNED: $(cat | jq -r '.agent_type // .subagent_type // \"unknown\"')\" >&2"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"SUBAGENT COMPLETED\" >&2"
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "echo 'PRESERVE: (1) modified files list (2) test/build results (3) phase progress (4) unresolved errors (5) three principles'"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-compact-recovery.sh",
+            "timeout": 10,
+            "statusMessage": "Recovering context after compaction..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-push-sync.sh",
+            "timeout": 10,
+            "statusMessage": "Syncing to integration branch..."
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-edit-rustfmt.sh",
+            "timeout": 15,
+            "statusMessage": "Auto-formatting Rust file..."
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/notification-log.sh",
+            "timeout": 5
           }
         ]
       }

@@ -13,6 +13,7 @@ use tracing::info;
 
 use dhan_live_trader_common::config::InstrumentConfig;
 use dhan_live_trader_common::constants::*;
+use dhan_live_trader_common::trading_calendar::ist_offset;
 
 use super::csv_downloader::download_instrument_csv;
 use super::csv_parser::parse_instrument_csv;
@@ -66,6 +67,160 @@ const EXPECTED_COLUMNS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Pure Helper Functions (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Segment breakdown counts from parsed instrument CSV rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentCounts {
+    /// NSE Index instruments.
+    pub nse_i: usize,
+    /// NSE Equity instruments.
+    pub nse_e: usize,
+    /// NSE Derivative instruments.
+    pub nse_d: usize,
+    /// BSE Index instruments.
+    pub bse_i: usize,
+    /// BSE Derivative instruments.
+    pub bse_d: usize,
+}
+
+/// Counts instruments by exchange + segment from parsed CSV rows.
+fn count_segments(rows: &[super::csv_parser::ParsedInstrumentRow]) -> SegmentCounts {
+    use dhan_live_trader_common::types::Exchange;
+
+    let mut counts = SegmentCounts {
+        nse_i: 0,
+        nse_e: 0,
+        nse_d: 0,
+        bse_i: 0,
+        bse_d: 0,
+    };
+
+    for r in rows {
+        match (&r.exchange, r.segment) {
+            (Exchange::NationalStockExchange, 'I') => {
+                counts.nse_i = counts.nse_i.saturating_add(1);
+            }
+            (Exchange::NationalStockExchange, 'E') => {
+                counts.nse_e = counts.nse_e.saturating_add(1);
+            }
+            (Exchange::NationalStockExchange, 'D') => {
+                counts.nse_d = counts.nse_d.saturating_add(1);
+            }
+            (Exchange::BombayStockExchange, 'I') => {
+                counts.bse_i = counts.bse_i.saturating_add(1);
+            }
+            (Exchange::BombayStockExchange, 'D') => {
+                counts.bse_d = counts.bse_d.saturating_add(1);
+            }
+            _ => {} // BSE_E and others: not tracked in diagnostic
+        }
+    }
+
+    counts
+}
+
+/// Builds the CSV parse check result detail string.
+fn build_csv_parse_detail(
+    total_rows: usize,
+    parsed_count: usize,
+    counts: &SegmentCounts,
+) -> String {
+    format!(
+        "total={total_rows}, parsed={parsed_count}, NSE_I={}, NSE_E={}, NSE_D={}, BSE_I={}, BSE_D={}",
+        counts.nse_i, counts.nse_e, counts.nse_d, counts.bse_i, counts.bse_d
+    )
+}
+
+/// Builds a CheckResult for a successful CSV parse.
+fn build_csv_parse_check(
+    total_rows: usize,
+    parsed_count: usize,
+    counts: &SegmentCounts,
+    duration_ms: u64,
+) -> CheckResult {
+    CheckResult {
+        name: "csv_parse".to_owned(),
+        passed: true,
+        detail: build_csv_parse_detail(total_rows, parsed_count, counts),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a failed CSV parse.
+fn build_csv_parse_error(err_msg: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "csv_parse".to_owned(),
+        passed: false,
+        detail: format!("parse failed: {err_msg}"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a successful CSV download.
+fn build_download_success(bytes_len: usize, source: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "csv_download".to_owned(),
+        passed: true,
+        detail: format!("downloaded {bytes_len} bytes from {source} source"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a failed CSV download.
+fn build_download_error(err_msg: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "csv_download".to_owned(),
+        passed: false,
+        detail: format!("download failed: {err_msg}"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a successful universe build + validation.
+fn build_universe_success(underlyings: usize, derivatives: usize, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "universe_build_and_validate".to_owned(),
+        passed: true,
+        detail: format!("{underlyings} underlyings, {derivatives} derivatives — validation passed"),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a universe build that passed but validation failed.
+fn build_universe_validation_error(
+    underlyings: usize,
+    derivatives: usize,
+    err_msg: &str,
+    duration_ms: u64,
+) -> CheckResult {
+    CheckResult {
+        name: "universe_build_and_validate".to_owned(),
+        passed: false,
+        detail: format!(
+            "{underlyings} underlyings, {derivatives} derivatives — validation FAILED: {err_msg}"
+        ),
+        duration_ms,
+    }
+}
+
+/// Builds a CheckResult for a failed universe build.
+fn build_universe_build_error(err_msg: &str, duration_ms: u64) -> CheckResult {
+    CheckResult {
+        name: "universe_build_and_validate".to_owned(),
+        passed: false,
+        detail: format!("universe build failed: {err_msg}"),
+        duration_ms,
+    }
+}
+
+/// Determines overall health from check results.
+fn determine_healthy(checks: &[CheckResult]) -> bool {
+    checks.iter().all(|c| c.passed)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -109,25 +264,15 @@ pub async fn run_instrument_diagnostic(
 
     let csv_text = match download_result {
         Ok(result) => {
-            checks.push(CheckResult {
-                name: "csv_download".to_owned(),
-                passed: true,
-                detail: format!(
-                    "downloaded {} bytes from {} source",
-                    result.csv_text.len(),
-                    result.source
-                ),
-                duration_ms: download_ms,
-            });
+            checks.push(build_download_success(
+                result.csv_text.len(),
+                &result.source,
+                download_ms,
+            ));
             Some(result.csv_text)
         }
         Err(err) => {
-            checks.push(CheckResult {
-                name: "csv_download".to_owned(),
-                passed: false,
-                detail: format!("download failed: {err}"),
-                duration_ms: download_ms,
-            });
+            checks.push(build_download_error(&err.to_string(), download_ms));
             None
         }
     };
@@ -144,66 +289,14 @@ pub async fn run_instrument_diagnostic(
 
         match parse_result {
             Ok((total_rows, parsed_rows)) => {
-                let nse_i = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'I'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::NationalStockExchange
-                            )
-                    })
-                    .count();
-                let nse_e = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'E'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::NationalStockExchange
-                            )
-                    })
-                    .count();
-                let nse_d = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'D'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::NationalStockExchange
-                            )
-                    })
-                    .count();
-                let bse_i = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'I'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::BombayStockExchange
-                            )
-                    })
-                    .count();
-                let bse_d = parsed_rows
-                    .iter()
-                    .filter(|r| {
-                        r.segment == 'D'
-                            && matches!(
-                                r.exchange,
-                                dhan_live_trader_common::types::Exchange::BombayStockExchange
-                            )
-                    })
-                    .count();
+                let counts = count_segments(&parsed_rows);
 
-                checks.push(CheckResult {
-                    name: "csv_parse".to_owned(),
-                    passed: true,
-                    detail: format!(
-                        "total={total_rows}, parsed={}, NSE_I={nse_i}, NSE_E={nse_e}, NSE_D={nse_d}, BSE_I={bse_i}, BSE_D={bse_d}",
-                        parsed_rows.len()
-                    ),
-                    duration_ms: parse_ms,
-                });
+                checks.push(build_csv_parse_check(
+                    total_rows,
+                    parsed_rows.len(),
+                    &counts,
+                    parse_ms,
+                ));
 
                 // Check 8: Universe build + validation
                 let start = Instant::now();
@@ -216,50 +309,31 @@ pub async fn run_instrument_diagnostic(
                         // Run validation
                         match validate_fno_universe(&universe) {
                             Ok(()) => {
-                                checks.push(CheckResult {
-                                    name: "universe_build_and_validate".to_owned(),
-                                    passed: true,
-                                    detail: format!(
-                                        "{uc} underlyings, {dc} derivatives — validation passed"
-                                    ),
-                                    duration_ms: build_ms,
-                                });
+                                checks.push(build_universe_success(uc, dc, build_ms));
                             }
                             Err(err) => {
-                                checks.push(CheckResult {
-                                    name: "universe_build_and_validate".to_owned(),
-                                    passed: false,
-                                    detail: format!(
-                                        "{uc} underlyings, {dc} derivatives — validation FAILED: {err}"
-                                    ),
-                                    duration_ms: build_ms,
-                                });
+                                checks.push(build_universe_validation_error(
+                                    uc,
+                                    dc,
+                                    &err.to_string(),
+                                    build_ms,
+                                ));
                             }
                         }
                     }
                     Err(err) => {
                         let build_ms = start.elapsed().as_millis() as u64;
-                        checks.push(CheckResult {
-                            name: "universe_build_and_validate".to_owned(),
-                            passed: false,
-                            detail: format!("universe build failed: {err}"),
-                            duration_ms: build_ms,
-                        });
+                        checks.push(build_universe_build_error(&err.to_string(), build_ms));
                     }
                 }
             }
             Err(err) => {
-                checks.push(CheckResult {
-                    name: "csv_parse".to_owned(),
-                    passed: false,
-                    detail: format!("parse failed: {err}"),
-                    duration_ms: parse_ms,
-                });
+                checks.push(build_csv_parse_error(&err.to_string(), parse_ms));
             }
         }
     }
 
-    let healthy = checks.iter().all(|c| c.passed);
+    let healthy = determine_healthy(&checks);
     info!(
         healthy,
         checks = checks.len(),
@@ -322,16 +396,12 @@ fn check_time_gate(window_start: &str, window_end: &str) -> CheckResult {
     let start = Instant::now();
     let is_open = is_within_build_window(window_start, window_end);
 
-    // IST_UTC_OFFSET_SECONDS (19800) is always valid for FixedOffset::east_opt.
-    // Fall back to UTC if somehow invalid (impossible with our constant).
-    let ist_offset = chrono::FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)
-        .or_else(|| chrono::FixedOffset::east_opt(0));
-    let now_ist_str = match ist_offset {
-        Some(offset) => chrono::Utc::now()
+    let now_ist_str = {
+        let offset = ist_offset();
+        chrono::Utc::now()
             .with_timezone(&offset)
             .format("%H:%M:%S")
-            .to_string(),
-        None => "unknown".to_owned(),
+            .to_string()
     };
 
     CheckResult {
@@ -519,5 +589,538 @@ mod tests {
         let result = check_url_reachability("http://127.0.0.1:1/nonexistent", "test").await;
         assert!(!result.passed, "unreachable URL should fail");
         assert!(result.detail.contains("request failed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // count_segments tests
+    // -----------------------------------------------------------------------
+
+    fn make_row(
+        exchange: dhan_live_trader_common::types::Exchange,
+        segment: char,
+    ) -> super::super::csv_parser::ParsedInstrumentRow {
+        super::super::csv_parser::ParsedInstrumentRow {
+            exchange,
+            segment,
+            security_id: 1,
+            instrument: String::new(),
+            underlying_security_id: 0,
+            underlying_symbol: String::new(),
+            symbol_name: String::new(),
+            display_name: String::new(),
+            series: String::new(),
+            lot_size: 1,
+            expiry_date: None,
+            strike_price: 0.0,
+            option_type: None,
+            tick_size: 0.05,
+            expiry_flag: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_count_segments_empty() {
+        let counts = count_segments(&[]);
+        assert_eq!(
+            counts,
+            SegmentCounts {
+                nse_i: 0,
+                nse_e: 0,
+                nse_d: 0,
+                bse_i: 0,
+                bse_d: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_count_segments_nse_only() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::NationalStockExchange, 'I'),
+            make_row(Exchange::NationalStockExchange, 'I'),
+            make_row(Exchange::NationalStockExchange, 'E'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(counts.nse_i, 2);
+        assert_eq!(counts.nse_e, 1);
+        assert_eq!(counts.nse_d, 3);
+        assert_eq!(counts.bse_i, 0);
+        assert_eq!(counts.bse_d, 0);
+    }
+
+    #[test]
+    fn test_count_segments_bse_only() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::BombayStockExchange, 'I'),
+            make_row(Exchange::BombayStockExchange, 'D'),
+            make_row(Exchange::BombayStockExchange, 'D'),
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(counts.nse_i, 0);
+        assert_eq!(counts.nse_e, 0);
+        assert_eq!(counts.nse_d, 0);
+        assert_eq!(counts.bse_i, 1);
+        assert_eq!(counts.bse_d, 2);
+    }
+
+    #[test]
+    fn test_count_segments_mixed() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::NationalStockExchange, 'I'),
+            make_row(Exchange::BombayStockExchange, 'I'),
+            make_row(Exchange::NationalStockExchange, 'E'),
+            make_row(Exchange::NationalStockExchange, 'D'),
+            make_row(Exchange::BombayStockExchange, 'D'),
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(counts.nse_i, 1);
+        assert_eq!(counts.nse_e, 1);
+        assert_eq!(counts.nse_d, 1);
+        assert_eq!(counts.bse_i, 1);
+        assert_eq!(counts.bse_d, 1);
+    }
+
+    #[test]
+    fn test_count_segments_unknown_segment_ignored() {
+        use dhan_live_trader_common::types::Exchange;
+
+        let rows = vec![
+            make_row(Exchange::NationalStockExchange, 'X'), // unknown segment
+            make_row(Exchange::BombayStockExchange, 'E'),   // BSE_E not tracked
+        ];
+        let counts = count_segments(&rows);
+        assert_eq!(
+            counts,
+            SegmentCounts {
+                nse_i: 0,
+                nse_e: 0,
+                nse_d: 0,
+                bse_i: 0,
+                bse_d: 0,
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_csv_parse_detail tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_csv_parse_detail() {
+        let counts = SegmentCounts {
+            nse_i: 10,
+            nse_e: 2000,
+            nse_d: 5000,
+            bse_i: 5,
+            bse_d: 100,
+        };
+        let detail = build_csv_parse_detail(10000, 7115, &counts);
+        assert!(detail.contains("total=10000"));
+        assert!(detail.contains("parsed=7115"));
+        assert!(detail.contains("NSE_I=10"));
+        assert!(detail.contains("NSE_E=2000"));
+        assert!(detail.contains("NSE_D=5000"));
+        assert!(detail.contains("BSE_I=5"));
+        assert!(detail.contains("BSE_D=100"));
+    }
+
+    #[test]
+    fn test_build_csv_parse_detail_zeros() {
+        let counts = SegmentCounts {
+            nse_i: 0,
+            nse_e: 0,
+            nse_d: 0,
+            bse_i: 0,
+            bse_d: 0,
+        };
+        let detail = build_csv_parse_detail(0, 0, &counts);
+        assert!(detail.contains("total=0"));
+        assert!(detail.contains("parsed=0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_csv_parse_check tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_csv_parse_check() {
+        let counts = SegmentCounts {
+            nse_i: 5,
+            nse_e: 100,
+            nse_d: 500,
+            bse_i: 3,
+            bse_d: 50,
+        };
+        let result = build_csv_parse_check(1000, 658, &counts, 42);
+        assert!(result.passed);
+        assert_eq!(result.name, "csv_parse");
+        assert_eq!(result.duration_ms, 42);
+        assert!(result.detail.contains("parsed=658"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_csv_parse_error tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_csv_parse_error() {
+        let result = build_csv_parse_error("column SECURITY_ID not found", 15);
+        assert!(!result.passed);
+        assert_eq!(result.name, "csv_parse");
+        assert!(result.detail.contains("parse failed"));
+        assert!(result.detail.contains("column SECURITY_ID not found"));
+        assert_eq!(result.duration_ms, 15);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_download_success / build_download_error tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_download_success() {
+        let result = build_download_success(5_000_000, "primary", 250);
+        assert!(result.passed);
+        assert_eq!(result.name, "csv_download");
+        assert!(result.detail.contains("5000000 bytes"));
+        assert!(result.detail.contains("primary source"));
+        assert_eq!(result.duration_ms, 250);
+    }
+
+    #[test]
+    fn test_build_download_error() {
+        let result = build_download_error("connection refused", 5000);
+        assert!(!result.passed);
+        assert_eq!(result.name, "csv_download");
+        assert!(result.detail.contains("download failed"));
+        assert!(result.detail.contains("connection refused"));
+        assert_eq!(result.duration_ms, 5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_universe_success / error tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_universe_success() {
+        let result = build_universe_success(25, 5000, 100);
+        assert!(result.passed);
+        assert_eq!(result.name, "universe_build_and_validate");
+        assert!(result.detail.contains("25 underlyings"));
+        assert!(result.detail.contains("5000 derivatives"));
+        assert!(result.detail.contains("validation passed"));
+        assert_eq!(result.duration_ms, 100);
+    }
+
+    #[test]
+    fn test_build_universe_validation_error() {
+        let result = build_universe_validation_error(25, 50, "too few derivatives", 100);
+        assert!(!result.passed);
+        assert_eq!(result.name, "universe_build_and_validate");
+        assert!(result.detail.contains("25 underlyings"));
+        assert!(result.detail.contains("50 derivatives"));
+        assert!(result.detail.contains("validation FAILED"));
+        assert!(result.detail.contains("too few derivatives"));
+    }
+
+    #[test]
+    fn test_build_universe_build_error() {
+        let result = build_universe_build_error("CSV parse failed", 50);
+        assert!(!result.passed);
+        assert_eq!(result.name, "universe_build_and_validate");
+        assert!(result.detail.contains("universe build failed"));
+        assert!(result.detail.contains("CSV parse failed"));
+        assert_eq!(result.duration_ms, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_healthy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_healthy_all_passed() {
+        let checks = vec![
+            CheckResult {
+                name: "a".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 1,
+            },
+            CheckResult {
+                name: "b".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 2,
+            },
+        ];
+        assert!(determine_healthy(&checks));
+    }
+
+    #[test]
+    fn test_determine_healthy_one_failed() {
+        let checks = vec![
+            CheckResult {
+                name: "a".to_owned(),
+                passed: true,
+                detail: "ok".to_owned(),
+                duration_ms: 1,
+            },
+            CheckResult {
+                name: "b".to_owned(),
+                passed: false,
+                detail: "fail".to_owned(),
+                duration_ms: 2,
+            },
+        ];
+        assert!(!determine_healthy(&checks));
+    }
+
+    #[test]
+    fn test_determine_healthy_empty() {
+        assert!(determine_healthy(&[]), "empty checks = vacuously healthy");
+    }
+
+    #[test]
+    fn test_determine_healthy_all_failed() {
+        let checks = vec![
+            CheckResult {
+                name: "a".to_owned(),
+                passed: false,
+                detail: "fail".to_owned(),
+                duration_ms: 1,
+            },
+            CheckResult {
+                name: "b".to_owned(),
+                passed: false,
+                detail: "fail".to_owned(),
+                duration_ms: 2,
+            },
+        ];
+        assert!(!determine_healthy(&checks));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_csv_headers additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_csv_headers_extra_columns_reported() {
+        let header = "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SECURITY_ID,\
+                       UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,SERIES,\
+                       LOT_SIZE,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,TICK_SIZE,EXPIRY_FLAG,\
+                       EXTRA_COL1,EXTRA_COL2";
+        let result = check_csv_headers(header);
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("extra columns"),
+            "detail: {}",
+            result.detail
+        );
+        assert!(result.detail.contains("EXTRA_COL1"));
+        assert!(result.detail.contains("EXTRA_COL2"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_only_extra_columns() {
+        let header = "EXTRA1,EXTRA2,EXTRA3";
+        let result = check_csv_headers(header);
+        assert!(!result.passed, "missing all expected columns should fail");
+        assert!(result.detail.contains("MISSING"));
+    }
+
+    #[test]
+    fn test_check_csv_headers_whitespace_trimmed() {
+        // Columns with spaces around names
+        let header = " EXCH_ID , SEGMENT , SECURITY_ID , INSTRUMENT , UNDERLYING_SECURITY_ID ,\
+                        UNDERLYING_SYMBOL , SYMBOL_NAME , DISPLAY_NAME , SERIES ,\
+                        LOT_SIZE , SM_EXPIRY_DATE , STRIKE_PRICE , OPTION_TYPE , TICK_SIZE , EXPIRY_FLAG ";
+        let result = check_csv_headers(header);
+        assert!(
+            result.passed,
+            "whitespace should be trimmed: {}",
+            result.detail
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_time_gate additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_time_gate_wide_window() {
+        let result = check_time_gate("00:00:00", "23:59:59");
+        assert!(result.passed);
+        assert!(result.detail.contains("gate_open="));
+        assert!(result.detail.contains("ist_time="));
+    }
+
+    #[test]
+    fn test_check_time_gate_narrow_window() {
+        let result = check_time_gate("08:25:00", "08:26:00");
+        assert!(result.passed);
+        assert_eq!(result.name, "time_gate");
+    }
+
+    // -----------------------------------------------------------------------
+    // check_cache_status additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_cache_status_with_tmp_dir() {
+        let result = check_cache_status("/tmp", "nonexistent_file.csv");
+        assert!(result.passed);
+        assert!(result.detail.contains("dir_exists=true"));
+        assert!(result.detail.contains("csv_exists=false"));
+    }
+
+    #[test]
+    fn test_check_cache_status_reports_fresh_and_marker() {
+        let result = check_cache_status("/tmp/dlt-nonexistent-99999", "test.csv");
+        assert!(result.detail.contains("fresh="));
+        assert!(result.detail.contains("marker="));
+        assert!(result.detail.contains("cache_dir="));
+    }
+
+    #[test]
+    fn test_check_cache_status_with_actual_csv_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-diag-cache-status-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let csv_filename = "test-instruments.csv";
+        let csv_path = temp_dir.join(csv_filename);
+        std::fs::write(&csv_path, "HEADER,ROW\ndata,here\n").unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), csv_filename);
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("dir_exists=true"),
+            "detail: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csv_exists=true"),
+            "detail: {}",
+            result.detail
+        );
+        // csv_bytes should be non-zero
+        assert!(
+            !result.detail.contains("csv_bytes=0"),
+            "csv_bytes should be non-zero when file exists: {}",
+            result.detail
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_check_cache_status_with_fresh_marker() {
+        use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dlt-diag-fresh-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Write today's marker
+        let today = chrono::Utc::now()
+            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset())
+            .date_naive()
+            .to_string();
+        std::fs::write(temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME), &today).unwrap();
+
+        let result = check_cache_status(temp_dir.to_str().unwrap(), "missing.csv");
+        assert!(result.passed);
+        assert!(
+            result.detail.contains("fresh=true"),
+            "should be fresh when marker matches today: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(&today),
+            "marker content should appear: {}",
+            result.detail
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // DiagnosticReport / CheckResult additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diagnostic_report_unhealthy() {
+        let report = DiagnosticReport {
+            healthy: false,
+            checks: vec![
+                CheckResult {
+                    name: "url_reachability_primary".to_owned(),
+                    passed: true,
+                    detail: "HTTP 200".to_owned(),
+                    duration_ms: 100,
+                },
+                CheckResult {
+                    name: "csv_download".to_owned(),
+                    passed: false,
+                    detail: "download failed: timeout".to_owned(),
+                    duration_ms: 5000,
+                },
+            ],
+        };
+        assert!(!report.healthy);
+        assert_eq!(report.checks.len(), 2);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"healthy\":false"));
+    }
+
+    #[test]
+    fn test_check_result_serialization() {
+        let check = CheckResult {
+            name: "test_check".to_owned(),
+            passed: false,
+            detail: "something went wrong".to_owned(),
+            duration_ms: 999,
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        assert!(json.contains("\"name\":\"test_check\""));
+        assert!(json.contains("\"passed\":false"));
+        assert!(json.contains("\"duration_ms\":999"));
+    }
+
+    #[test]
+    fn test_segment_counts_debug() {
+        let counts = SegmentCounts {
+            nse_i: 1,
+            nse_e: 2,
+            nse_d: 3,
+            bse_i: 4,
+            bse_d: 5,
+        };
+        let debug_str = format!("{counts:?}");
+        assert!(debug_str.contains("nse_i: 1"));
+        assert!(debug_str.contains("bse_d: 5"));
+    }
+
+    #[test]
+    fn test_segment_counts_clone() {
+        let counts = SegmentCounts {
+            nse_i: 10,
+            nse_e: 20,
+            nse_d: 30,
+            bse_i: 40,
+            bse_d: 50,
+        };
+        let cloned = counts.clone();
+        assert_eq!(counts, cloned);
     }
 }
