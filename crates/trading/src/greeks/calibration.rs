@@ -787,6 +787,93 @@ mod tests {
         );
     }
 
+    /// Diagnostic: prints full Greek values for ATM NIFTY at both day counts (1 and 2)
+    /// across key (r, q, dc) combinations so the user can compare against Dhan's website.
+    ///
+    /// Run with: `cargo test --package dhan-live-trader-trading --lib greeks::calibration::tests::test_print_greeks_comparison_both_day_counts -- --nocapture`
+    // APPROVED: uses println! only in test code for diagnostic comparison against Dhan's website
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn test_print_greeks_comparison_both_day_counts() {
+        let spot = 23100.0;
+        let iv = 0.12; // 12% IV — typical short-dated NIFTY
+
+        let strikes = [22900.0, 23000.0, 23100.0, 23200.0, 23300.0];
+
+        // Key (r, q, dc) combinations to test.
+        let params: &[(f64, f64, f64)] = &[
+            (0.0, 0.0, 365.0),
+            (0.05, 0.0, 365.0),
+            (0.06, 0.0, 365.0),
+            (0.065, 0.0, 365.0),
+            (0.068, 0.0, 365.0),
+            (0.07, 0.0, 365.0),
+            (0.075, 0.0, 365.0),
+            (0.07, 0.005, 365.0),
+            (0.07, 0.01, 365.0),
+            (0.07, 0.012, 365.0),
+            (0.07, 0.015, 365.0),
+            (0.065, 0.012, 365.0),
+            (0.068, 0.012, 365.0),
+            (0.0, 0.0, 365.25),
+            (0.07, 0.0, 365.25),
+            (0.07, 0.012, 365.25),
+            (0.0, 0.0, 252.0),
+            (0.07, 0.0, 252.0),
+            (0.07, 0.012, 252.0),
+        ];
+
+        for &days in &[1i64, 2i64] {
+            let separator = "=".repeat(80);
+            println!("\n{separator}");
+            println!(
+                "=== DAYS TO EXPIRY: {days} ({})",
+                if days == 1 {
+                    "exclusive"
+                } else {
+                    "inclusive/Dhan display"
+                }
+            );
+            println!("=== Spot: {spot}, IV: {:.1}%", iv * 100.0);
+            println!("{separator}");
+
+            for &(r, q, dc) in params {
+                let time = days as f64 / dc;
+                println!("\n--- r={r:.3}, q={q:.3}, dc={dc:.1}, T={time:.8} ---");
+                println!(
+                    "{:<8} {:<5} {:>10} {:>10} {:>12} {:>10} {:>10}",
+                    "Strike", "Side", "Delta", "Gamma", "Theta", "Vega", "BS Price"
+                );
+
+                for &strike in &strikes {
+                    for &side in &[OptionSide::Call, OptionSide::Put] {
+                        let price = black_scholes::bs_price(side, spot, strike, time, r, q, iv);
+                        if price < 0.01 {
+                            continue;
+                        }
+                        let g = black_scholes::compute_greeks_from_iv(
+                            side, spot, strike, time, r, q, iv, price, dc,
+                        );
+                        let side_str = match side {
+                            OptionSide::Call => "CE",
+                            OptionSide::Put => "PE",
+                        };
+                        println!(
+                            "{:<8.0} {:<5} {:>10.6} {:>10.6} {:>12.6} {:>10.6} {:>10.4}",
+                            strike, side_str, g.delta, g.gamma, g.theta, g.vega, g.bs_price
+                        );
+                    }
+                }
+            }
+        }
+
+        // Always passes — this is a diagnostic output test.
+        assert!(
+            true,
+            "Diagnostic test — compare output against Dhan's website values"
+        );
+    }
+
     #[test]
     fn test_is_exact_match_threshold() {
         let exact = CalibrationResult {
