@@ -348,12 +348,19 @@ async fn main() -> Result<()> {
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
         let (subscription_plan, fresh_universe) = load_instruments(&config, is_trading).await;
 
-        // --- WebSocket connect: THE ONLY BLOCKING STEP (~400ms) ---
-        let (frame_receiver, ws_handles) =
-            build_websocket_pool(&token_handle, &client_id, &subscription_plan, &config, true)
-                .await;
+        // --- WebSocket pool create (channel only, NOT spawned yet) ---
+        let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
+            &token_handle,
+            &client_id,
+            &subscription_plan,
+            &config,
+            true,
+        ) {
+            Some((receiver, pool)) => (Some(receiver), Some(pool)),
+            None => (None, None),
+        };
 
-        // --- Tick processor: TICKS FLOWING (in-memory, no persistence yet) ---
+        // --- Tick processor: start BEFORE WS connections spawn ---
         let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
             std::sync::Arc::new(std::sync::RwLock::new(None));
 
@@ -362,7 +369,7 @@ async fn main() -> Result<()> {
             dhan_live_trader_common::tick_types::ParsedTick,
         >(1024);
 
-        let processor_handle = if let Some(receiver) = frame_receiver {
+        let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
             let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
             let snapshot_handle = Some(shared_movers.clone());
@@ -388,6 +395,13 @@ async fn main() -> Result<()> {
         } else {
             info!("tick processor skipped — no frame source available");
             None
+        };
+
+        // --- NOW spawn WebSocket connections (tick processor consuming) ---
+        let ws_handles = if let Some(pool) = ws_pool_ready {
+            spawn_websocket_connections(pool).await
+        } else {
+            Vec::new()
         };
 
         // =================================================================
@@ -840,24 +854,27 @@ async fn main() -> Result<()> {
         credentials.client_id.expose_secret().to_string()
     };
 
-    let (frame_receiver, ws_handles) = if subscription_plan.is_some() {
-        info!("building WebSocket connection pool");
-
-        build_websocket_pool(
+    // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
+    // Step 9 starts tick processor BEFORE connections are spawned so frames
+    // are consumed immediately — prevents frame send timeouts during stagger.
+    let (pool_receiver, ws_pool_ready) = if subscription_plan.is_some() {
+        match create_websocket_pool(
             &token_handle,
             &ws_client_id,
             &subscription_plan,
             &config,
             is_market_hours,
-        )
-        .await
+        ) {
+            Some((receiver, pool)) => (Some(receiver), Some(pool)),
+            None => (None, None),
+        }
     } else {
         warn!("WebSocket pool skipped — running in offline mode");
-        (None, Vec::new())
+        (None, None)
     };
 
     // -----------------------------------------------------------------------
-    // Step 9: Spawn tick processor (with tick broadcast for trading pipeline)
+    // Step 9: Spawn tick processor FIRST (before WS connections send frames)
     // -----------------------------------------------------------------------
     let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
         std::sync::Arc::new(std::sync::RwLock::new(None));
@@ -867,7 +884,7 @@ async fn main() -> Result<()> {
     let (tick_broadcast_sender, _tick_broadcast_default_rx) =
         tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(1024);
 
-    let processor_handle = if let Some(receiver) = frame_receiver {
+    let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
         let live_candle_writer =
             match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(
@@ -906,6 +923,13 @@ async fn main() -> Result<()> {
     } else {
         info!("tick processor skipped — no frame source available");
         None
+    };
+
+    // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
+    let ws_handles = if let Some(pool) = ws_pool_ready {
+        spawn_websocket_connections(pool).await
+    } else {
+        Vec::new()
     };
 
     // -----------------------------------------------------------------------
@@ -1207,21 +1231,25 @@ async fn load_instruments(
 // Helper: Build WebSocket connection pool (shared by fast and slow boot paths)
 // ---------------------------------------------------------------------------
 
-async fn build_websocket_pool(
+/// Creates the WebSocket connection pool and returns the frame receiver
+/// WITHOUT spawning connections. This allows the tick processor to start
+/// consuming frames BEFORE connections begin sending data, preventing
+/// frame send timeouts during the stagger period.
+fn create_websocket_pool(
     token_handle: &TokenHandle,
     client_id: &str,
     subscription_plan: &Option<SubscriptionPlan>,
     config: &ApplicationConfig,
     is_market_hours: bool,
-) -> (
-    Option<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
-    Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
-) {
+) -> Option<(
+    tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    WebSocketConnectionPool,
+)> {
     let plan = match subscription_plan {
         Some(p) => p,
         None => {
             warn!("WebSocket pool skipped — no subscription plan");
-            return (None, Vec::new());
+            return None;
         }
     };
 
@@ -1246,7 +1274,6 @@ async fn build_websocket_pool(
         .collect();
 
     let feed_mode = plan.summary.feed_mode;
-    let instrument_count = instruments.len();
 
     let mut pool = match WebSocketConnectionPool::new(
         token_handle.clone(),
@@ -1259,21 +1286,22 @@ async fn build_websocket_pool(
         Ok(pool) => pool,
         Err(err) => {
             error!(?err, "failed to create WebSocket connection pool");
-            return (None, Vec::new());
+            return None;
         }
     };
 
     let receiver = pool.take_frame_receiver();
+    Some((receiver, pool))
+}
+
+/// Spawns all WebSocket connections in the pool (with stagger).
+/// Call AFTER the tick processor is started so frames are consumed immediately.
+async fn spawn_websocket_connections(
+    pool: WebSocketConnectionPool,
+) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
     let handles = pool.spawn_all().await;
-
-    info!(
-        connections = handles.len(),
-        instruments = instrument_count,
-        feed_mode = %feed_mode,
-        "WebSocket pool started"
-    );
-
-    (Some(receiver), handles)
+    info!(connections = handles.len(), "WebSocket connections spawned");
+    handles
 }
 
 // ---------------------------------------------------------------------------
