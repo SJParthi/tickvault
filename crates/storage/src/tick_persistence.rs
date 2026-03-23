@@ -137,15 +137,15 @@ impl TickPersistenceWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
-            if let Err(err) = self.force_flush() {
-                // Flush failed — sender is now None. Buffer the tick we just
-                // tried to write (it's in the ILP buffer which is now lost).
-                warn!(
-                    ?err,
-                    "tick auto-flush failed — buffering ticks until recovery"
-                );
-            }
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+            && let Err(err) = self.force_flush()
+        {
+            // Flush failed — sender is now None. Buffer the tick we just
+            // tried to write (it's in the ILP buffer which is now lost).
+            warn!(
+                ?err,
+                "tick auto-flush failed — buffering ticks until recovery"
+            );
         }
 
         Ok(())
@@ -279,16 +279,16 @@ impl TickPersistenceWriter {
             drained += 1;
 
             // Flush in batches during drain to avoid unbounded ILP buffer growth.
-            if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
-                if let Err(err) = self.force_flush() {
-                    warn!(
-                        ?err,
-                        drained,
-                        remaining = self.tick_buffer.len(),
-                        "flush during buffer drain failed — pausing drain"
-                    );
-                    break; // Stop draining, remaining ticks stay in buffer
-                }
+            if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+                && let Err(err) = self.force_flush()
+            {
+                warn!(
+                    ?err,
+                    drained,
+                    remaining = self.tick_buffer.len(),
+                    "flush during buffer drain failed — pausing drain"
+                );
+                break; // Stop draining, remaining ticks stay in buffer
             }
         }
 
@@ -1049,17 +1049,17 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
     let mut gap_times: Vec<String> = Vec::new();
 
     for row in dataset {
-        if let Some(arr) = row.as_array() {
-            if arr.len() >= 2 {
-                let count = arr[1].as_u64().unwrap_or(0);
-                if count == 0 {
-                    gap_count = gap_count.saturating_add(1);
-                    if let Some(ts) = arr[0].as_str() {
-                        if gap_times.len() < 10 {
-                            // O(1) EXEMPT: bounded to 10 entries for alert message
-                            gap_times.push(ts.to_string());
-                        }
-                    }
+        if let Some(arr) = row.as_array()
+            && arr.len() >= 2
+        {
+            let count = arr[1].as_u64().unwrap_or(0);
+            if count == 0 {
+                gap_count = gap_count.saturating_add(1);
+                if let Some(ts) = arr[0].as_str()
+                    && gap_times.len() < 10
+                {
+                    // O(1) EXEMPT: bounded to 10 entries for alert message
+                    gap_times.push(ts.to_string());
                 }
             }
         }
