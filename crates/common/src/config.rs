@@ -502,6 +502,10 @@ pub struct GreeksConfig {
     /// IV solver convergence tolerance.
     #[serde(default = "default_iv_solver_tolerance")]
     pub iv_solver_tolerance: f64,
+    /// Day count divisor for theta conversion (365.0 = calendar, 252.0 = trading days).
+    /// Calibrated to match Dhan's computation. Default: 365.0.
+    #[serde(default = "default_day_count")]
+    pub day_count: f64,
 }
 
 impl Default for GreeksConfig {
@@ -513,6 +517,7 @@ impl Default for GreeksConfig {
             dividend_yield: default_dividend_yield(),
             iv_solver_max_iterations: default_iv_solver_max_iterations(),
             iv_solver_tolerance: default_iv_solver_tolerance(),
+            day_count: default_day_count(),
         }
     }
 }
@@ -539,6 +544,10 @@ const fn default_iv_solver_max_iterations() -> u32 {
 
 const fn default_iv_solver_tolerance() -> f64 {
     1e-8
+}
+
+const fn default_day_count() -> f64 {
+    365.0
 }
 
 // ---------------------------------------------------------------------------

@@ -60,6 +60,42 @@ Adding +5:30 to WebSocket timestamps corrupts:
 
 **If any test with "CRITICAL" in its name fails on tick timestamps: REVERT IMMEDIATELY.**
 
+## Greeks Pipeline Timestamp Rule — ALWAYS ADD +5:30 TO ts
+
+**THIS IS A CRITICAL DATA INTEGRITY RULE FOR GREEKS TABLES.**
+
+Greeks pipeline uses `Utc::now()` (system clock UTC) for timestamps.
+This is the same source as `received_at` in tick persistence.
+**ALWAYS add IST_UTC_OFFSET_NANOS** to convert UTC → IST for QuestDB display.
+
+Applies to ALL 4 tables:
+- `option_greeks`
+- `dhan_option_chain_raw`
+- `greeks_verification`
+- `pcr_snapshots`
+
+Pattern:
+```rust
+let now_nanos = Utc::now()
+    .timestamp_nanos_opt()
+    .unwrap_or(0)
+    .saturating_add(IST_UTC_OFFSET_NANOS);
+```
+
+Today's date for time-to-expiry MUST use IST timezone:
+```rust
+let today = (Utc::now() + TimeDelta::seconds(IST_UTC_OFFSET_SECONDS_I64)).date_naive();
+```
+
+**Why this differs from WebSocket:** WebSocket `exchange_timestamp` is already IST.
+`Utc::now()` is UTC and needs conversion. Different sources, different rules.
+
+**Mechanical enforcement:**
+- `test_critical_greeks_timestamp_includes_ist_offset` — scans source code for IST_UTC_OFFSET_NANOS
+- `test_critical_greeks_today_uses_ist` — scans source code for IST_UTC_OFFSET_SECONDS_I64
+
+**If any test with "CRITICAL" in its name fails on greeks timestamps: REVERT IMMEDIATELY.**
+
 ## Safety
 - SEV-1/SEV-2: halt trading FIRST, diagnose second
 

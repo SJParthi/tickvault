@@ -1,8 +1,8 @@
 # Implementation Plan: Fix Greeks Tables — IST, Symbols, Exact Parameter Calibration
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-23
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Context
 
@@ -35,25 +35,25 @@ Once found, update config defaults → our IV solver also produces matching resu
 
 ## Plan Items
 
-- [ ] P1: Fix IST timestamp offset for all 4 tables
+- [x] P1: Fix IST timestamp offset for all 4 tables
   - Files: crates/app/src/greeks_pipeline.rs
   - Change line 128: add `IST_UTC_OFFSET_NANOS` to `now_nanos`
   - Import: `use dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS;`
   - Tests: test_critical_greeks_timestamp_includes_ist_offset
 
-- [ ] P2: Fix IST-based today date for time-to-expiry
+- [x] P2: Fix IST-based today date for time-to-expiry
   - Files: crates/app/src/greeks_pipeline.rs
   - Change line 129: use IST-based date instead of UTC
   - Import: `use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;`
   - Tests: test_today_uses_ist_date
 
-- [ ] P3: Populate symbol_name from available data
+- [x] P3: Populate symbol_name from available data
   - Files: crates/app/src/greeks_pipeline.rs
   - Change line 313: construct `"{UNDERLYING} {STRIKE:.0} {CE/PE}"` (e.g., "NIFTY 23000 CE")
   - Cold path (every 60s) so format!() is fine
   - Tests: test_symbol_name_constructed
 
-- [ ] P4: Add dual-mode verification with Dhan IV passthrough
+- [x] P4: Add dual-mode verification with Dhan IV passthrough
   - Files: crates/app/src/greeks_pipeline.rs, crates/trading/src/greeks/black_scholes.rs
   - Add `compute_greeks_from_iv()` — takes IV directly (no solver), computes delta/gamma/theta/vega
   - In verification: compute Greeks TWICE:
@@ -64,7 +64,7 @@ Once found, update config defaults → our IV solver also produces matching resu
   - Match status: EXACT if calibrated Greeks match within f64 epsilon
   - Tests: test_compute_greeks_from_iv_matches_full, test_dhan_iv_passthrough_verification
 
-- [ ] P5: Parameter calibration — find Dhan's exact r, q, day_count
+- [x] P5: Parameter calibration — find Dhan's exact r, q, day_count
   - Files: crates/trading/src/greeks/calibration.rs (NEW), crates/trading/src/greeks/mod.rs
   - Add `calibrate_parameters()` function:
     - Input: Vec of (spot, strike, time_days, dhan_iv, dhan_delta, dhan_gamma, dhan_theta, dhan_vega)
@@ -74,25 +74,25 @@ Once found, update config defaults → our IV solver also produces matching resu
   - Run calibration on first cycle, log results, update config if needed
   - Tests: test_calibrate_known_parameters, test_calibrate_zero_error_with_correct_params
 
-- [ ] P6: Update config defaults after calibration confirms Dhan's parameters
+- [x] P6: Update config defaults after calibration confirms Dhan's parameters
   - Files: crates/common/src/config.rs
   - Update `default_risk_free_rate()` and `default_dividend_yield()` to match Dhan's exact values
   - Update `compute_time_to_expiry()` day count to match Dhan's convention
   - Tests: existing config tests + calibration round-trip test
 
-- [ ] P7: Fix classify_match for exact-match verification
+- [x] P7: Fix classify_match for exact-match verification
   - Files: crates/app/src/greeks_pipeline.rs
   - MATCH = all Greeks within f64 epsilon (1e-6) when using Dhan's IV + calibrated params
   - PARAM_DIFF = calibrated matches but our IV solver produces different IV (expected if params differ)
   - MISMATCH = even calibrated Greeks don't match (formula bug or data issue)
   - Tests: test_classify_exact_match, test_classify_param_diff, test_classify_formula_mismatch
 
-- [ ] P8: Add mechanical enforcement rule for IST timestamps
+- [x] P8: Add mechanical enforcement rule for IST timestamps
   - Files: .claude/rules/project/data-integrity.md
   - Add "Greeks Pipeline Timestamp Rule" section
   - Tests: test_critical_greeks_timestamp_includes_ist_offset (source code scan)
 
-- [ ] P9: Add/update all tests, build, verify
+- [x] P9: Add/update all tests, build, verify
   - Files: crates/app/src/greeks_pipeline.rs, crates/trading/src/greeks/calibration.rs
   - All new tests listed above
   - cargo build + cargo test --workspace

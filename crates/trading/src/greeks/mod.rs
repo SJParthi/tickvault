@@ -5,9 +5,11 @@
 //!
 //! # Modules
 //! - `black_scholes` — Core pricing model: BS price, IV solver, all 4 Greeks
+//! - `calibration` — Parameter calibration to match Dhan's exact Greeks
 //! - `pcr` — Put-Call Ratio from live OI data
 //! - `buildup` — Option activity classification (Long/Short Buildup/Unwinding)
 
 pub mod black_scholes;
 pub mod buildup;
+pub mod calibration;
 pub mod pcr;

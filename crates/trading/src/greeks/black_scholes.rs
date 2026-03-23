@@ -38,6 +38,11 @@ const IV_MAX: f64 = 5.0;
 /// Minimum time to expiry (prevents division by zero). ~1 minute in years.
 const MIN_TIME_TO_EXPIRY: f64 = 1.0 / (365.25 * 24.0 * 60.0);
 
+/// Default day count for theta conversion (calendar days per year).
+/// Used by `compute_greeks()`. For calibration, pass explicit day_count
+/// to `compute_greeks_from_iv()`.
+pub const DEFAULT_DAY_COUNT: f64 = 365.0;
+
 // ---------------------------------------------------------------------------
 // Option Type
 // ---------------------------------------------------------------------------
@@ -290,6 +295,9 @@ pub fn iv_solve(
 
 /// Computes all Greeks for a single option contract in O(1).
 ///
+/// Uses Newton-Raphson to solve for IV from market price, then computes all Greeks.
+/// Day count divisor defaults to 365.0 (calendar days per year).
+///
 /// # Arguments
 /// * `side` — Call or Put
 /// * `spot` — Underlying price (live tick LTP)
@@ -311,6 +319,76 @@ pub fn compute_greeks(
     market_price: f64,
 ) -> Option<OptionGreeks> {
     let iv = iv_solve(side, spot, strike, time, rate, div, market_price)?;
+    Some(greeks_from_iv(
+        side,
+        spot,
+        strike,
+        time,
+        rate,
+        div,
+        iv,
+        market_price,
+        DEFAULT_DAY_COUNT,
+    ))
+}
+
+/// Computes all Greeks using a **given IV** (no solver).
+///
+/// Use this to validate formulas independently from IV solver, or to replicate
+/// another provider's Greeks by feeding their IV directly.
+///
+/// # Arguments
+/// * `side` — Call or Put
+/// * `spot` — Underlying price
+/// * `strike` — Strike price
+/// * `time` — Time to expiry in years
+/// * `rate` — Risk-free rate (annualized)
+/// * `div` — Dividend yield (annualized)
+/// * `iv` — Implied volatility (annualized decimal, e.g., 0.30 = 30%)
+/// * `market_price` — Current option LTP (for intrinsic/extrinsic split)
+/// * `day_count` — Days per year for theta conversion (365.0, 365.25, or 252.0)
+// APPROVED: 9 params needed — each is a distinct BS model input; no natural grouping
+#[allow(clippy::too_many_arguments)]
+pub fn compute_greeks_from_iv(
+    side: OptionSide,
+    spot: f64,
+    strike: f64,
+    time: f64,
+    rate: f64,
+    div: f64,
+    iv: f64,
+    market_price: f64,
+    day_count: f64,
+) -> OptionGreeks {
+    greeks_from_iv(
+        side,
+        spot,
+        strike,
+        time,
+        rate,
+        div,
+        iv,
+        market_price,
+        day_count,
+    )
+}
+
+/// Internal helper: computes all Greeks from a known IV.
+///
+/// Shared by `compute_greeks()` (solver path) and `compute_greeks_from_iv()` (passthrough path).
+// APPROVED: 9 params — internal helper mirrors public API; no natural grouping
+#[allow(clippy::too_many_arguments)]
+fn greeks_from_iv(
+    side: OptionSide,
+    spot: f64,
+    strike: f64,
+    time: f64,
+    rate: f64,
+    div: f64,
+    iv: f64,
+    market_price: f64,
+    day_count: f64,
+) -> OptionGreeks {
     let t = time.max(MIN_TIME_TO_EXPIRY);
     let (d1, d2) = compute_d1_d2(spot, strike, t, rate, div, iv);
 
@@ -328,7 +406,7 @@ pub fn compute_greeks(
     // Gamma (same for call and put)
     let gamma = exp_qt * pdf_d1 / (spot * iv * sqrt_t);
 
-    // Theta (per calendar day, not per year)
+    // Theta (per calendar day)
     let theta_annual = match side {
         OptionSide::Call => {
             -spot * iv * exp_qt * pdf_d1 / (2.0 * sqrt_t) - rate * strike * exp_rt * normal_cdf(d2)
@@ -339,7 +417,7 @@ pub fn compute_greeks(
                 - div * spot * exp_qt * normal_cdf(-d1)
         }
     };
-    let theta = theta_annual / 365.25; // Per calendar day
+    let theta = theta_annual / day_count;
 
     // Vega (per 1% IV change)
     let vega = spot * exp_qt * pdf_d1 * sqrt_t / 100.0;
@@ -354,7 +432,7 @@ pub fn compute_greeks(
     };
     let extrinsic = (market_price - intrinsic).max(0.0);
 
-    Some(OptionGreeks {
+    OptionGreeks {
         iv,
         delta,
         gamma,
@@ -363,7 +441,7 @@ pub fn compute_greeks(
         bs_price: bs_theoretical,
         intrinsic,
         extrinsic,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
