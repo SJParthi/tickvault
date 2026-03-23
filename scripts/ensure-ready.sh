@@ -36,22 +36,19 @@ open_url() {
 # ---- Auto-open all monitoring dashboards ----
 open_dashboards() {
     echo -e "${CYAN}Opening monitoring dashboards...${NC}"
-    # Grafana: anonymous access enabled — no login required
+    # QuestDB web console — primary SQL tool
+    open_url "http://localhost:9000"
+    sleep 0.3
+    # Grafana dashboards (anonymous access enabled — no login required)
     open_url "http://localhost:3000/d/dlt-system-overview/dlt-system-overview?orgId=1&refresh=5s"
     sleep 0.3
-    open_url "http://localhost:9090/targets"
+    open_url "http://localhost:3000/d/dlt-market-data/market-data-explorer?orgId=1&from=now-3d&to=now&timezone=Asia%2FKolkata&refresh=5s"
     sleep 0.3
+    open_url "http://localhost:3000/d/dlt-trading-pipeline/trading-pipeline?orgId=1&refresh=5s"
+    sleep 0.3
+    # Jaeger tracing UI
     open_url "http://localhost:16686"
-    sleep 0.3
-    open_url "http://localhost:8080"
-    sleep 0.3
-    # QuestDB web console — use this for SQL queries (NOT IntelliJ Database tool)
-    open_url "http://localhost:9000"
-    echo -e "${GREEN}Opened: Grafana, Prometheus, Jaeger, Traefik, QuestDB${NC}"
-    echo ""
-    echo -e "${YELLOW}NOTE:${NC} QuestDB SQL queries → use Web Console (localhost:9000) or Grafana Explore."
-    echo -e "${YELLOW}      ${NC} IntelliJ Database tool shows pg_catalog errors — this is a known QuestDB"
-    echo -e "${YELLOW}      ${NC} limitation (QuestDB's PG wire protocol doesn't support system catalogs)."
+    echo -e "${GREEN}Opened: QuestDB, Grafana (3 dashboards), Jaeger${NC}"
 }
 
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
@@ -97,10 +94,18 @@ all_running() {
     return 0
 }
 
-# Quick check — if everything is already running, exit immediately
+# Quick check — if everything is already running, still ensure schema is up-to-date
 if all_running; then
     ensure_pgpass
-    echo -e "${GREEN}All 8 infrastructure containers running. Ready.${NC}"
+    echo -e "${GREEN}All 8 infrastructure containers running.${NC}"
+    # Always run schema init (idempotent) — ensures new tables are created
+    # even when containers were already running before a code update.
+    echo -e "${CYAN}Ensuring QuestDB schema is up-to-date...${NC}"
+    if bash "${SCRIPT_DIR}/questdb-init.sh" localhost 9000; then
+        echo -e "  ${GREEN}QuestDB schema ready${NC}"
+    else
+        echo -e "  ${YELLOW}QuestDB schema init had warnings — app will retry at boot${NC}"
+    fi
     open_dashboards
     exit 0
 fi
