@@ -180,42 +180,12 @@ async fn connect_and_listen(
 
     debug!("order update WebSocket login sent");
 
-    // Wait for the server's auth response before entering the main read loop.
-    let auth_timeout = Duration::from_secs(ORDER_UPDATE_AUTH_TIMEOUT_SECS);
-    match time::timeout(auth_timeout, read.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match classify_auth_response(&text) {
-            AuthResponseKind::Success => {
-                info!("order update WebSocket auth succeeded");
-            }
-            AuthResponseKind::Failed(reason) => {
-                error!(reason = %reason, "order update WebSocket auth failed");
-                return Err(OrderUpdateConnectionError::AuthFailed(reason));
-            }
-        },
-        Ok(Some(Ok(Message::Close(frame)))) => {
-            warn!(?frame, "order update WebSocket closed during auth");
-            return Err(OrderUpdateConnectionError::AuthFailed(
-                "server closed connection during auth handshake".to_string(), // O(1) EXEMPT: cold error path
-            ));
-        }
-        Ok(Some(Err(err))) => {
-            return Err(OrderUpdateConnectionError::Read(err.to_string())); // O(1) EXEMPT: cold error path
-        }
-        Ok(None) => {
-            return Err(OrderUpdateConnectionError::AuthFailed(
-                "stream ended before auth response".to_string(), // O(1) EXEMPT: cold error path
-            ));
-        }
-        Err(_) => {
-            return Err(OrderUpdateConnectionError::AuthTimeout);
-        }
-        // Ping/Pong/Binary — skip and treat as no auth response.
-        Ok(Some(Ok(_))) => {
-            warn!(
-                "order update WebSocket received non-text message during auth — treating as success"
-            );
-        }
-    }
+    // Dhan's order update WS does NOT send an explicit auth response.
+    // After accepting the login, it silently starts streaming order updates
+    // when new ones arrive. If auth fails, the server sends a Close frame
+    // which the read loop below detects. No need to wait for a response
+    // that may never come (causes false AuthTimeout reconnect loops).
+    info!("order update WebSocket login sent — entering read loop");
 
     // Use longer timeout outside market hours to avoid reconnect noise.
     let timeout_secs = select_read_timeout_secs(is_within_market_hours(calendar));
@@ -254,12 +224,24 @@ async fn connect_and_listen(
                         let _ = order_sender.send(update);
                     }
                     Err(err) => {
-                        // Could be a login response or heartbeat — not all messages are order updates.
-                        debug!(
-                            ?err,
-                            text_preview = &text[..text.len().min(200)],
-                            "non-order JSON message"
-                        );
+                        // Not a valid order update — check if it's an auth error.
+                        match classify_auth_response(&text) {
+                            AuthResponseKind::Failed(reason) => {
+                                error!(
+                                    reason = %reason,
+                                    "order update WebSocket auth/API error from server"
+                                );
+                                return Err(OrderUpdateConnectionError::AuthFailed(reason));
+                            }
+                            AuthResponseKind::Success => {
+                                // Login ack or heartbeat — not all messages are order updates.
+                                debug!(
+                                    ?err,
+                                    text_preview = &text[..text.len().min(200)],
+                                    "non-order JSON message"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -497,6 +479,7 @@ enum OrderUpdateConnectionError {
     AuthFailed(String),
 
     #[error("no auth response within {ORDER_UPDATE_AUTH_TIMEOUT_SECS}s")]
+    #[allow(dead_code)] // APPROVED: kept for test coverage + future auth timeout detection
     AuthTimeout,
 
     #[error("read error: {0}")]
