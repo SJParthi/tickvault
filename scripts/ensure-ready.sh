@@ -169,31 +169,16 @@ if ! bash "${SCRIPT_DIR}/setup-observability.sh" --no-open; then
     exit 1
 fi
 
-# 4. Create QuestDB tables (idempotent)
+# 4. Create ALL QuestDB tables + materialized views (idempotent)
+#    Single source of truth: scripts/questdb-init.sh
+#    Creates 15 tables + 11 DEDUP keys + 18 materialized views
 echo ""
-echo -e "${CYAN}Ensuring QuestDB tables exist...${NC}"
-QUESTDB_EXEC_URL="http://localhost:9000/exec"
-
-init_table() {
-    local description="$1"
-    local ddl="$2"
-    echo -n "  $description... "
-    if curl -sf --max-time 5 -G "${QUESTDB_EXEC_URL}" --data-urlencode "query=${ddl}" > /dev/null 2>&1; then
-        echo -e "${GREEN}OK${NC}"
-    else
-        echo -e "${YELLOW}SKIPPED${NC} (app creates tables at runtime)"
-    fi
-}
-
-init_table "ticks" "CREATE TABLE IF NOT EXISTS ticks (segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, exchange_timestamp LONG, received_at TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
-
-init_table "instrument_build_metadata" "CREATE TABLE IF NOT EXISTS instrument_build_metadata (csv_source SYMBOL, csv_row_count LONG, parsed_row_count LONG, index_count LONG, equity_count LONG, underlying_count LONG, derivative_count LONG, option_chain_count LONG, build_duration_ms LONG, build_timestamp TIMESTAMP, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
-
-init_table "fno_underlyings" "CREATE TABLE IF NOT EXISTS fno_underlyings (underlying_symbol SYMBOL, price_feed_segment SYMBOL, derivative_segment SYMBOL, kind SYMBOL, underlying_security_id LONG, price_feed_security_id LONG, lot_size LONG, contract_count LONG, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
-
-init_table "derivative_contracts" "CREATE TABLE IF NOT EXISTS derivative_contracts (underlying_symbol SYMBOL, instrument_kind SYMBOL, exchange_segment SYMBOL, option_type SYMBOL, symbol_name SYMBOL, security_id LONG, expiry_date STRING, strike_price DOUBLE, lot_size LONG, tick_size DOUBLE, display_name STRING, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
-
-init_table "subscribed_indices" "CREATE TABLE IF NOT EXISTS subscribed_indices (symbol SYMBOL, exchange SYMBOL, category SYMBOL, subcategory SYMBOL, security_id LONG, timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY WAL"
+echo -e "${CYAN}Ensuring QuestDB schema (15 tables + 18 views)...${NC}"
+if bash "${SCRIPT_DIR}/questdb-init.sh" localhost 9000; then
+    echo -e "  ${GREEN}QuestDB schema ready${NC}"
+else
+    echo -e "  ${YELLOW}QuestDB schema init had errors — app will retry at boot${NC}"
+fi
 
 # 5. Verify QuestDB PG wire protocol (port 8812) is accepting connections
 #    IntelliJ database tool uses this port. HTTP (9000) can be ready before PG wire (8812).
