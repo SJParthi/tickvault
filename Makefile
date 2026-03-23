@@ -6,7 +6,7 @@
 # =============================================================================
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
-        docker-up docker-down docker-restart docker-status docker-logs \
+        docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
@@ -115,22 +115,26 @@ clean: ## Clean build artifacts
 # DOCKER INFRASTRUCTURE
 # =============================================================================
 
-docker-up: ## Start all Docker infrastructure (8 services)
+docker-up: ## Start all Docker infrastructure (8 services) + auto-init QuestDB schema
 	@echo "🐳 Starting Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ""
 	@$(MAKE) docker-status
+	@echo "🗄️  Initializing QuestDB schema (15 tables + 18 views)..."
+	@bash scripts/questdb-init.sh
 
 docker-down: ## Stop all Docker infrastructure
 	@echo "🐳 Stopping Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) down
 
-docker-restart: ## Restart all Docker infrastructure
+docker-restart: ## Restart all Docker infrastructure + re-init QuestDB schema
 	@echo "🐳 Restarting Docker infrastructure..."
 	docker compose -f $(COMPOSE_FILE) down
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ""
 	@$(MAKE) docker-status
+	@echo "🗄️  Initializing QuestDB schema (15 tables + 18 views)..."
+	@bash scripts/questdb-init.sh
 
 docker-status: ## Show Docker container health
 	@echo ""
@@ -141,6 +145,9 @@ docker-status: ## Show Docker container health
 
 docker-logs: ## Tail Docker logs (all services)
 	docker compose -f $(COMPOSE_FILE) logs -f --tail 50
+
+questdb-init: ## Create all QuestDB tables + materialized views (idempotent)
+	@bash scripts/questdb-init.sh
 
 # =============================================================================
 # HEALTH & STATUS
