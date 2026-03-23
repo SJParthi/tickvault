@@ -530,12 +530,15 @@ const fn default_greeks_fetch_interval_secs() -> u64 {
     60
 }
 
+// Calibrated against Dhan's live option chain data (2026-03-23).
+// Dhan's theta best matches at r ≈ 0.10. Gamma/vega insensitive to rate for short-dated.
 const fn default_risk_free_rate() -> f64 {
-    0.068
+    0.10
 }
 
+// Calibrated: Dhan uses q=0.0 for index options (no continuous dividend).
 const fn default_dividend_yield() -> f64 {
-    0.012
+    0.0
 }
 
 const fn default_iv_solver_max_iterations() -> u32 {

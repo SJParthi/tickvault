@@ -208,7 +208,10 @@ async fn process_underlying(
 
     let spot_price = chain.data.last_price;
     let days_to_expiry = compute_days_to_expiry(nearest_expiry, today);
-    let time_to_expiry = days_to_years(days_to_expiry, config.day_count);
+    // Use fractional days for precision (critical for short-dated options).
+    // NSE options expire at 15:30 IST on expiry day.
+    let fractional_days = compute_fractional_days_to_expiry(nearest_expiry, ts_nanos);
+    let time_to_expiry = fractional_days / config.day_count;
 
     // Accumulators for PCR and calibration.
     let mut total_call_oi: i64 = 0;
@@ -581,6 +584,40 @@ fn compute_days_to_expiry(expiry_str: &str, today: NaiveDate) -> i64 {
     };
     let days = (expiry - today).num_days();
     if days <= 0 { 0 } else { days }
+}
+
+/// NSE market close time: 15:30 IST = 15*3600 + 30*60 = 55800 seconds from midnight.
+const NSE_CLOSE_SECONDS_IST: i64 = 55_800;
+
+/// Computes fractional days to expiry with hour-level precision.
+///
+/// Options expire at NSE market close (15:30 IST) on expiry day.
+/// Uses current IST timestamp (already offset) for precise remaining time.
+///
+/// Example: If now is 14:30 IST on day before expiry (24h + 1h remaining = 25h = 1.04 days).
+fn compute_fractional_days_to_expiry(expiry_str: &str, now_ist_nanos: i64) -> f64 {
+    let expiry = match NaiveDate::parse_from_str(expiry_str, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return 0.0,
+    };
+
+    // Expiry moment = expiry_date at 15:30 IST (NSE close), in nanoseconds.
+    // expiry_date midnight epoch + 15:30 in nanos.
+    let expiry_midnight_secs = expiry
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or(0);
+    let expiry_close_nanos =
+        (expiry_midnight_secs + NSE_CLOSE_SECONDS_IST).saturating_mul(1_000_000_000);
+
+    // Remaining time in fractional days.
+    let remaining_nanos = expiry_close_nanos.saturating_sub(now_ist_nanos);
+    if remaining_nanos <= 0 {
+        return 0.0;
+    }
+
+    // Convert nanos to fractional days (1 day = 86400 seconds = 86_400_000_000_000 nanos).
+    remaining_nanos as f64 / 86_400_000_000_000.0
 }
 
 /// Computes time-to-expiry in years from calendar days.
