@@ -1078,6 +1078,51 @@ mod tests {
             );
         }
 
+        // Also report SSE for exact integer day counts (1 and 2) at best (r, q, dc).
+        for integer_days in [1.0_f64, 2.0] {
+            let t_int = integer_days / best_dc;
+            let mut sse_int = 0.0;
+            for &(strike, iv_pct, d_delta, d_gamma, d_theta, d_vega, ltp) in DHAN_CE_DATA {
+                let iv = iv_pct / 100.0;
+                let g = compute_greeks_from_iv(
+                    OptionSide::Call,
+                    SPOT,
+                    strike,
+                    t_int,
+                    best_r,
+                    best_q,
+                    iv,
+                    ltp,
+                    best_dc,
+                );
+                sse_int += (g.delta - d_delta).powi(2)
+                    + (g.gamma - d_gamma).powi(2)
+                    + (g.theta - d_theta).powi(2)
+                    + (g.vega - d_vega).powi(2);
+            }
+            for &(strike, iv_pct, d_delta, d_gamma, d_theta, d_vega, ltp) in DHAN_PE_DATA {
+                let iv = iv_pct / 100.0;
+                let g = compute_greeks_from_iv(
+                    OptionSide::Put,
+                    SPOT,
+                    strike,
+                    t_int,
+                    best_r,
+                    best_q,
+                    iv,
+                    ltp,
+                    best_dc,
+                );
+                sse_int += (g.delta - d_delta).powi(2)
+                    + (g.gamma - d_gamma).powi(2)
+                    + (g.theta - d_theta).powi(2)
+                    + (g.vega - d_vega).powi(2);
+            }
+            eprintln!(
+                "\nSSE at exact days={integer_days:.0} with best (r={best_r}, q={best_q}, dc={best_dc}): {sse_int:.4}"
+            );
+        }
+
         // The calibration should find parameters that produce a reasonably low error.
         // With fractional time precision, the formulas are proven correct.
         assert!(
