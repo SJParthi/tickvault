@@ -67,7 +67,6 @@ const OPTION_GREEKS_DDL: &str = "\
         buildup_type SYMBOL,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
-    DEDUP UPSERT KEYS(security_id, segment)\
 ";
 
 /// SQL to create the `pcr_snapshots` table.
@@ -86,7 +85,6 @@ const PCR_SNAPSHOTS_DDL: &str = "\
         sentiment SYMBOL,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
-    DEDUP UPSERT KEYS(underlying_symbol, expiry_date)\
 ";
 
 /// SQL to create the `dhan_option_chain_raw` table.
@@ -124,7 +122,6 @@ const DHAN_OPTION_CHAIN_RAW_DDL: &str = "\
         vega DOUBLE,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
-    DEDUP UPSERT KEYS(security_id, segment)\
 ";
 
 /// QuestDB table name for raw Dhan option chain snapshots.
@@ -160,8 +157,23 @@ const GREEKS_VERIFICATION_DDL: &str = "\
         match_status SYMBOL,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
-    DEDUP UPSERT KEYS(security_id, segment)\
 ";
+
+// ---------------------------------------------------------------------------
+// DEDUP UPSERT KEYS — must be separate ALTER TABLE (QuestDB rejects inline)
+// ---------------------------------------------------------------------------
+
+/// DEDUP key for `option_greeks`.
+const DEDUP_KEY_OPTION_GREEKS: &str = "security_id, segment";
+
+/// DEDUP key for `pcr_snapshots`.
+const DEDUP_KEY_PCR_SNAPSHOTS: &str = "underlying_symbol, expiry_date";
+
+/// DEDUP key for `dhan_option_chain_raw`.
+const DEDUP_KEY_DHAN_OPTION_CHAIN_RAW: &str = "security_id, segment";
+
+/// DEDUP key for `greeks_verification`.
+const DEDUP_KEY_GREEKS_VERIFICATION: &str = "security_id, segment";
 
 // ---------------------------------------------------------------------------
 // Public API — Table Setup
@@ -187,6 +199,7 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
         }
     };
 
+    // Step 1: CREATE TABLE IF NOT EXISTS (no inline DEDUP — QuestDB rejects it).
     execute_ddl(
         &client,
         &base_url,
@@ -215,6 +228,34 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
         "greeks_verification CREATE",
     )
     .await;
+
+    // Step 2: DEDUP UPSERT KEYS via ALTER TABLE (idempotent — re-enabling is a no-op).
+    let dedup_statements: &[(&str, &str, &str)] = &[
+        (
+            TABLE_OPTION_GREEKS,
+            DEDUP_KEY_OPTION_GREEKS,
+            "option_greeks DEDUP",
+        ),
+        (
+            TABLE_PCR_SNAPSHOTS,
+            DEDUP_KEY_PCR_SNAPSHOTS,
+            "pcr_snapshots DEDUP",
+        ),
+        (
+            TABLE_DHAN_OPTION_CHAIN_RAW,
+            DEDUP_KEY_DHAN_OPTION_CHAIN_RAW,
+            "dhan_option_chain_raw DEDUP",
+        ),
+        (
+            TABLE_GREEKS_VERIFICATION,
+            DEDUP_KEY_GREEKS_VERIFICATION,
+            "greeks_verification DEDUP",
+        ),
+    ];
+    for (table, dedup_key, label) in dedup_statements {
+        let dedup_sql = format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, {dedup_key})");
+        execute_ddl(&client, &base_url, &dedup_sql, label).await;
+    }
 
     info!(
         "Greeks tables setup complete (option_greeks, pcr_snapshots, dhan_option_chain_raw, greeks_verification)"
@@ -263,10 +304,14 @@ mod tests {
     }
 
     #[test]
-    fn test_option_greeks_ddl_has_dedup_key() {
+    fn test_option_greeks_dedup_key_constant() {
         assert!(
-            OPTION_GREEKS_DDL.contains("DEDUP UPSERT KEYS(security_id, segment)"),
-            "option_greeks must have dedup on security_id + segment"
+            DEDUP_KEY_OPTION_GREEKS.contains("security_id"),
+            "option_greeks dedup must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_OPTION_GREEKS.contains("segment"),
+            "option_greeks dedup must include segment"
         );
     }
 
@@ -312,10 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn test_pcr_snapshots_ddl_contains_dedup() {
+    fn test_pcr_snapshots_dedup_key_constant() {
         assert!(
-            PCR_SNAPSHOTS_DDL.contains("DEDUP UPSERT KEYS(underlying_symbol, expiry_date)"),
-            "pcr_snapshots must dedup on underlying + expiry"
+            DEDUP_KEY_PCR_SNAPSHOTS.contains("underlying_symbol"),
+            "pcr_snapshots dedup must include underlying_symbol"
+        );
+        assert!(
+            DEDUP_KEY_PCR_SNAPSHOTS.contains("expiry_date"),
+            "pcr_snapshots dedup must include expiry_date"
         );
     }
 
@@ -374,9 +423,14 @@ mod tests {
     }
 
     #[test]
-    fn test_verification_ddl_has_security_id_dedup() {
+    fn test_verification_ddl_has_security_id() {
         assert!(GREEKS_VERIFICATION_DDL.contains("security_id LONG"));
-        assert!(GREEKS_VERIFICATION_DDL.contains("DEDUP UPSERT KEYS(security_id, segment)"));
+    }
+
+    #[test]
+    fn test_verification_dedup_key_constant() {
+        assert!(DEDUP_KEY_GREEKS_VERIFICATION.contains("security_id"));
+        assert!(DEDUP_KEY_GREEKS_VERIFICATION.contains("segment"));
     }
 
     #[test]
@@ -467,11 +521,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dhan_raw_ddl_dedup_and_partition() {
-        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("DEDUP UPSERT KEYS(security_id, segment)"));
+    fn test_dhan_raw_ddl_partition_and_wal() {
         assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("PARTITION BY HOUR WAL"));
         assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("TIMESTAMP(ts)"));
         assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_dhan_raw_dedup_key_constant() {
+        assert!(DEDUP_KEY_DHAN_OPTION_CHAIN_RAW.contains("security_id"));
+        assert!(DEDUP_KEY_DHAN_OPTION_CHAIN_RAW.contains("segment"));
     }
 
     #[test]

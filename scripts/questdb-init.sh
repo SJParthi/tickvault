@@ -123,21 +123,21 @@ create_base_tables() {
     execute_ddl "index_constituents" \
         "CREATE TABLE IF NOT EXISTS index_constituents (index_name SYMBOL, symbol SYMBOL, isin STRING, weight DOUBLE, sector STRING, security_id LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY MONTH WAL"
 
-    # 12. option_greeks
+    # 12. option_greeks (DEDUP via ALTER TABLE in Phase 2 — QuestDB rejects inline DEDUP)
     execute_ddl "option_greeks" \
-        "CREATE TABLE IF NOT EXISTS option_greeks (segment SYMBOL, security_id LONG, symbol_name SYMBOL, underlying_security_id LONG, underlying_symbol SYMBOL, strike_price DOUBLE, option_type SYMBOL, expiry_date SYMBOL, iv DOUBLE, delta DOUBLE, gamma DOUBLE, theta DOUBLE, vega DOUBLE, bs_price DOUBLE, intrinsic_value DOUBLE, extrinsic_value DOUBLE, spot_price DOUBLE, option_ltp DOUBLE, oi LONG, volume LONG, buildup_type SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL DEDUP UPSERT KEYS(security_id, segment)"
+        "CREATE TABLE IF NOT EXISTS option_greeks (segment SYMBOL, security_id LONG, symbol_name SYMBOL, underlying_security_id LONG, underlying_symbol SYMBOL, strike_price DOUBLE, option_type SYMBOL, expiry_date SYMBOL, iv DOUBLE, delta DOUBLE, gamma DOUBLE, theta DOUBLE, vega DOUBLE, bs_price DOUBLE, intrinsic_value DOUBLE, extrinsic_value DOUBLE, spot_price DOUBLE, option_ltp DOUBLE, oi LONG, volume LONG, buildup_type SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
 
     # 13. pcr_snapshots
     execute_ddl "pcr_snapshots" \
-        "CREATE TABLE IF NOT EXISTS pcr_snapshots (underlying_symbol SYMBOL, expiry_date SYMBOL, pcr_oi DOUBLE, pcr_volume DOUBLE, total_put_oi LONG, total_call_oi LONG, total_put_volume LONG, total_call_volume LONG, sentiment SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL DEDUP UPSERT KEYS(underlying_symbol, expiry_date)"
+        "CREATE TABLE IF NOT EXISTS pcr_snapshots (underlying_symbol SYMBOL, expiry_date SYMBOL, pcr_oi DOUBLE, pcr_volume DOUBLE, total_put_oi LONG, total_call_oi LONG, total_put_volume LONG, total_call_volume LONG, sentiment SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
 
     # 14. dhan_option_chain_raw
     execute_ddl "dhan_option_chain_raw" \
-        "CREATE TABLE IF NOT EXISTS dhan_option_chain_raw (security_id LONG, segment SYMBOL, symbol_name SYMBOL, underlying_symbol SYMBOL, underlying_security_id LONG, underlying_segment SYMBOL, strike_price DOUBLE, option_type SYMBOL, expiry_date SYMBOL, spot_price DOUBLE, last_price DOUBLE, average_price DOUBLE, oi LONG, previous_close_price DOUBLE, previous_oi LONG, previous_volume LONG, volume LONG, top_bid_price DOUBLE, top_bid_quantity LONG, top_ask_price DOUBLE, top_ask_quantity LONG, implied_volatility DOUBLE, delta DOUBLE, theta DOUBLE, gamma DOUBLE, vega DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL DEDUP UPSERT KEYS(security_id, segment)"
+        "CREATE TABLE IF NOT EXISTS dhan_option_chain_raw (security_id LONG, segment SYMBOL, symbol_name SYMBOL, underlying_symbol SYMBOL, underlying_security_id LONG, underlying_segment SYMBOL, strike_price DOUBLE, option_type SYMBOL, expiry_date SYMBOL, spot_price DOUBLE, last_price DOUBLE, average_price DOUBLE, oi LONG, previous_close_price DOUBLE, previous_oi LONG, previous_volume LONG, volume LONG, top_bid_price DOUBLE, top_bid_quantity LONG, top_ask_price DOUBLE, top_ask_quantity LONG, implied_volatility DOUBLE, delta DOUBLE, theta DOUBLE, gamma DOUBLE, vega DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
 
     # 15. greeks_verification
     execute_ddl "greeks_verification" \
-        "CREATE TABLE IF NOT EXISTS greeks_verification (security_id LONG, segment SYMBOL, symbol_name SYMBOL, underlying_symbol SYMBOL, strike_price DOUBLE, option_type SYMBOL, our_iv DOUBLE, dhan_iv DOUBLE, iv_diff DOUBLE, our_delta DOUBLE, dhan_delta DOUBLE, delta_diff DOUBLE, our_gamma DOUBLE, dhan_gamma DOUBLE, gamma_diff DOUBLE, our_theta DOUBLE, dhan_theta DOUBLE, theta_diff DOUBLE, our_vega DOUBLE, dhan_vega DOUBLE, vega_diff DOUBLE, match_status SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(security_id, segment)"
+        "CREATE TABLE IF NOT EXISTS greeks_verification (security_id LONG, segment SYMBOL, symbol_name SYMBOL, underlying_symbol SYMBOL, strike_price DOUBLE, option_type SYMBOL, our_iv DOUBLE, dhan_iv DOUBLE, iv_diff DOUBLE, our_delta DOUBLE, dhan_delta DOUBLE, delta_diff DOUBLE, our_gamma DOUBLE, dhan_gamma DOUBLE, gamma_diff DOUBLE, our_theta DOUBLE, dhan_theta DOUBLE, theta_diff DOUBLE, our_vega DOUBLE, dhan_vega DOUBLE, vega_diff DOUBLE, match_status SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL"
 
     echo ""
 }
@@ -181,6 +181,19 @@ apply_dedup_keys() {
 
     execute_ddl "index_constituents DEDUP" \
         "ALTER TABLE index_constituents DEDUP ENABLE UPSERT KEYS(ts, index_name, symbol)"
+
+    # Greeks tables (12-15)
+    execute_ddl "option_greeks DEDUP" \
+        "ALTER TABLE option_greeks DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
+
+    execute_ddl "pcr_snapshots DEDUP" \
+        "ALTER TABLE pcr_snapshots DEDUP ENABLE UPSERT KEYS(ts, underlying_symbol, expiry_date)"
+
+    execute_ddl "dhan_option_chain_raw DEDUP" \
+        "ALTER TABLE dhan_option_chain_raw DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
+
+    execute_ddl "greeks_verification DEDUP" \
+        "ALTER TABLE greeks_verification DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
     echo ""
 }
