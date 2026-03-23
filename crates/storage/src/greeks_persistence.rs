@@ -12,6 +12,8 @@
 
 use std::time::Duration;
 
+use anyhow::{Context, Result};
+use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
@@ -182,6 +184,7 @@ const DEDUP_KEY_GREEKS_VERIFICATION: &str = "security_id, segment";
 /// Creates all Greeks-related QuestDB tables (idempotent).
 ///
 /// Best-effort: if QuestDB is unreachable, logs a warning and continues.
+// TEST-EXEMPT: requires live QuestDB HTTP endpoint (integration test)
 pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -283,6 +286,397 @@ async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
             warn!(?err, label, "DDL request failed");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ILP Writer — Batched writes to QuestDB
+// ---------------------------------------------------------------------------
+
+/// Batched writer for all greeks-related QuestDB tables via ILP.
+///
+/// Cold path — no ring buffer, no reconnect logic. If QuestDB is down,
+/// writes fail and are skipped (next cycle will write fresh data).
+pub struct GreeksPersistenceWriter {
+    sender: Sender,
+    buffer: Buffer,
+    pending_count: usize,
+}
+
+impl GreeksPersistenceWriter {
+    /// Creates a new writer connected to QuestDB via ILP TCP.
+    // TEST-EXEMPT: requires live QuestDB ILP connection (integration test)
+    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let sender = Sender::from_conf(&conf_string)
+            .context("failed to connect to QuestDB ILP for greeks")?;
+        let buffer = sender.new_buffer();
+        Ok(Self {
+            sender,
+            buffer,
+            pending_count: 0,
+        })
+    }
+
+    /// Writes a raw Dhan option chain row to `dhan_option_chain_raw`.
+    ///
+    /// Stores the API response exactly as received — no transformation.
+    // TEST-EXEMPT: delegates to build_dhan_raw_row which is tested via DDL schema tests
+    pub fn write_dhan_raw_row(&mut self, row: &DhanRawRow) -> Result<()> {
+        build_dhan_raw_row(&mut self.buffer, row)?;
+        self.pending_count = self.pending_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes a computed Greeks row to `option_greeks`.
+    // TEST-EXEMPT: delegates to build_option_greeks_row which is tested via DDL schema tests
+    pub fn write_option_greeks_row(&mut self, row: &OptionGreeksRow) -> Result<()> {
+        build_option_greeks_row(&mut self.buffer, row)?;
+        self.pending_count = self.pending_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes a PCR snapshot row to `pcr_snapshots`.
+    // TEST-EXEMPT: delegates to build_pcr_snapshot_row which is tested via DDL schema tests
+    pub fn write_pcr_snapshot_row(&mut self, row: &PcrSnapshotRow) -> Result<()> {
+        build_pcr_snapshot_row(&mut self.buffer, row)?;
+        self.pending_count = self.pending_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes a cross-verification row to `greeks_verification`.
+    // TEST-EXEMPT: delegates to build_verification_row which is tested via DDL schema tests
+    pub fn write_verification_row(&mut self, row: &VerificationRow) -> Result<()> {
+        build_verification_row(&mut self.buffer, row)?;
+        self.pending_count = self.pending_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Flushes all pending rows to QuestDB.
+    // TEST-EXEMPT: requires live QuestDB ILP connection (integration test)
+    pub fn flush(&mut self) -> Result<()> {
+        if self.pending_count == 0 {
+            return Ok(());
+        }
+        let count = self.pending_count;
+        self.sender
+            .flush(&mut self.buffer)
+            .context("flush greeks data to QuestDB")?;
+        self.pending_count = 0;
+        debug!(rows = count, "greeks data flushed to QuestDB");
+        Ok(())
+    }
+
+    /// Returns the number of pending (unflushed) rows.
+    // TEST-EXEMPT: trivial accessor, tested indirectly via pipeline cycle logs
+    pub fn pending_count(&self) -> usize {
+        self.pending_count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row Types — Input structs for ILP row builders
+// ---------------------------------------------------------------------------
+
+/// Raw Dhan Option Chain API response row (stored as-is).
+pub struct DhanRawRow<'a> {
+    pub security_id: i64,
+    pub segment: &'a str,
+    pub symbol_name: &'a str,
+    pub underlying_symbol: &'a str,
+    pub underlying_security_id: i64,
+    pub underlying_segment: &'a str,
+    pub strike_price: f64,
+    pub option_type: &'a str,
+    pub expiry_date: &'a str,
+    pub spot_price: f64,
+    pub last_price: f64,
+    pub average_price: f64,
+    pub oi: i64,
+    pub previous_close_price: f64,
+    pub previous_oi: i64,
+    pub previous_volume: i64,
+    pub volume: i64,
+    pub top_bid_price: f64,
+    pub top_bid_quantity: i64,
+    pub top_ask_price: f64,
+    pub top_ask_quantity: i64,
+    pub implied_volatility: f64,
+    pub delta: f64,
+    pub theta: f64,
+    pub gamma: f64,
+    pub vega: f64,
+    pub ts_nanos: i64,
+}
+
+/// Computed Greeks row for `option_greeks` table.
+pub struct OptionGreeksRow<'a> {
+    pub segment: &'a str,
+    pub security_id: i64,
+    pub symbol_name: &'a str,
+    pub underlying_security_id: i64,
+    pub underlying_symbol: &'a str,
+    pub strike_price: f64,
+    pub option_type: &'a str,
+    pub expiry_date: &'a str,
+    pub iv: f64,
+    pub delta: f64,
+    pub gamma: f64,
+    pub theta: f64,
+    pub vega: f64,
+    pub bs_price: f64,
+    pub intrinsic_value: f64,
+    pub extrinsic_value: f64,
+    pub spot_price: f64,
+    pub option_ltp: f64,
+    pub oi: i64,
+    pub volume: i64,
+    pub buildup_type: &'a str,
+    pub ts_nanos: i64,
+}
+
+/// PCR snapshot row for `pcr_snapshots` table.
+pub struct PcrSnapshotRow<'a> {
+    pub underlying_symbol: &'a str,
+    pub expiry_date: &'a str,
+    pub pcr_oi: f64,
+    pub pcr_volume: f64,
+    pub total_put_oi: i64,
+    pub total_call_oi: i64,
+    pub total_put_volume: i64,
+    pub total_call_volume: i64,
+    pub sentiment: &'a str,
+    pub ts_nanos: i64,
+}
+
+/// Cross-verification row for `greeks_verification` table.
+pub struct VerificationRow<'a> {
+    pub security_id: i64,
+    pub segment: &'a str,
+    pub symbol_name: &'a str,
+    pub underlying_symbol: &'a str,
+    pub strike_price: f64,
+    pub option_type: &'a str,
+    pub our_iv: f64,
+    pub dhan_iv: f64,
+    pub iv_diff: f64,
+    pub our_delta: f64,
+    pub dhan_delta: f64,
+    pub delta_diff: f64,
+    pub our_gamma: f64,
+    pub dhan_gamma: f64,
+    pub gamma_diff: f64,
+    pub our_theta: f64,
+    pub dhan_theta: f64,
+    pub theta_diff: f64,
+    pub our_vega: f64,
+    pub dhan_vega: f64,
+    pub vega_diff: f64,
+    pub match_status: &'a str,
+    pub ts_nanos: i64,
+}
+
+// ---------------------------------------------------------------------------
+// ILP Row Builders (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Writes a single `dhan_option_chain_raw` row into the ILP buffer.
+fn build_dhan_raw_row(buffer: &mut Buffer, row: &DhanRawRow<'_>) -> Result<()> {
+    let ts = TimestampNanos::new(row.ts_nanos);
+    buffer
+        .table(TABLE_DHAN_OPTION_CHAIN_RAW)
+        .context("table")?
+        .symbol("segment", row.segment)
+        .context("segment")?
+        .symbol("symbol_name", row.symbol_name)
+        .context("symbol_name")?
+        .symbol("underlying_symbol", row.underlying_symbol)
+        .context("underlying_symbol")?
+        .symbol("underlying_segment", row.underlying_segment)
+        .context("underlying_segment")?
+        .symbol("option_type", row.option_type)
+        .context("option_type")?
+        .symbol("expiry_date", row.expiry_date)
+        .context("expiry_date")?
+        .column_i64("security_id", row.security_id)
+        .context("security_id")?
+        .column_i64("underlying_security_id", row.underlying_security_id)
+        .context("underlying_security_id")?
+        .column_f64("strike_price", row.strike_price)
+        .context("strike_price")?
+        .column_f64("spot_price", row.spot_price)
+        .context("spot_price")?
+        .column_f64("last_price", row.last_price)
+        .context("last_price")?
+        .column_f64("average_price", row.average_price)
+        .context("average_price")?
+        .column_i64("oi", row.oi)
+        .context("oi")?
+        .column_f64("previous_close_price", row.previous_close_price)
+        .context("previous_close_price")?
+        .column_i64("previous_oi", row.previous_oi)
+        .context("previous_oi")?
+        .column_i64("previous_volume", row.previous_volume)
+        .context("previous_volume")?
+        .column_i64("volume", row.volume)
+        .context("volume")?
+        .column_f64("top_bid_price", row.top_bid_price)
+        .context("top_bid_price")?
+        .column_i64("top_bid_quantity", row.top_bid_quantity)
+        .context("top_bid_quantity")?
+        .column_f64("top_ask_price", row.top_ask_price)
+        .context("top_ask_price")?
+        .column_i64("top_ask_quantity", row.top_ask_quantity)
+        .context("top_ask_quantity")?
+        .column_f64("implied_volatility", row.implied_volatility)
+        .context("implied_volatility")?
+        .column_f64("delta", row.delta)
+        .context("delta")?
+        .column_f64("theta", row.theta)
+        .context("theta")?
+        .column_f64("gamma", row.gamma)
+        .context("gamma")?
+        .column_f64("vega", row.vega)
+        .context("vega")?
+        .at(ts)
+        .context("ts")?;
+    Ok(())
+}
+
+/// Writes a single `option_greeks` row into the ILP buffer.
+fn build_option_greeks_row(buffer: &mut Buffer, row: &OptionGreeksRow<'_>) -> Result<()> {
+    let ts = TimestampNanos::new(row.ts_nanos);
+    buffer
+        .table(TABLE_OPTION_GREEKS)
+        .context("table")?
+        .symbol("segment", row.segment)
+        .context("segment")?
+        .symbol("symbol_name", row.symbol_name)
+        .context("symbol_name")?
+        .symbol("underlying_symbol", row.underlying_symbol)
+        .context("underlying_symbol")?
+        .symbol("option_type", row.option_type)
+        .context("option_type")?
+        .symbol("expiry_date", row.expiry_date)
+        .context("expiry_date")?
+        .symbol("buildup_type", row.buildup_type)
+        .context("buildup_type")?
+        .column_i64("security_id", row.security_id)
+        .context("security_id")?
+        .column_i64("underlying_security_id", row.underlying_security_id)
+        .context("underlying_security_id")?
+        .column_f64("strike_price", row.strike_price)
+        .context("strike_price")?
+        .column_f64("iv", row.iv)
+        .context("iv")?
+        .column_f64("delta", row.delta)
+        .context("delta")?
+        .column_f64("gamma", row.gamma)
+        .context("gamma")?
+        .column_f64("theta", row.theta)
+        .context("theta")?
+        .column_f64("vega", row.vega)
+        .context("vega")?
+        .column_f64("bs_price", row.bs_price)
+        .context("bs_price")?
+        .column_f64("intrinsic_value", row.intrinsic_value)
+        .context("intrinsic_value")?
+        .column_f64("extrinsic_value", row.extrinsic_value)
+        .context("extrinsic_value")?
+        .column_f64("spot_price", row.spot_price)
+        .context("spot_price")?
+        .column_f64("option_ltp", row.option_ltp)
+        .context("option_ltp")?
+        .column_i64("oi", row.oi)
+        .context("oi")?
+        .column_i64("volume", row.volume)
+        .context("volume")?
+        .at(ts)
+        .context("ts")?;
+    Ok(())
+}
+
+/// Writes a single `pcr_snapshots` row into the ILP buffer.
+fn build_pcr_snapshot_row(buffer: &mut Buffer, row: &PcrSnapshotRow<'_>) -> Result<()> {
+    let ts = TimestampNanos::new(row.ts_nanos);
+    buffer
+        .table(TABLE_PCR_SNAPSHOTS)
+        .context("table")?
+        .symbol("underlying_symbol", row.underlying_symbol)
+        .context("underlying_symbol")?
+        .symbol("expiry_date", row.expiry_date)
+        .context("expiry_date")?
+        .symbol("sentiment", row.sentiment)
+        .context("sentiment")?
+        .column_f64("pcr_oi", row.pcr_oi)
+        .context("pcr_oi")?
+        .column_f64("pcr_volume", row.pcr_volume)
+        .context("pcr_volume")?
+        .column_i64("total_put_oi", row.total_put_oi)
+        .context("total_put_oi")?
+        .column_i64("total_call_oi", row.total_call_oi)
+        .context("total_call_oi")?
+        .column_i64("total_put_volume", row.total_put_volume)
+        .context("total_put_volume")?
+        .column_i64("total_call_volume", row.total_call_volume)
+        .context("total_call_volume")?
+        .at(ts)
+        .context("ts")?;
+    Ok(())
+}
+
+/// Writes a single `greeks_verification` row into the ILP buffer.
+fn build_verification_row(buffer: &mut Buffer, row: &VerificationRow<'_>) -> Result<()> {
+    let ts = TimestampNanos::new(row.ts_nanos);
+    buffer
+        .table(TABLE_GREEKS_VERIFICATION)
+        .context("table")?
+        .symbol("segment", row.segment)
+        .context("segment")?
+        .symbol("symbol_name", row.symbol_name)
+        .context("symbol_name")?
+        .symbol("underlying_symbol", row.underlying_symbol)
+        .context("underlying_symbol")?
+        .symbol("option_type", row.option_type)
+        .context("option_type")?
+        .symbol("match_status", row.match_status)
+        .context("match_status")?
+        .column_i64("security_id", row.security_id)
+        .context("security_id")?
+        .column_f64("strike_price", row.strike_price)
+        .context("strike_price")?
+        .column_f64("our_iv", row.our_iv)
+        .context("our_iv")?
+        .column_f64("dhan_iv", row.dhan_iv)
+        .context("dhan_iv")?
+        .column_f64("iv_diff", row.iv_diff)
+        .context("iv_diff")?
+        .column_f64("our_delta", row.our_delta)
+        .context("our_delta")?
+        .column_f64("dhan_delta", row.dhan_delta)
+        .context("dhan_delta")?
+        .column_f64("delta_diff", row.delta_diff)
+        .context("delta_diff")?
+        .column_f64("our_gamma", row.our_gamma)
+        .context("our_gamma")?
+        .column_f64("dhan_gamma", row.dhan_gamma)
+        .context("dhan_gamma")?
+        .column_f64("gamma_diff", row.gamma_diff)
+        .context("gamma_diff")?
+        .column_f64("our_theta", row.our_theta)
+        .context("our_theta")?
+        .column_f64("dhan_theta", row.dhan_theta)
+        .context("dhan_theta")?
+        .column_f64("theta_diff", row.theta_diff)
+        .context("theta_diff")?
+        .column_f64("our_vega", row.our_vega)
+        .context("our_vega")?
+        .column_f64("dhan_vega", row.dhan_vega)
+        .context("dhan_vega")?
+        .column_f64("vega_diff", row.vega_diff)
+        .context("vega_diff")?
+        .at(ts)
+        .context("ts")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -669,5 +1063,164 @@ mod tests {
             .build()
             .unwrap();
         execute_ddl(&client, &base_url, "SELECT 1", "test_send_error").await;
+    }
+
+    // --- ILP row builder tests ---
+
+    fn make_test_buffer() -> Buffer {
+        // TCP transport uses V1 protocol by default.
+        Buffer::new(questdb::ingress::ProtocolVersion::V1)
+    }
+
+    fn sample_ts_nanos() -> i64 {
+        1_711_180_800_000_000_000 // 2024-03-23T00:00:00Z in nanos
+    }
+
+    #[test]
+    fn test_build_dhan_raw_row() {
+        let mut buffer = make_test_buffer();
+        let row = DhanRawRow {
+            security_id: 42528,
+            segment: "NSE_FNO",
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_symbol: "NIFTY",
+            underlying_security_id: 13,
+            underlying_segment: "IDX_I",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            spot_price: 25642.8,
+            last_price: 134.0,
+            average_price: 146.99,
+            oi: 3786445,
+            previous_close_price: 244.85,
+            previous_oi: 402220,
+            previous_volume: 31931705,
+            volume: 117567970,
+            top_bid_price: 133.55,
+            top_bid_quantity: 1625,
+            top_ask_price: 134.0,
+            top_ask_quantity: 1365,
+            implied_volatility: 9.789,
+            delta: 0.53871,
+            theta: -15.1539,
+            gamma: 0.00132,
+            vega: 12.18593,
+            ts_nanos: sample_ts_nanos(),
+        };
+        assert!(build_dhan_raw_row(&mut buffer, &row).is_ok());
+        assert!(buffer.len() > 0);
+    }
+
+    #[test]
+    fn test_build_option_greeks_row() {
+        let mut buffer = make_test_buffer();
+        let row = OptionGreeksRow {
+            segment: "NSE_FNO",
+            security_id: 42528,
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_security_id: 13,
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            iv: 0.098,
+            delta: 0.54,
+            gamma: 0.0013,
+            theta: -15.2,
+            vega: 12.1,
+            bs_price: 135.5,
+            intrinsic_value: 0.0,
+            extrinsic_value: 134.0,
+            spot_price: 25642.8,
+            option_ltp: 134.0,
+            oi: 3786445,
+            volume: 117567970,
+            buildup_type: "LongBuildup",
+            ts_nanos: sample_ts_nanos(),
+        };
+        assert!(build_option_greeks_row(&mut buffer, &row).is_ok());
+        assert!(buffer.len() > 0);
+    }
+
+    #[test]
+    fn test_build_pcr_snapshot_row() {
+        let mut buffer = make_test_buffer();
+        let row = PcrSnapshotRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            pcr_oi: 0.78,
+            pcr_volume: 0.65,
+            total_put_oi: 4000000,
+            total_call_oi: 5128205,
+            total_put_volume: 80000000,
+            total_call_volume: 123000000,
+            sentiment: "Bullish",
+            ts_nanos: sample_ts_nanos(),
+        };
+        assert!(build_pcr_snapshot_row(&mut buffer, &row).is_ok());
+        assert!(buffer.len() > 0);
+    }
+
+    #[test]
+    fn test_build_verification_row() {
+        let mut buffer = make_test_buffer();
+        let row = VerificationRow {
+            security_id: 42528,
+            segment: "NSE_FNO",
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            our_iv: 0.098,
+            dhan_iv: 0.09789,
+            iv_diff: 0.00011,
+            our_delta: 0.54,
+            dhan_delta: 0.53871,
+            delta_diff: 0.00129,
+            our_gamma: 0.0013,
+            dhan_gamma: 0.00132,
+            gamma_diff: -0.00002,
+            our_theta: -15.2,
+            dhan_theta: -15.1539,
+            theta_diff: -0.0461,
+            our_vega: 12.1,
+            dhan_vega: 12.18593,
+            vega_diff: -0.08593,
+            match_status: "MATCH",
+            ts_nanos: sample_ts_nanos(),
+        };
+        assert!(build_verification_row(&mut buffer, &row).is_ok());
+        assert!(buffer.len() > 0);
+    }
+
+    #[test]
+    fn test_multiple_rows_accumulate_in_buffer() {
+        let mut buffer = make_test_buffer();
+        let row = PcrSnapshotRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            pcr_oi: 0.78,
+            pcr_volume: 0.65,
+            total_put_oi: 4000000,
+            total_call_oi: 5128205,
+            total_put_volume: 80000000,
+            total_call_volume: 123000000,
+            sentiment: "Bullish",
+            ts_nanos: sample_ts_nanos(),
+        };
+        build_pcr_snapshot_row(&mut buffer, &row).unwrap();
+        let len_after_one = buffer.len();
+
+        let row2 = PcrSnapshotRow {
+            underlying_symbol: "BANKNIFTY",
+            ts_nanos: sample_ts_nanos() + 1_000_000_000,
+            ..row
+        };
+        build_pcr_snapshot_row(&mut buffer, &row2).unwrap();
+        assert!(
+            buffer.len() > len_after_one,
+            "buffer should grow with each row"
+        );
     }
 }

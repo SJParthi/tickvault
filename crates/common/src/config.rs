@@ -479,10 +479,17 @@ const fn default_constituency_inter_batch_delay_ms() -> u64 {
 
 /// Greeks engine configuration.
 ///
-/// Controls Black-Scholes pricing parameters and IV solver settings.
+/// Controls Black-Scholes pricing parameters, IV solver settings,
+/// and the periodic option chain fetch pipeline.
 /// Defaults match Indian market conditions (NIFTY/BANKNIFTY).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GreeksConfig {
+    /// Enable the greeks pipeline (option chain fetch + compute + persist).
+    #[serde(default = "default_greeks_enabled")]
+    pub enabled: bool,
+    /// Interval between option chain fetch cycles (seconds).
+    #[serde(default = "default_greeks_fetch_interval_secs")]
+    pub fetch_interval_secs: u64,
     /// Risk-free interest rate (annualized). India 91-day T-Bill rate.
     #[serde(default = "default_risk_free_rate")]
     pub risk_free_rate: f64,
@@ -500,12 +507,22 @@ pub struct GreeksConfig {
 impl Default for GreeksConfig {
     fn default() -> Self {
         Self {
+            enabled: default_greeks_enabled(),
+            fetch_interval_secs: default_greeks_fetch_interval_secs(),
             risk_free_rate: default_risk_free_rate(),
             dividend_yield: default_dividend_yield(),
             iv_solver_max_iterations: default_iv_solver_max_iterations(),
             iv_solver_tolerance: default_iv_solver_tolerance(),
         }
     }
+}
+
+const fn default_greeks_enabled() -> bool {
+    true
+}
+
+const fn default_greeks_fetch_interval_secs() -> u64 {
+    60
 }
 
 const fn default_risk_free_rate() -> f64 {

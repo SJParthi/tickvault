@@ -247,6 +247,8 @@ max_retries = 3
 request_delay_ms = 500
 
 [greeks]
+enabled = true
+fetch_interval_secs = 60
 risk_free_rate = 0.068
 dividend_yield = 0.012
 iv_solver_max_iterations = 50

@@ -513,6 +513,28 @@ async fn main() -> Result<()> {
             info!("background candle persistence consumer started (cold path)");
         }
 
+        // --- Background: Greeks pipeline (option chain fetch → compute → persist) ---
+        if config.greeks.enabled {
+            let greeks_token = token_handle.clone();
+            let greeks_client_id = client_id.clone();
+            let greeks_base_url = config.dhan.rest_api_base_url.clone();
+            let greeks_config = config.greeks.clone();
+            let greeks_questdb = config.questdb.clone();
+            tokio::spawn(async move {
+                dhan_live_trader_app::greeks_pipeline::run_greeks_pipeline(
+                    greeks_token,
+                    greeks_client_id,
+                    greeks_base_url,
+                    greeks_config,
+                    greeks_questdb,
+                )
+                .await;
+            });
+            info!("background greeks pipeline started (cold path)");
+        } else {
+            info!("greeks pipeline disabled in config");
+        }
+
         // --- Background: Order update WebSocket ---
         let (order_update_sender, _order_update_receiver) = tokio::sync::broadcast::channel::<
             dhan_live_trader_common::order_types::OrderUpdate,
@@ -944,6 +966,30 @@ async fn main() -> Result<()> {
         std::sync::Arc::clone(&post_market_signal),
         is_trading,
     );
+
+    // -----------------------------------------------------------------------
+    // Step 9.6: Background greeks pipeline (option chain fetch → compute → persist)
+    // -----------------------------------------------------------------------
+    if config.greeks.enabled {
+        let greeks_token = token_handle.clone();
+        let greeks_client_id = ws_client_id.clone();
+        let greeks_base_url = config.dhan.rest_api_base_url.clone();
+        let greeks_config = config.greeks.clone();
+        let greeks_questdb = config.questdb.clone();
+        tokio::spawn(async move {
+            dhan_live_trader_app::greeks_pipeline::run_greeks_pipeline(
+                greeks_token,
+                greeks_client_id,
+                greeks_base_url,
+                greeks_config,
+                greeks_questdb,
+            )
+            .await;
+        });
+        info!("background greeks pipeline started (cold path)");
+    } else {
+        info!("greeks pipeline disabled in config");
+    }
 
     // -----------------------------------------------------------------------
     // Step 10: Spawn order update WebSocket connection

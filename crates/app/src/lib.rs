@@ -9,6 +9,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod boot_helpers;
+pub mod greeks_pipeline;
 pub mod infra;
 pub mod observability;
 pub mod trading_pipeline;

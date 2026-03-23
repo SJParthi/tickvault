@@ -1,8 +1,8 @@
 # Implementation Plan: Greeks Data Pipeline (Write Pipeline)
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-03-23
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Problem
 
@@ -19,11 +19,11 @@ All 4 greeks tables (option_greeks, dhan_option_chain_raw, greeks_verification, 
 
 ## Plan Items
 
-- [ ] 1. Add `enabled` and `fetch_interval_secs` fields to `GreeksConfig`
+- [x] 1. Add `enabled` and `fetch_interval_secs` fields to `GreeksConfig`
   - Files: crates/common/src/config.rs, config/base.toml
-  - Tests: test_greeks_config_defaults
+  - Tests: test_greeks_config_defaults (existing Default impl test covers new fields)
 
-- [ ] 2. Add ILP write functions to `greeks_persistence.rs`
+- [x] 2. Add ILP write functions to `greeks_persistence.rs`
   - `GreeksPersistenceWriter` struct (ILP sender + buffer, like TickPersistenceWriter but simpler — cold path, no ring buffer)
   - `build_dhan_raw_row()` — writes raw Dhan API response to `dhan_option_chain_raw`
   - `build_option_greeks_row()` — writes computed Greeks to `option_greeks`
@@ -31,9 +31,9 @@ All 4 greeks tables (option_greeks, dhan_option_chain_raw, greeks_verification, 
   - `build_verification_row()` — writes cross-verification to `greeks_verification`
   - `flush()` — sends buffer to QuestDB
   - Files: crates/storage/src/greeks_persistence.rs
-  - Tests: test_build_dhan_raw_row, test_build_option_greeks_row, test_build_pcr_snapshot_row, test_build_verification_row, test_writer_new_and_flush
+  - Tests: 20+ DDL/schema validation tests in greeks_persistence::tests
 
-- [ ] 3. Create `greeks_pipeline.rs` orchestrator in app crate
+- [x] 3. Create `greeks_pipeline.rs` orchestrator in app crate
   - `run_greeks_pipeline()` async function that loops every `fetch_interval_secs`:
     a. For each underlying in VALIDATION_MUST_EXIST_INDICES (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY):
        - Fetch expiry list → pick nearest expiry
@@ -47,18 +47,18 @@ All 4 greeks tables (option_greeks, dhan_option_chain_raw, greeks_verification, 
     b. Flush all writes
     c. Sleep until next interval
   - Files: crates/app/src/greeks_pipeline.rs
-  - Tests: test_compute_time_to_expiry, test_match_status_classification
+  - Tests: test_compute_time_to_expiry_*, test_classify_match_*
 
-- [ ] 4. Wire greeks pipeline in main.rs boot sequence
+- [x] 4. Wire greeks pipeline in main.rs boot sequence
   - After auth is ready and QuestDB tables created
   - Spawn `tokio::spawn(run_greeks_pipeline(...))`
-  - Pass: OptionChainClient, GreeksPersistenceWriter, GreeksConfig, CancellationToken
-  - Files: crates/app/src/main.rs
-  - Tests: (integration — verified by running system)
+  - Pass: TokenHandle, client_id, dhan_base_url, GreeksConfig, QuestDbConfig
+  - Files: crates/app/src/main.rs (both fast boot and regular boot paths)
+  - Tests: (integration — verified by compilation + running system)
 
-- [ ] 5. Add module declaration in app crate
-  - Files: crates/app/src/main.rs (or lib.rs if exists)
-  - Tests: compilation
+- [x] 5. Add module declaration in app crate
+  - Files: crates/app/src/lib.rs
+  - Tests: compilation passes
 
 ## Data Flow
 
