@@ -28,10 +28,12 @@ use super::types::{
 };
 
 /// Option chain endpoint path.
-const OPTION_CHAIN_PATH: &str = "/v2/optionchain";
+/// Base URL already includes `/v2` (e.g., `https://api.dhan.co/v2`).
+const OPTION_CHAIN_PATH: &str = "/optionchain";
 
 /// Expiry list endpoint path.
-const EXPIRY_LIST_PATH: &str = "/v2/optionchain/expirylist";
+/// Base URL already includes `/v2` (e.g., `https://api.dhan.co/v2`).
+const EXPIRY_LIST_PATH: &str = "/optionchain/expirylist";
 
 // ---------------------------------------------------------------------------
 // Client
@@ -214,8 +216,28 @@ mod tests {
 
     #[test]
     fn test_endpoint_paths() {
-        assert_eq!(OPTION_CHAIN_PATH, "/v2/optionchain");
-        assert_eq!(EXPIRY_LIST_PATH, "/v2/optionchain/expirylist");
+        // Paths must NOT include /v2 — base_url already has it.
+        assert_eq!(OPTION_CHAIN_PATH, "/optionchain");
+        assert_eq!(EXPIRY_LIST_PATH, "/optionchain/expirylist");
+    }
+
+    #[test]
+    fn test_full_url_no_double_v2() {
+        // Base URL from config includes /v2.
+        let base_url = "https://api.dhan.co/v2";
+        let chain_url = format!("{}{}", base_url, OPTION_CHAIN_PATH);
+        let expiry_url = format!("{}{}", base_url, EXPIRY_LIST_PATH);
+        assert_eq!(chain_url, "https://api.dhan.co/v2/optionchain");
+        assert_eq!(expiry_url, "https://api.dhan.co/v2/optionchain/expirylist");
+        // Must NOT contain double /v2/v2.
+        assert!(
+            !chain_url.contains("/v2/v2"),
+            "option chain URL has double /v2: {chain_url}"
+        );
+        assert!(
+            !expiry_url.contains("/v2/v2"),
+            "expiry list URL has double /v2: {expiry_url}"
+        );
     }
 
     #[test]
