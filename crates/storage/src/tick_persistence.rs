@@ -1772,11 +1772,11 @@ mod tests {
 
     #[test]
     fn test_build_tick_row_preserves_raw_exchange_timestamp() {
-        // The raw Dhan exchange_timestamp (UTC epoch seconds) is stored
+        // The raw Dhan exchange_timestamp (IST epoch seconds) is stored
         // verbatim in the `exchange_timestamp` LONG column for audit.
-        // The designated `ts` uses IST-adjusted epoch (UTC + 19800s).
+        // The designated `ts` stores IST epoch seconds directly (NO +19800 offset).
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        let dhan_raw_epoch: u32 = 1_740_556_500; // UTC epoch for 07:55 UTC (13:25 IST)
+        let dhan_raw_epoch: u32 = 1_740_556_500; // IST epoch for 13:25 IST
         let tick = ParsedTick {
             security_id: 13,
             exchange_segment_code: 2,
@@ -2982,6 +2982,93 @@ mod tests {
 
             epoch += 60; // advance 1 minute
         }
+    }
+
+    /// CRITICAL ENFORCEMENT: WebSocket `ts` must NEVER have +19800 (IST offset).
+    ///
+    /// Dhan WebSocket sends `exchange_timestamp` as IST epoch seconds.
+    /// The designated `ts` in QuestDB stores this value DIRECTLY — multiply
+    /// by 1_000_000_000 for nanos, nothing else. Adding +19800 corrupts
+    /// every timestamp in the ticks table and causes incorrect candle
+    /// aggregation, wrong market-hour detection, and P&L calculation errors
+    /// during live trading.
+    ///
+    /// ONLY `received_at` gets +IST_UTC_OFFSET_NANOS (because it comes from
+    /// `Utc::now()` which is UTC, and we store everything in IST-as-UTC).
+    ///
+    /// If this test fails, someone broke the timestamp pipeline. Revert immediately.
+    #[test]
+    fn test_critical_ws_timestamp_no_ist_offset_on_ts() {
+        // A known IST epoch: 2026-03-10 10:30:00 IST.
+        let dhan_epoch: u32 = ist_epoch_for_ist_time_2026_03_10(10, 30, 0);
+        let expected_ts_nanos = i64::from(dhan_epoch) * 1_000_000_000;
+        // WRONG: if someone adds +19800, the nanos would be wrong
+        let wrong_ts_nanos = (i64::from(dhan_epoch) + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 99999,
+            exchange_segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+            last_traded_price: 100.0,
+            exchange_timestamp: dhan_epoch,
+            received_at_nanos: 1_000_000_000,
+            ..Default::default()
+        };
+        build_tick_row(&mut buffer, &tick).unwrap();
+
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        let expected_suffix = format!("{expected_ts_nanos}\n");
+        let wrong_suffix = format!("{wrong_ts_nanos}\n");
+
+        assert!(
+            content.ends_with(&expected_suffix),
+            "CRITICAL: ts must be IST epoch nanos stored directly (NO +19800).\n\
+             Expected: ends with {expected_ts_nanos}\n\
+             Got: {content}"
+        );
+        assert!(
+            !content.ends_with(&wrong_suffix),
+            "CRITICAL: ts has +19800 offset applied — this CORRUPTS all tick timestamps!\n\
+             Someone added IST_UTC_OFFSET to exchange_timestamp in build_tick_row.\n\
+             This MUST be reverted. WebSocket LTT is already IST epoch seconds."
+        );
+    }
+
+    /// CRITICAL ENFORCEMENT: source code must never add IST offset to ts computation.
+    ///
+    /// Scans the build_tick_row function source for banned patterns that would
+    /// add +19800 to the designated timestamp. This catches the bug at compile-
+    /// time (test time) even if the offset cancels out due to other changes.
+    #[test]
+    fn test_critical_source_no_ist_offset_in_ts_computation() {
+        // Read the source of build_tick_row to verify it does NOT add IST offset.
+        let source = include_str!("tick_persistence.rs");
+
+        // Find the build_tick_row function body.
+        let fn_start = source
+            .find("fn build_tick_row(")
+            .expect("build_tick_row function must exist");
+        // Take ~500 chars which covers the ts_nanos computation.
+        let snippet = &source[fn_start..fn_start + 500.min(source.len() - fn_start)];
+
+        // The ts_nanos line must NOT contain IST_UTC_OFFSET, +19800, or saturating_add
+        // (saturating_add is used for received_at, NOT for ts).
+        let ts_line_region = &snippet[..snippet.find("received_nanos").unwrap_or(snippet.len())];
+        assert!(
+            !ts_line_region.contains("IST_UTC_OFFSET"),
+            "CRITICAL: build_tick_row ts_nanos computation must NOT use IST_UTC_OFFSET.\n\
+             WebSocket exchange_timestamp is IST epoch — store directly."
+        );
+        assert!(
+            !ts_line_region.contains("19800"),
+            "CRITICAL: build_tick_row ts_nanos computation must NOT contain 19800.\n\
+             WebSocket exchange_timestamp is IST epoch — store directly."
+        );
+        assert!(
+            !ts_line_region.contains("saturating_add"),
+            "CRITICAL: build_tick_row ts_nanos must use saturating_mul only, NOT saturating_add.\n\
+             saturating_add would add an offset. Only multiply by 1_000_000_000."
+        );
     }
 
     #[test]
