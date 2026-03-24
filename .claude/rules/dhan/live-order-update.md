@@ -11,11 +11,15 @@
 2. **Endpoint:** `wss://api-order-update.dhan.co`. No query params — auth is via JSON message after connect.
 
 3. **Auth message — exact structure.**
-   ```json
-   { "LoginReq": { "MsgCode": 42, "ClientId": "...", "Token": "JWT" }, "UserType": "SELF" }
-   ```
+   - **Individual:**
+     ```json
+     { "LoginReq": { "MsgCode": 42, "ClientId": "...", "Token": "JWT" }, "UserType": "SELF" }
+     ```
+   - **Partner:** Note: `Token` is ABSENT, `Secret` is OUTSIDE `LoginReq`:
+     ```json
+     { "LoginReq": { "MsgCode": 42, "ClientId": "partner_id" }, "UserType": "PARTNER", "Secret": "partner_secret" }
+     ```
    - `MsgCode` is always `42`
-   - `UserType`: `"SELF"` for individual, `"PARTNER"` for partner (with `Secret` field)
    - PascalCase field names — use `#[serde(rename)]`
 
 4. **JSON messages, NOT binary.** Unlike market feed WebSockets. Parse with `serde_json` directly.
@@ -44,6 +48,17 @@
 13. **`OffMktFlag: "1"`** = AMO order, `"0"` = normal.
 
 14. **`OptType: "XX"`** = non-option instrument. `"CE"` or `"PE"` for options.
+
+15. **Additional fields in Data (may arrive from Dhan, use `Option<>` / `#[serde(default)]`).**
+    - `AlgoOrdNo`: Entry leg order number for tracking related legs (string)
+    - `MktType`: `"NL"`=Normal Market, `"AU"`/`"A1"`/`"A2"`=Auction Market
+    - `Series`: Exchange series (e.g., `"EQ"`)
+    - `GoodTillDaysDate`: Order validity date for Forever Orders
+    - `RefLtp`: LTP at time of order update (float, camelCase — NOT PascalCase)
+    - `TickSize`: Tick size of instrument (float, camelCase — NOT PascalCase)
+    - `AlgoId`: Exchange ID for special order types (string)
+    - `Multiplier`: Multiplier for commodity/currency (int)
+    - Note: `RefLtp` and `TickSize` use camelCase, not PascalCase like other fields.
 
 ## What This Prevents
 

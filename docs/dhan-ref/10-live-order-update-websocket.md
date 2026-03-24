@@ -81,10 +81,13 @@ wss://api-order-update.dhan.co
         "TriggerPrice": 0,
         "TradedPrice": 0,
         "AvgTradedPrice": 0,
+        "AlgoOrdNo": "",
         "OffMktFlag": "0",
         "OrderDateTime": "2024-09-11 14:39:29",
         "ExchOrderTime": "2024-09-11 14:39:29",
         "LastUpdatedTime": "2024-09-11 14:39:29",
+        "Remarks": "NR",
+        "MktType": "NL",
         "ReasonDescription": "CONFIRMED",
         "LegNo": 1,
         "Instrument": "EQUITY",
@@ -92,12 +95,19 @@ wss://api-order-update.dhan.co
         "ProductName": "CNC",
         "Status": "Cancelled",
         "LotSize": 1,
+        "StrikePrice": 0,
         "ExpiryDate": "0001-01-01 00:00:00",
         "OptType": "XX",
         "DisplayName": "Vodafone Idea",
         "Isin": "INE669E01016",
+        "Series": "EQ",
+        "GoodTillDaysDate": "2024-09-11",
+        "RefLtp": 13.21,
+        "TickSize": 0.01,
+        "AlgoId": "0",
+        "Multiplier": 1,
         "CorrelationId": "",
-        "Remarks": ""
+        "Remarks": "Super Order"
     },
     "Type": "order_alert"
 }
@@ -136,10 +146,12 @@ wss://api-order-update.dhan.co
 | `TradedQty`        | int    | Executed quantity                                              |
 | `RemainingQuantity`| int    | Pending quantity                                               |
 | `DiscQuantity`     | int    | Disclosed quantity                                             |
+| `DiscQtyRem`       | int    | Disclosed quantity remaining                                   |
 | `Price`            | float  | Order price                                                    |
 | `TriggerPrice`     | float  | Trigger price (SL/CO/BO)                                       |
 | `TradedPrice`      | float  | Execution price                                                |
 | `AvgTradedPrice`   | float  | Average price (differs from TradedPrice on partial fills)      |
+| `AlgoOrdNo`        | string | Entry leg order number (for tracking related legs)             |
 
 ### Timestamps
 
@@ -161,6 +173,7 @@ wss://api-order-update.dhan.co
 | `OffMktFlag`       | string | `1`=AMO, `0`=normal                                           |
 | `CorrelationId`    | string | User-provided tracking ID (max 30 chars)                       |
 | `Remarks`          | string | `Super Order` if part of super order, else user remarks        |
+| `MktType`          | string | `NL`=Normal Market, `AU`/`A1`/`A2`=Auction Market             |
 
 ### Instrument Info
 
@@ -174,6 +187,12 @@ wss://api-order-update.dhan.co
 | `StrikePrice`      | float  | Strike price (options only)                                    |
 | `ExpiryDate`       | string | Expiry date                                                    |
 | `OptType`          | string | `CE`, `PE`, or `XX` (non-option)                               |
+| `Series`           | string | Exchange series (e.g., `EQ`)                                   |
+| `GoodTillDaysDate` | string | Order validity date for Forever Orders                         |
+| `RefLtp`           | float  | LTP at time of order update                                    |
+| `TickSize`         | float  | Minimum tick size of instrument                                |
+| `AlgoId`           | string | Exchange ID for special order types                            |
+| `Multiplier`       | int    | Multiplier for commodity/currency contracts                    |
 
 ---
 
@@ -213,10 +232,13 @@ pub struct OrderUpdateData {
     pub trigger_price: f64,
     pub traded_price: f64,
     pub avg_traded_price: f64,
+    pub algo_ord_no: Option<String>,
     pub off_mkt_flag: String,
     pub order_date_time: String,      // IST string, NOT epoch
     pub exch_order_time: String,
     pub last_updated_time: String,
+    pub remarks: Option<String>,
+    pub mkt_type: Option<String>,     // "NL"=Normal, "AU"/"A1"/"A2"=Auction
     pub reason_description: String,
     pub leg_no: i32,
     pub instrument: String,
@@ -224,10 +246,20 @@ pub struct OrderUpdateData {
     pub product_name: String,
     pub status: String,
     pub lot_size: i32,
+    pub strike_price: Option<f64>,
+    pub expiry_date: Option<String>,
+    pub opt_type: Option<String>,     // "CE", "PE", or "XX"
     pub display_name: String,
-    pub isin: String,
+    pub isin: Option<String>,
+    pub series: Option<String>,
+    pub good_till_days_date: Option<String>,
+    #[serde(rename = "refLtp")]       // NOTE: camelCase, not PascalCase
+    pub ref_ltp: Option<f64>,
+    #[serde(rename = "tickSize")]     // NOTE: camelCase, not PascalCase
+    pub tick_size: Option<f64>,
+    pub algo_id: Option<String>,
+    pub multiplier: Option<i32>,
     pub correlation_id: Option<String>,
-    pub remarks: Option<String>,
 }
 
 // ─── Auth Request ───

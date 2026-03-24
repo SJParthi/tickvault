@@ -43,7 +43,7 @@
    - `PRE_OPEN`, `OPEN`, `OPEN_30`, `OPEN_60`
 
 10. **Rate limits — exact numbers per API category.**
-    - Order: 10/sec, 250/min, 500/hr, 5000/day. Max 25 modifications per order.
+    - Order: 10/sec, 250/min, 1000/hr, 7000/day. Max 25 modifications per order.
     - Data: 5/sec, 100,000/day
     - Quote: 1/sec (unlimited per min/hr/day)
     - Non-Trading: 20/sec (unlimited per min/hr/day)

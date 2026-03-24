@@ -81,7 +81,18 @@ DELETE https://api.dhan.co/v2/pnlExit
 GET https://api.dhan.co/v2/pnlExit
 ```
 
-Response: `{ "pnlExitStatus": "ACTIVE", "profit": "1500.00", "loss": "500.00", ... }`
+Response:
+```json
+{
+    "pnlExitStatus": "ACTIVE",
+    "profit": "1500.00",
+    "loss": "500.00",
+    "productType": ["INTRADAY", "DELIVERY"],
+    "enable_kill_switch": true
+}
+```
+
+> **Field name differences**: POST uses `profitValue`/`lossValue` (camelCase), GET returns `profit`/`loss` (short names). POST uses `enableKillSwitch` (camelCase), GET returns `enable_kill_switch` (snake_case). Handle both conventions in deserialization.
 
 ---
 
