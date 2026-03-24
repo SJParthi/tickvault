@@ -75,7 +75,7 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 35 | yata | 0.7.0 | Technical indicators (EMA, RSI, MACD, etc.) |
-| 36 | blackscholes | 0.24.0 | Options pricing: Black-Scholes IV & greeks |
+| 36 | jaeckel | 0.2.0 | Options pricing: Jaeckel "Let's Be Rational" IV solver + Cody CDF |
 | 37 | statrs | 0.18.0 | Stats/probability: normal CDF for options |
 | 38 | governor | 0.10.2 | Rate limiter (GCRA): 10 orders/sec SEBI limit |
 | 39 | statig | 0.3.0 | Type-safe state machine for OMS transitions |

@@ -1,8 +1,8 @@
 # Implementation Plan: Eagle-Eye Precision Greeks Engine
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-24
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Context
 
@@ -32,7 +32,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
 
 ### Phase A: Fix Config (immediate — matches Dhan NOW)
 
-- [ ] A1: Fix base.toml parameters to match Dhan
+- [x] A1: Fix base.toml parameters to match Dhan
   - Files: config/base.toml
   - Change: `risk_free_rate = 0.10`, `dividend_yield = 0.0`
   - Tests: existing config + calibration tests should show EXACT match
@@ -40,13 +40,13 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
 
 ### Phase B: Precision Foundation (Normal CDF + IV Solver)
 
-- [ ] B1: Evaluate and add `implied-vol` or `jaeckel` crate dependency
+- [x] B1: Add `jaeckel` v0.2.0 crate (MIT, zero deps, Cody erfc + Jaeckel IV)
   - Files: Cargo.toml (root workspace)
   - Read Tech Stack Bible first for dependency policy
   - Pin exact version, verify license (MIT), verify no transitive deps
   - Tests: cargo build --workspace
 
-- [ ] B2: Replace Normal CDF with Cody's algorithm
+- [x] B2: Replace Normal CDF with Cody's algorithm
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Replace `normal_cdf()` (A&S, 7.5e-8) with Cody's erfc-based: `erfc(-x/sqrt(2))/2`
   - Replace `normal_pdf()` if crate provides it, else keep (PDF is already exact)
@@ -54,7 +54,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - Use `f64::mul_add()` for d1/d2 computation (free precision)
   - Tests: test_normal_cdf_precision_16_digits, test_log_moneyness_atm_precision
 
-- [ ] B3: Replace IV solver with Jaeckel's "Let's Be Rational"
+- [x] B3: Replace IV solver with Jaeckel's "Let's Be Rational"
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Replace `iv_solve()` (Newton-Raphson) with Jaeckel via crate API
   - Keep our `iv_solve()` signature for backward compat, delegate internally
@@ -64,7 +64,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
 
 ### Phase C: Edge Case Guards (QuantLib-grade)
 
-- [ ] C1: Add input validation to `greeks_from_iv()` and `compute_greeks_from_iv()`
+- [x] C1: Add input validation to `greeks_from_iv()` and `compute_greeks_from_iv()`
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Guard: spot <= 0, strike <= 0, iv <= 0, time <= 0 → return sensible defaults
   - Guard: `std_dev < f64::EPSILON` → return intrinsic (QuantLib 3-way branch: ATM/ITM/OTM)
@@ -72,7 +72,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - Guard: NaN/Infinity check on all outputs before returning
   - Tests: test_guard_zero_spot, test_guard_zero_time_itm, test_guard_zero_time_otm, test_guard_zero_time_atm, test_guard_nan_propagation_blocked
 
-- [ ] C2: Fix intrinsic value consistency
+- [x] C2: Fix intrinsic value consistency
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Decision: Use naive intrinsic `max(S-K, 0)` consistently (matches market convention)
   - Both `iv_solve()` intrinsic check AND `greeks_from_iv()` output use same formula
@@ -93,14 +93,14 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
 
 ### Phase D: Complete Greeks (all 13)
 
-- [ ] D1: Add Rho (first-order, rate sensitivity)
+- [x] D1: Add Rho (first-order, rate sensitivity)
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Call: `rho = K * T * exp(-rT) * N(d2)`
   - Put: `rho = -K * T * exp(-rT) * N(-d2)`
   - Add `rho: f64` to `OptionGreeks` struct
   - Tests: test_rho_call_positive, test_rho_put_negative, test_rho_near_expiry_zero
 
-- [ ] D2: Add second-order Greeks (Charm, Vanna, Volga, Veta, Speed)
+- [x] D2: Add second-order Greeks (Charm, Vanna, Volga, Veta, Speed)
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Charm: delta decay per time (Call/Put differ)
   - Vanna: `-e^(-qT) * n(d1) * d2 / sigma`
@@ -110,7 +110,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - Add all 5 fields to `OptionGreeks` struct
   - Tests: test_vanna_sign, test_volga_atm, test_charm_direction, test_speed_sign, test_veta_sign
 
-- [ ] D3: Add third-order Greeks (Color, Zomma, Ultima)
+- [x] D3: Add third-order Greeks (Color, Zomma, Ultima)
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Color: gamma decay per time
   - Zomma: `gamma * (d1*d2 - 1) / sigma`
