@@ -59,6 +59,15 @@ const OPTION_GREEKS_DDL: &str = "\
         gamma DOUBLE,\
         theta DOUBLE,\
         vega DOUBLE,\
+        rho DOUBLE,\
+        charm DOUBLE,\
+        vanna DOUBLE,\
+        volga DOUBLE,\
+        veta DOUBLE,\
+        speed DOUBLE,\
+        color DOUBLE,\
+        zomma DOUBLE,\
+        ultima DOUBLE,\
         bs_price DOUBLE,\
         intrinsic_value DOUBLE,\
         extrinsic_value DOUBLE,\
@@ -423,6 +432,15 @@ pub struct OptionGreeksRow<'a> {
     pub gamma: f64,
     pub theta: f64,
     pub vega: f64,
+    pub rho: f64,
+    pub charm: f64,
+    pub vanna: f64,
+    pub volga: f64,
+    pub veta: f64,
+    pub speed: f64,
+    pub color: f64,
+    pub zomma: f64,
+    pub ultima: f64,
     pub bs_price: f64,
     pub intrinsic_value: f64,
     pub extrinsic_value: f64,
@@ -576,6 +594,24 @@ fn build_option_greeks_row(buffer: &mut Buffer, row: &OptionGreeksRow<'_>) -> Re
         .context("theta")?
         .column_f64("vega", row.vega)
         .context("vega")?
+        .column_f64("rho", row.rho)
+        .context("rho")?
+        .column_f64("charm", row.charm)
+        .context("charm")?
+        .column_f64("vanna", row.vanna)
+        .context("vanna")?
+        .column_f64("volga", row.volga)
+        .context("volga")?
+        .column_f64("veta", row.veta)
+        .context("veta")?
+        .column_f64("speed", row.speed)
+        .context("speed")?
+        .column_f64("color", row.color)
+        .context("color")?
+        .column_f64("zomma", row.zomma)
+        .context("zomma")?
+        .column_f64("ultima", row.ultima)
+        .context("ultima")?
         .column_f64("bs_price", row.bs_price)
         .context("bs_price")?
         .column_f64("intrinsic_value", row.intrinsic_value)
@@ -1129,6 +1165,15 @@ mod tests {
             gamma: 0.0013,
             theta: -15.2,
             vega: 12.1,
+            rho: 0.05,
+            charm: -0.002,
+            vanna: 0.15,
+            volga: 3.2,
+            veta: -1.8,
+            speed: -0.00001,
+            color: -0.0003,
+            zomma: 0.001,
+            ultima: -0.5,
             bs_price: 135.5,
             intrinsic_value: 0.0,
             extrinsic_value: 134.0,

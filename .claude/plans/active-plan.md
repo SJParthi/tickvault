@@ -78,14 +78,14 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - Both `iv_solve()` intrinsic check AND `greeks_from_iv()` output use same formula
   - Tests: test_intrinsic_consistent_between_solver_and_output
 
-- [ ] C3: Fix expiry-day blackout
+- [x] C3: Fix expiry-day blackout (already uses fractional days)
   - Files: crates/app/src/greeks_pipeline.rs
   - Use `fractional_days` (not integer `days_to_expiry`) for ALL decisions including calibration
   - Change `CalibrationSample.days_to_expiry` from i64 to f64 (fractional)
   - Remove `days_to_expiry <= 0` skip in calibration — use `time_to_expiry <= MIN_TIME` instead
   - Tests: test_expiry_day_greeks_computed, test_calibration_includes_expiry_day
 
-- [ ] C4: Add NaN guard before QuestDB persistence
+- [x] C4: Add NaN guard before QuestDB persistence
   - Files: crates/app/src/greeks_pipeline.rs
   - Before every `writer.write_*_row()`, check all f64 fields for NaN/Infinity
   - Skip row + WARN log if any NaN detected
@@ -118,7 +118,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - Add all 3 fields to `OptionGreeks` struct
   - Tests: test_zomma_formula, test_ultima_formula, test_color_formula
 
-- [ ] D4: Update QuestDB schema for new Greeks columns
+- [x] D4: Update QuestDB schema for new Greeks columns
   - Files: crates/storage/src/greeks_persistence.rs
   - Add columns: rho, charm, vanna, volga, veta, speed, color, zomma, ultima
   - Update `write_greeks_row()` to persist all 13
@@ -126,13 +126,13 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
 
 ### Phase E: Historical Backtesting Support
 
-- [ ] E1: Add RBI repo rate lookup table
+- [x] E1: Add RBI repo rate lookup table
   - Files: crates/trading/src/greeks/historical_rates.rs (NEW)
   - Hardcode all rate change dates 2020-2026 (14 entries from research)
   - `fn rbi_repo_rate(date: NaiveDate) -> f64` — returns rate in effect on given date
   - Tests: test_rate_lookup_all_dates, test_rate_2020_covid_cut, test_rate_2023_peak
 
-- [ ] E2: Add dual-mode rate selection
+- [x] E2: Add dual-mode rate selection
   - Files: crates/common/src/config.rs, crates/app/src/greeks_pipeline.rs
   - Add `rate_mode` to GreeksConfig: `"dhan"` (fixed 10%) or `"theoretical"` (RBI lookup)
   - Default: `"dhan"` — matches Dhan/NSE displayed values
@@ -156,7 +156,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - IV roundtrip: `price → IV → price` to 1e-14
   - Tests: test_parity_machine_epsilon, test_delta_parity, test_iv_roundtrip_1e14
 
-- [ ] F3: Add Neumaier summation for portfolio Greeks aggregation
+- [x] F3: Add Neumaier summation for portfolio Greeks aggregation
   - Files: crates/trading/src/greeks/mod.rs
   - `fn neumaier_sum(values: &[f64]) -> f64` — compensated summation
   - Tests: test_neumaier_cancellation_resistance

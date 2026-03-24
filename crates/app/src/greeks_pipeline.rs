@@ -403,7 +403,18 @@ fn process_option_side(
     );
 
     let greeks = match our_greeks {
-        Some(g) => g,
+        Some(g) => {
+            // NaN guard: skip row if any critical Greek is not finite.
+            // greeks_from_iv sanitizes internally, but belt-and-suspenders for QuestDB.
+            if !g.iv.is_finite() || !g.delta.is_finite() || !g.bs_price.is_finite() {
+                warn!(
+                    security_id = option.security_id,
+                    "NaN/Inf in computed Greeks — skipping"
+                );
+                return Ok(None);
+            }
+            g
+        }
         None => return Ok(None), // IV solver didn't converge — skip.
     };
 
@@ -437,6 +448,15 @@ fn process_option_side(
         gamma: greeks.gamma,
         theta: greeks.theta,
         vega: greeks.vega,
+        rho: greeks.rho,
+        charm: greeks.charm,
+        vanna: greeks.vanna,
+        volga: greeks.volga,
+        veta: greeks.veta,
+        speed: greeks.speed,
+        color: greeks.color,
+        zomma: greeks.zomma,
+        ultima: greeks.ultima,
         bs_price: greeks.bs_price,
         intrinsic_value: greeks.intrinsic,
         extrinsic_value: greeks.extrinsic,
@@ -623,6 +643,7 @@ fn compute_fractional_days_to_expiry(expiry_str: &str, now_ist_nanos: i64) -> f6
 /// Computes time-to-expiry in years from calendar days.
 ///
 /// Uses the configured day_count divisor (365.0 default, calibration may change).
+#[cfg(test)]
 fn days_to_years(days: i64, day_count: f64) -> f64 {
     if days <= 0 {
         return 0.0;

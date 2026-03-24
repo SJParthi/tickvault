@@ -506,6 +506,10 @@ pub struct GreeksConfig {
     /// Calibrated to match Dhan's computation. Default: 365.0.
     #[serde(default = "default_day_count")]
     pub day_count: f64,
+    /// Rate mode: "dhan" = fixed 10% (match Dhan/NSE), "theoretical" = RBI repo rate lookup.
+    /// Default: "dhan".
+    #[serde(default = "default_rate_mode")]
+    pub rate_mode: String,
 }
 
 impl Default for GreeksConfig {
@@ -518,6 +522,7 @@ impl Default for GreeksConfig {
             iv_solver_max_iterations: default_iv_solver_max_iterations(),
             iv_solver_tolerance: default_iv_solver_tolerance(),
             day_count: default_day_count(),
+            rate_mode: default_rate_mode(),
         }
     }
 }
@@ -551,6 +556,10 @@ const fn default_iv_solver_tolerance() -> f64 {
 
 const fn default_day_count() -> f64 {
     365.0
+}
+
+fn default_rate_mode() -> String {
+    String::from("dhan")
 }
 
 // ---------------------------------------------------------------------------
