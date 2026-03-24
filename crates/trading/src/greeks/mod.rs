@@ -47,3 +47,39 @@ pub fn neumaier_sum(values: &[f64]) -> f64 {
 
     sum + compensation
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_neumaier_cancellation_resistance() {
+        // Classic cancellation test: 1e16 + 1.0 + (-1e16) = 1.0 (not 0.0).
+        let values = [1e16, 1.0, -1e16];
+        let naive: f64 = values.iter().sum();
+        let compensated = neumaier_sum(&values);
+        // Naive sum gives 0.0 due to catastrophic cancellation.
+        assert!((naive - 0.0).abs() < f64::EPSILON, "Naive: {naive}");
+        // Neumaier gives the correct answer: 1.0.
+        assert!(
+            (compensated - 1.0).abs() < f64::EPSILON,
+            "Neumaier: {compensated}"
+        );
+    }
+
+    #[test]
+    fn test_neumaier_empty() {
+        assert!((neumaier_sum(&[]) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_neumaier_single() {
+        assert!((neumaier_sum(&[42.0]) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_neumaier_simple_sum() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!((neumaier_sum(&values) - 15.0).abs() < f64::EPSILON);
+    }
+}
