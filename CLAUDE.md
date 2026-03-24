@@ -179,7 +179,7 @@ Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan
 | Zero-copy | rkyv | 0.8.15 |
 | Auth | arc-swap + jsonwebtoken + totp-rs | 1.9.0 / 10.3.0 / 5.7.1 |
 | Secrets | secrecy + zeroize | 0.10.3 / 1.8.2 |
-| AWS | aws-config + aws-sdk-ssm + aws-sdk-sns | 1.8.15 / 1.107.0 / 1.97.0 |
+| AWS | aws-config + aws-sdk-ssm + aws-sdk-sns | 1.8.15 / 1.108.0 / 1.98.0 |
 | Config | figment + toml | 0.10.19 / 1.1.0 |
 | Concurrent map | papaya | 0.2.3 |
 | Rate limiting | governor | 0.10.2 |

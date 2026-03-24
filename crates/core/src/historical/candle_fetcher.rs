@@ -1754,11 +1754,12 @@ mod tests {
 
     #[test]
     fn test_intraday_timeframes_constant() {
-        assert_eq!(INTRADAY_TIMEFRAMES.len(), 4);
+        assert_eq!(INTRADAY_TIMEFRAMES.len(), 5);
         assert_eq!(INTRADAY_TIMEFRAMES[0], ("1", "1m"));
         assert_eq!(INTRADAY_TIMEFRAMES[1], ("5", "5m"));
         assert_eq!(INTRADAY_TIMEFRAMES[2], ("15", "15m"));
-        assert_eq!(INTRADAY_TIMEFRAMES[3], ("60", "60m"));
+        assert_eq!(INTRADAY_TIMEFRAMES[3], ("25", "25m"));
+        assert_eq!(INTRADAY_TIMEFRAMES[4], ("60", "60m"));
     }
 
     // -- Error classification tests --
