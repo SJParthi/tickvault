@@ -1732,7 +1732,13 @@ async fn run_candle_persistence_consumer(
 
         // Periodic sweep: emit stale candles and flush to QuestDB
         if last_sweep.elapsed() >= sweep_interval {
-            let now_secs = chrono::Utc::now().timestamp() as u32;
+            // CRITICAL: Dhan WebSocket timestamps are IST epoch seconds.
+            // Must add IST offset to UTC clock for correct stale comparison.
+            // APPROVED: i64→u32 safe: IST epoch fits u32 until 2106.
+            #[allow(clippy::cast_possible_truncation)]
+            let now_secs = (chrono::Utc::now().timestamp()
+                + i64::from(dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS))
+                as u32;
             aggregator.sweep_stale(now_secs);
             let completed = aggregator.completed_slice();
 
