@@ -82,20 +82,20 @@ Strategy decision at ts=09:15:00:
   - `ts` = candle boundary timestamp
   - Tests: test_pcr_snapshots_live_ddl
 
-- [ ] 6. Add candle-close notification channel (candle aggregator → greeks aggregator)
-  - Files: crates/core/src/pipeline/candle_aggregator.rs, greeks_aggregator.rs
-  - New: `mpsc::channel<CandleCloseEvent>` carrying `candle_ts` + `timeframe`
-  - When candle aggregator completes a candle → send CandleCloseEvent
-  - GreeksAggregator listens: on event → snapshot all Greeks at that candle_ts
-  - Tests: test_candle_close_triggers_greeks_snapshot
+- [x] 6. Candle-close detection via tick second boundary
+  - Files: crates/app/src/main.rs (run_greeks_aggregator_consumer)
+  - Approach: detect 1-second boundary from tick.exchange_timestamp changes
+  - When exchange_timestamp second changes → snapshot previous second
+  - No separate mpsc channel needed — simpler, same result
+  - Tests: covered by aggregator unit tests (test_greeks_aggregator_emits_on_candle_close)
 
-- [ ] 7. Wire GreeksAggregator into trading pipeline
-  - Files: crates/app/src/trading_pipeline.rs
-  - Subscribe broadcast::Receiver<ParsedTick> for tick state updates
-  - Subscribe mpsc::Receiver<CandleCloseEvent> for snapshot triggers
-  - Spawn as background tokio task
-  - Pass instrument_registry + greeks_config + questdb_writer
-  - Tests: test_pipeline_wiring_greeks_aggregator
+- [x] 7. Wire GreeksAggregator into boot sequence
+  - Files: crates/app/src/main.rs
+  - Spawned as background tokio task in BOTH fast boot and slow boot paths
+  - Subscribes to tick_broadcast (same pattern as candle persistence consumer)
+  - Writes to QuestDB via GreeksPersistenceWriter
+  - Gated on config.greeks.enabled + subscription_plan availability
+  - Tests: TEST-EXEMPT (requires live QuestDB + tick broadcast)
 
 ## Architecture
 

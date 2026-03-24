@@ -535,6 +535,27 @@ async fn main() -> Result<()> {
             info!("greeks pipeline disabled in config");
         }
 
+        // --- Background: Tick-driven Greeks aggregator (candle-aligned) ---
+        if config.greeks.enabled {
+            if let Some(ref plan) = subscription_plan {
+                let greeks_agg_rx = fast_tick_broadcast_sender.subscribe();
+                // O(1) EXEMPT: cold path — clone registry once at startup for background consumer.
+                let greeks_agg_registry = plan.registry.clone();
+                let greeks_agg_config = config.greeks.clone();
+                let greeks_agg_questdb = config.questdb.clone();
+                tokio::spawn(async move {
+                    run_greeks_aggregator_consumer(
+                        greeks_agg_rx,
+                        greeks_agg_registry,
+                        greeks_agg_config,
+                        greeks_agg_questdb,
+                    )
+                    .await;
+                });
+                info!("tick-driven greeks aggregator started (candle-aligned, cold path)");
+            }
+        }
+
         // --- Background: Order update WebSocket ---
         let (order_update_sender, _order_update_receiver) = tokio::sync::broadcast::channel::<
             dhan_live_trader_common::order_types::OrderUpdate,
@@ -989,6 +1010,29 @@ async fn main() -> Result<()> {
         info!("background greeks pipeline started (cold path)");
     } else {
         info!("greeks pipeline disabled in config");
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 9.7: Tick-driven Greeks aggregator (candle-aligned, cold path)
+    // -----------------------------------------------------------------------
+    if config.greeks.enabled {
+        if let Some(ref plan) = subscription_plan {
+            let greeks_agg_rx = tick_broadcast_sender.subscribe();
+            // O(1) EXEMPT: cold path — clone registry once at startup for background consumer.
+            let greeks_agg_registry = plan.registry.clone();
+            let greeks_agg_config = config.greeks.clone();
+            let greeks_agg_questdb = config.questdb.clone();
+            tokio::spawn(async move {
+                run_greeks_aggregator_consumer(
+                    greeks_agg_rx,
+                    greeks_agg_registry,
+                    greeks_agg_config,
+                    greeks_agg_questdb,
+                )
+                .await;
+            });
+            info!("tick-driven greeks aggregator started (candle-aligned, cold path)");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1766,6 +1810,190 @@ async fn run_candle_persistence_consumer(
                 warn!(?err, "cold-path candle flush failed");
             }
             last_sweep = std::time::Instant::now();
+        }
+    }
+}
+
+/// Subscribes to the tick broadcast, aggregates Greeks/PCR aligned to 1-second
+/// candle boundaries, and persists them to QuestDB `option_greeks_live` and
+/// `pcr_snapshots_live`.
+///
+/// Runs as a cold-path background consumer. The `GreeksAggregator` receives every
+/// tick, updates internal state in O(1), then emits a snapshot every second boundary
+/// (when a tick's `exchange_timestamp` second differs from the previous snapshot).
+///
+/// All snapshots have `ts = candle_boundary` ensuring exact JOIN with `candles_1s`.
+// TEST-EXEMPT: requires live QuestDB + tick broadcast (integration test)
+async fn run_greeks_aggregator_consumer(
+    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
+    registry: dhan_live_trader_common::instrument_registry::InstrumentRegistry,
+    greeks_config: dhan_live_trader_common::config::GreeksConfig,
+    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+) {
+    let mut greeks_writer =
+        match dhan_live_trader_storage::greeks_persistence::GreeksPersistenceWriter::new(
+            &questdb_config,
+        ) {
+            Ok(w) => {
+                info!("greeks aggregator writer connected to QuestDB");
+                w
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "greeks aggregator writer unavailable — live Greeks will NOT be persisted"
+                );
+                return;
+            }
+        };
+
+    let mut aggregator = dhan_live_trader_trading::greeks::aggregator::GreeksAggregator::new(
+        registry,
+        greeks_config,
+    );
+
+    // Track the last snapshot second to detect candle boundaries.
+    let mut last_snapshot_secs: u32 = 0;
+    let mut snapshots_written: u64 = 0;
+    // O(1) EXEMPT: cold path, pipeline setup
+    let flush_interval = std::time::Duration::from_secs(1);
+    let mut last_flush = std::time::Instant::now();
+
+    loop {
+        match tokio::time::timeout(flush_interval, tick_rx.recv()).await {
+            Ok(Ok(tick)) => {
+                aggregator.update(&tick);
+
+                // Detect 1-second candle boundary: new second in exchange timestamp.
+                let tick_secs = tick.exchange_timestamp;
+                if tick_secs != last_snapshot_secs && last_snapshot_secs > 0 {
+                    // Previous second just completed → snapshot at that boundary.
+                    let event = dhan_live_trader_trading::greeks::aggregator::CandleCloseEvent {
+                        candle_ts: last_snapshot_secs,
+                        interval_secs: 1,
+                    };
+                    let emission = aggregator.snapshot(event);
+
+                    // Write Greeks snapshots to QuestDB
+                    for snap in &emission.greeks_snapshots {
+                        // IST epoch seconds → nanoseconds for QuestDB
+                        let ts_nanos = i64::from(snap.candle_ts) * 1_000_000_000;
+                        let expiry_str = snap.expiry_date.to_string();
+                        let segment_str =
+                            dhan_live_trader_common::types::ExchangeSegment::from_byte(
+                                snap.exchange_segment_code,
+                            )
+                            .map(|s| s.as_str())
+                            .unwrap_or("UNKNOWN");
+
+                        let row =
+                            dhan_live_trader_storage::greeks_persistence::OptionGreeksLiveRow {
+                                segment: segment_str,
+                                security_id: i64::from(snap.security_id),
+                                symbol_name: "",
+                                underlying_security_id: i64::from(snap.underlying_security_id),
+                                underlying_symbol: &snap.underlying_symbol,
+                                strike_price: snap.strike_price,
+                                option_type: snap.option_type.as_str(),
+                                expiry_date: &expiry_str,
+                                candle_interval: "1s",
+                                iv: snap.greeks.iv,
+                                delta: snap.greeks.delta,
+                                gamma: snap.greeks.gamma,
+                                theta: snap.greeks.theta,
+                                vega: snap.greeks.vega,
+                                rho: snap.greeks.rho,
+                                charm: snap.greeks.charm,
+                                vanna: snap.greeks.vanna,
+                                volga: snap.greeks.volga,
+                                veta: snap.greeks.veta,
+                                speed: snap.greeks.speed,
+                                color: snap.greeks.color,
+                                zomma: snap.greeks.zomma,
+                                ultima: snap.greeks.ultima,
+                                bs_price: snap.greeks.bs_price,
+                                intrinsic_value: snap.greeks.intrinsic,
+                                extrinsic_value: snap.greeks.extrinsic,
+                                spot_price: snap.spot_price,
+                                option_ltp: snap.option_ltp,
+                                oi: i64::from(snap.oi),
+                                volume: i64::from(snap.volume),
+                                ts_nanos,
+                            };
+                        if let Err(err) = greeks_writer.write_option_greeks_live_row(&row) {
+                            warn!(?err, "failed to write live greeks row");
+                            break;
+                        }
+                    }
+
+                    // Write PCR snapshots to QuestDB
+                    for pcr_snap in &emission.pcr_snapshots {
+                        let ts_nanos = i64::from(pcr_snap.candle_ts) * 1_000_000_000;
+                        let expiry_str = pcr_snap.expiry_date.to_string();
+                        let sentiment_str = match pcr_snap.sentiment {
+                            dhan_live_trader_trading::greeks::pcr::PcrSentiment::Bullish => {
+                                "Bullish"
+                            }
+                            dhan_live_trader_trading::greeks::pcr::PcrSentiment::Neutral => {
+                                "Neutral"
+                            }
+                            dhan_live_trader_trading::greeks::pcr::PcrSentiment::Bearish => {
+                                "Bearish"
+                            }
+                        };
+
+                        let row =
+                            dhan_live_trader_storage::greeks_persistence::PcrSnapshotLiveRow {
+                                underlying_symbol: &pcr_snap.underlying_symbol,
+                                expiry_date: &expiry_str,
+                                candle_interval: "1s",
+                                pcr_oi: pcr_snap.pcr_oi.unwrap_or(0.0),
+                                pcr_volume: pcr_snap.pcr_volume.unwrap_or(0.0),
+                                total_put_oi: pcr_snap.total_put_oi as i64,
+                                total_call_oi: pcr_snap.total_call_oi as i64,
+                                total_put_volume: pcr_snap.total_put_volume as i64,
+                                total_call_volume: pcr_snap.total_call_volume as i64,
+                                sentiment: sentiment_str,
+                                ts_nanos,
+                            };
+                        if let Err(err) = greeks_writer.write_pcr_snapshot_live_row(&row) {
+                            warn!(?err, "failed to write live PCR row");
+                            break;
+                        }
+                    }
+
+                    snapshots_written =
+                        snapshots_written.saturating_add(emission.greeks_snapshots.len() as u64);
+                }
+                last_snapshot_secs = tick_secs;
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                warn!(
+                    skipped,
+                    "greeks aggregator consumer lagged — some ticks not processed"
+                );
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                info!(
+                    snapshots_written,
+                    ticks_processed = aggregator.ticks_processed(),
+                    tracked_options = aggregator.tracked_options(),
+                    "greeks aggregator consumer shutting down (broadcast closed)"
+                );
+                let _ = greeks_writer.flush();
+                return;
+            }
+            Err(_timeout) => {
+                // No tick received within 1s — just flush below
+            }
+        }
+
+        // Periodic flush to QuestDB
+        if last_flush.elapsed() >= flush_interval {
+            if let Err(err) = greeks_writer.flush() {
+                warn!(?err, "greeks aggregator flush failed");
+            }
+            last_flush = std::time::Instant::now();
         }
     }
 }
