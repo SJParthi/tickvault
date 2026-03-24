@@ -336,7 +336,8 @@ impl Default for ObservabilityConfig {
 /// expiry only with ATM ± N strike filtering.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionConfig {
-    /// Feed mode for all subscriptions. Start with Ticker, upgrade later.
+    /// Feed mode for all subscriptions. Always Full for maximum data (LTP, OI, depth).
+    /// IDX_I instruments are forced to Ticker at connection level (Dhan limitation).
     /// Valid values: "Ticker", "Quote", "Full".
     pub feed_mode: String,
 
@@ -368,7 +369,7 @@ pub struct SubscriptionConfig {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
-            feed_mode: "Ticker".to_string(),
+            feed_mode: "Full".to_string(),
             subscribe_index_derivatives: true,
             subscribe_stock_derivatives: true,
             subscribe_display_indices: true,
@@ -1304,7 +1305,7 @@ mod tests {
     #[test]
     fn test_subscription_config_default() {
         let config = SubscriptionConfig::default();
-        assert_eq!(config.feed_mode, "Ticker");
+        assert_eq!(config.feed_mode, "Full");
         assert!(config.subscribe_index_derivatives);
         assert!(config.subscribe_stock_derivatives);
         assert!(config.subscribe_display_indices);
