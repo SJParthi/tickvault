@@ -54,7 +54,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32.1"
 
 # ---- Section 6: Trading Domain — Auth ----
-arc-swap = "1.7.1"
+arc-swap = "1.9.0"
 jsonwebtoken = "10.3.0"
 totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth"] }
 
