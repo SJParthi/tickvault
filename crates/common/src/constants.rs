@@ -1019,8 +1019,13 @@ pub const TIMEFRAME_1D: &str = "1d";
 
 /// All intraday timeframes to fetch from Dhan API.
 /// Each tuple: (interval for API request, timeframe label for storage).
-pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] =
-    &[("1", "1m"), ("5", "5m"), ("15", "15m"), ("60", "60m")];
+pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] = &[
+    ("1", "1m"),
+    ("5", "5m"),
+    ("15", "15m"),
+    ("25", "25m"),
+    ("60", "60m"),
+];
 
 // ---------------------------------------------------------------------------
 // Authentication — SSM Path Construction

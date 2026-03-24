@@ -168,19 +168,19 @@ Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan
 | Category | Crate | Version |
 |----------|-------|---------|
 | Async | tokio | 1.49.0 |
-| WebSocket | tokio-tungstenite | 0.28.0 |
+| WebSocket | tokio-tungstenite | 0.29.0 |
 | HTTP client | reqwest | 0.12.15 |
 | HTTP server | axum | 0.8.8 |
 | Database | questdb-rs | 6.1.0 |
-| Cache | redis | 1.0.5 |
+| Cache | redis | 1.1.0 |
 | Metrics | metrics + prometheus-exporter | 0.24.3 / 0.18.1 |
 | Tracing | tracing + opentelemetry | 0.1.44 / 0.31.0 |
 | Serialization | serde + serde_json | 1.0.228 / 1.0.149 |
 | Zero-copy | rkyv | 0.8.15 |
-| Auth | arc-swap + jsonwebtoken + totp-rs | 1.7.1 / 10.3.0 / 5.7.1 |
+| Auth | arc-swap + jsonwebtoken + totp-rs | 1.9.0 / 10.3.0 / 5.7.1 |
 | Secrets | secrecy + zeroize | 0.10.3 / 1.8.2 |
 | AWS | aws-config + aws-sdk-ssm + aws-sdk-sns | 1.8.15 / 1.107.0 / 1.97.0 |
-| Config | figment + toml | 0.10.19 / 1.0.6 |
+| Config | figment + toml | 0.10.19 / 1.1.0 |
 | Concurrent map | papaya | 0.2.3 |
 | Rate limiting | governor | 0.10.2 |
 | CLI | clap | 4.6.0 |

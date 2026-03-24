@@ -158,7 +158,7 @@ Split packets by message length from the header.
 { "RequestCode": 12 }
 ```
 
-Server disconnect packet: response code `50` with reason code in bytes 13-14 (see 08-annexure Section 11).
+Server disconnect packet: response code `50` with reason code in bytes 8-11 (u32 LE, within the 12-byte header — same position as sequence/row_count for data packets). See 08-annexure Section 11 for disconnect reason codes.
 
 ---
 

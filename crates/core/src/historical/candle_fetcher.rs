@@ -530,6 +530,9 @@ struct DailyRequest {
     instrument: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     expiry_code: Option<u8>,
+    /// Whether to include Open Interest data in the response.
+    /// Required for F&O instruments to receive OI in the `open_interest` array.
+    oi: bool,
     from_date: String,
     to_date: String,
 }
@@ -956,6 +959,7 @@ async fn fetch_single_instrument(
         exchange_segment: exchange_segment_str.to_string(),
         instrument: instrument_type.to_string(),
         expiry_code: None,
+        oi: true,
         from_date: daily_from.to_string(),
         to_date: daily_to.to_string(),
     };
@@ -1591,6 +1595,7 @@ mod tests {
             exchange_segment: "IDX_I".to_string(),
             instrument: "INDEX".to_string(),
             expiry_code: None,
+            oi: true,
             from_date: "2025-12-14".to_string(),
             to_date: "2026-03-14".to_string(),
         };
@@ -3065,6 +3070,7 @@ mod tests {
             exchange_segment: "NSE_FNO".to_string(),
             instrument: "FUTIDX".to_string(),
             expiry_code: Some(0),
+            oi: true,
             from_date: "2026-01-01".to_string(),
             to_date: "2026-03-21".to_string(),
         };
@@ -3079,6 +3085,7 @@ mod tests {
             exchange_segment: "NSE_EQ".to_string(),
             instrument: "EQUITY".to_string(),
             expiry_code: None,
+            oi: false,
             from_date: "2026-01-01".to_string(),
             to_date: "2026-03-21".to_string(),
         };

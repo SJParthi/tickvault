@@ -327,7 +327,7 @@ pub struct GenerateTokenRequest {
     pub totp: String,
 }
 
-/// Request body for `POST /v2/renewToken` (unused — renewal uses GET with headers).
+/// Request body for token renewal (unused — actual renewal uses `GET /v2/RenewToken` with headers).
 ///
 /// Fields are zeroized on drop to prevent credential leakage from freed memory.
 #[derive(serde::Serialize, Zeroize, ZeroizeOnDrop)]

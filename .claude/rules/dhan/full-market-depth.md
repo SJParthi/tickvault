@@ -63,7 +63,7 @@
 
 15. **All reads are Little Endian.** See `dhan-live-market-feed.md` rule 13.
 
-16. **Disconnect: code 50, reason in bytes 12-13** (not 8-9 like Live Market Feed, because header is 12 bytes).
+16. **Disconnect: code 50, reason in bytes 8-11** (within the 12-byte header, same position as seq/row_count). The disconnect reason code occupies the last 4 bytes of the 12-byte deep depth header (`u32` at offset 8), NOT bytes 12-13 after the header. This is consistent with the Python SDK's `<hBBiI>` format where the `I` field at bytes 8-11 carries context-dependent data (sequence for 20-level, row count for 200-level, disconnect code for code 50).
 
 17. **Ping/pong: let WebSocket library handle it.** See `dhan-live-market-feed.md` rule 16.
 
