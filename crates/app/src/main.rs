@@ -1822,6 +1822,14 @@ async fn run_candle_persistence_consumer(
 /// tick, updates internal state in O(1), then emits a snapshot every second boundary
 /// (when a tick's `exchange_timestamp` second differs from the previous snapshot).
 ///
+/// **Market hours filter:** Only snapshots within [09:00, 15:30) IST are persisted,
+/// matching the exact same window as ticks and candles_1s. Post-market ticks still
+/// update internal state (for smooth transition next day) but are NOT written to QuestDB.
+///
+/// **Computation frequency:** Greeks are computed once per second (on each 1-second
+/// candle boundary). Per-tick updates are O(1) state tracking only (LTP, OI, volume).
+/// The expensive Black-Scholes computation happens only at the second boundary.
+///
 /// All snapshots have `ts = candle_boundary` ensuring exact JOIN with `candles_1s`.
 // TEST-EXEMPT: requires live QuestDB + tick broadcast (integration test)
 async fn run_greeks_aggregator_consumer(
@@ -1867,6 +1875,20 @@ async fn run_greeks_aggregator_consumer(
                 // Detect 1-second candle boundary: new second in exchange timestamp.
                 let tick_secs = tick.exchange_timestamp;
                 if tick_secs != last_snapshot_secs && last_snapshot_secs > 0 {
+                    // Only persist within market hours [09:00, 15:30) IST — same
+                    // window as ticks table and candles_1s. Post-market ticks update
+                    // internal state but are NOT written to QuestDB.
+                    #[allow(clippy::arithmetic_side_effects)] // APPROVED: modulo by 86400 is safe
+                    let ist_secs_of_day =
+                        last_snapshot_secs % dhan_live_trader_common::constants::SECONDS_PER_DAY;
+                    if !(dhan_live_trader_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
+                        ..dhan_live_trader_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST)
+                        .contains(&ist_secs_of_day)
+                    {
+                        last_snapshot_secs = tick_secs;
+                        continue;
+                    }
+
                     // Previous second just completed → snapshot at that boundary.
                     let event = dhan_live_trader_trading::greeks::aggregator::CandleCloseEvent {
                         candle_ts: last_snapshot_secs,
