@@ -1,177 +1,155 @@
-# Implementation Plan: Tick-Driven Greeks Pipeline with Candle-Aligned Timestamps
+# Implementation Plan: Per-Tick Greeks as Columns in Ticks & Candles
 
-**Status:** IN_PROGRESS
+**Status:** DRAFT
 **Date:** 2026-03-24
-**Approved by:** Parthiban
+**Approved by:** pending
 
 ## Problem
 
-Greeks/PCR snapshots currently use `Utc::now()` as timestamp (system clock from REST API fetch time).
-This cannot be mapped to ticks/candles which use `exchange_timestamp` (NSE clock).
+Greeks are currently stored in separate `option_greeks_live` / `pcr_snapshots_live` tables,
+requiring JOINs to correlate with ticks and candles. This adds latency and complexity.
 
-**Critical requirement:** When the strategy evaluator checks a candle at 09:15:00 and asks
-"what were the Greeks at this moment?", the answer must be a Greeks row with `ts = 09:15:00`.
-The trading decision (ENTER/EXIT) depends on candle + Greeks + PCR all sharing the EXACT same timestamp.
+**New approach:** Greeks computed per-tick and stored as 6 additional columns directly in the
+`ticks` table and `candles_1s` table. All 18 materialized views inherit Greeks via `last()`.
+This eliminates JOINs, reduces writes (one ILP call instead of two), and keeps O(1) hot path.
 
-## Approach
+## What Gets Removed
 
-**Greeks/PCR snapshots are emitted at candle close boundaries**, not per-tick.
-The `GreeksAggregator` continuously updates its internal state from every tick,
-but only **emits a snapshot when a candle completes** — stamped with the candle's timestamp.
+- `option_greeks_live` table DDL, writer, row struct
+- `pcr_snapshots_live` table DDL, writer, row struct
+- `GreeksAggregator` candle-aligned emission to separate tables
+- `run_greeks_aggregator_consumer()` spawn in main.rs
 
-This means:
-- Ticks update internal state (latest option LTP, latest spot, latest OI)
-- When candle aggregator emits a completed 1s/1m candle → GreeksAggregator emits Greeks snapshot
-- Greeks snapshot `ts` = candle `ts` = exact match
-- Strategy evaluator sees: `candle OHLCV + Greeks + PCR` all at same `ts`
+## What Gets Kept
 
-```
-Strategy decision at ts=09:15:00:
-
-  candles_1m:          ts=09:15:00  open=22950 high=22965 low=22940 close=22958
-  option_greeks_live:  ts=09:15:00  delta=-0.464  gamma=0.00378  iv=18.29  theta=-88.27
-  pcr_snapshots_live:  ts=09:15:00  pcr_oi=0.95  sentiment=Bearish
-
-  → All three rows share ts=09:15:00
-  → Strategy evaluates: IF delta > -0.5 AND pcr < 1.0 → ENTER SHORT PUT
-```
+- `option_greeks` table (periodic API snapshot every 60s — cross-verification)
+- `pcr_snapshots` table (aggregate PCR — can't be per-instrument column)
+- `dhan_option_chain_raw` table (Dhan audit trail)
+- `greeks_verification` table (our vs Dhan comparison)
+- `GreeksAggregator` core logic (state tracking) — repurposed for inline compute
+- `greeks_pipeline.rs` (periodic API pipeline — unchanged)
 
 ## Plan Items
 
-- [x] 1. Add underlying LTP cache to track index/equity spot prices from ticks
-  - Files: crates/trading/src/greeks/aggregator.rs (NEW)
-  - Pattern: `HashMap<u32, (f32, u32)>` mapping security_id → (latest_ltp, exchange_timestamp)
-  - Updated on every IDX_I/NSE_EQ tick; read when computing F&O Greeks
-  - Tests: test_underlying_ltp_cache_update, test_underlying_ltp_cache_miss_skips_greeks
+- [ ] 1. Add 6 Greeks fields to `ParsedTick` struct
+  - Files: crates/common/src/tick_types.rs
+  - Add `iv: f64`, `delta: f64`, `gamma: f64`, `theta: f64`, `vega: f64`, `rho: f64`
+  - Default to `f64::NAN` (QuestDB NULL) for non-F&O ticks
+  - Tests: test_parsed_tick_greeks_default_nan, test_parsed_tick_greeks_copy
 
-- [x] 2. Add underlying security_id reverse lookup (symbol → security_id)
-  - Files: crates/common/src/instrument_registry.rs
-  - Add `fn get_underlying_security_id(&self, symbol: &str) -> Option<u32>` method
-  - Build reverse map at registry construction time (cold path, O(N) once)
-  - Tests: test_underlying_reverse_lookup, test_underlying_reverse_lookup_missing
+- [ ] 2. Add 6 Greeks columns to `ticks` table DDL
+  - Files: crates/storage/src/tick_persistence.rs
+  - Add `iv DOUBLE, delta DOUBLE, gamma DOUBLE, theta DOUBLE, vega DOUBLE, rho DOUBLE`
+  - Write Greeks columns in `append_tick()` ILP builder
+  - NaN values = QuestDB NULL (no storage cost in columnar format)
+  - Tests: test_ticks_ddl_has_greeks_columns, test_append_tick_writes_greeks
 
-- [x] 3. Create `GreeksAggregator` — candle-aligned Greeks computation engine
-  - Files: crates/trading/src/greeks/aggregator.rs (NEW)
-  - **Two-phase design:**
-    - Phase A (per-tick, O(1)): Update internal state maps:
-      - `option_state: HashMap<u32, OptionTickState>` (LTP, OI, volume per F&O security_id)
-      - `underlying_ltp: HashMap<u32, f32>` (spot price per underlying)
-    - Phase B (on candle close): Compute Greeks for ALL tracked options, emit snapshots
-      - Triggered by candle aggregator signal (candle_ts notification)
-      - Iterates option_state map, computes BS Greeks for each
-      - Emits rows with `ts = candle_ts` (the candle boundary)
-      - Computes PCR per underlying/expiry from aggregated OI
-  - O(1) per tick update, O(N) per candle close (N = active options, ~2-5K)
-  - Tests: test_greeks_aggregator_updates_state_on_tick,
-           test_greeks_aggregator_emits_on_candle_close,
-           test_greeks_aggregator_timestamp_matches_candle,
-           test_greeks_aggregator_skips_when_no_underlying_ltp
+- [ ] 3. Add 6 Greeks columns to `candles_1s` base table DDL
+  - Files: crates/storage/src/materialized_views.rs
+  - Add `iv DOUBLE, delta DOUBLE, gamma DOUBLE, theta DOUBLE, vega DOUBLE, rho DOUBLE`
+  - Tests: test_candles_1s_ddl_has_greeks_columns
 
-- [x] 4. Create `option_greeks_live` QuestDB table
+- [ ] 4. Add `last(iv)`, `last(delta)`, etc. to all 18 materialized views
+  - Files: crates/storage/src/materialized_views.rs
+  - Modify `build_view_sql()` to include `last(iv) AS iv, last(delta) AS delta, ...`
+  - All 18 views inherit Greeks automatically
+  - Tests: test_build_view_sql_has_greeks_columns, test_all_views_have_greeks
+
+- [ ] 5. Add Greeks fields to candle struct and candle persistence writer
+  - Files: crates/common/src/tick_types.rs, crates/storage/src/candle_persistence.rs
+  - Add Greeks to `CandleData` / candle write path
+  - Write `last()` Greeks when flushing candles
+  - Tests: test_candle_data_has_greeks, test_candle_persistence_writes_greeks
+
+- [ ] 6. Track last Greeks per instrument in candle aggregator
+  - Files: crates/core/src/pipeline/candle_aggregator.rs
+  - On each F&O tick with valid Greeks: store `(iv, delta, gamma, theta, vega, rho)`
+  - On candle close: emit last-seen Greeks as candle's Greeks
+  - Equity ticks: NaN Greeks (no computation)
+  - Tests: test_candle_aggregator_tracks_greeks, test_candle_close_has_last_greeks
+
+- [ ] 7. Compute Greeks inline in tick processor for F&O ticks
+  - Files: crates/core/src/pipeline/tick_processor.rs
+  - For NSE_FNO ticks: call `compute_greeks()` with spot (from underlying cache), strike, expiry, LTP
+  - For non-F&O ticks: leave Greeks as NaN
+  - Needs access to: instrument registry (strike, expiry, option_type), underlying LTP cache
+  - Tests: test_tick_processor_computes_greeks_fno, test_tick_processor_nan_greeks_equity
+
+- [ ] 8. Remove `option_greeks_live` table and all related code
   - Files: crates/storage/src/greeks_persistence.rs
-  - Same columns as `option_greeks` plus `candle_interval` (SYMBOL: "1s", "1m", etc.)
-  - DEDUP KEY: `(ts, security_id, segment, candle_interval)`
-  - `ts` = candle boundary timestamp (exchange clock, IST)
-  - Keep existing `option_greeks` for Dhan API audit trail
-  - Tests: test_option_greeks_live_ddl, test_dedup_key_includes_candle_interval
+  - Remove: `OPTION_GREEKS_LIVE_DDL`, `TABLE_OPTION_GREEKS_LIVE`, `DEDUP_KEY_OPTION_GREEKS_LIVE`
+  - Remove: `OptionGreeksLiveRow`, `write_option_greeks_live_row()`
+  - Remove: DDL execution in `ensure_greeks_tables()`
+  - Tests: test_no_option_greeks_live_table
 
-- [x] 5. Create `pcr_snapshots_live` QuestDB table
+- [ ] 9. Remove `pcr_snapshots_live` table and all related code
   - Files: crates/storage/src/greeks_persistence.rs
-  - Same columns as `pcr_snapshots` plus `candle_interval`
-  - DEDUP KEY: `(ts, underlying_symbol, expiry_date, candle_interval)`
-  - `ts` = candle boundary timestamp
-  - Tests: test_pcr_snapshots_live_ddl
+  - Remove: `PCR_SNAPSHOTS_LIVE_DDL`, `TABLE_PCR_SNAPSHOTS_LIVE`, `DEDUP_KEY_PCR_SNAPSHOTS_LIVE`
+  - Remove: `PcrSnapshotLiveRow`, `write_pcr_snapshot_live_row()`
+  - Remove: DDL execution in `ensure_greeks_tables()`
+  - Tests: test_no_pcr_snapshots_live_table
 
-- [x] 6. Candle-close detection via tick second boundary
-  - Files: crates/app/src/main.rs (run_greeks_aggregator_consumer)
-  - Approach: detect 1-second boundary from tick.exchange_timestamp changes
-  - When exchange_timestamp second changes → snapshot previous second
-  - No separate mpsc channel needed — simpler, same result
-  - Tests: covered by aggregator unit tests (test_greeks_aggregator_emits_on_candle_close)
-
-- [x] 7. Wire GreeksAggregator into boot sequence
+- [ ] 10. Remove GreeksAggregator candle-aligned consumer from main.rs
   - Files: crates/app/src/main.rs
-  - Spawned as background tokio task in BOTH fast boot and slow boot paths
-  - Subscribes to tick_broadcast (same pattern as candle persistence consumer)
-  - Writes to QuestDB via GreeksPersistenceWriter
-  - Gated on config.greeks.enabled + subscription_plan availability
-  - Tests: TEST-EXEMPT (requires live QuestDB + tick broadcast)
+  - Remove: `run_greeks_aggregator_consumer()` spawn
+  - Keep: periodic `run_greeks_pipeline()` spawn (API cross-verification)
+  - Tests: compile check (dead code elimination)
 
-## Architecture
+- [ ] 11. Update GreeksAggregator — repurpose for inline tick computation
+  - Files: crates/trading/src/greeks/aggregator.rs
+  - Remove: `GreeksEmission`, `emit_snapshot()`, candle-close emission logic
+  - Keep: underlying LTP cache, option state tracking
+  - Add: `compute_for_tick(tick) -> (iv, delta, gamma, theta, vega, rho)` method
+  - Tests: test_compute_for_tick_returns_greeks, test_compute_for_tick_no_spot_returns_nan
+
+- [ ] 12. Update all existing tests for schema changes
+  - Files: crates/storage/tests/*, crates/core/tests/*, crates/trading/tests/*
+  - Update DDL assertion tests for new columns
+  - Update tick/candle struct tests for Greeks fields
+  - Update integration tests that build ParsedTick/CandleData
+  - Tests: all existing tests must pass with new schema
+
+## Architecture (New)
 
 ```
 WebSocket (Full mode, 162 bytes)
     │
     ▼
-Tick Processor (parse binary → ParsedTick)
+Tick Processor
     │
-    ├─► Tick Persistence (QuestDB: ticks table, ts=exchange_timestamp)
+    ├─ Parse binary → ParsedTick
     │
-    ├─► Broadcast Channel (ParsedTick)
-    │       │
-    │       ├─► Candle Aggregator
-    │       │       │
-    │       │       ├─► Candle Persistence (QuestDB: candles, ts=candle_open)
-    │       │       │
-    │       │       └─► CandleCloseEvent channel ──┐
-    │       │                                       │
-    │       ├─► Strategy Evaluator                  │
-    │       │                                       │
-    │       └─► GreeksAggregator (NEW)  ◄───────────┘
-    │               │
-    │               ├─ Per tick: update internal state (O(1))
-    │               │   - IDX_I tick → underlying_ltp[sec_id] = ltp
-    │               │   - NSE_FNO tick → option_state[sec_id] = {ltp, oi, vol}
-    │               │
-    │               └─ On CandleCloseEvent(candle_ts):
-    │                   - For each option in option_state:
-    │                       compute_greeks(underlying_ltp, strike, T, r, q, option_ltp)
-    │                   - Aggregate OI → compute PCR per underlying
-    │                   - Write to QuestDB:
-    │                       option_greeks_live.ts = candle_ts
-    │                       pcr_snapshots_live.ts = candle_ts
+    ├─ IF NSE_FNO:
+    │     spot = underlying_ltp_cache[underlying_security_id]
+    │     greeks = compute_greeks(spot, strike, T, r, option_ltp)
+    │     tick.iv = greeks.iv
+    │     tick.delta = greeks.delta (... etc)
+    │  ELSE:
+    │     tick.iv = NaN (... etc)
+    │
+    ├─► Tick Persistence → ticks table (WITH Greeks columns)
+    │
+    ├─► Broadcast → Candle Aggregator
+    │                   │
+    │                   ├─ Track last Greeks per instrument
+    │                   ├─ On candle close: candle.iv = last_greeks.iv
+    │                   └─► candles_1s table (WITH Greeks columns)
+    │                           │
+    │                           └─► QuestDB Materialized Views
+    │                               candles_5s..1M all get last(iv), last(delta)...
     │
     └─► [Existing] Greeks Pipeline (REST API, every 60s, audit only)
-```
-
-## Timestamp Alignment (the whole point)
-
-```
-09:15:00 ─── candle boundary ───────────────────── 09:16:00
-   │                                                   │
-   │  ticks: 09:15:01  15:02  15:03  ...  15:58  15:59│
-   │         ↓ updates state    ↓ updates state        │
-   │                                                   │
-   │  candle_aggregator completes 1m candle:           │
-   │  → CandleCloseEvent { ts: 09:15:00 }             │
-   │                                                   │
-   │  greeks_aggregator receives event:                │
-   │  → snapshot Greeks using LATEST tick state        │
-   │  → ts = 09:15:00 (same as candle)                │
-   │                                                   │
-   │  QuestDB rows:                                    │
-   │    candles_1m.ts        = 09:15:00 ✓              │
-   │    option_greeks_live.ts = 09:15:00 ✓             │
-   │    pcr_snapshots_live.ts = 09:15:00 ✓             │
-   │                                                   │
-   │  Strategy evaluator at 09:16:00:                  │
-   │    SELECT c.close, g.delta, p.pcr_oi              │
-   │    FROM candles_1m c                              │
-   │    JOIN option_greeks_live g ON c.ts = g.ts       │
-   │    JOIN pcr_snapshots_live p ON c.ts = p.ts       │
-   │    WHERE c.ts = '09:15:00'                        │
-   │    → EXACT MATCH, no approximation ✓              │
 ```
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | 1m candle closes at 09:15:00 | Greeks/PCR snapshot emitted with ts=09:15:00 |
-| 2 | F&O tick arrives, no underlying LTP yet | State updated but no Greeks on candle close for that option |
-| 3 | IDX_I tick arrives | Updates underlying_ltp cache only |
-| 4 | Multiple candle intervals (1s, 1m) configured | Separate snapshot per interval, each with matching ts |
-| 5 | Expiry day, T approaching 0 | MIN_TIME_TO_EXPIRY guard in BS code handles it |
-| 6 | Strategy asks: "delta at 09:15:00?" | Exact JOIN on ts=09:15:00 → precise answer |
-| 7 | No ticks during a candle period | Candle still closes, Greeks use last known state |
-| 8 | OI changes mid-candle | Internal state updated; PCR snapshot at candle close reflects latest |
+| 1 | F&O tick arrives with spot available | Greeks computed, 6 columns populated in tick |
+| 2 | F&O tick arrives, no spot yet | Greeks = NaN (no underlying LTP cache hit) |
+| 3 | Equity tick arrives | Greeks = NaN (not F&O) |
+| 4 | IDX_I tick arrives | Greeks = NaN, but updates underlying LTP cache |
+| 5 | 1s candle closes with 10 F&O ticks | Candle Greeks = last tick's Greeks |
+| 6 | 1s candle closes with 0 F&O ticks | Candle Greeks = NaN |
+| 7 | Materialized view candles_5m | Gets `last(iv)` from candles_1s = last 1s candle's Greeks |
+| 8 | Query: "What was delta at 09:15?" | Direct column read from candles_1m, no JOIN |
