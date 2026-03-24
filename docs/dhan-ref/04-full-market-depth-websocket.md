@@ -158,7 +158,7 @@ Split packets by message length from the header.
 { "RequestCode": 12 }
 ```
 
-Server disconnect packet: response code `50` with reason code in bytes 8-11 (u32 LE, within the 12-byte header — same position as sequence/row_count for data packets). See 08-annexure Section 11 for disconnect reason codes.
+Server disconnect packet: 14 bytes total = 12-byte header (with feed code 50) + 2-byte disconnect reason code (i16 LE at bytes 12-13, 0-based). This differs from the Live Market Feed disconnect (10 bytes: 8-byte header + 2-byte code at bytes 8-9). Per Dhan docs, the header remains 12 bytes with code 50, followed by an int16 disconnection message code. See 08-annexure Section 11 for disconnect reason codes. Note: Python SDK `fulldepth.py` has a bug — uses `<hBBiI>` (12 bytes) but tries to access index `[5]` (needs `<hBBiIH>` = 14 bytes).
 
 ---
 

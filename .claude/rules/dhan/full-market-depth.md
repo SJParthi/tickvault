@@ -63,7 +63,7 @@
 
 15. **All reads are Little Endian.** See `dhan-live-market-feed.md` rule 13.
 
-16. **Disconnect: code 50, reason in bytes 8-11** (within the 12-byte header, same position as seq/row_count). The disconnect reason code occupies the last 4 bytes of the 12-byte deep depth header (`u32` at offset 8), NOT bytes 12-13 after the header. This is consistent with the Python SDK's `<hBBiI>` format where the `I` field at bytes 8-11 carries context-dependent data (sequence for 20-level, row count for 200-level, disconnect code for code 50).
+16. **Disconnect: code 50, reason in bytes 12-13 (0-based), i16 LE.** The depth disconnect packet is 14 bytes total: 12-byte depth header + 2-byte disconnect reason code at bytes 12-13. This is DIFFERENT from the Live Market Feed disconnect (10 bytes: 8-byte header + 2-byte code at bytes 8-9). The Python SDK's `fulldepth.py` has a bug: it uses `<hBBiI>` (12 bytes, 5 fields) but accesses index `[5]` which causes IndexError — the correct format should be `<hBBiIH>` (14 bytes, 6 fields) where the trailing `H` (u16) at bytes 12-13 is the disconnect reason code. Per Dhan docs: header is 12 bytes with code 50, followed by int16 disconnect message code.
 
 17. **Ping/pong: let WebSocket library handle it.** See `dhan-live-market-feed.md` rule 16.
 
