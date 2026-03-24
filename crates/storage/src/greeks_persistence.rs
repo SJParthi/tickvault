@@ -98,6 +98,78 @@ const PCR_SNAPSHOTS_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
+/// QuestDB table name for tick-driven (candle-aligned) Greeks.
+const TABLE_OPTION_GREEKS_LIVE: &str = "option_greeks_live";
+
+/// QuestDB table name for tick-driven (candle-aligned) PCR snapshots.
+const TABLE_PCR_SNAPSHOTS_LIVE: &str = "pcr_snapshots_live";
+
+/// SQL to create the `option_greeks_live` table.
+///
+/// Tick-driven Greeks aligned to candle close boundaries.
+/// `ts` = candle boundary timestamp (exchange clock), ensuring exact JOIN
+/// with `candles_1s`/`candles_1m` on timestamp.
+const OPTION_GREEKS_LIVE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS option_greeks_live (\
+        segment SYMBOL,\
+        security_id LONG,\
+        symbol_name SYMBOL,\
+        underlying_security_id LONG,\
+        underlying_symbol SYMBOL,\
+        strike_price DOUBLE,\
+        option_type SYMBOL,\
+        expiry_date SYMBOL,\
+        candle_interval SYMBOL,\
+        iv DOUBLE,\
+        delta DOUBLE,\
+        gamma DOUBLE,\
+        theta DOUBLE,\
+        vega DOUBLE,\
+        rho DOUBLE,\
+        charm DOUBLE,\
+        vanna DOUBLE,\
+        volga DOUBLE,\
+        veta DOUBLE,\
+        speed DOUBLE,\
+        color DOUBLE,\
+        zomma DOUBLE,\
+        ultima DOUBLE,\
+        bs_price DOUBLE,\
+        intrinsic_value DOUBLE,\
+        extrinsic_value DOUBLE,\
+        spot_price DOUBLE,\
+        option_ltp DOUBLE,\
+        oi LONG,\
+        volume LONG,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
+";
+
+/// SQL to create the `pcr_snapshots_live` table.
+///
+/// Tick-driven PCR aligned to candle close boundaries.
+const PCR_SNAPSHOTS_LIVE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS pcr_snapshots_live (\
+        underlying_symbol SYMBOL,\
+        expiry_date SYMBOL,\
+        candle_interval SYMBOL,\
+        pcr_oi DOUBLE,\
+        pcr_volume DOUBLE,\
+        total_put_oi LONG,\
+        total_call_oi LONG,\
+        total_put_volume LONG,\
+        total_call_volume LONG,\
+        sentiment SYMBOL,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
+";
+
+/// DEDUP key for `option_greeks_live`.
+const DEDUP_KEY_OPTION_GREEKS_LIVE: &str = "security_id, segment, candle_interval";
+
+/// DEDUP key for `pcr_snapshots_live`.
+const DEDUP_KEY_PCR_SNAPSHOTS_LIVE: &str = "underlying_symbol, expiry_date, candle_interval";
+
 /// SQL to create the `dhan_option_chain_raw` table.
 ///
 /// Stores raw Dhan Option Chain API response data **exactly as received**.
@@ -240,6 +312,20 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
         "greeks_verification CREATE",
     )
     .await;
+    execute_ddl(
+        &client,
+        &base_url,
+        OPTION_GREEKS_LIVE_DDL,
+        "option_greeks_live CREATE",
+    )
+    .await;
+    execute_ddl(
+        &client,
+        &base_url,
+        PCR_SNAPSHOTS_LIVE_DDL,
+        "pcr_snapshots_live CREATE",
+    )
+    .await;
 
     // Step 2: DEDUP UPSERT KEYS via ALTER TABLE (idempotent — re-enabling is a no-op).
     let dedup_statements: &[(&str, &str, &str)] = &[
@@ -263,6 +349,16 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
             DEDUP_KEY_GREEKS_VERIFICATION,
             "greeks_verification DEDUP",
         ),
+        (
+            TABLE_OPTION_GREEKS_LIVE,
+            DEDUP_KEY_OPTION_GREEKS_LIVE,
+            "option_greeks_live DEDUP",
+        ),
+        (
+            TABLE_PCR_SNAPSHOTS_LIVE,
+            DEDUP_KEY_PCR_SNAPSHOTS_LIVE,
+            "pcr_snapshots_live DEDUP",
+        ),
     ];
     for (table, dedup_key, label) in dedup_statements {
         let dedup_sql = format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, {dedup_key})");
@@ -270,7 +366,7 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
     }
 
     info!(
-        "Greeks tables setup complete (option_greeks, pcr_snapshots, dhan_option_chain_raw, greeks_verification)"
+        "Greeks tables setup complete (option_greeks, pcr_snapshots, dhan_option_chain_raw, greeks_verification, option_greeks_live, pcr_snapshots_live)"
     );
 }
 
@@ -356,6 +452,22 @@ impl GreeksPersistenceWriter {
     // TEST-EXEMPT: delegates to build_verification_row which is tested via DDL schema tests
     pub fn write_verification_row(&mut self, row: &VerificationRow) -> Result<()> {
         build_verification_row(&mut self.buffer, row)?;
+        self.pending_count = self.pending_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes a tick-driven (candle-aligned) Greeks row to `option_greeks_live`.
+    // TEST-EXEMPT: delegates to build_option_greeks_live_row which is tested via ILP builder tests
+    pub fn write_option_greeks_live_row(&mut self, row: &OptionGreeksLiveRow) -> Result<()> {
+        build_option_greeks_live_row(&mut self.buffer, row)?;
+        self.pending_count = self.pending_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes a tick-driven (candle-aligned) PCR row to `pcr_snapshots_live`.
+    // TEST-EXEMPT: delegates to build_pcr_snapshot_live_row which is tested via ILP builder tests
+    pub fn write_pcr_snapshot_live_row(&mut self, row: &PcrSnapshotLiveRow) -> Result<()> {
+        build_pcr_snapshot_live_row(&mut self.buffer, row)?;
         self.pending_count = self.pending_count.saturating_add(1);
         Ok(())
     }
@@ -490,6 +602,56 @@ pub struct VerificationRow<'a> {
     pub dhan_vega: f64,
     pub vega_diff: f64,
     pub match_status: &'a str,
+    pub ts_nanos: i64,
+}
+
+/// Tick-driven (candle-aligned) Greeks row for `option_greeks_live` table.
+pub struct OptionGreeksLiveRow<'a> {
+    pub segment: &'a str,
+    pub security_id: i64,
+    pub symbol_name: &'a str,
+    pub underlying_security_id: i64,
+    pub underlying_symbol: &'a str,
+    pub strike_price: f64,
+    pub option_type: &'a str,
+    pub expiry_date: &'a str,
+    pub candle_interval: &'a str,
+    pub iv: f64,
+    pub delta: f64,
+    pub gamma: f64,
+    pub theta: f64,
+    pub vega: f64,
+    pub rho: f64,
+    pub charm: f64,
+    pub vanna: f64,
+    pub volga: f64,
+    pub veta: f64,
+    pub speed: f64,
+    pub color: f64,
+    pub zomma: f64,
+    pub ultima: f64,
+    pub bs_price: f64,
+    pub intrinsic_value: f64,
+    pub extrinsic_value: f64,
+    pub spot_price: f64,
+    pub option_ltp: f64,
+    pub oi: i64,
+    pub volume: i64,
+    pub ts_nanos: i64,
+}
+
+/// Tick-driven (candle-aligned) PCR row for `pcr_snapshots_live` table.
+pub struct PcrSnapshotLiveRow<'a> {
+    pub underlying_symbol: &'a str,
+    pub expiry_date: &'a str,
+    pub candle_interval: &'a str,
+    pub pcr_oi: f64,
+    pub pcr_volume: f64,
+    pub total_put_oi: i64,
+    pub total_call_oi: i64,
+    pub total_put_volume: i64,
+    pub total_call_volume: i64,
+    pub sentiment: &'a str,
     pub ts_nanos: i64,
 }
 
@@ -710,6 +872,108 @@ fn build_verification_row(buffer: &mut Buffer, row: &VerificationRow<'_>) -> Res
         .context("dhan_vega")?
         .column_f64("vega_diff", row.vega_diff)
         .context("vega_diff")?
+        .at(ts)
+        .context("ts")?;
+    Ok(())
+}
+
+/// Writes a single `option_greeks_live` row into the ILP buffer.
+fn build_option_greeks_live_row(buffer: &mut Buffer, row: &OptionGreeksLiveRow<'_>) -> Result<()> {
+    let ts = TimestampNanos::new(row.ts_nanos);
+    buffer
+        .table(TABLE_OPTION_GREEKS_LIVE)
+        .context("table")?
+        .symbol("segment", row.segment)
+        .context("segment")?
+        .symbol("symbol_name", row.symbol_name)
+        .context("symbol_name")?
+        .symbol("underlying_symbol", row.underlying_symbol)
+        .context("underlying_symbol")?
+        .symbol("option_type", row.option_type)
+        .context("option_type")?
+        .symbol("expiry_date", row.expiry_date)
+        .context("expiry_date")?
+        .symbol("candle_interval", row.candle_interval)
+        .context("candle_interval")?
+        .column_i64("security_id", row.security_id)
+        .context("security_id")?
+        .column_i64("underlying_security_id", row.underlying_security_id)
+        .context("underlying_security_id")?
+        .column_f64("strike_price", row.strike_price)
+        .context("strike_price")?
+        .column_f64("iv", row.iv)
+        .context("iv")?
+        .column_f64("delta", row.delta)
+        .context("delta")?
+        .column_f64("gamma", row.gamma)
+        .context("gamma")?
+        .column_f64("theta", row.theta)
+        .context("theta")?
+        .column_f64("vega", row.vega)
+        .context("vega")?
+        .column_f64("rho", row.rho)
+        .context("rho")?
+        .column_f64("charm", row.charm)
+        .context("charm")?
+        .column_f64("vanna", row.vanna)
+        .context("vanna")?
+        .column_f64("volga", row.volga)
+        .context("volga")?
+        .column_f64("veta", row.veta)
+        .context("veta")?
+        .column_f64("speed", row.speed)
+        .context("speed")?
+        .column_f64("color", row.color)
+        .context("color")?
+        .column_f64("zomma", row.zomma)
+        .context("zomma")?
+        .column_f64("ultima", row.ultima)
+        .context("ultima")?
+        .column_f64("bs_price", row.bs_price)
+        .context("bs_price")?
+        .column_f64("intrinsic_value", row.intrinsic_value)
+        .context("intrinsic_value")?
+        .column_f64("extrinsic_value", row.extrinsic_value)
+        .context("extrinsic_value")?
+        .column_f64("spot_price", row.spot_price)
+        .context("spot_price")?
+        .column_f64("option_ltp", row.option_ltp)
+        .context("option_ltp")?
+        .column_i64("oi", row.oi)
+        .context("oi")?
+        .column_i64("volume", row.volume)
+        .context("volume")?
+        .at(ts)
+        .context("ts")?;
+    Ok(())
+}
+
+/// Writes a single `pcr_snapshots_live` row into the ILP buffer.
+fn build_pcr_snapshot_live_row(buffer: &mut Buffer, row: &PcrSnapshotLiveRow<'_>) -> Result<()> {
+    let ts = TimestampNanos::new(row.ts_nanos);
+    buffer
+        .table(TABLE_PCR_SNAPSHOTS_LIVE)
+        .context("table")?
+        .symbol("underlying_symbol", row.underlying_symbol)
+        .context("underlying_symbol")?
+        .symbol("expiry_date", row.expiry_date)
+        .context("expiry_date")?
+        .symbol("candle_interval", row.candle_interval)
+        .context("candle_interval")?
+        .symbol("sentiment", row.sentiment)
+        .context("sentiment")?
+        .column_f64("pcr_oi", row.pcr_oi)
+        .context("pcr_oi")?
+        .column_f64("pcr_volume", row.pcr_volume)
+        .context("pcr_volume")?
+        .column_i64("total_put_oi", row.total_put_oi)
+        .context("total_put_oi")?
+        .column_i64("total_call_oi", row.total_call_oi)
+        .context("total_call_oi")?
+        .column_i64("total_put_volume", row.total_put_volume)
+        .context("total_put_volume")?
+        .column_i64("total_call_volume", row.total_call_volume)
+        .context("total_call_volume")?
         .at(ts)
         .context("ts")?;
     Ok(())
@@ -973,6 +1237,120 @@ mod tests {
         assert_eq!(TABLE_OPTION_GREEKS, "option_greeks");
         assert_eq!(TABLE_PCR_SNAPSHOTS, "pcr_snapshots");
         assert_eq!(TABLE_GREEKS_VERIFICATION, "greeks_verification");
+        assert_eq!(TABLE_OPTION_GREEKS_LIVE, "option_greeks_live");
+        assert_eq!(TABLE_PCR_SNAPSHOTS_LIVE, "pcr_snapshots_live");
+    }
+
+    // --- option_greeks_live DDL tests ---
+
+    #[test]
+    fn test_option_greeks_live_ddl() {
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("IF NOT EXISTS"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("TIMESTAMP(ts)"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("PARTITION BY HOUR WAL"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("candle_interval SYMBOL"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("security_id LONG"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("delta DOUBLE"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("iv DOUBLE"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("spot_price DOUBLE"));
+    }
+
+    #[test]
+    fn test_dedup_key_includes_candle_interval() {
+        assert!(
+            DEDUP_KEY_OPTION_GREEKS_LIVE.contains("candle_interval"),
+            "live greeks dedup must include candle_interval"
+        );
+        assert!(
+            DEDUP_KEY_OPTION_GREEKS_LIVE.contains("security_id"),
+            "live greeks dedup must include security_id"
+        );
+        assert!(
+            DEDUP_KEY_OPTION_GREEKS_LIVE.contains("segment"),
+            "live greeks dedup must include segment"
+        );
+    }
+
+    // --- pcr_snapshots_live DDL tests ---
+
+    #[test]
+    fn test_pcr_snapshots_live_ddl() {
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("IF NOT EXISTS"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("TIMESTAMP(ts)"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("PARTITION BY HOUR WAL"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("candle_interval SYMBOL"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("underlying_symbol SYMBOL"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("pcr_oi DOUBLE"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("sentiment SYMBOL"));
+    }
+
+    #[test]
+    fn test_pcr_live_dedup_key_includes_candle_interval() {
+        assert!(DEDUP_KEY_PCR_SNAPSHOTS_LIVE.contains("candle_interval"));
+        assert!(DEDUP_KEY_PCR_SNAPSHOTS_LIVE.contains("underlying_symbol"));
+        assert!(DEDUP_KEY_PCR_SNAPSHOTS_LIVE.contains("expiry_date"));
+    }
+
+    // --- ILP builder tests for live tables ---
+
+    #[test]
+    fn test_build_option_greeks_live_row() {
+        let mut buffer = make_test_buffer();
+        let row = OptionGreeksLiveRow {
+            segment: "NSE_FNO",
+            security_id: 42528,
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_security_id: 13,
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            candle_interval: "1s",
+            iv: 0.098,
+            delta: 0.54,
+            gamma: 0.0013,
+            theta: -15.2,
+            vega: 12.1,
+            rho: 0.05,
+            charm: -0.002,
+            vanna: 0.15,
+            volga: 3.2,
+            veta: -1.8,
+            speed: -0.00001,
+            color: -0.0003,
+            zomma: 0.001,
+            ultima: -0.5,
+            bs_price: 135.5,
+            intrinsic_value: 0.0,
+            extrinsic_value: 134.0,
+            spot_price: 25642.8,
+            option_ltp: 134.0,
+            oi: 3786445,
+            volume: 117567970,
+            ts_nanos: sample_ts_nanos(),
+        };
+        assert!(build_option_greeks_live_row(&mut buffer, &row).is_ok());
+        assert!(buffer.len() > 0);
+    }
+
+    #[test]
+    fn test_build_pcr_snapshot_live_row() {
+        let mut buffer = make_test_buffer();
+        let row = PcrSnapshotLiveRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            candle_interval: "1m",
+            pcr_oi: 0.95,
+            pcr_volume: 0.82,
+            total_put_oi: 5000000,
+            total_call_oi: 5263158,
+            total_put_volume: 90000000,
+            total_call_volume: 109756098,
+            sentiment: "Neutral",
+            ts_nanos: sample_ts_nanos(),
+        };
+        assert!(build_pcr_snapshot_live_row(&mut buffer, &row).is_ok());
+        assert!(buffer.len() > 0);
     }
 
     // --- Async HTTP tests for ensure_greeks_tables + execute_ddl ---

@@ -1,8 +1,8 @@
 # Implementation Plan: Tick-Driven Greeks Pipeline with Candle-Aligned Timestamps
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-24
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Problem
 
@@ -38,20 +38,20 @@ Strategy decision at ts=09:15:00:
 
 ## Plan Items
 
-- [ ] 1. Add underlying LTP cache to track index/equity spot prices from ticks
-  - Files: crates/core/src/pipeline/greeks_aggregator.rs (NEW)
+- [x] 1. Add underlying LTP cache to track index/equity spot prices from ticks
+  - Files: crates/trading/src/greeks/aggregator.rs (NEW)
   - Pattern: `HashMap<u32, (f32, u32)>` mapping security_id → (latest_ltp, exchange_timestamp)
   - Updated on every IDX_I/NSE_EQ tick; read when computing F&O Greeks
   - Tests: test_underlying_ltp_cache_update, test_underlying_ltp_cache_miss_skips_greeks
 
-- [ ] 2. Add underlying security_id reverse lookup (symbol → security_id)
+- [x] 2. Add underlying security_id reverse lookup (symbol → security_id)
   - Files: crates/common/src/instrument_registry.rs
   - Add `fn get_underlying_security_id(&self, symbol: &str) -> Option<u32>` method
   - Build reverse map at registry construction time (cold path, O(N) once)
   - Tests: test_underlying_reverse_lookup, test_underlying_reverse_lookup_missing
 
-- [ ] 3. Create `GreeksAggregator` — candle-aligned Greeks computation engine
-  - Files: crates/core/src/pipeline/greeks_aggregator.rs (NEW)
+- [x] 3. Create `GreeksAggregator` — candle-aligned Greeks computation engine
+  - Files: crates/trading/src/greeks/aggregator.rs (NEW)
   - **Two-phase design:**
     - Phase A (per-tick, O(1)): Update internal state maps:
       - `option_state: HashMap<u32, OptionTickState>` (LTP, OI, volume per F&O security_id)
@@ -67,7 +67,7 @@ Strategy decision at ts=09:15:00:
            test_greeks_aggregator_timestamp_matches_candle,
            test_greeks_aggregator_skips_when_no_underlying_ltp
 
-- [ ] 4. Create `option_greeks_live` QuestDB table
+- [x] 4. Create `option_greeks_live` QuestDB table
   - Files: crates/storage/src/greeks_persistence.rs
   - Same columns as `option_greeks` plus `candle_interval` (SYMBOL: "1s", "1m", etc.)
   - DEDUP KEY: `(ts, security_id, segment, candle_interval)`
@@ -75,7 +75,7 @@ Strategy decision at ts=09:15:00:
   - Keep existing `option_greeks` for Dhan API audit trail
   - Tests: test_option_greeks_live_ddl, test_dedup_key_includes_candle_interval
 
-- [ ] 5. Create `pcr_snapshots_live` QuestDB table
+- [x] 5. Create `pcr_snapshots_live` QuestDB table
   - Files: crates/storage/src/greeks_persistence.rs
   - Same columns as `pcr_snapshots` plus `candle_interval`
   - DEDUP KEY: `(ts, underlying_symbol, expiry_date, candle_interval)`

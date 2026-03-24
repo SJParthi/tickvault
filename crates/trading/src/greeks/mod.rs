@@ -4,12 +4,14 @@
 //! Designed for real-time computation on every tick AND historical backtesting.
 //!
 //! # Modules
+//! - `aggregator` — Candle-aligned Greeks aggregation from live tick data
 //! - `black_scholes` — Core pricing: BS price, Jaeckel IV solver, all 13 Greeks
 //! - `calibration` — Parameter calibration to match Dhan's exact Greeks
 //! - `historical_rates` — RBI repo rate lookup table (2020-2026) for backtesting
 //! - `pcr` — Put-Call Ratio from live OI data
 //! - `buildup` — Option activity classification (Long/Short Buildup/Unwinding)
 
+pub mod aggregator;
 pub mod black_scholes;
 pub mod buildup;
 pub mod calibration;
