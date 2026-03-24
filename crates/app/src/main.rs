@@ -369,11 +369,19 @@ async fn main() -> Result<()> {
             dhan_live_trader_common::tick_types::ParsedTick,
         >(1024);
 
-        let processor_handle = if let Some(receiver) = pool_receiver {
+        let (processor_handle, prev_close_rx) = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
             let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
             let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
+            // PrevClose channel: tick_writer is None in fast boot, so PrevClose frames
+            // are forwarded via this channel to a cold-path consumer that persists
+            // them to QuestDB after it becomes available.
+            // Capacity 1024: PrevClose arrives once per security at subscription time
+            // (~500 instruments max), so 1024 is more than enough.
+            let (prev_close_tx, pc_rx) = tokio::sync::mpsc::channel::<
+                dhan_live_trader_common::tick_types::PrevCloseRecord,
+            >(1024);
             // Start with None writers — ticks are processed in-memory for trading.
             // QuestDB persistence reconnects in background (tables already exist
             // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
@@ -387,14 +395,15 @@ async fn main() -> Result<()> {
                     None, // live_candle_writer — QuestDB reconnects in background
                     movers,
                     snapshot_handle,
+                    Some(prev_close_tx),
                 )
                 .await;
             });
             info!("FAST BOOT COMPLETE — tick processor started, ticks flowing (in-memory)");
-            Some(handle)
+            (Some(handle), Some(pc_rx))
         } else {
             info!("tick processor skipped — no frame source available");
-            None
+            (None, None)
         };
 
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
@@ -511,6 +520,17 @@ async fn main() -> Result<()> {
                 run_candle_persistence_consumer(candle_persistence_rx, questdb_cfg).await;
             });
             info!("background candle persistence consumer started (cold path)");
+        }
+
+        // --- Background: PrevClose persistence (cold path — receives from tick processor) ---
+        // In fast boot, tick_writer is None so PrevClose frames are forwarded via
+        // the prev_close_rx channel. This consumer writes them to QuestDB once available.
+        if let Some(pc_rx) = prev_close_rx {
+            let questdb_cfg = config.questdb.clone();
+            tokio::spawn(async move {
+                run_prev_close_persistence_consumer(pc_rx, questdb_cfg).await;
+            });
+            info!("background prev_close persistence consumer started (cold path)");
         }
 
         // --- Background: Greeks pipeline (option chain fetch → compute → persist) ---
@@ -937,6 +957,7 @@ async fn main() -> Result<()> {
                 live_candle_writer,
                 movers,
                 snapshot_handle,
+                None, // prev_close_sender — not needed, tick_writer is available
             )
             .await;
         });
@@ -1732,7 +1753,12 @@ async fn run_candle_persistence_consumer(
 
         // Periodic sweep: emit stale candles and flush to QuestDB
         if last_sweep.elapsed() >= sweep_interval {
-            let now_secs = chrono::Utc::now().timestamp() as u32;
+            // exchange_timestamp from Dhan WS is IST epoch seconds.
+            // Add IST offset to UTC so sweep_stale compares like-for-like.
+            #[allow(clippy::cast_possible_truncation)] // APPROVED: epoch fits u32 until 2106
+            let now_secs = (chrono::Utc::now().timestamp()
+                + i64::from(dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS))
+                as u32;
             aggregator.sweep_stale(now_secs);
             let completed = aggregator.completed_slice();
 
@@ -1765,6 +1791,69 @@ async fn run_candle_persistence_consumer(
 }
 
 // compute_market_close_sleep is now in boot_helpers module (lib.rs).
+
+// ---------------------------------------------------------------------------
+// Cold-path: PrevClose persistence consumer (fast boot only)
+// ---------------------------------------------------------------------------
+
+/// Receives PrevClose records from the tick processor (fast boot mode) and
+/// persists them to QuestDB. In fast boot, the tick_writer is None so PrevClose
+/// frames are forwarded here via an unbounded mpsc channel.
+///
+/// Connects to QuestDB ILP on startup, then drains the channel.
+async fn run_prev_close_persistence_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<dhan_live_trader_common::tick_types::PrevCloseRecord>,
+    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+) {
+    let mut writer = match TickPersistenceWriter::new(&questdb_config) {
+        Ok(w) => {
+            info!("cold-path prev_close writer connected to QuestDB");
+            w
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "cold-path prev_close writer unavailable — previous close will NOT be persisted"
+            );
+            return;
+        }
+    };
+
+    let mut count: u64 = 0;
+
+    while let Some(record) = rx.recv().await {
+        if let Err(err) = dhan_live_trader_storage::tick_persistence::build_previous_close_row(
+            writer.buffer_mut(),
+            record.security_id,
+            record.exchange_segment_code,
+            record.previous_close,
+            record.previous_oi,
+            record.received_at_nanos,
+        ) {
+            warn!(
+                ?err,
+                security_id = record.security_id,
+                "cold-path prev_close write failed"
+            );
+            continue;
+        }
+
+        count = count.saturating_add(1);
+
+        // Flush every 50 records or when channel is empty (try_recv fails).
+        if count.is_multiple_of(50) || rx.is_empty() {
+            if let Err(err) = writer.flush_if_needed() {
+                warn!(?err, "cold-path prev_close flush failed");
+            }
+        }
+    }
+
+    // Final flush on channel close
+    if let Err(err) = writer.flush_if_needed() {
+        warn!(?err, "cold-path prev_close final flush failed");
+    }
+    info!(count, "cold-path prev_close consumer shutting down");
+}
 
 // ---------------------------------------------------------------------------
 // Helper: Graceful shutdown (shared by fast and slow boot paths)

@@ -75,6 +75,30 @@ impl Default for ParsedTick {
 }
 
 // ---------------------------------------------------------------------------
+// Previous Close Record — forwarded from tick processor to cold-path consumer
+// ---------------------------------------------------------------------------
+
+/// A previous close record from Dhan WebSocket code 6 packet.
+///
+/// Forwarded via channel when the hot-path tick processor has no QuestDB writer
+/// (fast boot mode). The cold-path consumer persists to QuestDB once available.
+///
+/// `Copy` for zero-allocation channel sends.
+#[derive(Debug, Clone, Copy)]
+pub struct PrevCloseRecord {
+    /// Dhan security identifier.
+    pub security_id: u32,
+    /// Binary exchange segment code.
+    pub exchange_segment_code: u8,
+    /// Previous close price (f32 from Dhan binary protocol).
+    pub previous_close: f32,
+    /// Previous day open interest.
+    pub previous_oi: u32,
+    /// Local receive timestamp in nanoseconds since Unix epoch.
+    pub received_at_nanos: i64,
+}
+
+// ---------------------------------------------------------------------------
 // Market Depth Level — from Full packet (5 levels × 20 bytes)
 // ---------------------------------------------------------------------------
 
