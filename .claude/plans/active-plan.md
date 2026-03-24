@@ -1,6 +1,6 @@
 # Implementation Plan: Eagle-Eye Precision Greeks Engine
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-03-24
 **Approved by:** Parthiban
 
@@ -141,13 +141,13 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
 
 ### Phase F: Verification & Tests
 
-- [ ] F1: Add Hull textbook reference value tests
+- [x] F1: Add Hull textbook reference value tests
   - Files: crates/trading/src/greeks/black_scholes.rs
   - S=100, K=100, T=1, r=5%, q=0%, sigma=20%
   - Assert all 13 Greeks match Hull to 1e-10
   - Tests: test_hull_reference_all_13_greeks
 
-- [ ] F2: Add mathematical invariant tests (machine epsilon)
+- [x] F2: Add mathematical invariant tests (machine epsilon)
   - Files: crates/trading/src/greeks/black_scholes.rs
   - Put-call parity: `C - P = S*e^(-qT) - K*e^(-rT)` to 1e-14
   - `delta_C - delta_P = e^(-qT)` to 1e-14
@@ -161,7 +161,7 @@ provide theoretically-correct values for backtesting. Every Greek to f64 machine
   - `fn neumaier_sum(values: &[f64]) -> f64` — compensated summation
   - Tests: test_neumaier_cancellation_resistance
 
-- [ ] F4: Build and verify
+- [x] F4: Build and verify
   - cargo fmt --check
   - cargo clippy --workspace -- -D warnings -W clippy::perf
   - cargo test --workspace

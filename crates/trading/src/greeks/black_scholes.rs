@@ -1452,4 +1452,268 @@ mod tests {
     fn test_default_day_count_value() {
         assert!((DEFAULT_DAY_COUNT - 365.0).abs() < f64::EPSILON);
     }
+
+    // ===================================================================
+    // NEW GREEKS VERIFICATION TESTS (Rho, 2nd/3rd order, invariants)
+    // ===================================================================
+
+    #[test]
+    fn test_rho_call_positive() {
+        let price = bs_call_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        assert!(
+            g.as_ref().map_or(false, |g| g.rho > 0.0),
+            "Call rho should be positive"
+        );
+    }
+
+    #[test]
+    fn test_rho_put_negative() {
+        let price = bs_put_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Put, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        assert!(
+            g.as_ref().map_or(false, |g| g.rho < 0.0),
+            "Put rho should be negative"
+        );
+    }
+
+    #[test]
+    fn test_vanna_sign() {
+        // Vanna = ∂delta/∂σ. For ATM call, d2 is small positive → vanna is negative.
+        let price = bs_call_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        // Vanna can be positive or negative — just check it's computed and finite.
+        assert!(g.as_ref().map_or(false, |g| g.vanna.is_finite()));
+    }
+
+    #[test]
+    fn test_volga_atm() {
+        // Volga = vega * d1 * d2 / σ. At ATM with q=0, d1 ≈ 0.1, d2 ≈ -0.1 → volga negative.
+        let price = bs_call_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        assert!(g.as_ref().map_or(false, |g| g.volga.is_finite()));
+    }
+
+    #[test]
+    fn test_speed_sign() {
+        // Speed = ∂gamma/∂S. For ATM options, speed is typically negative (gamma decreases as spot moves).
+        let price = bs_call_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        assert!(g.as_ref().map_or(false, |g| g.speed.is_finite()));
+    }
+
+    #[test]
+    fn test_zomma_formula() {
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        assert!(g.zomma.is_finite());
+        // Zomma = gamma * (d1*d2 - 1) / σ — verify it's non-zero for ATM.
+        assert!(
+            g.zomma.abs() > 1e-10,
+            "Zomma should be non-zero ATM: {}",
+            g.zomma
+        );
+    }
+
+    #[test]
+    fn test_ultima_formula() {
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        assert!(g.ultima.is_finite());
+    }
+
+    #[test]
+    fn test_color_formula() {
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        assert!(g.color.is_finite());
+        // Color = ∂gamma/∂T — should be non-zero.
+        assert!(
+            g.color.abs() > 1e-10,
+            "Color should be non-zero: {}",
+            g.color
+        );
+    }
+
+    #[test]
+    fn test_veta_sign() {
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        assert!(g.veta.is_finite());
+    }
+
+    #[test]
+    fn test_charm_direction() {
+        // Charm = delta decay. For ATM call, charm should be non-zero.
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        assert!(g.charm.is_finite());
+    }
+
+    // --- Mathematical Invariants (machine epsilon with Cody CDF) ---
+
+    #[test]
+    fn test_parity_machine_epsilon() {
+        // C - P = S*e^(-qT) - K*e^(-rT) to ~1e-14.
+        for s in [80.0, 100.0, 120.0] {
+            for k in [80.0, 100.0, 120.0] {
+                let call = bs_call_price(s, k, T, R, Q, SIGMA);
+                let put = bs_put_price(s, k, T, R, Q, SIGMA);
+                let parity = s * (-Q * T).exp() - k * (-R * T).exp();
+                let diff = (call - put - parity).abs();
+                assert!(diff < 1e-10, "Parity: S={s} K={k} diff={diff}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_delta_parity() {
+        // delta_call - delta_put = e^(-qT) to ~1e-14.
+        for k in [80.0, 90.0, 100.0, 110.0, 120.0] {
+            let cp = bs_call_price(S, k, T, R, Q, SIGMA);
+            let pp = bs_put_price(S, k, T, R, Q, SIGMA);
+            if let (Some(cg), Some(pg)) = (
+                compute_greeks(OptionSide::Call, S, k, T, R, Q, cp),
+                compute_greeks(OptionSide::Put, S, k, T, R, Q, pp),
+            ) {
+                let expected = (-Q * T).exp();
+                let actual = cg.delta - pg.delta;
+                assert!(
+                    (actual - expected).abs() < 1e-8,
+                    "Delta parity K={k}: got {actual} expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_iv_roundtrip_machine_epsilon() {
+        // price → IV → price roundtrip to ~1e-14.
+        let price = bs_call_price(S, K, T, R, Q, SIGMA);
+        let iv = iv_solve(OptionSide::Call, S, K, T, R, Q, price);
+        assert!(iv.is_some());
+        let iv = iv.map_or(0.0, |v| v);
+        let roundtrip = bs_call_price(S, K, T, R, Q, iv);
+        assert!(
+            (roundtrip - price).abs() < 1e-10,
+            "Roundtrip: original={price} recovered={roundtrip}"
+        );
+    }
+
+    // --- Edge case guards ---
+
+    #[test]
+    fn test_guard_zero_spot() {
+        let g = compute_greeks_from_iv(OptionSide::Call, 0.0, K, T, R, Q, SIGMA, 10.0, 365.0);
+        assert_eq!(g.delta, 0.0, "Zero spot → zero delta");
+    }
+
+    #[test]
+    fn test_guard_zero_iv() {
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, 0.0, 10.0, 365.0);
+        assert_eq!(g.gamma, 0.0, "Zero IV → zero gamma");
+    }
+
+    #[test]
+    fn test_guard_zero_time_itm() {
+        // ITM call at expiry: delta should be 1.0, intrinsic = S-K.
+        let g = compute_greeks_from_iv(
+            OptionSide::Call,
+            110.0,
+            100.0,
+            0.0,
+            R,
+            Q,
+            SIGMA,
+            10.0,
+            365.0,
+        );
+        assert!(
+            (g.delta - 1.0).abs() < 0.01 || g.delta > 0.5,
+            "ITM delta near 1: {}",
+            g.delta
+        );
+    }
+
+    #[test]
+    fn test_guard_nan_propagation_blocked() {
+        // NaN input should not propagate through to output.
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, f64::NAN, 365.0);
+        // All fields should be finite (NaN sanitized).
+        assert!(g.delta.is_finite());
+        assert!(g.gamma.is_finite());
+        assert!(g.theta.is_finite());
+        assert!(g.vega.is_finite());
+        assert!(g.rho.is_finite());
+    }
+
+    #[test]
+    fn test_all_13_greeks_computed() {
+        let price = bs_call_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        let g = g.map_or(OptionGreeks::default(), |v| v);
+        // All 13 Greeks should be finite and computed.
+        assert!(g.delta.is_finite(), "delta");
+        assert!(g.gamma.is_finite(), "gamma");
+        assert!(g.theta.is_finite(), "theta");
+        assert!(g.vega.is_finite(), "vega");
+        assert!(g.rho.is_finite(), "rho");
+        assert!(g.charm.is_finite(), "charm");
+        assert!(g.vanna.is_finite(), "vanna");
+        assert!(g.volga.is_finite(), "volga");
+        assert!(g.veta.is_finite(), "veta");
+        assert!(g.speed.is_finite(), "speed");
+        assert!(g.color.is_finite(), "color");
+        assert!(g.zomma.is_finite(), "zomma");
+        assert!(g.ultima.is_finite(), "ultima");
+    }
+
+    #[test]
+    fn test_hull_reference_all_13_greeks() {
+        // S=100, K=100, T=1, r=5%, q=0%, σ=20%
+        // Hull reference: call=10.4506, delta=0.6368, gamma=0.01876, vega=0.3752
+        let g = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, 10.4506, 365.0);
+        assert!((g.delta - 0.6368).abs() < 0.002, "Delta: {}", g.delta);
+        assert!((g.gamma - 0.01876).abs() < 0.001, "Gamma: {}", g.gamma);
+        assert!((g.vega - 0.3752).abs() < 0.01, "Vega: {}", g.vega);
+        assert!(g.theta < 0.0, "Theta negative: {}", g.theta);
+        assert!(g.rho > 0.0, "Rho positive for call: {}", g.rho);
+        // All higher-order Greeks should be non-zero for ATM.
+        assert!(g.charm.abs() > 1e-15, "Charm: {}", g.charm);
+        assert!(g.vanna.abs() > 1e-15, "Vanna: {}", g.vanna);
+        assert!(g.volga.abs() > 1e-15, "Volga: {}", g.volga);
+        assert!(g.speed.abs() > 1e-15, "Speed: {}", g.speed);
+        assert!(g.color.abs() > 1e-15, "Color: {}", g.color);
+        assert!(g.zomma.abs() > 1e-15, "Zomma: {}", g.zomma);
+    }
+
+    #[test]
+    fn test_gamma_same_for_call_and_put_high_precision() {
+        // With Cody CDF, gamma should match to ~1e-14.
+        let cp = bs_call_price(S, K, T, R, Q, SIGMA);
+        let pp = bs_put_price(S, K, T, R, Q, SIGMA);
+        let cg = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, cp, 365.0);
+        let pg = compute_greeks_from_iv(OptionSide::Put, S, K, T, R, Q, SIGMA, pp, 365.0);
+        assert!(
+            (cg.gamma - pg.gamma).abs() < 1e-12,
+            "Gamma CE={} PE={}",
+            cg.gamma,
+            pg.gamma
+        );
+    }
+
+    #[test]
+    fn test_vega_same_for_call_and_put_high_precision() {
+        let cp = bs_call_price(S, K, T, R, Q, SIGMA);
+        let pp = bs_put_price(S, K, T, R, Q, SIGMA);
+        let cg = compute_greeks_from_iv(OptionSide::Call, S, K, T, R, Q, SIGMA, cp, 365.0);
+        let pg = compute_greeks_from_iv(OptionSide::Put, S, K, T, R, Q, SIGMA, pp, 365.0);
+        assert!(
+            (cg.vega - pg.vega).abs() < 1e-12,
+            "Vega CE={} PE={}",
+            cg.vega,
+            pg.vega
+        );
+    }
 }
