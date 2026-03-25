@@ -5060,4 +5060,102 @@ mod tests {
         // Should not panic — logs a warning and returns gracefully.
         check_tick_gaps_after_recovery(&config, 5).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Reconnect throttle tests (A3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reconnect_throttle_constant_is_30_seconds() {
+        assert_eq!(
+            RECONNECT_THROTTLE_SECS, 30,
+            "throttle must be 30 seconds to prevent reconnect storms"
+        );
+    }
+
+    #[test]
+    fn test_tick_writer_reconnect_throttled_skips_when_too_soon() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnected state.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // Set next_reconnect_allowed to far in the future.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // try_reconnect_on_error should bail immediately (throttled).
+        let result = writer.try_reconnect_on_error();
+        assert!(
+            result.is_err(),
+            "reconnect must be throttled — no attempt should be made"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("throttled"),
+            "error message must say 'throttled', got: {err_msg}"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None when throttled"
+        );
+    }
+
+    #[test]
+    fn test_tick_writer_next_reconnect_allowed_advances_after_attempt() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnected state.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // Allow reconnect immediately.
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        let before = std::time::Instant::now();
+        let _result = writer.try_reconnect_on_error(); // will fail (unreachable)
+
+        // After attempt, next_reconnect_allowed should be ~30s in the future.
+        assert!(
+            writer.next_reconnect_allowed >= before + Duration::from_secs(25),
+            "next_reconnect_allowed must advance by ~30s after an attempt"
+        );
+    }
+
+    #[test]
+    fn test_depth_writer_reconnect_throttled_skips_when_too_soon() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_err(), "depth writer reconnect must be throttled");
+        assert!(
+            result.unwrap_err().to_string().contains("throttled"),
+            "error message must contain 'throttled'"
+        );
+    }
 }

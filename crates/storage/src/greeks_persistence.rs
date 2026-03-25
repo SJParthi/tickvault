@@ -1757,4 +1757,137 @@ mod tests {
             "buffer should grow with each row"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // GreeksPersistenceWriter resilience tests (Phase C)
+    // -----------------------------------------------------------------------
+
+    fn spawn_tcp_drain_server() -> u16 {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn test_greeks_writer_starts_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(
+            writer.sender.is_some(),
+            "greeks writer must start connected"
+        );
+        assert!(
+            !writer.ilp_conf_string.is_empty(),
+            "must store conf string for reconnect"
+        );
+    }
+
+    #[test]
+    fn test_greeks_writer_starts_disconnected_when_unreachable() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(
+            writer.sender.is_none(),
+            "greeks writer must start disconnected when host unreachable"
+        );
+    }
+
+    #[test]
+    fn test_greeks_writer_flush_ok_when_disconnected() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Prevent reconnect attempts.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Flush with nothing pending must return Ok.
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush must never fail — resilience guarantee"
+        );
+    }
+
+    #[test]
+    fn test_greeks_writer_reconnect_throttle_constant() {
+        assert_eq!(
+            GREEKS_RECONNECT_THROTTLE_SECS, 30,
+            "greeks writer throttle must be 30s"
+        );
+    }
+
+    #[test]
+    fn test_greeks_writer_reconnect_succeeds_with_valid_host() {
+        // Spawn a drain server that accepts multiple connections.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect — point to a NEW drain server for reconnect.
+        writer.sender = None;
+        let reconnect_port = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{reconnect_port};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_some(),
+            "sender must be Some after successful reconnect"
+        );
+    }
+
+    #[test]
+    fn test_greeks_writer_throttle_skips_when_too_soon() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect + set throttle far in future.
+        writer.sender = None;
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_none(),
+            "reconnect must be skipped when throttled"
+        );
+    }
 }

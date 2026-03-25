@@ -3609,4 +3609,76 @@ threshold = 70.0
             .await
             .expect("market close signal should fire within timeout");
     }
+
+    // -----------------------------------------------------------------------
+    // TokenHandleBridge resilience tests (A4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_bridge_returns_valid_token() {
+        let handle = make_token_handle_with_value("eyJhbGciOiJIUzI1NiJ9.valid");
+        let bridge = TokenHandleBridge { handle };
+        let result = bridge.get_access_token();
+        assert!(result.is_ok(), "valid token must return Ok");
+        let token = result.unwrap();
+        assert_eq!(
+            token.expose_secret(),
+            "eyJhbGciOiJIUzI1NiJ9.valid",
+            "token value must match"
+        );
+    }
+
+    #[test]
+    fn test_token_bridge_rejects_empty_token() {
+        let handle = make_token_handle_with_value("");
+        let bridge = TokenHandleBridge { handle };
+        let result = bridge.get_access_token();
+        assert!(result.is_err(), "empty token must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            "empty token must be NoToken, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_token_bridge_rejects_none_token() {
+        let handle = make_empty_token_handle();
+        let bridge = TokenHandleBridge { handle };
+        let result = bridge.get_access_token();
+        assert!(result.is_err(), "None handle must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            "None handle must be NoToken, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_token_bridge_rejects_expired_token() {
+        // Create a token that expires immediately (expires_in = 0).
+        let response = DhanAuthResponseData {
+            access_token: "eyJhbGciOiJIUzI1NiJ9.expired".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0, // Expires immediately
+        };
+        let token_state = TokenState::from_response(&response);
+        // Wait a tiny bit to ensure it's expired.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            !token_state.is_valid(),
+            "token with expires_in=0 must be expired"
+        );
+
+        let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(Some(token_state))));
+        let bridge = TokenHandleBridge { handle };
+
+        let result = bridge.get_access_token();
+        assert!(result.is_err(), "expired token must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, dhan_live_trader_trading::oms::OmsError::TokenExpired),
+            "expired token must be TokenExpired, got: {err}"
+        );
+    }
 }

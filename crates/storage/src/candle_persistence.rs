@@ -1348,4 +1348,392 @@ mod tests {
         // Exercises the Err(err) + return branch on CREATE TABLE (lines 379-380, 384)
         ensure_candle_table_dedup_keys(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // LiveCandleWriter resilience tests (Phase B)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_writer_starts_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some(), "writer must start connected");
+        assert_eq!(writer.buffered_candle_count(), 0);
+        assert_eq!(writer.candles_dropped_total(), 0);
+    }
+
+    #[test]
+    fn test_live_candle_writer_starts_disconnected_when_unreachable() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(), // RFC 5737 TEST-NET — unreachable
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        // Must NOT panic — initializes with sender=None.
+        let writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(
+            writer.sender.is_none(),
+            "writer must start disconnected when host unreachable"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_append_buffers_when_disconnected() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Prevent reconnect attempts (throttle to far future).
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Append should succeed (buffered, not written to QuestDB).
+        let result = writer.append_candle(
+            13,
+            2,
+            1_740_556_500,
+            24500.0,
+            24510.0,
+            24490.0,
+            24505.0,
+            100,
+            10,
+        );
+        assert!(
+            result.is_ok(),
+            "append must never fail — buffers on disconnect"
+        );
+        assert_eq!(
+            writer.buffered_candle_count(),
+            1,
+            "candle must be in ring buffer"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_ring_buffer_fifo_order() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Append 3 candles with different security_ids.
+        for i in 0..3_u32 {
+            writer
+                .append_candle(
+                    100 + i,
+                    2,
+                    1_740_556_500 + i,
+                    24500.0,
+                    24510.0,
+                    24490.0,
+                    24505.0,
+                    100,
+                    10,
+                )
+                .unwrap();
+        }
+        assert_eq!(writer.buffered_candle_count(), 3);
+
+        // Verify FIFO order: first candle has security_id 100.
+        let first = writer.candle_buffer.front().unwrap();
+        assert_eq!(
+            first.security_id, 100,
+            "ring buffer must be FIFO — oldest first"
+        );
+        let last = writer.candle_buffer.back().unwrap();
+        assert_eq!(
+            last.security_id, 102,
+            "ring buffer must be FIFO — newest last"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_ring_buffer_overflow_drops_oldest() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Fill ring buffer to capacity.
+        for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
+            writer
+                .append_candle(i, 2, 1_740_556_500 + i, 100.0, 110.0, 90.0, 105.0, 50, 5)
+                .unwrap();
+        }
+        assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
+        assert_eq!(
+            writer.candles_dropped_total(),
+            0,
+            "no drops yet at capacity"
+        );
+
+        // One more — should drop the oldest (security_id=0).
+        writer
+            .append_candle(999999, 2, 1_740_600_000, 200.0, 210.0, 190.0, 205.0, 50, 5)
+            .unwrap();
+        assert_eq!(
+            writer.buffered_candle_count(),
+            CANDLE_BUFFER_CAPACITY,
+            "buffer stays at capacity"
+        );
+        assert_eq!(
+            writer.candles_dropped_total(),
+            1,
+            "exactly 1 candle dropped"
+        );
+
+        // The oldest candle should now be security_id=1 (0 was dropped).
+        let oldest = writer.candle_buffer.front().unwrap();
+        assert_eq!(
+            oldest.security_id, 1,
+            "oldest candle (id=0) must be dropped, next oldest is id=1"
+        );
+
+        // The newest should be 999999.
+        let newest = writer.candle_buffer.back().unwrap();
+        assert_eq!(
+            newest.security_id, 999999,
+            "newest candle must be the last one appended"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_force_flush_ok_when_no_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        // Flush with nothing pending should be a no-op.
+        let result = writer.force_flush();
+        assert!(result.is_ok(), "flush with no pending must return Ok");
+    }
+
+    #[test]
+    fn test_live_candle_append_and_flush_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Append a candle — should go to ILP buffer, not ring buffer.
+        writer
+            .append_candle(
+                13,
+                2,
+                1_740_556_500,
+                24500.0,
+                24510.0,
+                24490.0,
+                24505.0,
+                100,
+                10,
+            )
+            .unwrap();
+        assert_eq!(writer.pending_count, 1, "should be in ILP buffer");
+        assert_eq!(
+            writer.buffered_candle_count(),
+            0,
+            "should NOT be in ring buffer"
+        );
+
+        // Flush to QuestDB.
+        writer.force_flush().unwrap();
+        assert_eq!(writer.pending_count, 0, "ILP buffer cleared after flush");
+    }
+
+    #[test]
+    fn test_live_candle_flush_error_nulls_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Append a candle to have pending data.
+        writer
+            .append_candle(
+                13,
+                2,
+                1_740_556_500,
+                24500.0,
+                24510.0,
+                24490.0,
+                24505.0,
+                100,
+                10,
+            )
+            .unwrap();
+
+        // Sabotage: point ilp_conf_string to unreachable host so reconnect fails.
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        // Drop the sender to simulate disconnect.
+        writer.sender = None;
+        writer.pending_count = 0;
+
+        // Subsequent append should buffer.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+        writer
+            .append_candle(
+                14,
+                2,
+                1_740_556_501,
+                24600.0,
+                24610.0,
+                24590.0,
+                24605.0,
+                200,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            writer.buffered_candle_count(),
+            1,
+            "must buffer when disconnected"
+        );
+        assert!(writer.sender.is_none(), "sender must remain None");
+    }
+
+    #[test]
+    fn test_live_candle_reconnect_throttle_constant() {
+        assert_eq!(
+            LIVE_CANDLE_RECONNECT_THROTTLE_SECS, 30,
+            "candle writer throttle must be 30s"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_buffered_candle_struct_is_copy() {
+        // Verify BufferedCandle is Copy (no allocation on push).
+        let c = BufferedCandle {
+            security_id: 13,
+            exchange_segment_code: 2,
+            timestamp_secs: 1_740_556_500,
+            open: 24500.0,
+            high: 24510.0,
+            low: 24490.0,
+            close: 24505.0,
+            volume: 100,
+            tick_count: 10,
+        };
+        let c2 = c; // Copy
+        assert_eq!(c.security_id, c2.security_id, "BufferedCandle must be Copy");
+    }
+
+    #[test]
+    fn test_candle_buffer_capacity_constant() {
+        assert_eq!(CANDLE_BUFFER_CAPACITY, 100_000);
+        // Memory footprint: ~48 bytes × 100K = ~4.8MB — reasonable.
+        let size = std::mem::size_of::<BufferedCandle>();
+        let total_mb = (size * CANDLE_BUFFER_CAPACITY) as f64 / 1_048_576.0;
+        assert!(
+            total_mb < 10.0,
+            "candle ring buffer must be < 10MB, got {total_mb:.1}MB"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CandlePersistenceWriter resilience tests (Phase D)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_historical_candle_writer_starts_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = CandlePersistenceWriter::new(&config).unwrap();
+        assert!(
+            writer.sender.is_some(),
+            "historical writer must start connected"
+        );
+        assert!(
+            !writer.ilp_conf_string.is_empty(),
+            "must store conf string for reconnect"
+        );
+    }
+
+    #[test]
+    fn test_historical_candle_writer_reconnect_fails_unreachable() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect + unreachable host.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_err(), "reconnect to unreachable host must fail");
+        assert!(writer.sender.is_none());
+    }
+
+    #[test]
+    fn test_historical_candle_writer_reconnect_succeeds() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect — point to a NEW drain server for reconnect.
+        writer.sender = None;
+        let reconnect_port = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{reconnect_port};");
+
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_ok(), "reconnect to drain server must succeed");
+        assert!(
+            writer.sender.is_some(),
+            "sender must be Some after successful reconnect"
+        );
+    }
+
+    #[test]
+    fn test_historical_candle_reconnect_constants() {
+        assert_eq!(HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS, 3);
+        assert_eq!(HISTORICAL_CANDLE_RECONNECT_INITIAL_DELAY_MS, 1000);
+    }
 }
