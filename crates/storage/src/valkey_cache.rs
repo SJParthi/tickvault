@@ -1170,4 +1170,118 @@ mod tests {
         metrics::counter!("dlt_valkey_errors_total", "op" => "del").increment(1);
         metrics::counter!("dlt_valkey_errors_total", "op" => "exists").increment(1);
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests with real Redis (port 6399)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a pool connected to the test Redis on port 6399.
+    fn test_pool() -> Option<ValkeyPool> {
+        let config = ValkeyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 6399,
+            max_connections: 4,
+        };
+        ValkeyPool::new(&config).ok()
+    }
+
+    #[tokio::test]
+    async fn test_valkey_health_check_real() {
+        let Some(pool) = test_pool() else { return };
+        let result = pool.health_check().await;
+        assert!(
+            result.is_ok(),
+            "health check must pass on real Redis: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valkey_set_get_roundtrip_real() {
+        let Some(pool) = test_pool() else { return };
+        let key = "dlt_test_set_get_roundtrip";
+
+        pool.set(key, "hello_world").await.unwrap();
+        let val = pool.get(key).await.unwrap();
+        assert_eq!(val, Some("hello_world".to_string()));
+
+        // Cleanup.
+        pool.del(key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valkey_get_missing_key_real() {
+        let Some(pool) = test_pool() else { return };
+        let val = pool.get("dlt_test_nonexistent_key_xyz").await.unwrap();
+        assert_eq!(val, None, "GET on missing key must return None");
+    }
+
+    #[tokio::test]
+    async fn test_valkey_set_ex_and_exists_real() {
+        let Some(pool) = test_pool() else { return };
+        let key = "dlt_test_set_ex";
+
+        pool.set_ex(key, "with_ttl", 300).await.unwrap();
+        let exists = pool.exists(key).await.unwrap();
+        assert!(exists, "key must exist after SET EX");
+
+        let val = pool.get(key).await.unwrap();
+        assert_eq!(val, Some("with_ttl".to_string()));
+
+        // Cleanup.
+        pool.del(key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valkey_del_real() {
+        let Some(pool) = test_pool() else { return };
+        let key = "dlt_test_del";
+
+        pool.set(key, "to_be_deleted").await.unwrap();
+        let exists_before = pool.exists(key).await.unwrap();
+        assert!(exists_before);
+
+        pool.del(key).await.unwrap();
+        let exists_after = pool.exists(key).await.unwrap();
+        assert!(!exists_after, "key must not exist after DEL");
+    }
+
+    #[tokio::test]
+    async fn test_valkey_exists_missing_key_real() {
+        let Some(pool) = test_pool() else { return };
+        let exists = pool.exists("dlt_test_does_not_exist").await.unwrap();
+        assert!(!exists, "EXISTS on missing key must return false");
+    }
+
+    #[tokio::test]
+    async fn test_valkey_set_nx_ex_real() {
+        let Some(pool) = test_pool() else { return };
+        let key = "dlt_test_set_nx_ex";
+
+        // Ensure clean state.
+        let _ = pool.del(key).await;
+
+        // First SET NX should succeed (key doesn't exist).
+        let acquired = pool.set_nx_ex(key, "lock_holder", 300).await.unwrap();
+        assert!(acquired, "SET NX EX must succeed on missing key");
+
+        // Second SET NX should fail (key already exists).
+        let acquired2 = pool.set_nx_ex(key, "another_holder", 300).await.unwrap();
+        assert!(!acquired2, "SET NX EX must fail on existing key");
+
+        // Cleanup.
+        pool.del(key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valkey_set_overwrite_real() {
+        let Some(pool) = test_pool() else { return };
+        let key = "dlt_test_overwrite";
+
+        pool.set(key, "first").await.unwrap();
+        pool.set(key, "second").await.unwrap();
+        let val = pool.get(key).await.unwrap();
+        assert_eq!(val, Some("second".to_string()), "SET must overwrite");
+
+        pool.del(key).await.unwrap();
+    }
 }
