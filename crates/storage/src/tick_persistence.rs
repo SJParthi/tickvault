@@ -5699,4 +5699,260 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+
+    // -----------------------------------------------------------------------
+    // REAL end-to-end test: TCP server crash → buffer + spill → recovery → drain
+    // -----------------------------------------------------------------------
+
+    /// Spawns a TCP server that counts ILP newlines (each newline = 1 row written).
+    /// Returns (port, row_count_handle). Drop the `Arc` to read the count.
+    fn spawn_counting_tcp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Read as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        std::thread::spawn(move || {
+            // Accept connections in a loop (supports reconnect).
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let cnt = Arc::clone(&count_clone);
+                        std::thread::spawn(move || {
+                            let mut buf = [0u8; 65536];
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        // Count newlines = ILP rows.
+                                        let newlines =
+                                            buf[..n].iter().filter(|&&b| b == b'\n').count();
+                                        cnt.fetch_add(newlines, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (port, count)
+    }
+
+    #[test]
+    fn test_e2e_crash_recovery_zero_loss() {
+        // =================================================================
+        // REAL end-to-end scenario:
+        //   Phase 1: QuestDB UP → write 50 ticks → flush → verify received
+        //   Phase 2: QuestDB DOWN → write 200 ticks → all buffered
+        //   Phase 3: QuestDB UP → reconnect → drain → verify ALL received
+        // =================================================================
+        use std::sync::atomic::Ordering;
+
+        // Phase 1: QuestDB is up. Write and flush ticks.
+        let (port, row_count) = spawn_counting_tcp_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some(), "Phase 1: sender must be connected");
+
+        let phase1_ticks = 50_usize;
+        for i in 0..phase1_ticks as u32 {
+            let tick = ParsedTick {
+                security_id: i,
+                exchange_segment_code: 2,
+                last_traded_price: 24500.0 + i as f32 * 0.05,
+                exchange_timestamp: 1_740_556_500 + i,
+                received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
+                ..ParsedTick::default()
+            };
+            writer.append_tick(&tick).unwrap();
+        }
+        writer.force_flush().unwrap();
+
+        // Give the TCP server a moment to process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let phase1_received = row_count.load(Ordering::Relaxed);
+        assert_eq!(
+            phase1_received, phase1_ticks,
+            "Phase 1: server must receive exactly {phase1_ticks} ILP rows"
+        );
+
+        // Phase 2: CRASH QuestDB (kill sender, point to unreachable host).
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Pre-set spill to unique temp path.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-e2e-crash-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("crash-test-spill.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        let phase2_ticks = 200_usize;
+        for i in 0..phase2_ticks as u32 {
+            let tick = ParsedTick {
+                security_id: phase1_ticks as u32 + i,
+                exchange_segment_code: 2,
+                last_traded_price: 25000.0 + i as f32 * 0.05,
+                exchange_timestamp: 1_740_560_000 + i,
+                received_at_nanos: 1_740_560_000_000_000_000 + i64::from(i),
+                ..ParsedTick::default()
+            };
+            writer.append_tick(&tick).unwrap();
+        }
+
+        // Verify: all phase 2 ticks are buffered (ring buffer), none lost.
+        assert_eq!(
+            writer.buffered_tick_count(),
+            phase2_ticks,
+            "Phase 2: all ticks must be in ring buffer"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "Phase 2: sender must still be None (QuestDB down)"
+        );
+
+        // Phase 3: QuestDB RECOVERS. Start a new counting server.
+        let (port2, row_count2) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now(); // Allow reconnect.
+
+        // Reconnect.
+        writer.try_reconnect_on_error().unwrap();
+        assert!(writer.sender.is_some(), "Phase 3: sender must reconnect");
+
+        // Drain buffered ticks.
+        writer.drain_tick_buffer();
+
+        // Final flush to push any remaining ILP rows.
+        let _ = writer.force_flush();
+
+        // Give the server time to process.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let phase3_received = row_count2.load(Ordering::Relaxed);
+        assert_eq!(
+            phase3_received, phase2_ticks,
+            "Phase 3: recovery server must receive ALL {phase2_ticks} buffered ticks"
+        );
+
+        // TOTAL ACCOUNTING: phase1 + phase3 = all ticks ever sent.
+        let total_sent = phase1_ticks + phase2_ticks;
+        let total_received = phase1_received + phase3_received;
+        assert_eq!(
+            total_received, total_sent,
+            "ZERO LOSS: total received ({total_received}) must equal total sent ({total_sent})"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_e2e_prolonged_outage_with_disk_spill_then_recovery() {
+        // =================================================================
+        // EXTREME scenario: QuestDB down for so long that ring buffer fills
+        // AND ticks spill to disk. Then recovery drains EVERYTHING.
+        //
+        // Phase 1: QuestDB DOWN from the start
+        // Phase 2: Send TICK_BUFFER_CAPACITY + 100 ticks (ring buf fills, 100 spill)
+        // Phase 3: QuestDB RECOVERS → drain ring buf + disk → verify count
+        // =================================================================
+        use std::sync::atomic::Ordering;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Phase 1: Kill QuestDB immediately.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Pre-set spill to unique temp path.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-e2e-prolonged-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("prolonged-spill.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Phase 2: Send more ticks than ring buffer can hold.
+        let spill_count: usize = 100;
+        let total_ticks = TICK_BUFFER_CAPACITY + spill_count;
+
+        for i in 0..total_ticks as u32 {
+            let tick = ParsedTick {
+                security_id: i,
+                exchange_segment_code: 2,
+                last_traded_price: 24500.0 + i as f32 * 0.01,
+                exchange_timestamp: 1_740_556_500 + i,
+                received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
+                ..ParsedTick::default()
+            };
+            writer.buffer_tick(tick);
+        }
+
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_spilled_total, spill_count as u64);
+
+        // Phase 3: QuestDB recovers.
+        let (port2, row_count) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        writer.try_reconnect_on_error().unwrap();
+        assert!(writer.sender.is_some(), "must reconnect");
+
+        // Drain everything: ring buffer + disk spill.
+        writer.drain_tick_buffer();
+        let _ = writer.force_flush();
+
+        // Give server time to process.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let received = row_count.load(Ordering::Relaxed);
+        assert_eq!(
+            received, total_ticks,
+            "ZERO LOSS after prolonged outage: received ({received}) must equal sent ({total_ticks})"
+        );
+
+        // Ring buffer should be empty after drain.
+        assert_eq!(
+            writer.buffered_tick_count(),
+            0,
+            "ring buffer must be empty after drain"
+        );
+
+        // Spill file should be deleted after drain.
+        assert!(
+            !spill_path.exists(),
+            "spill file must be deleted after successful drain"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }
