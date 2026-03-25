@@ -257,6 +257,7 @@ pub async fn run_tick_processor(
     let mut ticks_processed: u64 = 0;
     let mut parse_errors: u64 = 0;
     let mut storage_errors: u64 = 0;
+    let mut candle_write_errors: u64 = 0;
     let mut junk_ticks_filtered: u64 = 0;
     let mut dedup_filtered: u64 = 0;
     let mut outside_hours_filtered: u64 = 0;
@@ -651,8 +652,19 @@ pub async fn run_tick_processor(
                                 c.volume,
                                 c.tick_count,
                             ) {
-                                warn!(?err, "failed to append live candle to QuestDB");
-                                break;
+                                // Never break — remaining candles must still be processed.
+                                // Rate-limit: warn first 100, then every 1000th.
+                                candle_write_errors = candle_write_errors.saturating_add(1);
+                                if candle_write_errors <= 100
+                                    || candle_write_errors.is_multiple_of(1000)
+                                {
+                                    warn!(
+                                        ?err,
+                                        candle_write_errors,
+                                        "failed to append live candle to QuestDB"
+                                    );
+                                }
+                                continue;
                             }
                         }
                     }
@@ -752,6 +764,7 @@ pub async fn run_tick_processor(
         outside_hours_filtered,
         parse_errors,
         storage_errors,
+        candle_write_errors,
         "tick processor stopped"
     );
 }

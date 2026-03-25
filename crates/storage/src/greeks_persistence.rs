@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 
@@ -397,28 +397,56 @@ async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
 // ILP Writer — Batched writes to QuestDB
 // ---------------------------------------------------------------------------
 
+/// Max reconnection attempts for greeks writer.
+const GREEKS_MAX_RECONNECT_ATTEMPTS: u32 = 3;
+/// Initial backoff delay (ms) for greeks reconnection.
+const GREEKS_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+/// Minimum interval between reconnection attempt cycles.
+const GREEKS_RECONNECT_THROTTLE_SECS: u64 = 30;
+
 /// Batched writer for all greeks-related QuestDB tables via ILP.
 ///
-/// Cold path — no ring buffer, no reconnect logic. If QuestDB is down,
-/// writes fail and are skipped (next cycle will write fresh data).
+/// **Resilience:** On QuestDB disconnect, writes are silently skipped
+/// (no ring buffer — Greeks are recomputed every second from live ticks).
+/// Reconnection is attempted with exponential backoff, throttled to at
+/// most once per `GREEKS_RECONNECT_THROTTLE_SECS`.
 pub struct GreeksPersistenceWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
+    /// Throttle: earliest time a reconnect may be attempted.
+    next_reconnect_allowed: std::time::Instant,
 }
 
 impl GreeksPersistenceWriter {
     /// Creates a new writer connected to QuestDB via ILP TCP.
+    ///
+    /// If QuestDB is unreachable, initializes with `sender = None` and
+    /// skips writes until reconnected.
     // TEST-EXEMPT: requires live QuestDB ILP connection (integration test)
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
         let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
-        let sender = Sender::from_conf(&conf_string)
-            .context("failed to connect to QuestDB ILP for greeks")?;
-        let buffer = sender.new_buffer();
+        let (sender, buffer) = match Sender::from_conf(&conf_string) {
+            Ok(s) => {
+                let b = s.new_buffer();
+                (Some(s), b)
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "greeks writer: QuestDB unreachable at startup — skipping writes"
+                );
+                (None, Buffer::new(questdb::ingress::ProtocolVersion::V1))
+            }
+        };
         Ok(Self {
             sender,
             buffer,
             pending_count: 0,
+            ilp_conf_string: conf_string,
+            next_reconnect_allowed: std::time::Instant::now(),
         })
     }
 
@@ -473,15 +501,40 @@ impl GreeksPersistenceWriter {
     }
 
     /// Flushes all pending rows to QuestDB.
+    ///
+    /// On flush error, sets sender to `None` (triggers reconnect on next write).
+    /// Returns `Ok(())` even on failure — resilience guarantee.
     // TEST-EXEMPT: requires live QuestDB ILP connection (integration test)
     pub fn flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
+
+        // If disconnected, try reconnect first.
+        if self.sender.is_none() {
+            self.try_reconnect_on_error();
+        }
+
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush greeks data to QuestDB")?;
+        if let Some(ref mut sender) = self.sender {
+            if let Err(err) = sender.flush(&mut self.buffer) {
+                warn!(
+                    ?err,
+                    pending = count,
+                    "greeks flush failed — disconnecting sender"
+                );
+                self.sender = None;
+                self.buffer.clear();
+                self.pending_count = 0;
+                return Ok(()); // Swallow — Greeks are recomputed next second
+            }
+        } else {
+            // No sender — discard buffered ILP rows (will be recomputed).
+            self.buffer.clear();
+            self.pending_count = 0;
+            return Ok(());
+        }
+
         self.pending_count = 0;
         debug!(rows = count, "greeks data flushed to QuestDB");
         Ok(())
@@ -491,6 +544,64 @@ impl GreeksPersistenceWriter {
     // TEST-EXEMPT: trivial accessor, tested indirectly via pipeline cycle logs
     pub fn pending_count(&self) -> usize {
         self.pending_count
+    }
+
+    /// Attempts to reconnect to QuestDB with exponential backoff.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = GREEKS_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=GREEKS_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = GREEKS_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                "attempting QuestDB ILP reconnection for greeks writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for greeks writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = GREEKS_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for greeks writer"
+                    );
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for greeks writer",
+            GREEKS_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Throttled reconnect — at most once per `GREEKS_RECONNECT_THROTTLE_SECS`.
+    fn try_reconnect_on_error(&mut self) {
+        if self.sender.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now < self.next_reconnect_allowed {
+            return;
+        }
+        self.next_reconnect_allowed = now + Duration::from_secs(GREEKS_RECONNECT_THROTTLE_SECS);
+        if let Err(err) = self.reconnect() {
+            warn!(?err, "greeks writer reconnect failed — will retry later");
+        }
     }
 }
 

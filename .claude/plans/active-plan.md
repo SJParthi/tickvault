@@ -1,8 +1,8 @@
 # Implementation Plan: QuestDB Resilience + Per-Tick Greeks as Columns
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-25
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Problem Statement
 
@@ -16,40 +16,40 @@ Both touch the same files (tick_processor.rs, candle_persistence.rs, greeks_pers
 
 ### Phase A: Critical Resilience Fixes (prevent crashes)
 
-- [ ] **A1.** Fix tick_processor.rs candle loop: `break` → `continue` on append error (line 655)
+- [x] **A1.** Fix tick_processor.rs candle loop: `break` → `continue` on append error (line 655)
   - Files: crates/core/src/pipeline/tick_processor.rs
   - Add rate-limited error counter (warn first 100, then 1 per 1000)
   - Tests: test_candle_write_error_continues_remaining_candles
 
-- [ ] **A2.** Fix main.rs greeks loops: `break` → `continue` on write errors (lines 1947, 1983)
+- [x] **A2.** Fix main.rs greeks loops: `break` → `continue` on write errors (lines 1947, 1983)
   - Files: crates/app/src/main.rs
   - Add rate-limited error counter
   - Tests: (integration — tested via pipeline; break→continue is 1-line change)
 
-- [ ] **A3.** Fix `std::thread::sleep()` in reconnect — must not block async executor
+- [x] **A3.** Fix `std::thread::sleep()` in reconnect — must not block async executor
   - Files: crates/storage/src/tick_persistence.rs (lines 330, 743)
   - Replace `std::thread::sleep()` with `tokio::task::block_in_place()` wrapper OR move reconnect to `tokio::spawn_blocking()` — keeps reconnect off the hot path async task
   - For tick_processor (sync context): keep thread::sleep but gate reconnect attempts to max 1 per 30 seconds (not per tick)
   - Add `last_reconnect_attempt: Instant` field to prevent reconnect storms
   - Tests: test_reconnect_throttled_to_once_per_30s
 
-- [ ] **A4.** Fix token expiry check in `TokenHandleBridge::get_access_token()`
+- [x] **A4.** Fix token expiry check in `TokenHandleBridge::get_access_token()`
   - Files: crates/app/src/trading_pipeline.rs (lines 59-70)
   - Add `if !token_state.is_valid() { return Err(OmsError::TokenExpired); }`
   - Tests: test_token_bridge_rejects_expired_token
 
 ### Phase B: LiveCandleWriter Resilience (mirror TickPersistenceWriter)
 
-- [ ] **B1.** Change `sender: Sender` → `sender: Option<Sender>` + store `ilp_conf_string`
+- [x] **B1.** Change `sender: Sender` → `sender: Option<Sender>` + store `ilp_conf_string`
   - Files: crates/storage/src/candle_persistence.rs (LiveCandleWriter struct)
   - Tests: test_live_candle_writer_option_sender
 
-- [ ] **B2.** Add `reconnect()` with exponential backoff (1s/2s/4s, 3 attempts) + throttle
+- [x] **B2.** Add `reconnect()` with exponential backoff (1s/2s/4s, 3 attempts) + throttle
   - Files: crates/storage/src/candle_persistence.rs
   - Add `last_reconnect_attempt: Instant` — throttle to max 1 attempt per 30s
   - Tests: test_live_candle_reconnect_throttled
 
-- [ ] **B3.** Add bounded ring buffer `VecDeque<BufferedCandle>` for candle buffering
+- [x] **B3.** Add bounded ring buffer `VecDeque<BufferedCandle>` for candle buffering
   - Files: crates/storage/src/candle_persistence.rs, crates/common/src/constants.rs
   - New struct `BufferedCandle` (copy of append_candle args, ~48 bytes)
   - New constant: `CANDLE_BUFFER_CAPACITY = 100_000` (~5MB, holds ~27 min at 60 candles/sec)
@@ -57,7 +57,7 @@ Both touch the same files (tick_processor.rs, candle_persistence.rs, greeks_pers
   - `drain_candle_buffer()` — drain to QuestDB after recovery, batched
   - Tests: test_candle_ring_buffer_fifo, test_candle_ring_buffer_overflow_drops_oldest, test_candle_drain_after_recovery
 
-- [ ] **B4.** Make `append_candle()` and `force_flush()` resilient (swallow errors, buffer candles)
+- [x] **B4.** Make `append_candle()` and `force_flush()` resilient (swallow errors, buffer candles)
   - Files: crates/storage/src/candle_persistence.rs
   - `append_candle()`: if sender None → try reconnect (throttled) → buffer on failure → always return Ok(())
   - `force_flush()`: on flush error → set sender=None → don't propagate → buffer remaining
@@ -65,14 +65,14 @@ Both touch the same files (tick_processor.rs, candle_persistence.rs, greeks_pers
 
 ### Phase C: GreeksPersistenceWriter Resilience
 
-- [ ] **C1.** Change `sender: Sender` → `sender: Option<Sender>` + reconnect + throttle
+- [x] **C1.** Change `sender: Sender` → `sender: Option<Sender>` + reconnect + throttle
   - Files: crates/storage/src/greeks_persistence.rs
   - Add `ilp_conf_string: String`, `last_reconnect_attempt: Instant`
   - Add `reconnect()` with exponential backoff (same as tick writer)
   - No ring buffer needed — Greeks recomputed every second from live ticks
   - Tests: test_greeks_writer_option_sender, test_greeks_reconnect_throttled
 
-- [ ] **C2.** Make all `write_*_row()` and `flush()` resilient
+- [x] **C2.** Make all `write_*_row()` and `flush()` resilient
   - Files: crates/storage/src/greeks_persistence.rs
   - Try reconnect (throttled) if sender None → on failure skip write → return Ok
   - `flush()`: on error → set sender=None → return Ok (don't propagate)
@@ -80,7 +80,7 @@ Both touch the same files (tick_processor.rs, candle_persistence.rs, greeks_pers
 
 ### Phase D: CandlePersistenceWriter (historical) Resilience
 
-- [ ] **D1.** Change `sender: Sender` → `sender: Option<Sender>` + reconnect
+- [x] **D1.** Change `sender: Sender` → `sender: Option<Sender>` + reconnect
   - Files: crates/storage/src/candle_persistence.rs (CandlePersistenceWriter)
   - Cold path — propagate errors (caller decides to retry or skip)
   - Tests: test_historical_candle_writer_reconnect

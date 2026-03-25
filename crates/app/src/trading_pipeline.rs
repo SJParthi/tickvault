@@ -60,6 +60,11 @@ impl TokenProvider for TokenHandleBridge {
         let guard = self.handle.load();
         match guard.as_ref() {
             Some(token_state) => {
+                // Reject expired tokens — prevents sending orders with stale JWT
+                // that would return DH-901 and enter a retry loop.
+                if !token_state.is_valid() {
+                    return Err(dhan_live_trader_trading::oms::OmsError::TokenExpired);
+                }
                 let token_str = token_state.access_token().expose_secret();
                 if token_str.is_empty() {
                     return Err(dhan_live_trader_trading::oms::OmsError::NoToken);

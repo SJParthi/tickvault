@@ -66,6 +66,10 @@ const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// until QuestDB recovers. When QuestDB comes back, the ring buffer is drained
 /// oldest-first before accepting new ticks. If the buffer fills up (QuestDB down
 /// too long), the oldest ticks are dropped and a CRITICAL alert fires.
+/// Minimum interval between reconnection attempts (seconds).
+/// Prevents reconnect storms when QuestDB is down for extended periods.
+const RECONNECT_THROTTLE_SECS: u64 = 30;
+
 pub struct TickPersistenceWriter {
     sender: Option<Sender>,
     buffer: Buffer,
@@ -83,6 +87,9 @@ pub struct TickPersistenceWriter {
     /// Set to true after a successful reconnect + drain. The async consumer
     /// checks this flag to fire the gap integrity check.
     just_recovered: bool,
+    /// Throttle: earliest time a reconnect may be attempted.
+    /// Prevents blocking the async executor with repeated sleep() calls.
+    next_reconnect_allowed: std::time::Instant,
 }
 
 impl TickPersistenceWriter {
@@ -105,6 +112,7 @@ impl TickPersistenceWriter {
             tick_buffer: VecDeque::new(),
             ticks_dropped_total: 0,
             just_recovered: false,
+            next_reconnect_allowed: std::time::Instant::now(),
         })
     }
 
@@ -362,12 +370,24 @@ impl TickPersistenceWriter {
     }
 
     /// Attempts reconnection only when the sender is `None` (i.e., after a
-    /// previous write failure). This is a cold-path helper — never called
-    /// on the happy path.
+    /// previous write failure). Throttled to at most once per
+    /// `RECONNECT_THROTTLE_SECS` to avoid blocking the async executor with
+    /// repeated `thread::sleep()` calls during sustained QuestDB outages.
     fn try_reconnect_on_error(&mut self) -> Result<()> {
         if self.sender.is_some() {
             return Ok(());
         }
+        // Throttle: skip reconnect if too soon since last attempt.
+        let now = std::time::Instant::now();
+        if now < self.next_reconnect_allowed {
+            anyhow::bail!(
+                "reconnect throttled for tick writer — next attempt in {:?}",
+                self.next_reconnect_allowed.saturating_duration_since(now)
+            );
+        }
+        // Set next-allowed BEFORE attempting so even a failed attempt doesn't
+        // trigger another sleep storm on the very next tick.
+        self.next_reconnect_allowed = now + Duration::from_secs(RECONNECT_THROTTLE_SECS);
         self.reconnect()
     }
 }
@@ -615,6 +635,8 @@ pub struct DepthPersistenceWriter {
     last_flush_ms: u64,
     /// ILP connection config string, retained for reconnection.
     ilp_conf_string: String,
+    /// Throttle: earliest time a reconnect may be attempted.
+    next_reconnect_allowed: std::time::Instant,
 }
 
 impl DepthPersistenceWriter {
@@ -631,6 +653,7 @@ impl DepthPersistenceWriter {
             pending_count: 0,
             last_flush_ms: current_time_ms(),
             ilp_conf_string: conf_string,
+            next_reconnect_allowed: std::time::Instant::now(),
         })
     }
 
@@ -772,13 +795,20 @@ impl DepthPersistenceWriter {
         )
     }
 
-    /// Attempts reconnection only when the sender is `None` (i.e., after a
-    /// previous write failure). This is a cold-path helper — never called
-    /// on the happy path.
+    /// Attempts reconnection only when the sender is `None`. Throttled to at
+    /// most once per `RECONNECT_THROTTLE_SECS`.
     fn try_reconnect_on_error(&mut self) -> Result<()> {
         if self.sender.is_some() {
             return Ok(());
         }
+        let now = std::time::Instant::now();
+        if now < self.next_reconnect_allowed {
+            anyhow::bail!(
+                "reconnect throttled for depth writer — next attempt in {:?}",
+                self.next_reconnect_allowed.saturating_duration_since(now)
+            );
+        }
+        self.next_reconnect_allowed = now + Duration::from_secs(RECONNECT_THROTTLE_SECS);
         self.reconnect()
     }
 }

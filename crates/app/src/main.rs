@@ -536,24 +536,24 @@ async fn main() -> Result<()> {
         }
 
         // --- Background: Tick-driven Greeks aggregator (candle-aligned) ---
-        if config.greeks.enabled {
-            if let Some(ref plan) = subscription_plan {
-                let greeks_agg_rx = fast_tick_broadcast_sender.subscribe();
-                // O(1) EXEMPT: cold path — clone registry once at startup for background consumer.
-                let greeks_agg_registry = plan.registry.clone();
-                let greeks_agg_config = config.greeks.clone();
-                let greeks_agg_questdb = config.questdb.clone();
-                tokio::spawn(async move {
-                    run_greeks_aggregator_consumer(
-                        greeks_agg_rx,
-                        greeks_agg_registry,
-                        greeks_agg_config,
-                        greeks_agg_questdb,
-                    )
-                    .await;
-                });
-                info!("tick-driven greeks aggregator started (candle-aligned, cold path)");
-            }
+        if config.greeks.enabled
+            && let Some(ref plan) = subscription_plan
+        {
+            let greeks_agg_rx = fast_tick_broadcast_sender.subscribe();
+            // O(1) EXEMPT: cold path — clone registry once at startup for background consumer.
+            let greeks_agg_registry = plan.registry.clone();
+            let greeks_agg_config = config.greeks.clone();
+            let greeks_agg_questdb = config.questdb.clone();
+            tokio::spawn(async move {
+                run_greeks_aggregator_consumer(
+                    greeks_agg_rx,
+                    greeks_agg_registry,
+                    greeks_agg_config,
+                    greeks_agg_questdb,
+                )
+                .await;
+            });
+            info!("tick-driven greeks aggregator started (candle-aligned, cold path)");
         }
 
         // --- Background: Order update WebSocket ---
@@ -1015,24 +1015,24 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9.7: Tick-driven Greeks aggregator (candle-aligned, cold path)
     // -----------------------------------------------------------------------
-    if config.greeks.enabled {
-        if let Some(ref plan) = subscription_plan {
-            let greeks_agg_rx = tick_broadcast_sender.subscribe();
-            // O(1) EXEMPT: cold path — clone registry once at startup for background consumer.
-            let greeks_agg_registry = plan.registry.clone();
-            let greeks_agg_config = config.greeks.clone();
-            let greeks_agg_questdb = config.questdb.clone();
-            tokio::spawn(async move {
-                run_greeks_aggregator_consumer(
-                    greeks_agg_rx,
-                    greeks_agg_registry,
-                    greeks_agg_config,
-                    greeks_agg_questdb,
-                )
-                .await;
-            });
-            info!("tick-driven greeks aggregator started (candle-aligned, cold path)");
-        }
+    if config.greeks.enabled
+        && let Some(ref plan) = subscription_plan
+    {
+        let greeks_agg_rx = tick_broadcast_sender.subscribe();
+        // O(1) EXEMPT: cold path — clone registry once at startup for background consumer.
+        let greeks_agg_registry = plan.registry.clone();
+        let greeks_agg_config = config.greeks.clone();
+        let greeks_agg_questdb = config.questdb.clone();
+        tokio::spawn(async move {
+            run_greeks_aggregator_consumer(
+                greeks_agg_rx,
+                greeks_agg_registry,
+                greeks_agg_config,
+                greeks_agg_questdb,
+            )
+            .await;
+        });
+        info!("tick-driven greeks aggregator started (candle-aligned, cold path)");
     }
 
     // -----------------------------------------------------------------------
@@ -1863,6 +1863,8 @@ async fn run_greeks_aggregator_consumer(
     // Track the last snapshot second to detect candle boundaries.
     let mut last_snapshot_secs: u32 = 0;
     let mut snapshots_written: u64 = 0;
+    let mut greeks_write_errors: u64 = 0;
+    let mut pcr_write_errors: u64 = 0;
     // O(1) EXEMPT: cold path, pipeline setup
     let flush_interval = std::time::Duration::from_secs(1);
     let mut last_flush = std::time::Instant::now();
@@ -1943,8 +1945,13 @@ async fn run_greeks_aggregator_consumer(
                                 ts_nanos,
                             };
                         if let Err(err) = greeks_writer.write_option_greeks_live_row(&row) {
-                            warn!(?err, "failed to write live greeks row");
-                            break;
+                            greeks_write_errors = greeks_write_errors.saturating_add(1);
+                            if greeks_write_errors <= 100
+                                || greeks_write_errors.is_multiple_of(1000)
+                            {
+                                warn!(?err, greeks_write_errors, "failed to write live greeks row");
+                            }
+                            continue;
                         }
                     }
 
@@ -1979,8 +1986,11 @@ async fn run_greeks_aggregator_consumer(
                                 ts_nanos,
                             };
                         if let Err(err) = greeks_writer.write_pcr_snapshot_live_row(&row) {
-                            warn!(?err, "failed to write live PCR row");
-                            break;
+                            pcr_write_errors = pcr_write_errors.saturating_add(1);
+                            if pcr_write_errors <= 100 || pcr_write_errors.is_multiple_of(1000) {
+                                warn!(?err, pcr_write_errors, "failed to write live PCR row");
+                            }
+                            continue;
                         }
                     }
 

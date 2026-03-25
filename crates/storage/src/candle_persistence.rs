@@ -15,17 +15,18 @@
 //! Server-side: QuestDB DEDUP UPSERT KEYS(ts, security_id, timeframe) prevents
 //! duplicate candles from re-fetches.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, Sender, TimestampNanos};
+use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    CANDLE_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS_I64, QUESTDB_TABLE_CANDLES_1S,
-    QUESTDB_TABLE_HISTORICAL_CANDLES,
+    CANDLE_BUFFER_CAPACITY, CANDLE_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS_I64,
+    QUESTDB_TABLE_CANDLES_1S, QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
 use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::HistoricalCandle;
@@ -96,14 +97,21 @@ fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
 // Candle Persistence Writer
 // ---------------------------------------------------------------------------
 
+/// Max reconnection attempts for historical candle writer.
+const HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS: u32 = 3;
+/// Initial backoff delay (ms) for historical candle reconnection.
+const HISTORICAL_CANDLE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+
 /// Batched candle writer for QuestDB via ILP.
 ///
-/// Accumulates candle rows and flushes when the buffer reaches
-/// `CANDLE_FLUSH_BATCH_SIZE` rows.
+/// Used for historical candle ingestion (cold path). On disconnect,
+/// propagates errors to the caller (which decides whether to retry or skip).
 pub struct CandlePersistenceWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
 }
 
 impl CandlePersistenceWriter {
@@ -118,9 +126,10 @@ impl CandlePersistenceWriter {
         let buffer = sender.new_buffer();
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             buffer,
             pending_count: 0,
+            ilp_conf_string: conf_string,
         })
     }
 
@@ -137,6 +146,9 @@ impl CandlePersistenceWriter {
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
     pub fn append_candle(&mut self, candle: &HistoricalCandle) -> Result<()> {
+        // Try reconnect if disconnected (cold path — ok to propagate error).
+        self.try_reconnect_on_error()?;
+
         // UTC epoch → IST-as-UTC: add 19800s so QuestDB shows IST wall-clock time.
         let ts_nanos =
             TimestampNanos::new(compute_ist_nanos_from_utc_secs(candle.timestamp_utc_secs));
@@ -181,9 +193,16 @@ impl CandlePersistenceWriter {
         }
 
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush candles to QuestDB")?;
+        let sender = self
+            .sender
+            .as_mut()
+            .context("QuestDB sender disconnected for historical candle writer")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            self.sender = None;
+            self.pending_count = 0;
+            self.buffer.clear();
+            return Err(err).context("flush candles to QuestDB");
+        }
         self.pending_count = 0;
 
         debug!(flushed_rows = count, "candle batch flushed to QuestDB");
@@ -193,6 +212,57 @@ impl CandlePersistenceWriter {
     /// Returns the number of candles currently buffered (not yet flushed).
     pub fn pending_count(&self) -> usize {
         self.pending_count
+    }
+
+    /// Attempts to reconnect to QuestDB with exponential backoff.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = HISTORICAL_CANDLE_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                "attempting QuestDB ILP reconnection for historical candle writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for historical candle writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for historical candle writer"
+                    );
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for historical candle writer",
+            HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Attempts reconnection only when the sender is `None`.
+    fn try_reconnect_on_error(&mut self) -> Result<()> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
+        self.reconnect()
     }
 }
 
@@ -204,32 +274,89 @@ impl CandlePersistenceWriter {
 /// live candles arrive in real-time and need lower latency.
 const LIVE_CANDLE_FLUSH_BATCH_SIZE: usize = 128;
 
+/// Max reconnection attempts per cycle for live candle writer.
+const LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS: u32 = 3;
+/// Initial backoff delay (ms) for reconnection.
+const LIVE_CANDLE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+/// Minimum interval between reconnection attempt cycles.
+const LIVE_CANDLE_RECONNECT_THROTTLE_SECS: u64 = 30;
+
+/// A buffered candle waiting to be written to QuestDB after recovery.
+/// Fixed-size, Copy — no allocation on push.
+#[derive(Clone, Copy)]
+struct BufferedCandle {
+    security_id: u32,
+    exchange_segment_code: u8,
+    timestamp_secs: u32,
+    open: f32,
+    high: f32,
+    low: f32,
+    close: f32,
+    volume: u32,
+    tick_count: u32,
+}
+
 /// Batched writer for live 1-second candles to `candles_1s` via ILP.
 ///
 /// Completed candles from `CandleAggregator` are written here, feeding
 /// QuestDB materialized views (candles_1m, 5m, 15m, etc.).
+///
+/// **Resilience:** On QuestDB disconnect, candles are buffered in a bounded
+/// ring buffer (`CANDLE_BUFFER_CAPACITY`). On reconnect, buffered candles
+/// drain oldest-first. If the buffer overflows, oldest candles are dropped
+/// and a CRITICAL alert fires.
 pub struct LiveCandleWriter {
-    sender: Sender,
+    sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
+    /// ILP connection config string, retained for reconnection.
+    ilp_conf_string: String,
+    /// Resilience ring buffer: holds candles when QuestDB is down.
+    // O(1) EXEMPT: begin — VecDeque allocation bounded by CANDLE_BUFFER_CAPACITY (~5MB max)
+    candle_buffer: VecDeque<BufferedCandle>,
+    // O(1) EXEMPT: end
+    /// Total candles dropped because the ring buffer was full.
+    candles_dropped_total: u64,
+    /// Throttle: earliest time a reconnect may be attempted.
+    next_reconnect_allowed: std::time::Instant,
 }
 
 impl LiveCandleWriter {
     /// Creates a new live candle writer connected to QuestDB via ILP TCP.
+    ///
+    /// If QuestDB is unreachable at startup, the writer initializes with
+    /// `sender = None` and buffers candles until connection is established.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
         let conf_string = build_ilp_conf_string(&config.host, config.ilp_port);
-        let sender = Sender::from_conf(&conf_string)
-            .context("failed to connect to QuestDB for live candles")?;
-        let buffer = sender.new_buffer();
+        let (sender, buffer) = match Sender::from_conf(&conf_string) {
+            Ok(s) => {
+                let b = s.new_buffer();
+                (Some(s), b)
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "live candle writer: QuestDB unreachable at startup — buffering candles"
+                );
+                (None, Buffer::new(ProtocolVersion::V1))
+            }
+        };
 
         Ok(Self {
             sender,
             buffer,
             pending_count: 0,
+            ilp_conf_string: conf_string,
+            candle_buffer: VecDeque::new(),
+            candles_dropped_total: 0,
+            next_reconnect_allowed: std::time::Instant::now(),
         })
     }
 
     /// Appends a completed 1-second candle to the ILP buffer.
+    ///
+    /// If QuestDB is disconnected, the candle is buffered in the ring buffer.
+    /// Never returns an error — resilience guarantees the caller is never blocked.
     ///
     /// Auto-flushes when buffer reaches `LIVE_CANDLE_FLUSH_BATCH_SIZE`.
     ///
@@ -248,65 +375,266 @@ impl LiveCandleWriter {
         volume: u32,
         tick_count: u32,
     ) -> Result<()> {
-        // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
-        // Store directly — no offset needed.
+        // If disconnected, try reconnect (throttled) then buffer on failure.
+        if self.sender.is_none() {
+            self.try_reconnect_on_error();
+        }
+
+        // If still disconnected after reconnect attempt, buffer the candle.
+        if self.sender.is_none() {
+            self.buffer_candle(BufferedCandle {
+                security_id,
+                exchange_segment_code,
+                timestamp_secs,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                tick_count,
+            });
+            return Ok(());
+        }
+
+        // Connected — write to ILP buffer.
         let ts_nanos = TimestampNanos::new(compute_live_candle_nanos(timestamp_secs));
 
-        self.buffer
+        if let Err(err) = self
+            .buffer
             .table(QUESTDB_TABLE_CANDLES_1S)
-            .context("table name")?
-            .symbol("segment", segment_code_to_str(exchange_segment_code))
-            .context("segment")?
-            .column_i64("security_id", i64::from(security_id))
-            .context("security_id")?
-            .column_f64("open", f32_to_f64_clean(open))
-            .context("open")?
-            .column_f64("high", f32_to_f64_clean(high))
-            .context("high")?
-            .column_f64("low", f32_to_f64_clean(low))
-            .context("low")?
-            .column_f64("close", f32_to_f64_clean(close))
-            .context("close")?
-            .column_i64("volume", i64::from(volume))
-            .context("volume")?
-            .column_i64("oi", 0) // OI not available per-second from ticks
-            .context("oi")?
-            .column_i64("tick_count", i64::from(tick_count))
-            .context("tick_count")?
-            .at(ts_nanos)
-            .context("designated timestamp")?;
+            .and_then(|b| b.symbol("segment", segment_code_to_str(exchange_segment_code)))
+            .and_then(|b| b.column_i64("security_id", i64::from(security_id)))
+            .and_then(|b| b.column_f64("open", f32_to_f64_clean(open)))
+            .and_then(|b| b.column_f64("high", f32_to_f64_clean(high)))
+            .and_then(|b| b.column_f64("low", f32_to_f64_clean(low)))
+            .and_then(|b| b.column_f64("close", f32_to_f64_clean(close)))
+            .and_then(|b| b.column_i64("volume", i64::from(volume)))
+            .and_then(|b| b.column_i64("oi", 0))
+            .and_then(|b| b.column_i64("tick_count", i64::from(tick_count)))
+            .and_then(|b| b.at(ts_nanos))
+        {
+            warn!(?err, "live candle ILP buffer error — buffering candle");
+            self.buffer_candle(BufferedCandle {
+                security_id,
+                exchange_segment_code,
+                timestamp_secs,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                tick_count,
+            });
+            return Ok(());
+        }
 
         self.pending_count = self.pending_count.saturating_add(1);
 
         if should_flush(self.pending_count, LIVE_CANDLE_FLUSH_BATCH_SIZE) {
-            self.force_flush()?;
+            self.force_flush_internal();
         }
 
         Ok(())
     }
 
     /// Forces an immediate flush of all buffered candles to QuestDB.
+    ///
+    /// On flush error, sets sender to None (triggers reconnect on next write).
+    /// Never propagates errors — the caller is never blocked.
     pub fn force_flush(&mut self) -> Result<()> {
+        self.force_flush_internal();
+        Ok(())
+    }
+
+    /// Internal flush — sets sender=None on error, never panics.
+    fn force_flush_internal(&mut self) {
         if self.pending_count == 0 {
-            return Ok(());
+            return;
         }
 
         let count = self.pending_count;
-        self.sender
-            .flush(&mut self.buffer)
-            .context("flush live candles to QuestDB")?;
-        self.pending_count = 0;
 
+        if let Some(ref mut sender) = self.sender {
+            if let Err(err) = sender.flush(&mut self.buffer) {
+                warn!(
+                    ?err,
+                    pending = count,
+                    "live candle flush failed — disconnecting sender"
+                );
+                self.sender = None;
+                self.buffer.clear();
+                self.pending_count = 0;
+                return;
+            }
+        } else {
+            // No sender — clear the ILP buffer (data already in ring buffer or lost).
+            self.buffer.clear();
+            self.pending_count = 0;
+            return;
+        }
+
+        self.pending_count = 0;
         debug!(flushed_rows = count, "live candle batch flushed to QuestDB");
-        Ok(())
+
+        // After successful flush, drain any buffered candles.
+        if !self.candle_buffer.is_empty() {
+            self.drain_candle_buffer();
+        }
     }
 
     /// Flushes if any candles are buffered.
     pub fn flush_if_needed(&mut self) -> Result<()> {
         if self.pending_count > 0 {
-            self.force_flush()?;
+            self.force_flush_internal();
         }
         Ok(())
+    }
+
+    /// Buffer a candle in the ring buffer. Drops oldest on overflow.
+    fn buffer_candle(&mut self, candle: BufferedCandle) {
+        if self.candle_buffer.len() >= CANDLE_BUFFER_CAPACITY {
+            self.candle_buffer.pop_front();
+            self.candles_dropped_total = self.candles_dropped_total.saturating_add(1);
+            // CRITICAL alert every 1000 drops.
+            if self.candles_dropped_total.is_multiple_of(1000) {
+                error!(
+                    candles_dropped_total = self.candles_dropped_total,
+                    "CRITICAL: candle ring buffer overflow — oldest candles dropped"
+                );
+            }
+        }
+        self.candle_buffer.push_back(candle);
+    }
+
+    /// Drains buffered candles to QuestDB after recovery. Batched.
+    fn drain_candle_buffer(&mut self) {
+        let total = self.candle_buffer.len();
+        let mut drained: usize = 0;
+
+        while let Some(c) = self.candle_buffer.pop_front() {
+            let ts_nanos = TimestampNanos::new(compute_live_candle_nanos(c.timestamp_secs));
+
+            let row_result = self
+                .buffer
+                .table(QUESTDB_TABLE_CANDLES_1S)
+                .and_then(|b| b.symbol("segment", segment_code_to_str(c.exchange_segment_code)))
+                .and_then(|b| b.column_i64("security_id", i64::from(c.security_id)))
+                .and_then(|b| b.column_f64("open", f32_to_f64_clean(c.open)))
+                .and_then(|b| b.column_f64("high", f32_to_f64_clean(c.high)))
+                .and_then(|b| b.column_f64("low", f32_to_f64_clean(c.low)))
+                .and_then(|b| b.column_f64("close", f32_to_f64_clean(c.close)))
+                .and_then(|b| b.column_i64("volume", i64::from(c.volume)))
+                .and_then(|b| b.column_i64("oi", 0))
+                .and_then(|b| b.column_i64("tick_count", i64::from(c.tick_count)))
+                .and_then(|b| b.at(ts_nanos));
+
+            if row_result.is_err() {
+                // Re-push the candle and stop draining.
+                self.candle_buffer.push_front(c);
+                warn!(
+                    drained,
+                    remaining = self.candle_buffer.len(),
+                    "candle drain interrupted — ILP buffer error"
+                );
+                return;
+            }
+
+            drained = drained.saturating_add(1);
+
+            // Flush in batches.
+            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
+                && let Some(ref mut sender) = self.sender
+                && let Err(err) = sender.flush(&mut self.buffer)
+            {
+                warn!(?err, drained, "candle drain flush failed — stopping drain");
+                self.sender = None;
+                self.buffer.clear();
+                return;
+            }
+        }
+
+        // Final flush for any remaining rows.
+        if !drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
+            && let Some(ref mut sender) = self.sender
+            && let Err(err) = sender.flush(&mut self.buffer)
+        {
+            warn!(?err, drained, "candle drain final flush failed");
+            self.sender = None;
+            self.buffer.clear();
+            return;
+        }
+
+        info!(total, drained, "candle ring buffer drained to QuestDB");
+    }
+
+    /// Attempts to reconnect to QuestDB with exponential backoff.
+    fn reconnect(&mut self) -> Result<()> {
+        let mut delay_ms = LIVE_CANDLE_RECONNECT_INITIAL_DELAY_MS;
+
+        for attempt in 1..=LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
+                delay_ms,
+                buffered_candles = self.candle_buffer.len(),
+                "attempting QuestDB ILP reconnection for candle writer"
+            );
+
+            std::thread::sleep(Duration::from_millis(delay_ms));
+
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(new_sender) => {
+                    self.buffer = new_sender.new_buffer();
+                    self.sender = Some(new_sender);
+                    self.pending_count = 0;
+                    info!(
+                        attempt,
+                        "QuestDB ILP reconnection succeeded for candle writer"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        attempt,
+                        max_attempts = LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
+                        ?err,
+                        "QuestDB ILP reconnection failed for candle writer"
+                    );
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "QuestDB ILP reconnection failed after {} attempts for candle writer",
+            LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
+        )
+    }
+
+    /// Throttled reconnect — at most once per `LIVE_CANDLE_RECONNECT_THROTTLE_SECS`.
+    fn try_reconnect_on_error(&mut self) {
+        if self.sender.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now < self.next_reconnect_allowed {
+            return;
+        }
+        self.next_reconnect_allowed =
+            now + Duration::from_secs(LIVE_CANDLE_RECONNECT_THROTTLE_SECS);
+        if let Err(err) = self.reconnect() {
+            warn!(?err, "candle writer reconnect failed — will retry later");
+        }
+    }
+
+    /// Returns the number of candles in the resilience ring buffer.
+    pub fn buffered_candle_count(&self) -> usize {
+        self.candle_buffer.len()
+    }
+
+    /// Returns the total number of candles dropped due to buffer overflow.
+    pub fn candles_dropped_total(&self) -> u64 {
+        self.candles_dropped_total
     }
 }
 

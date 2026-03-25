@@ -1220,6 +1220,11 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
 pub const TICK_BUFFER_CAPACITY: usize = 300_000;
 
+/// Resilience ring buffer capacity for live candle writer.
+/// Holds candles in memory when QuestDB is down, drains on recovery.
+/// 100,000 candles × ~48 bytes = ~5MB. At ~60 candles/sec = ~27 minutes of data.
+pub const CANDLE_BUFFER_CAPACITY: usize = 100_000;
+
 /// Option Chain API minimum request interval in seconds (Dhan limit: 1 req / 3 sec).
 pub const OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS: u64 = 3;
 
