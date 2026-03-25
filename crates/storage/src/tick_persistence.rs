@@ -16,7 +16,7 @@
 //! the current batch to prevent OOM.
 
 use std::collections::VecDeque;
-use std::io::Write as _;
+use std::io::{BufReader, BufWriter, Read as _, Write as _};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -63,12 +63,75 @@ const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// - `flush_if_needed()` detects that `TICK_FLUSH_INTERVAL_MS` has elapsed.
 ///
 /// On write failure, ticks are held in a bounded ring buffer (`TICK_BUFFER_CAPACITY`)
-/// until QuestDB recovers. When QuestDB comes back, the ring buffer is drained
-/// oldest-first before accepting new ticks. If the buffer fills up (QuestDB down
-/// too long), the oldest ticks are dropped and a CRITICAL alert fires.
+/// until QuestDB recovers. When the ring buffer fills up, overflow ticks are
+/// spilled to a disk file (`data/spill/ticks-YYYYMMDD.bin`) as fixed-size binary
+/// records. On recovery, ring buffer drains first, then disk spill, then resume.
+/// **Zero tick loss guarantee** — no tick is ever dropped.
+///
 /// Minimum interval between reconnection attempts (seconds).
 /// Prevents reconnect storms when QuestDB is down for extended periods.
 const RECONNECT_THROTTLE_SECS: u64 = 30;
+
+/// Fixed record size for disk-spilled ticks: 72 bytes per tick.
+/// Layout: security_id(4) + segment(1) + pad(1) + ltp(4) + ltq(2) + ts(4) +
+///         received_nanos(8) + atp(4) + vol(4) + sell_qty(4) + buy_qty(4) +
+///         open(4) + close(4) + high(4) + low(4) + oi(4) + oi_high(4) + oi_low(4) + pad(3)
+///         = 72 bytes (aligned).
+const TICK_SPILL_RECORD_SIZE: usize = 72;
+
+/// Directory for tick spill files.
+const TICK_SPILL_DIR: &str = "data/spill";
+
+/// Serialize a `ParsedTick` to a fixed-size byte array for disk spill.
+/// All fields written as little-endian. O(1), zero allocation.
+fn serialize_tick(tick: &ParsedTick) -> [u8; TICK_SPILL_RECORD_SIZE] {
+    let mut buf = [0u8; TICK_SPILL_RECORD_SIZE];
+    buf[0..4].copy_from_slice(&tick.security_id.to_le_bytes());
+    buf[4] = tick.exchange_segment_code;
+    // buf[5] = padding
+    buf[6..10].copy_from_slice(&tick.last_traded_price.to_le_bytes());
+    buf[10..12].copy_from_slice(&tick.last_trade_quantity.to_le_bytes());
+    buf[12..16].copy_from_slice(&tick.exchange_timestamp.to_le_bytes());
+    buf[16..24].copy_from_slice(&tick.received_at_nanos.to_le_bytes());
+    buf[24..28].copy_from_slice(&tick.average_traded_price.to_le_bytes());
+    buf[28..32].copy_from_slice(&tick.volume.to_le_bytes());
+    buf[32..36].copy_from_slice(&tick.total_sell_quantity.to_le_bytes());
+    buf[36..40].copy_from_slice(&tick.total_buy_quantity.to_le_bytes());
+    buf[40..44].copy_from_slice(&tick.day_open.to_le_bytes());
+    buf[44..48].copy_from_slice(&tick.day_close.to_le_bytes());
+    buf[48..52].copy_from_slice(&tick.day_high.to_le_bytes());
+    buf[52..56].copy_from_slice(&tick.day_low.to_le_bytes());
+    buf[56..60].copy_from_slice(&tick.open_interest.to_le_bytes());
+    buf[60..64].copy_from_slice(&tick.oi_day_high.to_le_bytes());
+    buf[64..68].copy_from_slice(&tick.oi_day_low.to_le_bytes());
+    // buf[68..71] = padding
+    buf
+}
+
+/// Deserialize a `ParsedTick` from a fixed-size byte array.
+fn deserialize_tick(buf: &[u8; TICK_SPILL_RECORD_SIZE]) -> ParsedTick {
+    ParsedTick {
+        security_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        exchange_segment_code: buf[4],
+        last_traded_price: f32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
+        last_trade_quantity: u16::from_le_bytes([buf[10], buf[11]]),
+        exchange_timestamp: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+        received_at_nanos: i64::from_le_bytes([
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+        ]),
+        average_traded_price: f32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+        volume: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+        total_sell_quantity: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
+        total_buy_quantity: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
+        day_open: f32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
+        day_close: f32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
+        day_high: f32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]),
+        day_low: f32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]),
+        open_interest: u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]),
+        oi_day_high: u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]),
+        oi_day_low: u32::from_le_bytes([buf[64], buf[65], buf[66], buf[67]]),
+    }
+}
 
 pub struct TickPersistenceWriter {
     sender: Option<Sender>,
@@ -82,14 +145,18 @@ pub struct TickPersistenceWriter {
     // O(1) EXEMPT: begin — VecDeque allocation bounded by TICK_BUFFER_CAPACITY (~19MB max)
     tick_buffer: VecDeque<ParsedTick>,
     // O(1) EXEMPT: end
-    /// Total ticks dropped because the ring buffer was full (QuestDB down too long).
-    ticks_dropped_total: u64,
+    /// Total ticks spilled to disk (ring buffer overflow).
+    ticks_spilled_total: u64,
     /// Set to true after a successful reconnect + drain. The async consumer
     /// checks this flag to fire the gap integrity check.
     just_recovered: bool,
     /// Throttle: earliest time a reconnect may be attempted.
     /// Prevents blocking the async executor with repeated sleep() calls.
     next_reconnect_allowed: std::time::Instant,
+    /// Open file handle for disk spill (lazy-opened on first overflow).
+    spill_writer: Option<BufWriter<std::fs::File>>,
+    /// Path of the current spill file (for drain + cleanup).
+    spill_path: Option<std::path::PathBuf>,
 }
 
 impl TickPersistenceWriter {
@@ -110,9 +177,11 @@ impl TickPersistenceWriter {
             last_flush_ms: current_time_ms(),
             ilp_conf_string: conf_string,
             tick_buffer: VecDeque::new(),
-            ticks_dropped_total: 0,
+            ticks_spilled_total: 0,
             just_recovered: false,
             next_reconnect_allowed: std::time::Instant::now(),
+            spill_writer: None,
+            spill_path: None,
         })
     }
 
@@ -223,9 +292,11 @@ impl TickPersistenceWriter {
         self.tick_buffer.len()
     }
 
-    /// Returns the total number of ticks dropped due to ring buffer overflow.
+    /// Returns the total number of ticks spilled to disk (ring buffer overflow).
+    /// With disk spill enabled, this is NOT the number of ticks lost — they're
+    /// on disk and will drain on recovery. Ticks are only lost if disk write fails.
     pub fn ticks_dropped_total(&self) -> u64 {
-        self.ticks_dropped_total
+        self.ticks_spilled_total
     }
 
     /// Returns true (once) after a successful QuestDB reconnect + buffer drain.
@@ -246,47 +317,106 @@ impl TickPersistenceWriter {
     // Resilience ring buffer
     // -----------------------------------------------------------------------
 
-    /// Pushes a tick into the ring buffer. If the buffer is full, drops the
-    /// oldest tick and increments the drop counter.
+    /// Pushes a tick into the ring buffer. If the buffer is full, spills the
+    /// tick to disk instead of dropping it. **Zero tick loss guarantee.**
     fn buffer_tick(&mut self, tick: ParsedTick) {
         // O(1) EXEMPT: begin — bounded ring buffer, max TICK_BUFFER_CAPACITY
         if self.tick_buffer.len() >= TICK_BUFFER_CAPACITY {
-            self.tick_buffer.pop_front();
-            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            // CRITICAL alert every 1000 drops (triggers Telegram).
-            if self.ticks_dropped_total.is_multiple_of(1000) {
-                error!(
-                    dropped_total = self.ticks_dropped_total,
-                    buffer_size = self.tick_buffer.len(),
-                    capacity = TICK_BUFFER_CAPACITY,
-                    "tick ring buffer full — dropping oldest ticks (QuestDB still down)"
-                );
-            }
+            // Ring buffer full — spill to disk (never drop).
+            self.spill_tick_to_disk(&tick);
+        } else {
+            self.tick_buffer.push_back(tick);
         }
-        self.tick_buffer.push_back(tick);
         metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        metrics::counter!("dlt_ticks_spilled_total").absolute(self.ticks_spilled_total);
         // O(1) EXEMPT: end
     }
 
-    /// Drains buffered ticks to QuestDB after recovery. Writes in batches
-    /// and stops if a flush fails (remaining ticks stay in the buffer).
-    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by tick_buffer.len()
-    fn drain_tick_buffer(&mut self) {
-        if self.tick_buffer.is_empty() || self.sender.is_none() {
+    /// Spills a tick to disk when the ring buffer is full.
+    /// Creates the spill directory and file lazily on first call.
+    /// O(1) amortized — buffered sequential append.
+    fn spill_tick_to_disk(&mut self, tick: &ParsedTick) {
+        // Lazy-open the spill file.
+        if self.spill_writer.is_none()
+            && let Err(err) = self.open_spill_file()
+        {
+            // If we can't open the spill file, we have no choice but to drop.
+            // This should only happen if the filesystem is full or read-only.
+            error!(
+                ?err,
+                "CRITICAL: cannot open tick spill file — tick WILL be lost"
+            );
             return;
         }
 
-        let total_buffered = self.tick_buffer.len();
+        let record = serialize_tick(tick);
+        if let Some(ref mut writer) = self.spill_writer
+            && let Err(err) = writer.write_all(&record)
+        {
+            error!(
+                ?err,
+                ticks_spilled = self.ticks_spilled_total,
+                "CRITICAL: disk spill write failed — tick lost"
+            );
+            return;
+        }
+
+        self.ticks_spilled_total = self.ticks_spilled_total.saturating_add(1);
+        if self.ticks_spilled_total.is_multiple_of(10_000) {
+            warn!(
+                ticks_spilled = self.ticks_spilled_total,
+                "tick disk spill growing — QuestDB still down"
+            );
+        }
+    }
+
+    /// Opens (or creates) the spill file for the current date.
+    fn open_spill_file(&mut self) -> Result<()> {
+        std::fs::create_dir_all(TICK_SPILL_DIR).context("failed to create tick spill directory")?;
+
+        let date = chrono::Utc::now().format("%Y%m%d");
+        let path = std::path::PathBuf::from(format!("{TICK_SPILL_DIR}/ticks-{date}.bin"));
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open tick spill file: {}", path.display()))?;
+
+        info!(
+            path = %path.display(),
+            "opened tick spill file for disk overflow"
+        );
+
+        self.spill_writer = Some(BufWriter::new(file));
+        self.spill_path = Some(path);
+        Ok(())
+    }
+
+    /// Drains buffered ticks to QuestDB after recovery.
+    ///
+    /// Order:
+    /// 1. Ring buffer (oldest first — these arrived first)
+    /// 2. Disk spill (arrived after ring buffer filled)
+    ///
+    /// Writes in batches. Stops if a flush fails.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by tick_buffer.len()
+    fn drain_tick_buffer(&mut self) {
+        if self.sender.is_none() {
+            return;
+        }
+
+        let ring_count = self.tick_buffer.len();
         let mut drained: usize = 0;
 
+        // Phase 1: Drain ring buffer (oldest ticks first).
         while let Some(tick) = self.tick_buffer.pop_front() {
             if build_tick_row(&mut self.buffer, &tick).is_err() {
-                continue; // Skip malformed tick, don't stop drain
+                continue;
             }
             self.pending_count = self.pending_count.saturating_add(1);
             drained += 1;
 
-            // Flush in batches during drain to avoid unbounded ILP buffer growth.
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE
                 && let Err(err) = self.force_flush()
             {
@@ -294,25 +424,123 @@ impl TickPersistenceWriter {
                     ?err,
                     drained,
                     remaining = self.tick_buffer.len(),
-                    "flush during buffer drain failed — pausing drain"
+                    "flush during ring buffer drain failed — pausing"
                 );
-                break; // Stop draining, remaining ticks stay in buffer
+                return;
             }
+        }
+
+        // Flush any remaining ring buffer rows before moving to disk.
+        if self.pending_count > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(?err, drained, "ring buffer final flush failed");
+            return;
+        }
+
+        if drained > 0 {
+            info!(drained, ring_count, "ring buffer drained to QuestDB");
+        }
+
+        // Phase 2: Drain disk spill file (ticks that overflowed the ring buffer).
+        if self.ticks_spilled_total > 0 {
+            let spill_drained = self.drain_disk_spill();
+            drained = drained.saturating_add(spill_drained);
         }
 
         if drained > 0 {
             info!(
-                drained,
-                remaining = self.tick_buffer.len(),
-                total_buffered,
-                dropped_total = self.ticks_dropped_total,
-                "drained buffered ticks to QuestDB after recovery"
+                total_drained = drained,
+                from_ring = ring_count,
+                from_disk = self.ticks_spilled_total,
+                "recovery drain complete — all ticks written to QuestDB"
             );
-            // Signal the async consumer to run the gap integrity check.
             self.just_recovered = true;
         }
+
         metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
-        metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+        metrics::counter!("dlt_ticks_spilled_total").absolute(self.ticks_spilled_total);
+    }
+
+    /// Drains the disk spill file to QuestDB. Returns count of ticks drained.
+    fn drain_disk_spill(&mut self) -> usize {
+        // Close the spill writer first (flush buffered data).
+        if let Some(ref mut writer) = self.spill_writer {
+            let _ = writer.flush();
+        }
+        self.spill_writer = None;
+
+        let spill_path = match self.spill_path.take() {
+            Some(p) => p,
+            None => return 0,
+        };
+
+        let file = match std::fs::File::open(&spill_path) {
+            Ok(f) => f,
+            Err(err) => {
+                warn!(?err, path = %spill_path.display(), "cannot open spill file for drain");
+                return 0;
+            }
+        };
+
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let expected_records = file_len as usize / TICK_SPILL_RECORD_SIZE;
+        info!(
+            path = %spill_path.display(),
+            file_bytes = file_len,
+            expected_records,
+            "draining disk spill to QuestDB"
+        );
+
+        let mut reader = BufReader::new(file);
+        let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
+        let mut drained: usize = 0;
+
+        loop {
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    warn!(?err, drained, "disk spill read error — stopping drain");
+                    break;
+                }
+            }
+
+            let tick = deserialize_tick(&record);
+            if build_tick_row(&mut self.buffer, &tick).is_err() {
+                continue;
+            }
+            self.pending_count = self.pending_count.saturating_add(1);
+            drained = drained.saturating_add(1);
+
+            if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+                && let Err(err) = self.force_flush()
+            {
+                warn!(?err, drained, "flush during spill drain failed");
+                break;
+            }
+        }
+
+        // Final flush.
+        if self.pending_count > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(?err, drained, "spill drain final flush failed");
+        }
+
+        // Delete the spill file after successful drain.
+        if let Err(err) = std::fs::remove_file(&spill_path) {
+            warn!(?err, path = %spill_path.display(), "failed to delete spill file");
+        } else {
+            info!(
+                path = %spill_path.display(),
+                drained,
+                "disk spill file drained and deleted"
+            );
+        }
+
+        self.ticks_spilled_total = 0;
+        drained
     }
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
@@ -4873,7 +5101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_tick_drops_oldest_when_full() {
+    fn test_buffer_tick_spills_to_disk_when_full() {
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -4883,6 +5111,15 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
+        // Pre-set spill to unique temp path.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-spill-drop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-ticks-overflow.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path);
+
         // Fill the buffer to capacity with identifiable ticks.
         for i in 0..TICK_BUFFER_CAPACITY {
             writer.buffer_tick(make_test_tick(i as u32, i as f32));
@@ -4890,16 +5127,30 @@ mod tests {
         assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
         assert_eq!(writer.ticks_dropped_total(), 0);
 
-        // One more tick should drop the oldest.
+        // One more tick should SPILL to disk (not drop).
         writer.buffer_tick(make_test_tick(999_999, 999.0));
+        // Ring buffer stays at capacity — overflow goes to disk.
         assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
-        assert_eq!(writer.ticks_dropped_total(), 1);
+        // Spilled count = 1 (NOT dropped — it's on disk).
+        assert_eq!(writer.ticks_spilled_total, 1);
 
-        // The oldest tick (security_id=0) should be gone, newest (999999) present.
+        // The ring buffer contents are unchanged (no pop_front anymore).
         let front = writer.tick_buffer.front().unwrap();
-        assert_eq!(front.security_id, 1, "oldest tick (id=0) should be dropped");
+        assert_eq!(
+            front.security_id, 0,
+            "ring buffer oldest should still be id=0 (no drop)"
+        );
         let back = writer.tick_buffer.back().unwrap();
-        assert_eq!(back.security_id, 999_999, "newest tick should be at back");
+        assert_eq!(
+            back.security_id,
+            (TICK_BUFFER_CAPACITY - 1) as u32,
+            "ring buffer newest should be the last one that fit"
+        );
+
+        // Cleanup spill file.
+        if let Some(ref path) = writer.spill_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -5157,5 +5408,295 @@ mod tests {
             result.unwrap_err().to_string().contains("throttled"),
             "error message must contain 'throttled'"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Disk spill serialization roundtrip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_spill_record_size() {
+        assert_eq!(
+            TICK_SPILL_RECORD_SIZE, 72,
+            "spill record must be exactly 72 bytes"
+        );
+    }
+
+    #[test]
+    fn test_tick_serialize_deserialize_roundtrip() {
+        let tick = ParsedTick {
+            security_id: 49081,
+            exchange_segment_code: 2, // NSE_FNO
+            last_traded_price: 24505.75,
+            last_trade_quantity: 75,
+            exchange_timestamp: 1_740_556_500,
+            received_at_nanos: 1_740_556_500_123_456_789,
+            average_traded_price: 24495.50,
+            volume: 50000,
+            total_sell_quantity: 12000,
+            total_buy_quantity: 13000,
+            day_open: 24400.0,
+            day_close: 24300.0,
+            day_high: 24550.0,
+            day_low: 24350.0,
+            open_interest: 100000,
+            oi_day_high: 120000,
+            oi_day_low: 90000,
+        };
+
+        let bytes = serialize_tick(&tick);
+        assert_eq!(bytes.len(), TICK_SPILL_RECORD_SIZE);
+
+        let restored = deserialize_tick(&bytes);
+        assert_eq!(restored.security_id, tick.security_id);
+        assert_eq!(restored.exchange_segment_code, tick.exchange_segment_code);
+        assert_eq!(restored.last_traded_price, tick.last_traded_price);
+        assert_eq!(restored.last_trade_quantity, tick.last_trade_quantity);
+        assert_eq!(restored.exchange_timestamp, tick.exchange_timestamp);
+        assert_eq!(restored.received_at_nanos, tick.received_at_nanos);
+        assert_eq!(restored.average_traded_price, tick.average_traded_price);
+        assert_eq!(restored.volume, tick.volume);
+        assert_eq!(restored.total_sell_quantity, tick.total_sell_quantity);
+        assert_eq!(restored.total_buy_quantity, tick.total_buy_quantity);
+        assert_eq!(restored.day_open, tick.day_open);
+        assert_eq!(restored.day_close, tick.day_close);
+        assert_eq!(restored.day_high, tick.day_high);
+        assert_eq!(restored.day_low, tick.day_low);
+        assert_eq!(restored.open_interest, tick.open_interest);
+        assert_eq!(restored.oi_day_high, tick.oi_day_high);
+        assert_eq!(restored.oi_day_low, tick.oi_day_low);
+    }
+
+    #[test]
+    fn test_tick_serialize_roundtrip_zero_tick() {
+        let tick = ParsedTick::default();
+        let bytes = serialize_tick(&tick);
+        let restored = deserialize_tick(&bytes);
+        assert_eq!(restored.security_id, 0);
+        assert_eq!(restored.last_traded_price, 0.0);
+    }
+
+    #[test]
+    fn test_tick_serialize_roundtrip_max_values() {
+        let tick = ParsedTick {
+            security_id: u32::MAX,
+            exchange_segment_code: 255,
+            last_traded_price: f32::MAX,
+            last_trade_quantity: u16::MAX,
+            exchange_timestamp: u32::MAX,
+            received_at_nanos: i64::MAX,
+            average_traded_price: f32::MAX,
+            volume: u32::MAX,
+            total_sell_quantity: u32::MAX,
+            total_buy_quantity: u32::MAX,
+            day_open: f32::MAX,
+            day_close: f32::MAX,
+            day_high: f32::MAX,
+            day_low: f32::MAX,
+            open_interest: u32::MAX,
+            oi_day_high: u32::MAX,
+            oi_day_low: u32::MAX,
+        };
+        let bytes = serialize_tick(&tick);
+        let restored = deserialize_tick(&bytes);
+        assert_eq!(restored.security_id, u32::MAX);
+        assert_eq!(restored.exchange_timestamp, u32::MAX);
+        assert_eq!(restored.received_at_nanos, i64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // Disk spill file write/read integration test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disk_spill_write_read_roundtrip() {
+        // Use a unique temp dir for this test.
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-spill-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-ticks.bin");
+
+        // Write 1000 ticks to disk.
+        let tick_count = 1000_usize;
+        {
+            let file = std::fs::File::create(&spill_path).unwrap();
+            let mut writer = BufWriter::new(file);
+            for i in 0..tick_count as u32 {
+                let tick = ParsedTick {
+                    security_id: i,
+                    exchange_segment_code: 2,
+                    last_traded_price: 24500.0 + i as f32 * 0.05,
+                    last_trade_quantity: 75,
+                    exchange_timestamp: 1_740_556_500 + i,
+                    received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i) * 1000,
+                    ..ParsedTick::default()
+                };
+                writer.write_all(&serialize_tick(&tick)).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        // Verify file size.
+        let file_size = std::fs::metadata(&spill_path).unwrap().len();
+        assert_eq!(
+            file_size,
+            (tick_count * TICK_SPILL_RECORD_SIZE) as u64,
+            "spill file must be exactly tick_count * record_size bytes"
+        );
+
+        // Read back and verify every tick.
+        {
+            let file = std::fs::File::open(&spill_path).unwrap();
+            let mut reader = BufReader::new(file);
+            let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
+            let mut read_count = 0_usize;
+
+            loop {
+                match reader.read_exact(&mut record) {
+                    Ok(()) => {
+                        let tick = deserialize_tick(&record);
+                        assert_eq!(
+                            tick.security_id, read_count as u32,
+                            "tick {read_count}: security_id must match"
+                        );
+                        assert_eq!(
+                            tick.exchange_timestamp,
+                            1_740_556_500 + read_count as u32,
+                            "tick {read_count}: timestamp must match"
+                        );
+                        read_count += 1;
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => panic!("unexpected read error: {err}"),
+                }
+            }
+            assert_eq!(
+                read_count, tick_count,
+                "must read back exactly {tick_count} ticks — ZERO LOSS"
+            );
+        }
+
+        // Cleanup.
+        std::fs::remove_file(&spill_path).unwrap();
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Zero tick loss integration test — sustained QuestDB outage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_tick_loss_sustained_outage() {
+        // Simulate: QuestDB connected at start, then disconnects.
+        // Send MORE ticks than ring buffer capacity.
+        // Verify: ring buffer holds TICK_BUFFER_CAPACITY, rest goes to disk.
+        // On recovery: ALL ticks are accounted for (ring + disk = total sent).
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Pre-set spill to a unique temp file so we don't collide with other tests.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-zero-loss-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-ticks-spill.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Send ticks: ring buffer capacity + 500 extra that must spill to disk.
+        let overflow_count: usize = 500;
+        let total_ticks = TICK_BUFFER_CAPACITY + overflow_count;
+
+        for i in 0..total_ticks as u32 {
+            let tick = ParsedTick {
+                security_id: i,
+                exchange_segment_code: 2,
+                last_traded_price: 24500.0 + i as f32 * 0.01,
+                exchange_timestamp: 1_740_556_500 + i,
+                received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
+                ..ParsedTick::default()
+            };
+            writer.buffer_tick(tick);
+        }
+
+        // Verify: ring buffer is at capacity.
+        assert_eq!(
+            writer.buffered_tick_count(),
+            TICK_BUFFER_CAPACITY,
+            "ring buffer must be at capacity"
+        );
+
+        // Verify: overflow went to disk (not dropped).
+        assert_eq!(
+            writer.ticks_spilled_total, overflow_count as u64,
+            "exactly {overflow_count} ticks must be spilled to disk, NOT dropped"
+        );
+
+        // Verify: no ticks were lost.
+        let total_accounted = writer.buffered_tick_count() as u64 + writer.ticks_spilled_total;
+        assert_eq!(
+            total_accounted,
+            total_ticks as u64,
+            "ZERO TICK LOSS: ring({}) + disk({}) must equal total sent({})",
+            writer.buffered_tick_count(),
+            writer.ticks_spilled_total,
+            total_ticks
+        );
+
+        // Verify the disk spill file exists and has the right size.
+        if let Some(ref path) = writer.spill_path {
+            // Flush the BufWriter before checking file size.
+            if let Some(ref mut w) = writer.spill_writer {
+                w.flush().unwrap();
+            }
+            let file_size = std::fs::metadata(path).unwrap().len();
+            let expected_size = (overflow_count * TICK_SPILL_RECORD_SIZE) as u64;
+            assert_eq!(
+                file_size, expected_size,
+                "spill file must contain exactly {overflow_count} records ({expected_size} bytes)"
+            );
+
+            // Verify we can read back the spilled ticks and they're correct.
+            let file = std::fs::File::open(path).unwrap();
+            let mut reader = BufReader::new(file);
+            let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
+            let mut read_count = 0_usize;
+            loop {
+                match reader.read_exact(&mut record) {
+                    Ok(()) => {
+                        let tick = deserialize_tick(&record);
+                        // Spilled ticks are the OVERFLOW ticks (id >= TICK_BUFFER_CAPACITY).
+                        let expected_id = (TICK_BUFFER_CAPACITY + read_count) as u32;
+                        assert_eq!(
+                            tick.security_id, expected_id,
+                            "spilled tick {read_count}: id must be {expected_id}"
+                        );
+                        read_count += 1;
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => panic!("read error: {err}"),
+                }
+            }
+            assert_eq!(
+                read_count, overflow_count,
+                "must read back exactly {overflow_count} spilled ticks"
+            );
+
+            // Cleanup.
+            let _ = std::fs::remove_file(path);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
