@@ -8305,4 +8305,335 @@ mod tests {
             "flush_if_needed must flush when interval elapsed"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: drain_tick_buffer + drain_disk_spill + recover_stale_spill_files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_drain_tick_buffer_ring_and_disk_spill_full_path() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect and buffer ticks.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Set up temp spill file.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-tick-drain-full-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-ticks-drain.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Fill ring buffer to capacity + overflow to disk.
+        let overflow = 10_usize;
+        let total = TICK_BUFFER_CAPACITY + overflow;
+        for i in 0..total as u32 {
+            writer.buffer_tick(ParsedTick {
+                security_id: i,
+                exchange_segment_code: 2,
+                last_traded_price: 24500.0,
+                exchange_timestamp: 1_740_556_500 + i,
+                received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
+                ..ParsedTick::default()
+            });
+        }
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_spilled_total, overflow as u64);
+
+        // Reconnect to a new drain server.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+        let _ = writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some());
+
+        // Drain ring buffer + disk spill.
+        writer.drain_tick_buffer();
+        assert_eq!(
+            writer.buffered_tick_count(),
+            0,
+            "ring buffer must be empty after full drain"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_recover_stale_tick_spill_file() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Create the spill directory and a stale spill file.
+        std::fs::create_dir_all(TICK_SPILL_DIR).unwrap();
+        let stale_path = std::path::PathBuf::from(format!(
+            "{}/ticks-stale-test-{}.bin",
+            TICK_SPILL_DIR,
+            std::process::id()
+        ));
+
+        // Write 5 tick records to the stale file.
+        {
+            let mut file = std::fs::File::create(&stale_path).unwrap();
+            for i in 0..5_u32 {
+                let tick = ParsedTick {
+                    security_id: i,
+                    exchange_segment_code: 2,
+                    last_traded_price: 24500.0 + i as f32,
+                    exchange_timestamp: 1_740_556_500 + i,
+                    received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
+                    ..ParsedTick::default()
+                };
+                use std::io::Write as _;
+                file.write_all(&serialize_tick(&tick)).unwrap();
+            }
+        }
+
+        let recovered = writer.recover_stale_spill_files();
+        assert!(
+            recovered >= 5,
+            "must recover at least 5 ticks from stale file, got {recovered}"
+        );
+
+        // Verify stale file was deleted on successful drain.
+        assert!(
+            !stale_path.exists(),
+            "stale spill file must be deleted after successful drain"
+        );
+    }
+
+    #[test]
+    fn test_recover_stale_tick_spill_when_disconnected() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        // Writer cannot connect.
+        let writer_result = TickPersistenceWriter::new(&config);
+        if let Ok(mut writer) = writer_result {
+            let recovered = writer.recover_stale_spill_files();
+            assert_eq!(recovered, 0, "must return 0 when disconnected");
+        }
+        // If new() itself fails, that's also fine.
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: depth writer drain_depth_buffer + disk spill drain + recover
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_drain_buffer_with_disk_spill_full_path() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect and buffer depth snapshots.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Set up temp spill file.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-drain-full-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-depth-drain.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Fill ring buffer to capacity + overflow to disk.
+        let overflow = 5_usize;
+        let total = DEPTH_BUFFER_CAPACITY + overflow;
+        for i in 0..total {
+            let depth = make_test_depth();
+            writer.buffer_depth(BufferedDepth {
+                security_id: i as u32,
+                exchange_segment_code: 2,
+                received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
+                depth,
+            });
+        }
+        assert_eq!(writer.buffered_depth_count(), DEPTH_BUFFER_CAPACITY);
+        assert_eq!(writer.depth_spilled_total, overflow as u64);
+
+        // Reconnect to a new drain server.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+        let _ = writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some());
+
+        // Drain ring buffer + disk spill.
+        writer.drain_depth_buffer();
+        assert_eq!(
+            writer.buffered_depth_count(),
+            0,
+            "depth ring buffer must be empty after full drain"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_depth_append_triggers_drain_on_reconnect() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect and buffer some depth snapshots.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        for i in 0..5_u32 {
+            let depth = make_test_depth();
+            writer.buffer_depth(BufferedDepth {
+                security_id: i,
+                exchange_segment_code: 2,
+                received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
+                depth,
+            });
+        }
+        assert_eq!(writer.buffered_depth_count(), 5);
+
+        // Reconnect to a new server.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // Append triggers reconnect then drain.
+        let depth = make_test_depth();
+        let result = writer.append_depth(99, 2, 1_740_556_600_000_000_000, &depth);
+        assert!(result.is_ok());
+
+        // After drain, ring buffer should be empty.
+        assert_eq!(
+            writer.buffered_depth_count(),
+            0,
+            "depth ring buffer must be empty after drain on reconnect"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: check_tick_gaps_after_recovery async paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_unreachable() {
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // Must not panic — best-effort.
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_mock_200_empty_dataset() {
+        // Mock server that returns a valid QuestDB response with no dataset.
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 27\r\n\r\n{\"dataset\":[],\"columns\":[]}";
+        let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_mock_200_with_gaps() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 97\r\n\r\n{\"dataset\":[[\"2026-03-25T09:15:00\",100],[\"2026-03-25T09:16:00\",0]],\"columns\":[\"ts\",\"tick_count\"]}";
+        let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_mock_200_no_gaps() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n{\"dataset\":[[\"2026-03-25T09:15:00\",100],[\"2026-03-25T09:16:00\",200]],\"columns\":[\"ts\",\"tick_count\"]}";
+        let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_mock_invalid_json() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nnot-json!!!";
+        let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_mock_no_dataset() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"columns\":[\"ts\"]}";
+        let response_static: &'static str = Box::leak(response.to_string().into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
 }
