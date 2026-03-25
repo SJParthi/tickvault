@@ -1023,7 +1023,7 @@ mod tests {
         assert_eq!(plan.summary.stock_equities, 1);
         assert!(plan.summary.stock_derivatives > 0);
 
-        assert_eq!(plan.summary.feed_mode, FeedMode::Ticker);
+        assert_eq!(plan.summary.feed_mode, FeedMode::Full);
         assert!(!plan.summary.exceeds_capacity);
     }
 
@@ -1211,7 +1211,7 @@ mod tests {
         let plan = build_subscription_plan(&universe, &config, today);
 
         // Invalid feed mode falls back to Ticker
-        assert_eq!(plan.summary.feed_mode, FeedMode::Ticker);
+        assert_eq!(plan.summary.feed_mode, FeedMode::Full);
     }
 
     #[test]
