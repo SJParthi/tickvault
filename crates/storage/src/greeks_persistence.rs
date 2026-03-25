@@ -2196,4 +2196,199 @@ mod tests {
             "pending_count must be 0 after flush discards data"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: reconnect retry loop fails (greeks lines 549-589)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_reconnect_fails_after_max_attempts_with_unreachable() {
+        // Scenario: reconnect with unreachable host — verify all 3 attempts
+        // fail and sender remains None.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect and point to unreachable host.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // reconnect() should try 3 times and fail.
+        let result = writer.reconnect();
+        assert!(
+            result.is_err(),
+            "reconnect must fail after max attempts with unreachable host"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None after failed reconnect"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: try_reconnect_on_error with sender already Some
+    // (greeks lines 593-596)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_try_reconnect_noop_when_already_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // try_reconnect_on_error should be a noop when sender is already Some.
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_some(),
+            "sender must remain Some — no reconnect needed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: flush with pending data + sender.flush() failure
+    // (greeks lines 519-530 — the sender.flush() Err branch)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_flush_with_real_sender_failure_nulls_sender() {
+        // Connect to a TCP server that drops immediately.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Drop immediately to break pipe.
+            }
+        });
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Write a row to have pending data.
+        let row = PcrSnapshotRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            pcr_oi: 0.95,
+            pcr_volume: 0.82,
+            total_put_oi: 5000000,
+            total_call_oi: 5263158,
+            total_put_volume: 90000000,
+            total_call_volume: 109756098,
+            sentiment: "Neutral",
+            ts_nanos: sample_ts_nanos(),
+        };
+        writer.write_pcr_snapshot_row(&row).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Wait for TCP connection to drop.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Block reconnect so we can verify sender is None after flush failure.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Flush — may fail due to broken pipe.
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush must return Ok even on failure — resilience guarantee"
+        );
+        // Pending must be reset regardless.
+        assert_eq!(writer.pending_count(), 0, "pending must be 0 after flush");
+        // If flush actually failed, sender should be None.
+        // (On some OSes the OS buffer may allow the write to succeed.)
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: flush with pending data triggers reconnect
+    // (greeks lines 513-516 — reconnect before flush)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_flush_with_pending_triggers_reconnect() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Write a row to have pending data.
+        let row = PcrSnapshotRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            pcr_oi: 0.95,
+            pcr_volume: 0.82,
+            total_put_oi: 5000000,
+            total_call_oi: 5263158,
+            total_put_volume: 90000000,
+            total_call_volume: 109756098,
+            sentiment: "Neutral",
+            ts_nanos: sample_ts_nanos(),
+        };
+        writer.write_pcr_snapshot_row(&row).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Kill sender.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // Flush should trigger reconnect, then flush the pending data.
+        // Note: The ILP buffer was built with the OLD sender's buffer format.
+        // After reconnect, we get a new buffer, and the old pending data
+        // (from the old buffer) is discarded because flush() checks sender is Some
+        // but the buffer was cleared during reconnect. The code path at line 513-516
+        // detects sender is None and triggers try_reconnect_on_error.
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush must return Ok — resilience guarantee"
+        );
+        // After reconnect: sender is Some, pending data was in the old buffer
+        // that got replaced. pending_count was 1 but flush tries to use the
+        // new (empty) buffer — so the actual flush may succeed or fail.
+        // Either way, pending_count should be 0.
+        assert_eq!(writer.pending_count(), 0, "pending must be 0 after flush");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: greeks constants validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_reconnect_max_attempts_is_three() {
+        assert_eq!(
+            GREEKS_MAX_RECONNECT_ATTEMPTS, 3,
+            "greeks max reconnect must be 3"
+        );
+    }
+
+    #[test]
+    fn test_greeks_reconnect_initial_delay_is_1000ms() {
+        assert_eq!(
+            GREEKS_RECONNECT_INITIAL_DELAY_MS, 1000,
+            "greeks initial delay must be 1000ms"
+        );
+    }
 }

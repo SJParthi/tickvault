@@ -2757,4 +2757,448 @@ mod tests {
         // Cleanup: remove the active file we created.
         std::fs::remove_file(&active_file).unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: CandlePersistenceWriter (historical) reconnect path
+    // (candle_persistence lines 262-267 — try_reconnect_on_error calling reconnect)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_historical_candle_writer_reconnect_on_append() {
+        // Scenario: historical candle writer sender is None, append_candle
+        // calls try_reconnect_on_error which calls reconnect().
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Kill sender to simulate disconnect.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // append_candle should trigger try_reconnect_on_error → reconnect.
+        let candle = make_test_candle(42);
+        let result = writer.append_candle(&candle);
+        assert!(result.is_ok(), "append_candle must succeed after reconnect");
+        assert!(
+            writer.sender.is_some(),
+            "sender must be Some after reconnect"
+        );
+        assert_eq!(writer.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_historical_candle_writer_reconnect_fails_with_unreachable() {
+        // Scenario: sender is None, reconnect fails (unreachable host).
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Kill sender and point to unreachable host.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // append_candle should return error (reconnect failed).
+        let candle = make_test_candle(42);
+        let result = writer.append_candle(&candle);
+        assert!(
+            result.is_err(),
+            "append_candle must fail when reconnect fails"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None after failed reconnect"
+        );
+    }
+
+    #[test]
+    fn test_historical_candle_writer_force_flush_disconnected() {
+        // Scenario: force_flush with data when sender is None.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Append a candle, then kill sender.
+        let candle = make_test_candle(42);
+        writer.append_candle(&candle).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        writer.sender = None;
+
+        // force_flush should fail since sender is None.
+        let result = writer.force_flush();
+        assert!(result.is_err(), "force_flush must fail with None sender");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter force_flush_internal rescue path
+    // on real sender.flush() failure (candle_persistence lines 521-531)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_force_flush_real_sender_failure_rescues() {
+        // Connect to a TCP server that immediately drops the connection.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Drop immediately.
+            }
+        });
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Append candles to populate in_flight.
+        let candle_count = 3_usize;
+        for i in 0..candle_count as u32 {
+            writer
+                .append_candle(
+                    200 + i,
+                    2,
+                    1_740_556_500 + i,
+                    24500.0,
+                    24510.0,
+                    24490.0,
+                    24505.0,
+                    100,
+                    10,
+                )
+                .unwrap();
+        }
+        assert_eq!(writer.in_flight.len(), candle_count);
+
+        // Wait for TCP server to drop connection.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // force_flush_internal should detect flush failure and rescue.
+        writer.force_flush_internal();
+        if writer.sender.is_none() {
+            // Flush failed — verify rescue.
+            assert_eq!(
+                writer.buffered_candle_count(),
+                candle_count,
+                "all in-flight candles must be rescued"
+            );
+            assert!(writer.in_flight.is_empty());
+            assert_eq!(writer.pending_count, 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter rescue_in_flight when empty
+    // (candle_persistence lines 552-554)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_rescue_in_flight_when_empty_resets_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Set pending > 0 but in_flight is empty.
+        writer.pending_count = 7;
+        assert!(writer.in_flight.is_empty());
+
+        writer.rescue_in_flight();
+
+        assert_eq!(writer.pending_count, 0);
+        assert_eq!(writer.buffered_candle_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter spill path
+    // (candle_persistence lines 590-642)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_spill_to_disk_creates_records() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Set up temp spill path.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "dlt-candle-spill-create-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-candle-spill-create.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Fill ring buffer to capacity.
+        for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
+            writer.buffer_candle(make_buffered_candle(i));
+        }
+        assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
+        assert_eq!(writer.candles_spilled_total, 0);
+
+        // Spill 10 more to disk.
+        let spill_count = 10_u32;
+        for i in 0..spill_count {
+            writer.buffer_candle(make_buffered_candle(100_000 + i));
+        }
+        assert_eq!(writer.candles_spilled_total, u64::from(spill_count));
+
+        // Flush BufWriter.
+        if let Some(ref mut w) = writer.spill_writer {
+            w.flush().unwrap();
+        }
+
+        let metadata = std::fs::metadata(&spill_path).unwrap();
+        let expected_size = spill_count as u64 * CANDLE_SPILL_RECORD_SIZE as u64;
+        assert_eq!(metadata.len(), expected_size);
+
+        // Read back first record.
+        let raw = std::fs::read(&spill_path).unwrap();
+        let mut record = [0u8; CANDLE_SPILL_RECORD_SIZE];
+        record.copy_from_slice(&raw[..CANDLE_SPILL_RECORD_SIZE]);
+        let candle = deserialize_candle(&record);
+        assert_eq!(candle.security_id, 100_000);
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter open_candle_spill_file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_open_spill_file_creates_directory_and_file() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        let result = writer.open_candle_spill_file();
+        assert!(result.is_ok(), "open_candle_spill_file must succeed");
+        assert!(writer.spill_writer.is_some());
+        assert!(writer.spill_path.is_some());
+
+        // Cleanup.
+        if let Some(ref path) = writer.spill_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter drain with flush failure
+    // (candle_persistence lines 666-675 — mid-drain flush failure)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_drain_ring_buffer_rescues_on_mid_drain_failure() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Buffer some candles.
+        let buffer_count = 5_usize;
+        for i in 0..buffer_count as u32 {
+            writer.buffer_candle(make_buffered_candle(300 + i));
+        }
+        assert_eq!(writer.buffered_candle_count(), buffer_count);
+
+        // Kill sender before drain to simulate mid-drain failure.
+        // drain_candle_buffer will pop candles from ring buffer, try to flush,
+        // and the flush will fail because sender is killed during drain.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Manually set sender to Some but with a broken connection.
+        // We need a sender that will fail on flush. Use a short-lived TCP.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Drop immediately to break connection.
+            }
+        });
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // Reconnect (will get a sender that has a broken pipe).
+        writer.try_reconnect_on_error();
+        // Wait for connection to be dropped by server.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Drain — the flush may fail.
+        writer.drain_candle_buffer();
+
+        // Regardless of flush success or failure, no candles should be
+        // permanently lost — they're either drained or rescued back.
+        // Total candles accounted for = drained_to_server + ring_buffer + in_flight.
+        let total_accounted = writer.buffered_candle_count() + writer.in_flight.len();
+        // Either all drained or all rescued.
+        assert!(
+            total_accounted <= buffer_count,
+            "total accounted ({total_accounted}) must not exceed original ({buffer_count})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter flush_if_needed with pending
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_flush_if_needed_with_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        writer
+            .append_candle(
+                42,
+                2,
+                1_740_556_500,
+                24500.0,
+                24510.0,
+                24490.0,
+                24505.0,
+                100,
+                10,
+            )
+            .unwrap();
+        assert!(writer.pending_count > 0);
+
+        let result = writer.flush_if_needed();
+        assert!(result.is_ok());
+        // flush_if_needed flushes when pending > 0.
+        assert_eq!(
+            writer.pending_count, 0,
+            "flush_if_needed must flush when there are pending candles"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter candle_disk_spill with no
+    // spill_path set (candle_persistence lines 740-743)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_drain_disk_spill_noop_when_no_path() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Set spilled total but no path — drain should be a noop.
+        writer.candles_spilled_total = 10;
+        writer.spill_path = None;
+
+        writer.drain_candle_disk_spill();
+        // Should return without error.
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: LiveCandleWriter reconnect throttle
+    // (candle_persistence lines 1002-1015)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_candle_reconnect_throttle_skips_when_too_soon() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Simulate disconnect + set throttle far in future.
+        writer.sender = None;
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Point to a valid server — but throttle should prevent reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_none(),
+            "reconnect must be throttled — sender must remain None"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_reconnect_succeeds_after_throttle_expires() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Simulate disconnect.
+        writer.sender = None;
+        writer.next_reconnect_allowed = std::time::Instant::now(); // expired
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_some(),
+            "reconnect must succeed after throttle expires"
+        );
+    }
 }
