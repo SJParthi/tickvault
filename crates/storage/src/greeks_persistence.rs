@@ -1890,4 +1890,310 @@ mod tests {
             "reconnect must be skipped when throttled"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // GreeksPersistenceWriter resilience: reconnect, flush failure, buffering
+    // -----------------------------------------------------------------------
+
+    /// Spawns a TCP server that accepts multiple connections and counts ILP
+    /// newlines (each newline = 1 row written).
+    fn spawn_counting_tcp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Read as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let cnt = Arc::clone(&count_clone);
+                        std::thread::spawn(move || {
+                            let mut buf = [0u8; 65536];
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        let newlines =
+                                            buf[..n].iter().filter(|&&b| b == b'\n').count();
+                                        cnt.fetch_add(newlines, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (port, count)
+    }
+
+    #[test]
+    fn test_greeks_reconnect_after_disconnect() {
+        // Disconnect, reconnect to a new server, verify flush works.
+        use std::sync::atomic::Ordering;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Simulate disconnect.
+        writer.sender = None;
+
+        // Point to a new counting server for reconnect.
+        let (port2, row_count) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // Trigger reconnect.
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_some(),
+            "greeks writer must reconnect to new server"
+        );
+
+        // Write and flush a row to verify the new connection works.
+        let row = PcrSnapshotRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            pcr_oi: 0.95,
+            pcr_volume: 0.82,
+            total_put_oi: 5000000,
+            total_call_oi: 5263158,
+            total_put_volume: 90000000,
+            total_call_volume: 109756098,
+            sentiment: "Neutral",
+            ts_nanos: sample_ts_nanos(),
+        };
+        writer.write_pcr_snapshot_row(&row).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        let result = writer.flush();
+        assert!(result.is_ok(), "flush must succeed after reconnect");
+        assert_eq!(writer.pending_count(), 0);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let received = row_count.load(Ordering::Relaxed);
+        assert!(
+            received >= 1,
+            "counting server must receive at least 1 ILP row after reconnect flush"
+        );
+    }
+
+    #[test]
+    fn test_greeks_reconnect_throttled() {
+        // Attempt reconnect within 30s window, verify throttled (stays None).
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect.
+        writer.sender = None;
+
+        // Set throttle window far in the future.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Point to a valid server — but throttle should prevent reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_none(),
+            "reconnect must be throttled — sender must remain None"
+        );
+
+        // Verify it stays throttled on a second attempt.
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_none(),
+            "reconnect must still be throttled on second call"
+        );
+    }
+
+    #[test]
+    fn test_greeks_flush_failure_nulls_sender() {
+        // Flush with a broken sender, verify sender becomes None and
+        // pending_count is reset.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Write a row to have pending data.
+        let row = OptionGreeksRow {
+            segment: "NSE_FNO",
+            security_id: 42528,
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_security_id: 13,
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            iv: 0.098,
+            delta: 0.54,
+            gamma: 0.0013,
+            theta: -15.2,
+            vega: 12.1,
+            rho: 0.05,
+            charm: -0.002,
+            vanna: 0.15,
+            volga: 3.2,
+            veta: -1.8,
+            speed: -0.00001,
+            color: -0.0003,
+            zomma: 0.001,
+            ultima: -0.5,
+            bs_price: 135.5,
+            intrinsic_value: 0.0,
+            extrinsic_value: 134.0,
+            spot_price: 25642.8,
+            option_ltp: 134.0,
+            oi: 3786445,
+            volume: 117567970,
+            buildup_type: "LongBuildup",
+            ts_nanos: sample_ts_nanos(),
+        };
+        writer.write_option_greeks_row(&row).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+
+        // Kill sender to simulate broken connection, then replace with
+        // unreachable endpoint to prevent reconnect.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Flush — should gracefully handle missing sender.
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush must return Ok even when sender is None — resilience guarantee"
+        );
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "pending_count must be reset after discard"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None after failed flush"
+        );
+    }
+
+    #[test]
+    fn test_greeks_append_buffers_when_disconnected() {
+        // When disconnected, writes should still succeed (buffered in ILP
+        // buffer). On flush, they are discarded (Greeks are recomputed).
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_none(), "must start disconnected");
+
+        // Block reconnect.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Write multiple rows — they go into the ILP buffer.
+        let row = DhanRawRow {
+            security_id: 42528,
+            segment: "NSE_FNO",
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_symbol: "NIFTY",
+            underlying_security_id: 13,
+            underlying_segment: "IDX_I",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            spot_price: 25642.8,
+            last_price: 134.0,
+            average_price: 146.99,
+            oi: 3786445,
+            previous_close_price: 244.85,
+            previous_oi: 402220,
+            previous_volume: 31931705,
+            volume: 117567970,
+            top_bid_price: 133.55,
+            top_bid_quantity: 1625,
+            top_ask_price: 134.0,
+            top_ask_quantity: 1365,
+            implied_volatility: 9.789,
+            delta: 0.53871,
+            theta: -15.1539,
+            gamma: 0.00132,
+            vega: 12.18593,
+            ts_nanos: sample_ts_nanos(),
+        };
+        let result = writer.write_dhan_raw_row(&row);
+        assert!(
+            result.is_ok(),
+            "write must succeed even when disconnected — data goes to ILP buffer"
+        );
+        assert_eq!(writer.pending_count(), 1);
+
+        // Write a second row.
+        let row2 = VerificationRow {
+            security_id: 42528,
+            segment: "NSE_FNO",
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            our_iv: 0.098,
+            dhan_iv: 0.09789,
+            iv_diff: 0.00011,
+            our_delta: 0.54,
+            dhan_delta: 0.53871,
+            delta_diff: 0.00129,
+            our_gamma: 0.0013,
+            dhan_gamma: 0.00132,
+            gamma_diff: -0.00002,
+            our_theta: -15.2,
+            dhan_theta: -15.1539,
+            theta_diff: -0.0461,
+            our_vega: 12.1,
+            dhan_vega: 12.18593,
+            vega_diff: -0.08593,
+            match_status: "MATCH",
+            ts_nanos: sample_ts_nanos(),
+        };
+        let result = writer.write_verification_row(&row2);
+        assert!(result.is_ok(), "second write must also succeed");
+        assert_eq!(writer.pending_count(), 2);
+
+        // Flush — discards data (resilience: Greeks are recomputed).
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush must return Ok when disconnected — data discarded"
+        );
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "pending_count must be 0 after flush discards data"
+        );
+    }
 }

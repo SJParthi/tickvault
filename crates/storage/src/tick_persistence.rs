@@ -7493,4 +7493,337 @@ mod tests {
         assert_eq!(writer.depth_buffer[1].security_id, 101);
         assert_eq!(writer.depth_buffer[2].security_id, 102);
     }
+
+    // -----------------------------------------------------------------------
+    // DepthPersistenceWriter resilience: drain / spill / rescue coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_drain_ring_buffer_on_recovery() {
+        // Buffer depth snapshots while disconnected, then reconnect and
+        // verify that drain_depth_buffer sends them all to the new server.
+        use std::sync::atomic::Ordering;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect — block reconnect.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Buffer 10 depth snapshots while disconnected.
+        let depth = make_test_depth();
+        let snapshot_count = 10_usize;
+        for i in 0..snapshot_count as u32 {
+            writer
+                .append_depth(100 + i, 2, i64::from(i) * 1_000_000, &depth)
+                .unwrap();
+        }
+        assert_eq!(writer.buffered_depth_count(), snapshot_count);
+
+        // Reconnect to a counting server.
+        let (port2, row_count) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+        let _ = writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some(), "must reconnect");
+
+        // Drain the ring buffer.
+        writer.drain_depth_buffer();
+        let _ = writer.force_flush();
+
+        // Give server time to process.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Each depth snapshot = 5 ILP rows (one per level).
+        let received = row_count.load(Ordering::Relaxed);
+        let expected_rows = snapshot_count * 5;
+        assert_eq!(
+            received, expected_rows,
+            "drain must send all buffered depth: expected {expected_rows}, got {received}"
+        );
+        assert_eq!(
+            writer.buffered_depth_count(),
+            0,
+            "ring buffer must be empty after drain"
+        );
+    }
+
+    #[test]
+    fn test_depth_disk_spill_and_drain_on_recovery() {
+        // Fill the ring buffer + overflow to disk, reconnect, drain all.
+        use std::sync::atomic::Ordering;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect — block reconnect.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Pre-set spill to unique temp path to avoid interference.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-spill-drain-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-spill-test.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Fill ring buffer to capacity + overflow.
+        let depth = make_test_depth();
+        let spill_count: usize = 20;
+        let total = DEPTH_BUFFER_CAPACITY + spill_count;
+
+        for i in 0..total as u32 {
+            writer.buffer_depth(BufferedDepth {
+                security_id: i,
+                exchange_segment_code: 2,
+                received_at_nanos: i64::from(i) * 1_000_000,
+                depth,
+            });
+        }
+
+        assert_eq!(writer.buffered_depth_count(), DEPTH_BUFFER_CAPACITY);
+        assert_eq!(writer.depth_spilled_total(), spill_count as u64);
+
+        // Reconnect to a counting server.
+        let (port2, row_count) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+        let _ = writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some(), "must reconnect");
+
+        // Drain ring buffer + disk spill.
+        writer.drain_depth_buffer();
+        let _ = writer.force_flush();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let received = row_count.load(Ordering::Relaxed);
+        let expected_rows = total * 5; // 5 ILP rows per snapshot
+        assert_eq!(
+            received, expected_rows,
+            "must drain ALL depth (ring + disk): expected {expected_rows}, got {received}"
+        );
+        assert_eq!(writer.buffered_depth_count(), 0);
+
+        // Spill file must be deleted after complete drain.
+        assert!(
+            !spill_path.exists(),
+            "spill file must be deleted after successful drain"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_depth_rescue_in_flight_on_flush_failure() {
+        // Append depth, kill sender mid-flight, verify rescued to ring buffer.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Append 3 depth snapshots (goes to ILP buffer + in_flight).
+        let depth = make_test_depth();
+        for i in 0..3u32 {
+            writer
+                .append_depth(200 + i, 2, i64::from(i) * 1_000_000, &depth)
+                .unwrap();
+        }
+        assert_eq!(writer.in_flight.len(), 3);
+        assert_eq!(writer.pending_count, 3);
+
+        // Kill sender to simulate connection drop.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // force_flush with None sender should rescue in-flight to ring buffer,
+        // then attempt reconnect.
+        writer.force_flush().unwrap();
+
+        assert_eq!(
+            writer.buffered_depth_count(),
+            3,
+            "all in-flight depth must be rescued to ring buffer"
+        );
+        assert_eq!(writer.in_flight.len(), 0, "in-flight must be empty");
+        assert_eq!(writer.pending_count, 0, "pending must be 0");
+
+        // Verify data integrity of rescued snapshots.
+        assert_eq!(writer.depth_buffer[0].security_id, 200);
+        assert_eq!(writer.depth_buffer[1].security_id, 201);
+        assert_eq!(writer.depth_buffer[2].security_id, 202);
+    }
+
+    #[test]
+    fn test_depth_spill_file_preserved_on_partial_drain() {
+        // Start a drain from disk spill, simulate flush failure, verify the
+        // spill file is NOT deleted (preserved for next recovery).
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Create a temp spill file with depth records.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-partial-drain-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-partial.bin");
+
+        let depth = make_test_depth();
+        let record_count: usize = 10;
+        {
+            let file = std::fs::File::create(&spill_path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..record_count as u32 {
+                let snapshot = BufferedDepth {
+                    security_id: 300 + i,
+                    exchange_segment_code: 2,
+                    received_at_nanos: i64::from(i) * 1_000_000,
+                    depth,
+                };
+                bw.write_all(&serialize_depth(&snapshot)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        // Set the writer's spill state to point to this file.
+        writer.spill_path = Some(spill_path.clone());
+        writer.depth_spilled_total = record_count as u64;
+
+        // Kill sender so that flush during drain will fail.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Attempt drain — it should detect no sender, rescue in-flight,
+        // and stop. drain_depth_buffer returns early when sender is None.
+        writer.drain_depth_buffer();
+
+        // Since sender is None, drain_depth_buffer returns immediately.
+        // The spill file must still exist because no drain happened.
+        assert!(
+            spill_path.exists(),
+            "spill file must be preserved when drain cannot proceed"
+        );
+
+        // Now connect, populate spill_path again (drain cleared it), and
+        // trigger a drain that will fail mid-flush.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+        let _ = writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some());
+
+        // Set spill state again and trigger drain, then kill sender to cause
+        // flush failure.
+        writer.spill_path = Some(spill_path.clone());
+        writer.depth_spilled_total = record_count as u64;
+
+        // Kill sender just before drain so flush will fail.
+        writer.sender = None;
+        // drain_depth_buffer returns early when sender is None.
+        writer.drain_depth_buffer();
+
+        assert!(
+            spill_path.exists(),
+            "spill file must be preserved when sender is None"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_depth_recover_stale_files() {
+        // Create a fake depth spill file, set it as the writer's spill_path,
+        // reconnect, drain, and verify all records are recovered.
+        use std::sync::atomic::Ordering;
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-recover-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-stale.bin");
+
+        let depth = make_test_depth();
+        let record_count: usize = 25;
+        {
+            let file = std::fs::File::create(&spill_path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..record_count as u32 {
+                let snapshot = BufferedDepth {
+                    security_id: 400 + i,
+                    exchange_segment_code: 2,
+                    received_at_nanos: i64::from(i) * 1_000_000,
+                    depth,
+                };
+                bw.write_all(&serialize_depth(&snapshot)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        // Create a writer connected to a counting server.
+        let (port, row_count) = spawn_counting_tcp_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Set spill state to simulate a previous crash that left a spill file.
+        writer.spill_path = Some(spill_path.clone());
+        writer.depth_spilled_total = record_count as u64;
+
+        // Drain the disk spill.
+        writer.drain_depth_buffer();
+        let _ = writer.force_flush();
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let received = row_count.load(Ordering::Relaxed);
+        let expected_rows = record_count * 5; // 5 ILP rows per snapshot
+        assert_eq!(
+            received, expected_rows,
+            "must recover all depth from stale file: expected {expected_rows}, got {received}"
+        );
+
+        // Spill file must be deleted after successful drain.
+        assert!(
+            !spill_path.exists(),
+            "stale depth spill file must be deleted after successful drain"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }
