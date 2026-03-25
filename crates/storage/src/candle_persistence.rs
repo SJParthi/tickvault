@@ -628,11 +628,13 @@ impl LiveCandleWriter {
     }
 
     /// Returns the number of candles in the resilience ring buffer.
+    // TEST-EXEMPT: trivial accessor, tested indirectly via resilience integration tests
     pub fn buffered_candle_count(&self) -> usize {
         self.candle_buffer.len()
     }
 
     /// Returns the total number of candles dropped due to buffer overflow.
+    // TEST-EXEMPT: trivial accessor, tested indirectly via resilience integration tests
     pub fn candles_dropped_total(&self) -> u64 {
         self.candles_dropped_total
     }
