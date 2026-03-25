@@ -2222,4 +2222,189 @@ mod tests {
             g.delta
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: sigma_sqrt_t < EPSILON guard for Put side
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_sigma_sqrt_t_tiny_iv_put_itm() {
+        // ITM put (strike > spot) with extremely small IV → sigma_sqrt_t < EPSILON.
+        // Should return delta = -1.0 and intrinsic = K - S.
+        let g = compute_greeks_from_iv(
+            OptionSide::Put,
+            90.0,   // spot
+            100.0,  // strike (ITM for put)
+            0.0001, // very small T
+            R,
+            Q,
+            1e-20, // essentially zero IV
+            10.0,  // market price
+            365.0,
+        );
+        // Put ITM with zero sigma → delta = -1.0
+        assert!(
+            (g.delta - (-1.0)).abs() < 0.01,
+            "ITM put with tiny IV should have delta ~= -1.0, got {}",
+            g.delta
+        );
+        assert!(
+            (g.intrinsic - 10.0).abs() < 0.01,
+            "ITM put intrinsic = K - S = 10.0, got {}",
+            g.intrinsic
+        );
+        // Gamma, vega, theta should all be zero (no time value)
+        assert!(
+            g.gamma.abs() < f64::EPSILON,
+            "zero sigma put gamma should be 0"
+        );
+    }
+
+    #[test]
+    fn test_guard_sigma_sqrt_t_tiny_iv_put_otm() {
+        // OTM put (strike < spot) with extremely small IV → sigma_sqrt_t < EPSILON.
+        // Should return delta = 0.0, intrinsic = 0.0.
+        let g = compute_greeks_from_iv(
+            OptionSide::Put,
+            110.0,  // spot
+            100.0,  // strike (OTM for put)
+            0.0001, // very small T
+            R,
+            Q,
+            1e-20, // essentially zero IV
+            0.5,   // market price
+            365.0,
+        );
+        assert!(
+            g.delta.abs() < 0.01,
+            "OTM put with tiny IV should have delta ~= 0.0, got {}",
+            g.delta
+        );
+        assert!(
+            g.intrinsic.abs() < f64::EPSILON,
+            "OTM put intrinsic = 0.0, got {}",
+            g.intrinsic
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: iv_solve non-finite inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_iv_solve_nan_spot_returns_none() {
+        let result = iv_solve(OptionSide::Call, f64::NAN, K, T, R, Q, 10.0);
+        assert!(result.is_none(), "NaN spot should return None");
+    }
+
+    #[test]
+    fn test_iv_solve_nan_strike_returns_none() {
+        let result = iv_solve(OptionSide::Call, S, f64::NAN, T, R, Q, 10.0);
+        assert!(result.is_none(), "NaN strike should return None");
+    }
+
+    #[test]
+    fn test_iv_solve_nan_price_returns_none() {
+        let result = iv_solve(OptionSide::Call, S, K, T, R, Q, f64::NAN);
+        assert!(result.is_none(), "NaN price should return None");
+    }
+
+    #[test]
+    fn test_iv_solve_infinity_spot_returns_none() {
+        let result = iv_solve(OptionSide::Call, f64::INFINITY, K, T, R, Q, 10.0);
+        assert!(result.is_none(), "Infinity spot should return None");
+    }
+
+    #[test]
+    fn test_iv_solve_neg_infinity_strike_returns_none() {
+        let result = iv_solve(OptionSide::Call, S, f64::NEG_INFINITY, T, R, Q, 10.0);
+        assert!(result.is_none(), "Neg infinity strike should return None");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: put-side pricing with dividends
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bs_put_price_with_dividends() {
+        let div = 0.02;
+        let p = bs_put_price(S, K, T, R, div, SIGMA);
+        assert!(p > 0.0 && p.is_finite(), "Put with dividends: got {p}");
+        // With dividends, put should be more expensive than without
+        let p_no_div = bs_put_price(S, K, T, R, 0.0, SIGMA);
+        assert!(
+            p > p_no_div,
+            "Put with dividends > without: {p} vs {p_no_div}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: charm for Put side
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_charm_put_direction() {
+        let price = bs_put_price(S, K, T, R, Q, SIGMA);
+        let g = compute_greeks(OptionSide::Put, S, K, T, R, Q, price);
+        assert!(g.is_some());
+        let g = g.unwrap();
+        assert!(g.charm.is_finite(), "Charm must be finite");
+        // For ATM put, charm should be non-zero
+        assert!(g.charm.abs() > 1e-10, "Put charm non-zero: {}", g.charm);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: rho for Put with dividends
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rho_put_with_dividends() {
+        let div = 0.01;
+        let price = bs_put_price(S, K, T, R, div, SIGMA);
+        let g = compute_greeks(OptionSide::Put, S, K, T, R, div, price);
+        assert!(g.is_some());
+        let g = g.unwrap();
+        assert!(
+            g.rho < 0.0,
+            "Put rho with divs should be negative: {}",
+            g.rho
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: theta for Put side
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_theta_put_annual_conversion() {
+        // Verify theta is per-day (divided by day_count)
+        let g_365 = compute_greeks_from_iv(OptionSide::Put, S, K, T, R, Q, SIGMA, 5.57, 365.0);
+        let g_252 = compute_greeks_from_iv(OptionSide::Put, S, K, T, R, Q, SIGMA, 5.57, 252.0);
+        assert!(g_365.theta < 0.0, "Put theta negative");
+        assert!(g_252.theta < 0.0, "Put theta negative (252)");
+        // 252-day count gives larger daily theta (same annual, fewer days)
+        assert!(
+            g_252.theta.abs() > g_365.theta.abs(),
+            "252-day theta larger: {} vs {}",
+            g_252.theta,
+            g_365.theta
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: zero strike guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_zero_strike() {
+        let g = compute_greeks_from_iv(OptionSide::Call, S, 0.0, T, R, Q, SIGMA, 10.0, 365.0);
+        assert_eq!(g.delta, 0.0, "Zero strike → zero delta");
+        assert_eq!(g.gamma, 0.0, "Zero strike → zero gamma");
+    }
+
+    #[test]
+    fn test_guard_negative_spot() {
+        let g = compute_greeks_from_iv(OptionSide::Put, -100.0, K, T, R, Q, SIGMA, 10.0, 365.0);
+        assert_eq!(g.delta, 0.0, "Negative spot → zero delta");
+    }
 }

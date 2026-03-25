@@ -1130,4 +1130,229 @@ mod tests {
             "Total SSE should be low with correct parameters, got {best_total}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: compute_total_error skips invalid samples
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_calibrate_skips_zero_days_to_expiry() {
+        // Samples with days_to_expiry <= 0 should be skipped silently.
+        let samples = vec![CalibrationSample {
+            side: OptionSide::Call,
+            spot: 23000.0,
+            strike: 23000.0,
+            days_to_expiry: 0, // zero days
+            market_price: 100.0,
+            dhan_iv: 0.15,
+            dhan_delta: 0.5,
+            dhan_gamma: 0.001,
+            dhan_theta: -10.0,
+            dhan_vega: 5.0,
+        }];
+
+        // Should still return Some (non-empty input), but skip the invalid sample
+        // resulting in zero error.
+        let result = calibrate_parameters(&samples);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(
+            r.total_error.abs() < f64::EPSILON,
+            "all invalid samples skipped → zero total error, got {}",
+            r.total_error
+        );
+    }
+
+    #[test]
+    fn test_calibrate_skips_zero_iv() {
+        let samples = vec![CalibrationSample {
+            side: OptionSide::Put,
+            spot: 23000.0,
+            strike: 23000.0,
+            days_to_expiry: 7,
+            market_price: 100.0,
+            dhan_iv: 0.0, // zero IV → skip
+            dhan_delta: -0.5,
+            dhan_gamma: 0.001,
+            dhan_theta: -10.0,
+            dhan_vega: 5.0,
+        }];
+
+        let result = calibrate_parameters(&samples).unwrap();
+        assert!(
+            result.total_error.abs() < f64::EPSILON,
+            "zero IV samples skipped → zero error, got {}",
+            result.total_error
+        );
+    }
+
+    #[test]
+    fn test_calibrate_skips_tiny_market_price() {
+        let samples = vec![CalibrationSample {
+            side: OptionSide::Call,
+            spot: 23000.0,
+            strike: 23000.0,
+            days_to_expiry: 7,
+            market_price: 0.005, // tiny price → skip
+            dhan_iv: 0.15,
+            dhan_delta: 0.5,
+            dhan_gamma: 0.001,
+            dhan_theta: -10.0,
+            dhan_vega: 5.0,
+        }];
+
+        let result = calibrate_parameters(&samples).unwrap();
+        assert!(
+            result.total_error.abs() < f64::EPSILON,
+            "tiny price samples skipped → zero error, got {}",
+            result.total_error
+        );
+    }
+
+    #[test]
+    fn test_calibrate_skips_negative_days() {
+        let samples = vec![CalibrationSample {
+            side: OptionSide::Call,
+            spot: 23000.0,
+            strike: 23000.0,
+            days_to_expiry: -5, // negative days → skip
+            market_price: 100.0,
+            dhan_iv: 0.15,
+            dhan_delta: 0.5,
+            dhan_gamma: 0.001,
+            dhan_theta: -10.0,
+            dhan_vega: 5.0,
+        }];
+
+        let result = calibrate_parameters(&samples).unwrap();
+        assert!(
+            result.total_error.abs() < f64::EPSILON,
+            "negative days samples skipped → zero error, got {}",
+            result.total_error
+        );
+    }
+
+    #[test]
+    fn test_calibrate_mixed_valid_and_invalid_samples() {
+        // One valid sample + one invalid (zero IV).
+        // The valid sample's error should drive the result.
+        let known_r = 0.065;
+        let known_q = 0.0;
+        let known_dc = 365.0;
+        let spot = 23000.0;
+        let days = 7;
+        let time = days as f64 / known_dc;
+        let iv = 0.15;
+
+        let price = black_scholes::bs_call_price(spot, 23000.0, time, known_r, known_q, iv);
+        let greeks = black_scholes::compute_greeks_from_iv(
+            OptionSide::Call,
+            spot,
+            23000.0,
+            time,
+            known_r,
+            known_q,
+            iv,
+            price,
+            known_dc,
+        );
+
+        let samples = vec![
+            // Valid sample
+            CalibrationSample {
+                side: OptionSide::Call,
+                spot,
+                strike: 23000.0,
+                days_to_expiry: days,
+                market_price: price,
+                dhan_iv: iv,
+                dhan_delta: greeks.delta,
+                dhan_gamma: greeks.gamma,
+                dhan_theta: greeks.theta,
+                dhan_vega: greeks.vega,
+            },
+            // Invalid sample (zero IV → skipped)
+            CalibrationSample {
+                side: OptionSide::Put,
+                spot,
+                strike: 23000.0,
+                days_to_expiry: 7,
+                market_price: 100.0,
+                dhan_iv: 0.0,
+                dhan_delta: -0.5,
+                dhan_gamma: 0.001,
+                dhan_theta: -10.0,
+                dhan_vega: 5.0,
+            },
+        ];
+
+        let result = calibrate_parameters(&samples).unwrap();
+        // sample_count is 2 (both are in the input), but only 1 is valid
+        assert_eq!(result.sample_count, 2);
+        // The result should still find the correct parameters from the valid sample
+        assert!(
+            (result.risk_free_rate - known_r).abs() < f64::EPSILON,
+            "rate: expected {known_r}, got {}",
+            result.risk_free_rate
+        );
+    }
+
+    #[test]
+    fn test_is_exact_match_false_for_high_error() {
+        let result = CalibrationResult {
+            risk_free_rate: 0.065,
+            dividend_yield: 0.0,
+            day_count: 365.0,
+            total_error: 1.0,
+            sample_count: 1,
+            mean_error: 0.25, // > EXACT_MATCH_EPSILON
+        };
+        assert!(!is_exact_match(&result));
+    }
+
+    #[test]
+    fn test_is_exact_match_true_for_low_error() {
+        let result = CalibrationResult {
+            risk_free_rate: 0.065,
+            dividend_yield: 0.0,
+            day_count: 365.0,
+            total_error: 1e-20,
+            sample_count: 1,
+            mean_error: 1e-20,
+        };
+        assert!(is_exact_match(&result));
+    }
+
+    #[test]
+    fn test_calibration_result_debug() {
+        let result = CalibrationResult {
+            risk_free_rate: 0.065,
+            dividend_yield: 0.01,
+            day_count: 365.0,
+            total_error: 0.001,
+            sample_count: 10,
+            mean_error: 0.000025,
+        };
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("risk_free_rate"));
+        assert!(dbg.contains("0.065"));
+    }
+
+    #[test]
+    fn test_calibration_sample_copy() {
+        let sample = CalibrationSample {
+            side: OptionSide::Call,
+            spot: 23000.0,
+            strike: 23000.0,
+            days_to_expiry: 7,
+            market_price: 100.0,
+            dhan_iv: 0.15,
+            dhan_delta: 0.5,
+            dhan_gamma: 0.001,
+            dhan_theta: -10.0,
+            dhan_vega: 5.0,
+        };
+        let copy = sample; // Copy trait
+        assert!((copy.spot - 23000.0).abs() < f64::EPSILON);
+    }
 }

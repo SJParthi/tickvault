@@ -832,4 +832,188 @@ mod tests {
             emission.greeks_snapshots.len() as u64
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: near-zero option LTP skips Greeks computation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_near_zero_option_ltp_skips_greeks() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // Feed underlying LTP
+        agg.update(&make_tick(13, 0, 25042.5, SAMPLE_TS));
+
+        // Feed option tick with near-zero LTP (0.005 < 0.01 threshold)
+        agg.update(&make_tick(50001, 2, 0.005, SAMPLE_TS));
+
+        let event = CandleCloseEvent {
+            candle_ts: SAMPLE_TS,
+            interval_secs: 1,
+        };
+        let emission = agg.snapshot(event);
+        // Greeks should be empty (LTP too low), but PCR should still accumulate
+        assert!(
+            emission.greeks_snapshots.is_empty(),
+            "near-zero LTP should skip Greeks computation"
+        );
+        assert_eq!(emission.pcr_snapshots.len(), 1, "PCR still accumulates");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: unknown exchange segment tick is silently ignored
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unknown_segment_tick_ignored() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // Segment code 6 (gap in enum) — should be ignored
+        agg.update(&make_tick(9999, 6, 100.0, SAMPLE_TS));
+
+        assert_eq!(agg.tracked_options(), 0);
+        assert_eq!(agg.tracked_underlyings(), 0);
+        assert_eq!(agg.ticks_processed(), 1); // Still counted as processed
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: option state fast-path update (second tick for same sec_id)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_state_fast_path_update() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // First tick: slow path (enrichment from registry)
+        agg.update(&make_tick(50001, 2, TEST_CE_LTP, SAMPLE_TS));
+        assert_eq!(agg.tracked_options(), 1);
+        let state_v1 = agg.option_state.get(&50001).unwrap();
+        assert_eq!(state_v1.ltp, TEST_CE_LTP);
+
+        // Second tick: fast path (existing entry update)
+        let new_ltp = 250.0_f32;
+        agg.update(&make_tick(50001, 2, new_ltp, SAMPLE_TS + 1));
+        assert_eq!(agg.tracked_options(), 1); // Still 1 option
+        let state_v2 = agg.option_state.get(&50001).unwrap();
+        assert_eq!(state_v2.ltp, new_ltp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: FNO tick for unknown security_id (not in registry)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fno_tick_for_unknown_security_skips() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // Security ID 99999 is not in our test registry
+        agg.update(&make_tick(99999, 2, 100.0, SAMPLE_TS));
+
+        // Should NOT create an option state entry
+        assert_eq!(agg.tracked_options(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: negative/zero underlying LTP ignored
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_negative_underlying_ltp_ignored() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // Feed a negative LTP for underlying
+        agg.update(&make_tick(13, 0, -1.0, SAMPLE_TS));
+        assert_eq!(
+            agg.tracked_underlyings(),
+            0,
+            "negative LTP should be ignored"
+        );
+
+        // Feed zero LTP
+        agg.update(&make_tick(13, 0, 0.0, SAMPLE_TS));
+        assert_eq!(agg.tracked_underlyings(), 0, "zero LTP should be ignored");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: NaN underlying LTP ignored
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_nan_underlying_ltp_ignored() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        agg.update(&make_tick(13, 0, f32::NAN, SAMPLE_TS));
+        assert_eq!(agg.tracked_underlyings(), 0, "NaN LTP should be ignored");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: expired option skips Greeks (time_to_expiry too small)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expired_option_skips_greeks() {
+        // Build registry with already-expired option
+        let nifty_idx = make_index_instrument(13, "NIFTY");
+        let expired_ce = make_option_instrument(
+            60001,
+            "NIFTY",
+            22000.0,
+            OptionType::Call,
+            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap_or_default(), // expired
+        );
+        let registry = InstrumentRegistry::from_instruments(vec![nifty_idx, expired_ce]);
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // Feed underlying and option ticks
+        agg.update(&make_tick(13, 0, 25042.5, SAMPLE_TS));
+        agg.update(&make_tick(60001, 2, 200.0, SAMPLE_TS));
+
+        let event = CandleCloseEvent {
+            candle_ts: SAMPLE_TS,
+            interval_secs: 1,
+        };
+        let emission = agg.snapshot(event);
+        // Expired option → time_to_expiry < MIN → skipped
+        assert!(
+            emission.greeks_snapshots.is_empty(),
+            "expired option should skip Greeks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: CandleCloseEvent debug and copy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_close_event_debug_and_copy() {
+        let event = CandleCloseEvent {
+            candle_ts: SAMPLE_TS,
+            interval_secs: 60,
+        };
+        let copy = event; // Copy trait
+        assert_eq!(copy.candle_ts, SAMPLE_TS);
+        let dbg = format!("{event:?}");
+        assert!(dbg.contains("CandleCloseEvent"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: MCX commodity segment tick is silently ignored
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commodity_segment_tick_ignored() {
+        let registry = build_test_registry();
+        let mut agg = GreeksAggregator::new(registry, default_config());
+
+        // MCX_COMM segment code = 5
+        agg.update(&make_tick(7777, 5, 50000.0, SAMPLE_TS));
+        assert_eq!(agg.tracked_options(), 0);
+        assert_eq!(agg.tracked_underlyings(), 0);
+    }
 }
