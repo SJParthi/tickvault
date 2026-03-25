@@ -608,6 +608,7 @@ impl LiveCandleWriter {
                 candles_spilled = self.candles_spilled_total,
                 "CRITICAL: candle disk spill write failed — candle lost"
             );
+            self.spill_writer = None;
             return;
         }
 
@@ -721,8 +722,13 @@ impl LiveCandleWriter {
     /// Drains the candle disk spill file to QuestDB.
     fn drain_candle_disk_spill(&mut self) {
         // Close the spill writer first.
-        if let Some(ref mut writer) = self.spill_writer {
-            let _ = writer.flush();
+        if let Some(ref mut writer) = self.spill_writer
+            && let Err(err) = writer.flush()
+        {
+            warn!(
+                ?err,
+                "candle BufWriter flush failed before drain — last candles may be lost"
+            );
         }
         self.spill_writer = None;
 
@@ -795,6 +801,147 @@ impl LiveCandleWriter {
                 "candle spill partially drained — file preserved for next recovery"
             );
         }
+    }
+
+    /// Recovers stale spill files from previous crashes on startup.
+    ///
+    /// Scans `CANDLE_SPILL_DIR` for `candles-*.bin` files left by crashed sessions.
+    /// For each file found (except the current active spill file), reads records,
+    /// writes them to QuestDB via ILP, and deletes the file on success.
+    ///
+    /// Returns the total number of candles recovered across all files.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by file size / record size
+    // TEST-EXEMPT: tested by test_recover_stale_candle_spill_file_on_startup, test_recover_candle_skips_current_active_spill
+    pub fn recover_stale_spill_files(&mut self) -> usize {
+        if self.sender.is_none() {
+            warn!("cannot recover stale candle spill files — QuestDB not connected");
+            return 0;
+        }
+
+        let dir = match std::fs::read_dir(CANDLE_SPILL_DIR) {
+            Ok(d) => d,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    return 0;
+                }
+                warn!(
+                    ?err,
+                    dir = CANDLE_SPILL_DIR,
+                    "cannot read candle spill directory for recovery"
+                );
+                return 0;
+            }
+        };
+
+        let mut total_recovered: usize = 0;
+
+        for entry in dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    warn!(?err, "failed to read candle spill directory entry");
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            // Only process candles-*.bin files.
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name.starts_with("candles-") && name.ends_with(".bin") => name,
+                _ => continue,
+            };
+            let _ = file_name;
+
+            // Skip the current active spill file.
+            if let Some(ref active_path) = self.spill_path
+                && path == *active_path
+            {
+                info!(
+                    path = %path.display(),
+                    "skipping active candle spill file during stale recovery"
+                );
+                continue;
+            }
+
+            info!(path = %path.display(), "recovering stale candle spill file");
+
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(err) => {
+                    warn!(?err, path = %path.display(), "cannot open stale candle spill file");
+                    continue;
+                }
+            };
+
+            let mut reader = BufReader::new(file);
+            let mut record = [0u8; CANDLE_SPILL_RECORD_SIZE];
+            let mut drained: usize = 0;
+            let mut flush_failed = false;
+
+            loop {
+                match reader.read_exact(&mut record) {
+                    Ok(()) => {}
+                    Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => {
+                        warn!(?err, drained, path = %path.display(), "stale candle spill read error");
+                        break;
+                    }
+                }
+
+                let candle = deserialize_candle(&record);
+                if self.build_candle_row(&candle).is_err() {
+                    continue;
+                }
+                drained = drained.saturating_add(1);
+
+                if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
+                    && let Some(ref mut sender) = self.sender
+                    && let Err(err) = sender.flush(&mut self.buffer)
+                {
+                    warn!(?err, drained, path = %path.display(), "stale candle spill drain flush failed");
+                    flush_failed = true;
+                    break;
+                }
+            }
+
+            // Final flush.
+            if !flush_failed
+                && let Some(ref mut sender) = self.sender
+                && let Err(err) = sender.flush(&mut self.buffer)
+            {
+                warn!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed");
+                flush_failed = true;
+            }
+
+            if !flush_failed {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    warn!(?err, path = %path.display(), "failed to delete stale candle spill file");
+                } else {
+                    info!(
+                        path = %path.display(),
+                        drained,
+                        "stale candle spill file recovered and deleted"
+                    );
+                }
+                total_recovered = total_recovered.saturating_add(drained);
+            } else {
+                warn!(
+                    path = %path.display(),
+                    drained,
+                    "stale candle spill partially drained — file preserved for retry"
+                );
+            }
+        }
+
+        if total_recovered > 0 {
+            info!(
+                total_recovered,
+                "startup recovery complete — stale candle spill files drained to QuestDB"
+            );
+        }
+
+        total_recovered
     }
 
     /// Attempts to reconnect to QuestDB with exponential backoff.
@@ -1968,5 +2115,132 @@ mod tests {
     fn test_historical_candle_reconnect_constants() {
         assert_eq!(HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS, 3);
         assert_eq!(HISTORICAL_CANDLE_RECONNECT_INITIAL_DELAY_MS, 1000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup recovery: stale candle spill file tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_recover_stale_candle_spill_file_on_startup() {
+        // Create a fake stale spill file with known candles, call recover,
+        // verify count returned matches candles written.
+        let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+
+        let spill_file = real_spill_dir.join("candles-20230101.bin");
+        let candle_count = 50_usize;
+
+        // Write candles to the stale spill file.
+        {
+            let file = std::fs::File::create(&spill_file).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..candle_count as u32 {
+                let candle = BufferedCandle {
+                    security_id: 3000 + i,
+                    exchange_segment_code: 2,
+                    timestamp_secs: 1_740_556_500 + i,
+                    open: 24500.0,
+                    high: 24510.0,
+                    low: 24490.0,
+                    close: 24505.0,
+                    volume: 100,
+                    tick_count: 10,
+                };
+                bw.write_all(&serialize_candle(&candle)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        // Create a writer connected to a drain server (simulates QuestDB).
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        let recovered = writer.recover_stale_spill_files();
+
+        assert_eq!(
+            recovered, candle_count,
+            "must recover exactly {candle_count} candles from stale spill file"
+        );
+
+        // Stale file must be deleted after successful recovery.
+        assert!(
+            !spill_file.exists(),
+            "stale candle spill file must be deleted after successful drain"
+        );
+    }
+
+    #[test]
+    fn test_recover_candle_skips_current_active_spill() {
+        // Set spill_path to today's file, create that file plus an older one.
+        // Verify the active file is NOT drained but the older one IS.
+        let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+
+        let active_file = real_spill_dir.join("candles-20260325.bin");
+        let stale_file = real_spill_dir.join("candles-20260201.bin");
+        let candle_count = 10_usize;
+
+        // Write candles to both files.
+        for path in [&active_file, &stale_file] {
+            let file = std::fs::File::create(path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..candle_count as u32 {
+                let candle = BufferedCandle {
+                    security_id: 4000 + i,
+                    exchange_segment_code: 2,
+                    timestamp_secs: 1_740_556_500 + i,
+                    open: 24500.0,
+                    high: 24510.0,
+                    low: 24490.0,
+                    close: 24505.0,
+                    volume: 100,
+                    tick_count: 10,
+                };
+                bw.write_all(&serialize_candle(&candle)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Mark the active file as the current spill path.
+        writer.spill_path = Some(active_file.clone());
+
+        let recovered = writer.recover_stale_spill_files();
+
+        // Only the stale file should be recovered (not the active one).
+        assert_eq!(
+            recovered, candle_count,
+            "must recover only candles from stale file, not active file"
+        );
+
+        // Active file must still exist.
+        assert!(
+            active_file.exists(),
+            "active candle spill file must NOT be deleted during recovery"
+        );
+
+        // Stale file must be deleted.
+        assert!(
+            !stale_file.exists(),
+            "stale candle spill file must be deleted after recovery"
+        );
+
+        // Cleanup: remove the active file we created.
+        std::fs::remove_file(&active_file).unwrap();
     }
 }

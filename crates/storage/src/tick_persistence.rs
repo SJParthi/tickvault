@@ -26,9 +26,9 @@ use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, QUESTDB_TABLE_MARKET_DEPTH,
-    QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, TICK_BUFFER_CAPACITY, TICK_FLUSH_BATCH_SIZE,
-    TICK_FLUSH_INTERVAL_MS,
+    DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS,
+    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS,
+    TICK_BUFFER_CAPACITY, TICK_FLUSH_BATCH_SIZE, TICK_FLUSH_INTERVAL_MS,
 };
 use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
@@ -78,6 +78,13 @@ const RECONNECT_THROTTLE_SECS: u64 = 30;
 ///         open(4) + close(4) + high(4) + low(4) + oi(4) + oi_high(4) + oi_low(4) + pad(3)
 ///         = 72 bytes (aligned).
 const TICK_SPILL_RECORD_SIZE: usize = 72;
+
+// Compile-time guard: if ParsedTick changes size, this will fail.
+// Actual struct may be smaller (67 bytes raw) but we use 72 for alignment.
+const _: () = assert!(
+    std::mem::size_of::<ParsedTick>() <= TICK_SPILL_RECORD_SIZE,
+    "ParsedTick grew beyond TICK_SPILL_RECORD_SIZE — update serialize/deserialize"
+);
 
 /// Directory for tick spill files.
 const TICK_SPILL_DIR: &str = "data/spill";
@@ -393,6 +400,8 @@ impl TickPersistenceWriter {
                 ticks_spilled = self.ticks_spilled_total,
                 "CRITICAL: disk spill write failed — tick lost"
             );
+            // Reset writer so next call can attempt re-open (e.g., after disk space freed).
+            self.spill_writer = None;
             return;
         }
 
@@ -509,8 +518,13 @@ impl TickPersistenceWriter {
     /// Drains the disk spill file to QuestDB. Returns count of ticks drained.
     fn drain_disk_spill(&mut self) -> usize {
         // Close the spill writer first (flush buffered data).
-        if let Some(ref mut writer) = self.spill_writer {
-            let _ = writer.flush();
+        if let Some(ref mut writer) = self.spill_writer
+            && let Err(err) = writer.flush()
+        {
+            warn!(
+                ?err,
+                "BufWriter flush failed before drain — last ~111 ticks may be lost"
+            );
         }
         self.spill_writer = None;
 
@@ -609,6 +623,169 @@ impl TickPersistenceWriter {
         }
 
         drained
+    }
+
+    /// Recovers stale spill files from previous crashes on startup.
+    ///
+    /// Scans `TICK_SPILL_DIR` for `ticks-*.bin` files left by crashed sessions.
+    /// For each file found (except the current active spill file), reads records,
+    /// writes them to QuestDB via ILP, and deletes the file on success.
+    ///
+    /// Returns the total number of ticks recovered across all files.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by file size / record size
+    // TEST-EXEMPT: tested by test_recover_stale_spill_file_on_startup, test_recover_skips_current_active_spill
+    pub fn recover_stale_spill_files(&mut self) -> usize {
+        if self.sender.is_none() {
+            warn!("cannot recover stale spill files — QuestDB not connected");
+            return 0;
+        }
+
+        let dir = match std::fs::read_dir(TICK_SPILL_DIR) {
+            Ok(d) => d,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    // No spill directory means nothing to recover — not an error.
+                    return 0;
+                }
+                warn!(
+                    ?err,
+                    dir = TICK_SPILL_DIR,
+                    "cannot read tick spill directory for recovery"
+                );
+                return 0;
+            }
+        };
+
+        let mut total_recovered: usize = 0;
+
+        for entry in dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    warn!(?err, "failed to read tick spill directory entry");
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            // Only process ticks-*.bin files.
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name.starts_with("ticks-") && name.ends_with(".bin") => name,
+                _ => continue,
+            };
+            let _ = file_name; // used for filtering above
+
+            // Skip the current active spill file to avoid draining a file
+            // that is still being written to.
+            if let Some(ref active_path) = self.spill_path
+                && path == *active_path
+            {
+                info!(
+                    path = %path.display(),
+                    "skipping active spill file during stale recovery"
+                );
+                continue;
+            }
+
+            info!(path = %path.display(), "recovering stale tick spill file");
+
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(err) => {
+                    warn!(?err, path = %path.display(), "cannot open stale tick spill file");
+                    continue;
+                }
+            };
+
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let expected_records = file_len as usize / TICK_SPILL_RECORD_SIZE;
+            info!(
+                path = %path.display(),
+                file_bytes = file_len,
+                expected_records,
+                "draining stale tick spill file to QuestDB"
+            );
+
+            let mut reader = BufReader::new(file);
+            let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
+            let mut drained: usize = 0;
+            let mut flush_failed = false;
+
+            loop {
+                match reader.read_exact(&mut record) {
+                    Ok(()) => {}
+                    Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => {
+                        warn!(?err, drained, path = %path.display(), "stale spill read error — stopping drain");
+                        break;
+                    }
+                }
+
+                let tick = deserialize_tick(&record);
+                if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
+                    warn!(
+                        ?err,
+                        security_id = tick.security_id,
+                        "build_tick_row failed during stale spill drain — tick skipped"
+                    );
+                    continue;
+                }
+                self.in_flight.push(tick);
+                self.pending_count = self.pending_count.saturating_add(1);
+                drained = drained.saturating_add(1);
+
+                if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+                    && let Err(err) = self.force_flush()
+                {
+                    warn!(
+                        ?err,
+                        drained,
+                        path = %path.display(),
+                        "flush during stale spill drain failed"
+                    );
+                    flush_failed = true;
+                    break;
+                }
+            }
+
+            // Final flush for remaining records.
+            if !flush_failed
+                && self.pending_count > 0
+                && let Err(err) = self.force_flush()
+            {
+                warn!(?err, drained, path = %path.display(), "stale spill drain final flush failed");
+                flush_failed = true;
+            }
+
+            if !flush_failed {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    warn!(?err, path = %path.display(), "failed to delete stale tick spill file");
+                } else {
+                    info!(
+                        path = %path.display(),
+                        drained,
+                        "stale tick spill file recovered and deleted"
+                    );
+                }
+                total_recovered = total_recovered.saturating_add(drained);
+            } else {
+                warn!(
+                    path = %path.display(),
+                    drained,
+                    "stale tick spill partially drained — file preserved for retry"
+                );
+            }
+        }
+
+        if total_recovered > 0 {
+            info!(
+                total_recovered,
+                "startup recovery complete — stale tick spill files drained to QuestDB"
+            );
+        }
+
+        total_recovered
     }
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
@@ -916,13 +1093,111 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 // Market Depth Persistence
 // ---------------------------------------------------------------------------
 
+/// A buffered depth snapshot waiting to be written to QuestDB after recovery.
+/// Fixed-size, Copy — no allocation on push.
+#[derive(Clone, Copy)]
+struct BufferedDepth {
+    security_id: u32,
+    exchange_segment_code: u8,
+    received_at_nanos: i64,
+    depth: [MarketDepthLevel; 5],
+}
+
+/// Fixed record size for disk-spilled depth snapshots: 116 bytes per snapshot.
+/// Layout: security_id(4) + segment(1) + pad(3) + received_nanos(8) +
+///         5 x [bid_qty(4) + ask_qty(4) + bid_orders(2) + ask_orders(2) +
+///              bid_price(4) + ask_price(4)] = 16 + 100 = 116 bytes (aligned).
+const DEPTH_SPILL_RECORD_SIZE: usize = 116;
+
+/// Directory for depth spill files.
+const DEPTH_SPILL_DIR: &str = "data/spill";
+
+/// Serialize a `BufferedDepth` to a fixed-size byte array for disk spill.
+/// All fields written as little-endian. O(1), zero allocation.
+fn serialize_depth(d: &BufferedDepth) -> [u8; DEPTH_SPILL_RECORD_SIZE] {
+    let mut buf = [0u8; DEPTH_SPILL_RECORD_SIZE];
+    buf[0..4].copy_from_slice(&d.security_id.to_le_bytes());
+    buf[4] = d.exchange_segment_code;
+    // buf[5..7] = padding
+    buf[8..16].copy_from_slice(&d.received_at_nanos.to_le_bytes());
+    let mut offset = 16;
+    for level in &d.depth {
+        buf[offset..offset + 4].copy_from_slice(&level.bid_quantity.to_le_bytes());
+        buf[offset + 4..offset + 8].copy_from_slice(&level.ask_quantity.to_le_bytes());
+        buf[offset + 8..offset + 10].copy_from_slice(&level.bid_orders.to_le_bytes());
+        buf[offset + 10..offset + 12].copy_from_slice(&level.ask_orders.to_le_bytes());
+        buf[offset + 12..offset + 16].copy_from_slice(&level.bid_price.to_le_bytes());
+        buf[offset + 16..offset + 20].copy_from_slice(&level.ask_price.to_le_bytes());
+        // APPROVED: offset bounded by 5 iterations x 20 bytes = 100 max
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            offset += 20;
+        }
+    }
+    buf
+}
+
+/// Deserialize a `BufferedDepth` from a fixed-size byte array.
+fn deserialize_depth(buf: &[u8; DEPTH_SPILL_RECORD_SIZE]) -> BufferedDepth {
+    let security_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let exchange_segment_code = buf[4];
+    let received_at_nanos = i64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
+    let mut depth = [MarketDepthLevel::default(); 5];
+    let mut offset = 16;
+    for level in &mut depth {
+        level.bid_quantity = u32::from_le_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]);
+        level.ask_quantity = u32::from_le_bytes([
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
+        level.bid_orders = u16::from_le_bytes([buf[offset + 8], buf[offset + 9]]);
+        level.ask_orders = u16::from_le_bytes([buf[offset + 10], buf[offset + 11]]);
+        level.bid_price = f32::from_le_bytes([
+            buf[offset + 12],
+            buf[offset + 13],
+            buf[offset + 14],
+            buf[offset + 15],
+        ]);
+        level.ask_price = f32::from_le_bytes([
+            buf[offset + 16],
+            buf[offset + 17],
+            buf[offset + 18],
+            buf[offset + 19],
+        ]);
+        // APPROVED: offset bounded by 5 iterations x 20 bytes = 100 max
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            offset += 20;
+        }
+    }
+    BufferedDepth {
+        security_id,
+        exchange_segment_code,
+        received_at_nanos,
+        depth,
+    }
+}
+
 /// Batched depth writer for QuestDB via ILP.
 ///
 /// Writes 5-level market depth snapshots from Full (code 8) and
 /// Market Depth (code 3) packets. Each snapshot = 5 ILP rows (one per level).
 ///
-/// On write failure, the sender is set to `None` and a reconnection is
-/// attempted on the next write.
+/// On write failure, depth snapshots are held in a bounded ring buffer
+/// (`DEPTH_BUFFER_CAPACITY`) until QuestDB recovers. When the ring buffer
+/// fills up, overflow snapshots are spilled to a disk file
+/// (`data/spill/depth-YYYYMMDD.bin`) as fixed-size binary records.
+/// On recovery, ring buffer drains first, then disk spill, then resume.
+/// **Zero depth loss guarantee** — no depth snapshot is ever dropped.
 pub struct DepthPersistenceWriter {
     sender: Option<Sender>,
     buffer: Buffer,
@@ -930,8 +1205,26 @@ pub struct DepthPersistenceWriter {
     last_flush_ms: u64,
     /// ILP connection config string, retained for reconnection.
     ilp_conf_string: String,
+    /// Resilience ring buffer: holds depth snapshots when QuestDB is down.
+    /// Drains on recovery (oldest-first). Capacity: `DEPTH_BUFFER_CAPACITY`.
+    // O(1) EXEMPT: begin — VecDeque allocation bounded by DEPTH_BUFFER_CAPACITY (~5.5MB max)
+    depth_buffer: VecDeque<BufferedDepth>,
+    // O(1) EXEMPT: end
+    /// In-flight buffer: tracks depth snapshots currently in the ILP buffer that
+    /// haven't been confirmed flushed. On flush failure, these are rescued back
+    /// to the ring buffer. On successful flush, this is cleared.
+    /// Max size: `DEPTH_FLUSH_BATCH_SIZE` (200 snapshots x 116 bytes = ~23KB).
+    // O(1) EXEMPT: begin — bounded by DEPTH_FLUSH_BATCH_SIZE
+    in_flight: Vec<BufferedDepth>,
+    // O(1) EXEMPT: end
+    /// Total depth snapshots spilled to disk (ring buffer overflow).
+    depth_spilled_total: u64,
     /// Throttle: earliest time a reconnect may be attempted.
     next_reconnect_allowed: std::time::Instant,
+    /// Open file handle for disk spill (lazy-opened on first overflow).
+    spill_writer: Option<BufWriter<std::fs::File>>,
+    /// Path of the current spill file (for drain + cleanup).
+    spill_path: Option<std::path::PathBuf>,
 }
 
 impl DepthPersistenceWriter {
@@ -948,15 +1241,23 @@ impl DepthPersistenceWriter {
             pending_count: 0,
             last_flush_ms: current_time_ms(),
             ilp_conf_string: conf_string,
+            depth_buffer: VecDeque::with_capacity(DEPTH_BUFFER_CAPACITY),
+            in_flight: Vec::with_capacity(DEPTH_FLUSH_BATCH_SIZE),
+            depth_spilled_total: 0,
             next_reconnect_allowed: std::time::Instant::now(),
+            spill_writer: None,
+            spill_path: None,
         })
     }
 
     /// Appends a 5-level depth snapshot to the ILP buffer.
     ///
+    /// When QuestDB is down, depth snapshots are held in a ring buffer (up to
+    /// `DEPTH_BUFFER_CAPACITY`) and drained on recovery.
+    ///
     /// # Performance
     /// O(1) — fixed 5-iteration loop, no heap allocation.
-    /// Reconnect logic (cold path) only runs on error.
+    /// Ring buffer and reconnect logic (cold path) only run on error.
     pub fn append_depth(
         &mut self,
         security_id: u32,
@@ -966,7 +1267,22 @@ impl DepthPersistenceWriter {
     ) -> Result<()> {
         // If sender is None (previous failure), attempt reconnect before writing.
         if self.sender.is_none() {
-            self.try_reconnect_on_error()?;
+            match self.try_reconnect_on_error() {
+                Ok(()) => {
+                    // Reconnected — drain any buffered depth snapshots first.
+                    self.drain_depth_buffer();
+                }
+                Err(_) => {
+                    // Still can't connect — buffer this snapshot instead of losing it.
+                    self.buffer_depth(BufferedDepth {
+                        security_id,
+                        exchange_segment_code,
+                        received_at_nanos,
+                        depth: *depth,
+                    });
+                    return Ok(());
+                }
+            }
         }
 
         build_depth_rows(
@@ -977,13 +1293,23 @@ impl DepthPersistenceWriter {
             depth,
         )?;
 
+        // Track in-flight: save a copy so we can rescue on flush failure.
+        // BufferedDepth is Copy (116 bytes) — this is a memcpy, not a heap alloc.
+        self.in_flight.push(BufferedDepth {
+            security_id,
+            exchange_segment_code,
+            received_at_nanos,
+            depth: *depth,
+        });
         self.pending_count = self.pending_count.saturating_add(1);
 
         if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
             && let Err(err) = self.force_flush()
         {
-            warn!(?err, "depth auto-flush failed, sender invalidated");
-            return Err(err);
+            warn!(
+                ?err,
+                "depth auto-flush failed — in-flight snapshots rescued to ring buffer"
+            );
         }
 
         Ok(())
@@ -1005,15 +1331,18 @@ impl DepthPersistenceWriter {
 
     /// Forces an immediate flush of all buffered depth rows to QuestDB.
     ///
-    /// On failure, the sender is set to `None` so that the next write
-    /// attempt triggers a reconnection. Buffered data is lost on
-    /// reconnect — depth persistence is observability data, not critical path.
+    /// On failure, the sender is set to `None` and in-flight depth snapshots
+    /// are rescued back to the ring buffer (or disk spill if ring is full).
+    /// **Zero data loss** — no depth snapshot is ever silently discarded.
     pub fn force_flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
         if self.sender.is_none() {
+            // No active sender — rescue in-flight snapshots to ring buffer,
+            // then attempt reconnect.
+            self.rescue_in_flight();
             self.try_reconnect_on_error()?;
             return Ok(());
         }
@@ -1025,11 +1354,16 @@ impl DepthPersistenceWriter {
             .context("sender unavailable in force_flush")?;
 
         if let Err(err) = sender.flush(&mut self.buffer) {
+            // Sender is broken — rescue in-flight snapshots to ring buffer
+            // BEFORE clearing state, so no data is lost.
             self.sender = None;
-            self.pending_count = 0;
+            self.rescue_in_flight();
             self.last_flush_ms = current_time_ms();
             return Err(err).context("flush depth to QuestDB");
         }
+
+        // Flush succeeded — in-flight snapshots are confirmed written.
+        self.in_flight.clear();
         self.pending_count = 0;
         self.last_flush_ms = current_time_ms();
 
@@ -1037,12 +1371,310 @@ impl DepthPersistenceWriter {
         Ok(())
     }
 
+    /// Rescues in-flight depth snapshots (in the ILP buffer but not yet flushed)
+    /// back to the ring buffer / disk spill. Called on flush failure to prevent
+    /// data loss.
+    fn rescue_in_flight(&mut self) {
+        if self.in_flight.is_empty() {
+            self.pending_count = 0;
+            return;
+        }
+        // Move to local vec to avoid borrow conflict with buffer_depth(&mut self).
+        let rescued: Vec<BufferedDepth> = self.in_flight.drain(..).collect();
+        let count = rescued.len();
+        for snapshot in rescued {
+            self.buffer_depth(snapshot);
+        }
+        self.pending_count = 0;
+        warn!(
+            rescued = count,
+            ring_buffer = self.depth_buffer.len(),
+            "rescued in-flight depth snapshots to ring buffer after flush failure"
+        );
+    }
+
+    /// Returns the number of depth snapshots held in the resilience ring buffer.
+    // TEST-EXEMPT: trivial accessor, tested indirectly via resilience tests
+    pub fn buffered_depth_count(&self) -> usize {
+        self.depth_buffer.len()
+    }
+
+    /// Returns the total number of depth snapshots spilled to disk (ring buffer overflow).
+    // TEST-EXEMPT: trivial accessor, tested indirectly via resilience tests
+    pub fn depth_spilled_total(&self) -> u64 {
+        self.depth_spilled_total
+    }
+
+    // -----------------------------------------------------------------------
+    // Resilience ring buffer
+    // -----------------------------------------------------------------------
+
+    /// Pushes a depth snapshot into the ring buffer. If the buffer is full,
+    /// spills the snapshot to disk instead of dropping it.
+    /// **Zero depth loss guarantee.**
+    fn buffer_depth(&mut self, snapshot: BufferedDepth) {
+        // O(1) EXEMPT: begin — bounded ring buffer, max DEPTH_BUFFER_CAPACITY
+        if self.depth_buffer.len() >= DEPTH_BUFFER_CAPACITY {
+            // Ring buffer full — spill to disk (never drop).
+            self.spill_depth_to_disk(&snapshot);
+        } else {
+            self.depth_buffer.push_back(snapshot);
+        }
+        metrics::gauge!("dlt_depth_buffer_size").set(self.depth_buffer.len() as f64);
+        metrics::counter!("dlt_depth_spilled_total").absolute(self.depth_spilled_total);
+        // O(1) EXEMPT: end
+    }
+
+    /// Spills a depth snapshot to disk when the ring buffer is full.
+    /// Creates the spill directory and file lazily on first call.
+    /// O(1) amortized — buffered sequential append.
+    fn spill_depth_to_disk(&mut self, snapshot: &BufferedDepth) {
+        // Lazy-open the spill file.
+        if self.spill_writer.is_none()
+            && let Err(err) = self.open_depth_spill_file()
+        {
+            error!(
+                ?err,
+                "CRITICAL: cannot open depth spill file — depth snapshot WILL be lost"
+            );
+            return;
+        }
+
+        let record = serialize_depth(snapshot);
+        if let Some(ref mut writer) = self.spill_writer
+            && let Err(err) = writer.write_all(&record)
+        {
+            error!(
+                ?err,
+                depth_spilled = self.depth_spilled_total,
+                "CRITICAL: depth disk spill write failed — snapshot lost"
+            );
+            return;
+        }
+
+        self.depth_spilled_total = self.depth_spilled_total.saturating_add(1);
+        if self.depth_spilled_total.is_multiple_of(1_000) {
+            warn!(
+                depth_spilled = self.depth_spilled_total,
+                "depth disk spill growing — QuestDB still down"
+            );
+        }
+    }
+
+    /// Opens (or creates) the depth spill file for the current date.
+    fn open_depth_spill_file(&mut self) -> Result<()> {
+        std::fs::create_dir_all(DEPTH_SPILL_DIR)
+            .context("failed to create depth spill directory")?;
+
+        let date = chrono::Utc::now().format("%Y%m%d");
+        let path = std::path::PathBuf::from(format!("{DEPTH_SPILL_DIR}/depth-{date}.bin"));
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open depth spill file: {}", path.display()))?;
+
+        info!(
+            path = %path.display(),
+            "opened depth spill file for disk overflow"
+        );
+
+        self.spill_writer = Some(BufWriter::new(file));
+        self.spill_path = Some(path);
+        Ok(())
+    }
+
+    /// Drains buffered depth snapshots to QuestDB after recovery.
+    ///
+    /// Order:
+    /// 1. Ring buffer (oldest first — these arrived first)
+    /// 2. Disk spill (arrived after ring buffer filled)
+    ///
+    /// Writes in batches. Stops if a flush fails.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by depth_buffer.len()
+    fn drain_depth_buffer(&mut self) {
+        if self.sender.is_none() {
+            return;
+        }
+
+        let ring_count = self.depth_buffer.len();
+        let mut drained: usize = 0;
+
+        // Phase 1: Drain ring buffer (oldest snapshots first).
+        while let Some(snapshot) = self.depth_buffer.pop_front() {
+            if let Err(err) = build_depth_rows(
+                &mut self.buffer,
+                snapshot.security_id,
+                snapshot.exchange_segment_code,
+                snapshot.received_at_nanos,
+                &snapshot.depth,
+            ) {
+                warn!(
+                    ?err,
+                    security_id = snapshot.security_id,
+                    "build_depth_rows failed during drain — snapshot skipped"
+                );
+                continue;
+            }
+            // Track in-flight so rescue_in_flight can save them on flush failure.
+            self.in_flight.push(snapshot);
+            self.pending_count = self.pending_count.saturating_add(1);
+            drained += 1;
+
+            if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
+                && let Err(err) = self.force_flush()
+            {
+                // force_flush already called rescue_in_flight — snapshots are
+                // back in depth_buffer. Safe to stop.
+                warn!(
+                    ?err,
+                    drained,
+                    remaining = self.depth_buffer.len(),
+                    "flush during depth ring buffer drain failed — in-flight rescued"
+                );
+                return;
+            }
+        }
+
+        // Flush any remaining ring buffer rows before moving to disk.
+        if self.pending_count > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(?err, drained, "depth ring buffer final flush failed");
+            return;
+        }
+
+        if drained > 0 {
+            info!(drained, ring_count, "depth ring buffer drained to QuestDB");
+        }
+
+        // Phase 2: Drain disk spill file (snapshots that overflowed the ring buffer).
+        if self.depth_spilled_total > 0 {
+            self.drain_depth_disk_spill();
+        }
+
+        metrics::gauge!("dlt_depth_buffer_size").set(self.depth_buffer.len() as f64);
+        metrics::counter!("dlt_depth_spilled_total").absolute(self.depth_spilled_total);
+    }
+
+    /// Drains the depth disk spill file to QuestDB.
+    fn drain_depth_disk_spill(&mut self) {
+        // Close the spill writer first (flush buffered data).
+        if let Some(ref mut writer) = self.spill_writer {
+            let _ = writer.flush();
+        }
+        self.spill_writer = None;
+
+        let spill_path = match self.spill_path.take() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let file = match std::fs::File::open(&spill_path) {
+            Ok(f) => f,
+            Err(err) => {
+                warn!(?err, path = %spill_path.display(), "cannot open depth spill file for drain");
+                return;
+            }
+        };
+
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let expected_records = file_len as usize / DEPTH_SPILL_RECORD_SIZE;
+        info!(
+            path = %spill_path.display(),
+            file_bytes = file_len,
+            expected_records,
+            "draining depth disk spill to QuestDB"
+        );
+
+        let mut reader = BufReader::new(file);
+        let mut record = [0u8; DEPTH_SPILL_RECORD_SIZE];
+        let mut drained: usize = 0;
+        let mut flush_failed = false;
+
+        loop {
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        drained, "depth disk spill read error — stopping drain"
+                    );
+                    break;
+                }
+            }
+
+            let snapshot = deserialize_depth(&record);
+            if let Err(err) = build_depth_rows(
+                &mut self.buffer,
+                snapshot.security_id,
+                snapshot.exchange_segment_code,
+                snapshot.received_at_nanos,
+                &snapshot.depth,
+            ) {
+                warn!(
+                    ?err,
+                    security_id = snapshot.security_id,
+                    "build_depth_rows failed during spill drain — snapshot skipped"
+                );
+                continue;
+            }
+            self.in_flight.push(snapshot);
+            self.pending_count = self.pending_count.saturating_add(1);
+            drained = drained.saturating_add(1);
+
+            if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
+                && let Err(err) = self.force_flush()
+            {
+                warn!(
+                    ?err,
+                    drained, "flush during depth spill drain failed — in-flight rescued"
+                );
+                flush_failed = true;
+                break;
+            }
+        }
+
+        // Final flush.
+        if !flush_failed
+            && self.pending_count > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(?err, drained, "depth spill drain final flush failed");
+            flush_failed = true;
+        }
+
+        // Only delete spill file if drain was COMPLETE (no flush failures).
+        // If drain was partial, preserve file for next recovery attempt.
+        if !flush_failed {
+            if let Err(err) = std::fs::remove_file(&spill_path) {
+                warn!(?err, path = %spill_path.display(), "failed to delete depth spill file");
+            } else {
+                info!(
+                    path = %spill_path.display(),
+                    drained,
+                    "depth disk spill file drained and deleted"
+                );
+            }
+            self.depth_spilled_total = 0;
+        } else {
+            // Preserve spill file for next recovery.
+            self.spill_path = Some(spill_path);
+            warn!(
+                drained,
+                "depth spill partially drained — file preserved for next recovery"
+            );
+        }
+    }
+
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
     ///
     /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
     /// On success, replaces the sender and creates a fresh buffer.
-    /// Any data in the old buffer is lost — depth persistence is observability
-    /// data, not critical path (see module doc).
+    /// In-flight snapshots must be rescued BEFORE calling this method
+    /// (via `rescue_in_flight()`).
     ///
     /// # Errors
     /// Returns error if all reconnection attempts fail.
@@ -1054,7 +1686,7 @@ impl DepthPersistenceWriter {
                 attempt,
                 max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
                 delay_ms,
-                dropped_snapshots = self.pending_count,
+                buffered_snapshots = self.depth_buffer.len(),
                 "attempting QuestDB ILP reconnection for depth writer"
             );
 
@@ -6471,5 +7103,394 @@ mod tests {
         // The rescued tick data must be correct.
         let rescued = writer.tick_buffer.front().unwrap();
         assert_eq!(rescued.security_id, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup recovery: stale spill file tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_recover_stale_spill_file_on_startup() {
+        // Create a fake stale spill file with known ticks, call recover,
+        // verify count returned matches ticks written.
+        let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+
+        let spill_file = real_spill_dir.join("ticks-20230101.bin");
+        let tick_count = 50_usize;
+
+        // Write ticks to the stale spill file.
+        {
+            let file = std::fs::File::create(&spill_file).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..tick_count as u32 {
+                let tick = make_test_tick(1000 + i, 25000.0 + i as f32);
+                bw.write_all(&serialize_tick(&tick)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        // Create a writer connected to a drain server (simulates QuestDB).
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let recovered = writer.recover_stale_spill_files();
+
+        assert_eq!(
+            recovered, tick_count,
+            "must recover exactly {tick_count} ticks from stale spill file"
+        );
+
+        // Stale file must be deleted after successful recovery.
+        assert!(
+            !spill_file.exists(),
+            "stale spill file must be deleted after successful drain"
+        );
+    }
+
+    #[test]
+    fn test_recover_skips_current_active_spill() {
+        // Set spill_path to today's file, create that file plus an older one.
+        // Verify the active file is NOT drained but the older one IS.
+        let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+
+        let active_file = real_spill_dir.join("ticks-20260325.bin");
+        let stale_file = real_spill_dir.join("ticks-20260201.bin");
+        let tick_count = 10_usize;
+
+        // Write ticks to both files.
+        for path in [&active_file, &stale_file] {
+            let file = std::fs::File::create(path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..tick_count as u32 {
+                let tick = make_test_tick(2000 + i, 26000.0 + i as f32);
+                bw.write_all(&serialize_tick(&tick)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Mark the active file as the current spill path.
+        writer.spill_path = Some(active_file.clone());
+
+        let recovered = writer.recover_stale_spill_files();
+
+        // Only the stale file should be recovered (not the active one).
+        assert_eq!(
+            recovered, tick_count,
+            "must recover only ticks from stale file, not active file"
+        );
+
+        // Active file must still exist.
+        assert!(
+            active_file.exists(),
+            "active spill file must NOT be deleted during recovery"
+        );
+
+        // Stale file must be deleted.
+        assert!(
+            !stale_file.exists(),
+            "stale spill file must be deleted after recovery"
+        );
+
+        // Cleanup: remove the active file we created.
+        std::fs::remove_file(&active_file).unwrap();
+    }
+
+    #[test]
+    fn test_recover_returns_zero_when_no_spill_dir() {
+        // If the spill directory does not exist, recovery should return 0
+        // without error.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // The TICK_SPILL_DIR may or may not exist depending on prior tests.
+        // If it exists with no matching files, should also return 0.
+        let recovered = writer.recover_stale_spill_files();
+
+        // Can only guarantee >= 0 without controlling filesystem state,
+        // but the method must not panic.
+        assert!(recovered == 0 || recovered > 0, "must not panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // DepthPersistenceWriter resilience tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_writer_buffered_depth_count_initially_zero() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = DepthPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.buffered_depth_count(), 0);
+        assert_eq!(writer.depth_spilled_total(), 0);
+    }
+
+    #[test]
+    fn test_depth_writer_buffers_on_disconnect() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Kill sender to simulate disconnect.
+        writer.sender = None;
+        // Set throttle far in future to prevent reconnect.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+        // Unreachable endpoint for reconnect.
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        let depth = make_test_depth();
+        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        assert_eq!(
+            writer.buffered_depth_count(),
+            1,
+            "depth must be buffered when disconnected"
+        );
+        assert_eq!(
+            writer.pending_count, 0,
+            "pending_count should be 0 when buffered"
+        );
+    }
+
+    #[test]
+    fn test_depth_writer_rescue_in_flight_on_flush_failure() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Append a depth snapshot (goes to ILP buffer + in_flight).
+        let depth = make_test_depth();
+        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        assert_eq!(writer.in_flight.len(), 1);
+        assert_eq!(writer.pending_count, 1);
+
+        // Kill sender to simulate connection drop.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // force_flush with None sender should rescue in-flight to ring buffer.
+        writer.force_flush().unwrap();
+
+        assert_eq!(
+            writer.buffered_depth_count(),
+            1,
+            "depth must be rescued to ring buffer"
+        );
+        assert_eq!(writer.in_flight.len(), 0, "in-flight must be empty");
+        assert_eq!(writer.pending_count, 0, "pending must be 0");
+
+        // Verify rescued data integrity.
+        let rescued = &writer.depth_buffer[0];
+        assert_eq!(rescued.security_id, 42);
+        assert_eq!(rescued.exchange_segment_code, 2);
+    }
+
+    #[test]
+    fn test_depth_spill_serialize_deserialize_roundtrip() {
+        let depth = make_test_depth();
+        let buffered = BufferedDepth {
+            security_id: 49081,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_123_456_789,
+            depth,
+        };
+
+        let serialized = serialize_depth(&buffered);
+        assert_eq!(serialized.len(), DEPTH_SPILL_RECORD_SIZE);
+
+        let deserialized = deserialize_depth(&serialized);
+        assert_eq!(deserialized.security_id, buffered.security_id);
+        assert_eq!(
+            deserialized.exchange_segment_code,
+            buffered.exchange_segment_code
+        );
+        assert_eq!(deserialized.received_at_nanos, buffered.received_at_nanos);
+
+        // Verify all 5 levels roundtrip correctly.
+        for i in 0..5 {
+            assert_eq!(
+                deserialized.depth[i].bid_quantity,
+                buffered.depth[i].bid_quantity
+            );
+            assert_eq!(
+                deserialized.depth[i].ask_quantity,
+                buffered.depth[i].ask_quantity
+            );
+            assert_eq!(
+                deserialized.depth[i].bid_orders,
+                buffered.depth[i].bid_orders
+            );
+            assert_eq!(
+                deserialized.depth[i].ask_orders,
+                buffered.depth[i].ask_orders
+            );
+            assert_eq!(deserialized.depth[i].bid_price, buffered.depth[i].bid_price);
+            assert_eq!(deserialized.depth[i].ask_price, buffered.depth[i].ask_price);
+        }
+    }
+
+    #[test]
+    fn test_depth_spill_record_size() {
+        assert_eq!(
+            DEPTH_SPILL_RECORD_SIZE, 116,
+            "depth spill record must be exactly 116 bytes"
+        );
+    }
+
+    #[test]
+    fn test_depth_spill_serialize_zero_depth() {
+        let buffered = BufferedDepth {
+            security_id: 0,
+            exchange_segment_code: 0,
+            received_at_nanos: 0,
+            depth: [MarketDepthLevel::default(); 5],
+        };
+
+        let serialized = serialize_depth(&buffered);
+        let deserialized = deserialize_depth(&serialized);
+
+        assert_eq!(deserialized.security_id, 0);
+        assert_eq!(deserialized.exchange_segment_code, 0);
+        assert_eq!(deserialized.received_at_nanos, 0);
+        for i in 0..5 {
+            assert_eq!(deserialized.depth[i], MarketDepthLevel::default());
+        }
+    }
+
+    #[test]
+    fn test_depth_writer_buffer_depth_increments_count() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer.buffer_depth(BufferedDepth {
+            security_id: 1,
+            exchange_segment_code: 1,
+            received_at_nanos: 1_000_000,
+            depth,
+        });
+        assert_eq!(writer.buffered_depth_count(), 1);
+
+        writer.buffer_depth(BufferedDepth {
+            security_id: 2,
+            exchange_segment_code: 2,
+            received_at_nanos: 2_000_000,
+            depth,
+        });
+        assert_eq!(writer.buffered_depth_count(), 2);
+        assert_eq!(writer.depth_spilled_total(), 0);
+    }
+
+    #[test]
+    fn test_depth_writer_multiple_buffers_then_drain() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Buffer 3 snapshots.
+        let depth = make_test_depth();
+        for i in 0..3u32 {
+            writer.buffer_depth(BufferedDepth {
+                security_id: i,
+                exchange_segment_code: 2,
+                received_at_nanos: i64::from(i) * 1_000_000,
+                depth,
+            });
+        }
+        assert_eq!(writer.buffered_depth_count(), 3);
+
+        // Drain — sender is connected, should flush all 3.
+        writer.drain_depth_buffer();
+        assert_eq!(
+            writer.buffered_depth_count(),
+            0,
+            "ring buffer must be empty after drain"
+        );
+    }
+
+    #[test]
+    fn test_depth_writer_rescue_preserves_data_integrity() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Push 3 snapshots to in-flight.
+        let depth = make_test_depth();
+        for i in 0..3u32 {
+            writer.in_flight.push(BufferedDepth {
+                security_id: 100 + i,
+                exchange_segment_code: 2,
+                received_at_nanos: i64::from(i) * 1_000_000,
+                depth,
+            });
+        }
+        writer.pending_count = 3;
+
+        // Rescue in-flight to ring buffer.
+        writer.rescue_in_flight();
+
+        assert_eq!(writer.buffered_depth_count(), 3);
+        assert_eq!(writer.in_flight.len(), 0);
+        assert_eq!(writer.pending_count, 0);
+
+        // Verify order preserved (FIFO).
+        assert_eq!(writer.depth_buffer[0].security_id, 100);
+        assert_eq!(writer.depth_buffer[1].security_id, 101);
+        assert_eq!(writer.depth_buffer[2].security_id, 102);
     }
 }

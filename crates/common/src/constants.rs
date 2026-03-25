@@ -1235,6 +1235,11 @@ pub const OPTION_CHAIN_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
 
+/// Resilience ring buffer capacity for depth persistence writer.
+/// Holds depth snapshots in memory when QuestDB is down, drains on recovery.
+/// 50,000 snapshots × 116 bytes = ~5.5MB. At ~200 snapshots/sec = ~4 minutes of data.
+pub const DEPTH_BUFFER_CAPACITY: usize = 50_000;
+
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Validation Constants
 // ---------------------------------------------------------------------------

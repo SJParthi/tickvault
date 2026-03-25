@@ -132,6 +132,42 @@ groups:
           summary: "QuestDB storage errors detected"
           description: "Tick persistence is failing at {{ $value }}/sec. Check QuestDB connectivity."
 
+      - alert: TickBufferActive
+        expr: dlt_tick_buffer_size > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tick ring buffer is holding data (QuestDB may be down)"
+          description: "{{ $value }} ticks buffered in memory. QuestDB connection likely broken."
+
+      - alert: TickDiskSpillActive
+        expr: dlt_ticks_spilled_total > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ticks spilling to disk — ring buffer full"
+          description: "{{ $value }} ticks spilled to disk. QuestDB has been down for 5+ minutes."
+
+      - alert: CandleBufferActive
+        expr: dlt_candle_buffer_size > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Candle ring buffer is holding data (QuestDB may be down)"
+          description: "{{ $value }} candles buffered in memory."
+
+      - alert: CandleDiskSpillActive
+        expr: dlt_candles_spilled_total > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Candles spilling to disk — ring buffer full"
+          description: "{{ $value }} candles spilled to disk. QuestDB down for 27+ minutes."
+
       - alert: NoTicksReceived
         expr: dlt:tick_rate:1m == 0
         for: 5m
