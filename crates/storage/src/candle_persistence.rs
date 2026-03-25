@@ -16,6 +16,7 @@
 //! duplicate candles from re-fetches.
 
 use std::collections::VecDeque;
+use std::io::{BufReader, BufWriter, Read as _, Write as _};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -296,6 +297,44 @@ struct BufferedCandle {
     tick_count: u32,
 }
 
+/// Fixed record size for disk-spilled candles: 36 bytes per candle.
+const CANDLE_SPILL_RECORD_SIZE: usize = 36;
+
+/// Directory for candle spill files.
+const CANDLE_SPILL_DIR: &str = "data/spill";
+
+/// Serialize a `BufferedCandle` to a fixed-size byte array for disk spill.
+fn serialize_candle(c: &BufferedCandle) -> [u8; CANDLE_SPILL_RECORD_SIZE] {
+    let mut buf = [0u8; CANDLE_SPILL_RECORD_SIZE];
+    buf[0..4].copy_from_slice(&c.security_id.to_le_bytes());
+    buf[4] = c.exchange_segment_code;
+    // buf[5..7] = padding
+    buf[7..11].copy_from_slice(&c.timestamp_secs.to_le_bytes());
+    buf[11..15].copy_from_slice(&c.open.to_le_bytes());
+    buf[15..19].copy_from_slice(&c.high.to_le_bytes());
+    buf[19..23].copy_from_slice(&c.low.to_le_bytes());
+    buf[23..27].copy_from_slice(&c.close.to_le_bytes());
+    buf[27..31].copy_from_slice(&c.volume.to_le_bytes());
+    buf[31..35].copy_from_slice(&c.tick_count.to_le_bytes());
+    // buf[35] = padding
+    buf
+}
+
+/// Deserialize a `BufferedCandle` from a fixed-size byte array.
+fn deserialize_candle(buf: &[u8; CANDLE_SPILL_RECORD_SIZE]) -> BufferedCandle {
+    BufferedCandle {
+        security_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        exchange_segment_code: buf[4],
+        timestamp_secs: u32::from_le_bytes([buf[7], buf[8], buf[9], buf[10]]),
+        open: f32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]),
+        high: f32::from_le_bytes([buf[15], buf[16], buf[17], buf[18]]),
+        low: f32::from_le_bytes([buf[19], buf[20], buf[21], buf[22]]),
+        close: f32::from_le_bytes([buf[23], buf[24], buf[25], buf[26]]),
+        volume: u32::from_le_bytes([buf[27], buf[28], buf[29], buf[30]]),
+        tick_count: u32::from_le_bytes([buf[31], buf[32], buf[33], buf[34]]),
+    }
+}
+
 /// Batched writer for live 1-second candles to `candles_1s` via ILP.
 ///
 /// Completed candles from `CandleAggregator` are written here, feeding
@@ -315,10 +354,19 @@ pub struct LiveCandleWriter {
     // O(1) EXEMPT: begin — VecDeque allocation bounded by CANDLE_BUFFER_CAPACITY (~5MB max)
     candle_buffer: VecDeque<BufferedCandle>,
     // O(1) EXEMPT: end
-    /// Total candles dropped because the ring buffer was full.
-    candles_dropped_total: u64,
+    /// In-flight buffer: tracks candles in ILP buffer not yet confirmed flushed.
+    /// On flush failure, rescued back to ring buffer. Max: LIVE_CANDLE_FLUSH_BATCH_SIZE.
+    // O(1) EXEMPT: begin — bounded by LIVE_CANDLE_FLUSH_BATCH_SIZE
+    in_flight: Vec<BufferedCandle>,
+    // O(1) EXEMPT: end
+    /// Total candles spilled to disk (ring buffer overflow).
+    candles_spilled_total: u64,
     /// Throttle: earliest time a reconnect may be attempted.
     next_reconnect_allowed: std::time::Instant,
+    /// Open file handle for disk spill (lazy-opened on first overflow).
+    spill_writer: Option<BufWriter<std::fs::File>>,
+    /// Path of the current spill file (for drain + cleanup).
+    spill_path: Option<std::path::PathBuf>,
 }
 
 impl LiveCandleWriter {
@@ -348,8 +396,11 @@ impl LiveCandleWriter {
             pending_count: 0,
             ilp_conf_string: conf_string,
             candle_buffer: VecDeque::with_capacity(CANDLE_BUFFER_CAPACITY),
-            candles_dropped_total: 0,
+            in_flight: Vec::with_capacity(LIVE_CANDLE_FLUSH_BATCH_SIZE),
+            candles_spilled_total: 0,
             next_reconnect_allowed: std::time::Instant::now(),
+            spill_writer: None,
+            spill_path: None,
         })
     }
 
@@ -428,6 +479,18 @@ impl LiveCandleWriter {
             return Ok(());
         }
 
+        // Track in-flight so we can rescue on flush failure.
+        self.in_flight.push(BufferedCandle {
+            security_id,
+            exchange_segment_code,
+            timestamp_secs,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            tick_count,
+        });
         self.pending_count = self.pending_count.saturating_add(1);
 
         if should_flush(self.pending_count, LIVE_CANDLE_FLUSH_BATCH_SIZE) {
@@ -446,7 +509,7 @@ impl LiveCandleWriter {
         Ok(())
     }
 
-    /// Internal flush — sets sender=None on error, never panics.
+    /// Internal flush — sets sender=None on error, rescues in-flight candles.
     fn force_flush_internal(&mut self) {
         if self.pending_count == 0 {
             return;
@@ -459,20 +522,22 @@ impl LiveCandleWriter {
                 warn!(
                     ?err,
                     pending = count,
-                    "live candle flush failed — disconnecting sender"
+                    "live candle flush failed — rescuing in-flight candles"
                 );
                 self.sender = None;
                 self.buffer.clear();
-                self.pending_count = 0;
+                self.rescue_in_flight();
                 return;
             }
         } else {
-            // No sender — clear the ILP buffer (data already in ring buffer or lost).
+            // No sender — rescue in-flight candles to ring buffer.
             self.buffer.clear();
-            self.pending_count = 0;
+            self.rescue_in_flight();
             return;
         }
 
+        // Flush succeeded — in-flight candles confirmed written.
+        self.in_flight.clear();
         self.pending_count = 0;
         debug!(flushed_rows = count, "live candle batch flushed to QuestDB");
 
@@ -480,6 +545,25 @@ impl LiveCandleWriter {
         if !self.candle_buffer.is_empty() {
             self.drain_candle_buffer();
         }
+    }
+
+    /// Rescues in-flight candles back to ring buffer / disk spill on flush failure.
+    fn rescue_in_flight(&mut self) {
+        if self.in_flight.is_empty() {
+            self.pending_count = 0;
+            return;
+        }
+        let rescued: Vec<BufferedCandle> = self.in_flight.drain(..).collect();
+        let count = rescued.len();
+        for candle in rescued {
+            self.buffer_candle(candle);
+        }
+        self.pending_count = 0;
+        warn!(
+            rescued = count,
+            ring_buffer = self.candle_buffer.len(),
+            "rescued in-flight candles to ring buffer after flush failure"
+        );
     }
 
     /// Flushes if any candles are buffered.
@@ -490,81 +574,227 @@ impl LiveCandleWriter {
         Ok(())
     }
 
-    /// Buffer a candle in the ring buffer. Drops oldest on overflow.
+    /// Buffer a candle in the ring buffer. On overflow, spills to disk.
+    /// **Zero candle loss guarantee** — never drops candles.
     fn buffer_candle(&mut self, candle: BufferedCandle) {
         if self.candle_buffer.len() >= CANDLE_BUFFER_CAPACITY {
-            self.candle_buffer.pop_front();
-            self.candles_dropped_total = self.candles_dropped_total.saturating_add(1);
-            // CRITICAL alert every 1000 drops.
-            if self.candles_dropped_total.is_multiple_of(1000) {
-                error!(
-                    candles_dropped_total = self.candles_dropped_total,
-                    "CRITICAL: candle ring buffer overflow — oldest candles dropped"
-                );
-            }
+            // Ring buffer full — spill to disk (never drop).
+            self.spill_candle_to_disk(&candle);
+        } else {
+            self.candle_buffer.push_back(candle);
         }
-        self.candle_buffer.push_back(candle);
+        metrics::gauge!("dlt_candle_buffer_size").set(self.candle_buffer.len() as f64);
+        metrics::counter!("dlt_candles_spilled_total").absolute(self.candles_spilled_total);
     }
 
-    /// Drains buffered candles to QuestDB after recovery. Batched.
+    /// Spills a candle to disk when ring buffer is full.
+    fn spill_candle_to_disk(&mut self, candle: &BufferedCandle) {
+        if self.spill_writer.is_none()
+            && let Err(err) = self.open_candle_spill_file()
+        {
+            error!(
+                ?err,
+                "CRITICAL: cannot open candle spill file — candle WILL be lost"
+            );
+            return;
+        }
+
+        let record = serialize_candle(candle);
+        if let Some(ref mut writer) = self.spill_writer
+            && let Err(err) = writer.write_all(&record)
+        {
+            error!(
+                ?err,
+                candles_spilled = self.candles_spilled_total,
+                "CRITICAL: candle disk spill write failed — candle lost"
+            );
+            return;
+        }
+
+        self.candles_spilled_total = self.candles_spilled_total.saturating_add(1);
+        if self.candles_spilled_total.is_multiple_of(1_000) {
+            warn!(
+                candles_spilled = self.candles_spilled_total,
+                "candle disk spill growing — QuestDB still down"
+            );
+        }
+    }
+
+    /// Opens the candle spill file for the current date.
+    fn open_candle_spill_file(&mut self) -> Result<()> {
+        std::fs::create_dir_all(CANDLE_SPILL_DIR)
+            .context("failed to create candle spill directory")?;
+
+        let date = chrono::Utc::now().format("%Y%m%d");
+        let path = std::path::PathBuf::from(format!("{CANDLE_SPILL_DIR}/candles-{date}.bin"));
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open candle spill file: {}", path.display()))?;
+
+        info!(path = %path.display(), "opened candle spill file for disk overflow");
+        self.spill_writer = Some(BufWriter::new(file));
+        self.spill_path = Some(path);
+        Ok(())
+    }
+
+    /// Drains buffered candles to QuestDB after recovery.
+    ///
+    /// Order:
+    /// 1. Ring buffer (oldest first)
+    /// 2. Disk spill (arrived after ring buffer filled)
     fn drain_candle_buffer(&mut self) {
-        let total = self.candle_buffer.len();
+        let ring_count = self.candle_buffer.len();
         let mut drained: usize = 0;
 
+        // Phase 1: Drain ring buffer.
         while let Some(c) = self.candle_buffer.pop_front() {
-            let ts_nanos = TimestampNanos::new(compute_live_candle_nanos(c.timestamp_secs));
-
-            let row_result = self
-                .buffer
-                .table(QUESTDB_TABLE_CANDLES_1S)
-                .and_then(|b| b.symbol("segment", segment_code_to_str(c.exchange_segment_code)))
-                .and_then(|b| b.column_i64("security_id", i64::from(c.security_id)))
-                .and_then(|b| b.column_f64("open", f32_to_f64_clean(c.open)))
-                .and_then(|b| b.column_f64("high", f32_to_f64_clean(c.high)))
-                .and_then(|b| b.column_f64("low", f32_to_f64_clean(c.low)))
-                .and_then(|b| b.column_f64("close", f32_to_f64_clean(c.close)))
-                .and_then(|b| b.column_i64("volume", i64::from(c.volume)))
-                .and_then(|b| b.column_i64("oi", 0))
-                .and_then(|b| b.column_i64("tick_count", i64::from(c.tick_count)))
-                .and_then(|b| b.at(ts_nanos));
-
-            if row_result.is_err() {
-                // Re-push the candle and stop draining.
-                self.candle_buffer.push_front(c);
-                warn!(
-                    drained,
-                    remaining = self.candle_buffer.len(),
-                    "candle drain interrupted — ILP buffer error"
-                );
-                return;
+            if self.build_candle_row(&c).is_err() {
+                continue;
             }
-
+            self.in_flight.push(c);
             drained = drained.saturating_add(1);
 
-            // Flush in batches.
             if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
                 && let Some(ref mut sender) = self.sender
                 && let Err(err) = sender.flush(&mut self.buffer)
             {
-                warn!(?err, drained, "candle drain flush failed — stopping drain");
+                warn!(?err, drained, "candle ring drain flush failed");
                 self.sender = None;
                 self.buffer.clear();
+                self.rescue_in_flight();
                 return;
+            }
+            // Clear in-flight on successful batch flush.
+            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) {
+                self.in_flight.clear();
             }
         }
 
-        // Final flush for any remaining rows.
-        if !drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
+        // Final flush for ring buffer remainder.
+        if !self.in_flight.is_empty()
             && let Some(ref mut sender) = self.sender
             && let Err(err) = sender.flush(&mut self.buffer)
         {
-            warn!(?err, drained, "candle drain final flush failed");
+            warn!(?err, drained, "candle ring drain final flush failed");
             self.sender = None;
             self.buffer.clear();
+            self.rescue_in_flight();
             return;
         }
+        self.in_flight.clear();
 
-        info!(total, drained, "candle ring buffer drained to QuestDB");
+        if drained > 0 {
+            info!(drained, ring_count, "candle ring buffer drained to QuestDB");
+        }
+
+        // Phase 2: Drain disk spill file.
+        if self.candles_spilled_total > 0 {
+            self.drain_candle_disk_spill();
+        }
+
+        metrics::gauge!("dlt_candle_buffer_size").set(self.candle_buffer.len() as f64);
+        metrics::counter!("dlt_candles_spilled_total").absolute(self.candles_spilled_total);
+    }
+
+    /// Builds an ILP row for a buffered candle. Returns Err on ILP buffer error.
+    fn build_candle_row(&mut self, c: &BufferedCandle) -> Result<()> {
+        let ts_nanos = TimestampNanos::new(compute_live_candle_nanos(c.timestamp_secs));
+        self.buffer
+            .table(QUESTDB_TABLE_CANDLES_1S)
+            .and_then(|b| b.symbol("segment", segment_code_to_str(c.exchange_segment_code)))
+            .and_then(|b| b.column_i64("security_id", i64::from(c.security_id)))
+            .and_then(|b| b.column_f64("open", f32_to_f64_clean(c.open)))
+            .and_then(|b| b.column_f64("high", f32_to_f64_clean(c.high)))
+            .and_then(|b| b.column_f64("low", f32_to_f64_clean(c.low)))
+            .and_then(|b| b.column_f64("close", f32_to_f64_clean(c.close)))
+            .and_then(|b| b.column_i64("volume", i64::from(c.volume)))
+            .and_then(|b| b.column_i64("oi", 0))
+            .and_then(|b| b.column_i64("tick_count", i64::from(c.tick_count)))
+            .and_then(|b| b.at(ts_nanos))
+            .context("build candle ILP row")?;
+        Ok(())
+    }
+
+    /// Drains the candle disk spill file to QuestDB.
+    fn drain_candle_disk_spill(&mut self) {
+        // Close the spill writer first.
+        if let Some(ref mut writer) = self.spill_writer {
+            let _ = writer.flush();
+        }
+        self.spill_writer = None;
+
+        let spill_path = match self.spill_path.take() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let file = match std::fs::File::open(&spill_path) {
+            Ok(f) => f,
+            Err(err) => {
+                warn!(?err, path = %spill_path.display(), "cannot open candle spill file");
+                return;
+            }
+        };
+
+        let mut reader = BufReader::new(file);
+        let mut record = [0u8; CANDLE_SPILL_RECORD_SIZE];
+        let mut drained: usize = 0;
+        let mut flush_failed = false;
+
+        loop {
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    warn!(?err, drained, "candle spill read error");
+                    break;
+                }
+            }
+
+            let candle = deserialize_candle(&record);
+            if self.build_candle_row(&candle).is_err() {
+                continue;
+            }
+            drained = drained.saturating_add(1);
+
+            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
+                && let Some(ref mut sender) = self.sender
+                && let Err(err) = sender.flush(&mut self.buffer)
+            {
+                warn!(?err, drained, "candle spill drain flush failed");
+                flush_failed = true;
+                break;
+            }
+        }
+
+        // Final flush.
+        if !flush_failed
+            && let Some(ref mut sender) = self.sender
+            && let Err(err) = sender.flush(&mut self.buffer)
+        {
+            warn!(?err, drained, "candle spill drain final flush failed");
+            flush_failed = true;
+        }
+
+        // Only delete spill file if drain was complete (no flush failures).
+        if !flush_failed {
+            if let Err(err) = std::fs::remove_file(&spill_path) {
+                warn!(?err, path = %spill_path.display(), "failed to delete candle spill file");
+            } else {
+                info!(path = %spill_path.display(), drained, "candle spill drained and deleted");
+            }
+            self.candles_spilled_total = 0;
+        } else {
+            // Preserve spill file for next recovery attempt.
+            self.spill_path = Some(spill_path);
+            warn!(
+                drained,
+                "candle spill partially drained — file preserved for next recovery"
+            );
+        }
     }
 
     /// Attempts to reconnect to QuestDB with exponential backoff.
@@ -633,10 +863,10 @@ impl LiveCandleWriter {
         self.candle_buffer.len()
     }
 
-    /// Returns the total number of candles dropped due to buffer overflow.
+    /// Returns the total number of candles spilled to disk (ring buffer overflow).
     // TEST-EXEMPT: trivial accessor, tested indirectly via resilience integration tests
     pub fn candles_dropped_total(&self) -> u64 {
-        self.candles_dropped_total
+        self.candles_spilled_total
     }
 }
 
@@ -1463,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_live_candle_ring_buffer_overflow_drops_oldest() {
+    fn test_live_candle_ring_buffer_overflow_spills_to_disk() {
         let config = QuestDbConfig {
             host: "192.0.2.1".to_string(),
             ilp_port: 1,
@@ -1473,6 +1703,15 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
+        // Pre-set spill to unique temp path.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-candle-spill-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-candles-overflow.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
         // Fill ring buffer to capacity.
         for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
             writer
@@ -1480,40 +1719,34 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
-        assert_eq!(
-            writer.candles_dropped_total(),
-            0,
-            "no drops yet at capacity"
-        );
+        assert_eq!(writer.candles_spilled_total, 0, "no spill yet at capacity");
 
-        // One more — should drop the oldest (security_id=0).
+        // One more — should SPILL to disk (not drop).
         writer
             .append_candle(999999, 2, 1_740_600_000, 200.0, 210.0, 190.0, 205.0, 50, 5)
             .unwrap();
+        // Ring buffer stays at capacity.
         assert_eq!(
             writer.buffered_candle_count(),
             CANDLE_BUFFER_CAPACITY,
-            "buffer stays at capacity"
+            "ring buffer stays at capacity"
         );
+        // Spill count = 1 (NOT dropped — it's on disk).
         assert_eq!(
-            writer.candles_dropped_total(),
-            1,
-            "exactly 1 candle dropped"
+            writer.candles_spilled_total, 1,
+            "exactly 1 candle spilled to disk, NOT dropped"
         );
 
-        // The oldest candle should now be security_id=1 (0 was dropped).
+        // The ring buffer oldest is still id=0 (no pop_front anymore).
         let oldest = writer.candle_buffer.front().unwrap();
         assert_eq!(
-            oldest.security_id, 1,
-            "oldest candle (id=0) must be dropped, next oldest is id=1"
+            oldest.security_id, 0,
+            "oldest candle (id=0) must still be in ring buffer (not dropped)"
         );
 
-        // The newest should be 999999.
-        let newest = writer.candle_buffer.back().unwrap();
-        assert_eq!(
-            newest.security_id, 999999,
-            "newest candle must be the last one appended"
-        );
+        // Cleanup.
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

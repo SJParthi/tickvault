@@ -539,6 +539,7 @@ impl TickPersistenceWriter {
         let mut reader = BufReader::new(file);
         let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
         let mut drained: usize = 0;
+        let mut flush_failed = false;
 
         loop {
             match reader.read_exact(&mut record) {
@@ -571,29 +572,42 @@ impl TickPersistenceWriter {
                     ?err,
                     drained, "flush during spill drain failed — in-flight rescued"
                 );
+                flush_failed = true;
                 break;
             }
         }
 
         // Final flush.
-        if self.pending_count > 0
+        if !flush_failed
+            && self.pending_count > 0
             && let Err(err) = self.force_flush()
         {
             warn!(?err, drained, "spill drain final flush failed");
+            flush_failed = true;
         }
 
-        // Delete the spill file after successful drain.
-        if let Err(err) = std::fs::remove_file(&spill_path) {
-            warn!(?err, path = %spill_path.display(), "failed to delete spill file");
+        // Only delete spill file if drain was COMPLETE (no flush failures).
+        // If drain was partial, preserve file for next recovery attempt.
+        if !flush_failed {
+            if let Err(err) = std::fs::remove_file(&spill_path) {
+                warn!(?err, path = %spill_path.display(), "failed to delete spill file");
+            } else {
+                info!(
+                    path = %spill_path.display(),
+                    drained,
+                    "disk spill file drained and deleted"
+                );
+            }
+            self.ticks_spilled_total = 0;
         } else {
-            info!(
-                path = %spill_path.display(),
+            // Preserve spill file for next recovery.
+            self.spill_path = Some(spill_path);
+            warn!(
                 drained,
-                "disk spill file drained and deleted"
+                "tick spill partially drained — file preserved for next recovery"
             );
         }
 
-        self.ticks_spilled_total = 0;
         drained
     }
 
