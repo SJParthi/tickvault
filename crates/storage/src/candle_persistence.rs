@@ -347,7 +347,7 @@ impl LiveCandleWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: conf_string,
-            candle_buffer: VecDeque::new(),
+            candle_buffer: VecDeque::with_capacity(CANDLE_BUFFER_CAPACITY),
             candles_dropped_total: 0,
             next_reconnect_allowed: std::time::Instant::now(),
         })

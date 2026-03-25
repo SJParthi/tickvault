@@ -183,7 +183,7 @@ impl TickPersistenceWriter {
             pending_count: 0,
             last_flush_ms: current_time_ms(),
             ilp_conf_string: conf_string,
-            tick_buffer: VecDeque::new(),
+            tick_buffer: VecDeque::with_capacity(TICK_BUFFER_CAPACITY),
             in_flight: Vec::with_capacity(TICK_FLUSH_BATCH_SIZE),
             ticks_spilled_total: 0,
             just_recovered: false,
@@ -446,7 +446,12 @@ impl TickPersistenceWriter {
 
         // Phase 1: Drain ring buffer (oldest ticks first).
         while let Some(tick) = self.tick_buffer.pop_front() {
-            if build_tick_row(&mut self.buffer, &tick).is_err() {
+            if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
+                warn!(
+                    ?err,
+                    security_id = tick.security_id,
+                    "build_tick_row failed during drain — tick skipped"
+                );
                 continue;
             }
             // Track in-flight so rescue_in_flight can save them on flush failure.
@@ -546,7 +551,12 @@ impl TickPersistenceWriter {
             }
 
             let tick = deserialize_tick(&record);
-            if build_tick_row(&mut self.buffer, &tick).is_err() {
+            if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
+                warn!(
+                    ?err,
+                    security_id = tick.security_id,
+                    "build_tick_row failed during spill drain — tick skipped"
+                );
                 continue;
             }
             self.in_flight.push(tick);
