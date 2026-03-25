@@ -941,4 +941,46 @@ mod tests {
         let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
         assert!(!result, "execute_ddl must return false on send error");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: tracing subscriber to evaluate warn!/info! fields
+    // (lines 325, 343)
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_200_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With subscriber installed, info! evaluates views_total field (line 325).
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_400_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With subscriber installed, warn! evaluates body.chars().take(200) (line 343).
+        ensure_candle_views(&config).await;
+    }
 }

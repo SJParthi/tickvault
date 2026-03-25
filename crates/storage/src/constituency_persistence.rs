@@ -835,4 +835,32 @@ mod tests {
         let result = persist_constituency(&map, &config, None);
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: warn! field evaluation with tracing subscriber
+    // (lines 127, 159)
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_constituency_table_non_success_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With subscriber installed, warn! evaluates body.chars().take(200)
+        // covering lines 127 and 159.
+        ensure_constituency_table(&config).await;
+    }
 }

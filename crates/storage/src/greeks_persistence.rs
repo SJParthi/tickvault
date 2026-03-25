@@ -2391,4 +2391,119 @@ mod tests {
             "greeks initial delay must be 1000ms"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: writer methods for live tables (lines 489-501)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_writer_write_option_greeks_live_row() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0);
+
+        let row = OptionGreeksLiveRow {
+            segment: "NSE_FNO",
+            security_id: 42528,
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_security_id: 13,
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            candle_interval: "1s",
+            iv: 0.098,
+            delta: 0.54,
+            gamma: 0.0013,
+            theta: -15.2,
+            vega: 12.1,
+            rho: 0.05,
+            charm: -0.002,
+            vanna: 0.15,
+            volga: 3.2,
+            veta: -1.8,
+            speed: -0.00001,
+            color: -0.0003,
+            zomma: 0.001,
+            ultima: -0.5,
+            bs_price: 135.5,
+            intrinsic_value: 0.0,
+            extrinsic_value: 134.0,
+            spot_price: 25642.8,
+            option_ltp: 134.0,
+            oi: 3786445,
+            volume: 117567970,
+            ts_nanos: sample_ts_nanos(),
+        };
+        let result = writer.write_option_greeks_live_row(&row);
+        assert!(result.is_ok(), "write_option_greeks_live_row must succeed");
+        assert_eq!(writer.pending_count(), 1, "pending_count must increment");
+    }
+
+    #[test]
+    fn test_writer_write_pcr_snapshot_live_row() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0);
+
+        let row = PcrSnapshotLiveRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            candle_interval: "1m",
+            pcr_oi: 0.95,
+            pcr_volume: 0.82,
+            total_put_oi: 5000000,
+            total_call_oi: 5263158,
+            total_put_volume: 90000000,
+            total_call_volume: 109756098,
+            sentiment: "Neutral",
+            ts_nanos: sample_ts_nanos(),
+        };
+        let result = writer.write_pcr_snapshot_live_row(&row);
+        assert!(result.is_ok(), "write_pcr_snapshot_live_row must succeed");
+        assert_eq!(writer.pending_count(), 1, "pending_count must increment");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: try_reconnect_on_error failure path (line 603)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_try_reconnect_on_error_reconnect_fails() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate disconnect.
+        writer.sender = None;
+        // Point to an invalid conf string that fails immediately (not a TCP timeout).
+        writer.ilp_conf_string = "invalid_conf_string_no_protocol".to_string();
+        // Allow reconnect (no throttle).
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // try_reconnect_on_error calls reconnect() which will fail on
+        // Sender::from_conf with invalid conf string. This covers line 603.
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_none(),
+            "sender must remain None after failed reconnect"
+        );
+    }
 }
