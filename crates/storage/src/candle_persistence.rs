@@ -652,7 +652,12 @@ impl LiveCandleWriter {
 
         // Phase 1: Drain ring buffer.
         while let Some(c) = self.candle_buffer.pop_front() {
-            if self.build_candle_row(&c).is_err() {
+            if let Err(err) = self.build_candle_row(&c) {
+                error!(
+                    ?err,
+                    security_id = c.security_id,
+                    "CRITICAL: build_candle_row failed during drain — candle lost"
+                );
                 continue;
             }
             self.in_flight.push(c);
@@ -761,7 +766,12 @@ impl LiveCandleWriter {
             }
 
             let candle = deserialize_candle(&record);
-            if self.build_candle_row(&candle).is_err() {
+            if let Err(err) = self.build_candle_row(&candle) {
+                error!(
+                    ?err,
+                    security_id = candle.security_id,
+                    "CRITICAL: build_candle_row failed during spill drain — candle lost"
+                );
                 continue;
             }
             drained = drained.saturating_add(1);

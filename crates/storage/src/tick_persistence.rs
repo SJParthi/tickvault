@@ -1510,10 +1510,10 @@ impl DepthPersistenceWriter {
                 snapshot.received_at_nanos,
                 &snapshot.depth,
             ) {
-                warn!(
+                error!(
                     ?err,
                     security_id = snapshot.security_id,
-                    "build_depth_rows failed during drain — snapshot skipped"
+                    "CRITICAL: build_depth_rows failed during drain — snapshot lost"
                 );
                 continue;
             }
@@ -1614,10 +1614,10 @@ impl DepthPersistenceWriter {
                 snapshot.received_at_nanos,
                 &snapshot.depth,
             ) {
-                warn!(
+                error!(
                     ?err,
                     security_id = snapshot.security_id,
-                    "build_depth_rows failed during spill drain — snapshot skipped"
+                    "CRITICAL: build_depth_rows failed during spill drain — snapshot lost"
                 );
                 continue;
             }
