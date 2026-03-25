@@ -2186,6 +2186,510 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Counting TCP server for candle drain verification
+    // -----------------------------------------------------------------------
+
+    /// Spawns a TCP server that counts ILP newlines (each newline = 1 row written).
+    /// Returns (port, row_count_handle). Supports reconnect (multiple connections).
+    fn spawn_counting_tcp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Read as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let cnt = Arc::clone(&count_clone);
+                        std::thread::spawn(move || {
+                            let mut buf = [0u8; 65536];
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        let newlines =
+                                            buf[..n].iter().filter(|&&b| b == b'\n').count();
+                                        cnt.fetch_add(newlines, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (port, count)
+    }
+
+    /// Helper to make a `BufferedCandle` with a given security_id.
+    fn make_buffered_candle(security_id: u32) -> BufferedCandle {
+        BufferedCandle {
+            security_id,
+            exchange_segment_code: 2, // NSE_FNO
+            timestamp_secs: 1_740_556_500 + security_id,
+            open: 24500.0 + security_id as f32,
+            high: 24510.0 + security_id as f32,
+            low: 24490.0 + security_id as f32,
+            close: 24505.0 + security_id as f32,
+            volume: 100 + security_id,
+            tick_count: 10 + security_id,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // test_candle_serialize_deserialize_roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_serialize_deserialize_roundtrip() {
+        // Verify all 9 BufferedCandle fields survive serialize→deserialize roundtrip.
+        let candle = BufferedCandle {
+            security_id: 49081,
+            exchange_segment_code: 2, // NSE_FNO
+            timestamp_secs: 1_740_556_500,
+            open: 24567.25,
+            high: 24600.50,
+            low: 24510.75,
+            close: 24580.00,
+            volume: 1_234_567,
+            tick_count: 4_200,
+        };
+
+        let bytes = serialize_candle(&candle);
+        assert_eq!(
+            bytes.len(),
+            CANDLE_SPILL_RECORD_SIZE,
+            "serialized size must be exactly {CANDLE_SPILL_RECORD_SIZE} bytes"
+        );
+
+        let restored = deserialize_candle(&bytes);
+        assert_eq!(restored.security_id, candle.security_id, "security_id");
+        assert_eq!(
+            restored.exchange_segment_code, candle.exchange_segment_code,
+            "exchange_segment_code"
+        );
+        assert_eq!(
+            restored.timestamp_secs, candle.timestamp_secs,
+            "timestamp_secs"
+        );
+        assert_eq!(restored.open, candle.open, "open");
+        assert_eq!(restored.high, candle.high, "high");
+        assert_eq!(restored.low, candle.low, "low");
+        assert_eq!(restored.close, candle.close, "close");
+        assert_eq!(restored.volume, candle.volume, "volume");
+        assert_eq!(restored.tick_count, candle.tick_count, "tick_count");
+    }
+
+    #[test]
+    fn test_candle_serialize_deserialize_boundary_values() {
+        // Edge case: zero fields.
+        let candle_zero = BufferedCandle {
+            security_id: 0,
+            exchange_segment_code: 0,
+            timestamp_secs: 0,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0,
+            tick_count: 0,
+        };
+        let restored_zero = deserialize_candle(&serialize_candle(&candle_zero));
+        assert_eq!(restored_zero.security_id, 0);
+        assert_eq!(restored_zero.volume, 0);
+
+        // Edge case: max u32 fields.
+        let candle_max = BufferedCandle {
+            security_id: u32::MAX,
+            exchange_segment_code: 255,
+            timestamp_secs: u32::MAX,
+            open: f32::MAX,
+            high: f32::MAX,
+            low: f32::MIN,
+            close: f32::MIN_POSITIVE,
+            volume: u32::MAX,
+            tick_count: u32::MAX,
+        };
+        let restored_max = deserialize_candle(&serialize_candle(&candle_max));
+        assert_eq!(restored_max.security_id, u32::MAX);
+        assert_eq!(restored_max.exchange_segment_code, 255);
+        assert_eq!(restored_max.timestamp_secs, u32::MAX);
+        assert_eq!(restored_max.volume, u32::MAX);
+        assert_eq!(restored_max.tick_count, u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_candle_drain_ring_buffer_on_recovery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_drain_ring_buffer_on_recovery() {
+        // =================================================================
+        // Scenario:
+        //   Phase 1: QuestDB UP → write 10 candles → flush → verify received
+        //   Phase 2: QuestDB DOWN → write 50 candles → all buffered in ring
+        //   Phase 3: QuestDB UP → reconnect → drain ring buffer → verify ALL
+        // =================================================================
+        use std::sync::atomic::Ordering;
+
+        // Phase 1: QuestDB UP — write and flush.
+        let (port, row_count) = spawn_counting_tcp_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some(), "Phase 1: must be connected");
+
+        let phase1_count = 10_usize;
+        for i in 0..phase1_count as u32 {
+            writer
+                .append_candle(
+                    i,
+                    2,
+                    1_740_556_500 + i,
+                    24500.0,
+                    24510.0,
+                    24490.0,
+                    24505.0,
+                    100,
+                    10,
+                )
+                .unwrap();
+        }
+        writer.force_flush().unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+        let phase1_received = row_count.load(Ordering::Relaxed);
+        assert_eq!(
+            phase1_received, phase1_count,
+            "Phase 1: server must receive exactly {phase1_count} ILP rows"
+        );
+
+        // Phase 2: QuestDB DOWN — disconnect, buffer candles in ring.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        let phase2_count = 50_usize;
+        for i in 0..phase2_count as u32 {
+            writer
+                .append_candle(
+                    phase1_count as u32 + i,
+                    2,
+                    1_740_560_000 + i,
+                    25000.0,
+                    25010.0,
+                    24990.0,
+                    25005.0,
+                    200,
+                    20,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            writer.buffered_candle_count(),
+            phase2_count,
+            "Phase 2: all candles must be in ring buffer"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "Phase 2: sender must still be None"
+        );
+
+        // Phase 3: QuestDB RECOVERS — start new counting server, reconnect, drain.
+        let (port2, row_count2) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // Reconnect manually then trigger drain via force_flush_internal.
+        // drain_candle_buffer is called by force_flush_internal after successful flush.
+        // We need a pending candle to trigger the flush path.
+        writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some(), "Phase 3: must reconnect");
+
+        // Drain the ring buffer directly (private method accessible in test module).
+        writer.drain_candle_buffer();
+        let _ = writer.force_flush();
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let phase3_received = row_count2.load(Ordering::Relaxed);
+        assert_eq!(
+            phase3_received, phase2_count,
+            "Phase 3: recovery server must receive ALL {phase2_count} buffered candles"
+        );
+
+        // Ring buffer must be empty after drain.
+        assert_eq!(
+            writer.buffered_candle_count(),
+            0,
+            "ring buffer must be empty after drain"
+        );
+
+        // Total accounting: zero loss.
+        let total_sent = phase1_count + phase2_count;
+        let total_received = phase1_received + phase3_received;
+        assert_eq!(
+            total_received, total_sent,
+            "ZERO LOSS: total received ({total_received}) must equal total sent ({total_sent})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_candle_rescue_in_flight_on_flush_failure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_rescue_in_flight_on_flush_failure() {
+        // Scenario: put candles in ILP buffer (in-flight), simulate flush failure,
+        // verify rescued back to ring buffer.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Append candles — they go to ILP buffer + in_flight tracker.
+        let candle_count = 5_usize;
+        for i in 0..candle_count as u32 {
+            writer
+                .append_candle(
+                    100 + i,
+                    2,
+                    1_740_556_500 + i,
+                    24500.0,
+                    24510.0,
+                    24490.0,
+                    24505.0,
+                    100,
+                    10,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(writer.pending_count, candle_count);
+        assert_eq!(writer.in_flight.len(), candle_count);
+        assert_eq!(
+            writer.buffered_candle_count(),
+            0,
+            "ring buffer empty before rescue"
+        );
+
+        // Simulate flush failure: kill sender, then call force_flush_internal.
+        // This triggers the rescue_in_flight path.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        writer.force_flush_internal();
+
+        // In-flight candles must be rescued to ring buffer.
+        assert_eq!(
+            writer.buffered_candle_count(),
+            candle_count,
+            "all in-flight candles must be rescued to ring buffer"
+        );
+        assert!(
+            writer.in_flight.is_empty(),
+            "in-flight must be empty after rescue"
+        );
+        assert_eq!(
+            writer.pending_count, 0,
+            "pending must be reset after rescue"
+        );
+
+        // Verify the rescued candles have correct security_ids (FIFO order).
+        let first = writer.candle_buffer.front().unwrap();
+        assert_eq!(
+            first.security_id, 100,
+            "first rescued candle must be id 100"
+        );
+        let last = writer.candle_buffer.back().unwrap();
+        assert_eq!(last.security_id, 104, "last rescued candle must be id 104");
+    }
+
+    // -----------------------------------------------------------------------
+    // test_candle_disk_spill_and_drain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_disk_spill_and_drain() {
+        // =================================================================
+        // Scenario: QuestDB DOWN → fill ring buffer → overflow to disk →
+        //           QuestDB RECOVERS → drain ring + disk → verify ALL
+        // =================================================================
+        use std::sync::atomic::Ordering;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Kill QuestDB immediately.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // Pre-set spill to unique temp path (avoid interference with other tests).
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "dlt-candle-spill-drain-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-candles-spill-drain.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        // Fill ring buffer to capacity using buffer_candle directly.
+        for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
+            writer.buffer_candle(make_buffered_candle(i));
+        }
+        assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
+        assert_eq!(writer.candles_spilled_total, 0);
+
+        // Spill 50 more candles to disk.
+        let spill_count: usize = 50;
+        for i in 0..spill_count as u32 {
+            writer.buffer_candle(make_buffered_candle(CANDLE_BUFFER_CAPACITY as u32 + i));
+        }
+        assert_eq!(
+            writer.candles_spilled_total, spill_count as u64,
+            "exactly {spill_count} candles must be spilled to disk"
+        );
+
+        // QuestDB RECOVERS.
+        let (port2, row_count2) = spawn_counting_tcp_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some(), "must reconnect");
+
+        // Drain everything: ring buffer + disk spill.
+        writer.drain_candle_buffer();
+        let _ = writer.force_flush();
+
+        // Give server time to process all ILP rows.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let total_expected = CANDLE_BUFFER_CAPACITY + spill_count;
+        let received = row_count2.load(Ordering::Relaxed);
+        assert_eq!(
+            received, total_expected,
+            "ZERO LOSS: received ({received}) must equal ring ({}) + spill ({spill_count}) = {total_expected}",
+            CANDLE_BUFFER_CAPACITY
+        );
+
+        // Ring buffer must be empty.
+        assert_eq!(
+            writer.buffered_candle_count(),
+            0,
+            "ring buffer must be empty after drain"
+        );
+
+        // Spill file must be deleted after successful drain.
+        assert!(
+            !spill_path.exists(),
+            "spill file must be deleted after successful drain"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_candle_recover_stale_files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candle_recover_stale_files() {
+        // Create fake stale spill files with known candles, call recover,
+        // verify count matches total candles written across all files.
+        let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+
+        // Create two stale files with different dates and candle counts.
+        let stale_file_a = real_spill_dir.join("candles-20220101.bin");
+        let stale_file_b = real_spill_dir.join("candles-20220202.bin");
+        let count_a = 25_usize;
+        let count_b = 35_usize;
+
+        for (path, count, id_base) in [
+            (&stale_file_a, count_a, 5000_u32),
+            (&stale_file_b, count_b, 6000_u32),
+        ] {
+            let file = std::fs::File::create(path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..count as u32 {
+                bw.write_all(&serialize_candle(&make_buffered_candle(id_base + i)))
+                    .unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        // Create a writer connected to a counting server.
+        let (port, row_count) = spawn_counting_tcp_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        let recovered = writer.recover_stale_spill_files();
+
+        assert_eq!(
+            recovered,
+            count_a + count_b,
+            "must recover {count_a} + {count_b} = {} candles from stale files",
+            count_a + count_b
+        );
+
+        // Both stale files must be deleted.
+        assert!(
+            !stale_file_a.exists(),
+            "stale file A must be deleted after recovery"
+        );
+        assert!(
+            !stale_file_b.exists(),
+            "stale file B must be deleted after recovery"
+        );
+
+        // Give server time to process.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Verify the counting server received the correct number of ILP rows.
+        let received = row_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            received,
+            count_a + count_b,
+            "counting server must receive exactly {} ILP rows",
+            count_a + count_b
+        );
+    }
+
     #[test]
     fn test_recover_candle_skips_current_active_spill() {
         // Set spill_path to today's file, create that file plus an older one.
