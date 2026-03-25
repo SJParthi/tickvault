@@ -1,8 +1,8 @@
 # Implementation Plan: Per-Tick Greeks as Columns in Ticks & Candles
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-03-24
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Problem
 
@@ -31,7 +31,7 @@ This eliminates JOINs, reduces writes (one ILP call instead of two), and keeps O
 
 ## Plan Items
 
-- [ ] 1. Add 6 Greeks fields to `ParsedTick` struct
+- [x] 1. Add 6 Greeks fields to `ParsedTick` struct
   - Files: crates/common/src/tick_types.rs
   - Add `iv: f64`, `delta: f64`, `gamma: f64`, `theta: f64`, `vega: f64`, `rho: f64`
   - Default to `f64::NAN` (QuestDB NULL) for non-F&O ticks
