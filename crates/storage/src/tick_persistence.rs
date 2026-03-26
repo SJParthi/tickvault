@@ -72,15 +72,16 @@ const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// Prevents reconnect storms when QuestDB is down for extended periods.
 const RECONNECT_THROTTLE_SECS: u64 = 30;
 
-/// Fixed record size for disk-spilled ticks: 72 bytes per tick.
+/// Fixed record size for disk-spilled ticks: 112 bytes per tick.
 /// Layout: security_id(4) + segment(1) + pad(1) + ltp(4) + ltq(2) + ts(4) +
 ///         received_nanos(8) + atp(4) + vol(4) + sell_qty(4) + buy_qty(4) +
-///         open(4) + close(4) + high(4) + low(4) + oi(4) + oi_high(4) + oi_low(4) + pad(3)
-///         = 72 bytes (aligned).
-const TICK_SPILL_RECORD_SIZE: usize = 72;
+///         open(4) + close(4) + high(4) + low(4) + oi(4) + oi_high(4) + oi_low(4) +
+///         iv(8) + delta(8) + gamma(8) + theta(8) + vega(8) + pad(3)
+///         = 112 bytes (aligned).
+const TICK_SPILL_RECORD_SIZE: usize = 112;
 
 // Compile-time guard: if ParsedTick changes size, this will fail.
-// Actual struct may be smaller (67 bytes raw) but we use 72 for alignment.
+// Actual struct may be smaller but we use 112 for alignment.
 const _: () = assert!(
     std::mem::size_of::<ParsedTick>() <= TICK_SPILL_RECORD_SIZE,
     "ParsedTick grew beyond TICK_SPILL_RECORD_SIZE — update serialize/deserialize"
@@ -111,7 +112,12 @@ fn serialize_tick(tick: &ParsedTick) -> [u8; TICK_SPILL_RECORD_SIZE] {
     buf[56..60].copy_from_slice(&tick.open_interest.to_le_bytes());
     buf[60..64].copy_from_slice(&tick.oi_day_high.to_le_bytes());
     buf[64..68].copy_from_slice(&tick.oi_day_low.to_le_bytes());
-    // buf[68..71] = padding
+    buf[68..76].copy_from_slice(&tick.iv.to_le_bytes());
+    buf[76..84].copy_from_slice(&tick.delta.to_le_bytes());
+    buf[84..92].copy_from_slice(&tick.gamma.to_le_bytes());
+    buf[92..100].copy_from_slice(&tick.theta.to_le_bytes());
+    buf[100..108].copy_from_slice(&tick.vega.to_le_bytes());
+    // buf[108..111] = padding
     buf
 }
 
@@ -137,6 +143,21 @@ fn deserialize_tick(buf: &[u8; TICK_SPILL_RECORD_SIZE]) -> ParsedTick {
         open_interest: u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]),
         oi_day_high: u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]),
         oi_day_low: u32::from_le_bytes([buf[64], buf[65], buf[66], buf[67]]),
+        iv: f64::from_le_bytes([
+            buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
+        ]),
+        delta: f64::from_le_bytes([
+            buf[76], buf[77], buf[78], buf[79], buf[80], buf[81], buf[82], buf[83],
+        ]),
+        gamma: f64::from_le_bytes([
+            buf[84], buf[85], buf[86], buf[87], buf[88], buf[89], buf[90], buf[91],
+        ]),
+        theta: f64::from_le_bytes([
+            buf[92], buf[93], buf[94], buf[95], buf[96], buf[97], buf[98], buf[99],
+        ]),
+        vega: f64::from_le_bytes([
+            buf[100], buf[101], buf[102], buf[103], buf[104], buf[105], buf[106], buf[107],
+        ]),
     }
 }
 
@@ -228,7 +249,7 @@ impl TickPersistenceWriter {
         build_tick_row(&mut self.buffer, tick)?;
 
         // Track in-flight: save a copy so we can rescue on flush failure.
-        // ParsedTick is Copy (72 bytes) — this is a memcpy, not a heap alloc.
+        // ParsedTick is Copy (112 bytes) — this is a memcpy, not a heap alloc.
         self.in_flight.push(*tick);
         self.pending_count = self.pending_count.saturating_add(1);
 
@@ -742,6 +763,16 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("total_sell_qty")?
         .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
         .context("exchange_timestamp")?
+        .column_f64("iv", tick.iv)
+        .context("iv")?
+        .column_f64("delta", tick.delta)
+        .context("delta")?
+        .column_f64("gamma", tick.gamma)
+        .context("gamma")?
+        .column_f64("theta", tick.theta)
+        .context("theta")?
+        .column_f64("vega", tick.vega)
+        .context("vega")?
         .column_ts("received_at", received_nanos)
         .context("received_at")?
         .at(ts_nanos)
@@ -781,6 +812,11 @@ const TICKS_CREATE_DDL: &str = "\
         total_buy_qty LONG,\
         total_sell_qty LONG,\
         exchange_timestamp LONG,\
+        iv DOUBLE,\
+        delta DOUBLE,\
+        gamma DOUBLE,\
+        theta DOUBLE,\
+        vega DOUBLE,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
@@ -1724,6 +1760,11 @@ mod tests {
             open_interest: 120000,
             oi_day_high: 130000,
             oi_day_low: 110000,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         }
     }
 
@@ -2286,6 +2327,11 @@ mod tests {
             open_interest: u32::MAX,
             oi_day_high: u32::MAX,
             oi_day_low: u32::MAX,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
 
         build_tick_row(&mut buffer, &tick).unwrap();

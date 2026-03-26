@@ -48,6 +48,16 @@ pub struct ParsedTick {
     pub oi_day_high: u32,
     /// OI day low (from Full packet; 0 for Ticker/Quote).
     pub oi_day_low: u32,
+    /// Implied volatility (annualized decimal, e.g., 0.30 = 30%). f64::NAN for non-F&O.
+    pub iv: f64,
+    /// Delta (rate of option price change w.r.t. underlying). f64::NAN for non-F&O.
+    pub delta: f64,
+    /// Gamma (rate of delta change w.r.t. underlying). f64::NAN for non-F&O.
+    pub gamma: f64,
+    /// Theta (daily time decay). f64::NAN for non-F&O.
+    pub theta: f64,
+    /// Vega (sensitivity per 1% vol change). f64::NAN for non-F&O.
+    pub vega: f64,
 }
 
 impl Default for ParsedTick {
@@ -70,6 +80,11 @@ impl Default for ParsedTick {
             open_interest: 0,
             oi_day_high: 0,
             oi_day_low: 0,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         }
     }
 }
