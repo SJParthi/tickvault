@@ -2990,39 +2990,7 @@ mod tests {
         assert_eq!(writer.pending_count(), 0);
     }
 
-    // -----------------------------------------------------------------------
-    // fresh_buffer() — coverage for both branches
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_fresh_buffer_with_sender_returns_sender_buffer() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-        let writer = GreeksPersistenceWriter::new(&config).unwrap();
-        assert!(writer.sender.is_some());
-        let buf = writer.fresh_buffer();
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn test_fresh_buffer_without_sender_returns_v1_buffer() {
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
-        writer.sender = None;
-        let buf = writer.fresh_buffer();
-        assert!(buf.is_empty());
-    }
+    // (fresh_buffer tests already covered above at line ~2623)
 
     // -----------------------------------------------------------------------
     // live tables DDL and DEDUP key tests
@@ -3126,43 +3094,7 @@ mod tests {
         assert!(GREEKS_RECONNECT_THROTTLE_SECS >= 5);
     }
 
-    #[test]
-    fn test_option_greeks_ddl_has_higher_order_greeks() {
-        for col in [
-            "charm DOUBLE",
-            "vanna DOUBLE",
-            "volga DOUBLE",
-            "veta DOUBLE",
-            "speed DOUBLE",
-            "color DOUBLE",
-            "zomma DOUBLE",
-            "ultima DOUBLE",
-        ] {
-            assert!(
-                OPTION_GREEKS_DDL.contains(col),
-                "option_greeks missing higher-order: {col}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_option_greeks_live_ddl_has_higher_order_greeks() {
-        for col in [
-            "charm DOUBLE",
-            "vanna DOUBLE",
-            "volga DOUBLE",
-            "veta DOUBLE",
-            "speed DOUBLE",
-            "color DOUBLE",
-            "zomma DOUBLE",
-            "ultima DOUBLE",
-        ] {
-            assert!(
-                OPTION_GREEKS_LIVE_DDL.contains(col),
-                "option_greeks_live missing: {col}"
-            );
-        }
-    }
+    // (higher_order_greeks tests already covered above at line ~2664)
 
     #[test]
     fn test_pcr_snapshots_live_ddl_has_all_pcr_fields() {

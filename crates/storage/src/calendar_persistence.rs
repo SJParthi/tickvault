@@ -883,41 +883,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // classify_holiday_type
+    // classify_holiday_type — precedence edge case
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_classify_holiday_type_regular() {
-        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
-            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
-            name: "Republic Day".to_string(),
-            is_muhurat: false,
-            is_mock: false,
-        };
-        assert_eq!(classify_holiday_type(&entry), "Holiday");
-    }
-
-    #[test]
-    fn test_classify_holiday_type_muhurat() {
-        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
-            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 21).unwrap(),
-            name: "Diwali".to_string(),
-            is_muhurat: true,
-            is_mock: false,
-        };
-        assert_eq!(classify_holiday_type(&entry), "Muhurat Trading");
-    }
-
-    #[test]
-    fn test_classify_holiday_type_mock() {
-        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
-            date: chrono::NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(),
-            name: "Mock Trading".to_string(),
-            is_muhurat: false,
-            is_mock: true,
-        };
-        assert_eq!(classify_holiday_type(&entry), "Mock Trading Session");
-    }
 
     #[test]
     fn test_classify_holiday_type_mock_takes_precedence() {

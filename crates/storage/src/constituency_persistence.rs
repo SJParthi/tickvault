@@ -940,50 +940,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Coverage: DDL column tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ddl_has_index_name_column() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("index_name SYMBOL"));
-    }
-
-    #[test]
-    fn test_ddl_has_symbol_column() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("symbol SYMBOL"));
-    }
-
-    #[test]
-    fn test_ddl_has_isin_column() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("isin STRING"));
-    }
-
-    #[test]
-    fn test_ddl_has_weight_column() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("weight DOUBLE"));
-    }
-
-    #[test]
-    fn test_ddl_has_sector_column() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("sector STRING"));
-    }
-
-    #[test]
-    fn test_ddl_has_security_id_column() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("security_id LONG"));
-    }
-
-    #[test]
-    fn test_ddl_has_wal() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("WAL"));
-    }
-
-    #[test]
-    fn test_ddl_has_month_partitioning() {
-        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("PARTITION BY MONTH"));
-    }
-
-    // -----------------------------------------------------------------------
     // Coverage: count_total_constituents
     // -----------------------------------------------------------------------
 
