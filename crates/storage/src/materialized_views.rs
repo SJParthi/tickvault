@@ -50,6 +50,11 @@ const CANDLES_1S_CREATE_DDL: &str = "\
         volume LONG,\
         oi LONG,\
         tick_count INT,\
+        iv DOUBLE,\
+        delta DOUBLE,\
+        gamma DOUBLE,\
+        theta DOUBLE,\
+        vega DOUBLE,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -259,7 +264,9 @@ fn build_view_sql(def: &ViewDef) -> String {
          SELECT ts, security_id, segment, \
          first(open) AS open, max(high) AS high, \
          min(low) AS low, last(close) AS close, \
-         sum(volume) AS volume, last(oi) AS oi{tick_count} \
+         sum(volume) AS volume, last(oi) AS oi{tick_count}, \
+         last(iv) AS iv, last(delta) AS delta, last(gamma) AS gamma, \
+         last(theta) AS theta, last(vega) AS vega \
          FROM {source} \
          SAMPLE BY {interval} \
          ALIGN TO CALENDAR WITH OFFSET '{offset}'",
@@ -364,6 +371,11 @@ mod tests {
         assert!(CANDLES_1S_CREATE_DDL.contains("PARTITION BY DAY"));
         assert!(CANDLES_1S_CREATE_DDL.contains("security_id LONG"));
         assert!(CANDLES_1S_CREATE_DDL.contains("tick_count INT"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("iv DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("delta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("gamma DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("theta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("vega DOUBLE"));
     }
 
     #[test]
@@ -659,6 +671,31 @@ mod tests {
                 "view {} missing oi",
                 def.name
             );
+            assert!(
+                sql.contains("last(iv) AS iv"),
+                "view {} missing iv",
+                def.name
+            );
+            assert!(
+                sql.contains("last(delta) AS delta"),
+                "view {} missing delta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(gamma) AS gamma"),
+                "view {} missing gamma",
+                def.name
+            );
+            assert!(
+                sql.contains("last(theta) AS theta"),
+                "view {} missing theta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(vega) AS vega"),
+                "view {} missing vega",
+                def.name
+            );
         }
     }
 
@@ -817,6 +854,15 @@ mod tests {
         assert!(CANDLES_1S_CREATE_DDL.contains("high DOUBLE"));
         assert!(CANDLES_1S_CREATE_DDL.contains("low DOUBLE"));
         assert!(CANDLES_1S_CREATE_DDL.contains("close DOUBLE"));
+    }
+
+    #[test]
+    fn test_candles_1s_ddl_has_greeks_columns() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("iv DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("delta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("gamma DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("theta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("vega DOUBLE"));
     }
 
     // -----------------------------------------------------------------------
