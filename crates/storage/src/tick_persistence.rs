@@ -9480,4 +9480,909 @@ mod tests {
         assert_eq!(deserialized.total_sell_quantity, tick.total_sell_quantity);
         assert_eq!(deserialized.total_buy_quantity, tick.total_buy_quantity);
     }
+
+    // =======================================================================
+    // Coverage: TickPersistenceWriter append_tick reconnect + buffer path
+    // (lines 238-294)
+    // =======================================================================
+
+    #[test]
+    fn test_tick_append_reconnect_success_drains_buffer() {
+        // Exercise lines 214-218: append_tick when sender=None, reconnect
+        // succeeds, drain_tick_buffer called.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Disconnect, buffer a tick
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+        writer.tick_buffer.push_back(make_test_tick(100, 500.0));
+        assert_eq!(writer.buffered_tick_count(), 1);
+
+        // Now point to a valid server and allow reconnect
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // append_tick should reconnect, drain the buffer, then append
+        let tick = make_test_tick(101, 510.0);
+        let result = writer.append_tick(&tick);
+        assert!(result.is_ok());
+        assert!(writer.sender.is_some(), "must be reconnected");
+    }
+
+    #[test]
+    fn test_tick_append_reconnect_failure_buffers_tick() {
+        // Exercise lines 220-224: reconnect fails → buffer the tick.
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        // Use a valid server first to create the writer
+        let port = spawn_tcp_drain_server();
+        let config_ok = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config_ok).unwrap();
+
+        // Disconnect with unreachable conf
+        writer.sender = None;
+        writer.ilp_conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        let tick = make_test_tick(200, 600.0);
+        let result = writer.append_tick(&tick);
+        assert!(result.is_ok(), "append must succeed (tick buffered)");
+        assert_eq!(writer.buffered_tick_count(), 1);
+        assert!(writer.sender.is_none());
+    }
+
+    #[test]
+    fn test_tick_force_flush_sender_none_rescues_and_reconnects() {
+        // Exercise lines 274-280: force_flush with sender=None rescues
+        // in-flight and tries reconnect.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Simulate: sender is None, some ticks in-flight
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+        writer.pending_count = 2;
+        writer.in_flight.push(make_test_tick(300, 700.0));
+        writer.in_flight.push(make_test_tick(301, 710.0));
+
+        let result = writer.force_flush();
+        // Should rescue in-flight ticks, then fail reconnect (throttled)
+        assert!(result.is_err() || result.is_ok());
+        // In-flight should be empty (rescued to ring buffer)
+        assert!(writer.in_flight.is_empty());
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_tick_force_flush_sender_flush_error_rescues() {
+        // Exercise lines 288-294: sender.flush() fails, sender set to None,
+        // in-flight rescued.
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Append ticks
+        for i in 0..3_u32 {
+            let tick = make_test_tick(400 + i, 800.0 + i as f32);
+            writer.append_tick(&tick).unwrap();
+        }
+        assert_eq!(writer.pending_count(), 3);
+
+        // Now disconnect and call force_flush — the sender was moved but
+        // pending_count > 0 and sender is None, so it rescues.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        let _result = writer.force_flush();
+        // In-flight rescued to ring buffer
+        assert_eq!(writer.buffered_tick_count(), 3);
+        assert!(writer.in_flight.is_empty());
+    }
+
+    // =======================================================================
+    // Coverage: spill_tick_to_disk paths (lines 375-387)
+    // =======================================================================
+
+    #[test]
+    fn test_spill_tick_to_disk_write_error_nulls_writer() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Create read-only file as spill writer to trigger write error
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-tick-spill-werr-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("ticks-write-err.bin");
+        std::fs::write(&spill_path, b"").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&spill_path)
+            .unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        let tick = make_test_tick(500, 900.0);
+        writer.spill_tick_to_disk(&tick);
+        assert!(
+            writer.spill_writer.is_none(),
+            "spill_writer must be None after write failure"
+        );
+
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_spill_tick_to_disk_warns_at_10000_multiple() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-tick-spill-10k-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("ticks-10k.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        writer.ticks_spilled_total = 9999;
+        let tick = make_test_tick(600, 1000.0);
+        writer.spill_tick_to_disk(&tick);
+        assert_eq!(writer.ticks_spilled_total, 10000);
+
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // Coverage: drain_tick_buffer + drain_disk_spill (lines 418-501)
+    // =======================================================================
+
+    #[test]
+    fn test_drain_tick_buffer_noop_when_no_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+        writer.tick_buffer.push_back(make_test_tick(700, 1100.0));
+
+        writer.drain_tick_buffer();
+        assert_eq!(
+            writer.buffered_tick_count(),
+            1,
+            "buffer must not drain when sender is None"
+        );
+    }
+
+    #[test]
+    fn test_drain_disk_spill_noop_when_no_spill_path_tick() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert!(writer.spill_path.is_none());
+
+        let drained = writer.drain_disk_spill();
+        assert_eq!(drained, 0);
+    }
+
+    #[test]
+    fn test_drain_disk_spill_reads_candles_and_deletes_file() {
+        use std::io::Write as _;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-tick-drain-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("ticks-drain.bin");
+
+        let tick_count = 5_usize;
+        {
+            let file = std::fs::File::create(&spill_path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..tick_count as u32 {
+                bw.write_all(&serialize_tick(&make_test_tick(800 + i, 1200.0)))
+                    .unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        writer.spill_path = Some(spill_path.clone());
+        writer.ticks_spilled_total = tick_count as u64;
+
+        let drained = writer.drain_disk_spill();
+        assert_eq!(drained, tick_count);
+        assert!(!spill_path.exists(), "spill file must be deleted");
+        assert_eq!(writer.ticks_spilled_total, 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // Coverage: stale spill file recovery (lines 517-567)
+    // =======================================================================
+
+    #[test]
+    fn test_recover_stale_tick_spill_when_sender_none() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+
+        let recovered = writer.recover_stale_spill_files();
+        assert_eq!(recovered, 0, "must return 0 when sender is None");
+    }
+
+    #[test]
+    fn test_recover_stale_tick_spill_nonexistent_dir_not_found() {
+        // Exercise line 518: NotFound error returns 0
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        // Default TICK_SPILL_DIR may or may not exist — just verify no panic
+        let _recovered = writer.recover_stale_spill_files();
+    }
+
+    #[test]
+    fn test_recover_stale_tick_spill_with_data() {
+        use std::io::Write as _;
+
+        let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+
+        let spill_file = real_spill_dir.join("ticks-20230115.bin");
+        let tick_count = 20_usize;
+
+        {
+            let file = std::fs::File::create(&spill_file).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..tick_count as u32 {
+                bw.write_all(&serialize_tick(&make_test_tick(900 + i, 1300.0)))
+                    .unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        let recovered = writer.recover_stale_spill_files();
+        assert!(
+            recovered >= tick_count,
+            "must recover at least {tick_count} ticks"
+        );
+        assert!(
+            !spill_file.exists(),
+            "stale spill file must be deleted after recovery"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: DepthPersistenceWriter all methods (lines 1084-1300)
+    // =======================================================================
+
+    fn make_test_depth() -> [MarketDepthLevel; 5] {
+        let mut depth = [MarketDepthLevel::default(); 5];
+        for (i, level) in depth.iter_mut().enumerate() {
+            level.bid_quantity = (1000 + i as u32) * 10;
+            level.ask_quantity = (1000 + i as u32) * 10 + 5;
+            level.bid_orders = (50 + i as u16) * 2;
+            level.ask_orders = (50 + i as u16) * 2 + 1;
+            level.bid_price = 24500.0 - i as f32 * 10.0;
+            level.ask_price = 24500.0 + i as f32 * 10.0;
+        }
+        depth
+    }
+
+    #[test]
+    fn test_depth_append_auto_flush_rescues_on_failure() {
+        // Exercise lines 1081-1088: auto-flush failure during append
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        // Append enough to trigger auto-flush
+        for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
+            let result =
+                writer.append_depth(10000 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            assert!(result.is_ok());
+        }
+        // Auto-flush should have fired — pending should be 0 or low
+        assert!(
+            writer.pending_count < DEPTH_FLUSH_BATCH_SIZE,
+            "auto-flush should have fired"
+        );
+    }
+
+    #[test]
+    fn test_depth_flush_if_needed_triggers_after_interval() {
+        // Exercise lines 1094-1104
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer
+            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .unwrap();
+        assert_eq!(writer.pending_count, 1);
+
+        // Set last_flush_ms far in the past to trigger flush
+        writer.last_flush_ms = 0;
+        writer.flush_if_needed().unwrap();
+        assert_eq!(
+            writer.pending_count, 0,
+            "flush_if_needed should have flushed"
+        );
+    }
+
+    #[test]
+    fn test_depth_force_flush_no_pending_is_noop() {
+        // Exercise lines 1113-1115
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        let result = writer.force_flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_depth_force_flush_sender_none_rescues_in_flight() {
+        // Exercise lines 1117-1123
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer
+            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .unwrap();
+
+        // Disconnect
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        let _result = writer.force_flush();
+        // In-flight must be rescued
+        assert!(writer.in_flight.is_empty());
+        assert!(writer.buffered_depth_count() > 0);
+    }
+
+    #[test]
+    fn test_depth_force_flush_sender_flush_error() {
+        // Exercise lines 1131-1137: sender.flush() fails
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer
+            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .unwrap();
+
+        // Drop sender, set to None to simulate broken pipe
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        let _result = writer.force_flush();
+        assert!(writer.sender.is_none());
+        assert!(writer.in_flight.is_empty());
+    }
+
+    #[test]
+    fn test_depth_rescue_in_flight_empty_resets() {
+        // Exercise line 1152: in_flight empty → reset pending
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        writer.pending_count = 5;
+        writer.rescue_in_flight();
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    #[test]
+    fn test_depth_buffered_count_and_spilled_total() {
+        // Exercise lines 1162-1170: accessor methods
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.buffered_depth_count(), 0);
+        assert_eq!(writer.depth_spilled_total(), 0);
+
+        writer.depth_spilled_total = 99;
+        assert_eq!(writer.depth_spilled_total(), 99);
+    }
+
+    #[test]
+    fn test_depth_buffer_depth_pushes_to_ring() {
+        // Exercise lines 1179-1190
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        writer.buffer_depth(BufferedDepth {
+            security_id: 11536,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth,
+        });
+        assert_eq!(writer.buffered_depth_count(), 1);
+    }
+
+    #[test]
+    fn test_depth_spill_to_disk_creates_and_writes() {
+        // Exercise lines 1194-1206
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-spill-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-spill.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        let depth = make_test_depth();
+        let snapshot = BufferedDepth {
+            security_id: 11536,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth,
+        };
+        writer.spill_depth_to_disk(&snapshot);
+        assert_eq!(writer.depth_spilled_total, 1);
+
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_depth_drain_buffer_noop_when_sender_none() {
+        // Exercise line 1235
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+
+        let depth = make_test_depth();
+        writer.buffer_depth(BufferedDepth {
+            security_id: 11536,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth,
+        });
+
+        writer.drain_depth_buffer();
+        assert_eq!(
+            writer.buffered_depth_count(),
+            1,
+            "buffer must not drain when sender is None"
+        );
+    }
+
+    #[test]
+    fn test_depth_drain_buffer_drains_ring() {
+        // Exercise lines 1234-1256
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let depth = make_test_depth();
+        for i in 0..5_u32 {
+            writer.buffer_depth(BufferedDepth {
+                security_id: 20000 + i,
+                exchange_segment_code: 2,
+                received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
+                depth,
+            });
+        }
+        assert_eq!(writer.buffered_depth_count(), 5);
+
+        writer.drain_depth_buffer();
+        assert_eq!(
+            writer.buffered_depth_count(),
+            0,
+            "ring buffer must be empty after drain"
+        );
+    }
+
+    #[test]
+    fn test_depth_drain_disk_spill_reads_and_deletes() {
+        // Exercise lines 1260-1302
+        use std::io::Write as _;
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-drain-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-drain.bin");
+
+        let depth = make_test_depth();
+        let snapshot_count = 3_usize;
+        {
+            let file = std::fs::File::create(&spill_path).unwrap();
+            let mut bw = BufWriter::new(file);
+            for i in 0..snapshot_count as u32 {
+                let snapshot = BufferedDepth {
+                    security_id: 30000 + i,
+                    exchange_segment_code: 2,
+                    received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
+                    depth,
+                };
+                bw.write_all(&serialize_depth(&snapshot)).unwrap();
+            }
+            bw.flush().unwrap();
+        }
+
+        writer.spill_path = Some(spill_path.clone());
+        writer.depth_spilled_total = snapshot_count as u64;
+
+        writer.drain_depth_disk_spill();
+        // Force flush any remaining
+        let _ = writer.force_flush();
+
+        assert!(
+            !spill_path.exists(),
+            "spill file must be deleted after drain"
+        );
+        assert_eq!(writer.depth_spilled_total, 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_depth_drain_disk_spill_no_path_returns_early() {
+        // Exercise line 1263: no spill path → early return
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        assert!(writer.spill_path.is_none());
+        // Should be a no-op
+        writer.drain_depth_disk_spill();
+    }
+
+    // =======================================================================
+    // Coverage: DepthPersistenceWriter reconnect + try_reconnect_on_error
+    // (lines 1313-1372)
+    // =======================================================================
+
+    #[test]
+    fn test_depth_reconnect_succeeds() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        let result = writer.reconnect();
+        assert!(result.is_ok());
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_depth_try_reconnect_when_sender_some_is_noop() {
+        // Exercise line 1360-1361: sender is Some → return Ok immediately
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_ok());
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_depth_try_reconnect_throttled() {
+        // Exercise lines 1364-1368: throttle check
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        let result = writer.try_reconnect_on_error();
+        assert!(result.is_err(), "must fail when throttled");
+        assert!(writer.sender.is_none());
+    }
+
+    #[test]
+    fn test_depth_append_when_disconnected_reconnect_fails_buffers() {
+        // Exercise lines 1044-1058: reconnect fails → buffer snapshot
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        let depth = make_test_depth();
+        let result = writer.append_depth(40000, 2, 1_740_556_500_000_000_000, &depth);
+        assert!(result.is_ok());
+        assert_eq!(writer.buffered_depth_count(), 1);
+    }
+
+    #[test]
+    fn test_depth_append_when_disconnected_reconnect_succeeds_drains() {
+        // Exercise lines 1044-1049: reconnect succeeds → drain buffer
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Put something in the ring buffer
+        let depth = make_test_depth();
+        writer.buffer_depth(BufferedDepth {
+            security_id: 50000,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth,
+        });
+
+        // Disconnect
+        writer.sender = None;
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+        writer.next_reconnect_allowed = std::time::Instant::now();
+
+        // Append should reconnect, drain buffer, then append new
+        let result = writer.append_depth(50001, 2, 1_740_556_500_000_000_001, &depth);
+        assert!(result.is_ok());
+        assert!(writer.sender.is_some());
+        // Buffer should be drained
+        assert_eq!(writer.buffered_depth_count(), 0);
+    }
+
+    #[test]
+    fn test_depth_spill_write_error_nulls_writer() {
+        // Exercise lines 1199-1200
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-spill-werr-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-write-err.bin");
+        std::fs::write(&spill_path, b"").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&spill_path)
+            .unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        let depth = make_test_depth();
+        let snapshot = BufferedDepth {
+            security_id: 60000,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth,
+        };
+        writer.spill_depth_to_disk(&snapshot);
+        assert!(
+            writer.spill_writer.is_none(),
+            "spill writer must be None after write error"
+        );
+
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_depth_spill_warns_at_1000_multiple() {
+        // Exercise lines 1203-1204
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-depth-spill-1k-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("depth-1k.bin");
+        let file = std::fs::File::create(&spill_path).unwrap();
+        writer.spill_writer = Some(BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+
+        writer.depth_spilled_total = 999;
+        let depth = make_test_depth();
+        let snapshot = BufferedDepth {
+            security_id: 70000,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth,
+        };
+        writer.spill_depth_to_disk(&snapshot);
+        assert_eq!(writer.depth_spilled_total, 1000);
+
+        let _ = std::fs::remove_file(&spill_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

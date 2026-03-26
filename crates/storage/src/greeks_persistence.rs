@@ -3118,26 +3118,6 @@ mod tests {
     // Coverage: flush() error paths (lines 523-541)
     // =======================================================================
 
-    /// Spawn a background TCP server that accepts one connection and drains
-    /// all data until EOF. Returns the port.
-    fn spawn_tcp_drain_server() -> u16 {
-        use std::io::Read as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            }
-        });
-        port
-    }
-
     #[test]
     fn test_greeks_flush_sender_none_discards_and_returns_ok() {
         // Exercise lines 537-541: flush() when sender is None (no live QuestDB).
@@ -3231,14 +3211,23 @@ mod tests {
             strike_price: 25000.0,
             option_type: "CE",
             expiry_date: "2026-04-30",
-            ltp: 250.5,
-            volume: 100000,
+            spot_price: 24500.0,
+            last_price: 250.5,
+            average_price: 245.0,
             oi: 500000,
+            previous_close_price: 240.0,
+            previous_oi: 480000,
+            previous_volume: 90000,
+            volume: 100000,
+            top_bid_price: 249.0,
+            top_bid_quantity: 1000,
+            top_ask_price: 251.0,
+            top_ask_quantity: 1200,
+            implied_volatility: 15.5,
             delta: 0.55,
             gamma: 0.001,
             theta: -5.0,
             vega: 10.0,
-            iv: 15.5,
             ts_nanos: 1_740_556_500_000_000_000,
         };
         writer.write_dhan_raw_row(&row).unwrap();

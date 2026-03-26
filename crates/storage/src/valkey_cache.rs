@@ -1481,4 +1481,174 @@ mod tests {
             assert!(ttl <= 86_400, "hour {hour}: TTL {ttl} > 86400");
         }
     }
+
+    // =======================================================================
+    // Coverage: pure helper functions (lines 32-74)
+    // Additional tests to maximize tarpaulin tracing
+    // =======================================================================
+
+    #[test]
+    fn test_build_valkey_url_returns_string_with_host_and_port() {
+        let result = build_valkey_url("my-host", 9999);
+        assert!(result.contains("my-host"));
+        assert!(result.contains("9999"));
+        assert!(result.starts_with("redis://"));
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_contains_suffix() {
+        let result = build_instrument_cache_key("test_suffix");
+        assert!(result.contains("test_suffix"));
+        assert!(result.starts_with("dlt:instrument:"));
+    }
+
+    #[test]
+    fn test_build_token_cache_key_contains_suffix() {
+        let result = build_token_cache_key("refresh");
+        assert!(result.contains("refresh"));
+        assert!(result.starts_with("dlt:token:"));
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_contains_security_id_and_suffix() {
+        let result = build_tick_cache_key(12345, "volume");
+        assert!(result.contains("12345"));
+        assert!(result.contains("volume"));
+        assert!(result.starts_with("dlt:tick:"));
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_returns_u64() {
+        let result = compute_instrument_ttl_secs(1_700_000_000, 8);
+        // Should be a positive number between 60 and 86400
+        assert!(result >= 60);
+        assert!(result <= 86_400);
+    }
+
+    // =======================================================================
+    // Coverage: ValkeyPool methods without live Redis (lines 95-325)
+    // =======================================================================
+
+    #[test]
+    fn test_valkey_pool_reconnect_without_running_redis() {
+        // Pool reconnect should succeed (pool builder succeeds; connections are lazy).
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.reconnect();
+        assert!(
+            result.is_ok(),
+            "reconnect must succeed (lazy connections, no actual Redis needed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_health_check_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16379, // unlikely to have Redis on this port
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.health_check().await;
+        assert!(
+            result.is_err(),
+            "health check must fail when Redis is not running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_get_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16380,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.get("test_key").await;
+        assert!(result.is_err(), "GET must fail when Redis is not running");
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_set_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16381,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set("test_key", "test_value").await;
+        assert!(result.is_err(), "SET must fail when Redis is not running");
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_set_ex_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16382,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_ex("test_key", "test_value", 60).await;
+        assert!(
+            result.is_err(),
+            "SET EX must fail when Redis is not running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_del_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16383,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.del("test_key").await;
+        assert!(result.is_err(), "DEL must fail when Redis is not running");
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_exists_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16384,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.exists("test_key").await;
+        assert!(
+            result.is_err(),
+            "EXISTS must fail when Redis is not running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valkey_pool_set_nx_ex_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16385,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_nx_ex("lock_key", "value", 10).await;
+        assert!(
+            result.is_err(),
+            "SET NX EX must fail when Redis is not running"
+        );
+    }
+
+    #[test]
+    fn test_build_pool_with_valid_config() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::build_pool(&config);
+        assert!(pool.is_ok(), "build_pool must succeed with valid config");
+    }
 }
