@@ -9121,7 +9121,7 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_build_tick_row_produces_valid_ilp() {
+    fn test_build_tick_row_ilp_content_all_fields() {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = make_test_tick(42528, 25650.5);
         build_tick_row(&mut buffer, &tick).unwrap();
@@ -9146,7 +9146,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tick_row_multiple_rows() {
+    fn test_build_tick_row_accumulates_5_rows() {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         for i in 0..5_u32 {
             let tick = make_test_tick(1000 + i, 24500.0 + (i as f32));
@@ -9206,7 +9206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_previous_close_row_zero_oi() {
+    fn test_build_previous_close_row_equity_zero_oi() {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         build_previous_close_row(&mut buffer, 11536, 1, 1500.0, 0, 1_740_556_500_000_000_000)
             .unwrap();
@@ -9230,7 +9230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_f32_to_f64_clean_negative_zero() {
+    fn test_f32_to_f64_clean_neg_zero_handled() {
         let result = f32_to_f64_clean(-0.0_f32);
         assert!(result == 0.0 || result == -0.0);
     }
@@ -9405,12 +9405,12 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_tick_spill_record_size() {
+    fn test_tick_spill_record_size_is_72() {
         assert_eq!(TICK_SPILL_RECORD_SIZE, 72);
     }
 
     #[test]
-    fn test_depth_spill_record_size() {
+    fn test_depth_spill_record_size_is_116() {
         assert_eq!(DEPTH_SPILL_RECORD_SIZE, 116);
     }
 

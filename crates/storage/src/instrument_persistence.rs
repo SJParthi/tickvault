@@ -4310,7 +4310,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_lifecycle_event_debug_impl() {
+    fn test_lifecycle_event_debug_format_lot_size() {
         let event = LifecycleEvent {
             security_id: 42528,
             underlying_symbol: "NIFTY".to_string(),
@@ -4325,7 +4325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_event_type_clone() {
+    fn test_lifecycle_event_type_clone_reused_variant() {
         let original = LifecycleEventType::SecurityIdReused;
         let cloned = original.clone();
         assert_eq!(original, cloned);

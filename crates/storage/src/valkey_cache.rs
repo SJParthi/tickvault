@@ -1289,7 +1289,7 @@ mod tests {
     fn test_compute_instrument_ttl_one_second_before_target() {
         // IST at 05:59:59 → target 06:00:00 → should be 1 second
         // but clamped to minimum 60
-        let ist_offset: u64 = 19_800;
+        let _ist_offset: u64 = 19_800;
         // epoch at IST 05:59:59 = IST offset (19800) + 5*3600 + 59*60 + 59 = 19800 + 21599 = 41399
         // so UTC epoch = 41399 - 19800 = 21599
         let epoch = 21_599_u64;

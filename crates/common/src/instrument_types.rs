@@ -3188,7 +3188,7 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn test_index_constituency_map_serde_roundtrip() {
+    fn test_index_constituency_map_serde_roundtrip_multi_index() {
         let map = make_test_constituency_map();
         let json = serde_json::to_string(&map).unwrap();
         let deserialized: IndexConstituencyMap = serde_json::from_str(&json).unwrap();
