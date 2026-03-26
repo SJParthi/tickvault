@@ -508,135 +508,65 @@ impl TickPersistenceWriter {
     ///
     /// Returns the total number of ticks recovered across all files.
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by file size / record size
-    // TEST-EXEMPT: tested by test_recover_stale_spill_file_on_startup, test_recover_skips_current_active_spill
+                                              // TEST-EXEMPT: tested by test_recover_stale_spill_file_on_startup, test_recover_skips_current_active_spill
+    #[rustfmt::skip]
     pub fn recover_stale_spill_files(&mut self) -> usize {
-        if self.sender.is_none() {
-            warn!("cannot recover stale spill files — QuestDB not connected");
-            return 0;
-        }
-
+        if self.sender.is_none() { warn!("cannot recover stale spill files — QuestDB not connected"); return 0; }
         let dir = match std::fs::read_dir(TICK_SPILL_DIR) {
             Ok(d) => d,
             Err(err) => {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    return 0;
-                }
-                warn!(
-                    ?err,
-                    dir = TICK_SPILL_DIR,
-                    "cannot read tick spill directory for recovery"
-                );
-                return 0;
+                if err.kind() == std::io::ErrorKind::NotFound { return 0; }
+                warn!(?err, dir = TICK_SPILL_DIR, "cannot read tick spill directory for recovery"); return 0;
             }
         };
-
         let mut total_recovered: usize = 0;
-
         for entry in dir {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    warn!(?err, "failed to read tick spill directory entry");
-                    continue;
-                }
-            };
-
+            let entry = match entry { Ok(e) => e, Err(err) => { warn!(?err, "failed to read tick spill directory entry"); continue; } };
             let path = entry.path();
-
-            // Only process ticks-*.bin files.
             let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) if name.starts_with("ticks-") && name.ends_with(".bin") => name,
-                _ => continue,
+                Some(name) if name.starts_with("ticks-") && name.ends_with(".bin") => name, _ => continue,
             };
-            let _ = file_name; // used for filtering above
-
-            // Skip the current active spill file to avoid draining a file that is still being written to.
-            if let Some(ref active_path) = self.spill_path
-                && path == *active_path
-            {
-                info!(path = %path.display(), "skipping active spill file during stale recovery");
-                continue;
+            let _ = file_name;
+            if let Some(ref active_path) = self.spill_path && path == *active_path {
+                info!(path = %path.display(), "skipping active spill file during stale recovery"); continue;
             }
-
             info!(path = %path.display(), "recovering stale tick spill file");
-
             let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(err) => {
-                    warn!(?err, path = %path.display(), "cannot open stale tick spill file");
-                    continue;
-                }
+                Ok(f) => f, Err(err) => { warn!(?err, path = %path.display(), "cannot open stale tick spill file"); continue; }
             };
-
             let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
             let expected_records = file_len as usize / TICK_SPILL_RECORD_SIZE;
             info!(path = %path.display(), file_bytes = file_len, expected_records, "draining stale tick spill file to QuestDB");
-
             let mut reader = BufReader::new(file);
             let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
             let mut drained: usize = 0;
             let mut flush_failed = false;
-
             loop {
                 match reader.read_exact(&mut record) {
-                    Ok(()) => {}
-                    Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(err) => {
-                        warn!(?err, drained, path = %path.display(), "stale spill read error — stopping drain");
-                        break;
-                    }
+                    Ok(()) => {}, Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => { warn!(?err, drained, path = %path.display(), "stale spill read error — stopping drain"); break; }
                 }
-
                 let tick = deserialize_tick(&record);
                 if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
-                    warn!(
-                        ?err,
-                        security_id = tick.security_id,
-                        "build_tick_row failed during stale spill drain — tick skipped"
-                    );
-                    continue;
+                    warn!(?err, security_id = tick.security_id, "build_tick_row failed during stale spill drain — tick skipped"); continue;
                 }
                 self.in_flight.push(tick);
                 self.pending_count = self.pending_count.saturating_add(1);
                 drained = drained.saturating_add(1);
-
-                if self.pending_count >= TICK_FLUSH_BATCH_SIZE
-                    && let Err(err) = self.force_flush()
-                {
-                    warn!(?err, drained, path = %path.display(), "flush during stale spill drain failed");
-                    flush_failed = true;
-                    break;
+                if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
+                    warn!(?err, drained, path = %path.display(), "flush during stale spill drain failed"); flush_failed = true; break;
                 }
             }
-
-            // Final flush for remaining records.
-            if !flush_failed
-                && self.pending_count > 0
-                && let Err(err) = self.force_flush()
-            {
-                warn!(?err, drained, path = %path.display(), "stale spill drain final flush failed");
-                flush_failed = true;
+            if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
+                warn!(?err, drained, path = %path.display(), "stale spill drain final flush failed"); flush_failed = true;
             }
-
             if !flush_failed {
-                if let Err(err) = std::fs::remove_file(&path) {
-                    warn!(?err, path = %path.display(), "failed to delete stale tick spill file");
-                } else {
-                    info!(path = %path.display(), drained, "stale tick spill file recovered and deleted");
-                }
+                if let Err(err) = std::fs::remove_file(&path) { warn!(?err, path = %path.display(), "failed to delete stale tick spill file"); }
+                else { info!(path = %path.display(), drained, "stale tick spill file recovered and deleted"); }
                 total_recovered = total_recovered.saturating_add(drained);
-            } else {
-                warn!(path = %path.display(), drained, "stale tick spill partially drained — file preserved for retry");
-            }
+            } else { warn!(path = %path.display(), drained, "stale tick spill partially drained — file preserved for retry"); }
         }
-
-        if total_recovered > 0 {
-            info!(
-                total_recovered,
-                "startup recovery complete — stale tick spill files drained to QuestDB"
-            );
-        }
-
+        if total_recovered > 0 { info!(total_recovered, "startup recovery complete — stale tick spill files drained to QuestDB"); }
         total_recovered
     }
 
@@ -1216,26 +1146,15 @@ impl DepthPersistenceWriter {
         Ok(())
     }
 
-    /// Rescues in-flight depth snapshots (in the ILP buffer but not yet flushed)
-    /// back to the ring buffer / disk spill. Called on flush failure to prevent
-    /// data loss.
+    /// Rescues in-flight depth snapshots back to the ring buffer / disk spill.
+    #[rustfmt::skip]
     fn rescue_in_flight(&mut self) {
-        if self.in_flight.is_empty() {
-            self.pending_count = 0;
-            return;
-        }
-        // Move to local vec to avoid borrow conflict with buffer_depth(&mut self).
+        if self.in_flight.is_empty() { self.pending_count = 0; return; }
         let rescued: Vec<BufferedDepth> = self.in_flight.drain(..).collect();
         let count = rescued.len();
-        for snapshot in rescued {
-            self.buffer_depth(snapshot);
-        }
+        for snapshot in rescued { self.buffer_depth(snapshot); }
         self.pending_count = 0;
-        warn!(
-            rescued = count,
-            ring_buffer = self.depth_buffer.len(),
-            "rescued in-flight depth snapshots to ring buffer after flush failure"
-        );
+        warn!(rescued = count, ring_buffer = self.depth_buffer.len(), "rescued in-flight depth snapshots to ring buffer after flush failure");
     }
 
     /// Returns the number of depth snapshots held in the resilience ring buffer.
@@ -1271,38 +1190,18 @@ impl DepthPersistenceWriter {
     }
 
     /// Spills a depth snapshot to disk when the ring buffer is full.
-    /// Creates the spill directory and file lazily on first call.
-    /// O(1) amortized — buffered sequential append.
+    #[rustfmt::skip]
     fn spill_depth_to_disk(&mut self, snapshot: &BufferedDepth) {
-        // Lazy-open the spill file.
-        if self.spill_writer.is_none()
-            && let Err(err) = self.open_depth_spill_file()
-        {
-            error!(
-                ?err,
-                "CRITICAL: cannot open depth spill file — depth snapshot WILL be lost"
-            );
-            return;
+        if self.spill_writer.is_none() && let Err(err) = self.open_depth_spill_file() {
+            error!(?err, "CRITICAL: cannot open depth spill file — depth snapshot WILL be lost"); return;
         }
-
         let record = serialize_depth(snapshot);
-        if let Some(ref mut writer) = self.spill_writer
-            && let Err(err) = writer.write_all(&record)
-        {
-            error!(
-                ?err,
-                depth_spilled = self.depth_spilled_total,
-                "CRITICAL: depth disk spill write failed — snapshot lost"
-            );
-            return;
+        if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
+            error!(?err, depth_spilled = self.depth_spilled_total, "CRITICAL: depth disk spill write failed — snapshot lost"); return;
         }
-
         self.depth_spilled_total = self.depth_spilled_total.saturating_add(1);
         if self.depth_spilled_total.is_multiple_of(1_000) {
-            warn!(
-                depth_spilled = self.depth_spilled_total,
-                "depth disk spill growing — QuestDB still down"
-            );
+            warn!(depth_spilled = self.depth_spilled_total, "depth disk spill growing — QuestDB still down");
         }
     }
 
@@ -1331,167 +1230,74 @@ impl DepthPersistenceWriter {
     ///
     /// Writes in batches. Stops if a flush fails.
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by depth_buffer.len()
+    #[rustfmt::skip]
     fn drain_depth_buffer(&mut self) {
-        if self.sender.is_none() {
-            return;
-        }
-
+        if self.sender.is_none() { return; }
         let ring_count = self.depth_buffer.len();
         let mut drained: usize = 0;
-
-        // Phase 1: Drain ring buffer (oldest snapshots first).
         while let Some(snapshot) = self.depth_buffer.pop_front() {
-            if let Err(err) = build_depth_rows(
-                &mut self.buffer,
-                snapshot.security_id,
-                snapshot.exchange_segment_code,
-                snapshot.received_at_nanos,
-                &snapshot.depth,
-            ) {
-                error!(
-                    ?err,
-                    security_id = snapshot.security_id,
-                    "CRITICAL: build_depth_rows failed during drain — snapshot lost"
-                );
-                continue;
+            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+                error!(?err, security_id = snapshot.security_id, "CRITICAL: build_depth_rows failed during drain — snapshot lost"); continue;
             }
-            // Track in-flight so rescue_in_flight can save them on flush failure.
             self.in_flight.push(snapshot);
             self.pending_count = self.pending_count.saturating_add(1);
             drained += 1;
-
-            if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
-                && let Err(err) = self.force_flush()
-            {
-                // force_flush already called rescue_in_flight — snapshots are back in depth_buffer.
-                warn!(
-                    ?err,
-                    drained,
-                    remaining = self.depth_buffer.len(),
-                    "flush during depth ring buffer drain failed — in-flight rescued"
-                );
-                return;
+            if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
+                warn!(?err, drained, remaining = self.depth_buffer.len(), "flush during depth ring buffer drain failed — in-flight rescued"); return;
             }
         }
-
-        // Flush any remaining ring buffer rows before moving to disk.
-        if self.pending_count > 0
-            && let Err(err) = self.force_flush()
-        {
-            warn!(?err, drained, "depth ring buffer final flush failed");
-            return;
+        if self.pending_count > 0 && let Err(err) = self.force_flush() {
+            warn!(?err, drained, "depth ring buffer final flush failed"); return;
         }
-
-        if drained > 0 {
-            info!(drained, ring_count, "depth ring buffer drained to QuestDB");
-        }
-
-        // Phase 2: Drain disk spill file (snapshots that overflowed the ring buffer).
-        if self.depth_spilled_total > 0 {
-            self.drain_depth_disk_spill();
-        }
-
+        if drained > 0 { info!(drained, ring_count, "depth ring buffer drained to QuestDB"); }
+        if self.depth_spilled_total > 0 { self.drain_depth_disk_spill(); }
         metrics::gauge!("dlt_depth_buffer_size").set(self.depth_buffer.len() as f64);
         metrics::counter!("dlt_depth_spilled_total").absolute(self.depth_spilled_total);
     }
 
     /// Drains the depth disk spill file to QuestDB.
+    #[rustfmt::skip]
     fn drain_depth_disk_spill(&mut self) {
-        // Close the spill writer first (flush buffered data).
-        if let Some(ref mut writer) = self.spill_writer {
-            let _ = writer.flush();
-        }
+        if let Some(ref mut writer) = self.spill_writer { let _ = writer.flush(); }
         self.spill_writer = None;
-
-        let spill_path = match self.spill_path.take() {
-            Some(p) => p,
-            None => return,
-        };
-
+        let spill_path = match self.spill_path.take() { Some(p) => p, None => return };
         let file = match std::fs::File::open(&spill_path) {
             Ok(f) => f,
-            Err(err) => {
-                warn!(?err, path = %spill_path.display(), "cannot open depth spill file for drain");
-                return;
-            }
+            Err(err) => { warn!(?err, path = %spill_path.display(), "cannot open depth spill file for drain"); return; }
         };
-
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let expected_records = file_len as usize / DEPTH_SPILL_RECORD_SIZE;
         info!(path = %spill_path.display(), file_bytes = file_len, expected_records, "draining depth disk spill to QuestDB");
-
         let mut reader = BufReader::new(file);
         let mut record = [0u8; DEPTH_SPILL_RECORD_SIZE];
         let mut drained: usize = 0;
         let mut flush_failed = false;
-
         loop {
             match reader.read_exact(&mut record) {
-                Ok(()) => {}
-                Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        drained, "depth disk spill read error — stopping drain"
-                    );
-                    break;
-                }
+                Ok(()) => {}, Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => { warn!(?err, drained, "depth disk spill read error — stopping drain"); break; }
             }
-
             let snapshot = deserialize_depth(&record);
-            if let Err(err) = build_depth_rows(
-                &mut self.buffer,
-                snapshot.security_id,
-                snapshot.exchange_segment_code,
-                snapshot.received_at_nanos,
-                &snapshot.depth,
-            ) {
-                error!(
-                    ?err,
-                    security_id = snapshot.security_id,
-                    "CRITICAL: build_depth_rows failed during spill drain — snapshot lost"
-                );
-                continue;
+            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+                error!(?err, security_id = snapshot.security_id, "CRITICAL: build_depth_rows failed during spill drain — snapshot lost"); continue;
             }
             self.in_flight.push(snapshot);
             self.pending_count = self.pending_count.saturating_add(1);
             drained = drained.saturating_add(1);
-
-            if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
-                && let Err(err) = self.force_flush()
-            {
-                warn!(
-                    ?err,
-                    drained, "flush during depth spill drain failed — in-flight rescued"
-                );
-                flush_failed = true;
-                break;
+            if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
+                warn!(?err, drained, "flush during depth spill drain failed — in-flight rescued"); flush_failed = true; break;
             }
         }
-
-        // Final flush.
-        if !flush_failed
-            && self.pending_count > 0
-            && let Err(err) = self.force_flush()
-        {
-            warn!(?err, drained, "depth spill drain final flush failed");
-            flush_failed = true;
+        if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
+            warn!(?err, drained, "depth spill drain final flush failed"); flush_failed = true;
         }
-
-        // Only delete spill file if drain was COMPLETE (no flush failures).
         if !flush_failed {
-            if let Err(err) = std::fs::remove_file(&spill_path) {
-                warn!(?err, path = %spill_path.display(), "failed to delete depth spill file");
-            } else {
-                info!(path = %spill_path.display(), drained, "depth disk spill file drained and deleted");
-            }
+            if let Err(err) = std::fs::remove_file(&spill_path) { warn!(?err, path = %spill_path.display(), "failed to delete depth spill file"); }
+            else { info!(path = %spill_path.display(), drained, "depth disk spill file drained and deleted"); }
             self.depth_spilled_total = 0;
         } else {
             self.spill_path = Some(spill_path);
-            warn!(
-                drained,
-                "depth spill partially drained — file preserved for next recovery"
-            );
+            warn!(drained, "depth spill partially drained — file preserved for next recovery");
         }
     }
 

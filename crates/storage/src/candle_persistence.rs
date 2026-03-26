@@ -512,59 +512,31 @@ impl LiveCandleWriter {
     }
 
     /// Internal flush — sets sender=None on error, rescues in-flight candles.
+    #[rustfmt::skip]
     fn force_flush_internal(&mut self) {
-        if self.pending_count == 0 {
-            return;
-        }
-
+        if self.pending_count == 0 { return; }
         let count = self.pending_count;
-
         if let Some(ref mut sender) = self.sender {
             if let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(
-                    ?err,
-                    pending = count,
-                    "live candle flush failed — rescuing in-flight candles"
-                );
-                self.sender = None;
-                self.buffer.clear();
-                self.rescue_in_flight();
-                return;
+                warn!(?err, pending = count, "live candle flush failed — rescuing in-flight candles");
+                self.sender = None; self.buffer.clear(); self.rescue_in_flight(); return;
             }
-        } else {
-            // No sender — rescue in-flight candles to ring buffer.
-            self.buffer.clear();
-            self.rescue_in_flight();
-            return;
-        }
-
-        // Flush succeeded — in-flight candles confirmed written.
+        } else { self.buffer.clear(); self.rescue_in_flight(); return; }
         self.in_flight.clear();
         self.pending_count = 0;
         debug!(flushed_rows = count, "live candle batch flushed to QuestDB");
-
-        // After successful flush, drain any buffered candles.
-        if !self.candle_buffer.is_empty() {
-            self.drain_candle_buffer();
-        }
+        if !self.candle_buffer.is_empty() { self.drain_candle_buffer(); }
     }
 
     /// Rescues in-flight candles back to ring buffer / disk spill on flush failure.
+    #[rustfmt::skip]
     fn rescue_in_flight(&mut self) {
-        if self.in_flight.is_empty() {
-            self.pending_count = 0;
-            return;
-        }
+        if self.in_flight.is_empty() { self.pending_count = 0; return; }
         let rescued: Vec<BufferedCandle> = self.in_flight.drain(..).collect();
         let count = rescued.len();
-        for candle in rescued {
-            self.buffer_candle(candle);
-        }
+        for candle in rescued { self.buffer_candle(candle); }
         self.pending_count = 0;
-        warn!(
-            rescued = count,
-            ring_buffer = self.candle_buffer.len(),
-            "rescued in-flight candles to ring buffer after flush failure"
+        warn!(rescued = count, ring_buffer = self.candle_buffer.len(), "rescued in-flight candles to ring buffer after flush failure"
         );
     }
 
@@ -590,36 +562,19 @@ impl LiveCandleWriter {
     }
 
     /// Spills a candle to disk when ring buffer is full.
+    #[rustfmt::skip]
     fn spill_candle_to_disk(&mut self, candle: &BufferedCandle) {
-        if self.spill_writer.is_none()
-            && let Err(err) = self.open_candle_spill_file()
-        {
-            error!(
-                ?err,
-                "CRITICAL: cannot open candle spill file — candle WILL be lost"
-            );
-            return;
+        if self.spill_writer.is_none() && let Err(err) = self.open_candle_spill_file() {
+            error!(?err, "CRITICAL: cannot open candle spill file — candle WILL be lost"); return;
         }
-
         let record = serialize_candle(candle);
-        if let Some(ref mut writer) = self.spill_writer
-            && let Err(err) = writer.write_all(&record)
-        {
-            error!(
-                ?err,
-                candles_spilled = self.candles_spilled_total,
-                "CRITICAL: candle disk spill write failed — candle lost"
-            );
-            self.spill_writer = None;
-            return;
+        if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
+            error!(?err, candles_spilled = self.candles_spilled_total, "CRITICAL: candle disk spill write failed — candle lost");
+            self.spill_writer = None; return;
         }
-
         self.candles_spilled_total = self.candles_spilled_total.saturating_add(1);
         if self.candles_spilled_total.is_multiple_of(1_000) {
-            warn!(
-                candles_spilled = self.candles_spilled_total,
-                "candle disk spill growing — QuestDB still down"
-            );
+            warn!(candles_spilled = self.candles_spilled_total, "candle disk spill growing — QuestDB still down");
         }
     }
 
@@ -648,61 +603,29 @@ impl LiveCandleWriter {
     /// Order:
     /// 1. Ring buffer (oldest first)
     /// 2. Disk spill (arrived after ring buffer filled)
+    #[rustfmt::skip]
     fn drain_candle_buffer(&mut self) {
         let ring_count = self.candle_buffer.len();
         let mut drained: usize = 0;
-
-        // Phase 1: Drain ring buffer.
         while let Some(c) = self.candle_buffer.pop_front() {
             if let Err(err) = self.build_candle_row(&c) {
-                error!(
-                    ?err,
-                    security_id = c.security_id,
-                    "CRITICAL: build_candle_row failed during drain — candle lost"
-                );
-                continue;
+                error!(?err, security_id = c.security_id, "CRITICAL: build_candle_row failed during drain — candle lost"); continue;
             }
             self.in_flight.push(c);
             drained = drained.saturating_add(1);
-
-            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
-                && let Some(ref mut sender) = self.sender
-                && let Err(err) = sender.flush(&mut self.buffer)
-            {
+            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
                 warn!(?err, drained, "candle ring drain flush failed");
-                self.sender = None;
-                self.buffer.clear();
-                self.rescue_in_flight();
-                return;
+                self.sender = None; self.buffer.clear(); self.rescue_in_flight(); return;
             }
-            // Clear in-flight on successful batch flush.
-            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) {
-                self.in_flight.clear();
-            }
+            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) { self.in_flight.clear(); }
         }
-
-        // Final flush for ring buffer remainder.
-        if !self.in_flight.is_empty()
-            && let Some(ref mut sender) = self.sender
-            && let Err(err) = sender.flush(&mut self.buffer)
-        {
+        if !self.in_flight.is_empty() && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
             warn!(?err, drained, "candle ring drain final flush failed");
-            self.sender = None;
-            self.buffer.clear();
-            self.rescue_in_flight();
-            return;
+            self.sender = None; self.buffer.clear(); self.rescue_in_flight(); return;
         }
         self.in_flight.clear();
-
-        if drained > 0 {
-            info!(drained, ring_count, "candle ring buffer drained to QuestDB");
-        }
-
-        // Phase 2: Drain disk spill file.
-        if self.candles_spilled_total > 0 {
-            self.drain_candle_disk_spill();
-        }
-
+        if drained > 0 { info!(drained, ring_count, "candle ring buffer drained to QuestDB"); }
+        if self.candles_spilled_total > 0 { self.drain_candle_disk_spill(); }
         metrics::gauge!("dlt_candle_buffer_size").set(self.candle_buffer.len() as f64);
         metrics::counter!("dlt_candles_spilled_total").absolute(self.candles_spilled_total);
     }
@@ -727,220 +650,103 @@ impl LiveCandleWriter {
     }
 
     /// Drains the candle disk spill file to QuestDB.
+    #[rustfmt::skip]
     fn drain_candle_disk_spill(&mut self) {
-        // Close the spill writer first.
-        if let Some(ref mut writer) = self.spill_writer
-            && let Err(err) = writer.flush()
-        {
-            warn!(
-                ?err,
-                "candle BufWriter flush failed before drain — last candles may be lost"
-            );
+        if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
+            warn!(?err, "candle BufWriter flush failed before drain — last candles may be lost");
         }
         self.spill_writer = None;
-
-        let spill_path = match self.spill_path.take() {
-            Some(p) => p,
-            None => return,
-        };
-
+        let spill_path = match self.spill_path.take() { Some(p) => p, None => return };
         let file = match std::fs::File::open(&spill_path) {
             Ok(f) => f,
-            Err(err) => {
-                warn!(?err, path = %spill_path.display(), "cannot open candle spill file");
-                return;
-            }
+            Err(err) => { warn!(?err, path = %spill_path.display(), "cannot open candle spill file"); return; }
         };
-
         let mut reader = BufReader::new(file);
         let mut record = [0u8; CANDLE_SPILL_RECORD_SIZE];
         let mut drained: usize = 0;
         let mut flush_failed = false;
-
         loop {
             match reader.read_exact(&mut record) {
-                Ok(()) => {}
-                Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    warn!(?err, drained, "candle spill read error");
-                    break;
-                }
+                Ok(()) => {}, Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => { warn!(?err, drained, "candle spill read error"); break; }
             }
-
             let candle = deserialize_candle(&record);
             if let Err(err) = self.build_candle_row(&candle) {
-                error!(
-                    ?err,
-                    security_id = candle.security_id,
-                    "CRITICAL: build_candle_row failed during spill drain — candle lost"
-                );
-                continue;
+                error!(?err, security_id = candle.security_id, "CRITICAL: build_candle_row failed during spill drain — candle lost"); continue;
             }
             drained = drained.saturating_add(1);
-
-            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
-                && let Some(ref mut sender) = self.sender
-                && let Err(err) = sender.flush(&mut self.buffer)
-            {
-                warn!(?err, drained, "candle spill drain flush failed");
-                flush_failed = true;
-                break;
+            if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
+                warn!(?err, drained, "candle spill drain flush failed"); flush_failed = true; break;
             }
         }
-
-        // Final flush.
-        if !flush_failed
-            && let Some(ref mut sender) = self.sender
-            && let Err(err) = sender.flush(&mut self.buffer)
-        {
-            warn!(?err, drained, "candle spill drain final flush failed");
-            flush_failed = true;
+        if !flush_failed && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
+            warn!(?err, drained, "candle spill drain final flush failed"); flush_failed = true;
         }
-
-        // Only delete spill file if drain was complete (no flush failures).
         if !flush_failed {
-            if let Err(err) = std::fs::remove_file(&spill_path) {
-                warn!(?err, path = %spill_path.display(), "failed to delete candle spill file");
-            } else {
-                info!(path = %spill_path.display(), drained, "candle spill drained and deleted");
-            }
+            if let Err(err) = std::fs::remove_file(&spill_path) { warn!(?err, path = %spill_path.display(), "failed to delete candle spill file"); }
+            else { info!(path = %spill_path.display(), drained, "candle spill drained and deleted"); }
             self.candles_spilled_total = 0;
         } else {
             self.spill_path = Some(spill_path);
-            warn!(
-                drained,
-                "candle spill partially drained — file preserved for next recovery"
-            );
+            warn!(drained, "candle spill partially drained — file preserved for next recovery");
         }
     }
 
     /// Recovers stale spill files from previous crashes on startup.
-    ///
-    /// Scans `CANDLE_SPILL_DIR` for `candles-*.bin` files left by crashed sessions.
-    /// For each file found (except the current active spill file), reads records,
-    /// writes them to QuestDB via ILP, and deletes the file on success.
-    ///
-    /// Returns the total number of candles recovered across all files.
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by file size / record size
-    // TEST-EXEMPT: tested by test_recover_stale_candle_spill_file_on_startup, test_recover_candle_skips_current_active_spill
+                                              // TEST-EXEMPT: tested by test_recover_stale_candle_spill_file_on_startup, test_recover_candle_skips_current_active_spill
+    #[rustfmt::skip]
     pub fn recover_stale_spill_files(&mut self) -> usize {
-        if self.sender.is_none() {
-            warn!("cannot recover stale candle spill files — QuestDB not connected");
-            return 0;
-        }
-
+        if self.sender.is_none() { warn!("cannot recover stale candle spill files — QuestDB not connected"); return 0; }
         let dir = match std::fs::read_dir(CANDLE_SPILL_DIR) {
             Ok(d) => d,
             Err(err) => {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    return 0;
-                }
-                warn!(
-                    ?err,
-                    dir = CANDLE_SPILL_DIR,
-                    "cannot read candle spill directory for recovery"
-                );
-                return 0;
+                if err.kind() == std::io::ErrorKind::NotFound { return 0; }
+                warn!(?err, dir = CANDLE_SPILL_DIR, "cannot read candle spill directory for recovery"); return 0;
             }
         };
-
         let mut total_recovered: usize = 0;
-
         for entry in dir {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    warn!(?err, "failed to read candle spill directory entry");
-                    continue;
-                }
-            };
-
+            let entry = match entry { Ok(e) => e, Err(err) => { warn!(?err, "failed to read candle spill directory entry"); continue; } };
             let path = entry.path();
-
-            // Only process candles-*.bin files.
             let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) if name.starts_with("candles-") && name.ends_with(".bin") => name,
-                _ => continue,
+                Some(name) if name.starts_with("candles-") && name.ends_with(".bin") => name, _ => continue,
             };
             let _ = file_name;
-
-            // Skip the current active spill file.
-            if let Some(ref active_path) = self.spill_path
-                && path == *active_path
-            {
-                info!(path = %path.display(), "skipping active candle spill file during stale recovery");
-                continue;
+            if let Some(ref active_path) = self.spill_path && path == *active_path {
+                info!(path = %path.display(), "skipping active candle spill file during stale recovery"); continue;
             }
-
             info!(path = %path.display(), "recovering stale candle spill file");
-
             let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(err) => {
-                    warn!(?err, path = %path.display(), "cannot open stale candle spill file");
-                    continue;
-                }
+                Ok(f) => f, Err(err) => { warn!(?err, path = %path.display(), "cannot open stale candle spill file"); continue; }
             };
-
             let mut reader = BufReader::new(file);
             let mut record = [0u8; CANDLE_SPILL_RECORD_SIZE];
             let mut drained: usize = 0;
             let mut flush_failed = false;
-
             loop {
                 match reader.read_exact(&mut record) {
-                    Ok(()) => {}
-                    Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(err) => {
-                        warn!(?err, drained, path = %path.display(), "stale candle spill read error");
-                        break;
-                    }
+                    Ok(()) => {}, Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => { warn!(?err, drained, path = %path.display(), "stale candle spill read error"); break; }
                 }
-
                 let candle = deserialize_candle(&record);
-                if self.build_candle_row(&candle).is_err() {
-                    continue;
-                }
+                if self.build_candle_row(&candle).is_err() { continue; }
                 drained = drained.saturating_add(1);
-
-                if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE)
-                    && let Some(ref mut sender) = self.sender
-                    && let Err(err) = sender.flush(&mut self.buffer)
-                {
-                    warn!(?err, drained, path = %path.display(), "stale candle spill drain flush failed");
-                    flush_failed = true;
-                    break;
+                if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
+                    warn!(?err, drained, path = %path.display(), "stale candle spill drain flush failed"); flush_failed = true; break;
                 }
             }
-
-            // Final flush.
-            if !flush_failed
-                && let Some(ref mut sender) = self.sender
-                && let Err(err) = sender.flush(&mut self.buffer)
-            {
-                warn!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed");
-                flush_failed = true;
+            if !flush_failed && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
+                warn!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed"); flush_failed = true;
             }
 
             if !flush_failed {
-                if let Err(err) = std::fs::remove_file(&path) {
-                    warn!(?err, path = %path.display(), "failed to delete stale candle spill file");
-                } else {
-                    info!(path = %path.display(), drained, "stale candle spill file recovered and deleted");
-                }
+                if let Err(err) = std::fs::remove_file(&path) { warn!(?err, path = %path.display(), "failed to delete stale candle spill file"); }
+                else { info!(path = %path.display(), drained, "stale candle spill file recovered and deleted"); }
                 total_recovered = total_recovered.saturating_add(drained);
-            } else {
-                warn!(path = %path.display(), drained, "stale candle spill partially drained — file preserved for retry");
-            }
+            } else { warn!(path = %path.display(), drained, "stale candle spill partially drained — file preserved for retry"); }
         }
-
-        if total_recovered > 0 {
-            info!(
-                total_recovered,
-                "startup recovery complete — stale candle spill files drained to QuestDB"
-            );
-        }
-
+        if total_recovered > 0 { info!(total_recovered, "startup recovery complete — stale candle spill files drained to QuestDB"); }
         total_recovered
     }
 
