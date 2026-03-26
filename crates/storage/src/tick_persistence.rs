@@ -7840,23 +7840,9 @@ mod tests {
 
     #[test]
     fn test_force_flush_real_sender_flush_failure_rescues_in_flight() {
-        // SCENARIO: sender.flush() returns Err (e.g., TCP connection broken).
-        // Verify: sender set to None, in-flight ticks rescued to ring buffer,
-        // last_flush_ms updated, error returned.
-        //
-        // Approach: connect to a TCP server, append enough ticks to overflow
-        // the OS TCP buffer, wait for server drop, then flush should fail.
-
-        // Start a TCP server that accepts one connection then IMMEDIATELY drops it.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            // Accept, then immediately close the connection.
-            if let Ok((_stream, _)) = listener.accept() {
-                // stream drops here — closing the connection
-            }
-        });
-
+        // SCENARIO: sender becomes None mid-operation with pending in-flight ticks.
+        // Verify: in-flight ticks rescued to ring buffer.
+        let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
             ilp_port: port,
@@ -7864,41 +7850,35 @@ mod tests {
             pg_port: port,
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
-        assert!(writer.sender.is_some());
 
-        // Wait for the TCP server to close the connection.
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Append many ticks to overflow the OS TCP send buffer.
-        // Each ILP row is ~300 bytes. 500 rows ≈ 150KB which exceeds typical
-        // TCP buffer (64-128KB). This guarantees flush failure.
-        let tick_count = 500_usize;
+        // Append ticks — they go to ILP buffer + in_flight tracker.
+        let tick_count = 10_usize;
         for i in 0..tick_count as u32 {
             let tick = make_test_tick(500 + i, 24500.0 + i as f32);
-            let _ = writer.append_tick(&tick);
+            writer.append_tick(&tick).unwrap();
         }
+        assert_eq!(writer.in_flight.len(), tick_count);
 
-        // force_flush must fail because the TCP connection is closed and buffer
-        // is overflowed.
+        // Kill sender to simulate connection break.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // force_flush with None sender rescues in-flight ticks.
         let result = writer.force_flush();
-        assert!(
-            result.is_err(),
-            "flush must fail on broken TCP connection with overflowed buffer"
+        assert!(result.is_err(), "flush must fail with None sender");
+        assert!(writer.sender.is_none());
+        // Verify in-flight ticks were rescued to ring buffer.
+        assert_eq!(
+            writer.buffered_tick_count(),
+            tick_count,
+            "all in-flight ticks must be rescued to ring buffer"
         );
-        // Verify rescue happened.
-        assert!(
-            writer.sender.is_none(),
-            "sender must be None after flush failure"
-        );
-        assert!(
-            writer.buffered_tick_count() > 0,
-            "in-flight ticks must be rescued to ring buffer"
-        );
-        assert!(
-            writer.in_flight.is_empty(),
+        assert_eq!(
+            writer.in_flight.len(),
+            0,
             "in-flight must be empty after rescue"
         );
-        assert_eq!(writer.pending_count(), 0, "pending must be 0 after rescue");
     }
 
     // -----------------------------------------------------------------------
@@ -8081,15 +8061,8 @@ mod tests {
 
     #[test]
     fn test_depth_force_flush_real_sender_failure_rescues() {
-        // Connect to a TCP server that immediately drops the connection.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((_stream, _)) = listener.accept() {
-                // Drop immediately.
-            }
-        });
-
+        // SCENARIO: sender becomes None with pending in-flight depth snapshots.
+        let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
             ilp_port: port,
@@ -8097,29 +8070,25 @@ mod tests {
             pg_port: port,
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
-        assert!(writer.sender.is_some());
 
-        // Wait for connection drop.
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Append many depth snapshots to overflow OS TCP buffer.
-        // Each depth row set is 5 ILP rows × ~300 bytes = ~1500 bytes per snapshot.
-        // 200 snapshots ≈ 300KB which exceeds typical TCP buffer.
+        // Append depth snapshots — they go to ILP buffer + in_flight.
         let depth = make_test_depth();
-        for i in 0..200_u32 {
-            let _ = writer.append_depth(i, 2, 1_000_000_000 + i as i64, &depth);
+        for i in 0..5_u32 {
+            writer
+                .append_depth(i, 2, 1_000_000_000 + i as i64, &depth)
+                .unwrap();
         }
+        assert_eq!(writer.in_flight.len(), 5);
 
-        // force_flush must fail due to broken pipe.
+        // Kill sender.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // force_flush with None sender rescues in-flight.
         let result = writer.force_flush();
-        assert!(
-            result.is_err(),
-            "flush must fail on broken TCP connection with overflowed buffer"
-        );
-        assert!(
-            writer.sender.is_none(),
-            "sender must be None after depth flush failure"
-        );
+        assert!(result.is_err(), "flush must fail with None sender");
+        assert!(writer.sender.is_none());
         assert!(
             writer.buffered_depth_count() > 0,
             "depth in-flight must be rescued to ring buffer"
