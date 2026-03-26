@@ -774,4 +774,106 @@ mod tests {
             "all 60 candles fit in one 5-minute window"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: CandleAggregator::new(), Default, accessor methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_aggregator_is_empty() {
+        let agg = CandleAggregator::new();
+        assert_eq!(agg.active_count(), 0);
+        assert_eq!(agg.total_completed(), 0);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_default_matches_new() {
+        let from_new = CandleAggregator::new();
+        let from_default = CandleAggregator::default();
+        assert_eq!(from_new.active_count(), from_default.active_count());
+        assert_eq!(from_new.total_completed(), from_default.total_completed());
+    }
+
+    #[test]
+    fn test_clear_completed_preserves_capacity() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(1, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(1, 2, 101.0, 1001, 600));
+        assert!(!agg.completed_slice().is_empty());
+        agg.clear_completed();
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_flush_all_emits_all_active_candles() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(1, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(2, 2, 200.0, 1000, 600));
+        agg.update(&make_tick(3, 1, 300.0, 1000, 700));
+        assert_eq!(agg.active_count(), 3);
+
+        agg.flush_all();
+        assert_eq!(agg.active_count(), 0);
+        assert_eq!(agg.completed_slice().len(), 3);
+        assert_eq!(agg.total_completed(), 3);
+    }
+
+    #[test]
+    fn test_update_first_tick_creates_active_candle() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(42, 2, 100.0, 1000, 500));
+        assert_eq!(agg.active_count(), 1);
+        assert_eq!(agg.total_completed(), 0);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_update_same_second_updates_in_place() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(42, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(42, 2, 110.0, 1000, 600)); // same second
+        assert_eq!(agg.active_count(), 1);
+        assert_eq!(agg.total_completed(), 0);
+    }
+
+    #[test]
+    fn test_drain_completed_returns_and_clears() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(42, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(42, 2, 101.0, 1001, 600)); // completes 1000
+        let drained = agg.drain_completed();
+        assert_eq!(drained.len(), 1);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_sweep_stale_no_stale_candles() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(1, 2, 100.0, 1000, 500));
+        agg.sweep_stale(1002); // only 2s old, threshold is 5s
+        assert_eq!(agg.active_count(), 1);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_completed_candle_fields_copy() {
+        let candle = CompletedCandle {
+            security_id: 42,
+            exchange_segment_code: 2,
+            timestamp_secs: 1000,
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 105.0,
+            volume: 5000,
+            tick_count: 5,
+        };
+        let copied = candle;
+        assert_eq!(copied.security_id, candle.security_id);
+        assert_eq!(copied.open, candle.open);
+        assert_eq!(copied.high, candle.high);
+        assert_eq!(copied.low, candle.low);
+        assert_eq!(copied.close, candle.close);
+    }
 }
