@@ -305,23 +305,14 @@ impl TickPersistenceWriter {
 
     /// Rescues in-flight ticks (in the ILP buffer but not yet flushed) back to
     /// the ring buffer / disk spill. Called on flush failure to prevent data loss.
+    #[rustfmt::skip]
     fn rescue_in_flight(&mut self) {
-        if self.in_flight.is_empty() {
-            self.pending_count = 0;
-            return;
-        }
-        // Move to local vec to avoid borrow conflict with buffer_tick(&mut self).
+        if self.in_flight.is_empty() { self.pending_count = 0; return; }
         let rescued: Vec<ParsedTick> = self.in_flight.drain(..).collect();
         let count = rescued.len();
-        for tick in rescued {
-            self.buffer_tick(tick);
-        }
+        for tick in rescued { self.buffer_tick(tick); }
         self.pending_count = 0;
-        warn!(
-            rescued = count,
-            ring_buffer = self.tick_buffer.len(),
-            "rescued in-flight ticks to ring buffer after flush failure"
-        );
+        warn!(rescued = count, ring_buffer = self.tick_buffer.len(), "rescued in-flight ticks to ring buffer after flush failure");
     }
 
     /// Returns the number of ticks currently buffered (not yet flushed).
@@ -377,40 +368,22 @@ impl TickPersistenceWriter {
     /// Spills a tick to disk when the ring buffer is full.
     /// Creates the spill directory and file lazily on first call.
     /// O(1) amortized — buffered sequential append.
+    #[rustfmt::skip]
     fn spill_tick_to_disk(&mut self, tick: &ParsedTick) {
         // Lazy-open the spill file.
-        if self.spill_writer.is_none()
-            && let Err(err) = self.open_spill_file()
-        {
-            // If we can't open the spill file, we have no choice but to drop.
-            // This should only happen if the filesystem is full or read-only.
-            error!(
-                ?err,
-                "CRITICAL: cannot open tick spill file — tick WILL be lost"
-            );
+        if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
+            error!(?err, "CRITICAL: cannot open tick spill file — tick WILL be lost");
             return;
         }
-
         let record = serialize_tick(tick);
-        if let Some(ref mut writer) = self.spill_writer
-            && let Err(err) = writer.write_all(&record)
-        {
-            error!(
-                ?err,
-                ticks_spilled = self.ticks_spilled_total,
-                "CRITICAL: disk spill write failed — tick lost"
-            );
-            // Reset writer so next call can attempt re-open (e.g., after disk space freed).
+        if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
+            error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — tick lost");
             self.spill_writer = None;
             return;
         }
-
         self.ticks_spilled_total = self.ticks_spilled_total.saturating_add(1);
         if self.ticks_spilled_total.is_multiple_of(10_000) {
-            warn!(
-                ticks_spilled = self.ticks_spilled_total,
-                "tick disk spill growing — QuestDB still down"
-            );
+            warn!(ticks_spilled = self.ticks_spilled_total, "tick disk spill growing — QuestDB still down");
         }
     }
 
@@ -441,170 +414,89 @@ impl TickPersistenceWriter {
     ///
     /// Writes in batches. Stops if a flush fails.
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by tick_buffer.len()
+    #[rustfmt::skip]
     fn drain_tick_buffer(&mut self) {
-        if self.sender.is_none() {
-            return;
-        }
-
+        if self.sender.is_none() { return; }
         let ring_count = self.tick_buffer.len();
         let mut drained: usize = 0;
-
-        // Phase 1: Drain ring buffer (oldest ticks first).
         while let Some(tick) = self.tick_buffer.pop_front() {
             if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
-                warn!(
-                    ?err,
-                    security_id = tick.security_id,
-                    "build_tick_row failed during drain — tick skipped"
-                );
+                warn!(?err, security_id = tick.security_id, "build_tick_row failed during drain — tick skipped");
                 continue;
             }
-            // Track in-flight so rescue_in_flight can save them on flush failure.
             self.in_flight.push(tick);
             self.pending_count = self.pending_count.saturating_add(1);
             drained += 1;
-
-            if self.pending_count >= TICK_FLUSH_BATCH_SIZE
-                && let Err(err) = self.force_flush()
-            {
-                // force_flush already called rescue_in_flight — ticks are back in tick_buffer.
-                warn!(
-                    ?err,
-                    drained,
-                    remaining = self.tick_buffer.len(),
-                    "flush during ring buffer drain failed — in-flight ticks rescued"
-                );
+            if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
+                warn!(?err, drained, remaining = self.tick_buffer.len(), "flush during ring buffer drain failed — in-flight ticks rescued");
                 return;
             }
         }
-
-        // Flush any remaining ring buffer rows before moving to disk.
-        if self.pending_count > 0
-            && let Err(err) = self.force_flush()
-        {
-            warn!(?err, drained, "ring buffer final flush failed");
-            return;
+        if self.pending_count > 0 && let Err(err) = self.force_flush() {
+            warn!(?err, drained, "ring buffer final flush failed"); return;
         }
-
-        if drained > 0 {
-            info!(drained, ring_count, "ring buffer drained to QuestDB");
-        }
-
-        // Phase 2: Drain disk spill file (ticks that overflowed the ring buffer).
+        if drained > 0 { info!(drained, ring_count, "ring buffer drained to QuestDB"); }
         if self.ticks_spilled_total > 0 {
             let spill_drained = self.drain_disk_spill();
             drained = drained.saturating_add(spill_drained);
         }
-
         if drained > 0 {
-            info!(
-                total_drained = drained,
-                from_ring = ring_count,
-                from_disk = self.ticks_spilled_total,
-                "recovery drain complete — all ticks written to QuestDB"
-            );
+            info!(total_drained = drained, from_ring = ring_count, from_disk = self.ticks_spilled_total, "recovery drain complete — all ticks written to QuestDB");
             self.just_recovered = true;
         }
-
         metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
         metrics::counter!("dlt_ticks_spilled_total").absolute(self.ticks_spilled_total);
     }
 
     /// Drains the disk spill file to QuestDB. Returns count of ticks drained.
+    #[rustfmt::skip]
     fn drain_disk_spill(&mut self) -> usize {
-        // Close the spill writer first (flush buffered data).
-        if let Some(ref mut writer) = self.spill_writer
-            && let Err(err) = writer.flush()
-        {
-            warn!(
-                ?err,
-                "BufWriter flush failed before drain — last ~111 ticks may be lost"
-            );
+        if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
+            warn!(?err, "BufWriter flush failed before drain — last ~111 ticks may be lost");
         }
         self.spill_writer = None;
-
-        let spill_path = match self.spill_path.take() {
-            Some(p) => p,
-            None => return 0,
-        };
-
+        let spill_path = match self.spill_path.take() { Some(p) => p, None => return 0 };
         let file = match std::fs::File::open(&spill_path) {
             Ok(f) => f,
-            Err(err) => {
-                warn!(?err, path = %spill_path.display(), "cannot open spill file for drain");
-                return 0;
-            }
+            Err(err) => { warn!(?err, path = %spill_path.display(), "cannot open spill file for drain"); return 0; }
         };
-
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let expected_records = file_len as usize / TICK_SPILL_RECORD_SIZE;
         info!(path = %spill_path.display(), file_bytes = file_len, expected_records, "draining disk spill to QuestDB");
-
         let mut reader = BufReader::new(file);
         let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
         let mut drained: usize = 0;
         let mut flush_failed = false;
-
         loop {
             match reader.read_exact(&mut record) {
                 Ok(()) => {}
                 Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    warn!(?err, drained, "disk spill read error — stopping drain");
-                    break;
-                }
+                Err(err) => { warn!(?err, drained, "disk spill read error — stopping drain"); break; }
             }
-
             let tick = deserialize_tick(&record);
             if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
-                warn!(
-                    ?err,
-                    security_id = tick.security_id,
-                    "build_tick_row failed during spill drain — tick skipped"
-                );
+                warn!(?err, security_id = tick.security_id, "build_tick_row failed during spill drain — tick skipped");
                 continue;
             }
             self.in_flight.push(tick);
             self.pending_count = self.pending_count.saturating_add(1);
             drained = drained.saturating_add(1);
-
-            if self.pending_count >= TICK_FLUSH_BATCH_SIZE
-                && let Err(err) = self.force_flush()
-            {
-                warn!(
-                    ?err,
-                    drained, "flush during spill drain failed — in-flight rescued"
-                );
-                flush_failed = true;
-                break;
+            if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
+                warn!(?err, drained, "flush during spill drain failed — in-flight rescued");
+                flush_failed = true; break;
             }
         }
-
-        // Final flush.
-        if !flush_failed
-            && self.pending_count > 0
-            && let Err(err) = self.force_flush()
-        {
-            warn!(?err, drained, "spill drain final flush failed");
-            flush_failed = true;
+        if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
+            warn!(?err, drained, "spill drain final flush failed"); flush_failed = true;
         }
-
-        // Only delete spill file if drain was COMPLETE (no flush failures).
         if !flush_failed {
-            if let Err(err) = std::fs::remove_file(&spill_path) {
-                warn!(?err, path = %spill_path.display(), "failed to delete spill file");
-            } else {
-                info!(path = %spill_path.display(), drained, "disk spill file drained and deleted");
-            }
+            if let Err(err) = std::fs::remove_file(&spill_path) { warn!(?err, path = %spill_path.display(), "failed to delete spill file"); }
+            else { info!(path = %spill_path.display(), drained, "disk spill file drained and deleted"); }
             self.ticks_spilled_total = 0;
         } else {
             self.spill_path = Some(spill_path);
-            warn!(
-                drained,
-                "tick spill partially drained — file preserved for next recovery"
-            );
+            warn!(drained, "tick spill partially drained — file preserved for next recovery");
         }
-
         drained
     }
 
