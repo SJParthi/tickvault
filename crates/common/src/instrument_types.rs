@@ -3279,4 +3279,78 @@ mod tests {
         let hdfc = u.get_underlying("HDFCBANK").unwrap();
         assert_eq!(hdfc.lot_size, 550);
     }
+
+    // -----------------------------------------------------------------------
+    // rkyv roundtrip tests — exercises NaiveDateAsI32, DurationAsMillis,
+    // and DateTimeFixedOffset serialize/deserialize impls.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rkyv_roundtrip_derivative_contract() {
+        // Exercises NaiveDateAsI32 serialize_with (line 564) and
+        // deserialize_with for NaiveDate fields.
+        let contract = DerivativeContract {
+            security_id: 49081,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 23500.0,
+            option_type: Some(crate::types::OptionType::Call),
+            lot_size: 25,
+            tick_size: 0.05,
+            symbol_name: "NIFTY-Mar2026-23500-CE".to_string(),
+            display_name: "NIFTY 27MAR 23500 CE".to_string(),
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract).unwrap();
+        let archived = rkyv::access::<
+            <DerivativeContract as rkyv::Archive>::Archived,
+            rkyv::rancor::Error,
+        >(&bytes)
+        .unwrap();
+        let deserialized: DerivativeContract =
+            rkyv::deserialize::<DerivativeContract, rkyv::rancor::Error>(archived).unwrap();
+
+        assert_eq!(deserialized.security_id, 49081);
+        assert_eq!(
+            deserialized.expiry_date,
+            NaiveDate::from_ymd_opt(2026, 3, 27).unwrap()
+        );
+        assert_eq!(deserialized.strike_price, 23500.0);
+        assert_eq!(deserialized.lot_size, 25);
+    }
+
+    #[test]
+    fn test_rkyv_roundtrip_universe_build_metadata() {
+        use std::time::Duration;
+        // Exercises DurationAsMillis serialize_with (line 699) and
+        // DateTimeFixedOffsetAsI64 serialize/deserialize for DateTime fields.
+        let ist = chrono::FixedOffset::east_opt(19800).unwrap();
+        let meta = UniverseBuildMetadata {
+            csv_source: "https://example.com/scrip.csv".to_string(),
+            csv_row_count: 100_000,
+            parsed_row_count: 80_000,
+            index_count: 10,
+            equity_count: 2000,
+            underlying_count: 50,
+            derivative_count: 5000,
+            option_chain_count: 200,
+            build_duration: Duration::from_millis(1234),
+            build_timestamp: chrono::Utc::now().with_timezone(&ist),
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&meta).unwrap();
+        let archived = rkyv::access::<
+            <UniverseBuildMetadata as rkyv::Archive>::Archived,
+            rkyv::rancor::Error,
+        >(&bytes)
+        .unwrap();
+        let deserialized: UniverseBuildMetadata =
+            rkyv::deserialize::<UniverseBuildMetadata, rkyv::rancor::Error>(archived).unwrap();
+
+        assert_eq!(deserialized.csv_row_count, 100_000);
+        assert_eq!(deserialized.derivative_count, 5000);
+        assert_eq!(deserialized.build_duration, Duration::from_millis(1234));
+    }
 }
