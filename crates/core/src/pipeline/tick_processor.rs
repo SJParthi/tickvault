@@ -651,6 +651,11 @@ pub async fn run_tick_processor(
                                 c.close,
                                 c.volume,
                                 c.tick_count,
+                                c.iv,
+                                c.delta,
+                                c.gamma,
+                                c.theta,
+                                c.vega,
                             ) {
                                 // Never break — remaining candles must still be processed.
                                 // Rate-limit: warn first 100, then every 1000th.
@@ -732,6 +737,11 @@ pub async fn run_tick_processor(
                     c.close,
                     c.volume,
                     c.tick_count,
+                    c.iv,
+                    c.delta,
+                    c.gamma,
+                    c.theta,
+                    c.vega,
                 );
             }
             if let Err(err) = cw.force_flush() {

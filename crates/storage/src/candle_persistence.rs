@@ -300,10 +300,15 @@ struct BufferedCandle {
     close: f32,
     volume: u32,
     tick_count: u32,
+    iv: f64,
+    delta: f64,
+    gamma: f64,
+    theta: f64,
+    vega: f64,
 }
 
-/// Fixed record size for disk-spilled candles: 36 bytes per candle.
-const CANDLE_SPILL_RECORD_SIZE: usize = 36;
+/// Fixed record size for disk-spilled candles: 76 bytes per candle (36 + 5×8 Greeks).
+const CANDLE_SPILL_RECORD_SIZE: usize = 76;
 
 /// Directory for candle spill files.
 const CANDLE_SPILL_DIR: &str = "data/spill";
@@ -321,7 +326,12 @@ fn serialize_candle(c: &BufferedCandle) -> [u8; CANDLE_SPILL_RECORD_SIZE] {
     buf[23..27].copy_from_slice(&c.close.to_le_bytes());
     buf[27..31].copy_from_slice(&c.volume.to_le_bytes());
     buf[31..35].copy_from_slice(&c.tick_count.to_le_bytes());
-    // buf[35] = padding
+    // buf[35] = padding (legacy)
+    buf[36..44].copy_from_slice(&c.iv.to_le_bytes());
+    buf[44..52].copy_from_slice(&c.delta.to_le_bytes());
+    buf[52..60].copy_from_slice(&c.gamma.to_le_bytes());
+    buf[60..68].copy_from_slice(&c.theta.to_le_bytes());
+    buf[68..76].copy_from_slice(&c.vega.to_le_bytes());
     buf
 }
 
@@ -337,6 +347,21 @@ fn deserialize_candle(buf: &[u8; CANDLE_SPILL_RECORD_SIZE]) -> BufferedCandle {
         close: f32::from_le_bytes([buf[23], buf[24], buf[25], buf[26]]),
         volume: u32::from_le_bytes([buf[27], buf[28], buf[29], buf[30]]),
         tick_count: u32::from_le_bytes([buf[31], buf[32], buf[33], buf[34]]),
+        iv: f64::from_le_bytes([
+            buf[36], buf[37], buf[38], buf[39], buf[40], buf[41], buf[42], buf[43],
+        ]),
+        delta: f64::from_le_bytes([
+            buf[44], buf[45], buf[46], buf[47], buf[48], buf[49], buf[50], buf[51],
+        ]),
+        gamma: f64::from_le_bytes([
+            buf[52], buf[53], buf[54], buf[55], buf[56], buf[57], buf[58], buf[59],
+        ]),
+        theta: f64::from_le_bytes([
+            buf[60], buf[61], buf[62], buf[63], buf[64], buf[65], buf[66], buf[67],
+        ]),
+        vega: f64::from_le_bytes([
+            buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
+        ]),
     }
 }
 
@@ -418,7 +443,7 @@ impl LiveCandleWriter {
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
-    #[allow(clippy::too_many_arguments)] // APPROVED: ILP row requires all OHLCV+meta columns
+    #[allow(clippy::too_many_arguments)] // APPROVED: ILP row requires all OHLCV+meta+Greeks columns
     pub fn append_candle(
         &mut self,
         security_id: u32,
@@ -430,6 +455,11 @@ impl LiveCandleWriter {
         close: f32,
         volume: u32,
         tick_count: u32,
+        iv: f64,
+        delta: f64,
+        gamma: f64,
+        theta: f64,
+        vega: f64,
     ) -> Result<()> {
         // If disconnected, try reconnect (throttled) then buffer on failure.
         if self.sender.is_none() {
@@ -448,6 +478,11 @@ impl LiveCandleWriter {
                 close,
                 volume,
                 tick_count,
+                iv,
+                delta,
+                gamma,
+                theta,
+                vega,
             });
             return Ok(());
         }
@@ -467,6 +502,11 @@ impl LiveCandleWriter {
             .and_then(|b| b.column_i64("volume", i64::from(volume)))
             .and_then(|b| b.column_i64("oi", 0))
             .and_then(|b| b.column_i64("tick_count", i64::from(tick_count)))
+            .and_then(|b| b.column_f64("iv", iv))
+            .and_then(|b| b.column_f64("delta", delta))
+            .and_then(|b| b.column_f64("gamma", gamma))
+            .and_then(|b| b.column_f64("theta", theta))
+            .and_then(|b| b.column_f64("vega", vega))
             .and_then(|b| b.at(ts_nanos))
         {
             warn!(?err, "live candle ILP buffer error — buffering candle");
@@ -480,6 +520,11 @@ impl LiveCandleWriter {
                 close,
                 volume,
                 tick_count,
+                iv,
+                delta,
+                gamma,
+                theta,
+                vega,
             };
             self.buffer_candle(candle);
             return Ok(());
@@ -496,6 +541,11 @@ impl LiveCandleWriter {
             close,
             volume,
             tick_count,
+            iv,
+            delta,
+            gamma,
+            theta,
+            vega,
         };
         self.in_flight.push(candle);
         self.pending_count = self.pending_count.saturating_add(1);
@@ -649,6 +699,11 @@ impl LiveCandleWriter {
             .and_then(|b| b.column_i64("volume", i64::from(c.volume)))
             .and_then(|b| b.column_i64("oi", 0))
             .and_then(|b| b.column_i64("tick_count", i64::from(c.tick_count)))
+            .and_then(|b| b.column_f64("iv", c.iv))
+            .and_then(|b| b.column_f64("delta", c.delta))
+            .and_then(|b| b.column_f64("gamma", c.gamma))
+            .and_then(|b| b.column_f64("theta", c.theta))
+            .and_then(|b| b.column_f64("vega", c.vega))
             .and_then(|b| b.at(ts_nanos))
             .context("build candle ILP row")?;
         Ok(())
@@ -1393,6 +1448,11 @@ mod tests {
                 21025.0,
                 50_000,
                 100,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
             )
             .unwrap();
         assert_eq!(writer.pending_count, 1);
@@ -1442,7 +1502,22 @@ mod tests {
         };
         let mut writer = LiveCandleWriter::new(&config).unwrap();
         writer
-            .append_candle(11536, 2, 1_740_556_500, 100.0, 110.0, 90.0, 105.0, 1000, 10)
+            .append_candle(
+                11536,
+                2,
+                1_740_556_500,
+                100.0,
+                110.0,
+                90.0,
+                105.0,
+                1000,
+                10,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            )
             .unwrap();
         assert_eq!(writer.pending_count, 1);
         // flush_if_needed flushes if pending > 0
@@ -1593,6 +1668,11 @@ mod tests {
             24505.0,
             100,
             10,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
         );
         assert!(
             result.is_ok(),
@@ -1629,6 +1709,11 @@ mod tests {
                     24505.0,
                     100,
                     10,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -1670,7 +1755,22 @@ mod tests {
         // Fill ring buffer to capacity.
         for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
             writer
-                .append_candle(i, 2, 1_740_556_500 + i, 100.0, 110.0, 90.0, 105.0, 50, 5)
+                .append_candle(
+                    i,
+                    2,
+                    1_740_556_500 + i,
+                    100.0,
+                    110.0,
+                    90.0,
+                    105.0,
+                    50,
+                    5,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                )
                 .unwrap();
         }
         assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
@@ -1678,7 +1778,22 @@ mod tests {
 
         // One more — should SPILL to disk (not drop).
         writer
-            .append_candle(999999, 2, 1_740_600_000, 200.0, 210.0, 190.0, 205.0, 50, 5)
+            .append_candle(
+                999999,
+                2,
+                1_740_600_000,
+                200.0,
+                210.0,
+                190.0,
+                205.0,
+                50,
+                5,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            )
             .unwrap();
         // Ring buffer stays at capacity.
         assert_eq!(
@@ -1743,6 +1858,11 @@ mod tests {
                 24505.0,
                 100,
                 10,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
             )
             .unwrap();
         assert_eq!(writer.pending_count, 1, "should be in ILP buffer");
@@ -1781,6 +1901,11 @@ mod tests {
                 24505.0,
                 100,
                 10,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
             )
             .unwrap();
 
@@ -1803,6 +1928,11 @@ mod tests {
                 24605.0,
                 200,
                 20,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
             )
             .unwrap();
         assert_eq!(
@@ -1834,6 +1964,11 @@ mod tests {
             close: 24505.0,
             volume: 100,
             tick_count: 10,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let c2 = c; // Copy
         assert_eq!(c.security_id, c2.security_id, "BufferedCandle must be Copy");
@@ -1954,6 +2089,11 @@ mod tests {
                     close: 24505.0,
                     volume: 100,
                     tick_count: 10,
+                    iv: f64::NAN,
+                    delta: f64::NAN,
+                    gamma: f64::NAN,
+                    theta: f64::NAN,
+                    vega: f64::NAN,
                 };
                 bw.write_all(&serialize_candle(&candle)).unwrap();
             }
@@ -2039,6 +2179,11 @@ mod tests {
             close: 24505.0 + security_id as f32,
             volume: 100 + security_id,
             tick_count: 10 + security_id,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         }
     }
 
@@ -2059,6 +2204,11 @@ mod tests {
             close: 24580.00,
             volume: 1_234_567,
             tick_count: 4_200,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
 
         let bytes = serialize_candle(&candle);
@@ -2099,6 +2249,11 @@ mod tests {
             close: 0.0,
             volume: 0,
             tick_count: 0,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let restored_zero = deserialize_candle(&serialize_candle(&candle_zero));
         assert_eq!(restored_zero.security_id, 0);
@@ -2115,6 +2270,11 @@ mod tests {
             close: f32::MIN_POSITIVE,
             volume: u32::MAX,
             tick_count: u32::MAX,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let restored_max = deserialize_candle(&serialize_candle(&candle_max));
         assert_eq!(restored_max.security_id, u32::MAX);
@@ -2162,6 +2322,11 @@ mod tests {
                     24505.0,
                     100,
                     10,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -2192,6 +2357,11 @@ mod tests {
                     25005.0,
                     200,
                     20,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -2277,6 +2447,11 @@ mod tests {
                     24505.0,
                     100,
                     10,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -2514,6 +2689,11 @@ mod tests {
                     close: 24505.0,
                     volume: 100,
                     tick_count: 10,
+                    iv: f64::NAN,
+                    delta: f64::NAN,
+                    gamma: f64::NAN,
+                    theta: f64::NAN,
+                    vega: f64::NAN,
                 };
                 bw.write_all(&serialize_candle(&candle)).unwrap();
             }
@@ -2684,6 +2864,11 @@ mod tests {
                     24505.0,
                     100,
                     10,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -2906,6 +3091,11 @@ mod tests {
                 24505.0,
                 100,
                 10,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
             )
             .unwrap();
         assert!(writer.pending_count > 0);
@@ -3035,7 +3225,22 @@ mod tests {
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(1);
-        let result = writer.append_candle(sid, seg, ts, o, h, l, c, vol, tc);
+        let result = writer.append_candle(
+            sid,
+            seg,
+            ts,
+            o,
+            h,
+            l,
+            c,
+            vol,
+            tc,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        );
         assert!(result.is_ok());
         assert_eq!(writer.buffered_candle_count(), 1);
     }
@@ -3064,7 +3269,22 @@ mod tests {
         for i in 0..5_u32 {
             let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(i);
             writer
-                .append_candle(sid, seg, ts, o, h, l, c, vol, tc)
+                .append_candle(
+                    sid,
+                    seg,
+                    ts,
+                    o,
+                    h,
+                    l,
+                    c,
+                    vol,
+                    tc,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                )
                 .unwrap();
         }
         assert!(writer.pending_count > 0);
@@ -3100,7 +3320,22 @@ mod tests {
         for i in 0..10_u32 {
             let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(i);
             writer
-                .append_candle(sid, seg, ts, o, h, l, c, vol, tc)
+                .append_candle(
+                    sid,
+                    seg,
+                    ts,
+                    o,
+                    h,
+                    l,
+                    c,
+                    vol,
+                    tc,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                )
                 .unwrap();
         }
         assert_eq!(writer.buffered_candle_count(), 10);
@@ -3115,7 +3350,22 @@ mod tests {
         // Append a candle to have pending data, then force_flush triggers drain.
         let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(99);
         writer
-            .append_candle(sid, seg, ts, o, h, l, c, vol, tc)
+            .append_candle(
+                sid,
+                seg,
+                ts,
+                o,
+                h,
+                l,
+                c,
+                vol,
+                tc,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            )
             .unwrap();
         writer.force_flush_internal();
 
@@ -3166,6 +3416,11 @@ mod tests {
                 close: 100.5,
                 volume: 1000,
                 tick_count: 50,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             });
         }
         assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
@@ -3221,6 +3476,11 @@ mod tests {
                     close: 100.5,
                     volume: 1000,
                     tick_count: 50,
+                    iv: f64::NAN,
+                    delta: f64::NAN,
+                    gamma: f64::NAN,
+                    theta: f64::NAN,
+                    vega: f64::NAN,
                 };
                 use std::io::Write as _;
                 file.write_all(&serialize_candle(&candle)).unwrap();
@@ -3329,7 +3589,22 @@ mod tests {
         for i in 0..3_u32 {
             let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(i);
             writer
-                .append_candle(sid, seg, ts, o, h, l, c, vol, tc)
+                .append_candle(
+                    sid,
+                    seg,
+                    ts,
+                    o,
+                    h,
+                    l,
+                    c,
+                    vol,
+                    tc,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                )
                 .unwrap();
         }
         assert!(writer.pending_count > 0);
@@ -3359,7 +3634,22 @@ mod tests {
 
         let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(1);
         writer
-            .append_candle(sid, seg, ts, o, h, l, c, vol, tc)
+            .append_candle(
+                sid,
+                seg,
+                ts,
+                o,
+                h,
+                l,
+                c,
+                vol,
+                tc,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            )
             .unwrap();
         assert!(writer.pending_count > 0);
 
@@ -3608,6 +3898,11 @@ mod tests {
                     24505.0 + i as f32,
                     100 + i,
                     10 + i,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -3655,6 +3950,11 @@ mod tests {
                     24505.0,
                     100,
                     10,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -4133,6 +4433,11 @@ mod tests {
             close: 0.0,
             volume: 0,
             tick_count: 0,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let buf = serialize_candle(&candle);
         let restored = deserialize_candle(&buf);
@@ -4156,6 +4461,11 @@ mod tests {
             close: f32::MIN_POSITIVE,
             volume: u32::MAX,
             tick_count: u32::MAX,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let buf = serialize_candle(&candle);
         let restored = deserialize_candle(&buf);
@@ -4182,10 +4492,15 @@ mod tests {
             close: 24510.0,
             volume: 50000,
             tick_count: 42,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let buf = serialize_candle(&candle);
         assert_eq!(buf.len(), CANDLE_SPILL_RECORD_SIZE);
-        assert_eq!(buf.len(), 36);
+        assert_eq!(buf.len(), 76);
     }
 
     // =======================================================================
@@ -4367,6 +4682,11 @@ mod tests {
             close: 105.0,
             volume: 1000,
             tick_count: 10,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let copied = candle;
         assert_eq!(copied.security_id, 42);
@@ -4392,6 +4712,11 @@ mod tests {
             close: 0.0,
             volume: 0,
             tick_count: 0,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         assert_eq!(candle.security_id, 0);
         assert_eq!(candle.timestamp_secs, 0);
@@ -4460,7 +4785,22 @@ mod tests {
         // Don't call .at() — the buffer is now in an invalid state.
 
         // Now append_candle should hit the ILP error path and buffer instead.
-        let result = writer.append_candle(42, 2, 1_740_556_500, 100.0, 110.0, 90.0, 105.0, 500, 10);
+        let result = writer.append_candle(
+            42,
+            2,
+            1_740_556_500,
+            100.0,
+            110.0,
+            90.0,
+            105.0,
+            500,
+            10,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        );
         assert!(
             result.is_ok(),
             "append must never fail — buffers on ILP error"
@@ -4504,6 +4844,11 @@ mod tests {
                     105.0,
                     50,
                     5,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
                 )
                 .unwrap();
         }
@@ -5054,6 +5399,11 @@ mod tests {
             close: 102.0,
             volume: 1000,
             tick_count: 10,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         writer.in_flight.push(c);
         writer.pending_count = 1;
@@ -5097,6 +5447,11 @@ mod tests {
             close: 102.0,
             volume: 1000,
             tick_count: 10,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         writer.in_flight.push(c);
         writer.pending_count = 1;
@@ -5147,6 +5502,11 @@ mod tests {
                 close: 102.0,
                 volume: 1000,
                 tick_count: 10,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             });
         }
         assert_eq!(writer.candle_buffer.len(), 5);
@@ -5195,6 +5555,11 @@ mod tests {
                 close: 102.0,
                 volume: 1000,
                 tick_count: 10,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             });
         }
 
@@ -5226,6 +5591,11 @@ mod tests {
                 close: 205.0,
                 volume: 500,
                 tick_count: 5,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             });
         }
 
@@ -5276,6 +5646,11 @@ mod tests {
                     close: 305.0,
                     volume: 800,
                     tick_count: 8,
+                    iv: f64::NAN,
+                    delta: f64::NAN,
+                    gamma: f64::NAN,
+                    theta: f64::NAN,
+                    vega: f64::NAN,
                 };
                 let record = serialize_candle(&c);
                 use std::io::Write as _;
@@ -5377,6 +5752,11 @@ mod tests {
                 close: 405.0,
                 volume: 1200,
                 tick_count: 12,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             };
             let record = serialize_candle(&c);
             std::fs::write(&spill_path, &record).unwrap();
@@ -5418,6 +5798,11 @@ mod tests {
                 close: 505.0,
                 volume: 2000,
                 tick_count: 20,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             };
             let record = serialize_candle(&c);
             std::fs::write(&spill_path, &record).unwrap();
@@ -5506,6 +5891,11 @@ mod tests {
                 close: 605.0,
                 volume: 3000,
                 tick_count: 30,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             };
             let record = serialize_candle(&c);
             std::fs::write(&stale_path, &record).unwrap();
@@ -5584,6 +5974,11 @@ mod tests {
                 close: 705.0,
                 volume: 4000,
                 tick_count: 40,
+                iv: f64::NAN,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                theta: f64::NAN,
+                vega: f64::NAN,
             });
         }
 

@@ -1758,6 +1758,11 @@ async fn run_candle_persistence_consumer(
                         c.close,
                         c.volume,
                         c.tick_count,
+                        c.iv,
+                        c.delta,
+                        c.gamma,
+                        c.theta,
+                        c.vega,
                     );
                 }
                 aggregator.clear_completed();
@@ -1797,6 +1802,11 @@ async fn run_candle_persistence_consumer(
                     c.close,
                     c.volume,
                     c.tick_count,
+                    c.iv,
+                    c.delta,
+                    c.gamma,
+                    c.theta,
+                    c.vega,
                 ) {
                     warn!(?err, "cold-path candle write failed");
                     break;
