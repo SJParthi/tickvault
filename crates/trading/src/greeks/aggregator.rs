@@ -550,6 +550,11 @@ mod tests {
             open_interest: 500_000,
             oi_day_high: 600_000,
             oi_day_low: 400_000,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         }
     }
 

@@ -642,6 +642,11 @@ mod tests {
             open_interest: 120000,
             oi_day_high: 130000,
             oi_day_low: 110000,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         assert_eq!(tick.security_id, 52432);
         assert_eq!(tick.exchange_segment_code, 2);

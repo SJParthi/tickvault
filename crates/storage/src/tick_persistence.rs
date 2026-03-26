@@ -5776,8 +5776,8 @@ mod tests {
     #[test]
     fn test_tick_spill_record_size() {
         assert_eq!(
-            TICK_SPILL_RECORD_SIZE, 72,
-            "spill record must be exactly 72 bytes"
+            TICK_SPILL_RECORD_SIZE, 112,
+            "spill record must be exactly 112 bytes"
         );
     }
 
@@ -5801,6 +5801,11 @@ mod tests {
             open_interest: 100000,
             oi_day_high: 120000,
             oi_day_low: 90000,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
 
         let bytes = serialize_tick(&tick);
@@ -5855,6 +5860,11 @@ mod tests {
             open_interest: u32::MAX,
             oi_day_high: u32::MAX,
             oi_day_low: u32::MAX,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let bytes = serialize_tick(&tick);
         let restored = deserialize_tick(&bytes);
@@ -6484,6 +6494,11 @@ mod tests {
             open_interest: 100000,
             oi_day_high: 120000,
             oi_day_low: 90000,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
 
         let bytes = serialize_tick(&sample_tick);
