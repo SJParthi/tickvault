@@ -582,10 +582,10 @@ mod tests {
         assert!(parse_daily_download_time("08").is_err());
     }
 
-    // GAP-CFG-01: Whitespace in time string
+    // GAP-CFG-01: Alphabetic characters in time string
     #[test]
-    fn test_parse_daily_download_time_with_whitespace() {
-        assert!(parse_daily_download_time(" 08:55:00").is_err());
+    fn test_parse_daily_download_time_with_letters() {
+        assert!(parse_daily_download_time("ab:cd:ef").is_err());
     }
 
     // I-P1-01: compute_next_trigger_time — target far in the future today
