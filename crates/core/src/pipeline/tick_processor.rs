@@ -2983,6 +2983,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         });
@@ -3019,6 +3020,7 @@ mod tests {
                 None,
                 Some(top_movers),
                 Some(shared_snapshot),
+                None,
             )
             .await;
         });
@@ -3051,6 +3053,7 @@ mod tests {
                 None,
                 None,
                 Some(top_movers),
+                None,
                 None,
             )
             .await;
@@ -3085,6 +3088,7 @@ mod tests {
                 None,
                 None,
                 Some(top_movers),
+                None,
                 None,
             )
             .await;
