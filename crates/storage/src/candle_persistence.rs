@@ -4316,4 +4316,84 @@ mod tests {
         assert_eq!(HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS, 3);
         assert_eq!(HISTORICAL_CANDLE_RECONNECT_INITIAL_DELAY_MS, 1000);
     }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter::fresh_buffer() — both branches
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_writer_fresh_buffer_with_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_live_candle_writer_fresh_buffer_without_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        writer.sender = None;
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty());
+    }
+
+    // =======================================================================
+    // Coverage: BufferedCandle edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_buffered_candle_copy_trait() {
+        let candle = BufferedCandle {
+            security_id: 42,
+            exchange_segment_code: 2,
+            timestamp_secs: 1740556500,
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 105.0,
+            volume: 1000,
+            tick_count: 10,
+        };
+        let copied = candle;
+        assert_eq!(copied.security_id, 42);
+        assert_eq!(copied.exchange_segment_code, 2);
+        assert_eq!(copied.timestamp_secs, 1740556500);
+        assert_eq!(copied.open, 100.0);
+        assert_eq!(copied.high, 110.0);
+        assert_eq!(copied.low, 90.0);
+        assert_eq!(copied.close, 105.0);
+        assert_eq!(copied.volume, 1000);
+        assert_eq!(copied.tick_count, 10);
+    }
+
+    #[test]
+    fn test_buffered_candle_zero_values() {
+        let candle = BufferedCandle {
+            security_id: 0,
+            exchange_segment_code: 0,
+            timestamp_secs: 0,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0,
+            tick_count: 0,
+        };
+        assert_eq!(candle.security_id, 0);
+        assert_eq!(candle.timestamp_secs, 0);
+    }
 }
