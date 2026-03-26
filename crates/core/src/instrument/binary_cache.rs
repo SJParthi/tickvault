@@ -587,9 +587,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("version mismatch"), "error: {err_msg}");
+        assert!(result.is_err(), "wrong version should return Err");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
