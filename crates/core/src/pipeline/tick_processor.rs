@@ -20,7 +20,7 @@ use dhan_live_trader_common::constants::{
     DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
     SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
-use dhan_live_trader_common::tick_types::ParsedTick;
+use dhan_live_trader_common::tick_types::{GreeksEnricher, ParsedTick};
 
 use dhan_live_trader_storage::candle_persistence::LiveCandleWriter;
 use dhan_live_trader_storage::tick_persistence::{
@@ -222,6 +222,9 @@ impl TickDedupRing {
 /// * `live_candle_writer` — optional QuestDB ILP writer for persisting completed 1s candles
 /// * `top_movers` — optional top movers tracker (None disables gainers/losers tracking)
 /// * `shared_snapshot` — optional shared handle for publishing top movers snapshots to API
+/// * `greeks_enricher` — optional inline Greeks computer (Box<dyn GreeksEnricher>).
+///   When present, enriches every valid tick with IV + delta/gamma/theta/vega
+///   BEFORE persistence and broadcast. O(1) per tick (HashMap lookup + Jaeckel solve).
 pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
     mut tick_writer: Option<TickPersistenceWriter>,
@@ -231,6 +234,7 @@ pub async fn run_tick_processor(
     mut live_candle_writer: Option<LiveCandleWriter>,
     mut top_movers: Option<super::top_movers::TopMoversTracker>,
     shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
+    mut greeks_enricher: Option<Box<dyn GreeksEnricher>>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -298,7 +302,7 @@ pub async fn run_tick_processor(
 
         // Process based on frame type
         match parsed {
-            ParsedFrame::Tick(tick) => {
+            ParsedFrame::Tick(mut tick) => {
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
@@ -329,6 +333,13 @@ pub async fn run_tick_processor(
                     dedup_filtered = dedup_filtered.saturating_add(1);
                     m_dedup_filtered.increment(1);
                     continue;
+                }
+
+                // O(1) inline Greeks enrichment: compute IV + delta/gamma/theta/vega
+                // for F&O option ticks, update underlying LTP cache for index/equity.
+                // Runs BEFORE persistence so Greeks values are stored in QuestDB.
+                if let Some(ref mut enricher) = greeks_enricher {
+                    enricher.enrich(&mut tick);
                 }
 
                 // Persist tick to QuestDB — only during market hours [09:00, 15:30) IST.
@@ -375,7 +386,7 @@ pub async fn run_tick_processor(
                     "tick processed"
                 );
             }
-            ParsedFrame::TickWithDepth(tick, depth) => {
+            ParsedFrame::TickWithDepth(mut tick, depth) => {
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
@@ -398,6 +409,11 @@ pub async fn run_tick_processor(
                         dedup_filtered = dedup_filtered.saturating_add(1);
                         m_dedup_filtered.increment(1);
                         continue;
+                    }
+
+                    // O(1) inline Greeks enrichment for Full packet ticks.
+                    if let Some(ref mut enricher) = greeks_enricher {
+                        enricher.enrich(&mut tick);
                     }
 
                     // Persist tick to QuestDB (Full packet with valid timestamp)

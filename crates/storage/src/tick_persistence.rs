@@ -9466,8 +9466,8 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_tick_spill_record_size_is_72() {
-        assert_eq!(TICK_SPILL_RECORD_SIZE, 72);
+    fn test_tick_spill_record_size_is_112() {
+        assert_eq!(TICK_SPILL_RECORD_SIZE, 112);
     }
 
     #[test]

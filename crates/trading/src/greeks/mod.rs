@@ -16,6 +16,7 @@ pub mod black_scholes;
 pub mod buildup;
 pub mod calibration;
 pub mod historical_rates;
+pub mod inline_computer;
 pub mod pcr;
 
 // ---------------------------------------------------------------------------

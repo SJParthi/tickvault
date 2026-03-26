@@ -189,6 +189,27 @@ impl Default for OptionGreeksSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// GreeksEnricher — trait for inline Greeks computation on the hot path
+// ---------------------------------------------------------------------------
+
+/// Trait for enriching ticks with Greeks data on the hot path.
+///
+/// Implemented in `crates/trading` (InlineGreeksComputer) and injected into
+/// `crates/core` tick_processor via `Box<dyn GreeksEnricher>`.
+///
+/// # Contract
+/// - `enrich()` is called once per valid tick, BEFORE persistence and broadcast.
+/// - For index/equity ticks: updates internal underlying LTP cache, no Greeks.
+/// - For F&O option ticks: mutates `tick.iv`, `tick.delta`, `tick.gamma`,
+///   `tick.theta`, `tick.vega` in-place. Leaves them as NAN if computation fails.
+/// - Must be O(1) per tick (HashMap lookups + Jaeckel IV solver).
+/// - Must not allocate on the hot path (all maps pre-allocated).
+pub trait GreeksEnricher: Send {
+    /// Enrich a parsed tick with Greeks. Mutates Greeks fields in place.
+    fn enrich(&mut self, tick: &mut ParsedTick);
+}
+
+// ---------------------------------------------------------------------------
 // Historical Candle — 1-minute OHLCV from Dhan intraday API
 // ---------------------------------------------------------------------------
 
