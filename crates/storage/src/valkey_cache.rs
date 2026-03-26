@@ -1389,4 +1389,96 @@ mod tests {
         let ttl = compute_instrument_ttl_secs(0, 6);
         assert_eq!(ttl, 1800);
     }
+
+    // -----------------------------------------------------------------------
+    // Pure helper function tests — exercises build_* and compute_* directly
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_valkey_url_format() {
+        assert_eq!(
+            build_valkey_url("dlt-valkey", 6379),
+            "redis://dlt-valkey:6379"
+        );
+        assert_eq!(
+            build_valkey_url("localhost", 6380),
+            "redis://localhost:6380"
+        );
+        assert_eq!(
+            build_valkey_url("192.168.1.1", 6379),
+            "redis://192.168.1.1:6379"
+        );
+    }
+
+    #[test]
+    fn test_build_instrument_cache_key_format() {
+        assert_eq!(
+            build_instrument_cache_key("universe"),
+            "dlt:instrument:universe"
+        );
+        assert_eq!(
+            build_instrument_cache_key("csv_hash"),
+            "dlt:instrument:csv_hash"
+        );
+        assert_eq!(build_instrument_cache_key(""), "dlt:instrument:");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_format() {
+        assert_eq!(build_token_cache_key("access"), "dlt:token:access");
+        assert_eq!(build_token_cache_key("refresh"), "dlt:token:refresh");
+        assert_eq!(build_token_cache_key(""), "dlt:token:");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_format() {
+        assert_eq!(build_tick_cache_key(11536, "ltp"), "dlt:tick:11536:ltp");
+        assert_eq!(build_tick_cache_key(0, "volume"), "dlt:tick:0:volume");
+        assert_eq!(
+            build_tick_cache_key(u32::MAX, "depth"),
+            format!("dlt:tick:{}:depth", u32::MAX)
+        );
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_before_target_hour() {
+        // IST midnight (UTC 18:30 prev day) → target 6AM = 6h
+        let midnight_utc_for_ist = 86_400 - 19_800; // 66600 = UTC 18:30
+        let ttl = compute_instrument_ttl_secs(midnight_utc_for_ist, 6);
+        assert_eq!(ttl, 6 * 3600); // 6 hours until 6AM IST
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_after_target_hour() {
+        // IST 7AM (UTC 1:30) → target 6AM = 23h until next day 6AM
+        let ist_7am_utc = 7 * 3600 - 19_800 + 86_400; // normalize
+        let ttl = compute_instrument_ttl_secs(ist_7am_utc, 6);
+        assert_eq!(ttl, 23 * 3600);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_minimum() {
+        // If remaining < 60, clamp to 60
+        // IST 5:59:30 → target 6AM = 30s → clamped to 60
+        let ist_0559_utc = (5 * 3600 + 59 * 60 + 30) - 19_800 + 86_400;
+        let ttl = compute_instrument_ttl_secs(ist_0559_utc, 6);
+        assert!(ttl >= 60, "TTL must be at least 60s, got {ttl}");
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_maximum() {
+        // Result should never exceed 86400
+        let ttl = compute_instrument_ttl_secs(0, 0);
+        assert!(ttl <= 86_400, "TTL must be at most 86400s, got {ttl}");
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_all_hours() {
+        // Every target hour should produce a valid TTL
+        for hour in 0..24 {
+            let ttl = compute_instrument_ttl_secs(0, hour);
+            assert!(ttl >= 60, "hour {hour}: TTL {ttl} < 60");
+            assert!(ttl <= 86_400, "hour {hour}: TTL {ttl} > 86400");
+        }
+    }
 }
