@@ -518,27 +518,27 @@ impl GreeksPersistenceWriter {
         }
 
         let count = self.pending_count;
-        if let Some(ref mut sender) = self.sender {
-            if let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(
-                    ?err,
-                    pending = count,
-                    "greeks flush failed — disconnecting sender"
-                );
-                self.sender = None;
-                // IMPORTANT: Create fresh buffer, NOT clear(). The old buffer
-                // may be in a partial ILP state after a failed flush. clear()
-                // does not fully reset the questdb-rs state machine, causing
-                // every subsequent flush to fail with "Bad call to flush".
-                self.buffer = self.fresh_buffer();
-                self.pending_count = 0;
-                return Ok(()); // Swallow — Greeks are recomputed next second
-            }
-        } else {
-            // No sender — discard buffered ILP rows (will be recomputed).
+        // SAFETY: self.sender is guaranteed Some here — the is_none() check
+        // above (line 505) returns early if sender is None.
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in greeks flush (unreachable)")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            warn!(
+                ?err,
+                pending = count,
+                "greeks flush failed — disconnecting sender"
+            );
+            self.sender = None;
+            // IMPORTANT: Create fresh buffer, NOT clear(). The old buffer
+            // may be in a partial ILP state after a failed flush. clear()
+            // does not fully reset the questdb-rs state machine, causing
+            // every subsequent flush to fail with "Bad call to flush".
             self.buffer = self.fresh_buffer();
             self.pending_count = 0;
-            return Ok(());
+            return Ok(()); // Swallow — Greeks are recomputed next second
         }
 
         self.pending_count = 0;
