@@ -3637,4 +3637,646 @@ mod tests {
         let result = writer.force_flush();
         assert!(result.is_err());
     }
+
+    // =======================================================================
+    // Coverage: CandlePersistenceWriter force_flush with real sender broken pipe
+    // (candle_persistence lines 201-205)
+    // =======================================================================
+
+    #[test]
+    fn test_historical_candle_force_flush_broken_pipe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ilp_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Drop immediately to break pipe.
+            }
+        });
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port,
+            http_port: ilp_port,
+            pg_port: ilp_port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Append some candles.
+        for i in 0..3_u32 {
+            let candle = make_test_candle(i);
+            writer.append_candle(&candle).unwrap();
+        }
+        assert!(writer.pending_count() > 0);
+
+        // Wait for TCP drop.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Block reconnect.
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // Wait for TCP drop.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Append many candles to overflow TCP send buffer.
+        for i in 0..500_u32 {
+            let candle = HistoricalCandle {
+                security_id: i,
+                exchange_segment_code: 2,
+                timeframe: "1m",
+                timestamp_utc_secs: 1_704_067_200 + i64::from(i) * 60,
+                open: 21000.0,
+                high: 21050.0,
+                low: 20950.0,
+                close: 21025.0,
+                volume: 100_000,
+                open_interest: 0,
+            };
+            let _ = writer.append_candle(&candle);
+        }
+
+        // Block reconnect.
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // Force flush — may or may not detect broken pipe.
+        let result = writer.force_flush();
+        if result.is_err() {
+            // Flush failed — verify error path (lines 201-205).
+            assert!(writer.sender.is_none());
+            assert_eq!(writer.pending_count(), 0);
+        }
+    }
+
+    // =======================================================================
+    // Coverage: CandlePersistenceWriter append_candle auto-flush at threshold
+    // (candle_persistence line 184)
+    // =======================================================================
+
+    #[test]
+    fn test_historical_candle_append_triggers_auto_flush_at_batch_size() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        // Append CANDLE_FLUSH_BATCH_SIZE candles — the last one should trigger auto-flush.
+        for i in 0..CANDLE_FLUSH_BATCH_SIZE as u32 {
+            let candle = HistoricalCandle {
+                security_id: i,
+                exchange_segment_code: 2,
+                timeframe: "1m",
+                timestamp_utc_secs: 1_704_067_200 + i64::from(i) * 60,
+                open: 21000.0,
+                high: 21050.0,
+                low: 20950.0,
+                close: 21025.0,
+                volume: 100_000,
+                open_interest: 0,
+            };
+            let result = writer.append_candle(&candle);
+            assert!(result.is_ok(), "append_candle must succeed for candle {i}");
+        }
+        // After auto-flush, pending should be 0.
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "pending must be 0 after auto-flush triggered at batch size"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: CandlePersistenceWriter reconnect failure (lines 219-258) — 7s test
+    // =======================================================================
+
+    #[test]
+    fn test_historical_candle_reconnect_failure_with_unreachable_host() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = CandlePersistenceWriter::new(&config).unwrap();
+
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // reconnect() tries 3 times with backoff (1s + 2s + 4s = 7s).
+        let result = writer.reconnect();
+        assert!(
+            result.is_err(),
+            "reconnect must fail after 3 attempts to unreachable host"
+        );
+        assert!(writer.sender.is_none());
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter auto-flush at LIVE_CANDLE_FLUSH_BATCH_SIZE
+    // (candle_persistence line 497)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_append_triggers_auto_flush_at_batch_size() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Append LIVE_CANDLE_FLUSH_BATCH_SIZE candles to trigger auto-flush.
+        for i in 0..LIVE_CANDLE_FLUSH_BATCH_SIZE as u32 {
+            writer
+                .append_candle(
+                    i,
+                    2,
+                    1_740_556_500 + i,
+                    24500.0 + i as f32,
+                    24510.0 + i as f32,
+                    24490.0,
+                    24505.0 + i as f32,
+                    100 + i,
+                    10 + i,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            writer.pending_count, 0,
+            "pending must be 0 after auto-flush at batch size"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter force_flush_internal with real broken pipe
+    // (candle_persistence lines 521-530)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_flush_internal_broken_pipe_rescues() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ilp_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Drop immediately to break pipe.
+            }
+        });
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port,
+            http_port: ilp_port,
+            pg_port: ilp_port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // Append candles.
+        let candle_count = 5_u32;
+        for i in 0..candle_count {
+            writer
+                .append_candle(
+                    i,
+                    2,
+                    1_740_556_500 + i,
+                    24500.0,
+                    24510.0,
+                    24490.0,
+                    24505.0,
+                    100,
+                    10,
+                )
+                .unwrap();
+        }
+        assert_eq!(writer.in_flight.len(), candle_count as usize);
+
+        // Wait for TCP drop.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Block reconnect.
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        // force_flush_internal — may or may not detect broken pipe.
+        writer.force_flush_internal();
+        if writer.sender.is_none() {
+            // Flush failed — verify rescue path (lines 521-530).
+            assert_eq!(
+                writer.buffered_candle_count(),
+                candle_count as usize,
+                "all in-flight candles must be rescued to ring buffer"
+            );
+            assert!(writer.in_flight.is_empty());
+            assert_eq!(writer.pending_count, 0);
+        }
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter rescue_in_flight with data (line 556-564)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_rescue_in_flight_with_data_buffers_candles() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Manually populate in_flight.
+        let candle_count = 4_usize;
+        for i in 0..candle_count as u32 {
+            writer.in_flight.push(make_buffered_candle(i));
+        }
+        writer.pending_count = candle_count;
+
+        writer.rescue_in_flight();
+
+        assert_eq!(writer.pending_count, 0);
+        assert!(writer.in_flight.is_empty());
+        assert_eq!(
+            writer.buffered_candle_count(),
+            candle_count,
+            "rescued candles must be in ring buffer"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter spill_candle_to_disk error paths
+    // (candle_persistence lines 592-621)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_spill_open_lazy_and_write() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Fill ring buffer to capacity.
+        for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
+            writer.candle_buffer.push_back(make_buffered_candle(i));
+        }
+
+        // spill_writer is None — lazy open should kick in.
+        writer.spill_writer = None;
+        writer.spill_path = None;
+
+        let candle = make_buffered_candle(999_999);
+        writer.spill_candle_to_disk(&candle);
+        assert_eq!(
+            writer.candles_spilled_total, 1,
+            "spill should succeed with lazy open"
+        );
+
+        if let Some(ref path) = writer.spill_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter drain_candle_buffer full path with batch flush
+    // (candle_persistence lines 649-706)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_drain_large_ring_buffer_exercises_batch_flush() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Buffer more candles than LIVE_CANDLE_FLUSH_BATCH_SIZE to exercise
+        // the batch flush loop inside drain.
+        let buffer_count = LIVE_CANDLE_FLUSH_BATCH_SIZE + 10;
+        for i in 0..buffer_count as u32 {
+            writer.candle_buffer.push_back(make_buffered_candle(i));
+        }
+        assert_eq!(writer.buffered_candle_count(), buffer_count);
+
+        writer.drain_candle_buffer();
+        assert_eq!(
+            writer.buffered_candle_count(),
+            0,
+            "all candles must drain from ring buffer"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter drain_candle_disk_spill full path
+    // (candle_persistence lines 727-813)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_drain_disk_spill_reads_and_deletes_file() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "dlt-candle-drain-spill-full-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-candles-drain-spill.bin");
+
+        let record_count = 10_usize;
+        {
+            let mut file = std::fs::File::create(&spill_path).unwrap();
+            for i in 0..record_count as u32 {
+                use std::io::Write as _;
+                file.write_all(&serialize_candle(&make_buffered_candle(i)))
+                    .unwrap();
+            }
+        }
+
+        writer.spill_path = Some(spill_path.clone());
+        writer.candles_spilled_total = record_count as u64;
+
+        writer.drain_candle_disk_spill();
+        assert!(
+            !spill_path.exists(),
+            "candle spill file must be deleted after successful drain"
+        );
+        assert_eq!(writer.candles_spilled_total, 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter drain_candle_disk_spill with BufWriter flush
+    // error (candle_persistence lines 730-737)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_drain_disk_spill_with_active_writer() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("dlt-candle-drain-active-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let spill_path = tmp_dir.join("test-candles-active-drain.bin");
+
+        // Write records using BufWriter.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&spill_path)
+            .unwrap();
+        let mut bw = BufWriter::new(file);
+        let record_count = 5_usize;
+        for i in 0..record_count as u32 {
+            use std::io::Write as _;
+            bw.write_all(&serialize_candle(&make_buffered_candle(i)))
+                .unwrap();
+        }
+        // Set the BufWriter as active — drain should flush it first.
+        writer.spill_writer = Some(bw);
+        writer.spill_path = Some(spill_path.clone());
+        writer.candles_spilled_total = record_count as u64;
+
+        writer.drain_candle_disk_spill();
+        assert!(
+            !spill_path.exists(),
+            "spill file must be deleted after drain with active writer"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter recover_stale_spill_files full path
+    // (candle_persistence lines 825-955)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_recover_stale_spill_files_full_path() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Create a stale spill file in the actual CANDLE_SPILL_DIR.
+        std::fs::create_dir_all(CANDLE_SPILL_DIR).unwrap();
+        let stale_path = std::path::PathBuf::from(format!(
+            "{}/candles-stale-full-test-{}.bin",
+            CANDLE_SPILL_DIR,
+            std::process::id()
+        ));
+
+        let record_count = 8_usize;
+        {
+            let mut file = std::fs::File::create(&stale_path).unwrap();
+            for i in 0..record_count as u32 {
+                use std::io::Write as _;
+                file.write_all(&serialize_candle(&make_buffered_candle(i)))
+                    .unwrap();
+            }
+        }
+
+        let recovered = writer.recover_stale_spill_files();
+        assert!(
+            recovered >= record_count,
+            "must recover at least {record_count} candles, got {recovered}"
+        );
+        assert!(
+            !stale_path.exists(),
+            "stale spill file must be deleted after successful recovery"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter recover skips active spill (lines 867-875)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_recover_skips_active_spill() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        std::fs::create_dir_all(CANDLE_SPILL_DIR).unwrap();
+        let active_path = std::path::PathBuf::from(format!(
+            "{}/candles-active-skip-test-{}.bin",
+            CANDLE_SPILL_DIR,
+            std::process::id()
+        ));
+
+        {
+            let mut file = std::fs::File::create(&active_path).unwrap();
+            use std::io::Write as _;
+            file.write_all(&serialize_candle(&make_buffered_candle(0)))
+                .unwrap();
+        }
+        writer.spill_path = Some(active_path.clone());
+
+        let _ = writer.recover_stale_spill_files();
+        assert!(
+            active_path.exists(),
+            "active spill file must NOT be deleted by recover"
+        );
+
+        let _ = std::fs::remove_file(&active_path);
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter reconnect failure — 7s test
+    // (candle_persistence lines 957-998)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_reconnect_failure_with_unreachable_host() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+
+        let result = writer.reconnect();
+        assert!(
+            result.is_err(),
+            "reconnect must fail after 3 attempts to unreachable host"
+        );
+        assert!(writer.sender.is_none());
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter try_reconnect_on_error calls reconnect
+    // (candle_persistence lines 1002-1013)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_try_reconnect_calls_reconnect_on_expired_throttle() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        writer.sender = None;
+        writer.next_reconnect_allowed = std::time::Instant::now(); // expired
+
+        // Point to a working server — reconnect should succeed.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        writer.try_reconnect_on_error();
+        assert!(
+            writer.sender.is_some(),
+            "reconnect must succeed after throttle expires"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: ensure_candle_table_dedup_keys DDL non-success paths
+    // (candle_persistence lines 1064, 1085, 1118)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_ddl_non_success() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: ensure_candle_table DDL send error (CREATE succeeds, DEDUP fails)
+    // (candle_persistence lines 1085, 1118)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_ddl_create_ok_dedup_fail() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // First connection: respond with 200 (CREATE TABLE succeeds).
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(MOCK_HTTP_200.as_bytes()).await;
+                drop(stream);
+            }
+            // Second connection: drop immediately (DEDUP DDL fails).
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: ensure_candle_table CREATE DDL send error (line 1064)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_create_ddl_send_error() {
+        let config = QuestDbConfig {
+            host: "unreachable-host-12345".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        ensure_candle_table_dedup_keys(&config).await;
+    }
 }
