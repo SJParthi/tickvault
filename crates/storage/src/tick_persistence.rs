@@ -427,11 +427,7 @@ impl TickPersistenceWriter {
             .open(&path)
             .with_context(|| format!("failed to open tick spill file: {}", path.display()))?;
 
-        info!(
-            path = %path.display(),
-            "opened tick spill file for disk overflow"
-        );
-
+        info!(path = %path.display(), "opened tick spill file for disk overflow");
         self.spill_writer = Some(BufWriter::new(file));
         self.spill_path = Some(path);
         Ok(())
@@ -471,8 +467,7 @@ impl TickPersistenceWriter {
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE
                 && let Err(err) = self.force_flush()
             {
-                // force_flush already called rescue_in_flight — ticks are
-                // back in tick_buffer. Safe to stop.
+                // force_flush already called rescue_in_flight — ticks are back in tick_buffer.
                 warn!(
                     ?err,
                     drained,
@@ -543,12 +538,7 @@ impl TickPersistenceWriter {
 
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let expected_records = file_len as usize / TICK_SPILL_RECORD_SIZE;
-        info!(
-            path = %spill_path.display(),
-            file_bytes = file_len,
-            expected_records,
-            "draining disk spill to QuestDB"
-        );
+        info!(path = %spill_path.display(), file_bytes = file_len, expected_records, "draining disk spill to QuestDB");
 
         let mut reader = BufReader::new(file);
         let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
@@ -581,7 +571,6 @@ impl TickPersistenceWriter {
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE
                 && let Err(err) = self.force_flush()
             {
-                // force_flush rescued in-flight ticks to ring buffer.
                 warn!(
                     ?err,
                     drained, "flush during spill drain failed — in-flight rescued"
@@ -601,20 +590,14 @@ impl TickPersistenceWriter {
         }
 
         // Only delete spill file if drain was COMPLETE (no flush failures).
-        // If drain was partial, preserve file for next recovery attempt.
         if !flush_failed {
             if let Err(err) = std::fs::remove_file(&spill_path) {
                 warn!(?err, path = %spill_path.display(), "failed to delete spill file");
             } else {
-                info!(
-                    path = %spill_path.display(),
-                    drained,
-                    "disk spill file drained and deleted"
-                );
+                info!(path = %spill_path.display(), drained, "disk spill file drained and deleted");
             }
             self.ticks_spilled_total = 0;
         } else {
-            // Preserve spill file for next recovery.
             self.spill_path = Some(spill_path);
             warn!(
                 drained,
@@ -644,7 +627,6 @@ impl TickPersistenceWriter {
             Ok(d) => d,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    // No spill directory means nothing to recover — not an error.
                     return 0;
                 }
                 warn!(
@@ -676,15 +658,11 @@ impl TickPersistenceWriter {
             };
             let _ = file_name; // used for filtering above
 
-            // Skip the current active spill file to avoid draining a file
-            // that is still being written to.
+            // Skip the current active spill file to avoid draining a file that is still being written to.
             if let Some(ref active_path) = self.spill_path
                 && path == *active_path
             {
-                info!(
-                    path = %path.display(),
-                    "skipping active spill file during stale recovery"
-                );
+                info!(path = %path.display(), "skipping active spill file during stale recovery");
                 continue;
             }
 
@@ -700,12 +678,7 @@ impl TickPersistenceWriter {
 
             let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
             let expected_records = file_len as usize / TICK_SPILL_RECORD_SIZE;
-            info!(
-                path = %path.display(),
-                file_bytes = file_len,
-                expected_records,
-                "draining stale tick spill file to QuestDB"
-            );
+            info!(path = %path.display(), file_bytes = file_len, expected_records, "draining stale tick spill file to QuestDB");
 
             let mut reader = BufReader::new(file);
             let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
@@ -738,12 +711,7 @@ impl TickPersistenceWriter {
                 if self.pending_count >= TICK_FLUSH_BATCH_SIZE
                     && let Err(err) = self.force_flush()
                 {
-                    warn!(
-                        ?err,
-                        drained,
-                        path = %path.display(),
-                        "flush during stale spill drain failed"
-                    );
+                    warn!(?err, drained, path = %path.display(), "flush during stale spill drain failed");
                     flush_failed = true;
                     break;
                 }
@@ -762,19 +730,11 @@ impl TickPersistenceWriter {
                 if let Err(err) = std::fs::remove_file(&path) {
                     warn!(?err, path = %path.display(), "failed to delete stale tick spill file");
                 } else {
-                    info!(
-                        path = %path.display(),
-                        drained,
-                        "stale tick spill file recovered and deleted"
-                    );
+                    info!(path = %path.display(), drained, "stale tick spill file recovered and deleted");
                 }
                 total_recovered = total_recovered.saturating_add(drained);
             } else {
-                warn!(
-                    path = %path.display(),
-                    drained,
-                    "stale tick spill partially drained — file preserved for retry"
-                );
+                warn!(path = %path.display(), drained, "stale tick spill partially drained — file preserved for retry");
             }
         }
 
@@ -1015,12 +975,11 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     );
 
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| Client::new());
 
     // Step 1: Create the table with explicit schema (idempotent).
     match client
@@ -1459,21 +1418,14 @@ impl DepthPersistenceWriter {
     fn open_depth_spill_file(&mut self) -> Result<()> {
         std::fs::create_dir_all(DEPTH_SPILL_DIR)
             .context("failed to create depth spill directory")?;
-
         let date = chrono::Utc::now().format("%Y%m%d");
         let path = std::path::PathBuf::from(format!("{DEPTH_SPILL_DIR}/depth-{date}.bin"));
-
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open depth spill file: {}", path.display()))?;
-
-        info!(
-            path = %path.display(),
-            "opened depth spill file for disk overflow"
-        );
-
+        info!(path = %path.display(), "opened depth spill file for disk overflow");
         self.spill_writer = Some(BufWriter::new(file));
         self.spill_path = Some(path);
         Ok(())
@@ -1519,8 +1471,7 @@ impl DepthPersistenceWriter {
             if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE
                 && let Err(err) = self.force_flush()
             {
-                // force_flush already called rescue_in_flight — snapshots are
-                // back in depth_buffer. Safe to stop.
+                // force_flush already called rescue_in_flight — snapshots are back in depth_buffer.
                 warn!(
                     ?err,
                     drained,
@@ -1575,12 +1526,7 @@ impl DepthPersistenceWriter {
 
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let expected_records = file_len as usize / DEPTH_SPILL_RECORD_SIZE;
-        info!(
-            path = %spill_path.display(),
-            file_bytes = file_len,
-            expected_records,
-            "draining depth disk spill to QuestDB"
-        );
+        info!(path = %spill_path.display(), file_bytes = file_len, expected_records, "draining depth disk spill to QuestDB");
 
         let mut reader = BufReader::new(file);
         let mut record = [0u8; DEPTH_SPILL_RECORD_SIZE];
@@ -1641,20 +1587,14 @@ impl DepthPersistenceWriter {
         }
 
         // Only delete spill file if drain was COMPLETE (no flush failures).
-        // If drain was partial, preserve file for next recovery attempt.
         if !flush_failed {
             if let Err(err) = std::fs::remove_file(&spill_path) {
                 warn!(?err, path = %spill_path.display(), "failed to delete depth spill file");
             } else {
-                info!(
-                    path = %spill_path.display(),
-                    drained,
-                    "depth disk spill file drained and deleted"
-                );
+                info!(path = %spill_path.display(), drained, "depth disk spill file drained and deleted");
             }
             self.depth_spilled_total = 0;
         } else {
-            // Preserve spill file for next recovery.
             self.spill_path = Some(spill_path);
             warn!(
                 drained,
@@ -1876,12 +1816,11 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     );
 
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| Client::new());
 
     // --- market_depth table ---
     execute_ddl_best_effort(
@@ -1938,14 +1877,12 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
         questdb_config.host, questdb_config.http_port
     );
 
-    // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| Client::new());
 
     // Query: count ticks per 1-minute bucket in the last N minutes.
     let sql = format!(

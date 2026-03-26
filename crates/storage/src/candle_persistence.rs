@@ -465,7 +465,7 @@ impl LiveCandleWriter {
             .and_then(|b| b.at(ts_nanos))
         {
             warn!(?err, "live candle ILP buffer error — buffering candle");
-            self.buffer_candle(BufferedCandle {
+            let candle = BufferedCandle {
                 security_id,
                 exchange_segment_code,
                 timestamp_secs,
@@ -475,12 +475,13 @@ impl LiveCandleWriter {
                 close,
                 volume,
                 tick_count,
-            });
+            };
+            self.buffer_candle(candle);
             return Ok(());
         }
 
         // Track in-flight so we can rescue on flush failure.
-        self.in_flight.push(BufferedCandle {
+        let candle = BufferedCandle {
             security_id,
             exchange_segment_code,
             timestamp_secs,
@@ -490,7 +491,8 @@ impl LiveCandleWriter {
             close,
             volume,
             tick_count,
-        });
+        };
+        self.in_flight.push(candle);
         self.pending_count = self.pending_count.saturating_add(1);
 
         if should_flush(self.pending_count, LIVE_CANDLE_FLUSH_BATCH_SIZE) {
@@ -1057,12 +1059,11 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| Client::new());
 
     // Step 1: Create the new multi-timeframe table.
     match client

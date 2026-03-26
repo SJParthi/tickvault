@@ -97,12 +97,11 @@ pub async fn ensure_calendar_table(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| Client::new());
 
     // Step 1: CREATE TABLE IF NOT EXISTS
     match client

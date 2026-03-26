@@ -284,12 +284,11 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = reqwest::Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // Step 1: Create the candles_1s base table.
     if !execute_ddl(

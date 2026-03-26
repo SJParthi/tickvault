@@ -375,12 +375,7 @@ async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                warn!(
-                    %status,
-                    label,
-                    body = body.chars().take(200).collect::<String>(),
-                    "DDL returned non-success"
-                );
+                warn!(%status, label, body = body.chars().take(200).collect::<String>(), "DDL returned non-success");
             }
         }
         Err(err) => {
