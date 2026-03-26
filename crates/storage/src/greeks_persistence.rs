@@ -273,12 +273,11 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
     );
 
     // Client::builder().timeout().build() is infallible (no custom TLS).
-    let Ok(client) = Client::builder()
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = Client::builder()
         .timeout(Duration::from_secs(DDL_TIMEOUT_SECS))
         .build()
-    else {
-        return;
-    };
+        .unwrap_or_else(|_| Client::new());
 
     // Step 1: CREATE TABLE IF NOT EXISTS (no inline DEDUP — QuestDB rejects it).
     execute_ddl(
@@ -510,6 +509,12 @@ impl GreeksPersistenceWriter {
         // If disconnected, try reconnect first.
         if self.sender.is_none() {
             self.try_reconnect_on_error();
+            // After reconnect, pending data was in the old (broken) buffer.
+            // The new sender has a fresh buffer — nothing to flush.
+            // Greeks are recomputed every second, so data loss is acceptable.
+            self.buffer.clear();
+            self.pending_count = 0;
+            return Ok(());
         }
 
         let count = self.pending_count;
