@@ -754,4 +754,19 @@ mod tests {
         assert!(json.contains("\"security_id\":1"));
         assert!(json.contains("\"timestamp\":\"\""));
     }
+
+    #[test]
+    fn test_build_questdb_client_succeeds() {
+        // Exercises build_questdb_client happy path (lines 20-31)
+        let result = build_questdb_client(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_questdb_client_with_various_timeouts() {
+        // Exercise with different timeout values
+        assert!(build_questdb_client(1).is_ok());
+        assert!(build_questdb_client(30).is_ok());
+        assert!(build_questdb_client(0).is_ok()); // zero timeout still builds
+    }
 }

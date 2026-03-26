@@ -561,4 +561,17 @@ mod tests {
         assert!(!err_response.questdb_reachable);
         assert_eq!(err_response.tables, 0);
     }
+
+    #[test]
+    fn test_build_stats_client_succeeds() {
+        // Exercises build_stats_client happy path (line 17-29)
+        let result = build_stats_client(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_stats_client_various_timeouts() {
+        assert!(build_stats_client(0).is_ok());
+        assert!(build_stats_client(60).is_ok());
+    }
 }
