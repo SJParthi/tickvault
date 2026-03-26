@@ -1354,4 +1354,80 @@ mod tests {
         assert!(POOL_CHECKOUT_TIMEOUT_MS >= 100, "too fast timeout");
         assert!(POOL_CHECKOUT_TIMEOUT_MS <= 5000, "too slow timeout");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: compute_instrument_ttl_secs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_instrument_ttl_before_target() {
+        // 2026-01-01 00:00:00 UTC = IST 05:30:00, target = 8 AM IST
+        // Time until 08:00 IST = 2.5 hours = 9000 seconds
+        let epoch = 1_767_225_600_u64; // 2025-01-01 00:00:00 UTC
+        let ttl = compute_instrument_ttl_secs(epoch, 8);
+        // IST offset = 19800, so IST time = (epoch + 19800) % 86400 = 19800 secs = 05:30
+        // Target = 8 * 3600 = 28800
+        // remaining = 28800 - 19800 = 9000
+        assert_eq!(ttl, 9000);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_after_target() {
+        // IST time is 10:30 (target hour = 8 AM IST, which has passed)
+        // IST secs today = 10*3600 + 30*60 = 37800
+        // target = 8*3600 = 28800
+        // remaining = 86400 - 37800 + 28800 = 77400
+        let ist_offset: u64 = 19_800;
+        let ist_secs_today: u64 = 37_800; // 10:30:00 IST
+        let epoch = ist_secs_today - ist_offset; // raw epoch so (epoch + IST_OFFSET) % 86400 = 37800
+        let ttl = compute_instrument_ttl_secs(epoch, 8);
+        assert_eq!(ttl, 77_400);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamped_min() {
+        // If remaining is very small (< 60), clamp to 60
+        // IST time just before target: target=1, IST secs = 3599
+        // remaining = 3600 - 3599 = 1 → clamped to 60
+        let ist_offset: u64 = 19_800;
+        let epoch = 3599_u64.wrapping_sub(ist_offset % 86_400) + 86_400;
+        let ttl = compute_instrument_ttl_secs(epoch, 1);
+        assert!(ttl >= 60, "TTL must be clamped to minimum 60, got {ttl}");
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamped_max() {
+        // Max is 86400 — the result should never exceed this
+        let ttl = compute_instrument_ttl_secs(0, 0);
+        assert!(ttl <= 86_400, "TTL must be clamped to maximum 86400");
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_midnight_target() {
+        // Target = 0 AM IST, current IST = 00:00:01 → should wrap to next day
+        let ist_offset: u64 = 19_800;
+        let epoch = 86_400 + 1 - ist_offset; // IST = 00:00:01
+        let ttl = compute_instrument_ttl_secs(epoch, 0);
+        // Current = 1s past midnight, target = midnight → wrap to tomorrow = 86399
+        assert_eq!(ttl, 86_399);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_exactly_at_target() {
+        // IST is exactly at target → wrap to next day (full 86400, clamped)
+        let ist_offset: u64 = 19_800;
+        let target_hour: u8 = 9;
+        let target_secs = u64::from(target_hour) * 3600;
+        let epoch = target_secs.wrapping_sub(ist_offset % 86_400) + 86_400;
+        let ttl = compute_instrument_ttl_secs(epoch, target_hour);
+        // delta_secs = 0, so remaining = 86400, clamped to 86400
+        assert_eq!(ttl, 86_400);
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_large_epoch() {
+        // Far future epoch — should still compute valid TTL
+        let ttl = compute_instrument_ttl_secs(2_000_000_000, 8);
+        assert!(ttl >= 60 && ttl <= 86_400);
+    }
 }

@@ -9434,4 +9434,140 @@ mod tests {
     fn test_f32_decimal_buf_size() {
         assert_eq!(F32_DECIMAL_BUF_SIZE, 24);
     }
+
+    // =======================================================================
+    // Coverage: f32_to_f64_clean edge cases (NaN, infinity, subnormal, zero)
+    // =======================================================================
+
+    #[test]
+    fn test_f32_to_f64_clean_positive_zero() {
+        let result = f32_to_f64_clean(0.0_f32);
+        assert_eq!(result, 0.0_f64);
+        assert!(result.is_sign_positive());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_negative_zero() {
+        let result = f32_to_f64_clean(-0.0_f32);
+        assert_eq!(result, 0.0_f64);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_positive_infinity() {
+        let result = f32_to_f64_clean(f32::INFINITY);
+        assert!(result.is_infinite());
+        assert!(result.is_sign_positive());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_negative_infinity() {
+        let result = f32_to_f64_clean(f32::NEG_INFINITY);
+        assert!(result.is_infinite());
+        assert!(result.is_sign_negative());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_nan() {
+        let result = f32_to_f64_clean(f32::NAN);
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_subnormal() {
+        // Smallest positive subnormal f32
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        assert!(subnormal.is_subnormal() || subnormal == 0.0 || subnormal.is_normal());
+        let result = f32_to_f64_clean(subnormal);
+        // Should produce a valid non-NaN f64
+        assert!(!result.is_nan());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_max_f32() {
+        let result = f32_to_f64_clean(f32::MAX);
+        assert!(result.is_finite());
+        assert!(result > 3.0e38);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_min_positive() {
+        let result = f32_to_f64_clean(f32::MIN_POSITIVE);
+        assert!(result > 0.0);
+        assert!(result.is_finite());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_negative_value() {
+        let result = f32_to_f64_clean(-123.45_f32);
+        assert!(result < 0.0);
+        assert!((result - (-123.45_f64)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_typical_price_21004_95() {
+        // The signature test case from data-integrity rules
+        let result = f32_to_f64_clean(21004.95_f32);
+        assert_eq!(result, 21004.95_f64);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_typical_price_10_20() {
+        let result = f32_to_f64_clean(10.20_f32);
+        assert_eq!(result, 10.2_f64);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_one() {
+        let result = f32_to_f64_clean(1.0_f32);
+        assert_eq!(result, 1.0_f64);
+    }
+
+    // =======================================================================
+    // Coverage: spill path generation
+    // =======================================================================
+
+    #[test]
+    fn test_tick_spill_dir_constant() {
+        assert_eq!(TICK_SPILL_DIR, "data/spill");
+    }
+
+    // =======================================================================
+    // Coverage: serialize/deserialize roundtrip
+    // =======================================================================
+
+    #[test]
+    fn test_serialize_deserialize_tick_roundtrip() {
+        let tick = make_test_tick(42, 12345.67);
+        let serialized = serialize_tick(&tick);
+        let deserialized = deserialize_tick(&serialized);
+        assert_eq!(deserialized.security_id, tick.security_id);
+        assert_eq!(
+            deserialized.exchange_segment_code,
+            tick.exchange_segment_code
+        );
+        assert_eq!(deserialized.last_traded_price, tick.last_traded_price);
+        assert_eq!(deserialized.last_trade_quantity, tick.last_trade_quantity);
+        assert_eq!(deserialized.exchange_timestamp, tick.exchange_timestamp);
+        assert_eq!(deserialized.received_at_nanos, tick.received_at_nanos);
+        assert_eq!(deserialized.volume, tick.volume);
+        assert_eq!(deserialized.open_interest, tick.open_interest);
+        assert_eq!(deserialized.oi_day_high, tick.oi_day_high);
+        assert_eq!(deserialized.oi_day_low, tick.oi_day_low);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_zero_tick() {
+        let tick = ParsedTick::default();
+        let serialized = serialize_tick(&tick);
+        let deserialized = deserialize_tick(&serialized);
+        assert_eq!(deserialized.security_id, 0);
+        assert_eq!(deserialized.volume, 0);
+    }
+
+    #[test]
+    fn test_serialize_tick_size_matches_constant() {
+        let tick = make_test_tick(1, 100.0);
+        let serialized = serialize_tick(&tick);
+        assert_eq!(serialized.len(), TICK_SPILL_RECORD_SIZE);
+    }
 }

@@ -2989,4 +2989,196 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(writer.pending_count(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // fresh_buffer() — coverage for both branches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fresh_buffer_with_sender_returns_sender_buffer() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_fresh_buffer_without_sender_returns_v1_buffer() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // live tables DDL and DEDUP key tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_greeks_live_ddl_has_candle_interval() {
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("candle_interval SYMBOL"));
+    }
+
+    #[test]
+    fn test_option_greeks_live_ddl_has_all_greeks() {
+        for col in [
+            "iv DOUBLE",
+            "delta DOUBLE",
+            "gamma DOUBLE",
+            "theta DOUBLE",
+            "vega DOUBLE",
+        ] {
+            assert!(
+                OPTION_GREEKS_LIVE_DDL.contains(col),
+                "option_greeks_live missing: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_option_greeks_live_ddl_idempotent() {
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_option_greeks_live_ddl_has_wal() {
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_pcr_snapshots_live_ddl_has_candle_interval() {
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("candle_interval SYMBOL"));
+    }
+
+    #[test]
+    fn test_pcr_snapshots_live_ddl_idempotent() {
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_pcr_snapshots_live_ddl_has_wal() {
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_dedup_key_option_greeks_live_includes_candle_interval() {
+        assert!(DEDUP_KEY_OPTION_GREEKS_LIVE.contains("candle_interval"));
+        assert!(DEDUP_KEY_OPTION_GREEKS_LIVE.contains("security_id"));
+        assert!(DEDUP_KEY_OPTION_GREEKS_LIVE.contains("segment"));
+    }
+
+    #[test]
+    fn test_dedup_key_pcr_snapshots_live_includes_candle_interval() {
+        assert!(DEDUP_KEY_PCR_SNAPSHOTS_LIVE.contains("candle_interval"));
+        assert!(DEDUP_KEY_PCR_SNAPSHOTS_LIVE.contains("underlying_symbol"));
+        assert!(DEDUP_KEY_PCR_SNAPSHOTS_LIVE.contains("expiry_date"));
+    }
+
+    #[test]
+    fn test_dhan_raw_ddl_idempotent() {
+        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_dhan_raw_ddl_has_wal() {
+        assert!(DHAN_OPTION_CHAIN_RAW_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_dhan_raw_dedup_key_includes_security_id_and_segment() {
+        assert!(DEDUP_KEY_DHAN_OPTION_CHAIN_RAW.contains("security_id"));
+        assert!(DEDUP_KEY_DHAN_OPTION_CHAIN_RAW.contains("segment"));
+    }
+
+    #[test]
+    fn test_table_name_constants_non_empty() {
+        assert!(!TABLE_OPTION_GREEKS.is_empty());
+        assert!(!TABLE_PCR_SNAPSHOTS.is_empty());
+        assert!(!TABLE_GREEKS_VERIFICATION.is_empty());
+        assert!(!TABLE_DHAN_OPTION_CHAIN_RAW.is_empty());
+        assert!(!TABLE_OPTION_GREEKS_LIVE.is_empty());
+        assert!(!TABLE_PCR_SNAPSHOTS_LIVE.is_empty());
+    }
+
+    #[test]
+    fn test_greeks_ddl_timeout_reasonable() {
+        assert!((5..=30).contains(&DDL_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn test_greeks_reconnect_constants() {
+        assert!(GREEKS_MAX_RECONNECT_ATTEMPTS >= 1);
+        assert!(GREEKS_RECONNECT_INITIAL_DELAY_MS >= 100);
+        assert!(GREEKS_RECONNECT_THROTTLE_SECS >= 5);
+    }
+
+    #[test]
+    fn test_option_greeks_ddl_has_higher_order_greeks() {
+        for col in [
+            "charm DOUBLE",
+            "vanna DOUBLE",
+            "volga DOUBLE",
+            "veta DOUBLE",
+            "speed DOUBLE",
+            "color DOUBLE",
+            "zomma DOUBLE",
+            "ultima DOUBLE",
+        ] {
+            assert!(
+                OPTION_GREEKS_DDL.contains(col),
+                "option_greeks missing higher-order: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_option_greeks_live_ddl_has_higher_order_greeks() {
+        for col in [
+            "charm DOUBLE",
+            "vanna DOUBLE",
+            "volga DOUBLE",
+            "veta DOUBLE",
+            "speed DOUBLE",
+            "color DOUBLE",
+            "zomma DOUBLE",
+            "ultima DOUBLE",
+        ] {
+            assert!(
+                OPTION_GREEKS_LIVE_DDL.contains(col),
+                "option_greeks_live missing: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pcr_snapshots_live_ddl_has_all_pcr_fields() {
+        for col in [
+            "pcr_oi DOUBLE",
+            "pcr_volume DOUBLE",
+            "total_put_oi LONG",
+            "total_call_oi LONG",
+            "total_put_volume LONG",
+            "total_call_volume LONG",
+            "sentiment SYMBOL",
+        ] {
+            assert!(
+                PCR_SNAPSHOTS_LIVE_DDL.contains(col),
+                "pcr_snapshots_live missing: {col}"
+            );
+        }
+    }
 }

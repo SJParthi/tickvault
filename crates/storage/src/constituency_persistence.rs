@@ -938,4 +938,146 @@ mod tests {
     fn test_dedup_key_index_constituents_format() {
         assert_eq!(DEDUP_KEY_INDEX_CONSTITUENTS, "index_name, symbol");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL column tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ddl_has_index_name_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("index_name SYMBOL"));
+    }
+
+    #[test]
+    fn test_ddl_has_symbol_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("symbol SYMBOL"));
+    }
+
+    #[test]
+    fn test_ddl_has_isin_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("isin STRING"));
+    }
+
+    #[test]
+    fn test_ddl_has_weight_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("weight DOUBLE"));
+    }
+
+    #[test]
+    fn test_ddl_has_sector_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("sector STRING"));
+    }
+
+    #[test]
+    fn test_ddl_has_security_id_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("security_id LONG"));
+    }
+
+    #[test]
+    fn test_ddl_has_wal() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("WAL"));
+    }
+
+    #[test]
+    fn test_ddl_has_month_partitioning() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("PARTITION BY MONTH"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: count_total_constituents
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_total_constituents_empty_map() {
+        use dhan_live_trader_common::instrument_types::ConstituencyBuildMetadata;
+        let map = IndexConstituencyMap {
+            index_to_constituents: std::collections::HashMap::new(),
+            stock_to_indices: std::collections::HashMap::new(),
+            build_metadata: ConstituencyBuildMetadata::default(),
+        };
+        assert_eq!(count_total_constituents(&map), 0);
+    }
+
+    #[test]
+    fn test_count_total_constituents_single_index() {
+        use dhan_live_trader_common::instrument_types::{
+            ConstituencyBuildMetadata, IndexConstituent,
+        };
+        let today = chrono::Utc::now().date_naive();
+        let mut index_map = std::collections::HashMap::new();
+        index_map.insert(
+            "NIFTY 50".to_string(),
+            vec![
+                IndexConstituent {
+                    index_name: "NIFTY 50".to_string(),
+                    symbol: "RELIANCE".to_string(),
+                    isin: "INE002A01018".to_string(),
+                    weight: 10.5,
+                    sector: "Energy".to_string(),
+                    last_updated: today,
+                },
+                IndexConstituent {
+                    index_name: "NIFTY 50".to_string(),
+                    symbol: "TCS".to_string(),
+                    isin: "INE467B01029".to_string(),
+                    weight: 5.0,
+                    sector: "IT".to_string(),
+                    last_updated: today,
+                },
+            ],
+        );
+        let map = IndexConstituencyMap {
+            index_to_constituents: index_map,
+            stock_to_indices: std::collections::HashMap::new(),
+            build_metadata: ConstituencyBuildMetadata::default(),
+        };
+        assert_eq!(count_total_constituents(&map), 2);
+    }
+
+    #[test]
+    fn test_count_total_constituents_multiple_indices() {
+        use dhan_live_trader_common::instrument_types::{
+            ConstituencyBuildMetadata, IndexConstituent,
+        };
+        let today = chrono::Utc::now().date_naive();
+        let mut index_map = std::collections::HashMap::new();
+        index_map.insert(
+            "NIFTY 50".to_string(),
+            vec![IndexConstituent {
+                index_name: "NIFTY 50".to_string(),
+                symbol: "RELIANCE".to_string(),
+                isin: "INE002A01018".to_string(),
+                weight: 10.5,
+                sector: "Energy".to_string(),
+                last_updated: today,
+            }],
+        );
+        index_map.insert(
+            "NIFTY BANK".to_string(),
+            vec![
+                IndexConstituent {
+                    index_name: "NIFTY BANK".to_string(),
+                    symbol: "HDFCBANK".to_string(),
+                    isin: "INE040A01034".to_string(),
+                    weight: 25.0,
+                    sector: "Banking".to_string(),
+                    last_updated: today,
+                },
+                IndexConstituent {
+                    index_name: "NIFTY BANK".to_string(),
+                    symbol: "ICICIBANK".to_string(),
+                    isin: "INE090A01021".to_string(),
+                    weight: 20.0,
+                    sector: "Banking".to_string(),
+                    last_updated: today,
+                },
+            ],
+        );
+        let map = IndexConstituencyMap {
+            index_to_constituents: index_map,
+            stock_to_indices: std::collections::HashMap::new(),
+            build_metadata: ConstituencyBuildMetadata::default(),
+        };
+        assert_eq!(count_total_constituents(&map), 3);
+    }
 }

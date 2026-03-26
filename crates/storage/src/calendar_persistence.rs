@@ -881,4 +881,128 @@ mod tests {
         // covering lines 129 and 165.
         ensure_calendar_table(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // classify_holiday_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_holiday_type_regular() {
+        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
+            name: "Republic Day".to_string(),
+            is_muhurat: false,
+            is_mock: false,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Holiday");
+    }
+
+    #[test]
+    fn test_classify_holiday_type_muhurat() {
+        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 21).unwrap(),
+            name: "Diwali".to_string(),
+            is_muhurat: true,
+            is_mock: false,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Muhurat Trading");
+    }
+
+    #[test]
+    fn test_classify_holiday_type_mock() {
+        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(),
+            name: "Mock Trading".to_string(),
+            is_muhurat: false,
+            is_mock: true,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Mock Trading Session");
+    }
+
+    #[test]
+    fn test_classify_holiday_type_mock_takes_precedence() {
+        // If both is_mock and is_muhurat are true, mock wins (checked first)
+        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(),
+            name: "Both".to_string(),
+            is_muhurat: true,
+            is_mock: true,
+        };
+        assert_eq!(classify_holiday_type(&entry), "Mock Trading Session");
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_midnight_epoch_nanos
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_midnight_epoch_nanos_valid_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap();
+        let nanos = compute_midnight_epoch_nanos(date);
+        assert!(nanos.is_some());
+        let nanos = nanos.unwrap();
+        // 2026-01-26 00:00:00 UTC in nanos
+        assert!(nanos > 0);
+        // Should be divisible by 1_000_000_000 (whole seconds)
+        assert_eq!(nanos % 1_000_000_000, 0);
+    }
+
+    #[test]
+    fn test_compute_midnight_epoch_nanos_epoch() {
+        let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let nanos = compute_midnight_epoch_nanos(date);
+        assert_eq!(nanos, Some(0));
+    }
+
+    #[test]
+    fn test_compute_midnight_epoch_nanos_different_dates_differ() {
+        let d1 = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2026, 3, 2).unwrap();
+        let n1 = compute_midnight_epoch_nanos(d1).unwrap();
+        let n2 = compute_midnight_epoch_nanos(d2).unwrap();
+        assert_ne!(n1, n2);
+        // One day apart = 86400 * 1_000_000_000 nanos
+        assert_eq!(n2 - n1, 86_400 * 1_000_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_questdb_exec_url / build_dedup_sql / build_ilp_conf_string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_questdb_exec_url() {
+        let url = build_questdb_exec_url("dlt-questdb", 9000);
+        assert_eq!(url, "http://dlt-questdb:9000/exec");
+    }
+
+    #[test]
+    fn test_build_dedup_sql() {
+        let sql = build_dedup_sql("nse_holidays", "name");
+        assert_eq!(
+            sql,
+            "ALTER TABLE nse_holidays DEDUP ENABLE UPSERT KEYS(ts, name)"
+        );
+    }
+
+    #[test]
+    fn test_build_ilp_conf_string() {
+        let conf = build_ilp_conf_string("dlt-questdb", 9009);
+        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_calendar_persist_max_retries_reasonable() {
+        assert!(CALENDAR_PERSIST_MAX_RETRIES >= 1);
+        assert!(CALENDAR_PERSIST_MAX_RETRIES <= 10);
+    }
+
+    #[test]
+    fn test_calendar_persist_retry_delay_reasonable() {
+        assert!(CALENDAR_PERSIST_RETRY_DELAY_SECS >= 1);
+        assert!(CALENDAR_PERSIST_RETRY_DELAY_SECS <= 10);
+    }
 }
