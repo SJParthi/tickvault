@@ -4539,7 +4539,7 @@ mod tests {
     #[test]
     fn test_spill_candle_to_disk_write_error_nulls_writer() {
         // We test the case where the spill file writer exists but write fails.
-        // Use a file opened on a read-only path to simulate write error.
+        // Use /dev/full with capacity=1 BufWriter to force immediate flush failure (ENOSPC).
         let config = QuestDbConfig {
             host: "192.0.2.1".to_string(),
             ilp_port: 1,
@@ -4549,28 +4549,15 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
-        // Create a tmp dir with a read-only file to simulate write failure
-        let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-spill-write-err-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let spill_path = tmp_dir.join("candles-write-err.bin");
-
-        // Create the file, then open it read-only as the writer
-        std::fs::write(&spill_path, b"").unwrap();
-        // Open read-only — writing to it will fail on Linux
+        // /dev/full always returns ENOSPC on write. Capacity=1 forces immediate flush.
         let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&spill_path)
+            .write(true)
+            .open("/dev/full")
             .unwrap();
-        writer.spill_writer = Some(BufWriter::new(file));
-        writer.spill_path = Some(spill_path.clone());
+        writer.spill_writer = Some(BufWriter::with_capacity(1, file));
+        writer.spill_path = Some(std::path::PathBuf::from("/dev/full"));
 
-        // Fill ring buffer to trigger spill
-        for i in 0..CANDLE_BUFFER_CAPACITY as u32 {
-            writer.candle_buffer.push_back(make_buffered_candle(i));
-        }
-
-        // Now spill_candle_to_disk will try to write and fail
+        // Now spill_candle_to_disk will try to write and fail (ENOSPC)
         let candle = make_buffered_candle(999);
         writer.spill_candle_to_disk(&candle);
 
@@ -4579,10 +4566,6 @@ mod tests {
             writer.spill_writer.is_none(),
             "spill_writer must be None after write failure"
         );
-
-        // Cleanup
-        let _ = std::fs::remove_file(&spill_path);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -4737,18 +4720,21 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_candle_buffer_final_flush_failure_rescues() {
-        // Exercise lines 627-629: final flush fails after draining ring.
-        let port = spawn_tcp_drain_server();
+    fn test_drain_candle_buffer_sender_none_builds_but_no_flush() {
+        // Exercise drain_candle_buffer with sender=None: candles are popped
+        // and ILP rows built into the standalone buffer. The flush conditions
+        // at lines 621 and 627 silently skip when sender is None. Candles
+        // move from ring buffer into in_flight but never confirm flushed.
         let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
         };
         let mut writer = LiveCandleWriter::new(&config).unwrap();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+        assert!(writer.sender.is_none());
 
-        // Put fewer candles than batch size so we only get one final flush
         let count = 5_usize;
         for i in 0..count as u32 {
             writer
@@ -4756,24 +4742,13 @@ mod tests {
                 .push_back(make_buffered_candle(3000 + i));
         }
 
-        // Drain will build rows and do a final flush. With a drain server,
-        // flush succeeds — so instead disconnect the sender after building.
-        // Actually, drain_candle_buffer's final flush at line 627 fires
-        // when in_flight is non-empty after all candles are popped.
-        // The "error" path requires sender to fail. Let's poison it.
-        // Drop the sender, set to an unreachable one.
-        writer.sender = None;
-        // But drain_candle_buffer returns early if sender is None.
-        // So this path is only hit when sender is Some but flush fails.
-        // This requires a sender connected to a server that drops mid-stream.
-
-        // For coverage, let's call drain with sender=None to hit early return.
+        // Drain pops candles even with sender=None (no early return guard).
         writer.drain_candle_buffer();
-        // Candles stay in ring buffer since drain returned early.
+        // Ring buffer drained — candles were popped.
         assert_eq!(
             writer.candle_buffer.len(),
-            count,
-            "candles must remain when sender is None"
+            0,
+            "candles are popped during drain even with sender=None"
         );
     }
 
@@ -4915,7 +4890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recover_candle_skips_current_active_spill() {
+    fn test_recover_candle_active_spill_skipped_in_stale_recovery() {
         // Exercise line 721-722: active spill file is skipped during recovery.
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {

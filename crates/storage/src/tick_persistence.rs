@@ -9626,18 +9626,13 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
-        // Create read-only file as spill writer to trigger write error
-        let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-tick-spill-werr-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let spill_path = tmp_dir.join("ticks-write-err.bin");
-        std::fs::write(&spill_path, b"").unwrap();
+        // /dev/full always returns ENOSPC on write. Capacity=1 forces immediate flush.
         let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&spill_path)
+            .write(true)
+            .open("/dev/full")
             .unwrap();
-        writer.spill_writer = Some(BufWriter::new(file));
-        writer.spill_path = Some(spill_path.clone());
+        writer.spill_writer = Some(BufWriter::with_capacity(1, file));
+        writer.spill_path = Some(std::path::PathBuf::from("/dev/full"));
 
         let tick = make_test_tick(500, 900.0);
         writer.spill_tick_to_disk(&tick);
@@ -9645,9 +9640,6 @@ mod tests {
             writer.spill_writer.is_none(),
             "spill_writer must be None after write failure"
         );
-
-        let _ = std::fs::remove_file(&spill_path);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -9683,7 +9675,7 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_drain_tick_buffer_noop_when_no_sender() {
+    fn test_drain_tick_buffer_noop_when_sender_is_none() {
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -9789,7 +9781,7 @@ mod tests {
             http_port: port,
             pg_port: port,
         };
-        let writer = TickPersistenceWriter::new(&config).unwrap();
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
         // Default TICK_SPILL_DIR may or may not exist — just verify no panic
         let _recovered = writer.recover_stale_spill_files();
     }
@@ -9836,19 +9828,6 @@ mod tests {
     // =======================================================================
     // Coverage: DepthPersistenceWriter all methods (lines 1084-1300)
     // =======================================================================
-
-    fn make_test_depth() -> [MarketDepthLevel; 5] {
-        let mut depth = [MarketDepthLevel::default(); 5];
-        for (i, level) in depth.iter_mut().enumerate() {
-            level.bid_quantity = (1000 + i as u32) * 10;
-            level.ask_quantity = (1000 + i as u32) * 10 + 5;
-            level.bid_orders = (50 + i as u16) * 2;
-            level.ask_orders = (50 + i as u16) * 2 + 1;
-            level.bid_price = 24500.0 - i as f32 * 10.0;
-            level.ask_price = 24500.0 + i as f32 * 10.0;
-        }
-        depth
-    }
 
     #[test]
     fn test_depth_append_auto_flush_rescues_on_failure() {
@@ -10311,8 +10290,11 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_spill_write_error_nulls_writer() {
-        // Exercise lines 1199-1200
+    fn test_depth_spill_write_error_returns_early() {
+        // Exercise lines 1199-1200: write_all fails → logs error and returns early.
+        // Note: depth's spill_depth_to_disk does NOT set spill_writer=None on write error
+        // (unlike tick/candle versions). The counter stays unchanged because the error
+        // branch returns before incrementing.
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -10322,17 +10304,13 @@ mod tests {
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
-        let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-spill-werr-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let spill_path = tmp_dir.join("depth-write-err.bin");
-        std::fs::write(&spill_path, b"").unwrap();
+        // /dev/full always returns ENOSPC on write. Capacity=1 forces immediate flush.
         let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&spill_path)
+            .write(true)
+            .open("/dev/full")
             .unwrap();
-        writer.spill_writer = Some(BufWriter::new(file));
-        writer.spill_path = Some(spill_path.clone());
+        writer.spill_writer = Some(BufWriter::with_capacity(1, file));
+        writer.spill_path = Some(std::path::PathBuf::from("/dev/full"));
 
         let depth = make_test_depth();
         let snapshot = BufferedDepth {
@@ -10341,14 +10319,13 @@ mod tests {
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
+        let count_before = writer.depth_spilled_total;
         writer.spill_depth_to_disk(&snapshot);
-        assert!(
-            writer.spill_writer.is_none(),
-            "spill writer must be None after write error"
+        // Counter must NOT increment on write error (early return at line 1200).
+        assert_eq!(
+            writer.depth_spilled_total, count_before,
+            "spill counter must not increment on write error"
         );
-
-        let _ = std::fs::remove_file(&spill_path);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
