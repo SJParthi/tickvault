@@ -80,7 +80,7 @@ pub fn read_binary_cache(cache_dir: &str) -> Result<Option<FnoUniverse>> {
     let file = std::fs::File::open(&path)
         .with_context(|| format!("failed to open rkyv cache: {}", path.display()))?;
 
-    let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, single-process, no concurrent writers
+    let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, atomic rename(2) guarantees no torn writes, rkyv::from_bytes validates alignment/bounds
         .with_context(|| format!("failed to mmap rkyv cache: {}", path.display()))?;
 
     let rkyv_payload = validate_header(&mmap, &path)?;

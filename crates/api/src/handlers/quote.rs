@@ -50,6 +50,17 @@ pub async fn get_quote(
     State(state): State<SharedAppState>,
     Path(security_id): Path<u32>,
 ) -> impl IntoResponse {
+    // SECURITY: defense-in-depth guard against invalid security_id.
+    // The u32 type from Axum's Path extractor already prevents SQL injection,
+    // but we reject 0 as an invalid security_id (no instrument has id=0).
+    if security_id == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid security_id: must be non-zero"})),
+        )
+            .into_response();
+    }
+
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 

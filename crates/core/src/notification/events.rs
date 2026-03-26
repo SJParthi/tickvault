@@ -279,12 +279,10 @@ impl NotificationEvent {
     pub fn to_message(&self) -> String {
         match self {
             Self::StartupComplete { mode } => {
+                // SECURITY: Do not expose internal service ports in Telegram.
                 format!(
                     "<b>dhan-live-trader started</b>\nMode: {mode}\n\n\
-                     Grafana: http://localhost:3000\n\
-                     Prometheus: http://localhost:9090\n\
-                     Jaeger: http://localhost:16686\n\
-                     QuestDB: http://localhost:9000"
+                     Dashboards: Grafana / Prometheus / Jaeger / QuestDB available"
                 )
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
@@ -326,7 +324,11 @@ impl NotificationEvent {
                 reason,
                 manual_trigger_url,
             } => {
-                format!("<b>Instruments FAILED</b>\n{reason}\n\nRetry: {manual_trigger_url}")
+                // SECURITY: Do not expose internal API URL in Telegram.
+                let _ = manual_trigger_url; // kept in struct for internal use
+                format!(
+                    "<b>Instruments FAILED</b>\n{reason}\n\nRetry via /instruments/rebuild API endpoint"
+                )
             }
             Self::HistoricalFetchComplete {
                 instruments_fetched,
@@ -644,7 +646,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
-        assert!(msg.contains("Grafana: http://localhost:3000"));
+        // SECURITY: ports must NOT appear in Telegram message
+        assert!(!msg.contains("3000"), "internal port leaked: {msg}");
+        assert!(msg.contains("Dashboards"));
         assert!(msg.contains("Prometheus: http://localhost:9090"));
         assert!(msg.contains("Jaeger: http://localhost:16686"));
         assert!(msg.contains("QuestDB: http://localhost:9000"));
@@ -794,7 +798,10 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("Instruments FAILED"));
         assert!(msg.contains("HTTP 503"));
-        assert!(msg.contains("/api/instruments/rebuild"));
+        // SECURITY: internal URL must NOT appear in Telegram
+        assert!(!msg.contains("0.0.0.0"), "internal URL leaked: {msg}");
+        assert!(!msg.contains("3001"), "internal port leaked: {msg}");
+        assert!(msg.contains("/instruments/rebuild"));
     }
 
     #[test]
