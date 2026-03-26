@@ -806,7 +806,6 @@ impl LiveCandleWriter {
             }
             self.candles_spilled_total = 0;
         } else {
-            // Preserve spill file for next recovery attempt.
             self.spill_path = Some(spill_path);
             warn!(
                 drained,
@@ -869,10 +868,7 @@ impl LiveCandleWriter {
             if let Some(ref active_path) = self.spill_path
                 && path == *active_path
             {
-                info!(
-                    path = %path.display(),
-                    "skipping active candle spill file during stale recovery"
-                );
+                info!(path = %path.display(), "skipping active candle spill file during stale recovery");
                 continue;
             }
 
@@ -930,19 +926,11 @@ impl LiveCandleWriter {
                 if let Err(err) = std::fs::remove_file(&path) {
                     warn!(?err, path = %path.display(), "failed to delete stale candle spill file");
                 } else {
-                    info!(
-                        path = %path.display(),
-                        drained,
-                        "stale candle spill file recovered and deleted"
-                    );
+                    info!(path = %path.display(), drained, "stale candle spill file recovered and deleted");
                 }
                 total_recovered = total_recovered.saturating_add(drained);
             } else {
-                warn!(
-                    path = %path.display(),
-                    drained,
-                    "stale candle spill partially drained — file preserved for retry"
-                );
+                warn!(path = %path.display(), drained, "stale candle spill partially drained — file preserved for retry");
             }
         }
 
@@ -1081,11 +1069,7 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                warn!(
-                    %status,
-                    body = body.chars().take(200).collect::<String>(),
-                    "historical_candles table CREATE DDL returned non-success"
-                );
+                warn!(%status, body = body.chars().take(200).collect::<String>(), "historical_candles table CREATE DDL returned non-success");
             }
         }
         Err(err) => {
@@ -1114,11 +1098,7 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                warn!(
-                    %status,
-                    body = body.chars().take(200).collect::<String>(),
-                    "historical_candles table DEDUP DDL returned non-success"
-                );
+                warn!(%status, body = body.chars().take(200).collect::<String>(), "historical_candles table DEDUP DDL returned non-success");
             }
         }
         Err(err) => {
