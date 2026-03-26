@@ -15,11 +15,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use secrecy::ExposeSecret;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use dhan_live_trader_common::constants::{
     OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS, OPTION_CHAIN_REQUEST_TIMEOUT_SECS,
 };
+
+/// Maximum number of retry attempts for transient server errors (502, 500, 503).
+const MAX_RETRIES: u32 = 3;
+
+/// Initial retry delay in milliseconds (doubles each attempt: 1s, 2s, 4s).
+const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 
 use crate::auth::TokenHandle;
 
@@ -77,6 +83,7 @@ impl OptionChainClient {
     /// Fetches the list of active expiry dates for an underlying.
     ///
     /// Rate-limited: waits if less than 3 seconds since last request.
+    /// Retries up to 3 times with exponential backoff on server errors (502/500/503).
     pub async fn fetch_expiry_list(
         &mut self,
         underlying_scrip: u64,
@@ -90,41 +97,81 @@ impl OptionChainClient {
             underlying_seg: underlying_seg.to_string(),
         };
 
-        let token = self.get_token()?;
-        let response = self
-            .http
-            .post(&url)
-            .header("access-token", token)
-            .header("client-id", &self.client_id)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("expiry list request failed")?;
+        let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("expiry list API returned {status}: {body}");
+        for attempt in 0..=MAX_RETRIES {
+            let token = self.get_token()?;
+            let send_result = self
+                .http
+                .post(&url)
+                .header("access-token", token)
+                .header("client-id", &self.client_id)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            let response = match send_result {
+                Ok(r) => r,
+                Err(err) => {
+                    if attempt < MAX_RETRIES {
+                        warn!(
+                            attempt = attempt + 1,
+                            max = MAX_RETRIES,
+                            delay_ms,
+                            ?err,
+                            "expiry list request failed — retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = delay_ms.saturating_mul(2);
+                        continue;
+                    }
+                    return Err(err).context("expiry list request failed");
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                let resp: ExpiryListResponse = response
+                    .json()
+                    .await
+                    .context("failed to deserialize expiry list response")?;
+                debug!(
+                    underlying_scrip,
+                    expiry_count = resp.data.len(),
+                    "expiry list fetched"
+                );
+                return Ok(resp);
+            }
+
+            // Retry on transient server errors (502, 500, 503).
+            if is_retryable_status(status) && attempt < MAX_RETRIES {
+                let resp_body = response.text().await.unwrap_or_default();
+                warn!(
+                    attempt = attempt + 1,
+                    max = MAX_RETRIES,
+                    delay_ms,
+                    %status,
+                    "expiry list API server error — retrying"
+                );
+                debug!(resp_body, "server error response body");
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms = delay_ms.saturating_mul(2);
+                continue;
+            }
+
+            // Non-retryable error or retries exhausted.
+            let resp_body = response.text().await.unwrap_or_default();
+            bail!("expiry list API returned {status}: {resp_body}");
         }
 
-        let resp: ExpiryListResponse = response
-            .json()
-            .await
-            .context("failed to deserialize expiry list response")?;
-
-        debug!(
-            underlying_scrip,
-            expiry_count = resp.data.len(),
-            "expiry list fetched"
-        );
-
-        Ok(resp)
+        bail!("expiry list request failed after {MAX_RETRIES} retries")
     }
 
     /// Fetches the full option chain for an underlying at a specific expiry.
     ///
     /// Rate-limited: waits if less than 3 seconds since last request.
+    /// Retries up to 3 times with exponential backoff on server errors (502/500/503).
     pub async fn fetch_option_chain(
         &mut self,
         underlying_scrip: u64,
@@ -140,38 +187,77 @@ impl OptionChainClient {
             expiry: expiry.to_string(),
         };
 
-        let token = self.get_token()?;
-        let response = self
-            .http
-            .post(&url)
-            .header("access-token", token)
-            .header("client-id", &self.client_id)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("option chain request failed")?;
+        let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("option chain API returned {status}: {body}");
+        for attempt in 0..=MAX_RETRIES {
+            let token = self.get_token()?;
+            let send_result = self
+                .http
+                .post(&url)
+                .header("access-token", token)
+                .header("client-id", &self.client_id)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            let response = match send_result {
+                Ok(r) => r,
+                Err(err) => {
+                    if attempt < MAX_RETRIES {
+                        warn!(
+                            attempt = attempt + 1,
+                            max = MAX_RETRIES,
+                            delay_ms,
+                            ?err,
+                            "option chain request failed — retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = delay_ms.saturating_mul(2);
+                        continue;
+                    }
+                    return Err(err).context("option chain request failed");
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                let resp: OptionChainResponse = response
+                    .json()
+                    .await
+                    .context("failed to deserialize option chain response")?;
+                debug!(
+                    underlying_scrip,
+                    expiry,
+                    strikes = resp.data.oc.len(),
+                    spot = resp.data.last_price,
+                    "option chain fetched"
+                );
+                return Ok(resp);
+            }
+
+            // Retry on transient server errors (502, 500, 503).
+            if is_retryable_status(status) && attempt < MAX_RETRIES {
+                let resp_body = response.text().await.unwrap_or_default();
+                warn!(
+                    attempt = attempt + 1,
+                    max = MAX_RETRIES,
+                    delay_ms,
+                    %status,
+                    "option chain API server error — retrying"
+                );
+                debug!(resp_body, "server error response body");
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms = delay_ms.saturating_mul(2);
+                continue;
+            }
+
+            // Non-retryable error or retries exhausted.
+            let resp_body = response.text().await.unwrap_or_default();
+            bail!("option chain API returned {status}: {resp_body}");
         }
 
-        let resp: OptionChainResponse = response
-            .json()
-            .await
-            .context("failed to deserialize option chain response")?;
-
-        debug!(
-            underlying_scrip,
-            expiry,
-            strikes = resp.data.oc.len(),
-            spot = resp.data.last_price,
-            "option chain fetched"
-        );
-
-        Ok(resp)
+        bail!("option chain request failed after {MAX_RETRIES} retries")
     }
 
     /// Enforces the 3-second rate limit between requests.
@@ -199,6 +285,16 @@ impl OptionChainClient {
             .context("no token available for option chain API")?;
         Ok(state.access_token().expose_secret().to_string())
     }
+}
+
+/// Returns true for HTTP status codes that indicate transient server errors
+/// worth retrying: 500 (Internal Server Error), 502 (Bad Gateway),
+/// 503 (Service Unavailable).
+///
+/// Does NOT retry on 4xx (client errors) or DH-904 (rate limit — handled
+/// separately with exponential backoff per dhan-api-introduction rule 8).
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 500 | 502 | 503)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,5 +339,47 @@ mod tests {
     #[test]
     fn test_request_timeout() {
         assert_eq!(OPTION_CHAIN_REQUEST_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn test_retry_constants() {
+        assert_eq!(MAX_RETRIES, 3);
+        assert_eq!(INITIAL_RETRY_DELAY_MS, 1000);
+    }
+
+    #[test]
+    fn test_is_retryable_status_server_errors() {
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_retryable_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_status_not_client_errors() {
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn test_is_retryable_status_not_success() {
+        assert!(!is_retryable_status(reqwest::StatusCode::OK));
+        assert!(!is_retryable_status(reqwest::StatusCode::CREATED));
+    }
+
+    #[test]
+    fn test_exponential_backoff_sequence() {
+        let mut delay = INITIAL_RETRY_DELAY_MS;
+        assert_eq!(delay, 1000);
+        delay = delay.saturating_mul(2);
+        assert_eq!(delay, 2000);
+        delay = delay.saturating_mul(2);
+        assert_eq!(delay, 4000);
     }
 }

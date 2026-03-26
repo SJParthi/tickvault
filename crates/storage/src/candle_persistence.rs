@@ -201,7 +201,12 @@ impl CandlePersistenceWriter {
         if let Err(err) = sender.flush(&mut self.buffer) {
             self.sender = None;
             self.pending_count = 0;
-            self.buffer.clear();
+            // Create fresh buffer instead of clear() to avoid questdb-rs state corruption.
+            self.buffer = if let Some(ref s) = self.sender {
+                s.new_buffer()
+            } else {
+                Buffer::new(ProtocolVersion::V1)
+            };
             return Err(err).context("flush candles to QuestDB");
         }
         self.pending_count = 0;
@@ -519,9 +524,9 @@ impl LiveCandleWriter {
         if let Some(ref mut sender) = self.sender {
             if let Err(err) = sender.flush(&mut self.buffer) {
                 warn!(?err, pending = count, "live candle flush failed — rescuing in-flight candles");
-                self.sender = None; self.buffer.clear(); self.rescue_in_flight(); return;
+                self.sender = None; self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return;
             }
-        } else { self.buffer.clear(); self.rescue_in_flight(); return; }
+        } else { self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return; }
         self.in_flight.clear();
         self.pending_count = 0;
         debug!(flushed_rows = count, "live candle batch flushed to QuestDB");
@@ -615,13 +620,13 @@ impl LiveCandleWriter {
             drained = drained.saturating_add(1);
             if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
                 warn!(?err, drained, "candle ring drain flush failed");
-                self.sender = None; self.buffer.clear(); self.rescue_in_flight(); return;
+                self.sender = None; self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return;
             }
             if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) { self.in_flight.clear(); }
         }
         if !self.in_flight.is_empty() && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
             warn!(?err, drained, "candle ring drain final flush failed");
-            self.sender = None; self.buffer.clear(); self.rescue_in_flight(); return;
+            self.sender = None; self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return;
         }
         self.in_flight.clear();
         if drained > 0 { info!(drained, ring_count, "candle ring buffer drained to QuestDB"); }
@@ -792,6 +797,18 @@ impl LiveCandleWriter {
             "QuestDB ILP reconnection failed after {} attempts for candle writer",
             LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
         )
+    }
+
+    /// Creates a fresh ILP buffer. Uses sender's config if available,
+    /// otherwise standalone V1 buffer. MUST be used instead of `buffer.clear()`
+    /// in all error/reconnect paths to avoid corrupting the questdb-rs
+    /// Buffer internal state machine (production bug 2026-03-26).
+    fn fresh_buffer(&self) -> Buffer {
+        if let Some(ref sender) = self.sender {
+            sender.new_buffer()
+        } else {
+            Buffer::new(ProtocolVersion::V1)
+        }
     }
 
     /// Throttled reconnect — at most once per `LIVE_CANDLE_RECONNECT_THROTTLE_SECS`.

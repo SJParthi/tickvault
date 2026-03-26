@@ -54,6 +54,10 @@ const INDEX_SEGMENT: &str = "IDX_I";
 /// Segment string for F&O contracts in QuestDB.
 const FNO_SEGMENT: &str = "NSE_FNO";
 
+/// After this many consecutive cycles where ALL underlyings fail,
+/// escalate from WARN to ERROR (which triggers Telegram alert).
+const CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: u32 = 5;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -103,14 +107,51 @@ pub async fn run_greeks_pipeline(
     };
 
     let interval = Duration::from_secs(greeks_config.fetch_interval_secs);
+    let mut consecutive_zero_strikes: u32 = 0;
 
     loop {
         // Run one cycle.
-        if let Err(err) = run_one_cycle(&mut oc_client, &mut writer, &greeks_config).await {
-            warn!(
-                ?err,
-                "greeks pipeline cycle failed — will retry next interval"
-            );
+        match run_one_cycle(&mut oc_client, &mut writer, &greeks_config).await {
+            Ok(total_strikes) => {
+                if total_strikes == 0 {
+                    consecutive_zero_strikes = consecutive_zero_strikes.saturating_add(1);
+                    if consecutive_zero_strikes >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD {
+                        // ERROR level triggers Telegram alert (per rust-code.md).
+                        error!(
+                            consecutive_cycles = consecutive_zero_strikes,
+                            "greeks pipeline: ALL underlyings failed for {} consecutive cycles — \
+                             Dhan API may be down or token expired",
+                            consecutive_zero_strikes,
+                        );
+                    }
+                } else {
+                    if consecutive_zero_strikes >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD {
+                        info!(
+                            recovered_after = consecutive_zero_strikes,
+                            total_strikes,
+                            "greeks pipeline recovered after {} consecutive zero-strike cycles",
+                            consecutive_zero_strikes,
+                        );
+                    }
+                    consecutive_zero_strikes = 0;
+                }
+            }
+            Err(err) => {
+                consecutive_zero_strikes = consecutive_zero_strikes.saturating_add(1);
+                if consecutive_zero_strikes >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD {
+                    error!(
+                        ?err,
+                        consecutive_cycles = consecutive_zero_strikes,
+                        "greeks pipeline cycle failed — {} consecutive failures",
+                        consecutive_zero_strikes,
+                    );
+                } else {
+                    warn!(
+                        ?err,
+                        "greeks pipeline cycle failed — will retry next interval"
+                    );
+                }
+            }
         }
 
         tokio::time::sleep(interval).await;
@@ -122,11 +163,12 @@ pub async fn run_greeks_pipeline(
 // ---------------------------------------------------------------------------
 
 /// Runs one fetch-compute-persist cycle for all configured underlyings.
+/// Returns the total number of strikes processed (0 = all underlyings failed).
 async fn run_one_cycle(
     oc_client: &mut OptionChainClient,
     writer: &mut GreeksPersistenceWriter,
     config: &GreeksConfig,
-) -> Result<()> {
+) -> Result<u32> {
     // System clock (UTC) → IST for QuestDB display (same pattern as received_at in tick_persistence).
     let now_nanos = Utc::now()
         .timestamp_nanos_opt()
@@ -172,7 +214,7 @@ async fn run_one_cycle(
         );
     }
 
-    Ok(())
+    Ok(total_strikes)
 }
 
 /// Processes a single underlying: fetch chain → compute → write.

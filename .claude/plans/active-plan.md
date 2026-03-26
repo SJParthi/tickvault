@@ -236,3 +236,20 @@ Both touch the same files (tick_processor.rs, candle_persistence.rs, greeks_pers
 | 10 | Equity tick arrives | Greeks = NaN, zero compute overhead |
 | 11 | Disk full (can't spill) | Log CRITICAL, drop oldest from ring buffer |
 | 12 | All views queried | Greeks columns available via last() aggregation |
+| 13 | QuestDB broken pipe mid-flush (Greeks) | Fresh buffer created (not clear()), next cycle writes+flushes normally |
+| 14 | Dhan option chain API 502/500 | Retry 3x with 1s/2s/4s backoff, then skip |
+| 15 | Dhan 502 for 5+ consecutive cycles | Escalate to ERROR (Telegram alert) |
+
+### Phase I: Greeks Persistence Bug Fixes (Live Production Bugs)
+
+- [ ] **I1.** Fix buffer corruption in flush/reconnect: replace buffer.clear() with Buffer::new()
+  - Files: crates/storage/src/greeks_persistence.rs
+  - Tests: test_flush_reconnect_fresh_buffer, test_flush_error_fresh_buffer
+
+- [ ] **I2.** Add retry with exponential backoff for Dhan option chain 502/500
+  - Files: crates/core/src/option_chain/client.rs
+  - Tests: test_fetch_expiry_list_retries_on_server_error, test_fetch_option_chain_retries_on_server_error
+
+- [ ] **I3.** Add consecutive failure counter + ERROR escalation in greeks pipeline
+  - Files: crates/app/src/greeks_pipeline.rs
+  - Tests: (verified via log escalation pattern in pipeline loop)

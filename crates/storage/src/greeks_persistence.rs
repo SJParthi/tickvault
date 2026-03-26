@@ -507,7 +507,12 @@ impl GreeksPersistenceWriter {
             // After reconnect, pending data was in the old (broken) buffer.
             // The new sender has a fresh buffer — nothing to flush.
             // Greeks are recomputed every second, so data loss is acceptable.
-            self.buffer.clear();
+            // IMPORTANT: Create fresh buffer instead of clear() to avoid
+            // corrupting the questdb-rs Buffer internal state machine.
+            // clear() after reconnect causes "Bad call to flush, should have
+            // called table instead" on every subsequent cycle (production bug
+            // 2026-03-26 02:49–05:30 IST).
+            self.buffer = self.fresh_buffer();
             self.pending_count = 0;
             return Ok(());
         }
@@ -521,13 +526,17 @@ impl GreeksPersistenceWriter {
                     "greeks flush failed — disconnecting sender"
                 );
                 self.sender = None;
-                self.buffer.clear();
+                // IMPORTANT: Create fresh buffer, NOT clear(). The old buffer
+                // may be in a partial ILP state after a failed flush. clear()
+                // does not fully reset the questdb-rs state machine, causing
+                // every subsequent flush to fail with "Bad call to flush".
+                self.buffer = self.fresh_buffer();
                 self.pending_count = 0;
                 return Ok(()); // Swallow — Greeks are recomputed next second
             }
         } else {
             // No sender — discard buffered ILP rows (will be recomputed).
-            self.buffer.clear();
+            self.buffer = self.fresh_buffer();
             self.pending_count = 0;
             return Ok(());
         }
@@ -584,6 +593,22 @@ impl GreeksPersistenceWriter {
             "QuestDB ILP reconnection failed after {} attempts for greeks writer",
             GREEKS_MAX_RECONNECT_ATTEMPTS,
         )
+    }
+
+    /// Creates a fresh ILP buffer, using the sender's configuration if
+    /// available, otherwise falling back to a standalone V1 buffer.
+    ///
+    /// This MUST be used instead of `buffer.clear()` in all error/reconnect
+    /// paths. The questdb-rs `Buffer::clear()` does not fully reset the
+    /// internal state machine after a failed flush, causing every subsequent
+    /// `sender.flush()` to fail with "Bad call to flush, should have called
+    /// table instead".
+    fn fresh_buffer(&self) -> Buffer {
+        if let Some(ref sender) = self.sender {
+            sender.new_buffer()
+        } else {
+            Buffer::new(questdb::ingress::ProtocolVersion::V1)
+        }
     }
 
     /// Throttled reconnect — at most once per `GREEKS_RECONNECT_THROTTLE_SECS`.
