@@ -1949,12 +1949,7 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
     }
 
     if gap_count > 0 {
-        error!(
-            gap_minutes = gap_count,
-            lookback_minutes,
-            first_gaps = ?gap_times,
-            "tick data gaps detected after recovery — {gap_count} minute(s) with zero ticks"
-        );
+        error!(gap_minutes = gap_count, lookback_minutes, first_gaps = ?gap_times, "tick data gaps detected after recovery — {gap_count} minute(s) with zero ticks");
     } else {
         info!(
             lookback_minutes,
@@ -1973,12 +1968,7 @@ async fn execute_ddl_best_effort(client: &Client, base_url: &str, sql: &str, lab
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                warn!(
-                    %status,
-                    label,
-                    body = body.chars().take(200).collect::<String>(),
-                    "DDL returned non-success"
-                );
+                warn!(%status, label, body = body.chars().take(200).collect::<String>(), "DDL returned non-success");
             }
         }
         Err(err) => {

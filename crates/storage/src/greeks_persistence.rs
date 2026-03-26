@@ -526,10 +526,9 @@ impl GreeksPersistenceWriter {
                 return Ok(()); // Swallow — Greeks are recomputed next second
             }
         } else {
-            // No sender — discard buffered ILP rows (will be recomputed).
             self.buffer.clear();
             self.pending_count = 0;
-            return Ok(());
+            return Ok(()); // No sender — discard
         }
 
         self.pending_count = 0;
