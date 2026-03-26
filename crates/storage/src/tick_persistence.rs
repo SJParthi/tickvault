@@ -1014,6 +1014,8 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         questdb_config.host, questdb_config.http_port
     );
 
+    // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
+    // which cannot happen in our runtime (aws-lc-rs always installed).
     let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
@@ -1881,6 +1883,8 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
         questdb_config.host, questdb_config.http_port
     );
 
+    // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
+    // which cannot happen in our runtime (aws-lc-rs always installed).
     let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
@@ -1947,6 +1951,8 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
         questdb_config.host, questdb_config.http_port
     );
 
+    // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
+    // which cannot happen in our runtime (aws-lc-rs always installed).
     let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
@@ -7838,9 +7844,8 @@ mod tests {
         // Verify: sender set to None, in-flight ticks rescued to ring buffer,
         // last_flush_ms updated, error returned.
         //
-        // Approach: connect to a TCP server, append ticks (populates in_flight),
-        // then drop the TCP connection by having the server close, then call
-        // force_flush() which should fail at sender.flush().
+        // Approach: connect to a TCP server, append enough ticks to overflow
+        // the OS TCP buffer, wait for server drop, then flush should fail.
 
         // Start a TCP server that accepts one connection then IMMEDIATELY drops it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7861,41 +7866,39 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
         assert!(writer.sender.is_some());
 
-        // Append ticks to populate in_flight.
-        let tick_count = 3_usize;
+        // Wait for the TCP server to close the connection.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Append many ticks to overflow the OS TCP send buffer.
+        // Each ILP row is ~300 bytes. 500 rows ≈ 150KB which exceeds typical
+        // TCP buffer (64-128KB). This guarantees flush failure.
+        let tick_count = 500_usize;
         for i in 0..tick_count as u32 {
             let tick = make_test_tick(500 + i, 24500.0 + i as f32);
-            writer.append_tick(&tick).unwrap();
+            let _ = writer.append_tick(&tick);
         }
-        assert_eq!(writer.in_flight.len(), tick_count);
-        assert_eq!(writer.buffered_tick_count(), 0);
 
-        // Wait for the TCP server to close the connection.
-        std::thread::sleep(Duration::from_millis(100));
-
-        // force_flush should fail because the TCP connection is closed.
-        // The sender.flush() will detect the broken pipe.
+        // force_flush must fail because the TCP connection is closed and buffer
+        // is overflowed.
         let result = writer.force_flush();
-        // If the flush actually fails (connection was dropped):
-        if result.is_err() {
-            // Verify rescue happened.
-            assert!(
-                writer.sender.is_none(),
-                "sender must be None after flush failure"
-            );
-            assert_eq!(
-                writer.buffered_tick_count(),
-                tick_count,
-                "all in-flight ticks must be rescued to ring buffer"
-            );
-            assert!(
-                writer.in_flight.is_empty(),
-                "in-flight must be empty after rescue"
-            );
-            assert_eq!(writer.pending_count(), 0, "pending must be 0 after rescue");
-        }
-        // If the flush succeeds (OS buffered the data), that's also fine —
-        // we just can't verify the rescue path. The test doesn't panic either way.
+        assert!(
+            result.is_err(),
+            "flush must fail on broken TCP connection with overflowed buffer"
+        );
+        // Verify rescue happened.
+        assert!(
+            writer.sender.is_none(),
+            "sender must be None after flush failure"
+        );
+        assert!(
+            writer.buffered_tick_count() > 0,
+            "in-flight ticks must be rescued to ring buffer"
+        );
+        assert!(
+            writer.in_flight.is_empty(),
+            "in-flight must be empty after rescue"
+        );
+        assert_eq!(writer.pending_count(), 0, "pending must be 0 after rescue");
     }
 
     // -----------------------------------------------------------------------
@@ -8096,32 +8099,36 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         assert!(writer.sender.is_some());
 
-        let depth = make_test_depth();
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
-        assert_eq!(writer.in_flight.len(), 1);
-        assert_eq!(writer.buffered_depth_count(), 0);
-
         // Wait for connection drop.
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
 
-        // force_flush should fail due to broken pipe.
-        let result = writer.force_flush();
-        if result.is_err() {
-            assert!(
-                writer.sender.is_none(),
-                "sender must be None after depth flush failure"
-            );
-            assert_eq!(
-                writer.buffered_depth_count(),
-                1,
-                "depth in-flight must be rescued to ring buffer"
-            );
-            assert!(
-                writer.in_flight.is_empty(),
-                "in-flight must be empty after rescue"
-            );
-            assert_eq!(writer.pending_count, 0, "pending must be 0 after rescue");
+        // Append many depth snapshots to overflow OS TCP buffer.
+        // Each depth row set is 5 ILP rows × ~300 bytes = ~1500 bytes per snapshot.
+        // 200 snapshots ≈ 300KB which exceeds typical TCP buffer.
+        let depth = make_test_depth();
+        for i in 0..200_u32 {
+            let _ = writer.append_depth(i, 2, 1_000_000_000 + i as i64, &depth);
         }
+
+        // force_flush must fail due to broken pipe.
+        let result = writer.force_flush();
+        assert!(
+            result.is_err(),
+            "flush must fail on broken TCP connection with overflowed buffer"
+        );
+        assert!(
+            writer.sender.is_none(),
+            "sender must be None after depth flush failure"
+        );
+        assert!(
+            writer.buffered_depth_count() > 0,
+            "depth in-flight must be rescued to ring buffer"
+        );
+        assert!(
+            writer.in_flight.is_empty(),
+            "in-flight must be empty after rescue"
+        );
+        assert_eq!(writer.pending_count, 0, "pending must be 0 after rescue");
     }
 
     // -----------------------------------------------------------------------
@@ -8421,19 +8428,18 @@ mod tests {
 
     #[test]
     fn test_recover_stale_tick_spill_when_disconnected() {
+        // Create a working writer, then set sender to None to simulate disconnect.
+        let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
-            ilp_port: 1,
-            http_port: 1,
-            pg_port: 1,
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
         };
-        // Writer cannot connect.
-        let writer_result = TickPersistenceWriter::new(&config);
-        if let Ok(mut writer) = writer_result {
-            let recovered = writer.recover_stale_spill_files();
-            assert_eq!(recovered, 0, "must return 0 when disconnected");
-        }
-        // If new() itself fails, that's also fine.
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        writer.sender = None;
+        let recovered = writer.recover_stale_spill_files();
+        assert_eq!(recovered, 0, "must return 0 when disconnected");
     }
 
     // -----------------------------------------------------------------------
