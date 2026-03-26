@@ -1084,6 +1084,172 @@ mod tests {
         assert!(debug.contains("42"));
     }
 
+    #[test]
+    fn test_disconnect_code_debug_all_known_variants() {
+        let variants = [
+            (DisconnectCode::InternalServerError, "InternalServerError"),
+            (
+                DisconnectCode::InstrumentsExceedLimit,
+                "InstrumentsExceedLimit",
+            ),
+            (
+                DisconnectCode::ExceededActiveConnections,
+                "ExceededActiveConnections",
+            ),
+            (
+                DisconnectCode::DataApiSubscriptionRequired,
+                "DataApiSubscriptionRequired",
+            ),
+            (DisconnectCode::AccessTokenExpired, "AccessTokenExpired"),
+            (DisconnectCode::AuthenticationFailed, "AuthenticationFailed"),
+            (DisconnectCode::AccessTokenInvalid, "AccessTokenInvalid"),
+            (DisconnectCode::ClientIdInvalid, "ClientIdInvalid"),
+            (DisconnectCode::InvalidExpiryDate, "InvalidExpiryDate"),
+            (DisconnectCode::InvalidDateFormat, "InvalidDateFormat"),
+            (DisconnectCode::InvalidSecurityId, "InvalidSecurityId"),
+            (DisconnectCode::InvalidRequest, "InvalidRequest"),
+        ];
+        for (code, expected) in variants {
+            let debug = format!("{code:?}");
+            assert_eq!(debug, expected, "Debug mismatch for {code}");
+        }
+    }
+
+    // WS-GAP-01: exhaustive from_u16 for every gap code (801, 802, 803 are NOT in annexure)
+    #[test]
+    fn test_disconnect_code_from_u16_gap_codes_801_802_803_are_unknown() {
+        for code in [801, 802, 803] {
+            let dc = DisconnectCode::from_u16(code);
+            assert_eq!(dc, DisconnectCode::Unknown(code));
+            assert!(
+                dc.is_reconnectable(),
+                "unknown codes should be reconnectable"
+            );
+            assert!(
+                !dc.requires_token_refresh(),
+                "only 807 requires token refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disconnect_code_from_u16_999_is_unknown() {
+        let dc = DisconnectCode::from_u16(999);
+        assert_eq!(dc, DisconnectCode::Unknown(999));
+        assert_eq!(dc.as_u16(), 999);
+    }
+
+    #[test]
+    fn test_disconnect_code_all_known_as_u16_roundtrip_exhaustive() {
+        let all_known: [(DisconnectCode, u16); 12] = [
+            (DisconnectCode::InternalServerError, 800),
+            (DisconnectCode::InstrumentsExceedLimit, 804),
+            (DisconnectCode::ExceededActiveConnections, 805),
+            (DisconnectCode::DataApiSubscriptionRequired, 806),
+            (DisconnectCode::AccessTokenExpired, 807),
+            (DisconnectCode::AuthenticationFailed, 808),
+            (DisconnectCode::AccessTokenInvalid, 809),
+            (DisconnectCode::ClientIdInvalid, 810),
+            (DisconnectCode::InvalidExpiryDate, 811),
+            (DisconnectCode::InvalidDateFormat, 812),
+            (DisconnectCode::InvalidSecurityId, 813),
+            (DisconnectCode::InvalidRequest, 814),
+        ];
+        for (variant, expected_code) in all_known {
+            assert_eq!(variant.as_u16(), expected_code);
+            assert_eq!(DisconnectCode::from_u16(expected_code), variant);
+        }
+    }
+
+    #[test]
+    fn test_disconnect_code_is_reconnectable_exhaustive_all_variants() {
+        // Exhaustive: every named variant + Unknown
+        let reconnectable = [
+            DisconnectCode::InternalServerError,
+            DisconnectCode::AccessTokenExpired,
+            DisconnectCode::Unknown(0),
+            DisconnectCode::Unknown(42),
+            DisconnectCode::Unknown(u16::MAX),
+        ];
+        for dc in reconnectable {
+            assert!(dc.is_reconnectable(), "{dc} should be reconnectable");
+        }
+
+        let not_reconnectable = [
+            DisconnectCode::InstrumentsExceedLimit,
+            DisconnectCode::ExceededActiveConnections,
+            DisconnectCode::DataApiSubscriptionRequired,
+            DisconnectCode::AuthenticationFailed,
+            DisconnectCode::AccessTokenInvalid,
+            DisconnectCode::ClientIdInvalid,
+            DisconnectCode::InvalidExpiryDate,
+            DisconnectCode::InvalidDateFormat,
+            DisconnectCode::InvalidSecurityId,
+            DisconnectCode::InvalidRequest,
+        ];
+        for dc in not_reconnectable {
+            assert!(!dc.is_reconnectable(), "{dc} should NOT be reconnectable");
+        }
+    }
+
+    #[test]
+    fn test_disconnect_code_requires_token_refresh_exhaustive() {
+        // Only 807 requires token refresh
+        assert!(DisconnectCode::AccessTokenExpired.requires_token_refresh());
+
+        let no_refresh = [
+            DisconnectCode::InternalServerError,
+            DisconnectCode::InstrumentsExceedLimit,
+            DisconnectCode::ExceededActiveConnections,
+            DisconnectCode::DataApiSubscriptionRequired,
+            DisconnectCode::AuthenticationFailed,
+            DisconnectCode::AccessTokenInvalid,
+            DisconnectCode::ClientIdInvalid,
+            DisconnectCode::InvalidExpiryDate,
+            DisconnectCode::InvalidDateFormat,
+            DisconnectCode::InvalidSecurityId,
+            DisconnectCode::InvalidRequest,
+            DisconnectCode::Unknown(0),
+            DisconnectCode::Unknown(807), // Unknown(807) is NOT AccessTokenExpired variant
+        ];
+        for dc in no_refresh {
+            assert!(
+                !dc.requires_token_refresh(),
+                "{dc} should NOT require token refresh"
+            );
+        }
+    }
+
+    // ConnectionHealth — verify all field access paths
+    #[test]
+    fn test_connection_health_all_fields_accessible() {
+        let health = ConnectionHealth {
+            connection_id: 4,
+            state: ConnectionState::Reconnecting,
+            subscribed_count: 5000,
+            total_reconnections: 99,
+        };
+        assert_eq!(health.connection_id, 4);
+        assert_eq!(health.state, ConnectionState::Reconnecting);
+        assert_eq!(health.subscribed_count, 5000);
+        assert_eq!(health.total_reconnections, 99);
+    }
+
+    #[test]
+    fn test_connection_health_clone_preserves_all_fields() {
+        let original = ConnectionHealth {
+            connection_id: 0,
+            state: ConnectionState::Connecting,
+            subscribed_count: 100,
+            total_reconnections: 1,
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.connection_id, original.connection_id);
+        assert_eq!(cloned.state, original.state);
+        assert_eq!(cloned.subscribed_count, original.subscribed_count);
+        assert_eq!(cloned.total_reconnections, original.total_reconnections);
+    }
+
     // --- WebSocketError Debug ---
 
     #[test]
@@ -1091,6 +1257,49 @@ mod tests {
         let err = WebSocketError::NoTokenAvailable;
         let debug = format!("{err:?}");
         assert!(debug.contains("NoTokenAvailable"));
+    }
+
+    #[test]
+    fn test_websocket_error_all_variants_debug() {
+        // Verify Debug impl exists and is non-empty for every variant
+        let err1 = WebSocketError::CapacityExceeded {
+            requested: 1,
+            capacity: 0,
+        };
+        assert!(!format!("{err1:?}").is_empty());
+
+        let err2 = WebSocketError::ReconnectionExhausted {
+            connection_id: 0,
+            attempts: 0,
+        };
+        assert!(!format!("{err2:?}").is_empty());
+
+        let err3 = WebSocketError::SubscriptionFailed {
+            connection_id: 0,
+            reason: String::new(),
+        };
+        assert!(!format!("{err3:?}").is_empty());
+
+        let err4 = WebSocketError::TlsConfigurationFailed {
+            reason: String::new(),
+        };
+        assert!(!format!("{err4:?}").is_empty());
+
+        let err5 = WebSocketError::ReadTimeout {
+            connection_id: 0,
+            timeout_secs: 0,
+        };
+        assert!(!format!("{err5:?}").is_empty());
+
+        let err6 = WebSocketError::DhanDisconnect {
+            code: DisconnectCode::InternalServerError,
+        };
+        assert!(!format!("{err6:?}").is_empty());
+
+        let err7 = WebSocketError::NonReconnectableDisconnect {
+            code: DisconnectCode::InvalidRequest,
+        };
+        assert!(!format!("{err7:?}").is_empty());
     }
 
     // --- TwoHundredDepthSubscriptionRequest Clone + Debug ---

@@ -1244,4 +1244,71 @@ mod tests {
         // Exercise the function — should not panic regardless of platform.
         super::export_system_metrics();
     }
+
+    // -----------------------------------------------------------------------
+    // check_disk_space: result value validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_disk_space_returns_reasonable_value() {
+        if let Some(percent_free) = super::check_disk_space() {
+            assert!(
+                percent_free <= 100,
+                "free disk percentage must be <= 100, got {percent_free}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // check_memory_rss: result value validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_memory_rss_returns_positive_value() {
+        if let Some(rss_mb) = super::check_memory_rss() {
+            assert!(rss_mb > 0, "process RSS must be positive, got {rss_mb} MB");
+        }
+    }
+
+    #[test]
+    fn test_check_memory_rss_below_reasonable_limit() {
+        if let Some(rss_mb) = super::check_memory_rss() {
+            // Test process should use much less than 4GB
+            assert!(
+                rss_mb < 4096,
+                "test process RSS should be below 4GB, got {rss_mb} MB"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // export_system_metrics: idempotent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_export_system_metrics_idempotent() {
+        super::export_system_metrics();
+        super::export_system_metrics();
+        // No panic on repeated calls
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants: MIN_FREE_DISK_PERCENT and MEMORY_RSS_ALERT_MB relationships
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disk_threshold_in_valid_range() {
+        assert!(
+            super::MIN_FREE_DISK_PERCENT > 0 && super::MIN_FREE_DISK_PERCENT < 50,
+            "threshold must be between 1% and 49%"
+        );
+    }
+
+    #[test]
+    fn test_memory_threshold_in_valid_range() {
+        assert!(
+            super::MEMORY_RSS_ALERT_MB >= 128 && super::MEMORY_RSS_ALERT_MB <= 8192,
+            "RSS alert threshold must be between 128MB and 8GB"
+        );
+    }
 }

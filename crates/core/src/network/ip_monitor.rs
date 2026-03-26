@@ -1112,4 +1112,159 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // compare_ips — additional edge cases for 100% branch coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_ips_both_empty_is_match() {
+        assert_eq!(compare_ips("", ""), IpCheckResult::Match);
+    }
+
+    #[test]
+    fn test_compare_ips_expected_empty_actual_nonempty() {
+        let result = compare_ips("", "1.2.3.4");
+        match result {
+            IpCheckResult::Mismatch { expected, actual } => {
+                assert_eq!(expected, "");
+                assert_eq!(actual, "1.2.3.4");
+            }
+            _ => panic!("expected Mismatch"),
+        }
+    }
+
+    #[test]
+    fn test_compare_ips_trailing_newline_is_mismatch() {
+        assert!(matches!(
+            compare_ips("1.2.3.4", "1.2.3.4\n"),
+            IpCheckResult::Mismatch { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_ipv4 — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_ipv4_ipv6_full() {
+        assert!(!is_valid_ipv4("2001:0db8:85a3:0000:0000:8a2e:0370:7334"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_with_port() {
+        assert!(!is_valid_ipv4("192.168.1.1:80"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_with_tab() {
+        assert!(!is_valid_ipv4("\t1.2.3.4"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_extra_octet() {
+        assert!(!is_valid_ipv4("1.2.3.4.5"));
+    }
+
+    #[test]
+    fn test_is_valid_ipv4_loopback() {
+        assert!(is_valid_ipv4("127.0.0.1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // IpMonitorConfig — full coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_monitor_config_new_enabled_flag() {
+        let config = IpMonitorConfig::new("10.0.0.1".to_string(), 120);
+        assert!(config.enabled);
+        assert_eq!(config.expected_ip, "10.0.0.1");
+        assert_eq!(config.check_interval_secs, 120);
+    }
+
+    #[test]
+    fn test_ip_monitor_config_disabled_all_fields() {
+        let config = IpMonitorConfig::disabled();
+        assert!(!config.enabled);
+        assert!(config.expected_ip.is_empty());
+        assert_eq!(config.check_interval_secs, 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_ip — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_ip_exactly_four_parts() {
+        assert_eq!(mask_ip("10.20.30.40"), "10.20.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_three_parts() {
+        assert_eq!(mask_ip("10.20.30"), "XXX.XXX.XXX.XXX");
+    }
+
+    #[test]
+    fn test_mask_ip_single_part() {
+        assert_eq!(mask_ip("192"), "XXX.XXX.XXX.XXX");
+    }
+
+    // -----------------------------------------------------------------------
+    // IpCheckResult — Clone, Eq, Debug for all variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_check_result_match_clone() {
+        let r = IpCheckResult::Match;
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+    }
+
+    #[test]
+    fn test_ip_check_result_mismatch_clone() {
+        let r = IpCheckResult::Mismatch {
+            expected: "a".to_string(),
+            actual: "b".to_string(),
+        };
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+    }
+
+    #[test]
+    fn test_ip_check_result_check_failed_clone() {
+        let r = IpCheckResult::CheckFailed {
+            reason: "timeout".to_string(),
+        };
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+    }
+
+    #[test]
+    fn test_ip_check_result_debug_match() {
+        let r = IpCheckResult::Match;
+        assert_eq!(format!("{r:?}"), "Match");
+    }
+
+    #[test]
+    fn test_ip_check_result_debug_mismatch() {
+        let r = IpCheckResult::Mismatch {
+            expected: "a".to_string(),
+            actual: "b".to_string(),
+        };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("Mismatch"));
+        assert!(debug.contains("a"));
+        assert!(debug.contains("b"));
+    }
+
+    #[test]
+    fn test_ip_check_result_debug_check_failed() {
+        let r = IpCheckResult::CheckFailed {
+            reason: "err".to_string(),
+        };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("CheckFailed"));
+        assert!(debug.contains("err"));
+    }
 }

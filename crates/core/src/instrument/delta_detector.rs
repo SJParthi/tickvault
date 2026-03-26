@@ -1030,6 +1030,62 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // detect_universe_delta: underlying lot_size unchanged produces no event
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_underlying_lot_size_unchanged_no_event() {
+        let yesterday = make_universe(vec![], vec![make_underlying("NIFTY", 75)]);
+        let today = make_universe(vec![], vec![make_underlying("NIFTY", 75)]);
+        let events = detect_universe_delta(Some(&yesterday), &today);
+        let lot_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == LifecycleEventType::LotSizeChanged)
+            .collect();
+        assert!(
+            lot_events.is_empty(),
+            "same lot_size should produce no event"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_universe_delta: underlying lot_size changed produces event
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_underlying_lot_size_changed_event() {
+        let yesterday = make_universe(vec![], vec![make_underlying("NIFTY", 75)]);
+        let today = make_universe(vec![], vec![make_underlying("NIFTY", 50)]);
+        let events = detect_universe_delta(Some(&yesterday), &today);
+        let lot_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.event_type == LifecycleEventType::LotSizeChanged
+                    && e.field_changed == "underlying_lot_size"
+            })
+            .collect();
+        assert_eq!(lot_events.len(), 1);
+        assert_eq!(lot_events[0].old_value, "75");
+        assert_eq!(lot_events[0].new_value, "50");
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_universe_delta: contract unchanged produces no events
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_contract_unchanged_no_events() {
+        let contract = make_contract(1, "NIFTY", 75);
+        let yesterday = make_universe(vec![contract.clone()], vec![make_underlying("NIFTY", 75)]);
+        let today = make_universe(vec![contract], vec![make_underlying("NIFTY", 75)]);
+        let events = detect_universe_delta(Some(&yesterday), &today);
+        assert!(
+            events.is_empty(),
+            "unchanged contract should produce no events"
+        );
+    }
+
     #[test]
     fn test_p1_04_different_strike_no_reassignment() {
         // Different strike_price → different compound identity → not a reassignment

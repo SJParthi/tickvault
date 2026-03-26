@@ -576,6 +576,56 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
+    // GAP-CFG-01: Invalid HH:MM (no seconds) format
+    #[test]
+    fn test_parse_daily_download_time_only_hours() {
+        assert!(parse_daily_download_time("08").is_err());
+    }
+
+    // GAP-CFG-01: Whitespace in time string
+    #[test]
+    fn test_parse_daily_download_time_with_whitespace() {
+        assert!(parse_daily_download_time(" 08:55:00").is_err());
+    }
+
+    // I-P1-01: compute_next_trigger_time — target far in the future today
+    #[test]
+    fn test_compute_next_trigger_target_23h_now_0h() {
+        let now = ist_datetime(2026, 3, 11, 0, 0, 0);
+        let target = hms(23, 0, 0);
+        let duration = compute_next_trigger_time(now, target);
+        assert_eq!(duration.as_secs(), 23 * 3600);
+    }
+
+    // I-P1-01: DailyRefreshConfig fields accessible
+    #[test]
+    fn test_daily_refresh_config_enabled_custom() {
+        let config = DailyRefreshConfig {
+            download_time: hms(10, 0, 0),
+            enabled: true,
+        };
+        assert!(config.enabled);
+        assert_eq!(config.download_time, hms(10, 0, 0));
+    }
+
+    // GAP-CFG-01: parse returns correct time for edge values
+    #[test]
+    fn test_parse_daily_download_time_noon() {
+        let result = parse_daily_download_time("12:00:00");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), hms(12, 0, 0));
+    }
+
+    // I-P1-01: compute always returns >= 1 second
+    #[test]
+    fn test_compute_next_trigger_minimum_is_one_second() {
+        // When target is 1 second past now, should return 1 second
+        let now = ist_datetime(2026, 3, 11, 12, 0, 0);
+        let target = hms(12, 0, 1);
+        let duration = compute_next_trigger_time(now, target);
+        assert!(duration.as_secs() >= 1);
+    }
+
     // I-P1-01: Enabled scheduler fires on a trading day and sends trigger
     #[tokio::test]
     async fn test_spawn_daily_refresh_task_enabled_fires_on_trading_day() {
