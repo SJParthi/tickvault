@@ -373,4 +373,145 @@ mod tests {
         assert!((update.avg_traded_price - 250.25).abs() < f64::EPSILON);
         assert!((update.traded_price - 250.50).abs() < f64::EPSILON);
     }
+
+    // -----------------------------------------------------------------------
+    // OrderUpdateParseError coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_order_update_parse_error_debug() {
+        let err = parse_order_update("invalid json").unwrap_err();
+        let debug = format!("{err:?}");
+        assert!(debug.contains("JsonError"));
+    }
+
+    #[test]
+    fn test_order_update_parse_error_source() {
+        let err = parse_order_update("not json").unwrap_err();
+        // thiserror generates source from #[from] attribute
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_order_update_parse_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OrderUpdateParseError>();
+    }
+
+    // -----------------------------------------------------------------------
+    // build_order_update_login edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_order_update_login_msg_code_is_42() {
+        let msg = build_order_update_login("client", "token");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["LoginReq"]["MsgCode"], 42);
+    }
+
+    #[test]
+    fn test_build_order_update_login_user_type_is_self() {
+        let msg = build_order_update_login("client", "token");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["UserType"], "SELF");
+    }
+
+    #[test]
+    fn test_build_order_update_login_special_chars_in_token() {
+        let msg = build_order_update_login("client", "eyJ.token+with/special=chars");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["LoginReq"]["Token"], "eyJ.token+with/special=chars");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional order update field coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_order_update_all_ws_statuses() {
+        for status in [
+            "TRANSIT",
+            "PENDING",
+            "REJECTED",
+            "CANCELLED",
+            "TRADED",
+            "EXPIRED",
+        ] {
+            let json = format!(r#"{{"Data": {{"Status": "{status}"}}}}"#);
+            let update = parse_order_update(&json).unwrap();
+            assert_eq!(update.status, status);
+        }
+    }
+
+    #[test]
+    fn test_parse_order_update_segment_codes() {
+        for (segment, desc) in [
+            ("E", "Equity"),
+            ("D", "Derivatives"),
+            ("C", "Currency"),
+            ("M", "Commodity"),
+        ] {
+            let json = format!(r#"{{"Data": {{"Segment": "{segment}"}}}}"#);
+            let update = parse_order_update(&json).unwrap();
+            assert_eq!(update.segment, segment, "segment code for {desc}");
+        }
+    }
+
+    #[test]
+    fn test_parse_order_update_off_mkt_flag() {
+        let json = r#"{"Data": {"OffMktFlag": "1"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.off_mkt_flag, "1");
+
+        let json = r#"{"Data": {"OffMktFlag": "0"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.off_mkt_flag, "0");
+    }
+
+    #[test]
+    fn test_parse_order_update_disc_quantity() {
+        let json = r#"{"Data": {"DiscQuantity": 100, "DiscQtyRem": 50}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.disc_quantity, 100);
+        assert_eq!(update.disc_qty_rem, 50);
+    }
+
+    #[test]
+    fn test_parse_order_update_strike_price_and_expiry() {
+        let json = r#"{"Data": {"StrikePrice": 24500.0, "ExpiryDate": "2026-03-27"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert!((update.strike_price - 24500.0).abs() < f64::EPSILON);
+        assert_eq!(update.expiry_date, "2026-03-27");
+    }
+
+    #[test]
+    fn test_parse_order_update_lot_size() {
+        let json = r#"{"Data": {"LotSize": 50}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.lot_size, 50);
+    }
+
+    #[test]
+    fn test_parse_order_update_ref_ltp_and_tick_size() {
+        // refLtp and tickSize use camelCase, NOT PascalCase
+        let json = r#"{"Data": {"refLtp": 245.0, "tickSize": 0.05}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert!((update.ref_ltp - 245.0).abs() < f64::EPSILON);
+        assert!((update.tick_size - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_order_update_empty_string_fields() {
+        let json = r#"{"Data": {"OrderNo": "", "Status": "", "Symbol": ""}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.order_no, "");
+        assert_eq!(update.status, "");
+        assert_eq!(update.symbol, "");
+    }
+
+    #[test]
+    fn test_parse_order_update_null_data_fails() {
+        let err = parse_order_update(r#"{"Data": null}"#).unwrap_err();
+        assert!(matches!(err, OrderUpdateParseError::JsonError(_)));
+    }
 }

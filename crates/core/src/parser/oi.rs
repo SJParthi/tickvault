@@ -105,4 +105,44 @@ mod tests {
             panic!("wrong error: {err:?}")
         };
     }
+
+    #[test]
+    fn test_parse_oi_extra_bytes_ignored() {
+        let (mut buf, hdr) = make_oi_packet(42, 99999);
+        buf.extend_from_slice(&[0xFF; 20]);
+        let oi = parse_oi_packet(&buf, &hdr).unwrap();
+        assert_eq!(oi, 99999);
+    }
+
+    #[test]
+    fn test_parse_oi_header_only_fails() {
+        let buf = vec![0u8; 8]; // only header, no OI body
+        let hdr = PacketHeader {
+            response_code: 5,
+            message_length: 12,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_oi_packet(&buf, &hdr).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 12,
+            actual: 8,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
+    }
+
+    #[test]
+    fn test_parse_oi_one() {
+        let (buf, hdr) = make_oi_packet(1, 1);
+        assert_eq!(parse_oi_packet(&buf, &hdr).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_oi_typical_fno_value() {
+        // Typical F&O OI: 15 million contracts
+        let (buf, hdr) = make_oi_packet(52432, 15_000_000);
+        assert_eq!(parse_oi_packet(&buf, &hdr).unwrap(), 15_000_000);
+    }
 }

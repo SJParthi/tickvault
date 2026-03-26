@@ -618,10 +618,26 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_category_display() {
+    fn test_subscription_category_display_all_variants() {
         assert_eq!(
             format!("{}", SubscriptionCategory::MajorIndexValue),
             "MajorIndexValue"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::DisplayIndex),
+            "DisplayIndex"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::IndexDerivative),
+            "IndexDerivative"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::StockEquity),
+            "StockEquity"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::StockDerivative),
+            "StockDerivative"
         );
     }
 

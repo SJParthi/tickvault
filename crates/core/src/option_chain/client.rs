@@ -382,4 +382,135 @@ mod tests {
         delay = delay.saturating_mul(2);
         assert_eq!(delay, 4000);
     }
+
+    #[test]
+    fn test_is_retryable_status_gateway_timeout_not_retried() {
+        // 504 Gateway Timeout is NOT in the retry set — only 500/502/503
+        assert!(!is_retryable_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
+    }
+
+    #[test]
+    fn test_is_retryable_status_redirect_not_retried() {
+        assert!(!is_retryable_status(reqwest::StatusCode::MOVED_PERMANENTLY));
+        assert!(!is_retryable_status(reqwest::StatusCode::FOUND));
+        assert!(!is_retryable_status(
+            reqwest::StatusCode::TEMPORARY_REDIRECT
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_status_informational_not_retried() {
+        assert!(!is_retryable_status(reqwest::StatusCode::CONTINUE));
+    }
+
+    #[test]
+    fn test_is_retryable_status_conflict_not_retried() {
+        assert!(!is_retryable_status(reqwest::StatusCode::CONFLICT));
+    }
+
+    #[test]
+    fn test_is_retryable_status_unprocessable_entity_not_retried() {
+        assert!(!is_retryable_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+    }
+
+    #[test]
+    fn test_exponential_backoff_saturates_at_u64_max() {
+        // Verify saturating_mul prevents overflow
+        let mut delay = u64::MAX;
+        delay = delay.saturating_mul(2);
+        assert_eq!(delay, u64::MAX, "saturating_mul must not overflow");
+    }
+
+    #[test]
+    fn test_exponential_backoff_full_sequence_matches_expected() {
+        // After MAX_RETRIES iterations, the delay should be 1000 * 2^3 = 8000
+        let mut delay = INITIAL_RETRY_DELAY_MS;
+        for _ in 0..MAX_RETRIES {
+            delay = delay.saturating_mul(2);
+        }
+        assert_eq!(delay, 8000, "1000 * 2^3 = 8000");
+    }
+
+    #[test]
+    fn test_retry_constants_relationship() {
+        // MAX_RETRIES * exponential backoff should not exceed a reasonable total wait
+        let total_wait_ms: u64 = (0..MAX_RETRIES)
+            .map(|i| INITIAL_RETRY_DELAY_MS.saturating_mul(1 << i))
+            .sum();
+        // 1000 + 2000 + 4000 = 7000ms = 7s total wait
+        assert_eq!(total_wait_ms, 7000);
+        assert!(
+            total_wait_ms < 30_000,
+            "total retry wait should be < 30 seconds"
+        );
+    }
+
+    #[test]
+    fn test_option_chain_path_no_trailing_slash() {
+        assert!(!OPTION_CHAIN_PATH.ends_with('/'));
+        assert!(!EXPIRY_LIST_PATH.ends_with('/'));
+    }
+
+    #[test]
+    fn test_option_chain_path_starts_with_slash() {
+        assert!(OPTION_CHAIN_PATH.starts_with('/'));
+        assert!(EXPIRY_LIST_PATH.starts_with('/'));
+    }
+
+    #[test]
+    fn test_expiry_list_path_is_subpath_of_option_chain() {
+        assert!(
+            EXPIRY_LIST_PATH.starts_with(OPTION_CHAIN_PATH),
+            "expiry list should be under option chain path"
+        );
+    }
+
+    #[test]
+    fn test_is_retryable_status_all_5xx_codes() {
+        // Only 500, 502, 503 are retryable. All other 5xx are NOT.
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )); // 500
+        assert!(!is_retryable_status(reqwest::StatusCode::NOT_IMPLEMENTED)); // 501
+        assert!(is_retryable_status(reqwest::StatusCode::BAD_GATEWAY)); // 502
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        )); // 503
+        assert!(!is_retryable_status(reqwest::StatusCode::GATEWAY_TIMEOUT)); // 504
+        assert!(!is_retryable_status(
+            reqwest::StatusCode::HTTP_VERSION_NOT_SUPPORTED
+        )); // 505
+    }
+
+    #[test]
+    fn test_is_retryable_status_accepted_not_retried() {
+        assert!(!is_retryable_status(reqwest::StatusCode::ACCEPTED));
+    }
+
+    #[test]
+    fn test_is_retryable_status_no_content_not_retried() {
+        assert!(!is_retryable_status(reqwest::StatusCode::NO_CONTENT));
+    }
+
+    #[test]
+    fn test_is_retryable_status_method_not_allowed_not_retried() {
+        assert!(!is_retryable_status(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_status_gone_not_retried() {
+        assert!(!is_retryable_status(reqwest::StatusCode::GONE));
+    }
+
+    #[test]
+    fn test_exponential_backoff_from_large_initial() {
+        // Start from a large value — saturating_mul prevents panic
+        let mut delay = u64::MAX / 2 + 1;
+        delay = delay.saturating_mul(2);
+        assert_eq!(delay, u64::MAX, "large value * 2 saturates to MAX");
+    }
 }

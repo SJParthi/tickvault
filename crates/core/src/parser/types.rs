@@ -487,4 +487,112 @@ mod tests {
             other => panic!("expected DeepDepth, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_parse_error_insufficient_bytes_source_is_none() {
+        let err = ParseError::InsufficientBytes {
+            expected: 16,
+            actual: 8,
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_parse_error_unknown_response_code_boundary_values() {
+        // 0 is not a valid response code
+        let err = ParseError::UnknownResponseCode(0);
+        assert_eq!(err.to_string(), "unknown response code: 0");
+
+        // 255 is not a valid response code
+        let err = ParseError::UnknownResponseCode(255);
+        assert_eq!(err.to_string(), "unknown response code: 255");
+    }
+
+    #[test]
+    fn test_parse_error_insufficient_bytes_zero_expected() {
+        let err = ParseError::InsufficientBytes {
+            expected: 0,
+            actual: 0,
+        };
+        assert_eq!(err.to_string(), "frame too short: need 0 bytes, got 0");
+    }
+
+    #[test]
+    fn test_parse_error_invalid_row_count_zero() {
+        let err = ParseError::InvalidRowCount { actual: 0, max: 0 };
+        let msg = err.to_string();
+        assert!(msg.contains("0"));
+    }
+
+    #[test]
+    fn test_parsed_frame_tick_with_depth_all_zeroes() {
+        let tick = ParsedTick::default();
+        let depth = [MarketDepthLevel::default(); 5];
+        let frame = ParsedFrame::TickWithDepth(tick, depth);
+        match frame {
+            ParsedFrame::TickWithDepth(t, d) => {
+                assert_eq!(t.security_id, 0);
+                assert_eq!(t.last_traded_price, 0.0);
+                for level in &d {
+                    assert_eq!(level.bid_quantity, 0);
+                    assert_eq!(level.ask_quantity, 0);
+                }
+            }
+            other => panic!("expected TickWithDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parsed_frame_deep_depth_bid_side() {
+        let frame = ParsedFrame::DeepDepth {
+            security_id: 42,
+            exchange_segment_code: 2,
+            side: DepthSide::Bid,
+            levels: vec![DeepDepthLevel {
+                price: 100.0,
+                quantity: 500,
+                orders: 10,
+            }],
+            message_sequence: 99,
+            received_at_nanos: 123456,
+        };
+        match frame {
+            ParsedFrame::DeepDepth {
+                side,
+                message_sequence,
+                received_at_nanos,
+                ..
+            } => {
+                assert_eq!(side, DepthSide::Bid);
+                assert_eq!(message_sequence, 99);
+                assert_eq!(received_at_nanos, 123456);
+            }
+            other => panic!("expected DeepDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_packet_header_max_message_length() {
+        let hdr = PacketHeader {
+            response_code: 8,
+            message_length: u16::MAX,
+            exchange_segment_code: 2,
+            security_id: 1,
+        };
+        assert_eq!(hdr.message_length, u16::MAX);
+    }
+
+    #[test]
+    fn test_packet_header_zero_fields() {
+        let hdr = PacketHeader {
+            response_code: 0,
+            message_length: 0,
+            exchange_segment_code: 0,
+            security_id: 0,
+        };
+        assert_eq!(hdr.response_code, 0);
+        assert_eq!(hdr.message_length, 0);
+        assert_eq!(hdr.exchange_segment_code, 0);
+        assert_eq!(hdr.security_id, 0);
+    }
 }

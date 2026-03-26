@@ -1280,4 +1280,78 @@ mod tests {
 
         pool.del(key).await.unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: compute_instrument_ttl_secs additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_instrument_ttl_one_second_before_target() {
+        // IST at 05:59:59 → target 06:00:00 → should be 1 second
+        // but clamped to minimum 60
+        let ist_offset: u64 = 19_800;
+        // epoch at IST 05:59:59 = IST offset (19800) + 5*3600 + 59*60 + 59 = 19800 + 21599 = 41399
+        // so UTC epoch = 41399 - 19800 = 21599
+        let epoch = 21_599_u64;
+        let ttl = compute_instrument_ttl_secs(epoch, 6);
+        assert!(ttl >= 60, "TTL must be at least 60");
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_multiple_targets() {
+        let epoch: u64 = 1_700_000_000; // arbitrary
+        let ttl_6 = compute_instrument_ttl_secs(epoch, 6);
+        let ttl_12 = compute_instrument_ttl_secs(epoch, 12);
+        // Different targets should produce different TTLs (unless both are clamped)
+        assert!(ttl_6 > 0 && ttl_6 <= 86_400);
+        assert!(ttl_12 > 0 && ttl_12 <= 86_400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: cache key builders with various inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_instrument_cache_key_with_slashes() {
+        let key = build_instrument_cache_key("2026/03/26");
+        assert_eq!(key, "dlt:instrument:2026/03/26");
+    }
+
+    #[test]
+    fn test_build_token_cache_key_with_numbers() {
+        let key = build_token_cache_key("12345");
+        assert_eq!(key, "dlt:token:12345");
+    }
+
+    #[test]
+    fn test_build_tick_cache_key_with_large_security_id() {
+        let key = build_tick_cache_key(999999, "ohlc");
+        assert_eq!(key, "dlt:tick:999999:ohlc");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: build_valkey_url edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_valkey_url_docker_dns() {
+        let url = build_valkey_url("dlt-valkey", 6379);
+        assert_eq!(url, "redis://dlt-valkey:6379");
+    }
+
+    #[test]
+    fn test_build_valkey_url_contains_no_auth() {
+        let url = build_valkey_url("host", 6379);
+        assert!(!url.contains('@'), "URL must not contain auth");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: pool checkout timeout constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pool_checkout_timeout_is_reasonable() {
+        assert!(POOL_CHECKOUT_TIMEOUT_MS >= 100, "too fast timeout");
+        assert!(POOL_CHECKOUT_TIMEOUT_MS <= 5000, "too slow timeout");
+    }
 }

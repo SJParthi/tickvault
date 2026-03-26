@@ -9115,4 +9115,323 @@ mod tests {
         let result = writer.force_flush();
         assert!(result.is_ok());
     }
+
+    // =======================================================================
+    // Coverage: build_tick_row content verification
+    // =======================================================================
+
+    #[test]
+    fn test_build_tick_row_produces_valid_ilp() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = make_test_tick(42528, 25650.5);
+        build_tick_row(&mut buffer, &tick).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_TICKS));
+        assert!(content.contains("NSE_FNO"));
+        assert!(content.contains("security_id="));
+        assert!(content.contains("ltp="));
+        assert!(content.contains("open="));
+        assert!(content.contains("high="));
+        assert!(content.contains("low="));
+        assert!(content.contains("close="));
+        assert!(content.contains("volume="));
+        assert!(content.contains("oi="));
+        assert!(content.contains("avg_price="));
+        assert!(content.contains("last_trade_qty="));
+        assert!(content.contains("total_buy_qty="));
+        assert!(content.contains("total_sell_qty="));
+        assert!(content.contains("exchange_timestamp="));
+        assert!(content.contains("received_at="));
+    }
+
+    #[test]
+    fn test_build_tick_row_multiple_rows() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        for i in 0..5_u32 {
+            let tick = make_test_tick(1000 + i, 24500.0 + (i as f32));
+            build_tick_row(&mut buffer, &tick).unwrap();
+        }
+        assert_eq!(buffer.row_count(), 5);
+    }
+
+    // =======================================================================
+    // Coverage: build_depth_rows content verification
+    // =======================================================================
+
+    #[test]
+    fn test_build_depth_rows_produces_5_levels() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let depth = [MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 25600.0,
+            ask_price: 25610.0,
+        }; 5];
+        build_depth_rows(&mut buffer, 42528, 2, 1_740_556_500_000_000_000, &depth).unwrap();
+        assert_eq!(buffer.row_count(), 5, "depth must produce 5 ILP rows");
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_MARKET_DEPTH));
+        assert!(content.contains("bid_qty="));
+        assert!(content.contains("ask_qty="));
+        assert!(content.contains("bid_price="));
+        assert!(content.contains("ask_price="));
+        assert!(content.contains("level="));
+    }
+
+    // =======================================================================
+    // Coverage: build_previous_close_row content verification
+    // =======================================================================
+
+    #[test]
+    fn test_build_previous_close_row_content() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(
+            &mut buffer,
+            13,
+            0,
+            24500.5,
+            120000,
+            1_740_556_500_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_PREVIOUS_CLOSE));
+        assert!(content.contains("prev_close="));
+        assert!(content.contains("prev_oi="));
+        assert!(content.contains("security_id="));
+    }
+
+    #[test]
+    fn test_build_previous_close_row_zero_oi() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_previous_close_row(&mut buffer, 11536, 1, 1500.0, 0, 1_740_556_500_000_000_000)
+            .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    // =======================================================================
+    // Coverage: f32_to_f64_clean additional edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_f32_to_f64_clean_small_price() {
+        let result = f32_to_f64_clean(0.05_f32);
+        assert_eq!(result, 0.05_f64);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_large_price() {
+        let result = f32_to_f64_clean(99999.95_f32);
+        assert_eq!(result, 99999.95_f64);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_negative_zero() {
+        let result = f32_to_f64_clean(-0.0_f32);
+        assert!(result == 0.0 || result == -0.0);
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_typical_nifty_price() {
+        // Real-world Nifty index price
+        let result = f32_to_f64_clean(25642.8_f32);
+        assert_eq!(result, 25642.8_f64);
+    }
+
+    // =======================================================================
+    // Coverage: serialize/deserialize tick roundtrip with different segments
+    // =======================================================================
+
+    #[test]
+    fn test_serialize_deserialize_tick_all_segments() {
+        for seg in [
+            EXCHANGE_SEGMENT_IDX_I,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            EXCHANGE_SEGMENT_NSE_CURRENCY,
+            EXCHANGE_SEGMENT_BSE_EQ,
+            EXCHANGE_SEGMENT_MCX_COMM,
+            EXCHANGE_SEGMENT_BSE_CURRENCY,
+            EXCHANGE_SEGMENT_BSE_FNO,
+        ] {
+            let mut tick = make_test_tick(42528, 25000.0);
+            tick.exchange_segment_code = seg;
+            let buf = serialize_tick(&tick);
+            let restored = deserialize_tick(&buf);
+            assert_eq!(restored.exchange_segment_code, seg);
+            assert_eq!(restored.security_id, tick.security_id);
+            assert_eq!(restored.last_traded_price, tick.last_traded_price);
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_tick_zero_fields() {
+        let tick = ParsedTick::default();
+        let buf = serialize_tick(&tick);
+        let restored = deserialize_tick(&buf);
+        assert_eq!(restored.security_id, 0);
+        assert_eq!(restored.last_traded_price, 0.0);
+        assert_eq!(restored.volume, 0);
+        assert_eq!(restored.open_interest, 0);
+    }
+
+    // =======================================================================
+    // Coverage: serialize/deserialize depth roundtrip
+    // =======================================================================
+
+    #[test]
+    fn test_serialize_deserialize_depth_roundtrip() {
+        let depth = BufferedDepth {
+            security_id: 42528,
+            exchange_segment_code: 2,
+            received_at_nanos: 1_740_556_500_123_456_789,
+            depth: [MarketDepthLevel {
+                bid_quantity: 100,
+                ask_quantity: 200,
+                bid_orders: 5,
+                ask_orders: 10,
+                bid_price: 25600.0,
+                ask_price: 25610.0,
+            }; 5],
+        };
+        let buf = serialize_depth(&depth);
+        assert_eq!(buf.len(), DEPTH_SPILL_RECORD_SIZE);
+        let restored = deserialize_depth(&buf);
+        assert_eq!(restored.security_id, 42528);
+        assert_eq!(restored.exchange_segment_code, 2);
+        assert_eq!(restored.received_at_nanos, 1_740_556_500_123_456_789);
+        for i in 0..5 {
+            assert_eq!(restored.depth[i].bid_quantity, 100);
+            assert_eq!(restored.depth[i].ask_quantity, 200);
+            assert_eq!(restored.depth[i].bid_orders, 5);
+            assert_eq!(restored.depth[i].ask_orders, 10);
+            assert_eq!(restored.depth[i].bid_price, 25600.0);
+            assert_eq!(restored.depth[i].ask_price, 25610.0);
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_depth_zero_values() {
+        let depth = BufferedDepth {
+            security_id: 0,
+            exchange_segment_code: 0,
+            received_at_nanos: 0,
+            depth: [MarketDepthLevel::default(); 5],
+        };
+        let buf = serialize_depth(&depth);
+        let restored = deserialize_depth(&buf);
+        assert_eq!(restored.security_id, 0);
+        assert_eq!(restored.exchange_segment_code, 0);
+        assert_eq!(restored.received_at_nanos, 0);
+        for level in &restored.depth {
+            assert_eq!(level.bid_quantity, 0);
+            assert_eq!(level.ask_quantity, 0);
+        }
+    }
+
+    // =======================================================================
+    // Coverage: DDL string constants
+    // =======================================================================
+
+    #[test]
+    fn test_ticks_ddl_has_all_columns() {
+        assert!(TICKS_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(TICKS_CREATE_DDL.contains("security_id LONG"));
+        assert!(TICKS_CREATE_DDL.contains("ltp DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("open DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("high DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("low DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("close DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("volume LONG"));
+        assert!(TICKS_CREATE_DDL.contains("oi LONG"));
+        assert!(TICKS_CREATE_DDL.contains("avg_price DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("last_trade_qty LONG"));
+        assert!(TICKS_CREATE_DDL.contains("total_buy_qty LONG"));
+        assert!(TICKS_CREATE_DDL.contains("total_sell_qty LONG"));
+        assert!(TICKS_CREATE_DDL.contains("exchange_timestamp LONG"));
+        assert!(TICKS_CREATE_DDL.contains("received_at TIMESTAMP"));
+        assert!(TICKS_CREATE_DDL.contains("ts TIMESTAMP"));
+    }
+
+    #[test]
+    fn test_ticks_ddl_partition_by_hour() {
+        assert!(TICKS_CREATE_DDL.contains("PARTITION BY HOUR WAL"));
+    }
+
+    #[test]
+    fn test_ticks_ddl_idempotent() {
+        assert!(TICKS_CREATE_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_market_depth_ddl_has_all_columns() {
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("security_id LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("level LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_qty LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_orders LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_orders LONG"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("bid_price DOUBLE"));
+        assert!(MARKET_DEPTH_CREATE_DDL.contains("ask_price DOUBLE"));
+    }
+
+    #[test]
+    fn test_previous_close_ddl_has_all_columns() {
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("segment SYMBOL"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("security_id LONG"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("prev_close DOUBLE"));
+        assert!(PREVIOUS_CLOSE_CREATE_DDL.contains("prev_oi LONG"));
+    }
+
+    #[test]
+    fn test_dedup_keys_include_segment() {
+        assert!(DEDUP_KEY_TICKS.contains("segment"));
+        assert!(DEDUP_KEY_MARKET_DEPTH.contains("segment"));
+        assert!(DEDUP_KEY_PREVIOUS_CLOSE.contains("segment"));
+    }
+
+    #[test]
+    fn test_dedup_key_market_depth_includes_level() {
+        assert!(DEDUP_KEY_MARKET_DEPTH.contains("level"));
+    }
+
+    // =======================================================================
+    // Coverage: constants validation
+    // =======================================================================
+
+    #[test]
+    fn test_tick_spill_record_size() {
+        assert_eq!(TICK_SPILL_RECORD_SIZE, 72);
+    }
+
+    #[test]
+    fn test_depth_spill_record_size() {
+        assert_eq!(DEPTH_SPILL_RECORD_SIZE, 116);
+    }
+
+    #[test]
+    fn test_reconnect_throttle_secs() {
+        assert_eq!(RECONNECT_THROTTLE_SECS, 30);
+    }
+
+    #[test]
+    fn test_questdb_ddl_timeout() {
+        assert_eq!(QUESTDB_DDL_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn test_ilp_reconnect_constants() {
+        assert_eq!(QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS, 3);
+        assert_eq!(QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS, 1000);
+    }
+
+    #[test]
+    fn test_f32_decimal_buf_size() {
+        assert_eq!(F32_DECIMAL_BUF_SIZE, 24);
+    }
 }

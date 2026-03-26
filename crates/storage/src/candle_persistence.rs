@@ -4083,4 +4083,237 @@ mod tests {
         };
         ensure_candle_table_dedup_keys(&config).await;
     }
+
+    // =======================================================================
+    // Coverage: fresh_buffer() helper (LiveCandleWriter lines 806-812)
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_fresh_buffer_with_sender() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_live_candle_fresh_buffer_without_sender() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let writer = LiveCandleWriter::new(&config).unwrap();
+        assert!(writer.sender.is_none());
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty());
+    }
+
+    // =======================================================================
+    // Coverage: serialize/deserialize candle boundary values
+    // =======================================================================
+
+    #[test]
+    fn test_candle_serialize_deserialize_zero_values() {
+        let candle = BufferedCandle {
+            security_id: 0,
+            exchange_segment_code: 0,
+            timestamp_secs: 0,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0,
+            tick_count: 0,
+        };
+        let buf = serialize_candle(&candle);
+        let restored = deserialize_candle(&buf);
+        assert_eq!(restored.security_id, 0);
+        assert_eq!(restored.exchange_segment_code, 0);
+        assert_eq!(restored.timestamp_secs, 0);
+        assert_eq!(restored.open, 0.0);
+        assert_eq!(restored.volume, 0);
+        assert_eq!(restored.tick_count, 0);
+    }
+
+    #[test]
+    fn test_candle_serialize_deserialize_max_u32_values() {
+        let candle = BufferedCandle {
+            security_id: u32::MAX,
+            exchange_segment_code: u8::MAX,
+            timestamp_secs: u32::MAX,
+            open: f32::MAX,
+            high: f32::MAX,
+            low: f32::MIN,
+            close: f32::MIN_POSITIVE,
+            volume: u32::MAX,
+            tick_count: u32::MAX,
+        };
+        let buf = serialize_candle(&candle);
+        let restored = deserialize_candle(&buf);
+        assert_eq!(restored.security_id, u32::MAX);
+        assert_eq!(restored.exchange_segment_code, u8::MAX);
+        assert_eq!(restored.timestamp_secs, u32::MAX);
+        assert_eq!(restored.open, f32::MAX);
+        assert_eq!(restored.high, f32::MAX);
+        assert_eq!(restored.low, f32::MIN);
+        assert_eq!(restored.close, f32::MIN_POSITIVE);
+        assert_eq!(restored.volume, u32::MAX);
+        assert_eq!(restored.tick_count, u32::MAX);
+    }
+
+    #[test]
+    fn test_candle_serialize_record_size() {
+        let candle = BufferedCandle {
+            security_id: 13,
+            exchange_segment_code: 2,
+            timestamp_secs: 1740556500,
+            open: 24500.5,
+            high: 24520.0,
+            low: 24480.0,
+            close: 24510.0,
+            volume: 50000,
+            tick_count: 42,
+        };
+        let buf = serialize_candle(&candle);
+        assert_eq!(buf.len(), CANDLE_SPILL_RECORD_SIZE);
+        assert_eq!(buf.len(), 36);
+    }
+
+    // =======================================================================
+    // Coverage: compute_ist_nanos_from_utc_secs edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_compute_ist_nanos_zero() {
+        let result = compute_ist_nanos_from_utc_secs(0);
+        assert_eq!(result, IST_UTC_OFFSET_SECONDS_I64 * 1_000_000_000);
+    }
+
+    #[test]
+    fn test_compute_ist_nanos_adds_offset_then_multiplies() {
+        let utc_secs = 1000;
+        let result = compute_ist_nanos_from_utc_secs(utc_secs);
+        let expected = (utc_secs + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000;
+        assert_eq!(result, expected);
+    }
+
+    // =======================================================================
+    // Coverage: compute_live_candle_nanos edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_compute_live_candle_nanos_no_offset_applied() {
+        // Live candles are already IST — no offset should be applied.
+        let ist_secs: u32 = 1740556500;
+        let result = compute_live_candle_nanos(ist_secs);
+        let expected = i64::from(ist_secs) * 1_000_000_000;
+        assert_eq!(result, expected);
+    }
+
+    // =======================================================================
+    // Coverage: should_flush edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_should_flush_exactly_one_below() {
+        assert!(!should_flush(99, 100));
+    }
+
+    #[test]
+    fn test_should_flush_exactly_equal() {
+        assert!(should_flush(100, 100));
+    }
+
+    // =======================================================================
+    // Coverage: DDL content checks
+    // =======================================================================
+
+    #[test]
+    fn test_historical_candles_ddl_has_all_ohlcv_columns() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("open DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("high DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("low DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("close DOUBLE"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("volume LONG"));
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("oi LONG"));
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_partition_by_day() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_has_segment() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("segment SYMBOL"));
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_idempotent() {
+        assert!(HISTORICAL_CANDLES_CREATE_DDL.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_historical_candles_ddl_no_semicolons() {
+        assert!(!HISTORICAL_CANDLES_CREATE_DDL.contains(';'));
+    }
+
+    // =======================================================================
+    // Coverage: build helpers
+    // =======================================================================
+
+    #[test]
+    fn test_build_questdb_exec_url_with_ipv4() {
+        let url = build_questdb_exec_url("192.168.1.1", 9000);
+        assert_eq!(url, "http://192.168.1.1:9000/exec");
+    }
+
+    #[test]
+    fn test_build_dedup_sql_contains_alter() {
+        let sql = build_dedup_sql("my_table", "col_a, col_b");
+        assert!(sql.starts_with("ALTER TABLE my_table"));
+        assert!(sql.contains("DEDUP ENABLE UPSERT KEYS(ts, col_a, col_b)"));
+    }
+
+    #[test]
+    fn test_build_ilp_conf_string_format() {
+        let conf = build_ilp_conf_string("myhost", 9009);
+        assert_eq!(conf, "tcp::addr=myhost:9009;");
+    }
+
+    // =======================================================================
+    // Coverage: DEDUP key includes segment
+    // =======================================================================
+
+    #[test]
+    fn test_dedup_key_candles_includes_segment() {
+        assert!(DEDUP_KEY_CANDLES.contains("segment"));
+    }
+
+    // =======================================================================
+    // Coverage: LiveCandleWriter constants
+    // =======================================================================
+
+    #[test]
+    fn test_live_candle_constants() {
+        assert_eq!(LIVE_CANDLE_FLUSH_BATCH_SIZE, 128);
+        assert_eq!(LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS, 3);
+        assert_eq!(LIVE_CANDLE_RECONNECT_INITIAL_DELAY_MS, 1000);
+        assert_eq!(LIVE_CANDLE_RECONNECT_THROTTLE_SECS, 30);
+    }
+
+    #[test]
+    fn test_historical_candle_constants() {
+        assert_eq!(HISTORICAL_CANDLE_MAX_RECONNECT_ATTEMPTS, 3);
+        assert_eq!(HISTORICAL_CANDLE_RECONNECT_INITIAL_DELAY_MS, 1000);
+    }
 }

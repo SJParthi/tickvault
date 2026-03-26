@@ -1303,6 +1303,19 @@ mod tests {
     }
 
     #[test]
+    fn test_greeks_config_default() {
+        let config = GreeksConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.fetch_interval_secs, 60);
+        assert!((config.risk_free_rate - 0.10).abs() < f64::EPSILON);
+        assert!((config.dividend_yield - 0.0).abs() < f64::EPSILON);
+        assert_eq!(config.iv_solver_max_iterations, 50);
+        assert!((config.iv_solver_tolerance - 1e-8).abs() < f64::EPSILON);
+        assert!((config.day_count - 365.0).abs() < f64::EPSILON);
+        assert_eq!(config.rate_mode, "dhan");
+    }
+
+    #[test]
     fn test_subscription_config_default() {
         let config = SubscriptionConfig::default();
         assert_eq!(config.feed_mode, "Full");

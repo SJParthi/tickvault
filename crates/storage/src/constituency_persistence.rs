@@ -856,4 +856,86 @@ mod tests {
         // covering lines 127 and 159.
         ensure_constituency_table(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL column checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ddl_has_weight_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("weight DOUBLE"));
+    }
+
+    #[test]
+    fn test_ddl_has_index_name_symbol() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("index_name SYMBOL"));
+    }
+
+    #[test]
+    fn test_ddl_has_symbol_column() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("symbol SYMBOL"));
+    }
+
+    #[test]
+    fn test_ddl_timestamp_designation() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("TIMESTAMP(ts)"));
+    }
+
+    #[test]
+    fn test_ddl_create_if_not_exists() {
+        assert!(INDEX_CONSTITUENTS_CREATE_DDL.contains("CREATE TABLE IF NOT EXISTS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: resolve_security_id with None universe
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_security_id_returns_zero_for_none() {
+        assert_eq!(resolve_security_id(None, "RELIANCE"), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: helper function edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_questdb_exec_url_format() {
+        let url = build_questdb_exec_url("10.0.0.1", 19000);
+        assert!(url.starts_with("http://"));
+        assert!(url.ends_with("/exec"));
+        assert!(url.contains("10.0.0.1"));
+        assert!(url.contains("19000"));
+    }
+
+    #[test]
+    fn test_build_ilp_conf_string_format() {
+        let conf = build_ilp_conf_string("myhost", 9009);
+        assert!(conf.starts_with("tcp::addr="));
+        assert!(conf.ends_with(';'));
+        assert!(conf.contains("myhost:9009"));
+    }
+
+    #[test]
+    fn test_build_dedup_sql_format() {
+        let sql = build_dedup_sql("test_table", "col1, col2");
+        assert!(sql.contains("ALTER TABLE test_table"));
+        assert!(sql.contains("DEDUP ENABLE UPSERT KEYS(ts, col1, col2)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: constants validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_constituency_constants() {
+        assert_eq!(CONSTITUENCY_PERSIST_MAX_RETRIES, 3);
+        assert_eq!(CONSTITUENCY_PERSIST_RETRY_DELAY_SECS, 2);
+        assert_eq!(QUESTDB_DDL_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn test_dedup_key_index_constituents_format() {
+        assert_eq!(DEDUP_KEY_INDEX_CONSTITUENTS, "index_name, symbol");
+    }
 }

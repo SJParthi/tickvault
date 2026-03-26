@@ -2618,4 +2618,375 @@ mod tests {
         );
         assert_eq!(writer.pending_count(), 0, "pending must be cleared");
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage: fresh_buffer() helper (greeks lines 606-612)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fresh_buffer_with_sender_returns_sender_buffer() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty(), "fresh buffer from sender must be empty");
+        assert_eq!(buf.row_count(), 0);
+    }
+
+    #[test]
+    fn test_fresh_buffer_without_sender_returns_standalone_v1() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_none());
+
+        let buf = writer.fresh_buffer();
+        assert!(buf.is_empty(), "fresh V1 buffer must be empty");
+        assert_eq!(buf.row_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: DDL higher-order greeks columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_greeks_ddl_has_higher_order_greeks() {
+        for col in [
+            "rho DOUBLE",
+            "charm DOUBLE",
+            "vanna DOUBLE",
+            "volga DOUBLE",
+            "veta DOUBLE",
+            "speed DOUBLE",
+            "color DOUBLE",
+            "zomma DOUBLE",
+            "ultima DOUBLE",
+        ] {
+            assert!(
+                OPTION_GREEKS_DDL.contains(col),
+                "option_greeks missing higher-order greek: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_raw_ddl_has_underlying_segment() {
+        assert!(
+            DHAN_OPTION_CHAIN_RAW_DDL.contains("underlying_segment SYMBOL"),
+            "dhan_option_chain_raw must have underlying_segment"
+        );
+    }
+
+    #[test]
+    fn test_option_greeks_ddl_partition_by_hour() {
+        assert!(OPTION_GREEKS_DDL.contains("PARTITION BY HOUR WAL"));
+    }
+
+    #[test]
+    fn test_greeks_verification_ddl_partition_by_day() {
+        assert!(GREEKS_VERIFICATION_DDL.contains("PARTITION BY DAY WAL"));
+    }
+
+    #[test]
+    fn test_ddl_timeout_constant() {
+        assert_eq!(DDL_TIMEOUT_SECS, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: ILP row builder content verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dhan_raw_row_contains_expected_fields() {
+        let mut buffer = make_test_buffer();
+        let row = DhanRawRow {
+            security_id: 42528,
+            segment: "NSE_FNO",
+            symbol_name: "NIFTY25MAR25650CE",
+            underlying_symbol: "NIFTY",
+            underlying_security_id: 13,
+            underlying_segment: "IDX_I",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            spot_price: 25642.8,
+            last_price: 134.0,
+            average_price: 146.99,
+            oi: 3786445,
+            previous_close_price: 244.85,
+            previous_oi: 402220,
+            previous_volume: 31931705,
+            volume: 117567970,
+            top_bid_price: 133.55,
+            top_bid_quantity: 1625,
+            top_ask_price: 134.0,
+            top_ask_quantity: 1365,
+            implied_volatility: 9.789,
+            delta: 0.53871,
+            theta: -15.1539,
+            gamma: 0.00132,
+            vega: 12.18593,
+            ts_nanos: sample_ts_nanos(),
+        };
+        build_dhan_raw_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(TABLE_DHAN_OPTION_CHAIN_RAW));
+        assert!(content.contains("NSE_FNO"));
+        assert!(content.contains("security_id"));
+        assert!(content.contains("implied_volatility"));
+    }
+
+    #[test]
+    fn test_build_option_greeks_row_contains_higher_order_fields() {
+        let mut buffer = make_test_buffer();
+        let row = OptionGreeksRow {
+            segment: "NSE_FNO",
+            security_id: 42528,
+            symbol_name: "TEST",
+            underlying_security_id: 13,
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            iv: 0.098,
+            delta: 0.54,
+            gamma: 0.0013,
+            theta: -15.2,
+            vega: 12.1,
+            rho: 0.05,
+            charm: -0.002,
+            vanna: 0.15,
+            volga: 3.2,
+            veta: -1.8,
+            speed: -0.00001,
+            color: -0.0003,
+            zomma: 0.001,
+            ultima: -0.5,
+            bs_price: 135.5,
+            intrinsic_value: 0.0,
+            extrinsic_value: 134.0,
+            spot_price: 25642.8,
+            option_ltp: 134.0,
+            oi: 3786445,
+            volume: 117567970,
+            buildup_type: "LongBuildup",
+            ts_nanos: sample_ts_nanos(),
+        };
+        build_option_greeks_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("rho="));
+        assert!(content.contains("charm="));
+        assert!(content.contains("vanna="));
+        assert!(content.contains("bs_price="));
+        assert!(content.contains("LongBuildup"));
+    }
+
+    #[test]
+    fn test_build_verification_row_contains_diff_fields() {
+        let mut buffer = make_test_buffer();
+        let row = VerificationRow {
+            security_id: 42528,
+            segment: "NSE_FNO",
+            symbol_name: "TEST",
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            our_iv: 0.098,
+            dhan_iv: 0.09789,
+            iv_diff: 0.00011,
+            our_delta: 0.54,
+            dhan_delta: 0.53871,
+            delta_diff: 0.00129,
+            our_gamma: 0.0013,
+            dhan_gamma: 0.00132,
+            gamma_diff: -0.00002,
+            our_theta: -15.2,
+            dhan_theta: -15.1539,
+            theta_diff: -0.0461,
+            our_vega: 12.1,
+            dhan_vega: 12.18593,
+            vega_diff: -0.08593,
+            match_status: "MISMATCH",
+            ts_nanos: sample_ts_nanos(),
+        };
+        build_verification_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("MISMATCH"));
+        assert!(content.contains("iv_diff="));
+        assert!(content.contains("delta_diff="));
+    }
+
+    #[test]
+    fn test_build_option_greeks_live_row_contains_candle_interval() {
+        let mut buffer = make_test_buffer();
+        let row = OptionGreeksLiveRow {
+            segment: "NSE_FNO",
+            security_id: 42528,
+            symbol_name: "TEST",
+            underlying_security_id: 13,
+            underlying_symbol: "NIFTY",
+            strike_price: 25650.0,
+            option_type: "CE",
+            expiry_date: "2025-03-27",
+            candle_interval: "5m",
+            iv: 0.098,
+            delta: 0.54,
+            gamma: 0.0013,
+            theta: -15.2,
+            vega: 12.1,
+            rho: 0.05,
+            charm: -0.002,
+            vanna: 0.15,
+            volga: 3.2,
+            veta: -1.8,
+            speed: -0.00001,
+            color: -0.0003,
+            zomma: 0.001,
+            ultima: -0.5,
+            bs_price: 135.5,
+            intrinsic_value: 0.0,
+            extrinsic_value: 134.0,
+            spot_price: 25642.8,
+            option_ltp: 134.0,
+            oi: 3786445,
+            volume: 117567970,
+            ts_nanos: sample_ts_nanos(),
+        };
+        build_option_greeks_live_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("5m"));
+        assert!(content.contains(TABLE_OPTION_GREEKS_LIVE));
+    }
+
+    #[test]
+    fn test_build_pcr_snapshot_live_row_contains_candle_interval() {
+        let mut buffer = make_test_buffer();
+        let row = PcrSnapshotLiveRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            candle_interval: "15m",
+            pcr_oi: 0.95,
+            pcr_volume: 0.82,
+            total_put_oi: 5000000,
+            total_call_oi: 5263158,
+            total_put_volume: 90000000,
+            total_call_volume: 109756098,
+            sentiment: "Bullish",
+            ts_nanos: sample_ts_nanos(),
+        };
+        build_pcr_snapshot_live_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains("15m"));
+        assert!(content.contains(TABLE_PCR_SNAPSHOTS_LIVE));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: option_greeks_live DDL additional column checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_greeks_live_ddl_has_higher_order_greeks() {
+        for col in [
+            "rho DOUBLE",
+            "charm DOUBLE",
+            "vanna DOUBLE",
+            "volga DOUBLE",
+            "veta DOUBLE",
+            "speed DOUBLE",
+            "color DOUBLE",
+            "zomma DOUBLE",
+            "ultima DOUBLE",
+        ] {
+            assert!(
+                OPTION_GREEKS_LIVE_DDL.contains(col),
+                "live DDL missing: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_option_greeks_live_ddl_has_market_data() {
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("spot_price DOUBLE"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("option_ltp DOUBLE"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("oi LONG"));
+        assert!(OPTION_GREEKS_LIVE_DDL.contains("volume LONG"));
+    }
+
+    #[test]
+    fn test_pcr_snapshots_live_ddl_has_volume_fields() {
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("total_put_volume LONG"));
+        assert!(PCR_SNAPSHOTS_LIVE_DDL.contains("total_call_volume LONG"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: pending_count accessor and flush paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pending_count_starts_at_zero() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_greeks_flush_with_zero_pending_is_noop() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        let result = writer.flush();
+        assert!(result.is_ok());
+        assert!(writer.sender.is_some());
+    }
+
+    #[test]
+    fn test_greeks_flush_success_resets_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        let row = PcrSnapshotRow {
+            underlying_symbol: "NIFTY",
+            expiry_date: "2025-03-27",
+            pcr_oi: 0.78,
+            pcr_volume: 0.65,
+            total_put_oi: 4000000,
+            total_call_oi: 5128205,
+            total_put_volume: 80000000,
+            total_call_volume: 123000000,
+            sentiment: "Bullish",
+            ts_nanos: sample_ts_nanos(),
+        };
+        writer.write_pcr_snapshot_row(&row).unwrap();
+        assert_eq!(writer.pending_count(), 1);
+        let result = writer.flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count(), 0);
+    }
 }

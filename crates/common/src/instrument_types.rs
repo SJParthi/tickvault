@@ -1011,6 +1011,79 @@ mod tests {
     }
 
     #[test]
+    fn test_index_subcategory_serde_roundtrip_all_variants() {
+        let variants = [
+            IndexSubcategory::Volatility,
+            IndexSubcategory::BroadMarket,
+            IndexSubcategory::MidCap,
+            IndexSubcategory::SmallCap,
+            IndexSubcategory::Sectoral,
+            IndexSubcategory::Thematic,
+            IndexSubcategory::Fno,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: IndexSubcategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                variant, deserialized,
+                "Serde roundtrip failed for {:?}",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_underlying_kind_serde_roundtrip_all_variants() {
+        let variants = [
+            UnderlyingKind::NseIndex,
+            UnderlyingKind::BseIndex,
+            UnderlyingKind::Stock,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: UnderlyingKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                variant, deserialized,
+                "Serde roundtrip failed for {:?}",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_dhan_instrument_kind_serde_roundtrip_all_variants() {
+        let variants = [
+            DhanInstrumentKind::FutureIndex,
+            DhanInstrumentKind::FutureStock,
+            DhanInstrumentKind::OptionIndex,
+            DhanInstrumentKind::OptionStock,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: DhanInstrumentKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                variant, deserialized,
+                "Serde roundtrip failed for {:?}",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_category_serde_roundtrip_all_variants() {
+        let variants = [IndexCategory::FnoUnderlying, IndexCategory::DisplayIndex];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: IndexCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                variant, deserialized,
+                "Serde roundtrip failed for {:?}",
+                variant
+            );
+        }
+    }
+
+    #[test]
     fn test_index_subcategory_serde_roundtrip() {
         let original = IndexSubcategory::Sectoral;
         let json = serde_json::to_string(&original).unwrap();
@@ -1813,6 +1886,48 @@ mod tests {
     }
 
     #[test]
+    fn test_index_constituency_map_get_constituents_returns_slice() {
+        let mut map = IndexConstituencyMap::default();
+        let c1 = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.5,
+            sector: "Oil & Gas".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        };
+        let c2 = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "TCS".to_string(),
+            isin: "INE467B01029".to_string(),
+            weight: 5.0,
+            sector: "IT".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        };
+        map.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![c1, c2]);
+        let constituents = map.get_constituents("Nifty 50").unwrap();
+        assert_eq!(constituents.len(), 2);
+        assert_eq!(constituents[0].symbol, "RELIANCE");
+        assert_eq!(constituents[1].symbol, "TCS");
+    }
+
+    #[test]
+    fn test_index_constituency_map_get_indices_for_stock_returns_slice() {
+        let mut map = IndexConstituencyMap::default();
+        map.stock_to_indices.insert(
+            "HDFCBANK".to_string(),
+            vec![
+                "Nifty 50".to_string(),
+                "Nifty Bank".to_string(),
+                "Nifty 100".to_string(),
+            ],
+        );
+        let indices = map.get_indices_for_stock("HDFCBANK").unwrap();
+        assert_eq!(indices.len(), 3);
+    }
+
+    #[test]
     fn test_index_constituency_map_all_index_names_sorted() {
         let mut map = IndexConstituencyMap::default();
         map.index_to_constituents
@@ -2000,6 +2115,216 @@ mod tests {
                 ref symbol,
             } if symbol == "RELIANCE"
         ));
+    }
+
+    #[test]
+    fn test_index_constituent_serde_roundtrip() {
+        let constituent = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.5,
+            sector: "Oil & Gas".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        };
+        let json = serde_json::to_string(&constituent).unwrap();
+        let deserialized: IndexConstituent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.symbol, "RELIANCE");
+        assert_eq!(deserialized.index_name, "Nifty 50");
+        assert!((deserialized.weight - 10.5).abs() < f64::EPSILON);
+        assert_eq!(deserialized.isin, "INE002A01018");
+        assert_eq!(deserialized.sector, "Oil & Gas");
+        assert_eq!(
+            deserialized.last_updated,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_index_constituent_debug() {
+        let constituent = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "TCS".to_string(),
+            isin: "INE467B01029".to_string(),
+            weight: 5.0,
+            sector: "IT".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        };
+        let debug = format!("{:?}", constituent);
+        assert!(debug.contains("IndexConstituent"));
+        assert!(debug.contains("TCS"));
+    }
+
+    #[test]
+    fn test_index_constituency_map_serde_roundtrip() {
+        let mut map = IndexConstituencyMap::default();
+        let constituent = IndexConstituent {
+            index_name: "Nifty 50".to_string(),
+            symbol: "RELIANCE".to_string(),
+            isin: "INE002A01018".to_string(),
+            weight: 10.5,
+            sector: "Oil & Gas".to_string(),
+            last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        };
+        map.index_to_constituents
+            .insert("Nifty 50".to_string(), vec![constituent]);
+        map.stock_to_indices
+            .insert("RELIANCE".to_string(), vec!["Nifty 50".to_string()]);
+
+        let json = serde_json::to_string(&map).unwrap();
+        let deserialized: IndexConstituencyMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.index_count(), 1);
+        assert_eq!(deserialized.stock_count(), 1);
+        assert!(deserialized.contains_stock("RELIANCE"));
+        assert!(deserialized.contains_index("Nifty 50"));
+    }
+
+    #[test]
+    fn test_fno_underlying_serde_roundtrip() {
+        let underlying = FnoUnderlying {
+            underlying_symbol: "NIFTY".to_string(),
+            underlying_security_id: 26000,
+            price_feed_security_id: 13,
+            price_feed_segment: ExchangeSegment::IdxI,
+            derivative_segment: ExchangeSegment::NseFno,
+            kind: UnderlyingKind::NseIndex,
+            lot_size: 25,
+            contract_count: 100,
+        };
+        let json = serde_json::to_string(&underlying).unwrap();
+        let deserialized: FnoUnderlying = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "NIFTY");
+        assert_eq!(deserialized.lot_size, 25);
+        assert_eq!(deserialized.contract_count, 100);
+    }
+
+    #[test]
+    fn test_derivative_contract_serde_roundtrip() {
+        let contract = DerivativeContract {
+            security_id: 49001,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 24000.0,
+            option_type: Some(crate::types::OptionType::Call),
+            lot_size: 75,
+            tick_size: 0.05,
+            symbol_name: "NIFTY-27MAR26-24000-CE".to_string(),
+            display_name: "NIFTY 24000 CE Mar26".to_string(),
+        };
+        let json = serde_json::to_string(&contract).unwrap();
+        let deserialized: DerivativeContract = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.security_id, 49001);
+        assert!((deserialized.strike_price - 24000.0).abs() < f64::EPSILON);
+        assert_eq!(
+            deserialized.option_type,
+            Some(crate::types::OptionType::Call)
+        );
+    }
+
+    #[test]
+    fn test_option_chain_serde_roundtrip() {
+        let chain = OptionChain {
+            underlying_symbol: "BANKNIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+            calls: vec![OptionChainEntry {
+                security_id: 55001,
+                strike_price: 48000.0,
+                lot_size: 15,
+            }],
+            puts: vec![OptionChainEntry {
+                security_id: 55002,
+                strike_price: 48000.0,
+                lot_size: 15,
+            }],
+            future_security_id: Some(55000),
+        };
+        let json = serde_json::to_string(&chain).unwrap();
+        let deserialized: OptionChain = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "BANKNIFTY");
+        assert_eq!(deserialized.calls.len(), 1);
+        assert_eq!(deserialized.puts.len(), 1);
+        assert_eq!(deserialized.future_security_id, Some(55000));
+    }
+
+    #[test]
+    fn test_option_chain_entry_debug() {
+        let entry = OptionChainEntry {
+            security_id: 55001,
+            strike_price: 48000.0,
+            lot_size: 15,
+        };
+        let debug = format!("{:?}", entry);
+        assert!(debug.contains("OptionChainEntry"));
+    }
+
+    #[test]
+    fn test_expiry_calendar_serde_roundtrip() {
+        let cal = ExpiryCalendar {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_dates: vec![
+                chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+                chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+            ],
+        };
+        let json = serde_json::to_string(&cal).unwrap();
+        let deserialized: ExpiryCalendar = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "NIFTY");
+        assert_eq!(deserialized.expiry_dates.len(), 2);
+    }
+
+    #[test]
+    fn test_subscribed_index_serde_roundtrip() {
+        use crate::types::Exchange;
+        let idx = SubscribedIndex {
+            symbol: "INDIA VIX".to_string(),
+            security_id: 21,
+            exchange: Exchange::NationalStockExchange,
+            category: IndexCategory::DisplayIndex,
+            subcategory: IndexSubcategory::Volatility,
+        };
+        let json = serde_json::to_string(&idx).unwrap();
+        let deserialized: SubscribedIndex = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.symbol, "INDIA VIX");
+        assert_eq!(deserialized.security_id, 21);
+    }
+
+    #[test]
+    fn test_instrument_info_derivative_serde_roundtrip() {
+        let info = InstrumentInfo::Derivative {
+            security_id: 49001,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+            strike_price: 24000.0,
+            option_type: Some(crate::types::OptionType::Call),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: InstrumentInfo = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            deserialized,
+            InstrumentInfo::Derivative {
+                security_id: 49001,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_option_chain_key_serde_roundtrip() {
+        let key = OptionChainKey {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap(),
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        let deserialized: OptionChainKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.underlying_symbol, "NIFTY");
+        assert_eq!(
+            deserialized.expiry_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 27).unwrap()
+        );
     }
 
     #[test]

@@ -303,4 +303,225 @@ mod tests {
         let req2 = req.clone();
         assert_eq!(req.underlying_scrip, req2.underlying_scrip);
     }
+
+    #[test]
+    fn test_option_chain_response_empty_oc_map() {
+        let json = r#"{"data":{"last_price":25000.0,"oc":{}},"status":"success"}"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.data.oc.is_empty());
+        assert!((resp.data.last_price - 25000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_option_chain_response_both_ce_pe_null() {
+        let json = r#"{"data":{"last_price":100.0,"oc":{"20000.000000":{"ce":null,"pe":null}}},"status":"success"}"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        let strike = resp.data.oc.get("20000.000000").unwrap();
+        assert!(strike.ce.is_none());
+        assert!(strike.pe.is_none());
+    }
+
+    #[test]
+    fn test_expiry_list_response_empty() {
+        let json = r#"{"data": [], "status": "success"}"#;
+        let resp: ExpiryListResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.data.is_empty());
+        assert_eq!(resp.status, "success");
+    }
+
+    #[test]
+    fn test_expiry_list_request_clone() {
+        let req = ExpiryListRequest {
+            underlying_scrip: 13,
+            underlying_seg: "IDX_I".to_string(),
+        };
+        let cloned = req.clone();
+        assert_eq!(cloned.underlying_scrip, 13);
+        assert_eq!(cloned.underlying_seg, "IDX_I");
+    }
+
+    #[test]
+    fn test_option_chain_request_debug() {
+        let req = OptionChainRequest {
+            underlying_scrip: 13,
+            underlying_seg: "IDX_I".to_string(),
+            expiry: "2024-10-31".to_string(),
+        };
+        let debug = format!("{req:?}");
+        assert!(debug.contains("OptionChainRequest"));
+        assert!(debug.contains("13"));
+        assert!(debug.contains("IDX_I"));
+    }
+
+    #[test]
+    fn test_expiry_list_request_debug() {
+        let req = ExpiryListRequest {
+            underlying_scrip: 42,
+            underlying_seg: "NSE_EQ".to_string(),
+        };
+        let debug = format!("{req:?}");
+        assert!(debug.contains("ExpiryListRequest"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn test_option_chain_response_debug() {
+        let json = r#"{"data":{"last_price":100.0,"oc":{}},"status":"success"}"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("OptionChainResponse"));
+        assert!(debug.contains("success"));
+    }
+
+    #[test]
+    fn test_strike_data_debug() {
+        let strike = StrikeData { ce: None, pe: None };
+        let debug = format!("{strike:?}");
+        assert!(debug.contains("StrikeData"));
+        assert!(debug.contains("None"));
+    }
+
+    #[test]
+    fn test_option_data_all_fields() {
+        let json = r#"{
+            "data": {
+                "last_price": 25000.0,
+                "oc": {
+                    "25000.000000": {
+                        "ce": {
+                            "average_price": 0.0,
+                            "greeks": {"delta": 0.0, "theta": 0.0, "gamma": 0.0, "vega": 0.0},
+                            "implied_volatility": 0.0,
+                            "last_price": 0.0,
+                            "oi": 0,
+                            "previous_close_price": 0.0,
+                            "previous_oi": 0,
+                            "previous_volume": 0,
+                            "security_id": 99999,
+                            "top_ask_price": 0.0,
+                            "top_ask_quantity": 0,
+                            "top_bid_price": 0.0,
+                            "top_bid_quantity": 0,
+                            "volume": 0
+                        },
+                        "pe": null
+                    }
+                }
+            },
+            "status": "success"
+        }"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        let strike = resp.data.oc.get("25000.000000").unwrap();
+        let ce = strike.ce.as_ref().unwrap();
+        assert_eq!(ce.security_id, 99999);
+        assert_eq!(ce.oi, 0);
+        assert_eq!(ce.volume, 0);
+        assert_eq!(ce.previous_volume, 0);
+    }
+
+    #[test]
+    fn test_dhan_greeks_debug() {
+        let g = DhanGreeks {
+            delta: 0.5,
+            theta: -10.0,
+            gamma: 0.001,
+            vega: 8.0,
+        };
+        let debug = format!("{g:?}");
+        assert!(debug.contains("DhanGreeks"));
+        assert!(debug.contains("0.5"));
+    }
+
+    #[test]
+    fn test_dhan_greeks_clone() {
+        let g = DhanGreeks {
+            delta: 0.5,
+            theta: -10.0,
+            gamma: 0.001,
+            vega: 8.0,
+        };
+        let g2 = g.clone();
+        assert_eq!(g.delta, g2.delta);
+        assert_eq!(g.theta, g2.theta);
+        assert_eq!(g.gamma, g2.gamma);
+        assert_eq!(g.vega, g2.vega);
+    }
+
+    #[test]
+    fn test_option_chain_response_clone() {
+        let json = r#"{"data":{"last_price":100.0,"oc":{}},"status":"success"}"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        let cloned = resp.clone();
+        assert_eq!(resp.status, cloned.status);
+        assert!((resp.data.last_price - cloned.data.last_price).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_expiry_list_response_clone() {
+        let json = r#"{"data": ["2024-10-17"], "status": "success"}"#;
+        let resp: ExpiryListResponse = serde_json::from_str(json).unwrap();
+        let cloned = resp.clone();
+        assert_eq!(resp.data.len(), cloned.data.len());
+        assert_eq!(resp.status, cloned.status);
+    }
+
+    #[test]
+    fn test_option_chain_request_underlying_scrip_is_integer_in_json() {
+        let req = OptionChainRequest {
+            underlying_scrip: 13,
+            underlying_seg: "IDX_I".to_string(),
+            expiry: "2024-10-31".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // UnderlyingScrip must be integer, NOT string
+        assert!(json.contains("\"UnderlyingScrip\":13"));
+        assert!(!json.contains("\"UnderlyingScrip\":\"13\""));
+    }
+
+    #[test]
+    fn test_multiple_strike_keys_in_response() {
+        let json = r#"{"data":{"last_price":25000.0,"oc":{
+            "24500.000000":{"ce":null,"pe":null},
+            "25000.000000":{"ce":null,"pe":null},
+            "25500.000000":{"ce":null,"pe":null}
+        }},"status":"success"}"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.data.oc.len(), 3);
+    }
+
+    #[test]
+    fn test_option_data_negative_greeks() {
+        let json = r#"{
+            "data": {
+                "last_price": 25000.0,
+                "oc": {
+                    "25000.000000": {
+                        "ce": null,
+                        "pe": {
+                            "average_price": 180.0,
+                            "greeks": {"delta": -0.999, "theta": -99.99, "gamma": 0.00001, "vega": 0.001},
+                            "implied_volatility": 50.0,
+                            "last_price": 170.0,
+                            "oi": -1,
+                            "previous_close_price": 160.0,
+                            "previous_oi": -1,
+                            "previous_volume": -1,
+                            "security_id": 12346,
+                            "top_ask_price": 171.0,
+                            "top_ask_quantity": -1,
+                            "top_bid_price": 169.0,
+                            "top_bid_quantity": -1,
+                            "volume": -1
+                        }
+                    }
+                }
+            },
+            "status": "success"
+        }"#;
+        let resp: OptionChainResponse = serde_json::from_str(json).unwrap();
+        let strike = resp.data.oc.get("25000.000000").unwrap();
+        let pe = strike.pe.as_ref().unwrap();
+        assert!(pe.greeks.delta < 0.0);
+        assert!(pe.greeks.theta < 0.0);
+    }
 }
