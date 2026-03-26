@@ -272,15 +272,12 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
         questdb_config.host, questdb_config.http_port
     );
 
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(?err, "failed to build HTTP client for Greeks DDL");
-            return;
-        }
+    else {
+        return;
     };
 
     // Step 1: CREATE TABLE IF NOT EXISTS (no inline DEDUP — QuestDB rejects it).

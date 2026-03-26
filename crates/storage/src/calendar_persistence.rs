@@ -96,15 +96,12 @@ fn compute_midnight_epoch_nanos(date: chrono::NaiveDate) -> Option<i64> {
 pub async fn ensure_calendar_table(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(?err, "failed to build HTTP client for calendar table DDL");
-            return;
-        }
+    else {
+        return;
     };
 
     // Step 1: CREATE TABLE IF NOT EXISTS

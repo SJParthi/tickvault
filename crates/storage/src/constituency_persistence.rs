@@ -95,18 +95,12 @@ fn count_total_constituents(constituency_map: &IndexConstituencyMap) -> usize {
 pub async fn ensure_constituency_table(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(
-                ?err,
-                "failed to build HTTP client for constituency table DDL"
-            );
-            return;
-        }
+    else {
+        return;
     };
 
     // Step 1: Create table

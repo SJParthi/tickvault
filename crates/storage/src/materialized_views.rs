@@ -283,15 +283,12 @@ fn build_view_sql(def: &ViewDef) -> String {
 pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
-    let client = match reqwest::Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(?err, "failed to build HTTP client for candle view DDL");
-            return;
-        }
+    else {
+        return;
     };
 
     // Step 1: Create the candles_1s base table.

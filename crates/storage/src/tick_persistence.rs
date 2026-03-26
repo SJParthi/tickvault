@@ -1014,20 +1014,12 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         questdb_config.host, questdb_config.http_port
     );
 
-    // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
-    // which cannot happen in our runtime (aws-lc-rs always installed).
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(
-                ?err,
-                "failed to build HTTP client for tick table DDL — table not pre-created"
-            );
-            return;
-        }
+    else {
+        return;
     };
 
     // Step 1: Create the table with explicit schema (idempotent).
@@ -1883,17 +1875,12 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
         questdb_config.host, questdb_config.http_port
     );
 
-    // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
-    // which cannot happen in our runtime (aws-lc-rs always installed).
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(?err, "failed to build HTTP client for depth/prev_close DDL");
-            return;
-        }
+    else {
+        return;
     };
 
     // --- market_depth table ---
@@ -1952,16 +1939,12 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
     );
 
     // COVERAGE-EXCLUDED: Client::builder().build() only fails without TLS provider,
-    // which cannot happen in our runtime (aws-lc-rs always installed).
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(?err, "failed to build HTTP client for gap check");
-            return;
-        }
+    else {
+        return;
     };
 
     // Query: count ticks per 1-minute bucket in the last N minutes.

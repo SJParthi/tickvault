@@ -1056,18 +1056,12 @@ const HISTORICAL_CANDLES_CREATE_DDL: &str = "\
 pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
-    let client = match Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(
-                ?err,
-                "failed to build HTTP client for candle table DDL — tables not pre-created"
-            );
-            return;
-        }
+    else {
+        return;
     };
 
     // Step 1: Create the new multi-timeframe table.
