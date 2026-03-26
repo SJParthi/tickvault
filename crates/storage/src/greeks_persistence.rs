@@ -526,9 +526,10 @@ impl GreeksPersistenceWriter {
                 return Ok(()); // Swallow — Greeks are recomputed next second
             }
         } else {
+            // No sender — discard buffered ILP rows (will be recomputed).
             self.buffer.clear();
             self.pending_count = 0;
-            return Ok(()); // No sender — discard
+            return Ok(());
         }
 
         self.pending_count = 0;
@@ -2501,5 +2502,95 @@ mod tests {
             writer.sender.is_none(),
             "sender must remain None after failed reconnect"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test: greeks flush after reconnect must NOT call
+    // sender.flush() on empty buffer (caused infinite error loop in prod)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_flush_after_reconnect_does_not_flush_empty_buffer() {
+        // This test reproduces the exact bug seen in production logs:
+        // "State error: Bad call to flush, should have called table instead"
+        //
+        // Scenario:
+        // 1. Writer connected, writes some rows
+        // 2. Connection breaks (sender = None)
+        // 3. flush() called with pending_count > 0
+        // 4. Reconnect succeeds
+        // 5. OLD BUG: flush() continued to sender.flush() on fresh empty buffer → error loop
+        // 6. FIX: after reconnect, clear buffer and return immediately
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate having pending data (as if rows were written).
+        writer.pending_count = 1;
+
+        // Kill sender to simulate connection break.
+        writer.sender = None;
+
+        // Point to a new working server for reconnect.
+        let port2 = spawn_tcp_drain_server();
+        writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
+
+        // flush() should: reconnect → clear old buffer → return Ok
+        // NOT: reconnect → flush empty buffer → "Bad call to flush" error
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush after reconnect must succeed (not error loop)"
+        );
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "pending must be 0 after reconnect flush"
+        );
+        assert!(writer.sender.is_some(), "sender must be reconnected");
+
+        // Second flush should also be fine (no pending data).
+        let result2 = writer.flush();
+        assert!(
+            result2.is_ok(),
+            "second flush must succeed (no pending data)"
+        );
+    }
+
+    #[test]
+    fn test_greeks_flush_after_reconnect_failure_clears_pending() {
+        // When reconnect fails, pending data should still be cleared
+        // (Greeks are recomputed every second — stale data is worthless).
+
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+
+        // Simulate having pending data.
+        writer.pending_count = 1;
+
+        // Kill sender and point to unreachable host.
+        writer.sender = None;
+        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
+
+        // flush() should clear pending even though reconnect fails.
+        let result = writer.flush();
+        assert!(
+            result.is_ok(),
+            "flush must return Ok even on failed reconnect"
+        );
+        assert_eq!(writer.pending_count(), 0, "pending must be cleared");
     }
 }
