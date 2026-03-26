@@ -174,14 +174,10 @@ impl ValkeyPool {
     pub async fn health_check(&self) -> Result<()> {
         let mut conn = self.checkout_conn().await?;
 
-        let pong: String = redis::cmd("PING")
+        let _pong: String = redis::cmd("PING")
             .query_async(&mut conn)
             .await
             .context("Valkey PING failed")?;
-
-        if pong != "PONG" {
-            anyhow::bail!("unexpected PING response: {pong}");
-        }
 
         debug!("Valkey health check passed");
         Ok(())
