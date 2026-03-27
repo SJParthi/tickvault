@@ -595,4 +595,45 @@ mod tests {
         // Should not panic; Greeks remain NAN (unknown security_id).
         assert!(tick.iv.is_nan());
     }
+
+    #[test]
+    fn test_inline_greeks_bse_equity_updates_ltp() {
+        // BSE equity segment (4) should update underlying LTP cache.
+        let registry = build_test_registry();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
+
+        let mut tick = make_tick(5555, 4, 2500.0); // BSE_EQ = 4
+        computer.enrich(&mut tick);
+        assert_eq!(computer.underlying_ltp.get(&5555), Some(&2500.0));
+    }
+
+    #[test]
+    fn test_inline_greeks_unknown_segment_no_op() {
+        // Unknown segments (e.g. MCX=5, currency=3) should be no-op.
+        let registry = build_test_registry();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
+
+        let mut tick = make_tick(7777, 5, 5000.0); // MCX_COMM = 5
+        computer.enrich(&mut tick);
+        assert!(tick.iv.is_nan());
+        assert!(!computer.underlying_ltp.contains_key(&7777));
+
+        let mut tick2 = make_tick(8888, 3, 75.0); // NSE_CURRENCY = 3
+        computer.enrich(&mut tick2);
+        assert!(tick2.iv.is_nan());
+    }
+
+    #[test]
+    fn test_inline_greeks_set_today_updates_date() {
+        let registry = build_test_registry();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
+        assert_eq!(computer.today, today);
+
+        let tomorrow = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+        computer.set_today(tomorrow);
+        assert_eq!(computer.today, tomorrow);
+    }
 }
