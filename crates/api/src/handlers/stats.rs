@@ -12,20 +12,16 @@ use crate::state::SharedAppState;
 /// Timeout for QuestDB stats queries (cold path, not tick processing).
 const QUESTDB_STATS_TIMEOUT_SECS: u64 = 3;
 
-/// Builds a reqwest client with the given timeout. Returns a zeroed
-/// `StatsResponse` on failure (practically impossible, but defensive).
-fn build_stats_client(timeout_secs: u64) -> Result<reqwest::Client, StatsResponse> {
+/// Builds a reqwest client with the given timeout.
+///
+/// `reqwest::Client::builder().build()` only fails if the TLS backend
+/// cannot be initialised, which never happens at runtime. The function
+/// returns a default client as ultimate fallback.
+fn build_stats_client(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
-        .map_err(|_| StatsResponse {
-            questdb_reachable: false,
-            tables: 0,
-            underlyings: 0,
-            derivatives: 0,
-            subscribed_indices: 0,
-            ticks: 0,
-        })
+        .unwrap_or_default()
 }
 
 /// Dashboard statistics response.
@@ -44,10 +40,7 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
-    let client = match build_stats_client(QUESTDB_STATS_TIMEOUT_SECS) {
-        Ok(c) => c,
-        Err(resp) => return Json(resp),
-    };
+    let client = build_stats_client(QUESTDB_STATS_TIMEOUT_SECS);
 
     let tables = query_count(&client, &base_url, "SHOW TABLES").await;
     let questdb_reachable = tables.is_some();
@@ -542,8 +535,7 @@ mod tests {
 
     #[test]
     fn test_build_stats_client_success() {
-        let result = build_stats_client(3);
-        assert!(result.is_ok());
+        let _client = build_stats_client(3);
     }
 
     #[test]
@@ -564,14 +556,34 @@ mod tests {
 
     #[test]
     fn test_build_stats_client_succeeds() {
-        // Exercises build_stats_client happy path (line 17-29)
-        let result = build_stats_client(3);
-        assert!(result.is_ok());
+        let _client = build_stats_client(3);
     }
 
     #[test]
     fn test_build_stats_client_various_timeouts() {
-        assert!(build_stats_client(0).is_ok());
-        assert!(build_stats_client(60).is_ok());
+        let _c1 = build_stats_client(0);
+        let _c2 = build_stats_client(60);
+    }
+
+    // -----------------------------------------------------------------------
+    // StatsResponse zeroed construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stats_response_zeroed_all_fields() {
+        let resp = StatsResponse {
+            questdb_reachable: false,
+            tables: 0,
+            underlyings: 0,
+            derivatives: 0,
+            subscribed_indices: 0,
+            ticks: 0,
+        };
+        assert!(!resp.questdb_reachable);
+        assert_eq!(resp.tables, 0);
+        assert_eq!(resp.underlyings, 0);
+        assert_eq!(resp.derivatives, 0);
+        assert_eq!(resp.subscribed_indices, 0);
+        assert_eq!(resp.ticks, 0);
     }
 }

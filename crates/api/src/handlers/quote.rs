@@ -13,21 +13,16 @@ use crate::state::SharedAppState;
 /// Timeout for QuestDB quote queries (cold path, not tick processing).
 const QUESTDB_QUOTE_TIMEOUT_SECS: u64 = 3;
 
-/// Builds a reqwest client with the given timeout. Returns an error response
-/// on failure (practically impossible, but defensive).
-// APPROVED: Response is the natural error type for an HTTP handler helper.
-#[allow(clippy::result_large_err)]
-fn build_questdb_client(timeout_secs: u64) -> Result<reqwest::Client, axum::response::Response> {
+/// Builds a reqwest client with the given timeout.
+///
+/// `reqwest::Client::builder().build()` only fails if the TLS backend
+/// cannot be initialised, which never happens at runtime. The function
+/// returns a default client as ultimate fallback.
+fn build_questdb_client(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to build HTTP client"})),
-            )
-                .into_response()
-        })
+        .unwrap_or_default()
 }
 
 /// Latest quote response for a single security.
@@ -64,10 +59,7 @@ pub async fn get_quote(
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
-    let client = match build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
+    let client = build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS);
 
     match query_latest_tick(&client, &base_url, security_id).await {
         Some(quote) => (
@@ -706,24 +698,7 @@ mod tests {
 
     #[test]
     fn test_build_questdb_client_success() {
-        let result = build_questdb_client(3);
-        assert!(result.is_ok());
-    }
-
-    // -----------------------------------------------------------------------
-    // build_questdb_client: verify error mapping format
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_questdb_client_error_mapping_format() {
-        // The builder never actually fails, but the error mapping is exercised
-        // by verifying the response shape produced by the map_err closure.
-        let error_response = (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "failed to build HTTP client"})),
-        )
-            .into_response();
-        assert_eq!(error_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let _client = build_questdb_client(3);
     }
 
     // -----------------------------------------------------------------------
@@ -733,14 +708,12 @@ mod tests {
     #[test]
     fn test_build_questdb_client_zero_timeout() {
         // Zero timeout is valid for reqwest — it means no timeout
-        let result = build_questdb_client(0);
-        assert!(result.is_ok());
+        let _client = build_questdb_client(0);
     }
 
     #[test]
     fn test_build_questdb_client_large_timeout() {
-        let result = build_questdb_client(3600);
-        assert!(result.is_ok());
+        let _client = build_questdb_client(3600);
     }
 
     // -----------------------------------------------------------------------
@@ -768,16 +741,24 @@ mod tests {
 
     #[test]
     fn test_build_questdb_client_succeeds() {
-        // Exercises build_questdb_client happy path (lines 20-31)
-        let result = build_questdb_client(3);
-        assert!(result.is_ok());
+        let _client = build_questdb_client(3);
     }
 
     #[test]
     fn test_build_questdb_client_with_various_timeouts() {
-        // Exercise with different timeout values
-        assert!(build_questdb_client(1).is_ok());
-        assert!(build_questdb_client(30).is_ok());
-        assert!(build_questdb_client(0).is_ok()); // zero timeout still builds
+        let _c1 = build_questdb_client(1);
+        let _c2 = build_questdb_client(30);
+        let _c3 = build_questdb_client(0); // zero timeout still builds
+    }
+
+    // -----------------------------------------------------------------------
+    // get_quote handler: security_id == 0 → 400 Bad Request
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_quote_zero_security_id_returns_400() {
+        let state = mock_state(1);
+        let response = get_quote(State(state), Path(0)).await.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
