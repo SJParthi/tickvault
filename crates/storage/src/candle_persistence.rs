@@ -202,11 +202,8 @@ impl CandlePersistenceWriter {
             self.sender = None;
             self.pending_count = 0;
             // Create fresh buffer instead of clear() to avoid questdb-rs state corruption.
-            self.buffer = if let Some(ref s) = self.sender {
-                s.new_buffer()
-            } else {
-                Buffer::new(ProtocolVersion::V1)
-            };
+            // sender is None here (set above), so always use standalone buffer.
+            self.buffer = Buffer::new(ProtocolVersion::V1);
             return Err(err).context("flush candles to QuestDB");
         }
         self.pending_count = 0;

@@ -646,12 +646,16 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
-        // SECURITY: ports must NOT appear in Telegram message
+        // SECURITY: ports and URLs must NOT appear in Telegram message
         assert!(!msg.contains("3000"), "internal port leaked: {msg}");
+        assert!(!msg.contains("9090"), "internal port leaked: {msg}");
+        assert!(!msg.contains("16686"), "internal port leaked: {msg}");
+        assert!(!msg.contains("9000"), "internal port leaked: {msg}");
+        assert!(!msg.contains("localhost"), "localhost leaked: {msg}");
         assert!(msg.contains("Dashboards"));
-        assert!(msg.contains("Prometheus: http://localhost:9090"));
-        assert!(msg.contains("Jaeger: http://localhost:16686"));
-        assert!(msg.contains("QuestDB: http://localhost:9000"));
+        assert!(msg.contains("Grafana"));
+        assert!(msg.contains("Prometheus"));
+        assert!(msg.contains("QuestDB"));
     }
 
     #[test]
