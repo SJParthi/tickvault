@@ -225,6 +225,8 @@ impl TickDedupRing {
 /// * `greeks_enricher` — optional inline Greeks computer (Box<dyn GreeksEnricher>).
 ///   When present, enriches every valid tick with IV + delta/gamma/theta/vega
 ///   BEFORE persistence and broadcast. O(1) per tick (HashMap lookup + Jaeckel solve).
+// APPROVED: 9 params genuinely needed — pipeline entry point wiring tick/candle/depth/greeks subsystems
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
     mut tick_writer: Option<TickPersistenceWriter>,
