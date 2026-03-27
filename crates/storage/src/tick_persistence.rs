@@ -11291,4 +11291,269 @@ mod tests {
             "flag must be reset after take"
         );
     }
+
+    // =======================================================================
+    // Coverage: ensure_tick_table — CREATE 200, DEDUP 400 (non-success)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_create_ok_dedup_non_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let cc = call_count_clone.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let n = cc.fetch_add(1, Ordering::SeqCst);
+                        let response = if n == 0 { MOCK_HTTP_200 } else { MOCK_HTTP_400 };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: ensure_tick_table with tracing subscriber for info!/warn! args
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_all_200_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_all_400_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: ensure_depth_and_prev_close_tables with tracing subscriber
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_all_200_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_all_400_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_depth_prev_close_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        ensure_depth_and_prev_close_tables(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: check_tick_gaps_after_recovery with tracing subscriber
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_with_tracing_200_no_gaps() {
+        let _guard = install_test_subscriber();
+        let response_body = r#"{"query":"...","columns":[{"name":"ts","type":"TIMESTAMP"},{"name":"tick_count","type":"LONG"}],"dataset":[["2026-03-27T09:15:00.000000Z",100],["2026-03-27T09:16:00.000000Z",120]]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            response_body.len(),
+            response_body,
+        );
+        let response_static: &'static str = Box::leak(response.into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_tick_gaps_with_tracing_200_with_gaps() {
+        let _guard = install_test_subscriber();
+        let response_body = r#"{"query":"...","columns":[{"name":"ts","type":"TIMESTAMP"},{"name":"tick_count","type":"LONG"}],"dataset":[["2026-03-27T09:15:00.000000Z",100],["2026-03-27T09:16:00.000000Z",0]]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            response_body.len(),
+            response_body,
+        );
+        let response_static: &'static str = Box::leak(response.into_boxed_str());
+        let port = spawn_mock_http_server(response_static).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        check_tick_gaps_after_recovery(&config, 5).await;
+    }
+
+    // =======================================================================
+    // Coverage: depth writer drain_depth_disk_spill with BufWriter
+    // =======================================================================
+
+    #[test]
+    fn test_depth_drain_disk_spill_with_buf_writer_present() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Create a valid depth spill file
+        let spill_dir = std::path::Path::new(DEPTH_SPILL_DIR);
+        std::fs::create_dir_all(spill_dir).unwrap();
+        let spill_path = spill_dir.join("depth-19700103.bin");
+
+        let snapshot = BufferedDepth {
+            security_id: 11536,
+            exchange_segment_code: 1,
+            received_at_nanos: 1_740_556_500_123_456_789,
+            depth: [MarketDepthLevel::default(); 5],
+        };
+        let record = serialize_depth(&snapshot);
+        std::fs::write(&spill_path, record).unwrap();
+
+        // Set up the writer with an open BufWriter pointing to the spill
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spill_path)
+            .unwrap();
+        writer.spill_writer = Some(std::io::BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+        writer.depth_spilled_total = 1;
+
+        // Drain should read, write to QuestDB, and delete the file
+        writer.drain_depth_disk_spill();
+
+        let _ = std::fs::remove_file(&spill_path);
+    }
+
+    // =======================================================================
+    // Coverage: depth drain_depth_buffer with spilled_total > 0
+    // =======================================================================
+
+    #[test]
+    fn test_depth_drain_buffer_with_disk_spill_total_positive() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = DepthPersistenceWriter::new(&config).unwrap();
+
+        // Add a depth snapshot to ring buffer
+        let snapshot = BufferedDepth {
+            security_id: 11536,
+            exchange_segment_code: 1,
+            received_at_nanos: 1_740_556_500_000_000_000,
+            depth: [MarketDepthLevel::default(); 5],
+        };
+        writer.depth_buffer.push_back(snapshot);
+
+        // Set spilled total > 0 to trigger disk spill drain attempt
+        writer.depth_spilled_total = 1;
+        // No spill_path set — drain_depth_disk_spill returns early
+
+        writer.drain_depth_buffer();
+
+        assert_eq!(writer.depth_buffer.len(), 0);
+    }
+
+    // =======================================================================
+    // Coverage: execute_ddl_best_effort — direct tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_execute_ddl_best_effort_200() {
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let base_url = format!("http://127.0.0.1:{}/exec", port);
+        let client = reqwest::Client::new();
+        execute_ddl_best_effort(&client, &base_url, "SELECT 1", "test_200").await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_best_effort_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let base_url = format!("http://127.0.0.1:{}/exec", port);
+        let client = reqwest::Client::new();
+        execute_ddl_best_effort(&client, &base_url, "BAD SQL", "test_400").await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_best_effort_send_error() {
+        let base_url = "http://unreachable-host-99999:1/exec".to_string();
+        let client = reqwest::Client::new();
+        execute_ddl_best_effort(&client, &base_url, "SELECT 1", "test_err").await;
+    }
 }

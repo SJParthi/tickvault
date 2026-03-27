@@ -3572,4 +3572,185 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(writer.pending_count, 0);
     }
+
+    // =======================================================================
+    // Coverage: fresh_buffer() with sender=None (line 610)
+    // =======================================================================
+
+    #[test]
+    fn test_greeks_fresh_buffer_no_sender() {
+        // Create writer with unreachable host so sender=None
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_none());
+
+        // fresh_buffer with sender=None should return standalone V1 buffer
+        let buf = writer.fresh_buffer();
+        // Buffer created successfully (no panic)
+        drop(buf);
+    }
+
+    // =======================================================================
+    // Coverage: flush() when sender is None — reconnect path (lines 505-517)
+    // =======================================================================
+
+    #[test]
+    fn test_greeks_flush_no_sender_reconnect_path() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_none());
+
+        // Manually set pending_count > 0 to get past the early return
+        writer.pending_count = 5;
+
+        // flush() with sender=None should enter the reconnect path,
+        // create fresh buffer, reset pending, and return Ok
+        let result = writer.flush();
+        assert!(result.is_ok());
+        assert_eq!(writer.pending_count, 0);
+    }
+
+    // =======================================================================
+    // Coverage: try_reconnect_on_error() throttle branch (line 620-621)
+    // =======================================================================
+
+    #[test]
+    fn test_greeks_try_reconnect_throttled() {
+        let config = QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            ilp_port: 1,
+            http_port: 1,
+            pg_port: 1,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_none());
+
+        // Set next_reconnect_allowed far in the future
+        writer.next_reconnect_allowed =
+            std::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+        // try_reconnect_on_error should return immediately (throttled)
+        writer.try_reconnect_on_error();
+        // sender remains None
+        assert!(writer.sender.is_none());
+    }
+
+    // =======================================================================
+    // Coverage: try_reconnect_on_error() with sender already Some (line 616-617)
+    // =======================================================================
+
+    #[test]
+    fn test_greeks_try_reconnect_sender_already_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert!(writer.sender.is_some());
+
+        // try_reconnect_on_error should return immediately when already connected
+        writer.try_reconnect_on_error();
+        assert!(writer.sender.is_some());
+    }
+
+    // =======================================================================
+    // Coverage: flush() pending_count == 0 early return (line 500-502)
+    // =======================================================================
+
+    #[test]
+    fn test_greeks_flush_zero_pending() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count, 0);
+
+        let result = writer.flush();
+        assert!(result.is_ok());
+    }
+
+    // =======================================================================
+    // Coverage: pending_count() accessor (line 552)
+    // =======================================================================
+
+    #[test]
+    fn test_greeks_pending_count_accessor() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = GreeksPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0);
+    }
+
+    // =======================================================================
+    // Coverage: ensure_greeks_tables with tracing subscriber for info!/warn!/debug!
+    // =======================================================================
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_all_200_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_all_400_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        ensure_greeks_tables(&config).await;
+    }
 }

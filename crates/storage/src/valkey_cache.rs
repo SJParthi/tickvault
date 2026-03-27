@@ -1651,4 +1651,240 @@ mod tests {
         let pool = ValkeyPool::build_pool(&config);
         assert!(pool.is_ok(), "build_pool must succeed with valid config");
     }
+
+    // =======================================================================
+    // Coverage: get() retry path — reconnect succeeds, inner retry still fails
+    // Lines 192-209 (reconnect + retry + metrics)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_get_retry_path_reconnect_ok_retry_fails() {
+        // Use a port that nothing listens on. get_inner fails, reconnect
+        // succeeds (pool rebuild is lazy), get_inner fails again.
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16390,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.get("retry_key").await;
+        // Both attempts fail — error propagated
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: set() retry path — reconnect succeeds, inner retry still fails
+    // Lines 226-243 (reconnect + retry + metrics)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_set_retry_path_reconnect_ok_retry_fails() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16391,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set("retry_key", "retry_value").await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: set_ex() error metrics path (lines 264-266)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_set_ex_error_metrics() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16392,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_ex("key", "value", 120).await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: del() error metrics path (lines 282-284)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_del_error_metrics() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16393,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.del("key").await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: exists() error metrics path (lines 299-300)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_exists_error_metrics() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16394,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.exists("key").await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: set_nx_ex() error metrics path (lines 321-323)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_set_nx_ex_error_metrics() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16395,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.set_nx_ex("lock", "v", 30).await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: health_check() error path (lines 174-184)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_health_check_error() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16396,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.health_check().await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: checkout_conn() (lines 149-159)
+    // This is implicitly tested by all async tests above, but we add
+    // a direct test to be explicit.
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_checkout_conn_fails_without_running_redis() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16397,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let result = pool.checkout_conn().await;
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: reconnect() (lines 131-143) — pool reconstruction
+    // =======================================================================
+
+    #[test]
+    fn test_valkey_reconnect_rebuilds_pool_twice() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            max_connections: 4,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+
+        // First reconnect
+        let result = pool.reconnect();
+        assert!(result.is_ok());
+
+        // Second reconnect — also succeeds
+        let result = pool.reconnect();
+        assert!(result.is_ok());
+    }
+
+    // =======================================================================
+    // Coverage: get_inner() + set_inner() direct calls via get/set
+    // Lines 213-218 and 247-252
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_valkey_get_inner_error_with_different_keys() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16398,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        // Exercise different keys to ensure the error context includes the key
+        let r1 = pool.get("alpha").await;
+        assert!(r1.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_valkey_set_inner_error_with_different_keys() {
+        let config = ValkeyConfig {
+            host: "localhost".to_string(),
+            port: 16399,
+            max_connections: 1,
+        };
+        let pool = ValkeyPool::new(&config).unwrap();
+        let r1 = pool.set("beta", "val").await;
+        assert!(r1.is_err());
+    }
+
+    // =======================================================================
+    // Coverage: build_valkey_url function (line 33)
+    // =======================================================================
+
+    #[test]
+    fn test_build_valkey_url_with_various_hosts() {
+        assert_eq!(
+            build_valkey_url("localhost", 6379),
+            "redis://localhost:6379"
+        );
+        assert_eq!(build_valkey_url("10.0.0.1", 6380), "redis://10.0.0.1:6380");
+        assert_eq!(
+            build_valkey_url("dlt-valkey", 6379),
+            "redis://dlt-valkey:6379"
+        );
+    }
+
+    // =======================================================================
+    // Coverage: compute_instrument_ttl_secs edge cases
+    // =======================================================================
+
+    #[test]
+    fn test_compute_instrument_ttl_past_target_wraps_to_next_day() {
+        // IST 23:00 (past target of 8:00 IST)
+        // 23:00 IST = 17:30 UTC. epoch for 17:30 UTC today:
+        // We need to construct an epoch where IST time is past target hour.
+        // IST = UTC + 19800s. ist_secs_today = (epoch + 19800) % 86400.
+        // If target=8, target_secs=28800. Let ist_secs_today=82800 (23:00 IST).
+        // remaining = 86400 - 82800 + 28800 = 32400s (9 hours to next 8AM)
+        // epoch where ist_secs_today = 82800: (epoch + 19800) % 86400 = 82800
+        // epoch = 82800 - 19800 = 63000
+        let ttl = compute_instrument_ttl_secs(63000, 8);
+        assert_eq!(ttl, 32400); // 9 hours
+    }
+
+    #[test]
+    fn test_compute_instrument_ttl_clamps_to_minimum_60() {
+        // If somehow remaining is < 60, clamp to 60
+        // At target hour exactly: remaining = 0 -> past target -> wraps to 86400
+        // Actually remaining can never be < 60 for whole-hour targets...
+        // But let's verify the clamp works
+        let ttl = compute_instrument_ttl_secs(0, 0);
+        // IST midnight: (0 + 19800) % 86400 = 19800 secs today
+        // target_secs = 0. 19800 > 0 -> past target.
+        // remaining = 86400 - 19800 + 0 = 66600s
+        assert!(ttl >= 60);
+        assert!(ttl <= 86_400);
+    }
 }

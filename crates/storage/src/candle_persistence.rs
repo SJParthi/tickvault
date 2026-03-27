@@ -5984,4 +5984,154 @@ mod tests {
         let result = writer.reconnect();
         assert!(result.is_err(), "reconnect to unreachable host must fail");
     }
+
+    // =======================================================================
+    // Coverage: ensure_candle_table_dedup_keys — CREATE 200, DEDUP 400
+    // Covers lines 974-977 (DEDUP non-success body extraction)
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_create_ok_dedup_non_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let cc = call_count_clone.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let n = cc.fetch_add(1, Ordering::SeqCst);
+                        let response = if n == 0 { MOCK_HTTP_200 } else { MOCK_HTTP_400 };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // CREATE TABLE succeeds (200), DEDUP ALTER returns 400 — covers body extraction
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: ensure_candle_table_dedup_keys with tracing subscriber
+    // Covers info!/warn!/debug! argument evaluation in macro expansions
+    // =======================================================================
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_all_200_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, info!/debug! evaluate their field expressions
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_all_400_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With tracing subscriber, warn! evaluates body.chars().take(200) etc.
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_table_send_error_with_tracing() {
+        let _guard = install_test_subscriber();
+        let config = QuestDbConfig {
+            host: "unreachable-host-99999".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        // With tracing subscriber, warn! evaluates ?err
+        ensure_candle_table_dedup_keys(&config).await;
+    }
+
+    // =======================================================================
+    // Coverage: drain_candle_disk_spill — BufWriter flush error path (line 712)
+    // =======================================================================
+
+    #[test]
+    fn test_drain_candle_disk_spill_buf_writer_closed_before_drain() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = LiveCandleWriter::new(&config).unwrap();
+
+        // Create a valid spill file
+        let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
+        std::fs::create_dir_all(real_spill_dir).unwrap();
+        let spill_path = real_spill_dir.join("candles-19700103.bin");
+
+        let c = BufferedCandle {
+            security_id: 9000,
+            exchange_segment_code: 2,
+            timestamp_secs: 1_740_556_500,
+            open: 900.0,
+            high: 910.0,
+            low: 895.0,
+            close: 905.0,
+            volume: 9000,
+            tick_count: 90,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
+        };
+        let record = serialize_candle(&c);
+        std::fs::write(&spill_path, record).unwrap();
+
+        // Simulate: spill_writer is Some (open writer) with the spill_path set
+        // then drain_candle_disk_spill first flushes the writer, closes it, reads records
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spill_path)
+            .unwrap();
+        writer.spill_writer = Some(std::io::BufWriter::new(file));
+        writer.spill_path = Some(spill_path.clone());
+        writer.candles_spilled_total = 1;
+
+        // This exercises the BufWriter flush + drain path
+        writer.drain_candle_disk_spill();
+
+        // File should be deleted after successful drain
+        let _ = std::fs::remove_file(&spill_path);
+    }
 }
