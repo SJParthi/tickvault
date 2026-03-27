@@ -29,6 +29,7 @@ const POOL_CHECKOUT_TIMEOUT_MS: u64 = 500;
 /// Builds the Redis URL from host and port.
 ///
 /// Format: `redis://{host}:{port}` — no auth, no database selection.
+#[inline(never)]
 fn build_valkey_url(host: &str, port: u16) -> String {
     format!("redis://{}:{}", host, port)
 }
@@ -36,6 +37,7 @@ fn build_valkey_url(host: &str, port: u16) -> String {
 /// Builds a Valkey cache key for instrument-related data.
 ///
 /// Format: `dlt:instrument:{suffix}` — namespaced to prevent collisions.
+#[inline(never)]
 pub fn build_instrument_cache_key(suffix: &str) -> String {
     format!("dlt:instrument:{}", suffix)
 }
@@ -43,6 +45,7 @@ pub fn build_instrument_cache_key(suffix: &str) -> String {
 /// Builds a Valkey cache key for token-related data.
 ///
 /// Format: `dlt:token:{suffix}` — namespaced to prevent collisions.
+#[inline(never)]
 pub fn build_token_cache_key(suffix: &str) -> String {
     format!("dlt:token:{}", suffix)
 }
@@ -50,6 +53,7 @@ pub fn build_token_cache_key(suffix: &str) -> String {
 /// Builds a Valkey cache key for tick/market data.
 ///
 /// Format: `dlt:tick:{security_id}:{suffix}` — per-instrument namespacing.
+#[inline(never)]
 pub fn build_tick_cache_key(security_id: u32, suffix: &str) -> String {
     format!("dlt:tick:{}:{}", security_id, suffix)
 }
@@ -58,6 +62,7 @@ pub fn build_tick_cache_key(security_id: u32, suffix: &str) -> String {
 ///
 /// Returns TTL in seconds: the time from `current_epoch_secs` until
 /// `target_hour_ist` (next day if already past). Clamps to [60, 86400].
+#[inline(never)]
 pub fn compute_instrument_ttl_secs(current_epoch_secs: u64, target_hour_ist: u8) -> u64 {
     // IST = UTC + 5:30 = UTC + 19800s
     const IST_OFFSET: u64 = 19_800;

@@ -16,13 +16,13 @@ const QUESTDB_QUOTE_TIMEOUT_SECS: u64 = 3;
 /// Builds a reqwest client with the given timeout.
 ///
 /// `reqwest::Client::builder().build()` only fails if the TLS backend
-/// cannot be initialised, which never happens at runtime. We propagate
-/// the error as `Option` purely for defence-in-depth.
-fn build_questdb_client(timeout_secs: u64) -> Option<reqwest::Client> {
+/// cannot be initialised, which never happens at runtime. The function
+/// returns a default client as ultimate fallback.
+fn build_questdb_client(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
-        .ok()
+        .unwrap_or_default()
 }
 
 /// Latest quote response for a single security.
@@ -59,13 +59,7 @@ pub async fn get_quote(
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
-    let Some(client) = build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "failed to build HTTP client"})),
-        )
-            .into_response();
-    };
+    let client = build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS);
 
     match query_latest_tick(&client, &base_url, security_id).await {
         Some(quote) => (
@@ -704,8 +698,7 @@ mod tests {
 
     #[test]
     fn test_build_questdb_client_success() {
-        let result = build_questdb_client(3);
-        assert!(result.is_some());
+        let _client = build_questdb_client(3);
     }
 
     // -----------------------------------------------------------------------
@@ -715,14 +708,12 @@ mod tests {
     #[test]
     fn test_build_questdb_client_zero_timeout() {
         // Zero timeout is valid for reqwest — it means no timeout
-        let result = build_questdb_client(0);
-        assert!(result.is_some());
+        let _client = build_questdb_client(0);
     }
 
     #[test]
     fn test_build_questdb_client_large_timeout() {
-        let result = build_questdb_client(3600);
-        assert!(result.is_some());
+        let _client = build_questdb_client(3600);
     }
 
     // -----------------------------------------------------------------------
@@ -750,15 +741,14 @@ mod tests {
 
     #[test]
     fn test_build_questdb_client_succeeds() {
-        let result = build_questdb_client(3);
-        assert!(result.is_some());
+        let _client = build_questdb_client(3);
     }
 
     #[test]
     fn test_build_questdb_client_with_various_timeouts() {
-        assert!(build_questdb_client(1).is_some());
-        assert!(build_questdb_client(30).is_some());
-        assert!(build_questdb_client(0).is_some()); // zero timeout still builds
+        let _c1 = build_questdb_client(1);
+        let _c2 = build_questdb_client(30);
+        let _c3 = build_questdb_client(0); // zero timeout still builds
     }
 
     // -----------------------------------------------------------------------
