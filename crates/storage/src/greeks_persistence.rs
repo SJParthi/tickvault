@@ -308,21 +308,6 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
         "greeks_verification CREATE",
     )
     .await;
-    execute_ddl(
-        &client,
-        &base_url,
-        OPTION_GREEKS_LIVE_DDL,
-        "option_greeks_live CREATE",
-    )
-    .await;
-    execute_ddl(
-        &client,
-        &base_url,
-        PCR_SNAPSHOTS_LIVE_DDL,
-        "pcr_snapshots_live CREATE",
-    )
-    .await;
-
     // Step 2: DEDUP UPSERT KEYS via ALTER TABLE (idempotent — re-enabling is a no-op).
     let dedup_statements: &[(&str, &str, &str)] = &[
         (
@@ -345,24 +330,23 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
             DEDUP_KEY_GREEKS_VERIFICATION,
             "greeks_verification DEDUP",
         ),
-        (
-            TABLE_OPTION_GREEKS_LIVE,
-            DEDUP_KEY_OPTION_GREEKS_LIVE,
-            "option_greeks_live DEDUP",
-        ),
-        (
-            TABLE_PCR_SNAPSHOTS_LIVE,
-            DEDUP_KEY_PCR_SNAPSHOTS_LIVE,
-            "pcr_snapshots_live DEDUP",
-        ),
     ];
     for (table, dedup_key, label) in dedup_statements {
         let dedup_sql = format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, {dedup_key})");
         execute_ddl(&client, &base_url, &dedup_sql, label).await;
     }
 
+    // Step 3: Drop deprecated _live tables (replaced by inline Greeks in ticks/candles).
+    // DROP TABLE IF EXISTS is idempotent — no error if tables don't exist.
+    let deprecated_tables: &[&str] = &[TABLE_OPTION_GREEKS_LIVE, TABLE_PCR_SNAPSHOTS_LIVE];
+    for table in deprecated_tables {
+        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
+        execute_ddl(&client, &base_url, &drop_sql, &format!("{table} DROP")).await;
+    }
+    info!("deprecated Greeks _live tables cleaned up (option_greeks_live, pcr_snapshots_live)");
+
     info!(
-        "Greeks tables setup complete (option_greeks, pcr_snapshots, dhan_option_chain_raw, greeks_verification, option_greeks_live, pcr_snapshots_live)"
+        "Greeks tables setup complete (option_greeks, pcr_snapshots, dhan_option_chain_raw, greeks_verification)"
     );
 }
 

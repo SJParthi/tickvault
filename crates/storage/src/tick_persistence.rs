@@ -897,7 +897,24 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
     }
 
-    info!("ticks table setup complete (DDL + DEDUP UPSERT KEYS)");
+    // Step 3: Add Greeks columns if missing (schema migration for existing tables).
+    // QuestDB ALTER TABLE ADD COLUMN is idempotent — adding an already-existing
+    // column returns a non-fatal error that we safely ignore.
+    let greeks_columns: &[&str] = &["iv", "delta", "gamma", "theta", "vega"];
+    for col in greeks_columns {
+        let alter_sql = format!(
+            "ALTER TABLE {} ADD COLUMN {} DOUBLE",
+            QUESTDB_TABLE_TICKS, col
+        );
+        let _ = client
+            .get(&base_url)
+            .query(&[("query", &alter_sql)])
+            .send()
+            .await;
+    }
+    info!("ticks table Greeks columns ensured (idempotent ADD COLUMN)");
+
+    info!("ticks table setup complete (DDL + DEDUP UPSERT KEYS + Greeks migration)");
 }
 
 // ---------------------------------------------------------------------------
