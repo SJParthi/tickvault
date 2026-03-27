@@ -131,6 +131,11 @@ async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
     build_rebuild_response(result)
 }
 
+/// Produces a JSON error object when report serialization fails.
+fn diagnostic_serialization_fallback(err: serde_json::Error) -> serde_json::Value {
+    serde_json::json!({"error": format!("serialization failed: {err}")})
+}
+
 /// `GET /api/instruments/diagnostic` — full instrument system health check.
 ///
 /// Downloads CSV, validates headers, parses rows, builds universe, and
@@ -146,11 +151,7 @@ pub async fn instrument_diagnostic(State(state): State<SharedAppState>) -> Json<
     )
     .await;
 
-    Json(
-        serde_json::to_value(report).unwrap_or_else(
-            |err| serde_json::json!({"error": format!("serialization failed: {err}")}),
-        ),
-    )
+    Json(serde_json::to_value(report).unwrap_or_else(diagnostic_serialization_fallback))
 }
 
 #[cfg(test)]
@@ -548,5 +549,16 @@ mod tests {
                 .unwrap()
                 .contains("serialization failed")
         );
+    }
+
+    #[test]
+    fn test_diagnostic_serialization_fallback_produces_error_json() {
+        let err =
+            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::Other, "test error"));
+        let result = diagnostic_serialization_fallback(err);
+        assert!(result.is_object());
+        let error_msg = result.get("error").unwrap().as_str().unwrap();
+        assert!(error_msg.contains("serialization failed"));
+        assert!(error_msg.contains("test error"));
     }
 }
