@@ -1182,7 +1182,8 @@ mod tests {
     #[tokio::test]
     async fn test_views_missing_greeks_returns_false_when_iv_present() {
         // Mock server returns a response containing "iv" — views have Greeks.
-        let response_with_iv = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"iv\"},{\"name\":\"delta\"}]}";
+        // Body = 81 bytes.
+        let response_with_iv = "HTTP/1.1 200 OK\r\nContent-Length: 81\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"iv\"},{\"name\":\"delta\"}]}";
         let port = spawn_mock_http_server(response_with_iv).await;
         tokio::task::yield_now().await;
         let client = reqwest::Client::new();
@@ -1194,7 +1195,8 @@ mod tests {
     #[tokio::test]
     async fn test_views_missing_greeks_returns_true_when_iv_absent() {
         // Mock server returns a response WITHOUT "iv" — views need recreation.
-        let response_without_iv = "HTTP/1.1 200 OK\r\nContent-Length: 70\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"open\"}]}";
+        // Body = 66 bytes.
+        let response_without_iv = "HTTP/1.1 200 OK\r\nContent-Length: 66\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"open\"}]}";
         let port = spawn_mock_http_server(response_without_iv).await;
         tokio::task::yield_now().await;
         let client = reqwest::Client::new();
