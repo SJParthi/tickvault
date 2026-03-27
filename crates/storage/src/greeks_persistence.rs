@@ -104,11 +104,8 @@ const TABLE_OPTION_GREEKS_LIVE: &str = "option_greeks_live";
 /// QuestDB table name for tick-driven (candle-aligned) PCR snapshots.
 const TABLE_PCR_SNAPSHOTS_LIVE: &str = "pcr_snapshots_live";
 
-/// SQL to create the `option_greeks_live` table.
-///
-/// Tick-driven Greeks aligned to candle close boundaries.
-/// `ts` = candle boundary timestamp (exchange clock), ensuring exact JOIN
-/// with `candles_1s`/`candles_1m` on timestamp.
+/// SQL to create the `option_greeks_live` table (deprecated — retained for test coverage).
+#[cfg(test)]
 const OPTION_GREEKS_LIVE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS option_greeks_live (\
         segment SYMBOL,\
@@ -145,9 +142,8 @@ const OPTION_GREEKS_LIVE_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
-/// SQL to create the `pcr_snapshots_live` table.
-///
-/// Tick-driven PCR aligned to candle close boundaries.
+/// SQL to create the `pcr_snapshots_live` table (deprecated — retained for test coverage).
+#[cfg(test)]
 const PCR_SNAPSHOTS_LIVE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS pcr_snapshots_live (\
         underlying_symbol SYMBOL,\
@@ -164,10 +160,12 @@ const PCR_SNAPSHOTS_LIVE_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
-/// DEDUP key for `option_greeks_live`.
+/// DEDUP key for `option_greeks_live` (deprecated — retained for test coverage).
+#[cfg(test)]
 const DEDUP_KEY_OPTION_GREEKS_LIVE: &str = "security_id, segment, candle_interval";
 
-/// DEDUP key for `pcr_snapshots_live`.
+/// DEDUP key for `pcr_snapshots_live` (deprecated — retained for test coverage).
+#[cfg(test)]
 const DEDUP_KEY_PCR_SNAPSHOTS_LIVE: &str = "underlying_symbol, expiry_date, candle_interval";
 
 /// SQL to create the `dhan_option_chain_raw` table.
@@ -3645,5 +3643,47 @@ mod tests {
         // - buffer should be fresh (line 539)
         // - pending should be 0 (line 540)
         // The test verifies pending_count is 0 either way.
+    }
+
+    // -----------------------------------------------------------------------
+    // Deprecated _live table cleanup tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_deprecated_live_table_names() {
+        // Verify the constants used for DROP TABLE reference the correct names.
+        assert_eq!(TABLE_OPTION_GREEKS_LIVE, "option_greeks_live");
+        assert_eq!(TABLE_PCR_SNAPSHOTS_LIVE, "pcr_snapshots_live");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_drops_deprecated_live_tables() {
+        // When mock returns 200 for all requests, ensure_greeks_tables completes
+        // including the DROP TABLE IF EXISTS for deprecated _live tables.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // This exercises: 4x CREATE TABLE + 4x DEDUP + 2x DROP TABLE IF EXISTS
+        ensure_greeks_tables(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_tables_drop_deprecated_with_400() {
+        // When mock returns 400 for all requests, ensure_greeks_tables still
+        // completes without panic — DROP TABLE IF EXISTS failure is best-effort.
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_greeks_tables(&config).await;
     }
 }

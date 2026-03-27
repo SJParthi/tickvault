@@ -2486,6 +2486,47 @@ mod tests {
         assert!(TICKS_CREATE_DDL.contains("IF NOT EXISTS"));
     }
 
+    #[test]
+    fn test_ticks_ddl_has_greeks_columns() {
+        // The ticks DDL must include all 5 Greeks columns for new table creation.
+        assert!(TICKS_CREATE_DDL.contains("iv DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("delta DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("gamma DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("theta DOUBLE"));
+        assert!(TICKS_CREATE_DDL.contains("vega DOUBLE"));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_greeks_migration_with_mock_http() {
+        // When the mock returns 200 for all requests (CREATE, DEDUP, ALTER),
+        // the function completes without panic. The ALTER TABLE ADD COLUMN
+        // requests for Greeks columns are best-effort and ignored on error.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // This exercises: CREATE TABLE + DEDUP + 5x ALTER TABLE ADD COLUMN
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_tick_table_greeks_migration_non_success() {
+        // When the mock returns 400 for the CREATE TABLE, the function returns
+        // early — never reaching the ALTER TABLE ADD COLUMN steps. This is
+        // correct behavior: if the table doesn't exist, columns can't be added.
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        ensure_tick_table_dedup_keys(&config).await;
+    }
+
     /// STORAGE-GAP-01: DEDUP key must include both security_id and segment
     /// to prevent cross-segment tick collision (same security_id on NSE_EQ vs BSE_EQ).
     #[test]

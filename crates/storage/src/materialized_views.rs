@@ -1118,4 +1118,141 @@ mod tests {
         // With subscriber installed, warn! evaluates body.chars().take(200) (line 343).
         ensure_candle_views(&config).await;
     }
+
+    // -----------------------------------------------------------------------
+    // Greeks schema migration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_column_names_constant() {
+        assert_eq!(GREEKS_COLUMN_NAMES.len(), 5);
+        assert!(GREEKS_COLUMN_NAMES.contains(&"iv"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"delta"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"gamma"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"theta"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"vega"));
+    }
+
+    #[test]
+    fn test_all_views_include_greeks_in_sql() {
+        // Every materialized view SQL must include Greeks aggregations.
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("last(iv) AS iv"),
+                "view {} must include iv",
+                def.name
+            );
+            assert!(
+                sql.contains("last(delta) AS delta"),
+                "view {} must include delta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(gamma) AS gamma"),
+                "view {} must include gamma",
+                def.name
+            );
+            assert!(
+                sql.contains("last(theta) AS theta"),
+                "view {} must include theta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(vega) AS vega"),
+                "view {} must include vega",
+                def.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_false_on_unreachable() {
+        // When QuestDB is unreachable, views_missing_greeks returns false
+        // (conservative — let CREATE IF NOT EXISTS handle it).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        let result = views_missing_greeks(&client, base_url).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_false_when_iv_present() {
+        // Mock server returns a response containing "iv" — views have Greeks.
+        let response_with_iv = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"iv\"},{\"name\":\"delta\"}]}";
+        let port = spawn_mock_http_server(response_with_iv).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = views_missing_greeks(&client, &base_url).await;
+        assert!(!result, "should return false when iv column is present");
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_true_when_iv_absent() {
+        // Mock server returns a response WITHOUT "iv" — views need recreation.
+        let response_without_iv = "HTTP/1.1 200 OK\r\nContent-Length: 70\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"open\"}]}";
+        let port = spawn_mock_http_server(response_without_iv).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = views_missing_greeks(&client, &base_url).await;
+        assert!(result, "should return true when iv column is absent");
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_false_on_non_success() {
+        // Mock returns 400 (view doesn't exist) — return false, let CREATE handle it.
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = views_missing_greeks(&client, &base_url).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_drop_all_views_with_mock_200() {
+        // DROP MATERIALIZED VIEW IF EXISTS requests all return 200 — no panic.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        drop_all_views(&client, &base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_drop_all_views_with_unreachable_no_panic() {
+        // When QuestDB is unreachable, drop_all_views must not panic.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        drop_all_views(&client, base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_columns_on_table_with_mock_200() {
+        // ALTER TABLE ADD COLUMN requests all return 200 — no panic.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        ensure_greeks_columns_on_table(&client, &base_url, "test_table").await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_columns_on_table_with_unreachable_no_panic() {
+        // When QuestDB is unreachable, ensure_greeks_columns_on_table must not panic.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        ensure_greeks_columns_on_table(&client, base_url, "test_table").await;
+    }
 }
