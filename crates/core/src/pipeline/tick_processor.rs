@@ -65,6 +65,19 @@ fn is_within_persist_window(exchange_timestamp: u32) -> bool {
         .contains(&ist_secs_of_day)
 }
 
+/// Returns `true` if the exchange timestamp's IST day matches today.
+///
+/// Defense-in-depth: rejects stale ticks from previous trading days that
+/// Dhan may replay on WebSocket reconnection or on non-trading days.
+///
+/// # Algorithm (O(1), zero allocation)
+/// Integer division by 86,400 gives the day number. Compare with pre-computed today.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: division by 86400 is safe
+#[inline(always)]
+fn is_today_ist(exchange_timestamp: u32, today_ist_day_number: u32) -> bool {
+    exchange_timestamp / SECONDS_PER_DAY == today_ist_day_number
+}
+
 // ---------------------------------------------------------------------------
 // O(1) Tick Validity Checks (extracted for testability)
 // ---------------------------------------------------------------------------
@@ -256,6 +269,7 @@ pub async fn run_tick_processor(
     let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
     let m_crossed_market = counter!("dlt_crossed_market_total");
     let m_outside_hours = counter!("dlt_outside_hours_filtered_total");
+    let m_stale_day = counter!("dlt_stale_day_filtered_total");
     let m_channel_occupancy = gauge!("dlt_tick_channel_occupancy");
     let m_channel_capacity = gauge!("dlt_tick_channel_capacity");
 
@@ -267,16 +281,28 @@ pub async fn run_tick_processor(
     let mut junk_ticks_filtered: u64 = 0;
     let mut dedup_filtered: u64 = 0;
     let mut outside_hours_filtered: u64 = 0;
+    let mut stale_day_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
     let mut last_snapshot_check = Instant::now();
 
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
+    // Defense-in-depth: reject stale ticks from previous trading days.
+    // exchange_timestamp is IST epoch seconds; dividing by 86400 gives the IST day number.
+    // Computed once at startup — valid for the entire trading session (09:00–15:30).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // APPROVED: epoch day fits u32 until 2106
+    let today_ist_day_number: u32 = {
+        let now_utc = chrono::Utc::now().timestamp();
+        let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        now_ist.saturating_div(i64::from(SECONDS_PER_DAY)) as u32
+    };
+
     m_pipeline_active.set(1.0);
     // Record channel capacity once at startup (65536 for SPSC buffer).
     m_channel_capacity.set(frame_receiver.max_capacity() as f64);
-    info!("tick processor started");
+    info!(today_ist_day_number, "tick processor started");
 
     while let Some(raw_frame) = frame_receiver.recv().await {
         let tick_start = Instant::now();
@@ -344,10 +370,13 @@ pub async fn run_tick_processor(
                     enricher.enrich(&mut tick);
                 }
 
-                // Persist tick to QuestDB — only during market hours [09:00, 15:30) IST.
-                // Pre/post-market ticks still broadcast + aggregate but are NOT stored.
+                // Persist tick to QuestDB — only during market hours [09:00, 15:30) IST
+                // AND only if the tick is from today (rejects stale data from previous days).
                 if let Some(ref mut writer) = tick_writer {
-                    if is_within_persist_window(tick.exchange_timestamp) {
+                    if !is_today_ist(tick.exchange_timestamp, today_ist_day_number) {
+                        stale_day_filtered = stale_day_filtered.saturating_add(1);
+                        m_stale_day.increment(1);
+                    } else if is_within_persist_window(tick.exchange_timestamp) {
                         if let Err(err) = writer.append_tick(&tick) {
                             storage_errors = storage_errors.saturating_add(1);
                             m_storage_errors.increment(1);
@@ -419,9 +448,12 @@ pub async fn run_tick_processor(
                     }
 
                     // Persist tick to QuestDB (Full packet with valid timestamp)
-                    // — only during market hours [09:00, 15:30) IST.
+                    // — only during market hours [09:00, 15:30) IST AND today's date.
                     if let Some(ref mut writer) = tick_writer {
-                        if is_within_persist_window(tick.exchange_timestamp) {
+                        if !is_today_ist(tick.exchange_timestamp, today_ist_day_number) {
+                            stale_day_filtered = stale_day_filtered.saturating_add(1);
+                            m_stale_day.increment(1);
+                        } else if is_within_persist_window(tick.exchange_timestamp) {
                             if let Err(err) = writer.append_tick(&tick) {
                                 storage_errors = storage_errors.saturating_add(1);
                                 m_storage_errors.increment(1);
@@ -477,7 +509,7 @@ pub async fn run_tick_processor(
                 }
 
                 // Persist 5-level depth to QuestDB (separate table)
-                // — only during market hours [09:00, 15:30) IST.
+                // — only during market hours [09:00, 15:30) IST AND today's date.
                 // For Full packets (code 8), use exchange_timestamp.
                 // For Market Depth standalone (code 3), exchange_timestamp=0,
                 // so derive wall-clock seconds from received_at_nanos.
@@ -486,7 +518,10 @@ pub async fn run_tick_processor(
                     tick.exchange_timestamp,
                     tick.received_at_nanos,
                 );
-                if is_within_persist_window(depth_ts_secs) {
+                if !is_today_ist(depth_ts_secs, today_ist_day_number) {
+                    stale_day_filtered = stale_day_filtered.saturating_add(1);
+                    m_stale_day.increment(1);
+                } else if is_within_persist_window(depth_ts_secs) {
                     m_depth_snapshots.increment(1);
                     if let Some(ref mut dw) = depth_writer
                         && let Err(err) = dw.append_depth(
@@ -790,6 +825,7 @@ pub async fn run_tick_processor(
         junk_ticks_filtered,
         dedup_filtered,
         outside_hours_filtered,
+        stale_day_filtered,
         parse_errors,
         storage_errors,
         candle_write_errors,
@@ -2430,6 +2466,66 @@ mod tests {
         assert!(is_within_persist_window(
             TICK_PERSIST_END_SECS_OF_DAY_IST - 1
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_today_ist — stale day filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_today_ist_same_day() {
+        // 2026-03-27 10:00:00 IST = day 20539
+        let ts: u32 = 20539 * 86400 + 36000; // 10:00:00 IST
+        let today_day: u32 = 20539;
+        assert!(is_today_ist(ts, today_day));
+    }
+
+    #[test]
+    fn test_is_today_ist_previous_day_rejected() {
+        // Tick from yesterday (day 20538), today is day 20539
+        let ts: u32 = 20538 * 86400 + 36000; // yesterday 10:00:00 IST
+        let today_day: u32 = 20539;
+        assert!(!is_today_ist(ts, today_day));
+    }
+
+    #[test]
+    fn test_is_today_ist_future_day_rejected() {
+        // Tick from tomorrow (day 20540), today is day 20539
+        let ts: u32 = 20540 * 86400 + 36000;
+        let today_day: u32 = 20539;
+        assert!(!is_today_ist(ts, today_day));
+    }
+
+    #[test]
+    fn test_is_today_ist_boundary_start_of_day() {
+        // Exactly midnight IST (00:00:00) on today
+        let today_day: u32 = 20539;
+        let ts: u32 = today_day * 86400; // midnight
+        assert!(is_today_ist(ts, today_day));
+    }
+
+    #[test]
+    fn test_is_today_ist_boundary_end_of_day() {
+        // Last second of today (23:59:59 IST)
+        let today_day: u32 = 20539;
+        let ts: u32 = today_day * 86400 + 86399;
+        assert!(is_today_ist(ts, today_day));
+    }
+
+    #[test]
+    fn test_is_today_ist_zero_timestamp() {
+        // Zero timestamp should not match any real day
+        assert!(!is_today_ist(0, 20539));
+    }
+
+    #[test]
+    fn test_stale_day_combined_with_persist_window() {
+        // Tick from yesterday at 10:00 IST — passes time check but fails day check
+        let yesterday_day: u32 = 20538;
+        let today_day: u32 = 20539;
+        let ts: u32 = yesterday_day * 86400 + 36000; // yesterday 10:00:00 IST
+        assert!(is_within_persist_window(ts)); // time is within [09:00, 15:30)
+        assert!(!is_today_ist(ts, today_day)); // but it's not today
     }
 
     // -----------------------------------------------------------------------

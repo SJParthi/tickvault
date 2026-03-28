@@ -886,7 +886,14 @@ async fn main() -> Result<()> {
     // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
     // Step 9 starts tick processor BEFORE connections are spawned so frames
     // are consumed immediately — prevents frame send timeouts during stagger.
-    let (pool_receiver, ws_pool_ready) = if subscription_plan.is_some() {
+    //
+    // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
+    // Dhan's WebSocket server sends stale market data (last-traded prices from
+    // the previous trading day) even on non-trading days. Without this guard,
+    // those stale ticks pass the time-of-day persist window check and get
+    // written to QuestDB, polluting the database with duplicate/stale data.
+    let should_connect_ws = subscription_plan.is_some() && (is_trading || is_mock_trading);
+    let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
             &token_handle,
             &ws_client_id,
@@ -897,6 +904,9 @@ async fn main() -> Result<()> {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
         }
+    } else if !is_trading && !is_mock_trading {
+        info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
+        (None, None)
     } else {
         warn!("WebSocket pool skipped — running in offline mode");
         (None, None)
