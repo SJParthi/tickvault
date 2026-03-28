@@ -29,7 +29,19 @@
 
 9. **`enableKillSwitch: true`** in P&L exit = after auto-exit, also activates kill switch to prevent further trading.
 
-10. **For dhan-live-trader:** Wire kill switch activation into error handlers. On critical errors during live trading → call kill switch immediately.
+10. **Kill switch status response:** `{ "dhanClientId": "...", "killSwitchStatus": "ACTIVATE" }` or `"DEACTIVATE"`.
+
+11. **P&L exit POST response:** `{ "pnlExitStatus": "ACTIVE", "message": "..." }`.
+
+12. **P&L exit GET response uses DIFFERENT field names from POST request:**
+    - POST request: `profitValue`, `lossValue`
+    - GET response: `profit`, `loss` (shorter names)
+    - GET response: `{ "pnlExitStatus": "ACTIVE", "profit": "1500.00", "loss": "500.00", "productType": [...], "enable_kill_switch": true }`
+    - Note: `enable_kill_switch` uses snake_case in GET response (inconsistent with `enableKillSwitch` camelCase in POST).
+
+13. **P&L exit DELETE response:** `{ "pnlExitStatus": "DISABLED", "message": "..." }`.
+
+14. **For dhan-live-trader:** Wire kill switch activation into error handlers. On critical errors during live trading → call kill switch immediately.
 
 ## What This Prevents
 

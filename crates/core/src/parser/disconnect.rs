@@ -36,7 +36,7 @@ mod tests {
     use dhan_live_trader_common::constants::{
         DATA_API_ACCESS_TOKEN_EXPIRED, DATA_API_ACCESS_TOKEN_INVALID,
         DATA_API_AUTHENTICATION_FAILED, DATA_API_EXCEEDED_ACTIVE_CONNECTIONS,
-        DATA_API_NOT_SUBSCRIBED,
+        DATA_API_INSTRUMENTS_EXCEED_LIMIT, DATA_API_INTERNAL_SERVER_ERROR, DATA_API_NOT_SUBSCRIBED,
     };
 
     fn make_disconnect_packet(code: u16) -> (Vec<u8>, PacketHeader) {
@@ -132,5 +132,63 @@ mod tests {
         else {
             panic!("wrong error: {err:?}")
         };
+    }
+
+    #[test]
+    fn test_parse_disconnect_800() {
+        let (buf, hdr) = make_disconnect_packet(DATA_API_INTERNAL_SERVER_ERROR);
+        let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+        assert_eq!(code, DisconnectCode::InternalServerError);
+        assert!(code.is_reconnectable());
+    }
+
+    #[test]
+    fn test_parse_disconnect_804() {
+        let (buf, hdr) = make_disconnect_packet(DATA_API_INSTRUMENTS_EXCEED_LIMIT);
+        let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+        assert_eq!(code, DisconnectCode::InstrumentsExceedLimit);
+        assert!(!code.is_reconnectable());
+    }
+
+    #[test]
+    fn test_parse_disconnect_extra_bytes_ignored() {
+        let (mut buf, hdr) = make_disconnect_packet(807);
+        buf.extend_from_slice(&[0xFF; 10]);
+        let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+        assert_eq!(code, DisconnectCode::AccessTokenExpired);
+    }
+
+    #[test]
+    fn test_parse_disconnect_zero_code() {
+        let (buf, hdr) = make_disconnect_packet(0);
+        let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+        assert_eq!(code, DisconnectCode::Unknown(0));
+    }
+
+    #[test]
+    fn test_parse_disconnect_u16_max_code() {
+        let (buf, hdr) = make_disconnect_packet(u16::MAX);
+        let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+        assert_eq!(code, DisconnectCode::Unknown(u16::MAX));
+    }
+
+    #[test]
+    fn test_parse_disconnect_non_existent_codes_801_802_803() {
+        // Codes 801, 802, 803 are NOT in Dhan annexure — map to Unknown
+        for code_val in [801, 802, 803] {
+            let (buf, hdr) = make_disconnect_packet(code_val);
+            let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+            assert_eq!(code, DisconnectCode::Unknown(code_val));
+        }
+    }
+
+    #[test]
+    fn test_parse_disconnect_all_known_codes_roundtrip() {
+        let known_codes = [800, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814];
+        for &code_val in &known_codes {
+            let (buf, hdr) = make_disconnect_packet(code_val);
+            let code = parse_disconnect_packet(&buf, &hdr).unwrap();
+            assert_eq!(code.as_u16(), code_val, "roundtrip failed for {code_val}");
+        }
     }
 }

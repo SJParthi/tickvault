@@ -218,4 +218,88 @@ mod tests {
         assert!(json.contains("\"websocket\""));
         assert!(json.contains("\"questdb\""));
     }
+
+    // -------------------------------------------------------------------
+    // SubsystemInfo: skip_serializing_if for detail: None
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_subsystem_info_detail_none_omitted_from_json() {
+        let info = SubsystemInfo {
+            status: "reachable",
+            detail: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            !json.contains("detail"),
+            "detail: None should be omitted via skip_serializing_if"
+        );
+    }
+
+    #[test]
+    fn test_subsystem_info_detail_some_included_in_json() {
+        let info = SubsystemInfo {
+            status: "connected",
+            detail: Some("5 connections".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"detail\":\"5 connections\""));
+    }
+
+    // -------------------------------------------------------------------
+    // HealthResponse: version comes from CARGO_PKG_VERSION
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_version_matches_cargo_pkg_version() {
+        let health = Arc::new(SystemHealthStatus::new());
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(
+            response.version,
+            env!("CARGO_PKG_VERSION"),
+            "version must match CARGO_PKG_VERSION"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // HealthResponse: all subsystems down
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_all_down_subsystem_details() {
+        let health = Arc::new(SystemHealthStatus::new());
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        // websocket detail should show "0 connections"
+        assert_eq!(
+            response.subsystems.websocket.detail,
+            Some("0 connections".to_string())
+        );
+        // Other subsystems should have detail: None
+        assert!(response.subsystems.questdb.detail.is_none());
+        assert!(response.subsystems.token.detail.is_none());
+        assert!(response.subsystems.pipeline.detail.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // HealthResponse: websocket connection count in detail field
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_websocket_detail_shows_count() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_websocket_connections(5);
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(
+            response.subsystems.websocket.detail,
+            Some("5 connections".to_string())
+        );
+    }
 }

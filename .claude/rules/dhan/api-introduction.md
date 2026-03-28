@@ -19,7 +19,7 @@
 6. **Error response structure — exactly 3 string fields.** `errorType`, `errorCode`, `errorMessage` — all strings, all always present. Parse `errorCode` for handling action.
 
 7. **Rate limits must match the table exactly.**
-   - Order APIs: 10/sec, 250/min, 500/hr, 5000/day
+   - Order APIs: 10/sec, 250/min, 1000/hr, 7000/day
    - Data APIs: 5/sec, 100,000/day
    - Quote APIs: 1/sec (unlimited per min/hr/day)
    - Non-Trading APIs: 20/sec (unlimited per min/hr/day)

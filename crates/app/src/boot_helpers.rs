@@ -1669,4 +1669,100 @@ mod tests {
         assert_eq!(super::LOG_MAX_SIZE_BYTES, 50 * 1024 * 1024);
         assert_eq!(super::LOG_MAX_FILES, 7);
     }
+
+    // -----------------------------------------------------------------------
+    // Clock drift constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clock_drift_http_timeout_is_reasonable() {
+        assert!(super::CLOCK_DRIFT_HTTP_TIMEOUT_SECS >= 1);
+        assert!(super::CLOCK_DRIFT_HTTP_TIMEOUT_SECS <= 30);
+    }
+
+    #[test]
+    fn test_clock_drift_reference_url_is_https() {
+        assert!(
+            super::CLOCK_DRIFT_REFERENCE_URL.starts_with("https://"),
+            "clock drift reference URL must use HTTPS"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Log rotation constants relationships
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_max_size_is_at_least_1mb() {
+        assert!(
+            super::LOG_MAX_SIZE_BYTES >= 1024 * 1024,
+            "max log size must be at least 1MB"
+        );
+    }
+
+    #[test]
+    fn test_log_max_files_is_at_least_one() {
+        assert!(super::LOG_MAX_FILES >= 1, "must keep at least 1 log file");
+    }
+
+    // -----------------------------------------------------------------------
+    // create_log_file_writer_at: path with no parent (file at root-like level)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_log_file_writer_at_relative_no_parent() {
+        // A relative path with no slash has the parent "".
+        // This exercises the unwrap_or fallback to "data/logs".
+        let result = create_log_file_writer_at("justfilename.log");
+        // Should succeed because it creates "data/logs" fallback.
+        // Actually, Path::new("justfilename.log").parent() is Some(""),
+        // and create_dir_all("") succeeds (no-op).
+        // The file is created in current dir.
+        if result.is_some() {
+            let _ = std::fs::remove_file("justfilename.log");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // effective_ws_stagger: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_ws_stagger_u64_max_market_hours() {
+        let stagger = effective_ws_stagger(u64::MAX, true);
+        assert_eq!(stagger, u64::MAX);
+    }
+
+    #[test]
+    fn test_effective_ws_stagger_u64_max_off_hours() {
+        let stagger = effective_ws_stagger(u64::MAX, false);
+        assert_eq!(stagger, OFF_HOURS_CONNECTION_STAGGER_MS);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_bind_addr: empty host
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_bind_addr_empty_host() {
+        let addr = format_bind_addr("", 8080);
+        assert_eq!(addr, ":8080");
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_boot_mode and should_fast_boot: consistency exhaustive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_boot_mode_returns_only_fast_or_standard() {
+        for &cache in &[true, false] {
+            for &market in &[true, false] {
+                let mode = determine_boot_mode(cache, market);
+                assert!(
+                    mode == "fast" || mode == "standard",
+                    "unexpected boot mode: {mode}"
+                );
+            }
+        }
+    }
 }

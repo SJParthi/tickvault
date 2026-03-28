@@ -289,4 +289,99 @@ mod tests {
         assert_eq!(read_u32_le(&buf, 2), 11536);
         assert!((read_f32_le(&buf, 6) - 2100.50_f32).abs() < f32::EPSILON);
     }
+
+    // --- NaN and special float values ---
+
+    #[test]
+    fn test_read_f32_le_nan() {
+        let bytes = f32::NAN.to_le_bytes();
+        assert!(read_f32_le(&bytes, 0).is_nan());
+    }
+
+    #[test]
+    fn test_read_f32_le_infinity() {
+        let bytes = f32::INFINITY.to_le_bytes();
+        assert!(read_f32_le(&bytes, 0).is_infinite());
+        assert!(read_f32_le(&bytes, 0).is_sign_positive());
+    }
+
+    #[test]
+    fn test_read_f32_le_neg_infinity() {
+        let bytes = f32::NEG_INFINITY.to_le_bytes();
+        assert!(read_f32_le(&bytes, 0).is_infinite());
+        assert!(read_f32_le(&bytes, 0).is_sign_negative());
+    }
+
+    #[test]
+    fn test_read_f32_le_negative_zero() {
+        let bytes = (-0.0_f32).to_le_bytes();
+        assert_eq!(read_f32_le(&bytes, 0), 0.0);
+    }
+
+    #[test]
+    fn test_read_f64_le_nan() {
+        let bytes = f64::NAN.to_le_bytes();
+        assert!(read_f64_le(&bytes, 0).is_nan());
+    }
+
+    #[test]
+    fn test_read_f64_le_infinity() {
+        let bytes = f64::INFINITY.to_le_bytes();
+        assert!(read_f64_le(&bytes, 0).is_infinite());
+    }
+
+    #[test]
+    fn test_read_f64_le_neg_infinity() {
+        let bytes = f64::NEG_INFINITY.to_le_bytes();
+        assert!(read_f64_le(&bytes, 0).is_infinite());
+        assert!(read_f64_le(&bytes, 0).is_sign_negative());
+    }
+
+    #[test]
+    fn test_read_f64_le_max_value() {
+        let bytes = f64::MAX.to_le_bytes();
+        assert_eq!(read_f64_le(&bytes, 0), f64::MAX);
+    }
+
+    #[test]
+    fn test_read_f64_le_min_positive() {
+        let bytes = f64::MIN_POSITIVE.to_le_bytes();
+        assert_eq!(read_f64_le(&bytes, 0), f64::MIN_POSITIVE);
+    }
+
+    // --- u32 boundary values ---
+
+    #[test]
+    fn test_read_u32_le_one() {
+        let bytes = 1_u32.to_le_bytes();
+        assert_eq!(read_u32_le(&bytes, 0), 1);
+    }
+
+    #[test]
+    fn test_read_u32_le_large_value() {
+        // Typical Dhan volume: 100 million
+        let bytes = 100_000_000_u32.to_le_bytes();
+        assert_eq!(read_u32_le(&bytes, 0), 100_000_000);
+    }
+
+    // --- u16 boundary values ---
+
+    #[test]
+    fn test_read_u16_le_one() {
+        let bytes = 1_u16.to_le_bytes();
+        assert_eq!(read_u16_le(&bytes, 0), 1);
+    }
+
+    #[test]
+    fn test_read_u16_le_disconnect_code() {
+        // Typical Dhan disconnect code
+        let bytes = 805_u16.to_le_bytes();
+        assert_eq!(read_u16_le(&bytes, 0), 805);
+    }
+
+    #[test]
+    fn test_read_u16_le_all_ones() {
+        let buf = [0xFF, 0xFF];
+        assert_eq!(read_u16_le(&buf, 0), u16::MAX);
+    }
 }

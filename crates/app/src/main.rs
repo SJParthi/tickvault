@@ -79,6 +79,8 @@ use dhan_live_trader_storage::tick_persistence::{
     ensure_tick_table_dedup_keys,
 };
 
+use dhan_live_trader_trading::greeks::inline_computer::InlineGreeksComputer;
+
 use dhan_live_trader_api::build_router;
 use dhan_live_trader_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
 
@@ -374,6 +376,10 @@ async fn main() -> Result<()> {
             let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
             let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
+
+            // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
+            let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
+
             // Start with None writers — ticks are processed in-memory for trading.
             // QuestDB persistence reconnects in background (tables already exist
             // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
@@ -387,6 +393,7 @@ async fn main() -> Result<()> {
                     None, // live_candle_writer — QuestDB reconnects in background
                     movers,
                     snapshot_handle,
+                    greeks_enricher,
                 )
                 .await;
             });
@@ -927,6 +934,10 @@ async fn main() -> Result<()> {
         let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
         let snapshot_handle = Some(shared_movers.clone());
         let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
+
+        // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
+        let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -937,6 +948,7 @@ async fn main() -> Result<()> {
                 live_candle_writer,
                 movers,
                 snapshot_handle,
+                greeks_enricher,
             )
             .await;
         });
@@ -1714,6 +1726,11 @@ async fn run_candle_persistence_consumer(
                         c.close,
                         c.volume,
                         c.tick_count,
+                        c.iv,
+                        c.delta,
+                        c.gamma,
+                        c.theta,
+                        c.vega,
                     );
                 }
                 aggregator.clear_completed();
@@ -1732,7 +1749,13 @@ async fn run_candle_persistence_consumer(
 
         // Periodic sweep: emit stale candles and flush to QuestDB
         if last_sweep.elapsed() >= sweep_interval {
-            let now_secs = chrono::Utc::now().timestamp() as u32;
+            // CRITICAL: Dhan WebSocket timestamps are IST epoch seconds.
+            // Must add IST offset to UTC clock for correct stale comparison.
+            // APPROVED: i64→u32 safe: IST epoch fits u32 until 2106.
+            #[allow(clippy::cast_possible_truncation)]
+            let now_secs = (chrono::Utc::now().timestamp()
+                + i64::from(dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS))
+                as u32;
             aggregator.sweep_stale(now_secs);
             let completed = aggregator.completed_slice();
 
@@ -1747,6 +1770,11 @@ async fn run_candle_persistence_consumer(
                     c.close,
                     c.volume,
                     c.tick_count,
+                    c.iv,
+                    c.delta,
+                    c.gamma,
+                    c.theta,
+                    c.vega,
                 ) {
                     warn!(?err, "cold-path candle write failed");
                     break;
@@ -1971,6 +1999,59 @@ async fn wait_for_shutdown_signal() -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helper: Build inline Greeks enricher for tick processor
+// ---------------------------------------------------------------------------
+
+/// Constructs an `InlineGreeksComputer` wrapped as `Box<dyn GreeksEnricher>`
+/// for injection into the tick processor.
+///
+/// Returns `None` if Greeks are disabled or no subscription plan is available.
+/// O(1) EXEMPT: cold path — called once at startup.
+fn build_inline_greeks_enricher(
+    config: &ApplicationConfig,
+    subscription_plan: &Option<SubscriptionPlan>,
+) -> Option<Box<dyn dhan_live_trader_common::tick_types::GreeksEnricher>> {
+    if !config.greeks.enabled {
+        info!("inline Greeks enricher disabled in config");
+        return None;
+    }
+
+    let plan = match subscription_plan.as_ref() {
+        Some(p) => p,
+        None => {
+            info!("inline Greeks enricher skipped — no subscription plan");
+            return None;
+        }
+    };
+
+    // Compute today's date in IST for time-to-expiry calculation.
+    let today = (Utc::now()
+        + chrono::TimeDelta::seconds(
+            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64,
+        ))
+    .date_naive();
+
+    // O(1) EXEMPT: cold path — clone registry once at startup for enricher.
+    let enricher = InlineGreeksComputer::new(
+        plan.registry.clone(),
+        config.greeks.risk_free_rate,
+        config.greeks.dividend_yield,
+        config.greeks.day_count,
+        today,
+    );
+
+    info!(
+        rate = config.greeks.risk_free_rate,
+        div = config.greeks.dividend_yield,
+        day_count = config.greeks.day_count,
+        %today,
+        "inline Greeks enricher created for tick processor"
+    );
+
+    Some(Box::new(enricher))
+}
+
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
 // Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
@@ -2051,5 +2132,120 @@ mod tests {
         });
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         assert!(result.is_ok(), "task should complete within timeout");
+    }
+
+    // ===================================================================
+    // MECHANICAL ENFORCEMENT: IST offset in cold-path candle consumer
+    // ===================================================================
+
+    #[test]
+    fn test_cold_path_candle_consumer_uses_ist_offset() {
+        // Source-level enforcement: the cold-path candle persistence consumer
+        // MUST add IST_UTC_OFFSET_SECONDS to chrono::Utc::now() before calling
+        // sweep_stale(). Without this, UTC clock is 19800s behind IST candle
+        // timestamps → candles never swept → candles_1s stays empty forever.
+        let source = include_str!("main.rs");
+        // Find the run_candle_persistence_consumer function
+        let consumer_start = source
+            .find("async fn run_candle_persistence_consumer")
+            .expect("run_candle_persistence_consumer must exist");
+        let consumer_body = &source[consumer_start..];
+        // Must contain IST offset addition near sweep_stale
+        assert!(
+            consumer_body.contains("IST_UTC_OFFSET_SECONDS"),
+            "cold-path candle consumer MUST add IST_UTC_OFFSET_SECONDS to UTC clock \
+             before calling sweep_stale(). Dhan timestamps are IST epoch seconds."
+        );
+    }
+
+    #[test]
+    fn test_candle_sweep_ist_vs_utc_math() {
+        // Prove the IST offset fix is correct:
+        // If candle.timestamp_secs = 1774356559 (IST epoch for 2026-03-24 12:49 IST)
+        // UTC now() = 1774356559 - 19800 = 1774336759
+        // Without fix: threshold = 1774336759 - 5 = 1774336754
+        //   candle (1774356559) > threshold (1774336754) → NOT stale → NEVER emitted
+        // With fix: now_ist = 1774336759 + 19800 = 1774356559
+        //   threshold = 1774356559 - 5 = 1774356554
+        //   candle (1774356559) > threshold (1774356554) → still active (correct, just created)
+        //   After 5+ seconds: candle (1774356559) < threshold (1774356564) → STALE → emitted ✓
+
+        let candle_ts_ist: u32 = 1_774_356_559; // IST epoch
+        let utc_now: i64 = candle_ts_ist as i64 - 19800; // UTC = IST - 5h30m
+        let stale_threshold_secs: u32 = 5;
+
+        // WITHOUT IST offset (the bug): UTC clock for sweep
+        let threshold_broken = (utc_now as u32).saturating_sub(stale_threshold_secs);
+        assert!(
+            candle_ts_ist > threshold_broken,
+            "BUG: candle is NEVER stale with UTC clock (candle={candle_ts_ist} > threshold={threshold_broken})"
+        );
+
+        // WITH IST offset (the fix): IST clock for sweep
+        let now_ist = (utc_now + 19800) as u32;
+        assert_eq!(
+            now_ist, candle_ts_ist,
+            "IST now should equal candle timestamp"
+        );
+
+        // After 6 seconds, candle should be stale
+        let now_ist_plus_6 = now_ist + 6;
+        let threshold_fixed = now_ist_plus_6.saturating_sub(stale_threshold_secs);
+        assert!(
+            candle_ts_ist < threshold_fixed,
+            "FIX: candle IS stale after 6s with IST clock (candle={candle_ts_ist} < threshold={threshold_fixed})"
+        );
+    }
+
+    // ===================================================================
+    // MECHANICAL ENFORCEMENT: Timestamp consistency across all paths
+    // ===================================================================
+
+    #[test]
+    fn test_tick_persistence_no_ist_offset_on_exchange_timestamp() {
+        // Ticks from Dhan WebSocket have IST epoch seconds.
+        // The tick persistence writer must NOT add IST offset to exchange_timestamp.
+        // Only received_at (from Utc::now()) gets the offset.
+        let source = include_str!("../../storage/src/tick_persistence.rs");
+        // The designated ts column uses exchange_timestamp directly
+        assert!(
+            source.contains("i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000)"),
+            "tick ts must use exchange_timestamp directly (IST epoch, no offset)"
+        );
+        // received_at adds IST offset
+        assert!(
+            source.contains("received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)"),
+            "received_at must add IST_UTC_OFFSET_NANOS (UTC → IST)"
+        );
+    }
+
+    #[test]
+    fn test_live_candle_no_ist_offset() {
+        // Live candle writer uses IST epoch seconds directly (no offset).
+        let source = include_str!("../../storage/src/candle_persistence.rs");
+        assert!(
+            source.contains("compute_live_candle_nanos(timestamp_secs)"),
+            "live candles must use compute_live_candle_nanos (IST direct, no offset)"
+        );
+    }
+
+    #[test]
+    fn test_historical_candle_adds_ist_offset() {
+        // Historical REST API returns UTC → must add +19800s.
+        let source = include_str!("../../storage/src/candle_persistence.rs");
+        assert!(
+            source.contains("compute_ist_nanos_from_utc_secs"),
+            "historical candles must use compute_ist_nanos_from_utc_secs (UTC + 19800s)"
+        );
+    }
+
+    #[test]
+    fn test_greeks_pipeline_adds_ist_offset() {
+        // Greeks pipeline uses Utc::now() → must add IST offset.
+        let source = include_str!("greeks_pipeline.rs");
+        assert!(
+            source.contains("saturating_add(IST_UTC_OFFSET_NANOS)"),
+            "greeks pipeline MUST add IST_UTC_OFFSET_NANOS to Utc::now() timestamps"
+        );
     }
 }

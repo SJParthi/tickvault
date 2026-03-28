@@ -652,4 +652,92 @@ mod tests {
         let d = duration_until(t(1, 0, 0), t(23, 0, 0));
         assert_eq!(d.as_secs(), 22 * 3600);
     }
+
+    // -----------------------------------------------------------------------
+    // StorageGate: double open / double close idempotency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_gate_double_open_stays_open() {
+        let gate = StorageGate::new();
+        gate.open();
+        gate.open();
+        assert!(gate.is_open());
+    }
+
+    #[test]
+    fn test_storage_gate_double_close_stays_closed() {
+        let gate = StorageGate::new();
+        gate.close();
+        gate.close();
+        assert!(!gate.is_open());
+    }
+
+    // -----------------------------------------------------------------------
+    // phase_needs_websocket and phase_needs_storage: all 5 variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_phase_needs_websocket_all_five_variants() {
+        assert!(!phase_needs_websocket(SchedulePhase::PreConnect));
+        assert!(phase_needs_websocket(SchedulePhase::PreMarketWarm));
+        assert!(phase_needs_websocket(SchedulePhase::MarketOpen));
+        assert!(!phase_needs_websocket(SchedulePhase::PostMarket));
+        assert!(!phase_needs_websocket(SchedulePhase::NonTradingDay));
+    }
+
+    #[test]
+    fn test_phase_needs_storage_all_five_variants() {
+        assert!(!phase_needs_storage(SchedulePhase::PreConnect));
+        assert!(!phase_needs_storage(SchedulePhase::PreMarketWarm));
+        assert!(phase_needs_storage(SchedulePhase::MarketOpen));
+        assert!(!phase_needs_storage(SchedulePhase::PostMarket));
+        assert!(!phase_needs_storage(SchedulePhase::NonTradingDay));
+    }
+
+    // -----------------------------------------------------------------------
+    // duration_until: target == now returns ZERO
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_duration_until_target_equals_now_returns_zero() {
+        let now = t(12, 30, 45);
+        let d = duration_until(now, now);
+        assert_eq!(d, std::time::Duration::ZERO);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_phase: non-trading day overrides all time checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_trading_day_at_market_open_time() {
+        // Even at 09:15 IST on a non-trading day, phase is NonTradingDay
+        let phase = determine_phase(t(9, 15, 0), false, ws_connect(), data_start(), data_end());
+        assert_eq!(phase, SchedulePhase::NonTradingDay);
+    }
+
+    // -----------------------------------------------------------------------
+    // SchedulePhase: PartialEq / Eq exhaustive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_phase_inequality() {
+        let variants = [
+            SchedulePhase::PreConnect,
+            SchedulePhase::PreMarketWarm,
+            SchedulePhase::MarketOpen,
+            SchedulePhase::PostMarket,
+            SchedulePhase::NonTradingDay,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
 }

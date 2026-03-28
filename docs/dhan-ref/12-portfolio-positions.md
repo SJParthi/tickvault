@@ -146,7 +146,9 @@ DELETE https://api.dhan.co/v2/positions
 Headers: access-token
 ```
 
-Exits all open positions AND cancels all pending orders. Response: `{ "status": "SUCCESS", "message": "..." }`
+Exits all open positions. Response: `{ "status": "SUCCESS", "message": "All orders and positions exited successfully" }`
+
+> **Ambiguity in Dhan docs**: The API description says "only squares off open positions and does not cancel pending orders", but the v2.5 release notes say "close all open positions and open orders", and the response message mentions "All orders and positions". Treat conservatively: assume it MAY cancel pending orders too.
 
 ---
 

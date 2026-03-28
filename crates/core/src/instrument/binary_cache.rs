@@ -80,7 +80,7 @@ pub fn read_binary_cache(cache_dir: &str) -> Result<Option<FnoUniverse>> {
     let file = std::fs::File::open(&path)
         .with_context(|| format!("failed to open rkyv cache: {}", path.display()))?;
 
-    let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, single-process, no concurrent writers
+    let mmap = unsafe { Mmap::map(&file) } // SAFETY: read-only file, atomic rename(2) guarantees no torn writes, rkyv::from_bytes validates alignment/bounds
         .with_context(|| format!("failed to mmap rkyv cache: {}", path.display()))?;
 
     let rkyv_payload = validate_header(&mmap, &path)?;
@@ -516,6 +516,99 @@ mod tests {
 
         let result = MappedUniverse::load(dir.to_str().unwrap());
         assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cache_constants() {
+        assert_eq!(CACHE_MAGIC, b"RKYV");
+        assert_eq!(CACHE_VERSION, 2);
+        assert_eq!(HEADER_LEN, 8);
+        assert!(MIN_RKYV_CACHE_BYTES > HEADER_LEN as u64);
+    }
+
+    #[test]
+    fn test_validate_header_bad_magic_error_message() {
+        let mut data = vec![0u8; 20];
+        data[..4].copy_from_slice(b"NOPE");
+        data[4] = CACHE_VERSION;
+        let path = std::path::Path::new("/tmp/test.bin");
+        let err = validate_header(&data, path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad magic"), "error: {msg}");
+    }
+
+    #[test]
+    fn test_validate_header_wrong_version_error_message() {
+        let mut data = vec![0u8; 20];
+        data[..4].copy_from_slice(CACHE_MAGIC);
+        data[4] = 99; // wrong version
+        let path = std::path::Path::new("/tmp/test.bin");
+        let err = validate_header(&data, path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("version mismatch"), "error: {msg}");
+        assert!(msg.contains("99"), "should show actual version: {msg}");
+    }
+
+    #[test]
+    fn test_validate_header_exactly_7_bytes_too_small() {
+        let data = vec![0u8; 7]; // Less than HEADER_LEN=8
+        let path = std::path::Path::new("/tmp/test.bin");
+        let err = validate_header(&data, path).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn test_mapped_universe_derivative_and_underlying_count() {
+        let dir = unique_temp_dir("mapped-counts");
+        let cache_dir = dir.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let original = test_universe();
+        write_binary_cache(&original, cache_dir).unwrap();
+
+        let mapped = MappedUniverse::load(cache_dir).unwrap().unwrap();
+        assert_eq!(mapped.derivative_count(), 0);
+        assert_eq!(mapped.underlying_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mapped_universe_load_wrong_version() {
+        let dir = unique_temp_dir("mapped-wrong-ver");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join(BINARY_CACHE_FILENAME);
+        let mut data = vec![0u8; 200];
+        data[..4].copy_from_slice(CACHE_MAGIC);
+        data[4] = CACHE_VERSION.wrapping_add(1); // wrong version
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MappedUniverse::load(dir.to_str().unwrap());
+        assert!(result.is_err(), "wrong version should return Err");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_binary_cache_overwrites_existing() {
+        let dir = unique_temp_dir("rkyv-overwrite");
+        let cache_dir = dir.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let u1 = test_universe();
+        write_binary_cache(&u1, cache_dir).unwrap();
+
+        // Write again (overwrite)
+        let u2 = test_universe();
+        write_binary_cache(&u2, cache_dir).unwrap();
+
+        // Should still be readable
+        let loaded = read_binary_cache(cache_dir).unwrap().unwrap();
+        assert_eq!(loaded.build_metadata.csv_source, "test");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

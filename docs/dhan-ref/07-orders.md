@@ -236,7 +236,7 @@ pub struct TradeEntry {
 ## 9. Critical Notes
 
 1. **Static IP mandatory** for place/modify/cancel since v2.4.
-2. **Rate limit: 10 orders/sec**, 250/min, 500/hr, 5000/day. 25 modifications per order.
+2. **Rate limit: 10 orders/sec**, 250/min, 1000/hr, 7000/day. 25 modifications per order.
 3. **`quantity` in modify = TOTAL order qty**, not remaining qty.
 4. **`correlationId`** — set this on every order for tracking. Max 30 chars.
 5. **Timestamps are IST strings** (`YYYY-MM-DD HH:MM:SS`), not epoch.

@@ -1365,15 +1365,15 @@ fn test_disconnect_offset_match() {
 #[test]
 fn test_parsed_tick_size_is_known() {
     let size = std::mem::size_of::<ParsedTick>();
-    // Expected: 17 fields, mostly u32/f32 + i64 + u16 + u8
-    // = (4*13) + 8 + 2 + 1 + padding = ~64-72 bytes (depends on alignment)
+    // Expected: 22 fields (17 original + 5 Greeks f64), mostly u32/f32 + i64 + 5×f64 + u16 + u8
+    // = (4*13) + 8 + 2 + 1 + (5*8) + padding = ~107-120 bytes (depends on alignment)
     assert!(
-        size <= 80,
+        size <= 120,
         "ParsedTick must be compact: actual {size} bytes"
     );
     assert!(
-        size >= 56,
-        "ParsedTick has at least 56 bytes of data: actual {size}"
+        size >= 96,
+        "ParsedTick has at least 96 bytes of data: actual {size}"
     );
 }
 

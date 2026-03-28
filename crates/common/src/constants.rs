@@ -1019,8 +1019,13 @@ pub const TIMEFRAME_1D: &str = "1d";
 
 /// All intraday timeframes to fetch from Dhan API.
 /// Each tuple: (interval for API request, timeframe label for storage).
-pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] =
-    &[("1", "1m"), ("5", "5m"), ("15", "15m"), ("60", "60m")];
+pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] = &[
+    ("1", "1m"),
+    ("5", "5m"),
+    ("15", "15m"),
+    ("25", "25m"),
+    ("60", "60m"),
+];
 
 // ---------------------------------------------------------------------------
 // Authentication — SSM Path Construction
@@ -1215,6 +1220,11 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
 pub const TICK_BUFFER_CAPACITY: usize = 300_000;
 
+/// Resilience ring buffer capacity for live candle writer.
+/// Holds candles in memory when QuestDB is down, drains on recovery.
+/// 100,000 candles × ~48 bytes = ~5MB. At ~60 candles/sec = ~27 minutes of data.
+pub const CANDLE_BUFFER_CAPACITY: usize = 100_000;
+
 /// Option Chain API minimum request interval in seconds (Dhan limit: 1 req / 3 sec).
 pub const OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS: u64 = 3;
 
@@ -1224,6 +1234,11 @@ pub const OPTION_CHAIN_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
+
+/// Resilience ring buffer capacity for depth persistence writer.
+/// Holds depth snapshots in memory when QuestDB is down, drains on recovery.
+/// 50,000 snapshots × 116 bytes = ~5.5MB. At ~200 snapshots/sec = ~4 minutes of data.
+pub const DEPTH_BUFFER_CAPACITY: usize = 50_000;
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Validation Constants
@@ -1914,5 +1929,329 @@ mod tests {
         assert!(IV_MIN_BOUND > 0.0);
         assert!(IV_MAX_BOUND > IV_MIN_BOUND);
         assert!(IV_MAX_BOUND <= 10.0);
+    }
+
+    // --- Display Index Constants ---
+
+    #[test]
+    fn test_display_index_entries_count_matches_constant() {
+        assert_eq!(DISPLAY_INDEX_ENTRIES.len(), DISPLAY_INDEX_COUNT);
+    }
+
+    #[test]
+    fn test_display_index_entries_have_nonzero_security_ids() {
+        for &(name, security_id, _subcategory) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                security_id > 0,
+                "Display index '{}' has zero security_id",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_display_index_entries_have_valid_subcategories() {
+        let valid_subcategories = [
+            "Volatility",
+            "BroadMarket",
+            "MidCap",
+            "SmallCap",
+            "Sectoral",
+            "Thematic",
+        ];
+        for &(name, _, subcategory) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                valid_subcategories.contains(&subcategory),
+                "Display index '{}' has invalid subcategory '{}'",
+                name,
+                subcategory
+            );
+        }
+    }
+
+    #[test]
+    fn test_display_index_entries_unique_security_ids() {
+        let mut seen = std::collections::HashSet::new();
+        for &(name, security_id, _) in DISPLAY_INDEX_ENTRIES {
+            assert!(
+                seen.insert(security_id),
+                "Duplicate security_id {} for index '{}'",
+                security_id,
+                name
+            );
+        }
+    }
+
+    // --- Full Chain Index Constants ---
+
+    #[test]
+    fn test_full_chain_index_count_matches_symbols() {
+        assert_eq!(FULL_CHAIN_INDEX_SYMBOLS.len(), FULL_CHAIN_INDEX_COUNT);
+    }
+
+    #[test]
+    fn test_full_chain_index_symbols_nonempty() {
+        for &sym in FULL_CHAIN_INDEX_SYMBOLS {
+            assert!(!sym.is_empty(), "Full chain index symbol is empty");
+        }
+    }
+
+    // --- Validation Constants ---
+
+    #[test]
+    fn test_validation_must_exist_indices_nonempty() {
+        assert!(!VALIDATION_MUST_EXIST_INDICES.is_empty());
+        for &(sym, sid) in VALIDATION_MUST_EXIST_INDICES {
+            assert!(!sym.is_empty());
+            assert!(sid > 0);
+        }
+    }
+
+    #[test]
+    fn test_validation_fno_stock_min_less_than_max() {
+        assert!(VALIDATION_FNO_STOCK_MIN_COUNT < VALIDATION_FNO_STOCK_MAX_COUNT);
+    }
+
+    // --- Computed Packet Size Constants ---
+
+    #[test]
+    fn test_twenty_depth_packet_size_computed_correctly() {
+        assert_eq!(
+            TWENTY_DEPTH_PACKET_SIZE,
+            DEEP_DEPTH_HEADER_SIZE + TWENTY_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE
+        );
+    }
+
+    #[test]
+    fn test_two_hundred_depth_packet_size_computed_correctly() {
+        assert_eq!(
+            TWO_HUNDRED_DEPTH_PACKET_SIZE,
+            DEEP_DEPTH_HEADER_SIZE + TWO_HUNDRED_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE
+        );
+    }
+
+    #[test]
+    fn test_twenty_depth_body_size() {
+        assert_eq!(TWENTY_DEPTH_BODY_SIZE, 20 * 16);
+        assert_eq!(TWENTY_DEPTH_BODY_SIZE, 320);
+    }
+
+    #[test]
+    fn test_two_hundred_depth_body_size() {
+        assert_eq!(TWO_HUNDRED_DEPTH_BODY_SIZE, 200 * 16);
+        assert_eq!(TWO_HUNDRED_DEPTH_BODY_SIZE, 3200);
+    }
+
+    // --- Candle Constants ---
+
+    #[test]
+    fn test_candles_per_trading_day() {
+        assert_eq!(CANDLES_PER_TRADING_DAY, 375);
+    }
+
+    #[test]
+    fn test_intraday_timeframes_count() {
+        assert_eq!(INTRADAY_TIMEFRAMES.len(), 5);
+    }
+
+    #[test]
+    fn test_intraday_timeframes_valid_intervals() {
+        for &(interval, _label) in INTRADAY_TIMEFRAMES {
+            assert!(
+                ["1", "5", "15", "25", "60"].contains(&interval),
+                "Invalid intraday interval: '{}'",
+                interval
+            );
+        }
+    }
+
+    // --- SSM Path Constants ---
+
+    #[test]
+    fn test_ssm_paths_nonempty() {
+        assert!(!SSM_SECRET_BASE_PATH.is_empty());
+        assert!(!SSM_DHAN_SERVICE.is_empty());
+        assert!(!DHAN_CLIENT_ID_SECRET.is_empty());
+        assert!(!DHAN_CLIENT_SECRET_SECRET.is_empty());
+        assert!(!DHAN_TOTP_SECRET.is_empty());
+    }
+
+    // --- Market Status Codes ---
+
+    #[test]
+    fn test_market_status_codes_distinct() {
+        let codes = [
+            MARKET_STATUS_CLOSED,
+            MARKET_STATUS_PRE_OPEN,
+            MARKET_STATUS_OPEN,
+            MARKET_STATUS_POST_CLOSE,
+        ];
+        let mut unique = std::collections::HashSet::new();
+        for code in codes {
+            assert!(
+                unique.insert(code),
+                "Duplicate market status code: {}",
+                code
+            );
+        }
+    }
+
+    // --- Feed Request Codes ---
+
+    #[test]
+    fn test_feed_request_codes_correct() {
+        assert_eq!(FEED_REQUEST_CONNECT, 11);
+        assert_eq!(FEED_REQUEST_DISCONNECT, 12);
+        assert_eq!(FEED_REQUEST_TICKER, 15);
+        assert_eq!(FEED_UNSUBSCRIBE_TICKER, 16);
+        assert_eq!(FEED_REQUEST_QUOTE, 17);
+        assert_eq!(FEED_UNSUBSCRIBE_QUOTE, 18);
+        assert_eq!(FEED_REQUEST_FULL, 21);
+        assert_eq!(FEED_UNSUBSCRIBE_FULL, 22);
+    }
+
+    // --- Response Codes ---
+
+    #[test]
+    fn test_response_codes_correct() {
+        assert_eq!(RESPONSE_CODE_INDEX_TICKER, 1);
+        assert_eq!(RESPONSE_CODE_TICKER, 2);
+        assert_eq!(RESPONSE_CODE_MARKET_DEPTH, 3);
+        assert_eq!(RESPONSE_CODE_QUOTE, 4);
+        assert_eq!(RESPONSE_CODE_OI, 5);
+        assert_eq!(RESPONSE_CODE_PREVIOUS_CLOSE, 6);
+        assert_eq!(RESPONSE_CODE_MARKET_STATUS, 7);
+        assert_eq!(RESPONSE_CODE_FULL, 8);
+    }
+
+    // --- TOTP Constants ---
+
+    #[test]
+    fn test_totp_constants_valid() {
+        assert_eq!(TOTP_DIGITS, 6);
+        assert_eq!(TOTP_PERIOD_SECS, 30);
+        assert!(TOTP_MAX_RETRIES >= 1);
+    }
+
+    // --- Network Constants ---
+
+    #[test]
+    fn test_public_ip_check_urls_are_https() {
+        assert!(PUBLIC_IP_CHECK_PRIMARY_URL.starts_with("https://"));
+        assert!(PUBLIC_IP_CHECK_FALLBACK_URL.starts_with("https://"));
+    }
+
+    // --- Ring Buffer Constants ---
+
+    #[test]
+    fn test_tick_ring_buffer_is_power_of_two() {
+        assert!(TICK_RING_BUFFER_CAPACITY.is_power_of_two());
+        assert_eq!(TICK_RING_BUFFER_CAPACITY, 65536);
+    }
+
+    #[test]
+    fn test_order_event_ring_buffer_is_power_of_two() {
+        assert!(ORDER_EVENT_RING_BUFFER_CAPACITY.is_power_of_two());
+    }
+
+    // --- QuestDB Table Names ---
+
+    #[test]
+    fn test_questdb_table_names_nonempty() {
+        let tables = [
+            QUESTDB_TABLE_BUILD_METADATA,
+            QUESTDB_TABLE_FNO_UNDERLYINGS,
+            QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+            QUESTDB_TABLE_SUBSCRIBED_INDICES,
+            QUESTDB_TABLE_NSE_HOLIDAYS,
+            QUESTDB_TABLE_INDEX_CONSTITUENTS,
+            QUESTDB_TABLE_TICKS,
+            QUESTDB_TABLE_MARKET_DEPTH,
+            QUESTDB_TABLE_PREVIOUS_CLOSE,
+        ];
+        for table in tables {
+            assert!(!table.is_empty(), "QuestDB table name is empty");
+        }
+    }
+
+    // --- Depth Level Offsets ---
+
+    #[test]
+    fn test_depth_level_offsets_within_bounds() {
+        assert!(DEPTH_LEVEL_OFFSET_BID_QTY < MARKET_DEPTH_LEVEL_SIZE);
+        assert!(DEPTH_LEVEL_OFFSET_ASK_QTY < MARKET_DEPTH_LEVEL_SIZE);
+        assert!(DEPTH_LEVEL_OFFSET_BID_ORDERS < MARKET_DEPTH_LEVEL_SIZE);
+        assert!(DEPTH_LEVEL_OFFSET_ASK_ORDERS < MARKET_DEPTH_LEVEL_SIZE);
+        assert!(DEPTH_LEVEL_OFFSET_BID_PRICE < MARKET_DEPTH_LEVEL_SIZE);
+        assert!(DEPTH_LEVEL_OFFSET_ASK_PRICE < MARKET_DEPTH_LEVEL_SIZE);
+    }
+
+    // --- Deep Depth Header Offsets ---
+
+    #[test]
+    fn test_deep_depth_header_offsets_within_bounds() {
+        assert!(DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH < DEEP_DEPTH_HEADER_SIZE);
+        assert!(DEEP_DEPTH_HEADER_OFFSET_FEED_CODE < DEEP_DEPTH_HEADER_SIZE);
+        assert!(DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT < DEEP_DEPTH_HEADER_SIZE);
+        assert!(DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID < DEEP_DEPTH_HEADER_SIZE);
+        assert!(DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE < DEEP_DEPTH_HEADER_SIZE);
+    }
+
+    // --- Packet Header Offsets ---
+
+    #[test]
+    fn test_header_offsets_within_bounds() {
+        assert!(HEADER_OFFSET_RESPONSE_CODE < BINARY_HEADER_SIZE);
+        assert!(HEADER_OFFSET_MESSAGE_LENGTH < BINARY_HEADER_SIZE);
+        assert!(HEADER_OFFSET_EXCHANGE_SEGMENT < BINARY_HEADER_SIZE);
+        assert!(HEADER_OFFSET_SECURITY_ID < BINARY_HEADER_SIZE);
+    }
+
+    // --- API Endpoint Paths ---
+
+    #[test]
+    fn test_api_paths_start_with_slash() {
+        let paths = [
+            DHAN_GENERATE_TOKEN_PATH,
+            DHAN_RENEW_TOKEN_PATH,
+            DHAN_CHARTS_INTRADAY_PATH,
+            DHAN_CHARTS_HISTORICAL_PATH,
+            DHAN_USER_PROFILE_PATH,
+            DHAN_SET_IP_PATH,
+            DHAN_MODIFY_IP_PATH,
+            DHAN_GET_IP_PATH,
+            DHAN_HOLDINGS_PATH,
+            DHAN_POSITIONS_PATH,
+            DHAN_POSITIONS_CONVERT_PATH,
+            DHAN_MARGIN_CALCULATOR_PATH,
+            DHAN_MARGIN_CALCULATOR_MULTI_PATH,
+            DHAN_FUND_LIMIT_PATH,
+        ];
+        for path in paths {
+            assert!(
+                path.starts_with('/'),
+                "API path does not start with '/': '{}'",
+                path
+            );
+        }
+    }
+
+    // --- Unsubscribe code for depth ---
+
+    #[test]
+    fn test_depth_unsubscribe_code_is_25() {
+        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25);
+    }
+
+    // --- Application constants ---
+
+    #[test]
+    fn test_application_name() {
+        assert_eq!(APPLICATION_NAME, "dhan-live-trader");
+    }
+
+    #[test]
+    fn test_application_version_nonempty() {
+        assert!(!APPLICATION_VERSION.is_empty());
     }
 }

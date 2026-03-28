@@ -289,7 +289,7 @@ ParsedTick (from broadcast channel)
 ┌─────────────────────────────────────────────────────┐
 │  ORDER MANAGEMENT SYSTEM (OMS)                       │
 │                                                      │
-│  Rate Limiter (GCRA):   10/sec, 5000/day             │
+│  Rate Limiter (GCRA):   10/sec, 7000/day             │
 │  Circuit Breaker:       3 failures → open → block    │
 │  Idempotency:           correlation_id → UUID v4     │
 │                                                      │

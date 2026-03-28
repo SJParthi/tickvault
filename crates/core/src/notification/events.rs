@@ -10,6 +10,20 @@
 
 use dhan_live_trader_common::sanitize::redact_url_params;
 
+/// Masks the last two octets of an IPv4 address for safe display in
+/// Telegram messages. Prevents full IP exposure while still confirming
+/// the network prefix for verification.
+///
+/// Example: `"59.92.114.17"` → `"59.92.XXX.XX"`
+fn mask_ip_for_notification(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 {
+        format!("{}.{}.XXX.XX", parts[0], parts[1])
+    } else {
+        "XXX.XXX.XXX.XXX".to_string()
+    }
+}
+
 /// Alert severity level — determines which notification channels fire.
 ///
 /// `Critical` and `High` → Telegram + SNS SMS.
@@ -265,12 +279,10 @@ impl NotificationEvent {
     pub fn to_message(&self) -> String {
         match self {
             Self::StartupComplete { mode } => {
+                // SECURITY: Do not expose internal service ports in Telegram.
                 format!(
                     "<b>dhan-live-trader started</b>\nMode: {mode}\n\n\
-                     Grafana: http://localhost:3000\n\
-                     Prometheus: http://localhost:9090\n\
-                     Jaeger: http://localhost:16686\n\
-                     QuestDB: http://localhost:9000"
+                     Dashboards: Grafana / Prometheus / Jaeger / QuestDB available"
                 )
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
@@ -312,7 +324,11 @@ impl NotificationEvent {
                 reason,
                 manual_trigger_url,
             } => {
-                format!("<b>Instruments FAILED</b>\n{reason}\n\nRetry: {manual_trigger_url}")
+                // SECURITY: Do not expose internal API URL in Telegram.
+                let _ = manual_trigger_url; // kept in struct for internal use
+                format!(
+                    "<b>Instruments FAILED</b>\n{reason}\n\nRetry via /instruments/rebuild API endpoint"
+                )
             }
             Self::HistoricalFetchComplete {
                 instruments_fetched,
@@ -499,7 +515,10 @@ impl NotificationEvent {
                 )
             }
             Self::IpVerificationSuccess { verified_ip } => {
-                format!("<b>IP verified</b> — {verified_ip}")
+                // SECURITY: Mask the last two octets to prevent IP exposure
+                // in Telegram messages. Show only network prefix for confirmation.
+                let masked = mask_ip_for_notification(verified_ip);
+                format!("<b>IP verified</b> — {masked}")
             }
             Self::BootHealthCheck {
                 services_healthy,
@@ -627,10 +646,16 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
-        assert!(msg.contains("Grafana: http://localhost:3000"));
-        assert!(msg.contains("Prometheus: http://localhost:9090"));
-        assert!(msg.contains("Jaeger: http://localhost:16686"));
-        assert!(msg.contains("QuestDB: http://localhost:9000"));
+        // SECURITY: ports and URLs must NOT appear in Telegram message
+        assert!(!msg.contains("3000"), "internal port leaked: {msg}");
+        assert!(!msg.contains("9090"), "internal port leaked: {msg}");
+        assert!(!msg.contains("16686"), "internal port leaked: {msg}");
+        assert!(!msg.contains("9000"), "internal port leaked: {msg}");
+        assert!(!msg.contains("localhost"), "localhost leaked: {msg}");
+        assert!(msg.contains("Dashboards"));
+        assert!(msg.contains("Grafana"));
+        assert!(msg.contains("Prometheus"));
+        assert!(msg.contains("QuestDB"));
     }
 
     #[test]
@@ -661,12 +686,12 @@ mod tests {
     #[test]
     fn test_auth_failed_redacts_credentials_in_url() {
         let event = NotificationEvent::AuthenticationFailed {
-            reason: "generateAccessToken request failed: error sending request for url (https://auth.dhan.co/app/generateAccessToken?dhanClientId=1106656882&pin=785478&totp=772509)".to_string(),
+            reason: "generateAccessToken request failed: error sending request for url (https://auth.dhan.co/app/generateAccessToken?dhanClientId=0000000000&pin=000000&totp=000000)".to_string(),
         };
         let msg = event.to_message();
-        assert!(!msg.contains("1106656882"), "client ID leaked: {msg}");
-        assert!(!msg.contains("785478"), "PIN leaked: {msg}");
-        assert!(!msg.contains("772509"), "TOTP leaked: {msg}");
+        assert!(!msg.contains("0000000000"), "client ID leaked: {msg}");
+        assert!(!msg.contains("pin=000000"), "PIN leaked: {msg}");
+        assert!(!msg.contains("totp=000000"), "TOTP leaked: {msg}");
         assert!(msg.contains("FAILED"));
         assert!(msg.contains("[REDACTED]"));
     }
@@ -777,7 +802,10 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("Instruments FAILED"));
         assert!(msg.contains("HTTP 503"));
-        assert!(msg.contains("/api/instruments/rebuild"));
+        // SECURITY: internal URL must NOT appear in Telegram
+        assert!(!msg.contains("0.0.0.0"), "internal URL leaked: {msg}");
+        assert!(!msg.contains("3001"), "internal port leaked: {msg}");
+        assert!(msg.contains("/instruments/rebuild"));
     }
 
     #[test]
@@ -1159,13 +1187,19 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_verification_success_message() {
+    fn test_ip_verification_success_message_masks_ip() {
         let event = NotificationEvent::IpVerificationSuccess {
             verified_ip: "203.0.113.42".to_string(),
         };
         let msg = event.to_message();
         assert!(msg.contains("IP verified"));
-        assert!(msg.contains("203.0.113.42"));
+        // SECURITY: Full IP must NOT appear in Telegram message
+        assert!(
+            !msg.contains("203.0.113.42"),
+            "full IP must be masked in notification: {msg}"
+        );
+        // Only network prefix should be visible
+        assert!(msg.contains("203.0.XXX.XX"), "masked IP expected: {msg}");
     }
 
     #[test]
@@ -1174,6 +1208,18 @@ mod tests {
             verified_ip: "10.0.0.1".to_string(),
         };
         assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_mask_ip_for_notification_standard() {
+        assert_eq!(mask_ip_for_notification("59.92.114.17"), "59.92.XXX.XX");
+        assert_eq!(mask_ip_for_notification("10.0.0.1"), "10.0.XXX.XX");
+    }
+
+    #[test]
+    fn test_mask_ip_for_notification_invalid() {
+        assert_eq!(mask_ip_for_notification("not-an-ip"), "XXX.XXX.XXX.XXX");
+        assert_eq!(mask_ip_for_notification(""), "XXX.XXX.XXX.XXX");
     }
 
     #[test]

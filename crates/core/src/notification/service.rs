@@ -199,8 +199,9 @@ impl NotificationService {
             (None, None)
         };
 
+        // SECURITY: Do not log chat_id — it's a component of the
+        // credential pair needed for Telegram message injection.
         info!(
-            chat_id = %chat_id,
             sns_enabled = config.sns_enabled,
             "notification service initialized — Telegram active"
         );

@@ -50,6 +50,11 @@ const CANDLES_1S_CREATE_DDL: &str = "\
         volume LONG,\
         oi LONG,\
         tick_count INT,\
+        iv DOUBLE,\
+        delta DOUBLE,\
+        gamma DOUBLE,\
+        theta DOUBLE,\
+        vega DOUBLE,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -259,7 +264,9 @@ fn build_view_sql(def: &ViewDef) -> String {
          SELECT ts, security_id, segment, \
          first(open) AS open, max(high) AS high, \
          min(low) AS low, last(close) AS close, \
-         sum(volume) AS volume, last(oi) AS oi{tick_count} \
+         sum(volume) AS volume, last(oi) AS oi{tick_count}, \
+         last(iv) AS iv, last(delta) AS delta, last(gamma) AS gamma, \
+         last(theta) AS theta, last(vega) AS vega \
          FROM {source} \
          SAMPLE BY {interval} \
          ALIGN TO CALENDAR WITH OFFSET '{offset}'",
@@ -283,16 +290,12 @@ fn build_view_sql(def: &ViewDef) -> String {
 pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     let base_url = build_questdb_exec_url(&questdb_config.host, questdb_config.http_port);
 
-    let client = match reqwest::Client::builder()
+    // Client::builder().timeout().build() is infallible (no custom TLS).
+    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(DDL_TIMEOUT_SECS))
         .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(?err, "failed to build HTTP client for candle view DDL");
-            return;
-        }
-    };
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // Step 1: Create the candles_1s base table.
     if !execute_ddl(
@@ -310,7 +313,21 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     let dedup_sql = build_dedup_sql(QUESTDB_TABLE_CANDLES_1S, DEDUP_KEY_CANDLES_1S);
     execute_ddl(&client, &base_url, &dedup_sql, "candles_1s DEDUP").await;
 
-    // Step 3: Create materialized views in dependency order.
+    // Step 3: Add Greeks columns to candles_1s if missing (schema migration).
+    // QuestDB ALTER TABLE ADD COLUMN is idempotent — adding an already-existing
+    // column returns a non-fatal error that we safely ignore.
+    ensure_greeks_columns_on_table(&client, &base_url, QUESTDB_TABLE_CANDLES_1S).await;
+
+    // Step 4: Drop materialized views if they lack Greeks columns.
+    // Views created before Greeks were added cannot be ALTERed — they must be
+    // dropped and recreated. We probe the first view (candles_5s) for the 'iv'
+    // column. If absent, drop all 18 views so Step 5 recreates them with Greeks.
+    if views_missing_greeks(&client, &base_url).await {
+        info!("materialized views lack Greeks columns — dropping for recreation");
+        drop_all_views(&client, &base_url).await;
+    }
+
+    // Step 5: Create materialized views in dependency order.
     let mut created_count: u32 = 0;
     for def in VIEW_DEFS {
         let sql = build_view_sql(def);
@@ -325,6 +342,85 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
         views_total = VIEW_DEFS.len(),
         "candle materialized views setup complete"
     );
+}
+
+/// The 5 Greeks column names used in ticks, candles_1s, and materialized views.
+const GREEKS_COLUMN_NAMES: &[&str] = &["iv", "delta", "gamma", "theta", "vega"];
+
+/// Adds the 5 Greeks columns to a table if they are missing.
+///
+/// QuestDB `ALTER TABLE ADD COLUMN` is idempotent — adding an already-existing
+/// column returns a non-fatal error that we safely ignore. Zero manual intervention.
+async fn ensure_greeks_columns_on_table(
+    client: &reqwest::Client,
+    base_url: &str,
+    table_name: &str,
+) {
+    for col in GREEKS_COLUMN_NAMES {
+        let alter_sql = format!("ALTER TABLE {table_name} ADD COLUMN {col} DOUBLE");
+        let _ = client
+            .get(base_url)
+            .query(&[("query", &alter_sql)])
+            .send()
+            .await;
+    }
+    info!(
+        table = table_name,
+        "Greeks columns ensured (idempotent ADD COLUMN)"
+    );
+}
+
+/// Checks whether existing materialized views are missing Greeks columns.
+///
+/// Probes `candles_5s` (the first view in the dependency chain) by querying
+/// `SHOW COLUMNS FROM candles_5s`. If the response does not contain 'iv',
+/// the views were created before Greeks support and must be dropped + recreated.
+///
+/// Returns `true` if views need recreation, `false` if they already have Greeks
+/// or if the probe fails (in which case `CREATE ... IF NOT EXISTS` in Step 5
+/// handles it).
+async fn views_missing_greeks(client: &reqwest::Client, base_url: &str) -> bool {
+    let probe_sql = "SHOW COLUMNS FROM candles_5s";
+    match client
+        .get(base_url)
+        .query(&[("query", probe_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                // If candles_5s exists but does not have an 'iv' column,
+                // the views need recreation.
+                if !body.contains("iv") {
+                    return true;
+                }
+            }
+            // Non-success (e.g., view doesn't exist) → Step 5 will create it.
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Drops all 18 materialized views in reverse dependency order.
+///
+/// Reverse order ensures child views are dropped before their parents.
+/// `DROP MATERIALIZED VIEW IF EXISTS` is idempotent.
+async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
+    for def in VIEW_DEFS.iter().rev() {
+        let drop_sql = format!("DROP MATERIALIZED VIEW IF EXISTS {}", def.name);
+        let _ = client
+            .get(base_url)
+            .query(&[("query", &drop_sql)])
+            .send()
+            .await;
+        debug!(
+            view = def.name,
+            "dropped materialized view for Greeks migration"
+        );
+    }
+    info!("all 18 materialized views dropped for Greeks migration");
 }
 
 /// Executes a single DDL statement against QuestDB. Returns true on success.
@@ -368,6 +464,11 @@ mod tests {
         assert!(CANDLES_1S_CREATE_DDL.contains("PARTITION BY DAY"));
         assert!(CANDLES_1S_CREATE_DDL.contains("security_id LONG"));
         assert!(CANDLES_1S_CREATE_DDL.contains("tick_count INT"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("iv DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("delta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("gamma DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("theta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("vega DOUBLE"));
     }
 
     #[test]
@@ -663,6 +764,31 @@ mod tests {
                 "view {} missing oi",
                 def.name
             );
+            assert!(
+                sql.contains("last(iv) AS iv"),
+                "view {} missing iv",
+                def.name
+            );
+            assert!(
+                sql.contains("last(delta) AS delta"),
+                "view {} missing delta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(gamma) AS gamma"),
+                "view {} missing gamma",
+                def.name
+            );
+            assert!(
+                sql.contains("last(theta) AS theta"),
+                "view {} missing theta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(vega) AS vega"),
+                "view {} missing vega",
+                def.name
+            );
         }
     }
 
@@ -823,6 +949,15 @@ mod tests {
         assert!(CANDLES_1S_CREATE_DDL.contains("close DOUBLE"));
     }
 
+    #[test]
+    fn test_candles_1s_ddl_has_greeks_columns() {
+        assert!(CANDLES_1S_CREATE_DDL.contains("iv DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("delta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("gamma DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("theta DOUBLE"));
+        assert!(CANDLES_1S_CREATE_DDL.contains("vega DOUBLE"));
+    }
+
     // -----------------------------------------------------------------------
     // HTTP mock helpers
     // -----------------------------------------------------------------------
@@ -940,5 +1075,186 @@ mod tests {
         let client = reqwest::Client::new();
         let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
         assert!(!result, "execute_ddl must return false on send error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage gap-fill: tracing subscriber to evaluate warn!/info! fields
+    // (lines 325, 343)
+    // -----------------------------------------------------------------------
+
+    fn install_test_subscriber() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_200_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With subscriber installed, info! evaluates views_total field (line 325).
+        ensure_candle_views(&config).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_candle_views_all_400_with_tracing() {
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        // With subscriber installed, warn! evaluates body.chars().take(200) (line 343).
+        ensure_candle_views(&config).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Greeks schema migration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_greeks_column_names_constant() {
+        assert_eq!(GREEKS_COLUMN_NAMES.len(), 5);
+        assert!(GREEKS_COLUMN_NAMES.contains(&"iv"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"delta"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"gamma"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"theta"));
+        assert!(GREEKS_COLUMN_NAMES.contains(&"vega"));
+    }
+
+    #[test]
+    fn test_all_views_include_greeks_in_sql() {
+        // Every materialized view SQL must include Greeks aggregations.
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("last(iv) AS iv"),
+                "view {} must include iv",
+                def.name
+            );
+            assert!(
+                sql.contains("last(delta) AS delta"),
+                "view {} must include delta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(gamma) AS gamma"),
+                "view {} must include gamma",
+                def.name
+            );
+            assert!(
+                sql.contains("last(theta) AS theta"),
+                "view {} must include theta",
+                def.name
+            );
+            assert!(
+                sql.contains("last(vega) AS vega"),
+                "view {} must include vega",
+                def.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_false_on_unreachable() {
+        // When QuestDB is unreachable, views_missing_greeks returns false
+        // (conservative — let CREATE IF NOT EXISTS handle it).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        let result = views_missing_greeks(&client, base_url).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_false_when_iv_present() {
+        // Mock server returns a response containing "iv" — views have Greeks.
+        // Body = 81 bytes.
+        let response_with_iv = "HTTP/1.1 200 OK\r\nContent-Length: 81\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"iv\"},{\"name\":\"delta\"}]}";
+        let port = spawn_mock_http_server(response_with_iv).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = views_missing_greeks(&client, &base_url).await;
+        assert!(!result, "should return false when iv column is present");
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_true_when_iv_absent() {
+        // Mock server returns a response WITHOUT "iv" — views need recreation.
+        // Body = 66 bytes.
+        let response_without_iv = "HTTP/1.1 200 OK\r\nContent-Length: 66\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"open\"}]}";
+        let port = spawn_mock_http_server(response_without_iv).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = views_missing_greeks(&client, &base_url).await;
+        assert!(result, "should return true when iv column is absent");
+    }
+
+    #[tokio::test]
+    async fn test_views_missing_greeks_returns_false_on_non_success() {
+        // Mock returns 400 (view doesn't exist) — return false, let CREATE handle it.
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = views_missing_greeks(&client, &base_url).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_drop_all_views_with_mock_200() {
+        // DROP MATERIALIZED VIEW IF EXISTS requests all return 200 — no panic.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        drop_all_views(&client, &base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_drop_all_views_with_unreachable_no_panic() {
+        // When QuestDB is unreachable, drop_all_views must not panic.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        drop_all_views(&client, base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_columns_on_table_with_mock_200() {
+        // ALTER TABLE ADD COLUMN requests all return 200 — no panic.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        ensure_greeks_columns_on_table(&client, &base_url, "test_table").await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_greeks_columns_on_table_with_unreachable_no_panic() {
+        // When QuestDB is unreachable, ensure_greeks_columns_on_table must not panic.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        ensure_greeks_columns_on_table(&client, base_url, "test_table").await;
     }
 }

@@ -249,8 +249,8 @@ request_delay_ms = 500
 [greeks]
 enabled = true
 fetch_interval_secs = 60
-risk_free_rate = 0.068
-dividend_yield = 0.012
+risk_free_rate = 0.10
+dividend_yield = 0.0
 iv_solver_max_iterations = 50
 iv_solver_tolerance = 1e-8
 

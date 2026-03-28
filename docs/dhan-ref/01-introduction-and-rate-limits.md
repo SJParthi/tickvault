@@ -44,8 +44,8 @@ See `08-annexure-enums.md` Sections 10–11 for all error codes.
 |-------------|-----------|-----------|------------|------------------|
 | per second  | 10        | 5         | 1          | 20               |
 | per minute  | 250       | —         | Unlimited  | Unlimited        |
-| per hour    | 500       | —         | Unlimited  | Unlimited        |
-| per day     | 5000      | 100000    | Unlimited  | Unlimited        |
+| per hour    | 1000      | —         | Unlimited  | Unlimited        |
+| per day     | 7000      | 100000    | Unlimited  | Unlimited        |
 
 - Order modifications capped at **25 per order**
 - Quote APIs: 1/sec but unlimited per minute/hour/day

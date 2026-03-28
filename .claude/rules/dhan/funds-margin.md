@@ -17,15 +17,22 @@
 
 4. **Margin calculator request** uses same fields as order placement: `exchangeSegment`, `transactionType`, `quantity`, `productType`, `securityId` (STRING), `price`, `triggerPrice`.
 
-5. **Margin response fields:**
+5. **Single margin response fields (camelCase, floats except leverage):**
    - `totalMargin` — total margin required
    - `spanMargin` — SPAN margin component
    - `exposureMargin` — exposure margin component
    - `availableBalance` — available in account (note: different spelling from fundlimit!)
+   - `variableMargin` — VAR or variable margin required
    - `insufficientBalance` — shortfall (0 if sufficient)
+   - `brokerage` — brokerage charges for the order
    - `leverage` — STRING, not float (`"4.00"`)
 
-6. **Multi margin calculator** — includes `includePosition` and `includeOrders` booleans, `scripts` array of orders. Response includes `hedge_benefit`.
+6. **Multi margin calculator** — includes `includePosition` and `includeOrders` booleans, `scripts` array of orders.
+   - **Response uses snake_case and ALL STRING values** (different from single margin!):
+   - `total_margin`, `span_margin`, `exposure_margin` — strings like `"150000.00"`
+   - `equity_margin`, `fo_margin`, `commodity_margin` — per-segment breakdown
+   - `currency` — currency margin
+   - `hedge_benefit` — hedge benefit amount (string)
 
 7. **Fund limit response fields:** `sodLimit`, `collateralAmount`, `receiveableAmount`, `utilizedAmount`, `blockedPayoutAmount`, `withdrawableBalance`.
 

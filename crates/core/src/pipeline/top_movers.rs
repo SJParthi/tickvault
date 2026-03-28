@@ -1021,4 +1021,109 @@ mod tests {
         assert!(snapshot.most_active.len() <= TOP_N);
         assert_eq!(snapshot.total_tracked, 100);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: ticks_processed saturating behavior
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ticks_processed_uses_saturating_add() {
+        let mut tracker = TopMoversTracker::new();
+        // Feed 100 ticks: 50 valid, 50 skipped (no close). All should count.
+        for i in 0..50u32 {
+            tracker.update(&make_tick(i, 2, 110.0, 100.0, 1000));
+        }
+        for i in 50..100u32 {
+            tracker.update(&make_tick(i, 2, 110.0, 0.0, 1000)); // skipped
+        }
+        assert_eq!(tracker.ticks_processed(), 100);
+        assert_eq!(tracker.tracked_count(), 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // Update: existing vs new key in HashMap (insert vs get_mut paths)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_exercises_insert_path_for_new_key() {
+        let mut tracker = TopMoversTracker::new();
+        assert_eq!(tracker.tracked_count(), 0);
+        // First tick for this (security_id, segment) exercises the insert path
+        tracker.update(&make_tick(999, 1, 200.0, 100.0, 5000));
+        assert_eq!(tracker.tracked_count(), 1);
+    }
+
+    #[test]
+    fn update_exercises_get_mut_path_for_existing_key() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update(&make_tick(999, 1, 200.0, 100.0, 5000));
+        // Second tick for same key exercises the get_mut path
+        tracker.update(&make_tick(999, 1, 210.0, 100.0, 6000));
+        assert_eq!(tracker.tracked_count(), 1);
+        let snapshot = tracker.compute_snapshot();
+        // Should have updated values from second tick
+        assert!((snapshot.gainers[0].last_traded_price - 210.0).abs() < 0.01);
+        assert_eq!(snapshot.gainers[0].volume, 6000);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_snapshot: gainers filter (change_pct > threshold)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_snapshot_exactly_at_threshold_excluded_from_gainers() {
+        // Exactly at threshold should NOT pass the > check
+        let mut tracker = TopMoversTracker::new();
+        // change_pct = 0.01 exactly: close=10000, ltp=10001 => pct = 0.01
+        tracker.update(&make_tick(1, 2, 10001.0, 10000.0, 100));
+        let snapshot = tracker.compute_snapshot();
+        // 0.01 is NOT > 0.01, so excluded
+        assert!(
+            snapshot.gainers.is_empty(),
+            "change_pct exactly at threshold should be excluded"
+        );
+    }
+
+    #[test]
+    fn compute_snapshot_exactly_at_neg_threshold_excluded_from_losers() {
+        let mut tracker = TopMoversTracker::new();
+        // change_pct = -0.01 exactly: close=10000, ltp=9999 => pct = -0.01
+        tracker.update(&make_tick(1, 2, 9999.0, 10000.0, 100));
+        let snapshot = tracker.compute_snapshot();
+        // -0.01 is NOT < -0.01, so excluded
+        assert!(
+            snapshot.losers.is_empty(),
+            "change_pct exactly at neg threshold should be excluded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // latest_snapshot: starts None, populated after compute
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn latest_snapshot_none_before_first_compute() {
+        let tracker = TopMoversTracker::new();
+        assert!(tracker.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn latest_snapshot_some_after_compute_with_no_data() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.compute_snapshot();
+        assert!(tracker.latest_snapshot().is_some());
+        assert_eq!(tracker.latest_snapshot().unwrap().total_tracked, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default trait produces same state as new()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_tracker_no_snapshot_no_ticks() {
+        let tracker = TopMoversTracker::default();
+        assert_eq!(tracker.tracked_count(), 0);
+        assert_eq!(tracker.ticks_processed(), 0);
+        assert!(tracker.latest_snapshot().is_none());
+    }
 }

@@ -88,6 +88,11 @@ pub fn parse_full_packet(
         open_interest,
         oi_day_high,
         oi_day_low,
+        iv: f64::NAN,
+        delta: f64::NAN,
+        gamma: f64::NAN,
+        theta: f64::NAN,
+        vega: f64::NAN,
     };
 
     Ok((tick, depth))

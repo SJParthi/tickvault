@@ -337,7 +337,7 @@ fn test_config_default_values() {
         toml::from_str(VALID_CONFIG_TOML).expect("valid TOML must deserialize");
 
     // SubscriptionConfig defaults.
-    assert_eq!(config.subscription.feed_mode, "Ticker");
+    assert_eq!(config.subscription.feed_mode, "Full");
     assert!(config.subscription.subscribe_index_derivatives);
     assert_eq!(config.subscription.stock_atm_strikes_above, 10);
 

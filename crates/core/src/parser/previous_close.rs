@@ -134,4 +134,60 @@ mod tests {
             panic!("wrong error: {err:?}")
         };
     }
+
+    #[test]
+    fn test_parse_previous_close_max_oi() {
+        let (buf, hdr) = make_prev_close_packet(1, 100.0, u32::MAX);
+        let data = parse_previous_close_packet(&buf, &hdr).unwrap();
+        assert_eq!(data.previous_oi, u32::MAX);
+    }
+
+    #[test]
+    fn test_parse_previous_close_nan_price() {
+        let (buf, hdr) = make_prev_close_packet(1, f32::NAN, 0);
+        let data = parse_previous_close_packet(&buf, &hdr).unwrap();
+        assert!(data.previous_close.is_nan());
+    }
+
+    #[test]
+    fn test_parse_previous_close_infinity_price() {
+        let (buf, hdr) = make_prev_close_packet(1, f32::INFINITY, 0);
+        let data = parse_previous_close_packet(&buf, &hdr).unwrap();
+        assert!(data.previous_close.is_infinite());
+    }
+
+    #[test]
+    fn test_parse_previous_close_negative_price() {
+        let (buf, hdr) = make_prev_close_packet(1, -500.0, 0);
+        let data = parse_previous_close_packet(&buf, &hdr).unwrap();
+        assert!(data.previous_close < 0.0);
+    }
+
+    #[test]
+    fn test_parse_previous_close_extra_bytes_ignored() {
+        let (mut buf, hdr) = make_prev_close_packet(1, 100.0, 5000);
+        buf.extend_from_slice(&[0xFF; 20]);
+        let data = parse_previous_close_packet(&buf, &hdr).unwrap();
+        assert!((data.previous_close - 100.0).abs() < f32::EPSILON);
+        assert_eq!(data.previous_oi, 5000);
+    }
+
+    #[test]
+    fn test_parse_previous_close_header_only_fails() {
+        let buf = vec![0u8; 8];
+        let hdr = PacketHeader {
+            response_code: 6,
+            message_length: 16,
+            exchange_segment_code: 0,
+            security_id: 1,
+        };
+        let err = parse_previous_close_packet(&buf, &hdr).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 16,
+            actual: 8,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
+    }
 }

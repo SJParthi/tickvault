@@ -33,7 +33,7 @@ ringbuf = "0.4.8"
 
 # ---- Section 4: Database & Cache ----
 questdb-rs = { version = "6.1.0", features = ["chrono_timestamp"] }
-redis = { version = "1.0.5", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.1.0", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = "0.23.0"
 
 # ---- Section 5: Observability — Metrics ----
@@ -54,13 +54,13 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32.1"
 
 # ---- Section 6: Trading Domain — Auth ----
-arc-swap = "1.7.1"
+arc-swap = "1.9.0"
 jsonwebtoken = "10.3.0"
 totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
 statig = "0.4.1"
-blackscholes = "0.24.0"
+jaeckel = "0.2.0"
 governor = "0.10.2"
 failsafe = "1.3.0"
 backon = "1.6.0"
@@ -75,7 +75,7 @@ tower = { version = "0.5.2", features = ["full"] }
 tower-http = { version = "0.6.5", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "1.0.7"
+toml = "1.1.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----

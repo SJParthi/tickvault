@@ -336,7 +336,8 @@ impl Default for ObservabilityConfig {
 /// expiry only with ATM ± N strike filtering.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionConfig {
-    /// Feed mode for all subscriptions. Start with Ticker, upgrade later.
+    /// Feed mode for all subscriptions. Always Full for maximum data (LTP, OI, depth).
+    /// IDX_I instruments are forced to Ticker at connection level (Dhan limitation).
     /// Valid values: "Ticker", "Quote", "Full".
     pub feed_mode: String,
 
@@ -368,7 +369,7 @@ pub struct SubscriptionConfig {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
-            feed_mode: "Ticker".to_string(),
+            feed_mode: "Full".to_string(),
             subscribe_index_derivatives: true,
             subscribe_stock_derivatives: true,
             subscribe_display_indices: true,
@@ -502,6 +503,14 @@ pub struct GreeksConfig {
     /// IV solver convergence tolerance.
     #[serde(default = "default_iv_solver_tolerance")]
     pub iv_solver_tolerance: f64,
+    /// Day count divisor for theta conversion (365.0 = calendar, 252.0 = trading days).
+    /// Calibrated to match Dhan's computation. Default: 365.0.
+    #[serde(default = "default_day_count")]
+    pub day_count: f64,
+    /// Rate mode: "dhan" = fixed 10% (match Dhan/NSE), "theoretical" = RBI repo rate lookup.
+    /// Default: "dhan".
+    #[serde(default = "default_rate_mode")]
+    pub rate_mode: String,
 }
 
 impl Default for GreeksConfig {
@@ -513,6 +522,8 @@ impl Default for GreeksConfig {
             dividend_yield: default_dividend_yield(),
             iv_solver_max_iterations: default_iv_solver_max_iterations(),
             iv_solver_tolerance: default_iv_solver_tolerance(),
+            day_count: default_day_count(),
+            rate_mode: default_rate_mode(),
         }
     }
 }
@@ -525,12 +536,15 @@ const fn default_greeks_fetch_interval_secs() -> u64 {
     60
 }
 
+// Calibrated against Dhan's live option chain data (2026-03-23).
+// Dhan's theta best matches at r ≈ 0.10. Gamma/vega insensitive to rate for short-dated.
 const fn default_risk_free_rate() -> f64 {
-    0.068
+    0.10
 }
 
+// Calibrated: Dhan uses q=0.0 for index options (no continuous dividend).
 const fn default_dividend_yield() -> f64 {
-    0.012
+    0.0
 }
 
 const fn default_iv_solver_max_iterations() -> u32 {
@@ -539,6 +553,14 @@ const fn default_iv_solver_max_iterations() -> u32 {
 
 const fn default_iv_solver_tolerance() -> f64 {
     1e-8
+}
+
+const fn default_day_count() -> f64 {
+    365.0
+}
+
+fn default_rate_mode() -> String {
+    String::from("dhan")
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,9 +1303,22 @@ mod tests {
     }
 
     #[test]
+    fn test_greeks_config_default() {
+        let config = GreeksConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.fetch_interval_secs, 60);
+        assert!((config.risk_free_rate - 0.10).abs() < f64::EPSILON);
+        assert!((config.dividend_yield - 0.0).abs() < f64::EPSILON);
+        assert_eq!(config.iv_solver_max_iterations, 50);
+        assert!((config.iv_solver_tolerance - 1e-8).abs() < f64::EPSILON);
+        assert!((config.day_count - 365.0).abs() < f64::EPSILON);
+        assert_eq!(config.rate_mode, "dhan");
+    }
+
+    #[test]
     fn test_subscription_config_default() {
         let config = SubscriptionConfig::default();
-        assert_eq!(config.feed_mode, "Ticker");
+        assert_eq!(config.feed_mode, "Full");
         assert!(config.subscribe_index_derivatives);
         assert!(config.subscribe_stock_derivatives);
         assert!(config.subscribe_display_indices);

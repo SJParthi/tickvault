@@ -22,6 +22,7 @@ governor = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 metrics = { workspace = true }
+jaeckel = { workspace = true }
 loom = { workspace = true, optional = true }
 
 [features]
@@ -38,4 +39,4 @@ name = "oms"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
+ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]

@@ -66,4 +66,32 @@ mod tests {
             panic!("wrong error: {err:?}")
         };
     }
+
+    #[test]
+    fn test_validate_market_status_single_byte_fails() {
+        let err = validate_market_status_packet(&[0]).unwrap_err();
+        let ParseError::InsufficientBytes {
+            expected: 8,
+            actual: 1,
+        } = err
+        else {
+            panic!("wrong error: {err:?}")
+        };
+    }
+
+    #[test]
+    fn test_validate_market_status_exactly_8_bytes_ok() {
+        assert!(validate_market_status_packet(&[0u8; 8]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_market_status_content_irrelevant() {
+        // Market status packet is header-only — content of bytes is irrelevant
+        assert!(validate_market_status_packet(&[0xFF; 8]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_market_status_large_buffer() {
+        assert!(validate_market_status_packet(&[0u8; 1000]).is_ok());
+    }
 }

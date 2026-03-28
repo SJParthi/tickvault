@@ -118,6 +118,11 @@ pub struct InstrumentRegistry {
 
     /// Total subscribed instrument count.
     total_count: usize,
+
+    /// O(1) reverse lookup: underlying_symbol → price_feed_security_id.
+    /// Built at construction time from MajorIndexValue + StockEquity instruments.
+    /// Used by GreeksAggregator to map F&O tick → underlying spot price.
+    underlying_symbol_to_security_id: HashMap<String, SecurityId>,
 }
 
 impl InstrumentRegistry {
@@ -127,6 +132,7 @@ impl InstrumentRegistry {
             instruments: HashMap::new(),
             category_counts: HashMap::new(),
             total_count: 0,
+            underlying_symbol_to_security_id: HashMap::new(),
         }
     }
 
@@ -147,10 +153,24 @@ impl InstrumentRegistry {
 
         let total_count = map.len();
 
+        // Build reverse lookup: underlying_symbol → price_feed_security_id.
+        // Only indices and equities serve as price feeds for F&O underlyings.
+        let mut underlying_symbol_to_security_id = HashMap::new();
+        for instrument in map.values() {
+            match instrument.category {
+                SubscriptionCategory::MajorIndexValue | SubscriptionCategory::StockEquity => {
+                    underlying_symbol_to_security_id
+                        .insert(instrument.underlying_symbol.clone(), instrument.security_id);
+                }
+                _ => {}
+            }
+        }
+
         Self {
             instruments: map,
             category_counts,
             total_count,
+            underlying_symbol_to_security_id,
         }
     }
 
@@ -191,6 +211,15 @@ impl InstrumentRegistry {
     /// Returns an iterator over all subscribed instruments.
     pub fn iter(&self) -> impl Iterator<Item = &SubscribedInstrument> {
         self.instruments.values()
+    }
+
+    /// O(1) reverse lookup: returns the price_feed_security_id for an underlying symbol.
+    ///
+    /// Used by `GreeksAggregator` to find the spot price security_id from an F&O
+    /// tick's `underlying_symbol`. Returns `None` if the symbol is not tracked.
+    #[inline]
+    pub fn get_underlying_security_id(&self, symbol: &str) -> Option<SecurityId> {
+        self.underlying_symbol_to_security_id.get(symbol).copied()
     }
 
     /// Returns all security_ids grouped by exchange segment.
@@ -589,10 +618,26 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_category_display() {
+    fn test_subscription_category_display_all_variants() {
         assert_eq!(
             format!("{}", SubscriptionCategory::MajorIndexValue),
             "MajorIndexValue"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::DisplayIndex),
+            "DisplayIndex"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::IndexDerivative),
+            "IndexDerivative"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::StockEquity),
+            "StockEquity"
+        );
+        assert_eq!(
+            format!("{}", SubscriptionCategory::StockDerivative),
+            "StockDerivative"
         );
     }
 
@@ -980,5 +1025,42 @@ mod tests {
         ];
         let set: HashSet<SubscriptionCategory> = categories.iter().copied().collect();
         assert_eq!(set.len(), 5);
+    }
+
+    // --- Underlying reverse lookup tests ---
+
+    #[test]
+    fn test_underlying_reverse_lookup() {
+        let mut nifty = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty.underlying_symbol = "NIFTY".to_string();
+        let mut reliance = sample_instrument(2885, SubscriptionCategory::StockEquity);
+        reliance.underlying_symbol = "RELIANCE".to_string();
+        let registry = InstrumentRegistry::from_instruments(vec![nifty, reliance]);
+
+        assert_eq!(registry.get_underlying_security_id("NIFTY"), Some(13));
+        assert_eq!(registry.get_underlying_security_id("RELIANCE"), Some(2885));
+    }
+
+    #[test]
+    fn test_underlying_reverse_lookup_missing() {
+        let nifty = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        let registry = InstrumentRegistry::from_instruments(vec![nifty]);
+        assert_eq!(registry.get_underlying_security_id("BANKNIFTY"), None);
+    }
+
+    #[test]
+    fn test_underlying_reverse_lookup_excludes_derivatives() {
+        // Derivatives should NOT appear in the reverse lookup
+        let mut deriv = sample_instrument(50000, SubscriptionCategory::IndexDerivative);
+        deriv.underlying_symbol = "NIFTY".to_string();
+        let registry = InstrumentRegistry::from_instruments(vec![deriv]);
+        // Derivative with underlying_symbol = "NIFTY" should not be in reverse map
+        assert_eq!(registry.get_underlying_security_id("NIFTY"), None);
+    }
+
+    #[test]
+    fn test_underlying_reverse_lookup_empty_registry() {
+        let registry = InstrumentRegistry::empty();
+        assert_eq!(registry.get_underlying_security_id("NIFTY"), None);
     }
 }

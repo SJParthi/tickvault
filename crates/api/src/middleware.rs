@@ -79,9 +79,12 @@ impl ApiAuthConfig {
                 } else {
                     // Fail-closed: generate a random token so auth is still enforced.
                     let generated_token = uuid::Uuid::new_v4().to_string();
+                    // SECURITY: Do NOT log the generated token — it protects
+                    // the /api/instruments/rebuild endpoint. Log only the fact
+                    // that one was generated.
                     error!(
                         "GAP-SEC-01 CRITICAL: DLT_API_TOKEN not set in LIVE mode — \
-                         auto-generated bearer token for this session: {generated_token}"
+                         auto-generated bearer token for this session (set DLT_API_TOKEN env var)"
                     );
                     warn!(
                         "GAP-SEC-01: Set DLT_API_TOKEN environment variable to suppress this warning"

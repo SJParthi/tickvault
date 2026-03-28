@@ -7,6 +7,17 @@
 
 ---
 
+## Version 2.5.1 — Mar 17, 2026
+
+### Improvements
+- **Market Order conversion**: Effective March 21 — market orders via API will be converted to limit orders with Market Protection Percentage (MPP). This is a Dhan/exchange-side conversion; API behavior unchanged.
+- **Order rate limits**: Reduced to 10/sec (already enforced since v2.3).
+
+### Breaking Changes
+- **Static IP mandatory for ALL API orders**: Effective April 1 — all API orders (place/modify/cancel) must come from a whitelisted static IP. Already required since v2.4 but now strictly enforced by exchange.
+
+---
+
 ## Version 2.5 — Feb 09, 2026
 
 ### New Features

@@ -514,6 +514,153 @@ mod tests {
         assert_eq!(msg.data.price, 0.0);
     }
 
+    // --- Serde roundtrip for ALL OrderStatus variants ---
+
+    #[test]
+    fn test_order_status_serde_roundtrip_all_variants() {
+        let variants = [
+            (OrderStatus::Transit, "\"TRANSIT\""),
+            (OrderStatus::Pending, "\"PENDING\""),
+            (OrderStatus::Confirmed, "\"CONFIRMED\""),
+            (OrderStatus::PartTraded, "\"PART_TRADED\""),
+            (OrderStatus::Traded, "\"TRADED\""),
+            (OrderStatus::Cancelled, "\"CANCELLED\""),
+            (OrderStatus::Rejected, "\"REJECTED\""),
+            (OrderStatus::Expired, "\"EXPIRED\""),
+            (OrderStatus::Closed, "\"CLOSED\""),
+            (OrderStatus::Triggered, "\"TRIGGERED\""),
+        ];
+        for (variant, expected_json) in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json);
+            let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, deserialized);
+        }
+    }
+
+    // --- Serde roundtrip for ALL TransactionType variants ---
+
+    #[test]
+    fn test_transaction_type_serde_roundtrip_all_variants() {
+        for variant in [TransactionType::Buy, TransactionType::Sell] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: TransactionType = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, deserialized);
+        }
+    }
+
+    // --- Serde roundtrip for ALL ProductType variants ---
+
+    #[test]
+    fn test_product_type_serde_roundtrip_all_variants() {
+        let variants = [
+            (ProductType::Cnc, "\"CNC\""),
+            (ProductType::Intraday, "\"INTRADAY\""),
+            (ProductType::Margin, "\"MARGIN\""),
+            (ProductType::Mtf, "\"MTF\""),
+            (ProductType::Co, "\"CO\""),
+            (ProductType::Bo, "\"BO\""),
+        ];
+        for (variant, expected_json) in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json);
+            let deserialized: ProductType = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, deserialized);
+        }
+    }
+
+    // --- Serde roundtrip for ALL OrderType variants ---
+
+    #[test]
+    fn test_order_type_serde_roundtrip_all_variants() {
+        let variants = [
+            (OrderType::Limit, "\"LIMIT\""),
+            (OrderType::Market, "\"MARKET\""),
+            (OrderType::StopLoss, "\"STOP_LOSS\""),
+            (OrderType::StopLossMarket, "\"STOP_LOSS_MARKET\""),
+        ];
+        for (variant, expected_json) in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json);
+            let deserialized: OrderType = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, deserialized);
+        }
+    }
+
+    // --- Serde roundtrip for ALL OrderValidity variants ---
+
+    #[test]
+    fn test_order_validity_serde_roundtrip_all_variants() {
+        for variant in [OrderValidity::Day, OrderValidity::Ioc] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: OrderValidity = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, deserialized);
+        }
+    }
+
+    // --- OrderUpdate: source and off_mkt_flag fields ---
+
+    #[test]
+    fn test_order_update_source_and_off_mkt_flag_from_json() {
+        let json = r#"{
+            "Data": {
+                "OrderNo": "111",
+                "Status": "TRADED",
+                "Source": "P",
+                "OffMktFlag": "1"
+            },
+            "Type": "order_alert"
+        }"#;
+        let msg: OrderUpdateMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.data.source, "P");
+        assert_eq!(msg.data.off_mkt_flag, "1");
+        assert_eq!(msg.r#type, "order_alert");
+    }
+
+    // --- OrderStatus Debug impl ---
+
+    #[test]
+    fn test_order_status_debug() {
+        let debug = format!("{:?}", OrderStatus::PartTraded);
+        assert!(debug.contains("PartTraded"));
+    }
+
+    // --- OrderUpdate with Type field ---
+
+    #[test]
+    fn test_order_update_message_type_field() {
+        let json = r#"{
+            "Data": {
+                "OrderNo": "222",
+                "Status": "PENDING"
+            },
+            "Type": "order_alert"
+        }"#;
+        let msg: OrderUpdateMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.r#type, "order_alert");
+    }
+
+    // --- OrderUpdate Hash/Eq/Clone ---
+
+    #[test]
+    fn test_order_status_hash_eq() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(OrderStatus::Transit);
+        set.insert(OrderStatus::Traded);
+        set.insert(OrderStatus::Transit); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_transaction_type_hash_eq() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TransactionType::Buy);
+        set.insert(TransactionType::Sell);
+        assert_eq!(set.len(), 2);
+    }
+
     #[test]
     fn test_order_update_serialize_roundtrip() {
         let update = OrderUpdate {

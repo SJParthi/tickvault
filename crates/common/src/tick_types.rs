@@ -48,6 +48,16 @@ pub struct ParsedTick {
     pub oi_day_high: u32,
     /// OI day low (from Full packet; 0 for Ticker/Quote).
     pub oi_day_low: u32,
+    /// Implied volatility (annualized decimal, e.g., 0.30 = 30%). f64::NAN for non-F&O.
+    pub iv: f64,
+    /// Delta (rate of option price change w.r.t. underlying). f64::NAN for non-F&O.
+    pub delta: f64,
+    /// Gamma (rate of delta change w.r.t. underlying). f64::NAN for non-F&O.
+    pub gamma: f64,
+    /// Theta (daily time decay). f64::NAN for non-F&O.
+    pub theta: f64,
+    /// Vega (sensitivity per 1% vol change). f64::NAN for non-F&O.
+    pub vega: f64,
 }
 
 impl Default for ParsedTick {
@@ -70,6 +80,11 @@ impl Default for ParsedTick {
             open_interest: 0,
             oi_day_high: 0,
             oi_day_low: 0,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         }
     }
 }
@@ -171,6 +186,27 @@ impl Default for OptionGreeksSnapshot {
             pcr: 0.0,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GreeksEnricher — trait for inline Greeks computation on the hot path
+// ---------------------------------------------------------------------------
+
+/// Trait for enriching ticks with Greeks data on the hot path.
+///
+/// Implemented in `crates/trading` (InlineGreeksComputer) and injected into
+/// `crates/core` tick_processor via `Box<dyn GreeksEnricher>`.
+///
+/// # Contract
+/// - `enrich()` is called once per valid tick, BEFORE persistence and broadcast.
+/// - For index/equity ticks: updates internal underlying LTP cache, no Greeks.
+/// - For F&O option ticks: mutates `tick.iv`, `tick.delta`, `tick.gamma`,
+///   `tick.theta`, `tick.vega` in-place. Leaves them as NAN if computation fails.
+/// - Must be O(1) per tick (HashMap lookups + Jaeckel IV solver).
+/// - Must not allocate on the hot path (all maps pre-allocated).
+pub trait GreeksEnricher: Send {
+    /// Enrich a parsed tick with Greeks. Mutates Greeks fields in place.
+    fn enrich(&mut self, tick: &mut ParsedTick);
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +663,11 @@ mod tests {
             open_interest: 120000,
             oi_day_high: 130000,
             oi_day_low: 110000,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         assert_eq!(tick.security_id, 52432);
         assert_eq!(tick.exchange_segment_code, 2);
@@ -738,6 +779,267 @@ mod tests {
         assert_eq!(g.iv, copy.iv);
         assert_eq!(g.delta, copy.delta);
         assert_eq!(g.pcr, copy.pcr);
+    }
+
+    // --- DhanDailyResponse deserialization from JSON ---
+
+    #[test]
+    fn test_daily_response_full_json_deserialize() {
+        let json = r#"{
+            "open": [100.0, 101.0],
+            "high": [102.0, 103.0],
+            "low": [99.0, 100.0],
+            "close": [101.0, 102.0],
+            "volume": [100000.0, 200000.0],
+            "timestamp": [1700000000.0, 1700086400.0],
+            "open_interest": [5000.0, 6000.0]
+        }"#;
+        let resp: DhanDailyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.len(), 2);
+        assert!(resp.is_consistent());
+        assert_eq!(resp.volume, vec![100000, 200000]);
+        assert_eq!(resp.timestamp, vec![1700000000, 1700086400]);
+        assert_eq!(resp.open_interest, vec![5000, 6000]);
+    }
+
+    #[test]
+    fn test_daily_response_empty_json_deserialize() {
+        let json = r#"{
+            "open": [],
+            "high": [],
+            "low": [],
+            "close": [],
+            "volume": [],
+            "timestamp": []
+        }"#;
+        let resp: DhanDailyResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.is_empty());
+        assert_eq!(resp.len(), 0);
+        assert!(resp.is_consistent());
+    }
+
+    #[test]
+    fn test_daily_response_missing_oi_defaults_empty() {
+        let json = r#"{
+            "open": [100.0],
+            "high": [102.0],
+            "low": [99.0],
+            "close": [101.0],
+            "volume": [1000.0],
+            "timestamp": [1700000000.0]
+        }"#;
+        let resp: DhanDailyResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.open_interest.is_empty());
+        assert!(resp.is_consistent());
+    }
+
+    #[test]
+    fn test_daily_response_inconsistent_open_length() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0], // 1 vs 2
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_daily_response_inconsistent_close_length() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0], // 1 vs 2
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_daily_response_inconsistent_volume_length() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000], // 1 vs 2
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    // --- DhanIntradayResponse more edge cases ---
+
+    #[test]
+    fn test_intraday_response_inconsistent_close_length() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0], // 1 vs 2
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_intraday_response_inconsistent_volume_length() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000], // 1 vs 2
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_intraday_response_inconsistent_low_length() {
+        let resp = DhanIntradayResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0], // 1 vs 2
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700000060],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    // --- DhanDailyResponse inconsistent low/high lengths ---
+
+    #[test]
+    fn test_daily_response_inconsistent_low_length() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0, 103.0],
+            low: vec![99.0], // 1 vs 2
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    #[test]
+    fn test_daily_response_inconsistent_high_length() {
+        let resp = DhanDailyResponse {
+            open: vec![100.0, 101.0],
+            high: vec![102.0], // 1 vs 2
+            low: vec![99.0, 100.0],
+            close: vec![101.0, 102.0],
+            volume: vec![1000, 2000],
+            timestamp: vec![1700000000, 1700086400],
+            open_interest: vec![],
+        };
+        assert!(!resp.is_consistent());
+    }
+
+    // --- HistoricalCandle field access ---
+
+    #[test]
+    fn test_historical_candle_all_timeframes() {
+        for tf in ["1m", "5m", "15m", "60m", "1d"] {
+            let candle = HistoricalCandle {
+                timestamp_utc_secs: 1700000000,
+                security_id: 42,
+                exchange_segment_code: 2,
+                timeframe: tf,
+                open: 100.0,
+                high: 102.0,
+                low: 99.0,
+                close: 101.0,
+                volume: 1000,
+                open_interest: 0,
+            };
+            assert_eq!(candle.timeframe, tf);
+        }
+    }
+
+    // --- ParsedTick Debug impl ---
+
+    #[test]
+    fn test_parsed_tick_debug_output() {
+        let tick = ParsedTick {
+            security_id: 42,
+            last_traded_price: 100.5,
+            ..Default::default()
+        };
+        let debug = format!("{:?}", tick);
+        assert!(debug.contains("ParsedTick"));
+        assert!(debug.contains("42"));
+    }
+
+    // --- MarketDepthLevel Debug impl ---
+
+    #[test]
+    fn test_market_depth_level_debug_output() {
+        let level = MarketDepthLevel {
+            bid_quantity: 100,
+            ask_quantity: 200,
+            bid_orders: 5,
+            ask_orders: 10,
+            bid_price: 245.5,
+            ask_price: 246.0,
+        };
+        let debug = format!("{:?}", level);
+        assert!(debug.contains("MarketDepthLevel"));
+    }
+
+    // --- DeepDepthLevel Debug impl ---
+
+    #[test]
+    fn test_deep_depth_level_debug_output() {
+        let level = DeepDepthLevel {
+            price: 24500.50,
+            quantity: 1000,
+            orders: 42,
+        };
+        let debug = format!("{:?}", level);
+        assert!(debug.contains("DeepDepthLevel"));
+    }
+
+    // --- OptionGreeksSnapshot Debug impl ---
+
+    #[test]
+    fn test_option_greeks_snapshot_debug_output() {
+        let g = OptionGreeksSnapshot::default();
+        let debug = format!("{:?}", g);
+        assert!(debug.contains("OptionGreeksSnapshot"));
+    }
+
+    // --- HistoricalCandle Debug impl ---
+
+    #[test]
+    fn test_historical_candle_debug_output() {
+        let candle = HistoricalCandle {
+            timestamp_utc_secs: 1700000000,
+            security_id: 42,
+            exchange_segment_code: 2,
+            timeframe: "1m",
+            open: 100.0,
+            high: 102.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1000,
+            open_interest: 5000,
+        };
+        let debug = format!("{:?}", candle);
+        assert!(debug.contains("HistoricalCandle"));
     }
 
     #[test]

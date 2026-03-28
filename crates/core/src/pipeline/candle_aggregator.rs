@@ -7,7 +7,7 @@
 //! # Performance
 //! - O(1) per tick: HashMap lookup + OHLCV update (all inline arithmetic)
 //! - Pre-allocated HashMap (no reallocation on hot path)
-//! - `LiveCandle` is 32 bytes (Copy, half cache line)
+//! - `LiveCandle` is Copy, compact struct (OHLCV + Greeks)
 
 use std::collections::HashMap;
 
@@ -30,7 +30,7 @@ const STALE_CANDLE_THRESHOLD_SECS: u32 = 5;
 
 /// A single in-memory 1-second candle being accumulated from live ticks.
 ///
-/// 36 bytes — fits in a cache line. Copy for zero-allocation hot path.
+/// Copy for zero-allocation hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct LiveCandle {
     /// Candle timestamp (exchange_timestamp truncated to second boundary).
@@ -47,6 +47,16 @@ pub struct LiveCandle {
     pub volume: u32,
     /// Number of ticks aggregated into this candle.
     pub tick_count: u32,
+    /// Implied volatility (latest snapshot from Greeks pipeline, f64::NAN if not available).
+    pub iv: f64,
+    /// Delta (latest snapshot from Greeks pipeline, f64::NAN if not available).
+    pub delta: f64,
+    /// Gamma (latest snapshot from Greeks pipeline, f64::NAN if not available).
+    pub gamma: f64,
+    /// Theta (latest snapshot from Greeks pipeline, f64::NAN if not available).
+    pub theta: f64,
+    /// Vega (latest snapshot from Greeks pipeline, f64::NAN if not available).
+    pub vega: f64,
 }
 
 impl LiveCandle {
@@ -61,6 +71,11 @@ impl LiveCandle {
             close: tick.last_traded_price,
             volume: tick.volume,
             tick_count: 1,
+            iv: tick.iv,
+            delta: tick.delta,
+            gamma: tick.gamma,
+            theta: tick.theta,
+            vega: tick.vega,
         }
     }
 
@@ -76,6 +91,14 @@ impl LiveCandle {
         self.close = tick.last_traded_price;
         self.volume = tick.volume; // Snapshot, not incremental
         self.tick_count = self.tick_count.saturating_add(1);
+        // Update Greeks from latest tick snapshot (only if available).
+        if !tick.iv.is_nan() {
+            self.iv = tick.iv;
+            self.delta = tick.delta;
+            self.gamma = tick.gamma;
+            self.theta = tick.theta;
+            self.vega = tick.vega;
+        }
     }
 }
 
@@ -104,6 +127,16 @@ pub struct CompletedCandle {
     pub volume: u32,
     /// Number of ticks aggregated into this candle.
     pub tick_count: u32,
+    /// Implied volatility (latest snapshot, f64::NAN if not available).
+    pub iv: f64,
+    /// Delta (latest snapshot, f64::NAN if not available).
+    pub delta: f64,
+    /// Gamma (latest snapshot, f64::NAN if not available).
+    pub gamma: f64,
+    /// Theta (latest snapshot, f64::NAN if not available).
+    pub theta: f64,
+    /// Vega (latest snapshot, f64::NAN if not available).
+    pub vega: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +199,11 @@ impl CandleAggregator {
                     close: candle.close,
                     volume: candle.volume,
                     tick_count: candle.tick_count,
+                    iv: candle.iv,
+                    delta: candle.delta,
+                    gamma: candle.gamma,
+                    theta: candle.theta,
+                    vega: candle.vega,
                 });
                 self.total_completed = self.total_completed.saturating_add(1);
                 *candle = LiveCandle::from_tick(tick);
@@ -195,6 +233,11 @@ impl CandleAggregator {
                     close: candle.close,
                     volume: candle.volume,
                     tick_count: candle.tick_count,
+                    iv: candle.iv,
+                    delta: candle.delta,
+                    gamma: candle.gamma,
+                    theta: candle.theta,
+                    vega: candle.vega,
                 });
                 self.total_completed = self.total_completed.saturating_add(1);
                 false // Remove from map
@@ -217,6 +260,11 @@ impl CandleAggregator {
                 close: candle.close,
                 volume: candle.volume,
                 tick_count: candle.tick_count,
+                iv: candle.iv,
+                delta: candle.delta,
+                gamma: candle.gamma,
+                theta: candle.theta,
+                vega: candle.vega,
             });
             self.total_completed = self.total_completed.saturating_add(1);
         }
@@ -401,9 +449,10 @@ mod tests {
 
     #[test]
     fn live_candle_size_is_compact() {
+        // 28 bytes (OHLCV + meta) + 40 bytes (5 × f64 Greeks) + padding = 72 bytes
         assert!(
-            std::mem::size_of::<LiveCandle>() <= 36,
-            "LiveCandle must fit in a cache line"
+            std::mem::size_of::<LiveCandle>() <= 80,
+            "LiveCandle must be compact (OHLCV + Greeks)"
         );
     }
 
@@ -493,6 +542,11 @@ mod tests {
             close: 105.0,
             volume: 500,
             tick_count: 10,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
         };
         let copy = c; // Copy
         assert_eq!(c.security_id, copy.security_id);
@@ -773,5 +827,112 @@ mod tests {
             60,
             "all 60 candles fit in one 5-minute window"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage: CandleAggregator::new(), Default, accessor methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_aggregator_is_empty() {
+        let agg = CandleAggregator::new();
+        assert_eq!(agg.active_count(), 0);
+        assert_eq!(agg.total_completed(), 0);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_default_matches_new() {
+        let from_new = CandleAggregator::new();
+        let from_default = CandleAggregator::default();
+        assert_eq!(from_new.active_count(), from_default.active_count());
+        assert_eq!(from_new.total_completed(), from_default.total_completed());
+    }
+
+    #[test]
+    fn test_clear_completed_preserves_capacity() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(1, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(1, 2, 101.0, 1001, 600));
+        assert!(!agg.completed_slice().is_empty());
+        agg.clear_completed();
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_flush_all_emits_all_active_candles() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(1, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(2, 2, 200.0, 1000, 600));
+        agg.update(&make_tick(3, 1, 300.0, 1000, 700));
+        assert_eq!(agg.active_count(), 3);
+
+        agg.flush_all();
+        assert_eq!(agg.active_count(), 0);
+        assert_eq!(agg.completed_slice().len(), 3);
+        assert_eq!(agg.total_completed(), 3);
+    }
+
+    #[test]
+    fn test_update_first_tick_creates_active_candle() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(42, 2, 100.0, 1000, 500));
+        assert_eq!(agg.active_count(), 1);
+        assert_eq!(agg.total_completed(), 0);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_update_same_second_updates_in_place() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(42, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(42, 2, 110.0, 1000, 600)); // same second
+        assert_eq!(agg.active_count(), 1);
+        assert_eq!(agg.total_completed(), 0);
+    }
+
+    #[test]
+    fn test_drain_completed_returns_and_clears() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(42, 2, 100.0, 1000, 500));
+        agg.update(&make_tick(42, 2, 101.0, 1001, 600)); // completes 1000
+        let drained = agg.drain_completed();
+        assert_eq!(drained.len(), 1);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_sweep_stale_no_stale_candles() {
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(1, 2, 100.0, 1000, 500));
+        agg.sweep_stale(1002); // only 2s old, threshold is 5s
+        assert_eq!(agg.active_count(), 1);
+        assert!(agg.completed_slice().is_empty());
+    }
+
+    #[test]
+    fn test_completed_candle_fields_copy() {
+        let candle = CompletedCandle {
+            security_id: 42,
+            exchange_segment_code: 2,
+            timestamp_secs: 1000,
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 105.0,
+            volume: 5000,
+            tick_count: 5,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
+        };
+        let copied = candle;
+        assert_eq!(copied.security_id, candle.security_id);
+        assert_eq!(copied.open, candle.open);
+        assert_eq!(copied.high, candle.high);
+        assert_eq!(copied.low, candle.low);
+        assert_eq!(copied.close, candle.close);
     }
 }

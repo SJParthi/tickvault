@@ -7,7 +7,7 @@
 > Single source of truth for all versions, components, and architecture.
 > If CLAUDE.md and the Bible conflict, the Bible wins.
 >
-> **Versions reconciled with Cargo.toml on 2026-02-26.**
+> **Versions reconciled with Cargo.toml on 2026-03-24.**
 > Cargo.toml is the executable truth — this file tracks it.
 
 ---
@@ -20,7 +20,7 @@
 | 6 | Rust Toolchain | 1.93.1 | Compiler version — pinned, no nightly |
 | 7 | tokio | 1.49.0 | Async runtime — full features |
 | 8 | tracing | 0.1.44 | Structured logging spans |
-| 9 | tracing-subscriber | 0.3.22 | Log formatting: JSON, filtering, layers |
+| 9 | tracing-subscriber | 0.3.23 | Log formatting: JSON, filtering, layers |
 
 ---
 
@@ -28,11 +28,11 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 10 | tokio-tungstenite | 0.28.0 | WebSocket client for Dhan V2 binary feed |
-| 11 | zerocopy | 0.8.39 | Zero-allocation binary parsing of tick packets |
+| 10 | tokio-tungstenite | 0.29.0 | WebSocket client for Dhan V2 binary feed |
+| 11 | zerocopy | 0.8.47 | Zero-allocation binary parsing of tick packets |
 | 12 | rtrb | 0.3.1 | Lock-free SPSC ring buffer — tick pipeline |
 | 13 | crossbeam-channel | 0.5.15 | MPMC channel for fan-out routing |
-| 14 | arc-swap | 1.7.1 | O(1) atomic pointer swap for token/config |
+| 14 | arc-swap | 1.9.0 | O(1) atomic pointer swap for token/config |
 | 15 | papaya | 0.2.3 | Lock-free concurrent HashMap for hot-path lookups |
 
 ---
@@ -44,7 +44,7 @@
 | 16 | QuestDB | 8.3.3 | Time-series DB: tick storage, OHLCV, audit |
 | 17 | questdb-rs | 6.1.0 | ILP client: high-throughput row ingestion |
 | 18 | Valkey | 9.0.2-alpine | In-memory cache (Redis fork): OMS state, live greeks |
-| 19 | redis (crate) | 1.0.5 | Rust client for Valkey — async, connection pool |
+| 19 | redis (crate) | 1.1.0 | Rust client for Valkey — async, connection pool |
 | 20 | deadpool-redis | 0.23.0 | Async connection pool for Valkey |
 
 ---
@@ -61,8 +61,8 @@
 | 26 | Jaeger v2 | 2.15.0 | Distributed tracing — trace every tick, order |
 | 27 | opentelemetry | 0.31.0 | OTel API — vendor-neutral tracing interface |
 | 28 | opentelemetry_sdk | 0.31.0 | OTel SDK — span processing, export |
-| 29 | opentelemetry-otlp | 0.31.0 | OTLP exporter — sends traces to Jaeger v2 |
-| 30 | tracing-opentelemetry | 0.31.0 | Bridge: tracing spans → OTel spans |
+| 29 | opentelemetry-otlp | 0.31.1 | OTLP exporter — sends traces to Jaeger v2 |
+| 30 | tracing-opentelemetry | 0.32.1 | Bridge: tracing spans → OTel spans |
 | 31 | opentelemetry-semantic-conventions | 0.31.0 | Standard attribute names for spans |
 | 32 | Grafana dashboards | Custom JSON | Pre-built panels for every metric |
 | 33 | Grafana | 12.3.3 | Observability dashboards: ticks, P&L, risk, OMS state |
@@ -75,10 +75,10 @@
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
 | 35 | yata | 0.7.0 | Technical indicators (EMA, RSI, MACD, etc.) |
-| 36 | blackscholes | 0.24.0 | Options pricing: Black-Scholes IV & greeks |
+| 36 | jaeckel | 0.2.0 | Options pricing: Jaeckel "Let's Be Rational" IV solver + Cody CDF |
 | 37 | statrs | 0.18.0 | Stats/probability: normal CDF for options |
 | 38 | governor | 0.10.2 | Rate limiter (GCRA): 10 orders/sec SEBI limit |
-| 39 | statig | 0.3.0 | Type-safe state machine for OMS transitions |
+| 39 | statig | 0.4.1 | Type-safe state machine for OMS transitions |
 | 40 | arrayvec | 0.7.6 | Stack-allocated Vec: zero heap on hot path |
 | 41 | enum_dispatch | 0.3.13 | Zero-cost enum dispatch → vtable-free |
 | 42 | rust_decimal | 1.37.1 | Fixed-point decimal: prices, quantities, P&L |
@@ -109,7 +109,7 @@
 
 | # | Component | Version | Purpose |
 |---|-----------|---------|---------|
-| 49 | toml (crate) | 1.0.6 | Parse base.toml + local-overrides.toml |
+| 49 | toml (crate) | 1.1.0 | Parse base.toml + local-overrides.toml |
 
 ---
 
@@ -172,7 +172,7 @@
 | 72 | cargo-audit | 0.21.1 | CVE scanner for dependencies |
 | 73 | clippy | Built-in | Lint: -D warnings, perf group enforced |
 | 74 | rustfmt | Built-in | Code formatting: cargo fmt --check in CI |
-| 75 | totp-rs | 5.7.0 | TOTP 2FA: Dhan mandatory login |
+| 75 | totp-rs | 5.7.1 | TOTP 2FA: Dhan mandatory login |
 | 76 | bitcode | 0.6.9 | Binary serialization: compact state snapshots |
 | 77 | rkyv | 0.8.15 | Zero-copy deserialization: sub-ms instrument universe loading |
 

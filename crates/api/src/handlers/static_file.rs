@@ -33,4 +33,23 @@ mod tests {
         let response = portal().await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_portal_handler_content_type_is_html() {
+        let response = portal().await.into_response();
+        let ct = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn test_portal_html_contains_doctype_and_closing_tags() {
+        assert!(PORTAL_HTML.contains("</html>"));
+        assert!(PORTAL_HTML.contains("<head>"));
+        assert!(PORTAL_HTML.contains("</body>"));
+    }
 }
