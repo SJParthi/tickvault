@@ -129,7 +129,7 @@ teloxide = { version = "0.13.0", features = ["macros"] }
 
 # ---- Section 13: Dev/Test Dependencies ----
 criterion = { version = "0.8.2", features = ["html_reports"] }
-proptest = "1.6.0"
+proptest = "1.11.0"
 loom = "0.7.2"
 dhat = "0.3.3"
 tokio-test = "0.4.4"
