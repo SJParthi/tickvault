@@ -122,7 +122,7 @@ aws-sdk-ssm = "1.108.0"
 clap = { version = "4.6.0", features = ["derive"] }
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "1.22.0", features = ["v4", "serde"] }
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 teloxide = { version = "0.13.0", features = ["macros"] }
