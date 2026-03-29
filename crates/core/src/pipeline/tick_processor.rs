@@ -231,6 +231,59 @@ fn persist_stock_movers_snapshot(
     let _ = writer.flush();
 }
 
+/// Persists an option movers snapshot to QuestDB (cold path, best-effort).
+///
+/// Writes top 20 entries per category (7 categories × 20 = 140 rows max).
+fn persist_option_movers_snapshot(
+    writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+    snapshot: &super::option_movers::OptionMoversSnapshot,
+    ts_nanos: i64,
+) {
+    let f32_clean = dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+
+    let persist_category =
+        |writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+         entries: &[super::option_movers::OptionMoverEntry],
+         category: &str| {
+            for (i, entry) in entries.iter().enumerate() {
+                let _ = writer.append_option_mover(
+                    ts_nanos,
+                    category,
+                    (i as i32).saturating_add(1),
+                    entry.security_id,
+                    dhan_live_trader_common::segment::segment_code_to_str(
+                        entry.exchange_segment_code,
+                    ),
+                    "",  // contract_name — enriched later
+                    "",  // underlying — enriched later
+                    "",  // option_type — enriched later
+                    0.0, // strike — enriched later
+                    "",  // expiry — enriched later
+                    0.0, // spot_price — enriched later
+                    f32_clean(entry.ltp),
+                    f32_clean(entry.change),
+                    f32_clean(entry.change_pct),
+                    i64::from(entry.oi),
+                    entry.oi_change,
+                    // DATA-INTEGRITY-EXEMPT: oi_change_pct is a derived calculation, not raw Dhan price
+                    f64::from(entry.oi_change_pct),
+                    i64::from(entry.volume),
+                    entry.value,
+                );
+            }
+        };
+
+    persist_category(writer, &snapshot.highest_oi, "HIGHEST_OI");
+    persist_category(writer, &snapshot.oi_gainers, "OI_GAINER");
+    persist_category(writer, &snapshot.oi_losers, "OI_LOSER");
+    persist_category(writer, &snapshot.top_volume, "TOP_VOLUME");
+    persist_category(writer, &snapshot.top_value, "TOP_VALUE");
+    persist_category(writer, &snapshot.price_gainers, "PRICE_GAINER");
+    persist_category(writer, &snapshot.price_losers, "PRICE_LOSER");
+
+    let _ = writer.flush();
+}
+
 // ---------------------------------------------------------------------------
 // O(1) Tick Deduplication Ring Buffer
 // ---------------------------------------------------------------------------
@@ -325,7 +378,7 @@ impl TickDedupRing {
 /// * `greeks_enricher` — optional inline Greeks computer (Box<dyn GreeksEnricher>).
 ///   When present, enriches every valid tick with IV + delta/gamma/theta/vega
 ///   BEFORE persistence and broadcast. O(1) per tick (HashMap lookup + Jaeckel solve).
-// APPROVED: 10 params genuinely needed — pipeline entry point wiring tick/candle/depth/greeks/movers subsystems
+// APPROVED: 12 params genuinely needed — pipeline entry point wiring tick/candle/depth/greeks/movers subsystems
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tick_processor(
     mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
@@ -339,6 +392,10 @@ pub async fn run_tick_processor(
     mut greeks_enricher: Option<Box<dyn GreeksEnricher>>,
     mut stock_movers_writer: Option<
         dhan_live_trader_storage::movers_persistence::StockMoversWriter,
+    >,
+    mut option_movers: Option<super::option_movers::OptionMoversTracker>,
+    mut option_movers_writer: Option<
+        dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
     >,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
@@ -504,6 +561,11 @@ pub async fn run_tick_processor(
                     movers.update(&tick);
                 }
 
+                // O(1) option movers: update OI/price for F&O contracts.
+                if let Some(ref mut opt_movers) = option_movers {
+                    opt_movers.update(&tick);
+                }
+
                 trace!(
                     security_id = tick.security_id,
                     ltp = tick.last_traded_price,
@@ -655,6 +717,11 @@ pub async fn run_tick_processor(
                     movers.update(&tick);
                 }
 
+                // O(1) option movers: update OI/price for F&O contracts.
+                if ltp_valid && let Some(ref mut opt_movers) = option_movers {
+                    opt_movers.update(&tick);
+                }
+
                 trace!(
                     security_id = tick.security_id,
                     ltp = tick.last_traded_price,
@@ -679,6 +746,12 @@ pub async fn run_tick_processor(
                 previous_oi,
             } => {
                 m_prev_close_updates.increment(1);
+
+                // Update option movers with previous day OI (always, regardless of market hours).
+                // PrevClose packets set the baseline for OI change calculations.
+                if let Some(ref mut opt_movers) = option_movers {
+                    opt_movers.update_prev_oi(security_id, exchange_segment_code, previous_oi);
+                }
 
                 // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame)
                 if !previous_close.is_finite() {
@@ -867,6 +940,18 @@ pub async fn run_tick_processor(
                     movers_persist_count = movers_persist_count.saturating_add(1);
                     m_movers_persisted.increment(1);
                 }
+                // Also persist option movers in the same 1-minute window
+                if in_movers_window
+                    && let Some(ref mut opt_movers) = option_movers
+                    && let Some(ref mut opt_writer) = option_movers_writer
+                {
+                    let opt_snapshot = opt_movers.compute_snapshot();
+                    let ts_nanos = received_at_nanos.saturating_add(
+                        i64::from(IST_UTC_OFFSET_SECONDS).saturating_mul(1_000_000_000),
+                    );
+                    persist_option_movers_snapshot(opt_writer, &opt_snapshot, ts_nanos);
+                }
+
                 last_movers_persist = Instant::now();
             }
 
@@ -990,7 +1075,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1013,7 +1098,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1044,7 +1129,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1065,7 +1150,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1086,7 +1171,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1111,7 +1196,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1138,7 +1223,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1154,7 +1239,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1170,7 +1255,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1186,7 +1271,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1204,7 +1289,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1228,7 +1313,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1258,7 +1343,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1280,7 +1365,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1307,7 +1392,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1327,7 +1412,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1348,7 +1433,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1410,7 +1495,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1435,7 +1520,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1458,7 +1543,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1480,7 +1565,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(500);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1511,7 +1596,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1624,6 +1709,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
         });
@@ -1666,6 +1753,8 @@ mod tests {
             run_tick_processor(
                 frame_rx,
                 Some(writer),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1729,7 +1818,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1752,7 +1841,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1803,6 +1892,8 @@ mod tests {
                 frame_rx,
                 Some(tick_writer),
                 Some(depth_writer),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1966,7 +2057,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1982,7 +2073,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -1998,7 +2089,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2014,7 +2105,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2033,7 +2124,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2053,7 +2144,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2069,7 +2160,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2090,7 +2181,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2111,7 +2202,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2138,7 +2229,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2165,7 +2256,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2192,7 +2283,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2214,7 +2305,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2241,7 +2332,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2266,7 +2357,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2294,7 +2385,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2312,7 +2403,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2328,7 +2419,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2346,7 +2437,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2363,7 +2454,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2384,7 +2475,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2466,7 +2557,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2489,7 +2580,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2573,7 +2664,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2589,7 +2680,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2609,7 +2700,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -2627,7 +2718,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3359,6 +3450,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
         });
@@ -3397,6 +3490,8 @@ mod tests {
                 Some(shared_snapshot),
                 None,
                 None,
+                None,
+                None,
             )
             .await;
         });
@@ -3429,6 +3524,8 @@ mod tests {
                 None,
                 None,
                 Some(top_movers),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -3465,6 +3562,8 @@ mod tests {
                 None,
                 None,
                 Some(top_movers),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -3510,7 +3609,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3530,7 +3629,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3548,7 +3647,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3569,7 +3668,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3610,7 +3709,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3629,7 +3728,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3647,7 +3746,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3665,7 +3764,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });
@@ -3683,7 +3782,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
             run_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None,
+                frame_rx, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
         });

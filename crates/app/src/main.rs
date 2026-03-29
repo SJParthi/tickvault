@@ -395,6 +395,8 @@ async fn main() -> Result<()> {
                     snapshot_handle,
                     greeks_enricher,
                     None, // stock_movers_writer — QuestDB reconnects in background
+                    None, // option_movers — created in slow boot only
+                    None, // option_movers_writer — created in slow boot only
                 )
                 .await;
             });
@@ -968,6 +970,26 @@ async fn main() -> Result<()> {
                 }
             };
 
+        // Create option movers tracker + QuestDB writer
+        let option_movers_tracker =
+            Some(dhan_live_trader_core::pipeline::OptionMoversTracker::new());
+        let option_movers_writer =
+            match dhan_live_trader_storage::movers_persistence::OptionMoversWriter::new(
+                &config.questdb,
+            ) {
+                Ok(w) => {
+                    info!("QuestDB option movers writer connected");
+                    Some(w)
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "option movers writer unavailable — option movers will not be persisted"
+                    );
+                    None
+                }
+            };
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -980,10 +1002,14 @@ async fn main() -> Result<()> {
                 snapshot_handle,
                 greeks_enricher,
                 stock_movers_writer,
+                option_movers_tracker,
+                option_movers_writer,
             )
             .await;
         });
-        info!("tick processor started (with candle aggregation + top movers + trading broadcast)");
+        info!(
+            "tick processor started (with candle aggregation + top movers + option movers + trading broadcast)"
+        );
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
