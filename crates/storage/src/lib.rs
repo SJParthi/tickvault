@@ -23,6 +23,7 @@ pub mod constituency_persistence;
 pub mod greeks_persistence;
 pub mod instrument_persistence;
 pub mod materialized_views;
+pub mod movers_persistence;
 pub mod tick_persistence;
 pub mod valkey_cache;
 

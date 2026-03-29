@@ -1,8 +1,8 @@
 # Implementation Plan: Top Movers Persistence + Options Movers + Depth Selection + Warmup
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-03-29
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Decisions Made
 
@@ -17,9 +17,9 @@
 
 ### Phase A: Stock Top Movers Persistence (Day 1)
 
-- [ ] Item 1: Create `stock_movers` QuestDB table DDL + persistence writer
+- [x] Item 1: Create `stock_movers` + `option_movers` QuestDB table DDL + persistence writers
   - Files: crates/storage/src/movers_persistence.rs (NEW), crates/storage/src/lib.rs
-  - Tests: test_stock_movers_table_ddl, test_append_stock_mover, test_flush_batch
+  - Tests: 18 tests passing (DDL validation, DEDUP keys, categories, table names, writer construction)
 
 - [ ] Item 2: Add 1-minute snapshot persistence to tick processor
   - Files: crates/core/src/pipeline/tick_processor.rs, crates/core/src/pipeline/top_movers.rs

@@ -394,6 +394,7 @@ async fn main() -> Result<()> {
                     movers,
                     snapshot_handle,
                     greeks_enricher,
+                    None, // stock_movers_writer — QuestDB reconnects in background
                 )
                 .await;
             });
@@ -819,6 +820,7 @@ async fn main() -> Result<()> {
         ),
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
+        dhan_live_trader_storage::movers_persistence::ensure_movers_tables(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -948,6 +950,24 @@ async fn main() -> Result<()> {
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
+        // Create stock movers QuestDB writer (cold path, best-effort)
+        let stock_movers_writer =
+            match dhan_live_trader_storage::movers_persistence::StockMoversWriter::new(
+                &config.questdb,
+            ) {
+                Ok(w) => {
+                    info!("QuestDB stock movers writer connected");
+                    Some(w)
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "stock movers writer unavailable — movers will not be persisted"
+                    );
+                    None
+                }
+            };
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -959,6 +979,7 @@ async fn main() -> Result<()> {
                 movers,
                 snapshot_handle,
                 greeks_enricher,
+                stock_movers_writer,
             )
             .await;
         });
