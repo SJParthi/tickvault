@@ -613,6 +613,316 @@ pub struct FundLimitResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Conditional Trigger Types (07c-conditional-trigger.md)
+// ---------------------------------------------------------------------------
+
+/// Comparison type for conditional triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ComparisonType {
+    /// Indicator vs fixed number.
+    #[serde(rename = "TECHNICAL_WITH_VALUE")]
+    TechnicalWithValue,
+    /// Indicator vs another indicator.
+    #[serde(rename = "TECHNICAL_WITH_INDICATOR")]
+    TechnicalWithIndicator,
+    /// Indicator vs closing price.
+    #[serde(rename = "TECHNICAL_WITH_CLOSE")]
+    TechnicalWithClose,
+    /// Market price vs fixed value.
+    #[serde(rename = "PRICE_WITH_VALUE")]
+    PriceWithValue,
+}
+
+/// Operator for conditional trigger comparisons (9 variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerOperator {
+    #[serde(rename = "CROSSING_UP")]
+    CrossingUp,
+    #[serde(rename = "CROSSING_DOWN")]
+    CrossingDown,
+    #[serde(rename = "CROSSING_ANY_SIDE")]
+    CrossingAnySide,
+    #[serde(rename = "GREATER_THAN")]
+    GreaterThan,
+    #[serde(rename = "LESS_THAN")]
+    LessThan,
+    #[serde(rename = "GREATER_THAN_EQUAL")]
+    GreaterThanEqual,
+    #[serde(rename = "LESS_THAN_EQUAL")]
+    LessThanEqual,
+    #[serde(rename = "EQUAL")]
+    Equal,
+    #[serde(rename = "NOT_EQUAL")]
+    NotEqual,
+}
+
+/// Timeframe for conditional trigger indicator evaluation (4 variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerTimeFrame {
+    #[serde(rename = "DAY")]
+    Day,
+    #[serde(rename = "ONE_MIN")]
+    OneMin,
+    #[serde(rename = "FIVE_MIN")]
+    FiveMin,
+    #[serde(rename = "FIFTEEN_MIN")]
+    FifteenMin,
+}
+
+/// Condition for a conditional trigger.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerCondition {
+    /// Comparison type.
+    pub comparison_type: String,
+    /// Exchange segment: "NSE_EQ" or index only. F&O NOT supported.
+    pub exchange_segment: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Indicator name (required for TECHNICAL_WITH_* types).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indicator_name: Option<String>,
+    /// Timeframe (required for TECHNICAL_WITH_* types).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_frame: Option<String>,
+    /// Comparison operator.
+    pub operator: String,
+    /// Fixed value to compare against (TECHNICAL_WITH_VALUE, PRICE_WITH_VALUE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparing_value: Option<f64>,
+    /// Second indicator to compare against (TECHNICAL_WITH_INDICATOR).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparing_indicator_name: Option<String>,
+    /// Expiry date (YYYY-MM-DD). Default: 1 year from creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp_date: Option<String>,
+    /// Trigger frequency: "ONCE" (triggers once then deactivates).
+    #[serde(default = "default_frequency")]
+    pub frequency: String,
+    /// User note/description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
+}
+
+fn default_frequency() -> String {
+    "ONCE".to_string()
+}
+
+/// Order attached to a conditional trigger.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerOrder {
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment.
+    pub exchange_segment: String,
+    /// Product type.
+    pub product_type: String,
+    /// Order type.
+    pub order_type: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Quantity.
+    pub quantity: i64,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Price (STRING in Dhan API).
+    pub price: String,
+    /// Disclosed quantity (STRING in Dhan API).
+    #[serde(default, rename = "discQuantity")]
+    pub disc_quantity: String,
+    /// Trigger price (STRING in Dhan API).
+    pub trigger_price: String,
+}
+
+/// Create conditional trigger request.
+/// Endpoint: `POST /v2/alerts/orders`
+///
+/// **Equities and Indices ONLY.** F&O and commodities NOT supported.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanConditionalTriggerRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Trigger condition.
+    pub condition: TriggerCondition,
+    /// Orders to execute when condition fires (can be multiple).
+    pub orders: Vec<TriggerOrder>,
+}
+
+/// Conditional trigger response.
+/// Endpoint: `POST/PUT/DELETE/GET /v2/alerts/orders`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanConditionalTriggerResponse {
+    /// Alert ID.
+    #[serde(default)]
+    pub alert_id: String,
+    /// Alert status: "ACTIVE", "TRIGGERED", "EXPIRED", "CANCELLED".
+    #[serde(default)]
+    pub alert_status: String,
+}
+
+// ---------------------------------------------------------------------------
+// EDIS Types (07d-edis.md)
+// ---------------------------------------------------------------------------
+
+/// EDIS form request for CDSL T-PIN authorization.
+/// Endpoint: `POST /v2/edis/form`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EdisFormRequest {
+    /// ISIN of the security to authorize for delivery.
+    pub isin: String,
+    /// Quantity to authorize.
+    pub qty: i64,
+    /// Exchange: "NSE" or "BSE".
+    pub exchange: String,
+    /// Segment: "EQ".
+    pub segment: String,
+    /// Mark all holdings for sell.
+    pub bulk: bool,
+}
+
+/// EDIS inquiry response.
+/// Endpoint: `GET /v2/edis/inquire/{isin}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdisInquiryResponse {
+    /// Total quantity held.
+    #[serde(default)]
+    pub total_qty: i64,
+    /// Approved quantity for delivery.
+    #[serde(default)]
+    pub aprvd_qty: i64,
+    /// EDIS status.
+    #[serde(default)]
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
+// Statements Types (14-statements-trade-history.md)
+// ---------------------------------------------------------------------------
+
+/// Ledger entry from Dhan.
+/// Endpoint: `GET /v2/ledger?from-date=YYYY-MM-DD&to-date=YYYY-MM-DD`
+///
+/// **CRITICAL:** `debit` and `credit` are STRINGS, not floats.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DhanLedgerEntry {
+    /// Dhan client ID.
+    #[serde(default, rename = "dhanClientId")]
+    pub dhan_client_id: String,
+    /// Transaction narration.
+    #[serde(default)]
+    pub narration: String,
+    /// Voucher date (human-readable: "Jun 22, 2022" — NOT ISO format).
+    #[serde(default)]
+    pub voucherdate: String,
+    /// Exchange.
+    #[serde(default)]
+    pub exchange: String,
+    /// Voucher description.
+    #[serde(default)]
+    pub voucherdesc: String,
+    /// Voucher number.
+    #[serde(default)]
+    pub vouchernumber: String,
+    /// Debit amount (STRING, not float). "0.00" when credit.
+    #[serde(default)]
+    pub debit: String,
+    /// Credit amount (STRING, not float). "0.00" when debit.
+    #[serde(default)]
+    pub credit: String,
+    /// Running balance (STRING).
+    #[serde(default)]
+    pub runbal: String,
+}
+
+/// Historical trade entry from Dhan.
+/// Endpoint: `GET /v2/trades/{from-date}/{to-date}/{page}`
+///
+/// **NOTE:** Page is 0-indexed. Path params, NOT query params.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanHistoricalTradeEntry {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Exchange order ID.
+    #[serde(default)]
+    pub exchange_order_id: String,
+    /// Exchange trade ID.
+    #[serde(default)]
+    pub exchange_trade_id: String,
+    /// Transaction type.
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Product type.
+    #[serde(default)]
+    pub product_type: String,
+    /// Order type.
+    #[serde(default)]
+    pub order_type: String,
+    /// Trading symbol.
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Custom symbol.
+    #[serde(default)]
+    pub custom_symbol: String,
+    /// Security ID.
+    #[serde(default)]
+    pub security_id: String,
+    /// Traded quantity.
+    #[serde(default)]
+    pub traded_quantity: i64,
+    /// Traded price.
+    #[serde(default)]
+    pub traded_price: f64,
+    /// ISIN.
+    #[serde(default)]
+    pub isin: String,
+    /// Instrument type.
+    #[serde(default)]
+    pub instrument: String,
+    /// SEBI tax.
+    #[serde(default)]
+    pub sebi_tax: f64,
+    /// Securities Transaction Tax.
+    #[serde(default)]
+    pub stt: f64,
+    /// Brokerage charges.
+    #[serde(default)]
+    pub brokerage_charges: f64,
+    /// Service tax / GST.
+    #[serde(default)]
+    pub service_tax: f64,
+    /// Exchange transaction charges.
+    #[serde(default)]
+    pub exchange_transaction_charges: f64,
+    /// Stamp duty.
+    #[serde(default)]
+    pub stamp_duty: f64,
+    /// Derivative expiry date ("NA" for non-derivatives).
+    #[serde(default)]
+    pub drv_expiry_date: String,
+    /// Derivative option type.
+    #[serde(default)]
+    pub drv_option_type: String,
+    /// Derivative strike price.
+    #[serde(default)]
+    pub drv_strike_price: f64,
+    /// Exchange time (IST string).
+    #[serde(default)]
+    pub exchange_time: String,
+}
+
+// ---------------------------------------------------------------------------
 // Kill Switch Types
 // ---------------------------------------------------------------------------
 

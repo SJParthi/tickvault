@@ -28,13 +28,14 @@ use tracing::{debug, warn};
 use dhan_live_trader_common::constants;
 
 use super::types::{
-    DhanConvertPositionRequest, DhanExitAllResponse, DhanForeverOrderRequest,
-    DhanForeverOrderResponse, DhanHoldingResponse, DhanModifyOrderRequest,
+    DhanConditionalTriggerRequest, DhanConditionalTriggerResponse, DhanConvertPositionRequest,
+    DhanExitAllResponse, DhanForeverOrderRequest, DhanForeverOrderResponse,
+    DhanHistoricalTradeEntry, DhanHoldingResponse, DhanLedgerEntry, DhanModifyOrderRequest,
     DhanModifySuperOrderRequest, DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse,
     DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
-    FundLimitResponse, KillSwitchResponse, MarginCalculatorRequest, MarginCalculatorResponse,
-    MultiMarginRequest, MultiMarginResponse, OmsError, PnlExitRequest, PnlExitResponse,
-    PnlExitStatusResponse,
+    EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
+    MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
+    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -568,6 +569,314 @@ impl OrderApiClient {
             });
         }
 
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional Trigger Endpoints (Phase 6) — docs/dhan-ref/07c-conditional-trigger.md
+    // Equities and Indices ONLY. F&O/commodities NOT supported.
+    // -----------------------------------------------------------------------
+
+    /// Creates a conditional trigger (alert-based order).
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn create_conditional_trigger(
+        &self,
+        access_token: &str,
+        request: &DhanConditionalTriggerRequest,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders", self.base_url);
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "create_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Modifies a conditional trigger.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn modify_conditional_trigger(
+        &self,
+        access_token: &str,
+        alert_id: &str,
+        request: &DhanConditionalTriggerRequest,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders/{}", self.base_url, alert_id);
+        let response = self
+            .auth_headers(self.http.put(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "modify_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Deletes a conditional trigger.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn delete_conditional_trigger(
+        &self,
+        access_token: &str,
+        alert_id: &str,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders/{}", self.base_url, alert_id);
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "delete_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets a conditional trigger by alert ID.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_conditional_trigger(
+        &self,
+        access_token: &str,
+        alert_id: &str,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders/{}", self.base_url, alert_id);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets all conditional triggers.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_all_conditional_triggers(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<DhanConditionalTriggerResponse>, OmsError> {
+        let url = format!("{}/alerts/orders", self.base_url);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_all_conditional_triggers")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // EDIS Endpoints (Phase 8) — docs/dhan-ref/07d-edis.md
+    // -----------------------------------------------------------------------
+
+    /// Generates T-PIN (sent to registered mobile via SMS).
+    // TEST-EXEMPT: requires live Dhan API (sends real SMS)
+    pub async fn generate_tpin(&self, access_token: &str) -> Result<(), OmsError> {
+        let url = format!("{}/edis/tpin", self.base_url);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = response
+                .text()
+                .await
+                .map_err(|err| OmsError::HttpError(err.to_string()))?;
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        Ok(()) // 202 Accepted — T-PIN sent to SMS
+    }
+
+    /// Generates EDIS form HTML for CDSL T-PIN entry (browser rendering).
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn generate_edis_form(
+        &self,
+        access_token: &str,
+        request: &EdisFormRequest,
+    ) -> Result<String, OmsError> {
+        let url = format!("{}/edis/form", self.base_url);
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        Ok(body) // Returns HTML form
+    }
+
+    /// Inquires EDIS approval status for a security (or "ALL" for all holdings).
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn inquire_edis_approval(
+        &self,
+        access_token: &str,
+        isin: &str,
+    ) -> Result<EdisInquiryResponse, OmsError> {
+        let url = format!("{}/edis/inquire/{}", self.base_url, isin);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Statements Endpoints (Phase 8) — docs/dhan-ref/14-statements-trade-history.md
+    // -----------------------------------------------------------------------
+
+    /// Gets ledger entries for a date range.
+    /// **NOTE:** `debit`/`credit` are STRINGS, not floats.
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn get_ledger(
+        &self,
+        access_token: &str,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<DhanLedgerEntry>, OmsError> {
+        let url = format!(
+            "{}/ledger?from-date={}&to-date={}",
+            self.base_url, from_date, to_date
+        );
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets historical trade entries with pagination.
+    /// **NOTE:** Page is 0-indexed. Uses PATH params, NOT query params.
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn get_trade_history(
+        &self,
+        access_token: &str,
+        from_date: &str,
+        to_date: &str,
+        page: u32,
+    ) -> Result<Vec<DhanHistoricalTradeEntry>, OmsError> {
+        let url = format!(
+            "{}/trades/{}/{}/{}",
+            self.base_url, from_date, to_date, page
+        );
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
         serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
     }
 
