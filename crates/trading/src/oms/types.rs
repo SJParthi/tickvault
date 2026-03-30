@@ -454,7 +454,7 @@ pub struct MarginCalculatorRequest {
     pub exchange_segment: String,
     /// Transaction type ("BUY" or "SELL").
     pub transaction_type: String,
-    /// Quantity in lots.
+    /// Quantity in lots (i32 per Dhan docs, but i64 for safety).
     pub quantity: i64,
     /// Product type (e.g., "INTRADAY", "MARGIN").
     pub product_type: String,
@@ -462,8 +462,9 @@ pub struct MarginCalculatorRequest {
     pub security_id: String,
     /// Order price.
     pub price: f64,
-    /// Trigger price (for stop-loss).
-    pub trigger_price: f64,
+    /// Trigger price (for stop-loss orders). None for non-SL orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -525,8 +526,9 @@ pub struct MarginScript {
     pub security_id: String,
     /// Order price.
     pub price: f64,
-    /// Trigger price.
-    pub trigger_price: f64,
+    /// Trigger price (optional for non-SL orders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<f64>,
 }
 
 /// Request body for `POST /v2/margincalculator/multi`.

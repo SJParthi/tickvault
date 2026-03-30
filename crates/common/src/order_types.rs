@@ -315,6 +315,24 @@ pub struct OrderUpdate {
     /// Off-market flag: "1" = AMO (After Market Order), "0" = normal.
     #[serde(default)]
     pub off_mkt_flag: String,
+    /// Entry leg order number for tracking related legs in BO/CO/super orders.
+    #[serde(default)]
+    pub algo_ord_no: String,
+    /// Market type: "NL" = Normal Market, "AU"/"A1"/"A2" = Auction Market.
+    #[serde(default)]
+    pub mkt_type: String,
+    /// Exchange series (e.g., "EQ").
+    #[serde(default)]
+    pub series: String,
+    /// Order validity date for Forever Orders.
+    #[serde(default)]
+    pub good_till_days_date: String,
+    /// Exchange ID for special order types.
+    #[serde(default)]
+    pub algo_id: String,
+    /// Multiplier for commodity/currency contracts.
+    #[serde(default)]
+    pub multiplier: i64,
 }
 
 /// Wrapper for the Dhan order update WebSocket message.
