@@ -326,17 +326,36 @@ async fn main() -> Result<()> {
         let client_id = cache_result.client_id;
 
         // --- IP verification + notification init (parallel, both needed before Dhan calls) ---
-        // Notification must be ready so IP failure can alert via Telegram.
-        // IP verification must pass before any WebSocket/REST call to Dhan.
+        // Sandbox/paper mode: skip IP verification (not required).
+        // Live mode: MUST verify IP before any Dhan API call.
+        let fast_trading_mode = config.strategy.mode;
         let (fast_notifier, ip_result) = tokio::join!(
             NotificationService::initialize(&config.notification),
-            ip_verifier::verify_public_ip(),
+            async {
+                if fast_trading_mode.is_live() {
+                    ip_verifier::verify_public_ip().await
+                } else {
+                    info!(
+                        mode = fast_trading_mode.as_str(),
+                        "FAST BOOT: IP verification skipped — {} mode",
+                        fast_trading_mode.as_str()
+                    );
+                    // Return a dummy success — no verification needed
+                    Ok(
+                        dhan_live_trader_core::network::ip_verifier::IpVerificationResult {
+                            verified_ip: "skipped".to_string(),
+                        },
+                    )
+                }
+            },
         );
         match ip_result {
             Ok(result) => {
-                fast_notifier.notify(NotificationEvent::IpVerificationSuccess {
-                    verified_ip: result.verified_ip,
-                });
+                if fast_trading_mode.is_live() {
+                    fast_notifier.notify(NotificationEvent::IpVerificationSuccess {
+                        verified_ip: result.verified_ip,
+                    });
+                }
             }
             Err(err) => {
                 error!(error = %err, "FAST BOOT: IP verification failed — BLOCKING BOOT");
@@ -754,22 +773,32 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 5.5: Verify public IP matches SSM static IP (BLOCKS BOOT on failure)
     // -----------------------------------------------------------------------
-    // Must run AFTER notification (so Telegram alerts fire) and BEFORE auth
-    // (so no Dhan API call ever happens from a non-whitelisted IP).
-    info!("verifying public IP against SSM static IP");
-    match ip_verifier::verify_public_ip().await {
-        Ok(result) => {
-            notifier.notify(NotificationEvent::IpVerificationSuccess {
-                verified_ip: result.verified_ip,
-            });
+    // Sandbox mode: skip IP verification (sandbox doesn't require registered IP).
+    // Live mode: MUST verify IP before any Dhan API call.
+    // Paper mode: skip (no Dhan API calls at all).
+    let trading_mode = config.strategy.mode;
+    if trading_mode.is_live() {
+        info!("verifying public IP against SSM static IP");
+        match ip_verifier::verify_public_ip().await {
+            Ok(result) => {
+                notifier.notify(NotificationEvent::IpVerificationSuccess {
+                    verified_ip: result.verified_ip,
+                });
+            }
+            Err(err) => {
+                error!(error = %err, "IP verification failed — BLOCKING BOOT");
+                notifier.notify(NotificationEvent::IpVerificationFailed {
+                    reason: err.to_string(),
+                });
+                return Ok(());
+            }
         }
-        Err(err) => {
-            error!(error = %err, "IP verification failed — BLOCKING BOOT");
-            notifier.notify(NotificationEvent::IpVerificationFailed {
-                reason: err.to_string(),
-            });
-            return Ok(());
-        }
+    } else {
+        info!(
+            mode = trading_mode.as_str(),
+            "IP verification skipped — not required for {} mode",
+            trading_mode.as_str()
+        );
     }
 
     // -----------------------------------------------------------------------
