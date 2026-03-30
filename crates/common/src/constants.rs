@@ -489,6 +489,10 @@ pub const SSM_DHAN_SERVICE: &str = "dhan";
 pub const DHAN_CLIENT_ID_SECRET: &str = "client-id";
 pub const DHAN_CLIENT_SECRET_SECRET: &str = "client-secret";
 pub const DHAN_TOTP_SECRET: &str = "totp-secret";
+/// SSM secret name for Dhan sandbox client ID (DevPortal).
+pub const DHAN_SANDBOX_CLIENT_ID_SECRET: &str = "sandbox-client-id";
+/// SSM secret name for Dhan sandbox access token (DevPortal, 30-day validity).
+pub const DHAN_SANDBOX_TOKEN_SECRET: &str = "sandbox-token";
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — QuestDB Service

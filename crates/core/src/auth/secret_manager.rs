@@ -10,7 +10,8 @@ use secrecy::SecretString;
 use tracing::{info, instrument};
 
 use dhan_live_trader_common::constants::{
-    DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET, DHAN_TOTP_SECRET,
+    DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
+    DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET, DHAN_TOTP_SECRET,
     GRAFANA_ADMIN_PASSWORD_SECRET, GRAFANA_ADMIN_USER_SECRET, QUESTDB_PG_PASSWORD_SECRET,
     QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GRAFANA_SERVICE, SSM_QUESTDB_SERVICE,
     SSM_SECRET_BASE_PATH,
@@ -156,6 +157,52 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
         client_id,
         client_secret,
         totp_secret,
+    })
+}
+
+/// Fetches Dhan Sandbox credentials from AWS SSM Parameter Store.
+///
+/// Sandbox uses a separate client ID and pre-generated token (30-day validity).
+/// No TOTP or client-secret needed — token generated manually on DevPortal.
+///
+/// SSM paths:
+/// - `/dlt/{env}/dhan/sandbox-client-id`
+/// - `/dlt/{env}/dhan/sandbox-token`
+///
+/// # Errors
+///
+/// Returns `ApplicationError::SecretRetrieval` if either secret cannot be fetched.
+#[instrument(skip_all, fields(environment))]
+pub async fn fetch_sandbox_credentials()
+-> Result<super::types::SandboxCredentials, ApplicationError> {
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+
+    let client_id_path = build_ssm_path(
+        &environment,
+        SSM_DHAN_SERVICE,
+        DHAN_SANDBOX_CLIENT_ID_SECRET,
+    );
+    let token_path = build_ssm_path(&environment, SSM_DHAN_SERVICE, DHAN_SANDBOX_TOKEN_SECRET);
+
+    info!(
+        client_id_path = %client_id_path,
+        token_path = %token_path,
+        "fetching Dhan sandbox credentials from SSM"
+    );
+
+    let (client_id, access_token) = tokio::try_join!(
+        fetch_secret(&ssm_client, &client_id_path),
+        fetch_secret(&ssm_client, &token_path),
+    )?;
+
+    info!("all Dhan sandbox credentials fetched successfully from SSM");
+
+    Ok(super::types::SandboxCredentials {
+        client_id,
+        access_token,
     })
 }
 

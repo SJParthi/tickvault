@@ -192,6 +192,10 @@ pub struct DhanConfig {
     pub order_update_websocket_url: String,
     /// REST API base URL (for trading, data, renewal).
     pub rest_api_base_url: String,
+    /// Sandbox API base URL (for sandbox mode order testing).
+    /// Set in config/base.toml — no default in code (must come from config).
+    #[serde(default)]
+    pub sandbox_base_url: String,
     /// Auth base URL (for token generation — separate from REST API).
     /// Dhan uses `https://auth.dhan.co` for authentication endpoints.
     pub auth_base_url: String,

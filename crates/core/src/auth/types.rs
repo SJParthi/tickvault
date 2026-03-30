@@ -154,6 +154,26 @@ impl fmt::Debug for TelegramCredentials {
     }
 }
 
+/// Dhan Sandbox credentials from AWS SSM Parameter Store.
+///
+/// Sandbox uses a separate client ID and pre-generated token (30-day validity).
+/// No TOTP or JWT refresh needed — token generated manually on DevPortal.
+pub struct SandboxCredentials {
+    /// Sandbox client ID (different from live client ID).
+    pub client_id: SecretString,
+    /// Sandbox access token (pre-generated, 30-day validity).
+    pub access_token: SecretString,
+}
+
+impl fmt::Debug for SandboxCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SandboxCredentials")
+            .field("client_id", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Token State (stored in ArcSwap)
 // ---------------------------------------------------------------------------
