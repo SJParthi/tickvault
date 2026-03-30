@@ -1223,6 +1223,7 @@ mod tests {
             instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
             max_instruments_per_connection: 100,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         };
         let token_config = TokenConfig {
             refresh_before_expiry_hours: 1,
@@ -1264,6 +1265,7 @@ mod tests {
             instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
             max_instruments_per_connection: 100,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         };
         let token_config = TokenConfig {
             refresh_before_expiry_hours: 1,
@@ -1649,6 +1651,7 @@ mod tests {
             instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
             max_instruments_per_connection: 100,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         };
         let token_config = TokenConfig {
             refresh_before_expiry_hours: 1,
@@ -2509,6 +2512,7 @@ mod tests {
             instrument_csv_fallback_url: "https://example.com/instruments-fallback.csv".to_string(),
             max_instruments_per_connection: 100,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         };
         let token_config = TokenConfig {
             refresh_before_expiry_hours: 1,

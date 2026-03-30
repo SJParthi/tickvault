@@ -175,10 +175,10 @@ impl IndicatorSnapshotWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= INDICATOR_FLUSH_BATCH_SIZE {
-            if let Err(err) = self.flush() {
-                warn!(?err, "indicator snapshot auto-flush failed");
-            }
+        if self.pending_count >= INDICATOR_FLUSH_BATCH_SIZE
+            && let Err(err) = self.flush()
+        {
+            warn!(?err, "indicator snapshot auto-flush failed");
         }
 
         Ok(())
