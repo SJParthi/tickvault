@@ -30,8 +30,9 @@ use dhan_live_trader_common::constants;
 use super::types::{
     DhanConvertPositionRequest, DhanExitAllResponse, DhanHoldingResponse, DhanModifyOrderRequest,
     DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse, DhanPositionResponse,
-    FundLimitResponse, MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest,
-    MultiMarginResponse, OmsError,
+    FundLimitResponse, KillSwitchResponse, MarginCalculatorRequest, MarginCalculatorResponse,
+    MultiMarginRequest, MultiMarginResponse, OmsError, PnlExitRequest, PnlExitResponse,
+    PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -551,6 +552,240 @@ impl OrderApiClient {
 
         let status = response.status().as_u16();
         self.check_rate_limit(status, "get_fund_limit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Trader's Control — Kill Switch + P&L Exit (5 endpoints)
+    // Ground truth: docs/dhan-ref/15-traders-control.md
+    // -----------------------------------------------------------------------
+
+    /// Activates the kill switch — disables ALL trading for the day.
+    ///
+    /// **Prerequisite:** All positions must be closed and no pending orders.
+    /// If positions exist, call `exit_all_positions()` first.
+    ///
+    /// Endpoint: `POST /v2/killswitch?killSwitchStatus=ACTIVATE`
+    // TEST-EXEMPT: requires live/sandbox Dhan API with real account state
+    pub async fn activate_kill_switch(
+        &self,
+        access_token: &str,
+    ) -> Result<KillSwitchResponse, OmsError> {
+        let url = format!(
+            "{}{}?killSwitchStatus=ACTIVATE",
+            self.base_url,
+            constants::DHAN_KILL_SWITCH_PATH
+        );
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "activate_kill_switch")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Deactivates the kill switch — re-enables trading.
+    ///
+    /// Endpoint: `POST /v2/killswitch?killSwitchStatus=DEACTIVATE`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn deactivate_kill_switch(
+        &self,
+        access_token: &str,
+    ) -> Result<KillSwitchResponse, OmsError> {
+        let url = format!(
+            "{}{}?killSwitchStatus=DEACTIVATE",
+            self.base_url,
+            constants::DHAN_KILL_SWITCH_PATH
+        );
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "deactivate_kill_switch")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets the current kill switch status.
+    ///
+    /// Endpoint: `GET /v2/killswitch`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_kill_switch_status(
+        &self,
+        access_token: &str,
+    ) -> Result<KillSwitchResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_KILL_SWITCH_PATH);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_kill_switch_status")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Configures P&L-based auto-exit for the current session.
+    ///
+    /// **WARNING:** If `profit_value` < current profit OR `loss_value` < current loss,
+    /// exit triggers IMMEDIATELY. Always check current P&L before configuring.
+    ///
+    /// Session-scoped — resets at end of trading day. Must reconfigure daily.
+    ///
+    /// Endpoint: `POST /v2/pnlExit`
+    // TEST-EXEMPT: requires live/sandbox Dhan API with real positions
+    pub async fn configure_pnl_exit(
+        &self,
+        access_token: &str,
+        request: &PnlExitRequest,
+    ) -> Result<PnlExitResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_PNL_EXIT_PATH);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "configure_pnl_exit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Stops P&L-based auto-exit.
+    ///
+    /// Endpoint: `DELETE /v2/pnlExit`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn stop_pnl_exit(&self, access_token: &str) -> Result<PnlExitResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_PNL_EXIT_PATH);
+
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "stop_pnl_exit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets the current P&L exit configuration.
+    ///
+    /// **Note:** Response field names differ from request:
+    /// - Request: `profitValue`, `lossValue`, `enableKillSwitch`
+    /// - Response: `profit`, `loss`, `enable_kill_switch` (shorter, snake_case mix)
+    ///
+    /// Endpoint: `GET /v2/pnlExit`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_pnl_exit_status(
+        &self,
+        access_token: &str,
+    ) -> Result<PnlExitStatusResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_PNL_EXIT_PATH);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_pnl_exit_status")?;
 
         let body = response
             .text()
