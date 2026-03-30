@@ -30,9 +30,9 @@ use dhan_live_trader_common::constants;
 use super::types::{
     DhanConvertPositionRequest, DhanExitAllResponse, DhanHoldingResponse, DhanModifyOrderRequest,
     DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse, DhanPositionResponse,
-    FundLimitResponse, KillSwitchResponse, MarginCalculatorRequest, MarginCalculatorResponse,
-    MultiMarginRequest, MultiMarginResponse, OmsError, PnlExitRequest, PnlExitResponse,
-    PnlExitStatusResponse,
+    DhanTradeEntry, FundLimitResponse, KillSwitchResponse, MarginCalculatorRequest,
+    MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse, OmsError, PnlExitRequest,
+    PnlExitResponse, PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -552,6 +552,155 @@ impl OrderApiClient {
 
         let status = response.status().as_u16();
         self.check_rate_limit(status, "get_fund_limit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing Standard Order Endpoints (Phase 3)
+    // Ground truth: docs/dhan-ref/07-orders.md
+    // -----------------------------------------------------------------------
+
+    /// Places an order with auto-slicing for F&O freeze quantity.
+    ///
+    /// Same request body as place_order. System automatically splits the
+    /// order into multiple legs if quantity exceeds exchange freeze limit.
+    ///
+    /// Endpoint: `POST /v2/orders/slicing`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn place_order_slicing(
+        &self,
+        access_token: &str,
+        request: &DhanPlaceOrderRequest,
+    ) -> Result<DhanPlaceOrderResponse, OmsError> {
+        let url = format!("{}/orders/slicing", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "place_order_slicing")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets an order by its correlation ID (user-supplied idempotency key).
+    ///
+    /// Endpoint: `GET /v2/orders/external/{correlation-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_order_by_correlation_id(
+        &self,
+        access_token: &str,
+        correlation_id: &str,
+    ) -> Result<DhanOrderResponse, OmsError> {
+        let url = format!("{}/orders/external/{}", self.base_url, correlation_id);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_order_by_correlation_id")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets all trades for today (trade book).
+    ///
+    /// Endpoint: `GET /v2/trades`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_trades(&self, access_token: &str) -> Result<Vec<DhanTradeEntry>, OmsError> {
+        let url = format!("{}/trades", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_trades")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets trades for a specific order.
+    ///
+    /// Endpoint: `GET /v2/trades/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_trades_for_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+    ) -> Result<Vec<DhanTradeEntry>, OmsError> {
+        let url = format!("{}/trades/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_trades_for_order")?;
 
         let body = response
             .text()

@@ -616,6 +616,105 @@ pub struct FundLimitResponse {
 // Kill Switch Types
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Trade Book Types
+// ---------------------------------------------------------------------------
+
+/// A single trade entry from the trade book.
+/// Endpoint: `GET /v2/trades` and `GET /v2/trades/{order-id}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanTradeEntry {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Dhan order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Exchange order ID.
+    #[serde(default)]
+    pub exchange_order_id: String,
+    /// Exchange trade ID (unique per trade).
+    #[serde(default)]
+    pub exchange_trade_id: String,
+    /// Transaction type: "BUY" or "SELL".
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment: "NSE_EQ", "NSE_FNO", etc.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Product type: "CNC", "INTRADAY", "MARGIN", "MTF".
+    #[serde(default)]
+    pub product_type: String,
+    /// Order type: "LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_MARKET".
+    #[serde(default)]
+    pub order_type: String,
+    /// Trading symbol.
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Custom symbol.
+    #[serde(default)]
+    pub custom_symbol: String,
+    /// Dhan security ID (string in response).
+    #[serde(default)]
+    pub security_id: String,
+    /// Traded quantity.
+    #[serde(default)]
+    pub traded_quantity: i64,
+    /// Traded price.
+    #[serde(default)]
+    pub traded_price: f64,
+    /// ISIN (International Securities Identification Number).
+    #[serde(default)]
+    pub isin: String,
+    /// Instrument type.
+    #[serde(default)]
+    pub instrument: String,
+    /// SEBI tax.
+    #[serde(default)]
+    pub sebi_tax: f64,
+    /// Securities Transaction Tax.
+    #[serde(default)]
+    pub stt: f64,
+    /// Brokerage charges.
+    #[serde(default)]
+    pub brokerage_charges: f64,
+    /// Service tax / GST.
+    #[serde(default)]
+    pub service_tax: f64,
+    /// Exchange transaction charges.
+    #[serde(default)]
+    pub exchange_transaction_charges: f64,
+    /// Stamp duty.
+    #[serde(default)]
+    pub stamp_duty: f64,
+    /// Derivative expiry date ("NA" for non-derivatives, date string for F&O).
+    #[serde(default)]
+    pub drv_expiry_date: String,
+    /// Derivative option type (CE/PE or empty).
+    #[serde(default)]
+    pub drv_option_type: String,
+    /// Derivative strike price.
+    #[serde(default)]
+    pub drv_strike_price: f64,
+    /// Exchange time (IST string: "YYYY-MM-DD HH:MM:SS").
+    #[serde(default)]
+    pub exchange_time: String,
+}
+
+/// Cancel order response from Dhan.
+/// Endpoint: `DELETE /v2/orders/{order-id}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanCancelOrderResponse {
+    /// Dhan order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Order status after cancellation.
+    #[serde(default)]
+    pub order_status: String,
+}
+
 /// Kill switch status response from Dhan.
 /// Endpoint: `GET /v2/killswitch` and `POST /v2/killswitch`
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
