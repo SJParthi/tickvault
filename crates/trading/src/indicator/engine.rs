@@ -1133,4 +1133,281 @@ mod tests {
         let engine = IndicatorEngine::new(params);
         assert_eq!(engine.warmup_count(u32::MAX), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Exact-Value Indicator Tests (mutation-targeted)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ema_exact_value_after_two_ticks() {
+        // EMA(12) alpha = 2/(12+1) = 0.153846...
+        // Tick 1: EMA = 100.0 (first tick initializes to price)
+        // Tick 2: EMA = alpha * 105.0 + (1-alpha) * 100.0
+        //       = 0.153846 * 105.0 + 0.846154 * 100.0
+        //       = 16.1538 + 84.6154 = 100.7692...
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        let tick1 = ParsedTick {
+            security_id: 1,
+            last_traded_price: 100.0,
+            day_high: 101.0,
+            day_low: 99.0,
+            volume: 1000,
+            average_traded_price: 100.0,
+            ..ParsedTick::default()
+        };
+        let snap1 = engine.update(&tick1);
+        assert!(
+            (snap1.ema_fast - 100.0).abs() < 0.001,
+            "First tick EMA must equal price"
+        );
+
+        let tick2 = ParsedTick {
+            security_id: 1,
+            last_traded_price: 105.0,
+            day_high: 106.0,
+            day_low: 104.0,
+            volume: 2000,
+            average_traded_price: 105.0,
+            ..ParsedTick::default()
+        };
+        let snap2 = engine.update(&tick2);
+        // If mutation changes + to - in EMA: result would be very different
+        // If mutation changes * to / in EMA: result would be very different
+        assert!(snap2.ema_fast > 100.0, "EMA must increase when price rises");
+        assert!(snap2.ema_fast < 105.0, "EMA must lag behind price");
+        // Exact check: EMA should be approximately 100.769
+        assert!(
+            (snap2.ema_fast - 100.769).abs() < 0.1,
+            "EMA fast after 2 ticks must be ~100.77, got {}",
+            snap2.ema_fast
+        );
+    }
+
+    #[test]
+    fn test_rsi_after_known_sequence() {
+        // Feed: 100, 102, 101, 103, 100, 104
+        // Alternating gains and losses → RSI should be near 50
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        let prices = [
+            100.0_f32, 102.0, 101.0, 103.0, 100.0, 104.0, 99.0, 105.0, 98.0, 106.0,
+        ];
+        let mut last_snap = IndicatorSnapshot::default();
+        for &price in &prices {
+            let tick = ParsedTick {
+                security_id: 2,
+                last_traded_price: price,
+                day_high: price + 1.0,
+                day_low: price - 1.0,
+                volume: 1000,
+                average_traded_price: price,
+                ..ParsedTick::default()
+            };
+            last_snap = engine.update(&tick);
+        }
+        // RSI must be in valid range
+        assert!(
+            last_snap.rsi >= 0.0 && last_snap.rsi <= 100.0,
+            "RSI out of range: {}",
+            last_snap.rsi
+        );
+        // With alternating up/down, RSI should be roughly balanced (30-70)
+        assert!(
+            last_snap.rsi > 20.0 && last_snap.rsi < 80.0,
+            "RSI with alternating prices should be near 50, got {}",
+            last_snap.rsi
+        );
+    }
+
+    #[test]
+    fn test_macd_signal_divergence() {
+        // Feed consistently rising prices → MACD line should be positive
+        // (fast EMA > slow EMA when prices rise)
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        let mut last_snap = IndicatorSnapshot::default();
+        for i in 0..40_u32 {
+            let price = 100.0 + i as f32 * 2.0; // Steadily rising
+            let tick = ParsedTick {
+                security_id: 3,
+                last_traded_price: price,
+                day_high: price + 0.5,
+                day_low: price - 0.5,
+                volume: 1000,
+                average_traded_price: price,
+                ..ParsedTick::default()
+            };
+            last_snap = engine.update(&tick);
+        }
+        // MACD line = EMA_fast - EMA_slow → positive for rising prices
+        assert!(
+            last_snap.macd_line > 0.0,
+            "MACD line must be positive for rising prices, got {}",
+            last_snap.macd_line
+        );
+        // Signal should also be positive but lag
+        assert!(
+            last_snap.macd_signal > 0.0,
+            "MACD signal must be positive, got {}",
+            last_snap.macd_signal
+        );
+        // Histogram = line - signal
+        let expected_hist = last_snap.macd_line - last_snap.macd_signal;
+        assert!(
+            (last_snap.macd_histogram - expected_hist).abs() < 0.001,
+            "MACD histogram must equal line - signal"
+        );
+    }
+
+    #[test]
+    fn test_atr_positive_after_volatile_sequence() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        let mut last_snap = IndicatorSnapshot::default();
+        for i in 0..20_u32 {
+            // Alternating high volatility
+            let base = 100.0 + if i % 2 == 0 { 10.0 } else { -10.0 };
+            let tick = ParsedTick {
+                security_id: 4,
+                last_traded_price: base as f32,
+                day_high: (base + 5.0) as f32,
+                day_low: (base - 5.0) as f32,
+                volume: 1000,
+                average_traded_price: base as f32,
+                ..ParsedTick::default()
+            };
+            last_snap = engine.update(&tick);
+        }
+        // ATR must be positive for volatile data
+        assert!(
+            last_snap.atr > 0.0,
+            "ATR must be positive, got {}",
+            last_snap.atr
+        );
+        // ATR should reflect the ~10-20 point swings
+        assert!(
+            last_snap.atr > 1.0,
+            "ATR too small for volatile data: {}",
+            last_snap.atr
+        );
+    }
+
+    #[test]
+    fn test_bollinger_bands_relationship() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        let mut last_snap = IndicatorSnapshot::default();
+        for i in 0..30_u32 {
+            let price = 100.0 + (i as f32 * 0.1);
+            let tick = ParsedTick {
+                security_id: 5,
+                last_traded_price: price,
+                day_high: price + 0.5,
+                day_low: price - 0.5,
+                volume: 1000,
+                average_traded_price: price,
+                ..ParsedTick::default()
+            };
+            last_snap = engine.update(&tick);
+        }
+        // Bollinger: upper > middle > lower (always)
+        assert!(
+            last_snap.bollinger_upper >= last_snap.bollinger_middle,
+            "Upper band must be >= middle"
+        );
+        assert!(
+            last_snap.bollinger_middle >= last_snap.bollinger_lower,
+            "Middle band must be >= lower"
+        );
+        // Middle band is Bollinger mean (Welford's online — separate from SMA ring buffer)
+        assert!(
+            last_snap.bollinger_middle > 0.0,
+            "Bollinger middle must be positive"
+        );
+    }
+
+    #[test]
+    fn test_obv_increases_on_up_tick() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        // First tick
+        let tick1 = ParsedTick {
+            security_id: 6,
+            last_traded_price: 100.0,
+            day_high: 101.0,
+            day_low: 99.0,
+            volume: 1000,
+            average_traded_price: 100.0,
+            ..ParsedTick::default()
+        };
+        engine.update(&tick1);
+
+        // Up tick → OBV should increase by volume
+        let tick2 = ParsedTick {
+            security_id: 6,
+            last_traded_price: 105.0,
+            day_high: 106.0,
+            day_low: 104.0,
+            volume: 2000,
+            average_traded_price: 105.0,
+            ..ParsedTick::default()
+        };
+        let snap2 = engine.update(&tick2);
+        assert!(
+            snap2.obv > 0.0,
+            "OBV must increase on up tick, got {}",
+            snap2.obv
+        );
+
+        // Down tick → OBV should decrease
+        let tick3 = ParsedTick {
+            security_id: 6,
+            last_traded_price: 95.0,
+            day_high: 96.0,
+            day_low: 94.0,
+            volume: 3000,
+            average_traded_price: 95.0,
+            ..ParsedTick::default()
+        };
+        let snap3 = engine.update(&tick3);
+        assert!(snap3.obv < snap2.obv, "OBV must decrease on down tick");
+    }
+
+    #[test]
+    fn test_supertrend_direction_for_trending_market() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+
+        let mut last_snap = IndicatorSnapshot::default();
+        // Feed 30 consistently rising ticks
+        for i in 0..30_u32 {
+            let price = 100.0 + i as f32 * 3.0;
+            let tick = ParsedTick {
+                security_id: 7,
+                last_traded_price: price,
+                day_high: price + 1.0,
+                day_low: price - 1.0,
+                volume: 1000,
+                average_traded_price: price,
+                ..ParsedTick::default()
+            };
+            last_snap = engine.update(&tick);
+        }
+        // Strong uptrend → supertrend should be bullish
+        assert!(
+            last_snap.supertrend_bullish,
+            "Supertrend must be bullish in uptrend"
+        );
+        assert!(
+            last_snap.supertrend > 0.0,
+            "Supertrend value must be positive"
+        );
+    }
 }

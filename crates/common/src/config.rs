@@ -1350,6 +1350,92 @@ mod tests {
         assert!(err.to_string().contains("websocket read timeout"));
     }
 
+    // Mutation-targeted tests: catch `replace + with -`, `replace * with +`,
+    // `replace + with *`, `replace > with >=` in validate() read timeout logic.
+
+    #[test]
+    fn test_websocket_read_timeout_exactly_at_boundary_passes() {
+        // computed = ping * (failures + 1) + pong
+        // With ping=10, failures=3, pong=10: computed = 10*(3+1)+10 = 50
+        // max = SERVER_PING_TIMEOUT_SECS * 2 = 80
+        // 50 < 80 → should pass
+        let mut config = make_valid_config();
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 3;
+        config.websocket.pong_timeout_secs = 10;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_exactly_at_max_passes() {
+        // computed = ping * (failures + 1) + pong = 80 exactly
+        // max = 80
+        // 80 > 80 is FALSE → should PASS (equal is OK)
+        // This catches `replace > with >=` mutation — if >= were used, this would fail
+        let mut config = make_valid_config();
+        // 10 * (6 + 1) + 10 = 10 * 7 + 10 = 80
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 6;
+        config.websocket.pong_timeout_secs = 10;
+        assert!(
+            config.validate().is_ok(),
+            "computed=80, max=80 → equal should PASS (> not >=)"
+        );
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_one_above_max_fails() {
+        // computed = 81, max = 80
+        // 81 > 80 → should FAIL
+        let mut config = make_valid_config();
+        // 10 * (6 + 1) + 11 = 81
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 6;
+        config.websocket.pong_timeout_secs = 11;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("websocket read timeout"));
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_plus_one_matters() {
+        // This catches `replace + with -` and `replace + with *` on the `+ 1`
+        // With failures=0: computed = ping * (0 + 1) + pong = ping + pong
+        // Mutation `+ 1` → `- 1`: computed = ping * (0 - 1) + pong = UNDERFLOW or 0 + pong
+        // Mutation `+ 1` → `* 1`: computed = ping * (0 * 1) + pong = 0 + pong
+        // Both mutations would give a DIFFERENT computed value
+        let mut config = make_valid_config();
+        // Normal: 40 * (0 + 1) + 41 = 40 + 41 = 81 > 80 → FAIL
+        // Mutant (-1): 40 * (0 - 1) + 41 → saturating = 0 + 41 = 41 ≤ 80 → PASS (wrong!)
+        // Mutant (*1): 40 * (0 * 1) + 41 = 0 + 41 = 41 ≤ 80 → PASS (wrong!)
+        config.websocket.ping_interval_secs = 40;
+        config.websocket.max_consecutive_pong_failures = 0;
+        config.websocket.pong_timeout_secs = 41;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("websocket read timeout"),
+            "failures=0 with +1 should compute 81 > 80"
+        );
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_times_two_matters() {
+        // This catches `replace * with +` on `SERVER_PING_TIMEOUT_SECS * 2`
+        // Normal max = 40 * 2 = 80
+        // Mutant max = 40 + 2 = 42
+        // With computed = 50: normal 50 ≤ 80 → PASS, mutant 50 > 42 → FAIL (wrong!)
+        let mut config = make_valid_config();
+        // computed = 10 * (3 + 1) + 10 = 50
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 3;
+        config.websocket.pong_timeout_secs = 10;
+        // 50 ≤ 80 → PASS (correct)
+        // If max were 42 (mutant): 50 > 42 → FAIL (mutation caught!)
+        assert!(
+            config.validate().is_ok(),
+            "computed=50 should be within max=80"
+        );
+    }
+
     #[test]
     fn test_feed_mode_ticker_passes() {
         let config = SubscriptionConfig {
