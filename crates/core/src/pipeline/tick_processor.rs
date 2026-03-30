@@ -760,10 +760,16 @@ pub async fn run_tick_processor(
                     continue;
                 }
 
-                // Only persist previous close during market hours [09:00, 15:30) IST.
-                // PrevClose packets arrive on every subscription, even pre-market.
-                let prev_close_ist_secs = utc_nanos_to_ist_secs_of_day(received_at_nanos);
-                if !is_within_persist_window(prev_close_ist_secs) {
+                // PrevClose is reference data — persist ALWAYS regardless of market hours.
+                // These packets arrive on every subscription (typically at boot, before 09:00).
+                // Blocking them with is_within_persist_window() causes "No data" in Grafana.
+                // Stale-day check still applies to prevent cross-day pollution.
+                if !is_today_ist(
+                    utc_nanos_to_ist_epoch_secs(received_at_nanos),
+                    today_ist_day_number,
+                ) {
+                    stale_day_filtered = stale_day_filtered.saturating_add(1);
+                    m_stale_day.increment(1);
                     continue;
                 }
 

@@ -348,7 +348,8 @@ async fn main() -> Result<()> {
         }
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
-        let (subscription_plan, fresh_universe) = load_instruments(&config, is_trading).await;
+        let (subscription_plan, fresh_universe, _needs_persist) =
+            load_instruments(&config, is_trading).await;
 
         // --- WebSocket pool create (channel only, NOT spawned yet) ---
         let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
@@ -444,11 +445,13 @@ async fn main() -> Result<()> {
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
                 let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
 
-                // Re-persist instrument data if fresh build happened before Docker started.
-                // The initial persistence inside load_or_build_instruments fails when QuestDB
-                // is not running yet. Now that Docker is up and tables exist, retry.
-                if let Some(ref universe) = fresh_universe {
-                    let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+                // Re-persist instrument data ONLY for CachedPlan path.
+                // FreshBuild already persisted inside load_or_build_instruments.
+                // Double-persist creates duplicate rows in QuestDB snapshot tables.
+                if _needs_persist {
+                    if let Some(ref universe) = fresh_universe {
+                        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+                    }
                 }
 
                 info!("QuestDB DDL complete (background)");
@@ -866,11 +869,18 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 7: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
-    // In slow boot, Docker is already running. FreshBuild persists internally,
-    // but CachedPlan (within build window) needs explicit persistence here.
-    let (subscription_plan, slow_boot_universe) = load_instruments(&config, is_trading).await;
-    if let Some(ref universe) = slow_boot_universe {
-        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+    // FreshBuild persists internally (inside load_or_build_instruments).
+    // CachedPlan loads from rkyv cache and returns universe for persistence here.
+    // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
+    let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
+        load_instruments(&config, is_trading).await;
+    // Only persist for CachedPlan (not yet persisted). FreshBuild already
+    // persisted inside load_or_build_instruments — double-write creates
+    // duplicate rows in the same timestamp second.
+    if needs_instrument_persist {
+        if let Some(ref universe) = slow_boot_universe {
+            let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1267,10 +1277,13 @@ async fn main() -> Result<()> {
 ///
 /// `is_trading_day` ensures non-trading days (weekends/holidays) always
 /// download fresh instruments instead of using potentially stale cache.
+/// Returns (plan, universe, needs_persist).
+/// `needs_persist` is true for CachedPlan (not yet persisted) and false for
+/// FreshBuild (already persisted inside load_or_build_instruments).
 async fn load_instruments(
     config: &ApplicationConfig,
     is_trading_day: bool,
-) -> (Option<SubscriptionPlan>, Option<FnoUniverse>) {
+) -> (Option<SubscriptionPlan>, Option<FnoUniverse>, bool) {
     info!("checking instrument build eligibility");
 
     match load_or_build_instruments(
@@ -1292,7 +1305,7 @@ async fn load_instruments(
                 feed_mode = %plan.summary.feed_mode,
                 "subscription plan ready (fresh build)"
             );
-            (Some(plan), Some(universe))
+            (Some(plan), Some(universe), false) // FreshBuild already persisted internally
         }
         Ok(InstrumentLoadResult::CachedPlan(plan)) => {
             info!(
@@ -1321,21 +1334,21 @@ async fn load_instruments(
                     None
                 }
             };
-            (Some(plan), universe)
+            (Some(plan), universe, true) // CachedPlan needs explicit persistence
         }
         Ok(InstrumentLoadResult::Unavailable) => {
             // I-P0-06: This should only trigger if emergency download also failed
             error!(
                 "CRITICAL: instruments unavailable — emergency download failed, system has ZERO instruments"
             );
-            (None, None)
+            (None, None, false)
         }
         Err(err) => {
             warn!(
                 error = %err,
                 "instrument build failed — no instruments to subscribe"
             );
-            (None, None)
+            (None, None, false)
         }
     }
 }
