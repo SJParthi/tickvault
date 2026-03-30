@@ -341,6 +341,71 @@ impl IndicatorEngine {
     pub const fn params(&self) -> &IndicatorParams {
         &self.params
     }
+
+    /// Warms up indicators from historical candle data.
+    ///
+    /// Feed OHLCV candles in chronological order (oldest first). Each candle
+    /// updates all indicators using the close price as LTP. After processing
+    /// enough candles (>= warmup threshold), `is_warm` becomes true.
+    ///
+    /// # Usage
+    /// Call before market open with 90 days of daily or 1-minute candles.
+    /// After warmup, the first live tick produces meaningful indicator values
+    /// instead of starting cold.
+    ///
+    /// # Performance
+    /// O(N × M) where N = number of candles and M = number of instruments.
+    /// Cold path — runs once at startup, not during live trading.
+    // O(1) EXEMPT: begin — cold path startup warmup (runs once before tick processing)
+    pub fn warmup_from_candles(
+        &mut self,
+        security_id: u32,
+        candles: &[(f64, f64, f64, f64, f64)], // (open, high, low, close, volume)
+    ) -> usize {
+        let sid = security_id as usize;
+        if sid >= self.states.len() || candles.is_empty() {
+            return 0;
+        }
+
+        let mut processed = 0_usize;
+
+        for &(open, high, low, close, volume) in candles {
+            // Skip invalid candles
+            if !close.is_finite() || close <= 0.0 {
+                continue;
+            }
+
+            // Create a synthetic tick from candle data
+            let tick = ParsedTick {
+                security_id,
+                exchange_segment_code: 0,
+                last_traded_price: close as f32,
+                day_high: high as f32,
+                day_low: low as f32,
+                day_open: open as f32,
+                day_close: 0.0, // Not used for indicator calculation
+                volume: volume as u32,
+                average_traded_price: close as f32,
+                ..ParsedTick::default()
+            };
+
+            // Feed through the normal update path
+            let _ = self.update(&tick);
+            processed = processed.saturating_add(1);
+        }
+        // O(1) EXEMPT: end
+
+        processed
+    }
+
+    /// Returns the warmup count for a given security.
+    pub fn warmup_count(&self, security_id: u32) -> u16 {
+        let sid = security_id as usize;
+        if sid >= self.states.len() {
+            return 0;
+        }
+        self.states[sid].warmup_count
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -952,5 +1017,120 @@ mod tests {
         assert!(snap.is_warm, "u16::MAX warmup_count must be warm");
         // EMA should still update correctly
         assert!(snap.ema_fast > 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Warmup from Historical Candles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_warmup_from_candles_empty() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        let result = engine.warmup_from_candles(100, &[]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_warmup_from_candles_processes_all() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        let candles: Vec<(f64, f64, f64, f64, f64)> = (0..50)
+            .map(|i| {
+                let price = 100.0 + i as f64;
+                (price - 1.0, price + 2.0, price - 2.0, price, 1000.0)
+            })
+            .collect();
+        let processed = engine.warmup_from_candles(100, &candles);
+        assert_eq!(processed, 50);
+    }
+
+    #[test]
+    fn test_warmup_makes_engine_warm() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        // Feed 40 candles (above warmup threshold of 30)
+        let candles: Vec<(f64, f64, f64, f64, f64)> = (0..40)
+            .map(|i| {
+                let price = 100.0 + i as f64;
+                (price, price + 1.0, price - 1.0, price, 1000.0)
+            })
+            .collect();
+        engine.warmup_from_candles(100, &candles);
+        assert!(engine.warmup_count(100) >= 30);
+    }
+
+    #[test]
+    fn test_warmup_indicators_have_values() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        let candles: Vec<(f64, f64, f64, f64, f64)> = (0..50)
+            .map(|i| {
+                let price = 100.0 + (i as f64 * 0.5);
+                (price, price + 2.0, price - 1.0, price, 5000.0)
+            })
+            .collect();
+        engine.warmup_from_candles(200, &candles);
+
+        // After warmup, feed one more tick to get a snapshot
+        let tick = ParsedTick {
+            security_id: 200,
+            last_traded_price: 125.0,
+            day_high: 126.0,
+            day_low: 124.0,
+            day_open: 124.5,
+            volume: 5000,
+            average_traded_price: 125.0,
+            ..ParsedTick::default()
+        };
+        let snap = engine.update(&tick);
+        assert!(snap.is_warm);
+        assert!(snap.ema_fast > 0.0);
+        assert!(snap.ema_slow > 0.0);
+        assert!(snap.sma > 0.0);
+        assert!(snap.rsi > 0.0 && snap.rsi <= 100.0);
+        assert!(snap.atr >= 0.0);
+    }
+
+    #[test]
+    fn test_warmup_skips_invalid_candles() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        let candles = vec![
+            (100.0, 101.0, 99.0, 100.0, 1000.0),           // valid
+            (0.0, 0.0, 0.0, 0.0, 0.0),                     // invalid (close=0)
+            (f64::NAN, f64::NAN, f64::NAN, f64::NAN, 0.0), // invalid (NaN)
+            (102.0, 103.0, 101.0, 102.0, 2000.0),          // valid
+        ];
+        let processed = engine.warmup_from_candles(300, &candles);
+        assert_eq!(processed, 2); // Only 2 valid candles
+    }
+
+    #[test]
+    fn test_warmup_oob_security_id() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        let candles = vec![(100.0, 101.0, 99.0, 100.0, 1000.0)];
+        let processed = engine.warmup_from_candles(u32::MAX, &candles);
+        assert_eq!(processed, 0); // Out of bounds
+    }
+
+    #[test]
+    fn test_warmup_count_method() {
+        let params = IndicatorParams::default();
+        let mut engine = IndicatorEngine::new(params);
+        assert_eq!(engine.warmup_count(100), 0); // Initially zero
+        let candles: Vec<(f64, f64, f64, f64, f64)> = (0..10)
+            .map(|i| (100.0 + i as f64, 101.0, 99.0, 100.0 + i as f64, 1000.0))
+            .collect();
+        engine.warmup_from_candles(100, &candles);
+        assert_eq!(engine.warmup_count(100), 10);
+    }
+
+    #[test]
+    fn test_warmup_count_oob() {
+        let params = IndicatorParams::default();
+        let engine = IndicatorEngine::new(params);
+        assert_eq!(engine.warmup_count(u32::MAX), 0);
     }
 }
