@@ -862,6 +862,9 @@ async fn main() -> Result<()> {
         dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
         dhan_live_trader_storage::movers_persistence::ensure_movers_tables(&config.questdb),
+        dhan_live_trader_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
+            &config.questdb
+        ),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
