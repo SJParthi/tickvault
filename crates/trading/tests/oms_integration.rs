@@ -121,6 +121,12 @@ fn make_order_update(order_no: &str, status: &str) -> OrderUpdate {
         tick_size: 0.0,
         source: String::new(),
         off_mkt_flag: String::new(),
+        algo_ord_no: String::new(),
+        mkt_type: String::new(),
+        series: String::new(),
+        good_till_days_date: String::new(),
+        algo_id: String::new(),
+        multiplier: 0,
     }
 }
 

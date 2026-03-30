@@ -462,9 +462,8 @@ pub struct MarginCalculatorRequest {
     pub security_id: String,
     /// Order price.
     pub price: f64,
-    /// Trigger price (for stop-loss orders). None for non-SL orders.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger_price: Option<f64>,
+    /// Trigger price (for stop-loss orders). 0.0 for non-SL orders.
+    pub trigger_price: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -526,9 +525,8 @@ pub struct MarginScript {
     pub security_id: String,
     /// Order price.
     pub price: f64,
-    /// Trigger price (optional for non-SL orders).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger_price: Option<f64>,
+    /// Trigger price (0.0 for non-SL orders).
+    pub trigger_price: f64,
 }
 
 /// Request body for `POST /v2/margincalculator/multi`.

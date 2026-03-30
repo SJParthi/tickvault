@@ -51,21 +51,17 @@ pub struct ApplicationConfig {
 ///   Use for API integration testing before going live.
 /// - `Live`: HTTP calls to `api.dhan.co/v2/`. Real exchange orders, real money.
 ///   Requires static IP. Use only when ready for production.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TradingMode {
     /// Local simulation — no HTTP calls, PAPER-{counter} order IDs.
+    /// Default: safe — never touch real money.
+    #[default]
     Paper,
     /// Dhan sandbox — HTTP to sandbox.dhan.co, orders fill at ₹100.
     Sandbox,
     /// Real trading — HTTP to api.dhan.co, real exchange orders.
     Live,
-}
-
-impl Default for TradingMode {
-    fn default() -> Self {
-        Self::Paper // Safe default: never touch real money
-    }
 }
 
 impl TradingMode {
@@ -869,6 +865,7 @@ mod tests {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),
                 order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
                 rest_api_base_url: "https://api.dhan.co/v2".to_string(),
+                sandbox_base_url: "https://sandbox.dhan.co/v2".to_string(),
                 auth_base_url: "https://auth.dhan.co".to_string(),
                 instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
                     .to_string(),
