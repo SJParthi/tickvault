@@ -613,6 +613,83 @@ pub struct FundLimitResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Kill Switch Types
+// ---------------------------------------------------------------------------
+
+/// Kill switch status response from Dhan.
+/// Endpoint: `GET /v2/killswitch` and `POST /v2/killswitch`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillSwitchResponse {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Kill switch status: "ACTIVATE" or "DEACTIVATE".
+    #[serde(default)]
+    pub kill_switch_status: String,
+}
+
+// ---------------------------------------------------------------------------
+// P&L Exit Types
+// ---------------------------------------------------------------------------
+
+/// P&L-based exit configuration request.
+/// Endpoint: `POST /v2/pnlExit`
+///
+/// **WARNING:** If `profit_value` < current profit OR `loss_value` < current loss,
+/// exit triggers IMMEDIATELY. Always check current P&L before configuring.
+///
+/// Session-scoped — resets at end of trading session. Must reconfigure daily.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlExitRequest {
+    /// Profit threshold (STRING, not float) — e.g., "1500.00".
+    pub profit_value: String,
+    /// Loss threshold (STRING, not float) — e.g., "500.00".
+    pub loss_value: String,
+    /// Product types to apply exit on — e.g., ["INTRADAY", "DELIVERY"].
+    pub product_type: Vec<String>,
+    /// Also activate kill switch after P&L exit triggers.
+    pub enable_kill_switch: bool,
+}
+
+/// P&L exit configure/stop response from Dhan.
+/// Endpoint: `POST /v2/pnlExit` and `DELETE /v2/pnlExit`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlExitResponse {
+    /// P&L exit status: "ACTIVE" or "DISABLED".
+    #[serde(default)]
+    pub pnl_exit_status: String,
+    /// Confirmation message.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// P&L exit status response from Dhan (GET endpoint).
+/// **Field names differ from POST request** (Dhan API inconsistency):
+/// - POST request: `profitValue`, `lossValue`, `enableKillSwitch` (camelCase)
+/// - GET response: `profit`, `loss`, `enable_kill_switch` (shorter names, snake_case mix)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PnlExitStatusResponse {
+    /// P&L exit status: "ACTIVE" or "DISABLED".
+    #[serde(default, rename = "pnlExitStatus")]
+    pub pnl_exit_status: String,
+    /// Profit threshold (shorter name than request).
+    #[serde(default)]
+    pub profit: String,
+    /// Loss threshold (shorter name than request).
+    #[serde(default)]
+    pub loss: String,
+    /// Product types.
+    #[serde(default, rename = "productType")]
+    pub product_type: Vec<String>,
+    /// Kill switch enabled flag (snake_case in GET, camelCase in POST — Dhan inconsistency).
+    #[serde(default)]
+    pub enable_kill_switch: bool,
+}
+
+// ---------------------------------------------------------------------------
 // OMS Error
 // ---------------------------------------------------------------------------
 

@@ -929,6 +929,14 @@ pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
 /// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
 pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
 
+/// Path for kill switch activate/deactivate (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE|DEACTIVATE>
+pub const DHAN_KILL_SWITCH_PATH: &str = "/killswitch";
+
+/// Path for P&L-based exit configuration (appended to rest_api_base_url).
+/// Endpoint: POST/DELETE/GET <https://api.dhan.co/v2/pnlExit>
+pub const DHAN_PNL_EXIT_PATH: &str = "/pnlExit";
+
 // ---------------------------------------------------------------------------
 // Full Market Depth — WebSocket Base URLs
 // ---------------------------------------------------------------------------
