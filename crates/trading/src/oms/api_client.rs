@@ -28,11 +28,13 @@ use tracing::{debug, warn};
 use dhan_live_trader_common::constants;
 
 use super::types::{
-    DhanConvertPositionRequest, DhanExitAllResponse, DhanHoldingResponse, DhanModifyOrderRequest,
-    DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse, DhanPositionResponse,
-    DhanTradeEntry, FundLimitResponse, KillSwitchResponse, MarginCalculatorRequest,
-    MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse, OmsError, PnlExitRequest,
-    PnlExitResponse, PnlExitStatusResponse,
+    DhanConvertPositionRequest, DhanExitAllResponse, DhanForeverOrderRequest,
+    DhanForeverOrderResponse, DhanHoldingResponse, DhanModifyOrderRequest,
+    DhanModifySuperOrderRequest, DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse,
+    DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
+    FundLimitResponse, KillSwitchResponse, MarginCalculatorRequest, MarginCalculatorResponse,
+    MultiMarginRequest, MultiMarginResponse, OmsError, PnlExitRequest, PnlExitResponse,
+    PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -552,6 +554,315 @@ impl OrderApiClient {
 
         let status = response.status().as_u16();
         self.check_rate_limit(status, "get_fund_limit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Super Order Endpoints (Phase 4) — docs/dhan-ref/07a-super-order.md
+    // -----------------------------------------------------------------------
+
+    /// Places a super order (entry + target + stop loss as 3 legs).
+    ///
+    /// Endpoint: `POST /v2/super/orders`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn place_super_order(
+        &self,
+        access_token: &str,
+        request: &DhanPlaceSuperOrderRequest,
+    ) -> Result<DhanSuperOrderResponse, OmsError> {
+        let url = format!("{}/super/orders", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "place_super_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Modifies a super order leg.
+    ///
+    /// Restrictions: ENTRY_LEG=all fields, TARGET_LEG=targetPrice only,
+    /// STOP_LOSS_LEG=stopLossPrice+trailingJump only.
+    ///
+    /// Endpoint: `PUT /v2/super/orders/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn modify_super_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+        request: &DhanModifySuperOrderRequest,
+    ) -> Result<DhanSuperOrderResponse, OmsError> {
+        let url = format!("{}/super/orders/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.put(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "modify_super_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Cancels a super order leg.
+    ///
+    /// ENTRY_LEG cancellation = cancels ALL legs (entire super order).
+    /// TARGET_LEG/STOP_LOSS_LEG = permanent removal, cannot re-add.
+    ///
+    /// Endpoint: `DELETE /v2/super/orders/{order-id}/{order-leg}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn cancel_super_order_leg(
+        &self,
+        access_token: &str,
+        order_id: &str,
+        leg: &str,
+    ) -> Result<DhanSuperOrderResponse, OmsError> {
+        let url = format!("{}/super/orders/{}/{}", self.base_url, order_id, leg);
+
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "cancel_super_order_leg")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Lists all super orders for today.
+    ///
+    /// Endpoint: `GET /v2/super/orders`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_super_orders(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<DhanSuperOrderResponse>, OmsError> {
+        let url = format!("{}/super/orders", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_super_orders")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Forever Order Endpoints (Phase 5) — docs/dhan-ref/07b-forever-order.md
+    // -----------------------------------------------------------------------
+
+    /// Creates a forever order (GTT — Good Till Triggered).
+    ///
+    /// Product types: CNC, MTF ONLY. INTRADAY/MARGIN rejected.
+    ///
+    /// Endpoint: `POST /v2/forever/orders`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn create_forever_order(
+        &self,
+        access_token: &str,
+        request: &DhanForeverOrderRequest,
+    ) -> Result<DhanForeverOrderResponse, OmsError> {
+        let url = format!("{}/forever/orders", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "create_forever_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Modifies a forever order (by leg name: TARGET_LEG or STOP_LOSS_LEG).
+    ///
+    /// Endpoint: `PUT /v2/forever/orders/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn modify_forever_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+        request: &DhanForeverOrderRequest,
+    ) -> Result<DhanForeverOrderResponse, OmsError> {
+        let url = format!("{}/forever/orders/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.put(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "modify_forever_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Deletes a forever order.
+    ///
+    /// Endpoint: `DELETE /v2/forever/orders/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn delete_forever_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+    ) -> Result<DhanForeverOrderResponse, OmsError> {
+        let url = format!("{}/forever/orders/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "delete_forever_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Lists all forever orders.
+    ///
+    /// Endpoint: `GET /v2/forever/all`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_all_forever_orders(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<DhanForeverOrderResponse>, OmsError> {
+        let url = format!("{}/forever/all", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_all_forever_orders")?;
 
         let body = response
             .text()

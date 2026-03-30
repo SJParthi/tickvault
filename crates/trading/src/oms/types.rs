@@ -617,6 +617,223 @@ pub struct FundLimitResponse {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Super Order Types (07a-super-order.md)
+// ---------------------------------------------------------------------------
+
+/// Leg type for super orders (bracket orders with entry + target + stop loss).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OrderLeg {
+    /// Entry leg — the initial order.
+    #[serde(rename = "ENTRY_LEG")]
+    EntryLeg,
+    /// Target leg — profit booking.
+    #[serde(rename = "TARGET_LEG")]
+    TargetLeg,
+    /// Stop loss leg — risk limit.
+    #[serde(rename = "STOP_LOSS_LEG")]
+    StopLossLeg,
+}
+
+impl OrderLeg {
+    /// Returns the Dhan API string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryLeg => "ENTRY_LEG",
+            Self::TargetLeg => "TARGET_LEG",
+            Self::StopLossLeg => "STOP_LOSS_LEG",
+        }
+    }
+}
+
+/// Place super order request (entry + target + stop loss as 3 legs).
+/// Endpoint: `POST /v2/super/orders`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanPlaceSuperOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// User-supplied idempotency key (max 30 chars).
+    #[serde(default)]
+    pub correlation_id: String,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment: "NSE_EQ", "NSE_FNO", etc.
+    pub exchange_segment: String,
+    /// Product type: "CNC", "INTRADAY", "MARGIN", "MTF".
+    pub product_type: String,
+    /// Order type: "LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_MARKET".
+    pub order_type: String,
+    /// Dhan security ID (STRING, not integer).
+    pub security_id: String,
+    /// Quantity in lots.
+    pub quantity: i64,
+    /// Entry price.
+    pub price: f64,
+    /// Target exit price (profit booking).
+    pub target_price: f64,
+    /// Stop loss price (risk limit).
+    pub stop_loss_price: f64,
+    /// Trailing SL price jump (0 = no trailing, 0 explicitly cancels trailing).
+    pub trailing_jump: f64,
+}
+
+/// Modify super order request (leg-specific restrictions).
+/// Endpoint: `PUT /v2/super/orders/{order-id}`
+///
+/// Modification restrictions by leg:
+/// - ENTRY_LEG: all fields modifiable (only when PENDING or PART_TRADED)
+/// - TARGET_LEG: only `targetPrice`
+/// - STOP_LOSS_LEG: only `stopLossPrice` and `trailingJump`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanModifySuperOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Which leg to modify.
+    pub leg_name: String,
+    /// Order type (ENTRY_LEG only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_type: Option<String>,
+    /// Quantity (ENTRY_LEG only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<i64>,
+    /// Entry price (ENTRY_LEG only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
+    /// Target price (TARGET_LEG or ENTRY_LEG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_price: Option<f64>,
+    /// Stop loss price (STOP_LOSS_LEG or ENTRY_LEG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss_price: Option<f64>,
+    /// Trailing SL jump (STOP_LOSS_LEG or ENTRY_LEG). 0 = cancel trailing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailing_jump: Option<f64>,
+}
+
+/// Super order leg detail from response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuperOrderLegDetail {
+    /// Dhan order ID for this leg.
+    #[serde(default)]
+    pub order_id: String,
+    /// Leg name: "ENTRY_LEG", "TARGET_LEG", "STOP_LOSS_LEG".
+    #[serde(default)]
+    pub leg_name: String,
+    /// Transaction type: "BUY" or "SELL".
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Remaining quantity.
+    #[serde(default)]
+    pub remaining_quantity: i64,
+    /// Triggered quantity.
+    #[serde(default)]
+    pub triggered_quantity: i64,
+    /// Price for this leg.
+    #[serde(default)]
+    pub price: f64,
+    /// Status of this leg.
+    #[serde(default)]
+    pub order_status: String,
+    /// Trailing jump value.
+    #[serde(default)]
+    pub trailing_jump: f64,
+}
+
+/// Super order response (includes leg details).
+/// Endpoint: `GET /v2/super/orders` and `POST /v2/super/orders`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanSuperOrderResponse {
+    /// Dhan order ID (entry leg).
+    #[serde(default)]
+    pub order_id: String,
+    /// Order status.
+    #[serde(default)]
+    pub order_status: String,
+    /// Correlation ID.
+    #[serde(default)]
+    pub correlation_id: String,
+    /// Leg details array (target + stop loss legs).
+    #[serde(default)]
+    pub leg_details: Vec<SuperOrderLegDetail>,
+}
+
+// ---------------------------------------------------------------------------
+// Forever Order Types (07b-forever-order.md)
+// ---------------------------------------------------------------------------
+
+/// Order flag for forever orders: SINGLE (one trigger) or OCO (two triggers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ForeverOrderFlag {
+    /// Single trigger — one price condition.
+    #[serde(rename = "SINGLE")]
+    Single,
+    /// OCO (One Cancels Other) — two triggers, whichever hits first.
+    #[serde(rename = "OCO")]
+    Oco,
+}
+
+/// Place forever order (GTT) request.
+/// Endpoint: `POST /v2/forever/orders`
+///
+/// Product types: CNC, MTF ONLY (no INTRADAY, no MARGIN).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanForeverOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// User-supplied idempotency key.
+    #[serde(default)]
+    pub correlation_id: String,
+    /// "SINGLE" or "OCO".
+    pub order_flag: String,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment.
+    pub exchange_segment: String,
+    /// Product type: CNC or MTF ONLY.
+    pub product_type: String,
+    /// Order type: "LIMIT" or "MARKET".
+    pub order_type: String,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// First leg quantity.
+    pub quantity: i64,
+    /// Disclosed quantity (optional).
+    #[serde(default)]
+    pub disclosed_quantity: i64,
+    /// First leg price.
+    pub price: f64,
+    /// First leg trigger price.
+    pub trigger_price: f64,
+    /// Second leg price (OCO ONLY — REQUIRED for OCO, must NOT be sent for SINGLE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price1: Option<f64>,
+    /// Second leg trigger price (OCO ONLY).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_price1: Option<f64>,
+    /// Second leg quantity (OCO ONLY).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity1: Option<i64>,
+}
+
+/// Forever order response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanForeverOrderResponse {
+    /// Dhan order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Order status (includes CONFIRM — unique to forever orders).
+    #[serde(default)]
+    pub order_status: String,
+}
+
+// ---------------------------------------------------------------------------
 // Trade Book Types
 // ---------------------------------------------------------------------------
 
