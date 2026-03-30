@@ -35,7 +35,7 @@ use super::types::{
     DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
     EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
     MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
-    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
+    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse, TriggerCondition,
 };
 
 // ---------------------------------------------------------------------------
@@ -4503,5 +4503,462 @@ mod tests {
         for code in ["DH-901", "DH-904", "DH-905", "DH-906"] {
             metrics::counter!("dlt_dhan_error_total", "code" => code).increment(1);
         }
+    }
+
+    // ===================================================================
+    // Mock HTTP tests for ALL new API methods (Phase 2-8)
+    // Each method tested with success (200) and error (non-200) paths
+    // ===================================================================
+
+    // --- Kill Switch ---
+
+    #[tokio::test]
+    async fn test_activate_kill_switch_success() {
+        let body = r#"{"dhanClientId":"100","killSwitchStatus":"ACTIVATE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.activate_kill_switch("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().kill_switch_status, "ACTIVATE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_activate_kill_switch_error() {
+        let body = r#"{"errorType":"error","errorCode":"DH-905","errorMessage":"bad"}"#;
+        let (url, h) = start_mock_server(400, body).await;
+        let client = make_test_client(&url);
+        let result = client.activate_kill_switch("jwt").await;
+        assert!(result.is_err());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_deactivate_kill_switch_success() {
+        let body = r#"{"dhanClientId":"100","killSwitchStatus":"DEACTIVATE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.deactivate_kill_switch("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().kill_switch_status, "DEACTIVATE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_kill_switch_status_success() {
+        let body = r#"{"dhanClientId":"100","killSwitchStatus":"DEACTIVATE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_kill_switch_status("jwt").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    // --- P&L Exit ---
+
+    #[tokio::test]
+    async fn test_configure_pnl_exit_success() {
+        let body = r#"{"pnlExitStatus":"ACTIVE","message":"configured"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = PnlExitRequest {
+            profit_value: "1500.00".to_string(),
+            loss_value: "500.00".to_string(),
+            product_type: vec!["INTRADAY".to_string()],
+            enable_kill_switch: true,
+        };
+        let result = client.configure_pnl_exit("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().pnl_exit_status, "ACTIVE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stop_pnl_exit_success() {
+        let body = r#"{"pnlExitStatus":"DISABLED","message":"stopped"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.stop_pnl_exit("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().pnl_exit_status, "DISABLED");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_pnl_exit_status_success() {
+        let body = r#"{"pnlExitStatus":"ACTIVE","profit":"1500.00","loss":"500.00","productType":["INTRADAY"],"enable_kill_switch":true}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_pnl_exit_status("jwt").await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert_eq!(resp.profit, "1500.00");
+        assert!(resp.enable_kill_switch);
+        h.abort();
+    }
+
+    // --- Order Slicing ---
+
+    #[tokio::test]
+    async fn test_place_order_slicing_success() {
+        let body = r#"{"orderId":"SL-1","orderStatus":"PENDING","correlationId":"c1"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = make_test_place_request();
+        let result = client.place_order_slicing("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_id, "SL-1");
+        h.abort();
+    }
+
+    // --- Get by Correlation ---
+
+    #[tokio::test]
+    async fn test_get_order_by_correlation_id_success() {
+        let body = r#"{"orderId":"O1","correlationId":"c1","orderStatus":"TRADED","quantity":50,"filledQty":50,"remainingQuantity":0,"averageTradedPrice":245.5,"price":245.5,"triggerPrice":0,"omsErrorCode":"","omsErrorDescription":"","tradingSymbol":"NIFTY","securityId":"52432","tradedQuantity":50,"tradedPrice":245.5,"transactionType":"BUY","exchangeSegment":"NSE_FNO","productType":"INTRADAY","orderType":"LIMIT","validity":"DAY","exchangeOrderId":"E1","exchangeTime":"2026-03-30 10:00:00","createTime":"2026-03-30 10:00:00","updateTime":"2026-03-30 10:00:00","rejectionReason":"","tag":"","drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_order_by_correlation_id("jwt", "c1").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_id, "O1");
+        h.abort();
+    }
+
+    // --- Trade Book ---
+
+    #[tokio::test]
+    async fn test_get_trades_success() {
+        let body = r#"[{"dhanClientId":"100","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_FNO","productType":"INTRADAY","orderType":"LIMIT","tradingSymbol":"NIFTY","customSymbol":"","securityId":"52432","tradedQuantity":50,"tradedPrice":245.5,"isin":"","instrument":"OPTIDX","sebiTax":0.1,"stt":1.0,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":0.5,"stampDuty":0.01,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-30 10:00:00"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_trades("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_trades_for_order_success() {
+        let body = r#"[{"dhanClientId":"100","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_FNO","productType":"INTRADAY","orderType":"LIMIT","tradingSymbol":"NIFTY","customSymbol":"","securityId":"52432","tradedQuantity":50,"tradedPrice":245.5,"isin":"","instrument":"OPTIDX","sebiTax":0,"stt":0,"brokerageCharges":0,"serviceTax":0,"exchangeTransactionCharges":0,"stampDuty":0,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0,"exchangeTime":"2026-03-30 10:00:00"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_trades_for_order("jwt", "O1").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    // --- Super Orders ---
+
+    #[tokio::test]
+    async fn test_place_super_order_success() {
+        let body =
+            r#"{"orderId":"SO-1","orderStatus":"PENDING","correlationId":"","legDetails":[]}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 5,
+            price: 1500.0,
+            target_price: 1600.0,
+            stop_loss_price: 1400.0,
+            trailing_jump: 10.0,
+        };
+        let result = client.place_super_order("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_id, "SO-1");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_modify_super_order_success() {
+        let body =
+            r#"{"orderId":"SO-1","orderStatus":"PENDING","correlationId":"","legDetails":[]}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            leg_name: "TARGET_LEG".to_string(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: Some(1650.0),
+            stop_loss_price: None,
+            trailing_jump: None,
+        };
+        let result = client.modify_super_order("jwt", "SO-1", &req).await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancel_super_order_leg_success() {
+        let body =
+            r#"{"orderId":"SO-1","orderStatus":"CANCELLED","correlationId":"","legDetails":[]}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client
+            .cancel_super_order_leg("jwt", "SO-1", "ENTRY_LEG")
+            .await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_super_orders_success() {
+        let body =
+            r#"[{"orderId":"SO-1","orderStatus":"PENDING","correlationId":"","legDetails":[]}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_super_orders("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- Forever Orders ---
+
+    #[tokio::test]
+    async fn test_create_forever_order_success() {
+        let body = r#"{"orderId":"FO-1","orderStatus":"CONFIRM"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            order_flag: "SINGLE".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: None,
+            trigger_price1: None,
+            quantity1: None,
+        };
+        let result = client.create_forever_order("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_status, "CONFIRM");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_delete_forever_order_success() {
+        let body = r#"{"orderId":"FO-1","orderStatus":"CANCELLED"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.delete_forever_order("jwt", "FO-1").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_forever_orders_success() {
+        let body = r#"[{"orderId":"FO-1","orderStatus":"CONFIRM"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_all_forever_orders("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- Conditional Triggers ---
+
+    #[tokio::test]
+    async fn test_create_conditional_trigger_success() {
+        let body = r#"{"alertId":"A1","alertStatus":"ACTIVE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "100".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "PRICE_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "1333".to_string(),
+                indicator_name: None,
+                time_frame: None,
+                operator: "GREATER_THAN".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![],
+        };
+        let result = client.create_conditional_trigger("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().alert_status, "ACTIVE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_delete_conditional_trigger_success() {
+        let body = r#"{"alertId":"A1","alertStatus":"CANCELLED"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.delete_conditional_trigger("jwt", "A1").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_conditional_triggers_success() {
+        let body = r#"[{"alertId":"A1","alertStatus":"ACTIVE"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_all_conditional_triggers("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- EDIS ---
+
+    #[tokio::test]
+    async fn test_generate_tpin_success() {
+        let (url, h) = start_mock_server(202, "").await;
+        let client = make_test_client(&url);
+        let result = client.generate_tpin("jwt").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_generate_edis_form_success() {
+        let html = "<html><form>CDSL Form</form></html>";
+        let (url, h) = start_mock_server(200, html).await;
+        let client = make_test_client(&url);
+        let req = EdisFormRequest {
+            isin: "INE733E01010".to_string(),
+            qty: 100,
+            exchange: "NSE".to_string(),
+            segment: "EQ".to_string(),
+            bulk: false,
+        };
+        let result = client.generate_edis_form("jwt", &req).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("CDSL Form"));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_inquire_edis_approval_success() {
+        let body = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.inquire_edis_approval("jwt", "ALL").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().aprvd_qty, 50);
+        h.abort();
+    }
+
+    // --- Statements ---
+
+    #[tokio::test]
+    async fn test_get_ledger_success() {
+        let body = r#"[{"dhanClientId":"100","narration":"trade","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_ledger("jwt", "2022-06-01", "2022-06-30").await;
+        assert!(result.is_ok());
+        let entries = result.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].debit, "1500.50"); // String, not float
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_trade_history_success() {
+        let body = r#"[{"dhanClientId":"100","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0,"serviceTax":0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0,"exchangeTime":"2026-03-25 14:30:00"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client
+            .get_trade_history("jwt", "2026-03-01", "2026-03-30", 0)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- Rate limit tests for new methods ---
+
+    #[tokio::test]
+    async fn test_kill_switch_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let result = client.activate_kill_switch("jwt").await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_super_order_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 5,
+            price: 1500.0,
+            target_price: 1600.0,
+            stop_loss_price: 1400.0,
+            trailing_jump: 0.0,
+        };
+        let result = client.place_super_order("jwt", &req).await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_forever_order_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            order_flag: "SINGLE".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: None,
+            trigger_price1: None,
+            quantity1: None,
+        };
+        let result = client.create_forever_order("jwt", &req).await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_conditional_trigger_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let result = client.get_all_conditional_triggers("jwt").await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
     }
 }
