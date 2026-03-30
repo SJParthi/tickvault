@@ -211,6 +211,7 @@ mod tests {
                 .to_string(),
             max_instruments_per_connection: 5000,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         }
     }
 
