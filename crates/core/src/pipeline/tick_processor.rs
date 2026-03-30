@@ -138,9 +138,12 @@ fn derive_depth_timestamp_secs(
     received_at_nanos: i64,
 ) -> u32 {
     if tick_is_valid {
-        exchange_timestamp
+        exchange_timestamp // Already IST epoch seconds from Dhan WS
     } else {
-        (received_at_nanos / 1_000_000_000) as u32
+        // Wall-clock path (Market Depth code 3): convert UTC → IST epoch seconds
+        // Must add IST offset so is_today_ist() comparison works correctly
+        // (today_ist_day_number is computed in IST, so this must also be IST)
+        utc_nanos_to_ist_epoch_secs(received_at_nanos)
     }
 }
 
@@ -164,6 +167,15 @@ fn persist_stock_movers_snapshot(
     snapshot: &super::top_movers::TopMoversSnapshot,
     ts_nanos: i64,
 ) {
+    if snapshot.gainers.is_empty() && snapshot.losers.is_empty() && snapshot.most_active.is_empty()
+    {
+        debug!(
+            total_tracked = snapshot.total_tracked,
+            "empty movers snapshot — no gainers/losers/most_active to persist"
+        );
+        return;
+    }
+
     let segment_str =
         |code: u8| -> &'static str { dhan_live_trader_common::segment::segment_code_to_str(code) };
 
@@ -3409,16 +3421,18 @@ mod tests {
 
     #[test]
     fn test_derive_depth_timestamp_invalid_tick() {
-        // tick_is_valid = false → derive from received_at_nanos
+        // tick_is_valid = false → derive from received_at_nanos (UTC → IST)
         let nanos: i64 = 1_772_073_900_000_000_000;
         let ts = derive_depth_timestamp_secs(false, 0, nanos);
-        assert_eq!(ts, 1_772_073_900);
+        // utc_nanos_to_ist_epoch_secs adds IST_UTC_OFFSET_SECONDS (19800)
+        assert_eq!(ts, 1_772_073_900 + IST_UTC_OFFSET_SECONDS as u32);
     }
 
     #[test]
     fn test_derive_depth_timestamp_invalid_tick_zero_nanos() {
         let ts = derive_depth_timestamp_secs(false, 0, 0);
-        assert_eq!(ts, 0);
+        // Zero UTC nanos → IST offset only
+        assert_eq!(ts, IST_UTC_OFFSET_SECONDS as u32);
     }
 
     #[test]
@@ -3430,9 +3444,10 @@ mod tests {
 
     #[test]
     fn test_derive_depth_timestamp_invalid_large_nanos() {
-        let nanos: i64 = 2_000_000_000_000_000_000; // ~2033
+        let nanos: i64 = 2_000_000_000_000_000_000; // ~2033 UTC
         let ts = derive_depth_timestamp_secs(false, 0, nanos);
-        assert_eq!(ts, 2_000_000_000);
+        // UTC → IST: adds 19800 seconds
+        assert_eq!(ts, 2_000_000_000 + IST_UTC_OFFSET_SECONDS as u32);
     }
 
     // ===================================================================

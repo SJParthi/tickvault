@@ -943,7 +943,11 @@ async fn main() -> Result<()> {
     // the previous trading day) even on non-trading days. Without this guard,
     // those stale ticks pass the time-of-day persist window check and get
     // written to QuestDB, polluting the database with duplicate/stale data.
-    let should_connect_ws = subscription_plan.is_some() && (is_trading || is_mock_trading);
+    // Connect WebSocket on trading days, mock trading Saturdays, AND Muhurat sessions.
+    // Muhurat = special Diwali evening session on an otherwise closed day.
+    // Without this, Muhurat trading days get zero market data.
+    let should_connect_ws =
+        subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
             &token_handle,
