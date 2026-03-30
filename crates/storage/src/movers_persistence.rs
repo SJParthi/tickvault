@@ -44,6 +44,8 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 const MOVERS_FLUSH_BATCH_SIZE: usize = 250;
 
 /// Flush interval for movers (60 seconds — aligned with snapshot interval).
+/// Used by future flush_if_needed() implementation.
+#[allow(dead_code)] // APPROVED: will be used when flush_if_needed() is wired
 const MOVERS_FLUSH_INTERVAL_MS: u64 = 65_000;
 
 // ---------------------------------------------------------------------------
@@ -143,6 +145,8 @@ impl StockMoversWriter {
     /// * `change_pct` — percentage change
     /// * `volume` — day volume
     // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
+    #[allow(clippy::too_many_arguments)]
+    // APPROVED: 10 params — each maps to a QuestDB column, no abstraction reduces this
     pub fn append_stock_mover(
         &mut self,
         ts_nanos: i64,
@@ -187,10 +191,10 @@ impl StockMoversWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE {
-            if let Err(err) = self.flush() {
-                warn!(?err, "stock movers auto-flush failed");
-            }
+        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
+            && let Err(err) = self.flush()
+        {
+            warn!(?err, "stock movers auto-flush failed");
         }
 
         Ok(())
@@ -347,10 +351,10 @@ impl OptionMoversWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE {
-            if let Err(err) = self.flush() {
-                warn!(?err, "option movers auto-flush failed");
-            }
+        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
+            && let Err(err) = self.flush()
+        {
+            warn!(?err, "option movers auto-flush failed");
         }
 
         Ok(())

@@ -481,21 +481,14 @@ const fn default_constituency_inter_batch_delay_ms() -> u64 {
 }
 
 /// Infrastructure configuration — controls Docker auto-start behavior.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct InfrastructureConfig {
     /// Whether to auto-start Docker services on boot.
     /// Set to `false` on Mac (dev) — run `make docker-up` manually.
     /// Set to `true` on AWS (prod) — auto-start on deploy.
+    /// Default: `false` (safe — never auto-start).
     #[serde(default)]
     pub auto_start_docker: bool,
-}
-
-impl Default for InfrastructureConfig {
-    fn default() -> Self {
-        Self {
-            auto_start_docker: false, // Safe default: never auto-start
-        }
-    }
 }
 
 /// Greeks engine configuration.
@@ -882,6 +875,7 @@ mod tests {
             strategy: StrategyConfig::default(),
             index_constituency: IndexConstituencyConfig::default(),
             greeks: GreeksConfig::default(),
+            infrastructure: InfrastructureConfig::default(),
         }
     }
 

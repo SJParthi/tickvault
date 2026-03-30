@@ -448,10 +448,8 @@ async fn main() -> Result<()> {
                 // Re-persist instrument data ONLY for CachedPlan path.
                 // FreshBuild already persisted inside load_or_build_instruments.
                 // Double-persist creates duplicate rows in QuestDB snapshot tables.
-                if _needs_persist {
-                    if let Some(ref universe) = fresh_universe {
-                        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
-                    }
+                if _needs_persist && let Some(ref universe) = fresh_universe {
+                    let _ = persist_instrument_snapshot(universe, &config.questdb).await;
                 }
 
                 info!("QuestDB DDL complete (background)");
@@ -886,10 +884,8 @@ async fn main() -> Result<()> {
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
-    if needs_instrument_persist {
-        if let Some(ref universe) = slow_boot_universe {
-            let _ = persist_instrument_snapshot(universe, &config.questdb).await;
-        }
+    if needs_instrument_persist && let Some(ref universe) = slow_boot_universe {
+        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
     }
 
     // -----------------------------------------------------------------------

@@ -204,7 +204,7 @@ impl OptionMoversTracker {
     pub fn compute_snapshot(&self) -> OptionMoversSnapshot {
         // Build entries from all tracked options
         // O(1) EXEMPT: begin — cold path snapshot computation (every 60s)
-        let mut entries: Vec<OptionMoverEntry> = self
+        let entries: Vec<OptionMoverEntry> = self
             .options
             .iter()
             .filter_map(|(&(_sid, _seg), state)| {
