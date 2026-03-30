@@ -741,7 +741,16 @@ async fn main() -> Result<()> {
     info!("initializing notification service + checking Docker infra (parallel)");
     let (notifier, _) = tokio::join!(
         NotificationService::initialize(&config.notification),
-        infra::ensure_infra_running(&config.questdb),
+        async {
+            if config.infrastructure.auto_start_docker {
+                infra::ensure_infra_running(&config.questdb).await;
+            } else {
+                info!(
+                    "Docker auto-start disabled (infrastructure.auto_start_docker = false). \
+                     Run `make docker-up` manually before starting the app."
+                );
+            }
+        },
     );
 
     // -----------------------------------------------------------------------

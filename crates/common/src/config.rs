@@ -39,6 +39,8 @@ pub struct ApplicationConfig {
     pub index_constituency: IndexConstituencyConfig,
     #[serde(default)]
     pub greeks: GreeksConfig,
+    #[serde(default)]
+    pub infrastructure: InfrastructureConfig,
 }
 
 /// Strategy and paper-trading configuration.
@@ -476,6 +478,24 @@ const fn default_constituency_max_concurrent_downloads() -> usize {
 
 const fn default_constituency_inter_batch_delay_ms() -> u64 {
     200
+}
+
+/// Infrastructure configuration — controls Docker auto-start behavior.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InfrastructureConfig {
+    /// Whether to auto-start Docker services on boot.
+    /// Set to `false` on Mac (dev) — run `make docker-up` manually.
+    /// Set to `true` on AWS (prod) — auto-start on deploy.
+    #[serde(default)]
+    pub auto_start_docker: bool,
+}
+
+impl Default for InfrastructureConfig {
+    fn default() -> Self {
+        Self {
+            auto_start_docker: false, // Safe default: never auto-start
+        }
+    }
 }
 
 /// Greeks engine configuration.

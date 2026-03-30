@@ -259,3 +259,9 @@ enabled = true
 download_timeout_secs = 30
 max_concurrent_downloads = 5
 inter_batch_delay_ms = 0
+
+[infrastructure]
+# Auto-start Docker services on boot (docker compose up -d).
+# Set to true ONLY on AWS production instances.
+# On Mac (dev), run `make docker-up` manually before starting the app.
+auto_start_docker = false
