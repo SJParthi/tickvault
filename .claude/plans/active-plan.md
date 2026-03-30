@@ -148,6 +148,29 @@ Hybrid sandbox mode: real market data + sandbox order execution.
   - Files: crates/trading/src/oms/types.rs
   - Tests: test_margin_optional_trigger_price, test_margin_quantity_i32
 
+### Phase 9: Indicator Persistence + Warmup from Historical (Day 11-12)
+
+- [ ] 9.1: Create `indicator_snapshots` QuestDB table DDL
+  - Files: crates/storage/src/indicator_persistence.rs (NEW), crates/storage/src/lib.rs
+  - Columns: ts, security_id, segment, timeframe, sma_5, sma_10, sma_20, sma_50, ema_9, ema_12, ema_26, rsi_14, macd_line, macd_signal, macd_hist, bb_upper, bb_lower, bb_middle, atr_14, obv, vwap, adx
+  - Tests: test_indicator_snapshot_ddl, test_append_indicator_snapshot
+
+- [ ] 9.2: Persist indicator values alongside 1-minute candles
+  - Files: crates/core/src/pipeline/tick_processor.rs, crates/trading/src/indicator/engine.rs
+  - Every 60s: snapshot current indicator state for all tracked securities
+  - Tests: test_indicator_snapshot_persisted, test_indicator_outside_hours_skipped
+
+- [ ] 9.3: Load indicator state from QuestDB on restart (warmup)
+  - Files: crates/trading/src/indicator/engine.rs, crates/app/src/trading_pipeline.rs
+  - At boot: query last indicator snapshot per security from DB
+  - Initialize EMA/SMA/RSI/MACD with historical state (no cold start)
+  - Tests: test_warmup_from_db, test_warmup_skips_if_no_data, test_indicators_warm_after_load
+
+- [ ] 9.4: Store indicator values for multiple timeframes (1m, 5m, 15m, 1h, 1d)
+  - Files: crates/trading/src/indicator/engine.rs
+  - Compute indicators from materialized view candles (not just ticks)
+  - Tests: test_multi_timeframe_indicators, test_5m_sma_from_candles
+
 ## Scenarios
 
 | # | Scenario | Expected |
