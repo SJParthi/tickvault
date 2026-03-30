@@ -2293,4 +2293,447 @@ mod tests {
         assert!(debug.contains("52432"), "Debug must include security_id");
         assert!(debug.contains("Pending"), "Debug must include status");
     }
+
+    // -----------------------------------------------------------------------
+    // Kill Switch Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kill_switch_response_deserialize() {
+        let json = r#"{"dhanClientId":"1100003626","killSwitchStatus":"ACTIVATE"}"#;
+        let resp: KillSwitchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.kill_switch_status, "ACTIVATE");
+        assert_eq!(resp.dhan_client_id, "1100003626");
+    }
+
+    #[test]
+    fn test_kill_switch_response_deactivate() {
+        let json = r#"{"dhanClientId":"1100003626","killSwitchStatus":"DEACTIVATE"}"#;
+        let resp: KillSwitchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.kill_switch_status, "DEACTIVATE");
+    }
+
+    #[test]
+    fn test_kill_switch_response_missing_fields_default() {
+        let json = r#"{}"#;
+        let resp: KillSwitchResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.kill_switch_status.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // P&L Exit Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pnl_exit_request_serialize() {
+        let req = PnlExitRequest {
+            profit_value: "1500.00".to_string(),
+            loss_value: "500.00".to_string(),
+            product_type: vec!["INTRADAY".to_string(), "DELIVERY".to_string()],
+            enable_kill_switch: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"profitValue\":\"1500.00\""));
+        assert!(json.contains("\"lossValue\":\"500.00\""));
+        assert!(json.contains("\"enableKillSwitch\":true"));
+        assert!(json.contains("DELIVERY"));
+    }
+
+    #[test]
+    fn test_pnl_exit_request_string_values_not_floats() {
+        let req = PnlExitRequest {
+            profit_value: "1500.00".to_string(),
+            loss_value: "500.00".to_string(),
+            product_type: vec!["INTRADAY".to_string()],
+            enable_kill_switch: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // Values must be strings, not numbers
+        assert!(json.contains("\"1500.00\""));
+        assert!(json.contains("\"500.00\""));
+    }
+
+    #[test]
+    fn test_pnl_exit_response_deserialize() {
+        let json = r#"{"pnlExitStatus":"ACTIVE","message":"P&L based exit configured"}"#;
+        let resp: PnlExitResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.pnl_exit_status, "ACTIVE");
+    }
+
+    #[test]
+    fn test_pnl_exit_status_response_different_field_names() {
+        // GET response uses different field names from POST request
+        let json = r#"{"pnlExitStatus":"ACTIVE","profit":"1500.00","loss":"500.00","productType":["INTRADAY"],"enable_kill_switch":true}"#;
+        let resp: PnlExitStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.profit, "1500.00"); // Short name, not profitValue
+        assert_eq!(resp.loss, "500.00"); // Short name, not lossValue
+        assert!(resp.enable_kill_switch); // snake_case, not camelCase
+    }
+
+    // -----------------------------------------------------------------------
+    // Super Order Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_order_leg_serialize() {
+        assert_eq!(
+            serde_json::to_string(&OrderLeg::EntryLeg).unwrap(),
+            "\"ENTRY_LEG\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrderLeg::TargetLeg).unwrap(),
+            "\"TARGET_LEG\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrderLeg::StopLossLeg).unwrap(),
+            "\"STOP_LOSS_LEG\""
+        );
+    }
+
+    #[test]
+    fn test_order_leg_deserialize() {
+        let entry: OrderLeg = serde_json::from_str("\"ENTRY_LEG\"").unwrap();
+        assert_eq!(entry, OrderLeg::EntryLeg);
+        let target: OrderLeg = serde_json::from_str("\"TARGET_LEG\"").unwrap();
+        assert_eq!(target, OrderLeg::TargetLeg);
+        let sl: OrderLeg = serde_json::from_str("\"STOP_LOSS_LEG\"").unwrap();
+        assert_eq!(sl, OrderLeg::StopLossLeg);
+    }
+
+    #[test]
+    fn test_order_leg_as_str() {
+        assert_eq!(OrderLeg::EntryLeg.as_str(), "ENTRY_LEG");
+        assert_eq!(OrderLeg::TargetLeg.as_str(), "TARGET_LEG");
+        assert_eq!(OrderLeg::StopLossLeg.as_str(), "STOP_LOSS_LEG");
+    }
+
+    #[test]
+    fn test_super_order_request_serialize() {
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "1000000003".to_string(),
+            correlation_id: "abc123".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 5,
+            price: 1500.0,
+            target_price: 1600.0,
+            stop_loss_price: 1400.0,
+            trailing_jump: 10.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"targetPrice\":1600"));
+        assert!(json.contains("\"stopLossPrice\":1400"));
+        assert!(json.contains("\"trailingJump\":10"));
+        assert!(json.contains("\"securityId\":\"11536\"")); // STRING not number
+    }
+
+    #[test]
+    fn test_super_order_trailing_jump_zero_cancels_trailing() {
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "1".to_string(),
+            correlation_id: String::new(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 1,
+            price: 100.0,
+            target_price: 110.0,
+            stop_loss_price: 90.0,
+            trailing_jump: 0.0, // Explicitly cancels trailing
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"trailingJump\":0")); // Must be 0, not omitted
+    }
+
+    #[test]
+    fn test_modify_super_order_target_only_price() {
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "1".to_string(),
+            leg_name: "TARGET_LEG".to_string(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: Some(1650.0),
+            stop_loss_price: None,
+            trailing_jump: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"targetPrice\":1650"));
+        assert!(!json.contains("quantity")); // Skipped
+        assert!(!json.contains("price\":")); // Skipped (not targetPrice)
+    }
+
+    #[test]
+    fn test_modify_super_order_sl_only_sl_and_trail() {
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "1".to_string(),
+            leg_name: "STOP_LOSS_LEG".to_string(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: None,
+            stop_loss_price: Some(1380.0),
+            trailing_jump: Some(5.0),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"stopLossPrice\":1380"));
+        assert!(json.contains("\"trailingJump\":5"));
+        assert!(!json.contains("\"quantity\"")); // Skipped
+    }
+
+    #[test]
+    fn test_super_order_leg_detail_deserialize() {
+        let json = r#"{"orderId":"ORD-1","legName":"ENTRY_LEG","transactionType":"BUY","remainingQuantity":5,"triggeredQuantity":0,"price":1500.0,"orderStatus":"PENDING","trailingJump":10.0}"#;
+        let leg: SuperOrderLegDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(leg.order_id, "ORD-1");
+        assert_eq!(leg.leg_name, "ENTRY_LEG");
+        assert_eq!(leg.remaining_quantity, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Forever Order Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_forever_order_flag_serialize() {
+        assert_eq!(
+            serde_json::to_string(&ForeverOrderFlag::Single).unwrap(),
+            "\"SINGLE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ForeverOrderFlag::Oco).unwrap(),
+            "\"OCO\""
+        );
+    }
+
+    #[test]
+    fn test_forever_order_single_no_second_leg() {
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "1".to_string(),
+            correlation_id: String::new(),
+            order_flag: "SINGLE".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: None,
+            trigger_price1: None,
+            quantity1: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("price1")); // Omitted for SINGLE
+        assert!(!json.contains("triggerPrice1")); // Omitted for SINGLE
+        assert!(!json.contains("quantity1")); // Omitted for SINGLE
+    }
+
+    #[test]
+    fn test_forever_order_oco_has_second_leg() {
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "1".to_string(),
+            correlation_id: String::new(),
+            order_flag: "OCO".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: Some(1420.0),
+            trigger_price1: Some(1419.0),
+            quantity1: Some(10),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"price1\":1420")); // Present for OCO
+        assert!(json.contains("\"triggerPrice1\":1419"));
+        assert!(json.contains("\"quantity1\":10"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional Trigger Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_comparison_type_serialize() {
+        assert_eq!(
+            serde_json::to_string(&ComparisonType::TechnicalWithValue).unwrap(),
+            "\"TECHNICAL_WITH_VALUE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComparisonType::PriceWithValue).unwrap(),
+            "\"PRICE_WITH_VALUE\""
+        );
+    }
+
+    #[test]
+    fn test_trigger_operator_all_9_variants() {
+        let operators = [
+            TriggerOperator::CrossingUp,
+            TriggerOperator::CrossingDown,
+            TriggerOperator::CrossingAnySide,
+            TriggerOperator::GreaterThan,
+            TriggerOperator::LessThan,
+            TriggerOperator::GreaterThanEqual,
+            TriggerOperator::LessThanEqual,
+            TriggerOperator::Equal,
+            TriggerOperator::NotEqual,
+        ];
+        assert_eq!(operators.len(), 9);
+        for op in &operators {
+            let json = serde_json::to_string(op).unwrap();
+            assert!(!json.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_trigger_timeframe_all_4_variants() {
+        let timeframes = [
+            TriggerTimeFrame::Day,
+            TriggerTimeFrame::OneMin,
+            TriggerTimeFrame::FiveMin,
+            TriggerTimeFrame::FifteenMin,
+        ];
+        assert_eq!(timeframes.len(), 4);
+        assert_eq!(
+            serde_json::to_string(&TriggerTimeFrame::Day).unwrap(),
+            "\"DAY\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TriggerTimeFrame::OneMin).unwrap(),
+            "\"ONE_MIN\""
+        );
+    }
+
+    #[test]
+    fn test_trigger_condition_frequency_default() {
+        let json = r#"{"comparisonType":"PRICE_WITH_VALUE","exchangeSegment":"NSE_EQ","securityId":"1333","operator":"GREATER_THAN"}"#;
+        let cond: TriggerCondition = serde_json::from_str(json).unwrap();
+        assert_eq!(cond.frequency, "ONCE"); // Default
+    }
+
+    #[test]
+    fn test_conditional_trigger_request_serialize() {
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "1".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "TECHNICAL_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "12345".to_string(),
+                indicator_name: Some("SMA_5".to_string()),
+                time_frame: Some("DAY".to_string()),
+                operator: "CROSSING_UP".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![TriggerOrder {
+                transaction_type: "BUY".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                product_type: "CNC".to_string(),
+                order_type: "LIMIT".to_string(),
+                security_id: "12345".to_string(),
+                quantity: 10,
+                validity: "DAY".to_string(),
+                price: "250.00".to_string(),
+                disc_quantity: "0".to_string(),
+                trigger_price: "0".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("SMA_5"));
+        assert!(json.contains("CROSSING_UP"));
+        assert!(json.contains("ONCE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Trade Book + DhanTradeEntry Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trade_entry_deserialize_with_tax_breakdown() {
+        let json = r#"{"dhanClientId":"1","orderId":"ORD-1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"INTRADAY","orderType":"MARKET","tradingSymbol":"NIFTY","customSymbol":"","securityId":"11536","tradedQuantity":50,"tradedPrice":24500.0,"isin":"INE1234","instrument":"OPTIDX","sebiTax":0.5,"stt":12.25,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":2.0,"stampDuty":0.1,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-27 10:30:45"}"#;
+        let entry: DhanTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 50);
+        assert!((entry.stt - 12.25).abs() < f64::EPSILON);
+        assert!((entry.stamp_duty - 0.1).abs() < f64::EPSILON);
+        assert_eq!(entry.drv_option_type, "CE");
+    }
+
+    // -----------------------------------------------------------------------
+    // EDIS Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edis_form_request_serialize() {
+        let req = EdisFormRequest {
+            isin: "INE733E01010".to_string(),
+            qty: 100,
+            exchange: "NSE".to_string(),
+            segment: "EQ".to_string(),
+            bulk: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("INE733E01010"));
+        assert!(json.contains("\"bulk\":false"));
+    }
+
+    #[test]
+    fn test_edis_inquiry_response_deserialize() {
+        let json = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
+        let resp: EdisInquiryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_qty, 100);
+        assert_eq!(resp.aprvd_qty, 50);
+        assert_eq!(resp.status, "APPROVED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Statement Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ledger_entry_string_debit_credit() {
+        // CRITICAL: debit and credit are STRINGS, not floats
+        let json = r#"{"dhanClientId":"1","narration":"test","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000.00"}"#;
+        let entry: DhanLedgerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.debit, "1500.50"); // String, not float
+        assert_eq!(entry.credit, "0.00"); // String, not float
+        assert_eq!(entry.voucherdate, "Jun 22, 2022"); // Human-readable format
+    }
+
+    #[test]
+    fn test_historical_trade_entry_deserialize() {
+        let json = r#"{"dhanClientId":"1","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0.0,"serviceTax":0.0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0.0,"exchangeTime":"2026-03-25 14:30:00"}"#;
+        let entry: DhanHistoricalTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 10);
+        assert_eq!(entry.drv_expiry_date, "NA"); // "NA" for non-derivatives
+        assert_eq!(entry.exchange_time, "2026-03-25 14:30:00"); // IST string
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel Order Response Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_order_response_deserialize() {
+        let json = r#"{"orderId":"ORD-123","orderStatus":"CANCELLED"}"#;
+        let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "ORD-123");
+        assert_eq!(resp.order_status, "CANCELLED");
+    }
 }
