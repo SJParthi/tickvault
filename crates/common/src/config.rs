@@ -43,6 +43,62 @@ pub struct ApplicationConfig {
     pub infrastructure: InfrastructureConfig,
 }
 
+/// Trading execution mode — controls how orders are routed.
+///
+/// - `Paper`: Zero HTTP calls. Orders simulated locally with PAPER-{counter} IDs.
+///   Use for strategy development with real market data.
+/// - `Sandbox`: HTTP calls to `sandbox.dhan.co/v2/`. Orders fill at ₹100 (simulated).
+///   Use for API integration testing before going live.
+/// - `Live`: HTTP calls to `api.dhan.co/v2/`. Real exchange orders, real money.
+///   Requires static IP. Use only when ready for production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TradingMode {
+    /// Local simulation — no HTTP calls, PAPER-{counter} order IDs.
+    Paper,
+    /// Dhan sandbox — HTTP to sandbox.dhan.co, orders fill at ₹100.
+    Sandbox,
+    /// Real trading — HTTP to api.dhan.co, real exchange orders.
+    Live,
+}
+
+impl Default for TradingMode {
+    fn default() -> Self {
+        Self::Paper // Safe default: never touch real money
+    }
+}
+
+impl TradingMode {
+    /// Returns true if this mode makes real HTTP calls to Dhan (sandbox or live).
+    pub fn is_http_active(self) -> bool {
+        matches!(self, Self::Sandbox | Self::Live)
+    }
+
+    /// Returns true if this mode is paper trading (no HTTP calls).
+    pub fn is_paper(self) -> bool {
+        self == Self::Paper
+    }
+
+    /// Returns true if this is the live production mode.
+    pub fn is_live(self) -> bool {
+        self == Self::Live
+    }
+
+    /// Returns true if this is the sandbox testing mode.
+    pub fn is_sandbox(self) -> bool {
+        self == Self::Sandbox
+    }
+
+    /// Returns the display name for logging.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paper => "paper",
+            Self::Sandbox => "sandbox",
+            Self::Live => "live",
+        }
+    }
+}
+
 /// Strategy and paper-trading configuration.
 #[derive(Debug, Deserialize)]
 pub struct StrategyConfig {
@@ -54,8 +110,13 @@ pub struct StrategyConfig {
     pub capital: f64,
     /// Dry-run mode: when true, NO real orders are placed. All orders are simulated.
     /// DEFAULT: true. This is a developer-only tool.
+    /// DEPRECATED: Use `mode` instead. Kept for backward compatibility.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// Trading execution mode: paper (local sim), sandbox (Dhan DevPortal), live (real).
+    /// Overrides dry_run when set. Default: paper.
+    #[serde(default)]
+    pub mode: TradingMode,
 }
 
 impl Default for StrategyConfig {
@@ -64,6 +125,7 @@ impl Default for StrategyConfig {
             config_path: default_strategy_config_path(),
             capital: default_capital(),
             dry_run: default_dry_run(),
+            mode: TradingMode::default(),
         }
     }
 }
@@ -878,6 +940,74 @@ mod tests {
             infrastructure: InfrastructureConfig::default(),
         }
     }
+
+    #[test]
+    // -----------------------------------------------------------------------
+    // TradingMode tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_trading_mode_default_is_paper() {
+        assert_eq!(TradingMode::default(), TradingMode::Paper);
+    }
+
+    #[test]
+    fn test_trading_mode_paper_no_http() {
+        assert!(!TradingMode::Paper.is_http_active());
+        assert!(TradingMode::Paper.is_paper());
+        assert!(!TradingMode::Paper.is_live());
+        assert!(!TradingMode::Paper.is_sandbox());
+    }
+
+    #[test]
+    fn test_trading_mode_sandbox_has_http() {
+        assert!(TradingMode::Sandbox.is_http_active());
+        assert!(!TradingMode::Sandbox.is_paper());
+        assert!(!TradingMode::Sandbox.is_live());
+        assert!(TradingMode::Sandbox.is_sandbox());
+    }
+
+    #[test]
+    fn test_trading_mode_live_has_http() {
+        assert!(TradingMode::Live.is_http_active());
+        assert!(!TradingMode::Live.is_paper());
+        assert!(TradingMode::Live.is_live());
+        assert!(!TradingMode::Live.is_sandbox());
+    }
+
+    #[test]
+    fn test_trading_mode_as_str() {
+        assert_eq!(TradingMode::Paper.as_str(), "paper");
+        assert_eq!(TradingMode::Sandbox.as_str(), "sandbox");
+        assert_eq!(TradingMode::Live.as_str(), "live");
+    }
+
+    #[test]
+    fn test_trading_mode_deserialize_lowercase() {
+        let paper: TradingMode = serde_json::from_str("\"paper\"").unwrap();
+        assert_eq!(paper, TradingMode::Paper);
+        let sandbox: TradingMode = serde_json::from_str("\"sandbox\"").unwrap();
+        assert_eq!(sandbox, TradingMode::Sandbox);
+        let live: TradingMode = serde_json::from_str("\"live\"").unwrap();
+        assert_eq!(live, TradingMode::Live);
+    }
+
+    #[test]
+    fn test_trading_mode_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&TradingMode::Paper).unwrap(),
+            "\"paper\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TradingMode::Sandbox).unwrap(),
+            "\"sandbox\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TradingMode::Live).unwrap(),
+            "\"live\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_valid_config_passes_validation() {

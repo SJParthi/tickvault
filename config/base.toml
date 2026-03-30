@@ -200,6 +200,11 @@ max_position_size_lots = 50
 config_path = "config/strategies.toml"
 capital = 1000000.0
 dry_run = true  # SAFETY: never place real orders — paper trading only
+# Trading mode: "paper" (local sim) | "sandbox" (Dhan DevPortal) | "live" (real orders)
+# paper  = zero HTTP to Dhan order APIs, PAPER-{counter} IDs
+# sandbox = HTTP to sandbox.dhan.co, fills at ₹100, no static IP needed
+# live   = HTTP to api.dhan.co, real exchange, static IP required
+mode = "sandbox"
 
 [logging]
 level = "info"

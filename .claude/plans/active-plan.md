@@ -1,97 +1,164 @@
-# Implementation Plan: Top Movers Persistence + Options Movers + Depth Selection + Warmup
+# Implementation Plan: Sandbox Mode + Complete Order Trading Implementation
 
 **Status:** IN_PROGRESS
-**Date:** 2026-03-29
+**Date:** 2026-03-30
 **Approved by:** Parthiban
 
-## Decisions Made
+## Scope
 
-- **Storage interval:** 1-minute snapshots (09:15 inclusive — 15:30 exclusive)
-- **Options movers:** All 7 categories (Highest OI, OI Gainers, OI Losers, Top Volume, Top Value, Price Gainers, Price Losers)
-- **Stock movers:** 3 categories (Gainers, Losers, Most Active)
-- **Options filter:** Current month expiry + All types (default). Configurable.
-- **Market depth:** Major F&O indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) for 20-level depth
-- **Tables:** Separate `stock_movers` + `option_movers` (different schemas)
+26 missing endpoints + 6 missing WS fields across 11 Dhan order docs.
+Hybrid sandbox mode: real market data + sandbox order execution.
 
 ## Plan Items
 
-### Phase A: Stock Top Movers Persistence (Day 1)
+### Phase 1: Sandbox Mode Infrastructure (Day 1)
 
-- [x] Item 1: Create `stock_movers` + `option_movers` QuestDB table DDL + persistence writers
-  - Files: crates/storage/src/movers_persistence.rs (NEW), crates/storage/src/lib.rs
-  - Tests: 18 tests passing (DDL validation, DEDUP keys, categories, table names, writer construction)
+- [ ] 1.1: Add TradingMode enum (Paper/Sandbox/Live) to config.rs
+  - Files: crates/common/src/config.rs, config/base.toml
+  - Tests: test_trading_mode_paper, test_trading_mode_sandbox, test_trading_mode_live
 
-- [ ] Item 2: Add 1-minute snapshot persistence to tick processor
-  - Files: crates/core/src/pipeline/tick_processor.rs, crates/core/src/pipeline/top_movers.rs
-  - Tests: test_snapshot_at_minute_boundary, test_no_snapshot_outside_hours
+- [ ] 1.2: Add sandbox SSM credential fetch (sandbox-client-id + sandbox-token)
+  - Files: crates/core/src/auth/secret_manager.rs
+  - Tests: test_fetch_sandbox_credentials
 
-- [ ] Item 3: Enrich TopMoversSnapshot with symbol name from instrument registry
-  - Files: crates/core/src/pipeline/top_movers.rs
-  - Tests: test_mover_entry_with_symbol
+- [ ] 1.3: Add DHAN_SANDBOX_BASE_URL constant + URL switching in OMS engine
+  - Files: crates/common/src/constants.rs, crates/trading/src/oms/engine.rs
+  - Tests: test_sandbox_url_selected, test_live_url_selected, test_paper_no_http
 
-### Phase B: Options Movers Computation + Persistence (Day 2-3)
+- [ ] 1.4: Skip IP verification + TOTP auth chain for sandbox mode in boot
+  - Files: crates/app/src/main.rs
+  - Tests: test_sandbox_skips_ip_check
 
-- [ ] Item 4: Create OptionMoversTracker with all 7 categories
-  - Files: crates/core/src/pipeline/option_movers.rs (NEW), crates/core/src/pipeline/mod.rs
-  - Categories: Highest OI, OI Gainers, OI Losers, Top Volume, Top Value, Price Gainers, Price Losers
-  - Tests: test_oi_change_calculation, test_all_7_categories_sorted, test_expiry_filter, test_nan_filtered
+### Phase 2: Kill Switch + P&L Exit API Methods (Day 2)
 
-- [ ] Item 5: Create `option_movers` QuestDB table DDL + persistence writer
-  - Files: crates/storage/src/movers_persistence.rs (extend)
-  - Tests: test_option_movers_table_ddl, test_append_option_mover
+- [ ] 2.1: Add 6 API client methods for kill switch + P&L exit
+  - Files: crates/trading/src/oms/api_client.rs
+  - Methods: activate_kill_switch, deactivate_kill_switch, get_kill_switch_status, configure_pnl_exit, stop_pnl_exit, get_pnl_exit_status
+  - Tests: test_kill_switch_activate, test_pnl_exit_configure, test_pnl_exit_string_values
 
-- [ ] Item 6: Wire OptionMoversTracker into tick processor + 1-minute persistence
-  - Files: crates/core/src/pipeline/tick_processor.rs, crates/app/src/main.rs
-  - Tests: test_option_movers_snapshot_persisted, test_outside_hours_skipped
+- [ ] 2.2: Add emergency halt module wired to kill switch
+  - Files: crates/trading/src/risk/kill_switch.rs (NEW)
+  - Tests: test_emergency_halt_activates_kill_switch
 
-- [ ] Item 7: Add API endpoints for options movers
-  - Files: crates/api/src/handlers/option_movers.rs (NEW), crates/api/src/lib.rs
-  - Tests: test_option_movers_endpoint_200, test_option_movers_categories
+### Phase 3: Missing Standard Order Endpoints (Day 3)
 
-### Phase C: Market Depth Instrument Selection (Day 4)
+- [ ] 3.1: Add order slicing endpoint (POST /orders/slicing)
+  - Files: crates/trading/src/oms/api_client.rs, types.rs
+  - Tests: test_order_slicing_request
 
-- [ ] Item 8: Add depth subscription config + selection logic
-  - Files: crates/core/src/instrument/subscription_planner.rs, crates/common/src/config.rs
-  - Tests: test_depth_instrument_selection, test_depth_config_defaults
+- [ ] 3.2: Add trade book endpoints (GET /trades, GET /trades/{order-id})
+  - Files: crates/trading/src/oms/api_client.rs, types.rs (TradeEntry struct)
+  - Tests: test_get_trades, test_get_trades_for_order
 
-- [ ] Item 9: Wire 20-level depth WS connection in boot sequence
-  - Files: crates/app/src/main.rs, crates/core/src/websocket/connection_pool.rs
-  - Tests: test_depth_connection_created, test_depth_subscription_uses_code_23
+- [ ] 3.3: Add get order by correlation ID (GET /orders/external/{corr-id})
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: test_get_order_by_correlation
 
-### Phase D: Indicator Warmup from Historical (Day 5)
+- [ ] 3.4: Fix cancel order to return response body (not discard)
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: test_cancel_returns_status
 
-- [ ] Item 10: Load historical candles into indicator engine before market open
-  - Files: crates/trading/src/indicator/engine.rs, crates/app/src/trading_pipeline.rs
-  - Tests: test_warmup_from_historical, test_warmup_skips_if_no_data
+- [ ] 3.5: Add missing PlaceOrderRequest fields (amoTime, boProfitValue, boStopLossValue, disclosedQuantity, correlationId)
+  - Files: crates/trading/src/oms/types.rs
+  - Tests: test_amo_fields, test_bracket_fields
 
-### Phase E: Auto-Reconciliation + Phase Doc Update (Day 6)
+### Phase 4: Super Orders (Day 4-5)
 
-- [ ] Item 11: Schedule automatic reconciliation every 30s during market hours
-  - Files: crates/app/src/trading_pipeline.rs
-  - Tests: test_reconciliation_scheduled, test_reconciliation_skipped_outside_hours
+- [ ] 4.1: Add PlaceSuperOrderRequest + SuperOrderLeg types + OrderLeg enum
+  - Files: crates/trading/src/oms/types.rs
+  - Tests: test_super_order_request_serialization, test_leg_enum
 
-- [ ] Item 12: Update phase doc checkboxes
-  - Files: docs/phases/phase-1-live-trading.md
+- [ ] 4.2: Add 4 super order API client methods (place/modify/cancel/list)
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: test_place_super_order, test_modify_entry_leg, test_modify_target_leg_only_price, test_modify_sl_leg_only_sl_and_trail, test_cancel_entry_cancels_all
 
-### Phase F: Grafana Dashboards (Day 6)
+- [ ] 4.3: Add trailing SL logic (trailingJump=0 cancels trailing)
+  - Files: crates/trading/src/oms/super_order.rs (NEW)
+  - Tests: test_trailing_jump_zero_cancels, test_trailing_jump_positive
 
-- [ ] Item 13: Stock movers Grafana panels (Gainers, Losers, Most Active tables)
-  - Files: deploy/docker/grafana/dashboards/market-data.json
+- [ ] 4.4: Add leg-specific modification restrictions validation
+  - Files: crates/trading/src/oms/super_order.rs
+  - Tests: test_entry_leg_all_fields_modifiable, test_target_leg_only_price, test_sl_leg_only_sl_and_trail
 
-- [ ] Item 14: Options movers Grafana panels (Highest OI, OI Gainers/Losers, Top Volume)
-  - Files: deploy/docker/grafana/dashboards/market-data.json
+### Phase 5: Forever Orders / GTT (Day 6)
+
+- [ ] 5.1: Add ForeverOrderRequest + OrderFlag enum (SINGLE/OCO) + OCO second-leg fields
+  - Files: crates/trading/src/oms/types.rs
+  - Tests: test_single_order_flag, test_oco_requires_second_leg, test_single_rejects_second_leg
+
+- [ ] 5.2: Add 4 forever order API client methods (create/modify/delete/list)
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: test_create_forever_single, test_create_forever_oco, test_modify_with_leg_name
+
+- [ ] 5.3: Add CNC/MTF-only product type validation
+  - Files: crates/trading/src/oms/forever_order.rs (NEW)
+  - Tests: test_intraday_rejected, test_margin_rejected, test_cnc_accepted, test_mtf_accepted
+
+- [ ] 5.4: Add CONFIRM status handling in state machine
+  - Files: crates/trading/src/oms/state_machine.rs
+  - Tests: test_confirm_status_parsed, test_confirm_to_traded_valid
+
+### Phase 6: Conditional Triggers (Day 7)
+
+- [ ] 6.1: Add ComparisonType, Operator, IndicatorName, TimeFrame enums
+  - Files: crates/trading/src/oms/types.rs
+  - Tests: test_all_comparison_types, test_all_operators, test_all_indicators, test_all_timeframes
+
+- [ ] 6.2: Add 5 conditional trigger API client methods
+  - Files: crates/trading/src/oms/api_client.rs
+  - Tests: test_create_trigger, test_modify_trigger, test_delete_trigger
+
+- [ ] 6.3: Add equities/indices-only validation (reject F&O/commodity)
+  - Files: crates/trading/src/oms/conditional_trigger.rs (NEW)
+  - Tests: test_fno_rejected, test_commodity_rejected, test_equity_accepted, test_index_accepted
+
+- [ ] 6.4: Add required-field validation per comparison type
+  - Files: crates/trading/src/oms/conditional_trigger.rs
+  - Tests: test_technical_with_value_requires_indicator, test_price_with_value_no_indicator
+
+### Phase 7: OrderUpdate WS Fields + Position Reconciliation (Day 8)
+
+- [ ] 7.1: Add 6 missing fields to OrderUpdate struct (AlgoOrdNo, Series, GoodTillDaysDate, AlgoId, Multiplier, MktType)
+  - Files: crates/common/src/order_types.rs
+  - Tests: test_all_ws_fields_parsed, test_missing_fields_default
+
+- [ ] 7.2: Update handle_order_update to sync all fields (not just traded_qty/avg_price)
+  - Files: crates/trading/src/oms/engine.rs
+  - Tests: test_update_syncs_all_fields
+
+- [ ] 7.3: Add position-level reconciliation (aggregate fills per security)
+  - Files: crates/trading/src/oms/reconciliation.rs
+  - Tests: test_position_level_recon, test_multi_order_position_netting
+
+### Phase 8: EDIS + Statements + Margin Fixes (Day 9-10)
+
+- [ ] 8.1: Add EDIS types + constants + 3 API methods (tpin/form/inquire)
+  - Files: crates/trading/src/oms/api_client.rs, types.rs, crates/common/src/constants.rs
+  - Tests: test_generate_tpin, test_edis_form, test_edis_inquire_all
+
+- [ ] 8.2: Add ledger endpoint (GET /ledger) with STRING debit/credit
+  - Files: crates/trading/src/oms/api_client.rs, types.rs
+  - Tests: test_ledger_string_debit_credit, test_ledger_date_format
+
+- [ ] 8.3: Add trade history endpoint (GET /trades/{from}/{to}/{page}) with 0-indexed pagination
+  - Files: crates/trading/src/oms/api_client.rs, types.rs
+  - Tests: test_trade_history_page_zero, test_trade_history_path_params
+
+- [ ] 8.4: Fix margin calculator type issues (quantity i32, trigger_price Option<f64>)
+  - Files: crates/trading/src/oms/types.rs
+  - Tests: test_margin_optional_trigger_price, test_margin_quantity_i32
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Boot on trading day at 09:00 | Movers trackers initialize empty, no snapshots until 09:15 |
-| 2 | First tick at 09:15:00 | Movers start tracking, first snapshot at 09:16:00 |
-| 3 | Every minute 09:16-15:29 | Snapshot persisted for both stock + option movers |
-| 4 | Tick at 15:30:00 | No snapshot persisted (exclusive boundary) |
-| 5 | Non-trading day boot | Movers trackers initialize but no snapshots persisted |
-| 6 | NaN/Infinity LTP in option | Filtered, not included in rankings |
-| 7 | Zero OI option | Valid for price movers, excluded from OI rankings |
-| 8 | QuestDB down during persist | Error logged, next snapshot retried |
-| 9 | WebSocket reconnect | Movers state survives in-memory, gap in snapshots |
-| 10 | 20-level depth subscription | Only configured indices, separate WS connection |
+| 1 | mode=paper, place order | PAPER-0001 ID, zero HTTP calls |
+| 2 | mode=sandbox, place order | HTTP to sandbox.dhan.co, fills at ₹100 |
+| 3 | mode=live, place order | HTTP to api.dhan.co, real exchange fill |
+| 4 | mode=sandbox, kill switch | HTTP to sandbox.dhan.co/killswitch |
+| 5 | mode=sandbox, no static IP | IP check skipped, boot succeeds |
+| 6 | Super order cancel ENTRY_LEG | All 3 legs cancelled |
+| 7 | Super order cancel TARGET_LEG | Only target removed, cannot re-add |
+| 8 | Forever order OCO missing price1 | Rejected at build time |
+| 9 | Conditional trigger on F&O | Rejected (equities/indices only) |
+| 10 | OrderUpdate with AlgoOrdNo field | Parsed into OrderUpdate struct |
