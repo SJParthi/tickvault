@@ -547,8 +547,8 @@ const fn default_constituency_inter_batch_delay_ms() -> u64 {
 pub struct InfrastructureConfig {
     /// Whether to auto-start Docker services on boot.
     /// When true (default): one-click Run — app auto-launches Docker Desktop
-    /// + containers. Probes first, skips if already running. Zero manual steps.
-    /// When false: run "Docker Restart" in IntelliJ first, then "Run dhan-live-trader".
+    /// and containers. Probes first, skips if already running. Zero manual steps.
+    /// When false: run "Docker Restart" in IntelliJ first, then run the app.
     #[serde(default = "default_auto_start")]
     pub auto_start_docker: bool,
 }
