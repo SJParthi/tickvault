@@ -187,7 +187,12 @@ impl RiskEngine {
             // Adding to position: weighted average
             let old_value = pos.avg_entry_price * f64::from(old_lots.unsigned_abs());
             let new_value = fill_price * f64::from(filled_lots.unsigned_abs());
-            pos.avg_entry_price = (old_value + new_value) / f64::from(pos.net_lots.unsigned_abs());
+            let denominator = f64::from(pos.net_lots.unsigned_abs());
+            // Safety: denominator is always > 0 here because this branch only runs
+            // when adding same-direction lots. Guard against division by zero anyway.
+            if denominator > 0.0 {
+                pos.avg_entry_price = (old_value + new_value) / denominator;
+            }
         }
         // If reversing through zero, just set the new entry price
         if (old_lots > 0 && pos.net_lots < 0) || (old_lots < 0 && pos.net_lots > 0) {
