@@ -268,6 +268,7 @@ inter_batch_delay_ms = 0
 
 [infrastructure]
 # Auto-start Docker services on boot (docker compose up -d).
-# Set to true ONLY on AWS production instances.
-# On Mac (dev), run `make docker-up` manually before starting the app.
-auto_start_docker = false
+# On Mac: launches Docker Desktop if not running, then docker compose up -d.
+# On AWS: docker daemon is always running, just starts containers.
+# Safe: probes first — if services already running, skips immediately.
+auto_start_docker = true
