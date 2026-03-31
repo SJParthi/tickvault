@@ -35,7 +35,7 @@ use super::types::{
     DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
     EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
     MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
-    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse, TriggerCondition,
+    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -1635,6 +1635,7 @@ impl OrderApiClient {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::TriggerCondition;
     use super::*;
 
     #[test]
