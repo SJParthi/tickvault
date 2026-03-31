@@ -1,187 +1,222 @@
-# Implementation Plan: Sandbox Mode + Complete Order Trading Implementation
+# Implementation Plan: 100% Test Coverage & Mechanical Enforcement
 
-**Status:** IN_PROGRESS
-**Date:** 2026-03-30
-**Approved by:** Parthiban
+**Status:** DRAFT
+**Date:** 2026-03-31
+**Approved by:** pending
 
-## Scope
+---
 
-26 missing endpoints + 6 missing WS fields across 11 Dhan order docs.
-Hybrid sandbox mode: real market data + sandbox order execution.
+## Current State (Verified Facts — Not Hallucinated)
 
-## Plan Items
+| Metric | Current Value | How Verified |
+|--------|--------------|--------------|
+| Test functions | 7,251 | `grep -rE '#\[test\]' crates/ \| wc -l` |
+| 22 test types | 59/59 PASS | `bash scripts/test-coverage-guard.sh` |
+| Dhan API endpoints | 54/58 implemented | Grep of constants.rs + api_client.rs |
+| Coverage threshold config | 100% all crates | `quality/crate-coverage-thresholds.toml` |
+| Pre-push gates | 7 gates | `.claude/hooks/pre-push-gate.sh` |
+| Tick resilience | PARTIAL — fails on cold start | Code audit of tick_persistence.rs |
+| Monitoring | 85% complete | Audit of observability.rs + dashboards |
+| Disk space | 14GB free / 252GB | `df -h /` |
 
-### Phase 1: Sandbox Mode Infrastructure (Day 1)
+---
 
-- [ ] 1.1: Add TradingMode enum (Paper/Sandbox/Live) to config.rs
-  - Files: crates/common/src/config.rs, config/base.toml
-  - Tests: test_trading_mode_paper, test_trading_mode_sandbox, test_trading_mode_live
+## BLOCK A: Zero Tick Loss Guarantee (Even If QuestDB Down From Start)
 
-- [ ] 1.2: Add sandbox SSM credential fetch (sandbox-client-id + sandbox-token)
-  - Files: crates/core/src/auth/secret_manager.rs
-  - Tests: test_fetch_sandbox_credentials
+### Current Gap (Proven by Code Audit)
+- `TickPersistenceWriter::new()` at `crates/storage/src/tick_persistence.rs` returns `Err` if QuestDB unreachable
+- `crates/app/src/main.rs:873-892`: startup failure → `tick_writer = None` → ticks **discarded silently**
+- Ring buffer (300,000 capacity) + disk spill to `data/spill/ticks-YYYYMMDD.bin` only activates AFTER initial QuestDB connection succeeds
+- `recover_stale_spill_files()` exists but requires QuestDB sender to be `Some`
+- **Result**: If QuestDB never connects during entire trading session, ALL ticks are lost
 
-- [ ] 1.3: Add DHAN_SANDBOX_BASE_URL constant + URL switching in OMS engine
-  - Files: crates/common/src/constants.rs, crates/trading/src/oms/engine.rs
-  - Tests: test_sandbox_url_selected, test_live_url_selected, test_paper_no_http
+### Fix (3 items)
 
-- [ ] 1.4: Skip IP verification + TOTP auth chain for sandbox mode in boot
-  - Files: crates/app/src/main.rs
-  - Tests: test_sandbox_skips_ip_check
+- [ ] A1: Make TickPersistenceWriter start in "disconnected buffering" mode when QuestDB unavailable
+  - Files: `crates/storage/src/tick_persistence.rs`, `crates/app/src/main.rs`
+  - Change: `new()` succeeds with `sender = None`, ring buffer + disk spill activate immediately. Background task polls QuestDB every 30s. On connect → drain buffer → set sender.
+  - Tests: `test_tick_writer_starts_without_questdb`, `test_ticks_buffered_before_questdb_available`, `test_reconnect_drains_buffer_after_questdb_starts`
 
-### Phase 2: Kill Switch + P&L Exit API Methods (Day 2)
+- [ ] A2: Add CRITICAL Telegram alert when tick persistence enters disconnected mode
+  - Files: `crates/storage/src/tick_persistence.rs`, `crates/core/src/notification/events.rs`
+  - Change: Fire CRITICAL alert on startup if QuestDB unreachable. Repeat every 5 min until connected.
+  - Tests: `test_critical_alert_on_questdb_unavailable`, `test_alert_stops_after_questdb_connects`
 
-- [ ] 2.1: Add 6 API client methods for kill switch + P&L exit
-  - Files: crates/trading/src/oms/api_client.rs
-  - Methods: activate_kill_switch, deactivate_kill_switch, get_kill_switch_status, configure_pnl_exit, stop_pnl_exit, get_pnl_exit_status
-  - Tests: test_kill_switch_activate, test_pnl_exit_configure, test_pnl_exit_string_values
+- [ ] A3: Add tick drop counter metric (must always read 0 after this fix)
+  - Files: `crates/storage/src/tick_persistence.rs`
+  - Change: Add `dlt_ticks_dropped_total` Prometheus counter. Incremented only if both ring buffer AND disk spill fail (should be impossible).
+  - Tests: `test_tick_drop_counter_zero_with_buffering`
 
-- [ ] 2.2: Add emergency halt module wired to kill switch
-  - Files: crates/trading/src/risk/kill_switch.rs (NEW)
-  - Tests: test_emergency_halt_activates_kill_switch
-
-### Phase 3: Missing Standard Order Endpoints (Day 3)
-
-- [ ] 3.1: Add order slicing endpoint (POST /orders/slicing)
-  - Files: crates/trading/src/oms/api_client.rs, types.rs
-  - Tests: test_order_slicing_request
-
-- [ ] 3.2: Add trade book endpoints (GET /trades, GET /trades/{order-id})
-  - Files: crates/trading/src/oms/api_client.rs, types.rs (TradeEntry struct)
-  - Tests: test_get_trades, test_get_trades_for_order
-
-- [ ] 3.3: Add get order by correlation ID (GET /orders/external/{corr-id})
-  - Files: crates/trading/src/oms/api_client.rs
-  - Tests: test_get_order_by_correlation
-
-- [ ] 3.4: Fix cancel order to return response body (not discard)
-  - Files: crates/trading/src/oms/api_client.rs
-  - Tests: test_cancel_returns_status
-
-- [ ] 3.5: Add missing PlaceOrderRequest fields (amoTime, boProfitValue, boStopLossValue, disclosedQuantity, correlationId)
-  - Files: crates/trading/src/oms/types.rs
-  - Tests: test_amo_fields, test_bracket_fields
-
-### Phase 4: Super Orders (Day 4-5)
-
-- [ ] 4.1: Add PlaceSuperOrderRequest + SuperOrderLeg types + OrderLeg enum
-  - Files: crates/trading/src/oms/types.rs
-  - Tests: test_super_order_request_serialization, test_leg_enum
-
-- [ ] 4.2: Add 4 super order API client methods (place/modify/cancel/list)
-  - Files: crates/trading/src/oms/api_client.rs
-  - Tests: test_place_super_order, test_modify_entry_leg, test_modify_target_leg_only_price, test_modify_sl_leg_only_sl_and_trail, test_cancel_entry_cancels_all
-
-- [ ] 4.3: Add trailing SL logic (trailingJump=0 cancels trailing)
-  - Files: crates/trading/src/oms/super_order.rs (NEW)
-  - Tests: test_trailing_jump_zero_cancels, test_trailing_jump_positive
-
-- [ ] 4.4: Add leg-specific modification restrictions validation
-  - Files: crates/trading/src/oms/super_order.rs
-  - Tests: test_entry_leg_all_fields_modifiable, test_target_leg_only_price, test_sl_leg_only_sl_and_trail
-
-### Phase 5: Forever Orders / GTT (Day 6)
-
-- [ ] 5.1: Add ForeverOrderRequest + OrderFlag enum (SINGLE/OCO) + OCO second-leg fields
-  - Files: crates/trading/src/oms/types.rs
-  - Tests: test_single_order_flag, test_oco_requires_second_leg, test_single_rejects_second_leg
-
-- [ ] 5.2: Add 4 forever order API client methods (create/modify/delete/list)
-  - Files: crates/trading/src/oms/api_client.rs
-  - Tests: test_create_forever_single, test_create_forever_oco, test_modify_with_leg_name
-
-- [ ] 5.3: Add CNC/MTF-only product type validation
-  - Files: crates/trading/src/oms/forever_order.rs (NEW)
-  - Tests: test_intraday_rejected, test_margin_rejected, test_cnc_accepted, test_mtf_accepted
-
-- [ ] 5.4: Add CONFIRM status handling in state machine
-  - Files: crates/trading/src/oms/state_machine.rs
-  - Tests: test_confirm_status_parsed, test_confirm_to_traded_valid
-
-### Phase 6: Conditional Triggers (Day 7)
-
-- [ ] 6.1: Add ComparisonType, Operator, IndicatorName, TimeFrame enums
-  - Files: crates/trading/src/oms/types.rs
-  - Tests: test_all_comparison_types, test_all_operators, test_all_indicators, test_all_timeframes
-
-- [ ] 6.2: Add 5 conditional trigger API client methods
-  - Files: crates/trading/src/oms/api_client.rs
-  - Tests: test_create_trigger, test_modify_trigger, test_delete_trigger
-
-- [ ] 6.3: Add equities/indices-only validation (reject F&O/commodity)
-  - Files: crates/trading/src/oms/conditional_trigger.rs (NEW)
-  - Tests: test_fno_rejected, test_commodity_rejected, test_equity_accepted, test_index_accepted
-
-- [ ] 6.4: Add required-field validation per comparison type
-  - Files: crates/trading/src/oms/conditional_trigger.rs
-  - Tests: test_technical_with_value_requires_indicator, test_price_with_value_no_indicator
-
-### Phase 7: OrderUpdate WS Fields + Position Reconciliation (Day 8)
-
-- [ ] 7.1: Add 6 missing fields to OrderUpdate struct (AlgoOrdNo, Series, GoodTillDaysDate, AlgoId, Multiplier, MktType)
-  - Files: crates/common/src/order_types.rs
-  - Tests: test_all_ws_fields_parsed, test_missing_fields_default
-
-- [ ] 7.2: Update handle_order_update to sync all fields (not just traded_qty/avg_price)
-  - Files: crates/trading/src/oms/engine.rs
-  - Tests: test_update_syncs_all_fields
-
-- [ ] 7.3: Add position-level reconciliation (aggregate fills per security)
-  - Files: crates/trading/src/oms/reconciliation.rs
-  - Tests: test_position_level_recon, test_multi_order_position_netting
-
-### Phase 8: EDIS + Statements + Margin Fixes (Day 9-10)
-
-- [ ] 8.1: Add EDIS types + constants + 3 API methods (tpin/form/inquire)
-  - Files: crates/trading/src/oms/api_client.rs, types.rs, crates/common/src/constants.rs
-  - Tests: test_generate_tpin, test_edis_form, test_edis_inquire_all
-
-- [ ] 8.2: Add ledger endpoint (GET /ledger) with STRING debit/credit
-  - Files: crates/trading/src/oms/api_client.rs, types.rs
-  - Tests: test_ledger_string_debit_credit, test_ledger_date_format
-
-- [ ] 8.3: Add trade history endpoint (GET /trades/{from}/{to}/{page}) with 0-indexed pagination
-  - Files: crates/trading/src/oms/api_client.rs, types.rs
-  - Tests: test_trade_history_page_zero, test_trade_history_path_params
-
-- [ ] 8.4: Fix margin calculator type issues (quantity i32, trigger_price Option<f64>)
-  - Files: crates/trading/src/oms/types.rs
-  - Tests: test_margin_optional_trigger_price, test_margin_quantity_i32
-
-### Phase 9: Indicator Persistence + Warmup from Historical (Day 11-12)
-
-- [ ] 9.1: Create `indicator_snapshots` QuestDB table DDL
-  - Files: crates/storage/src/indicator_persistence.rs (NEW), crates/storage/src/lib.rs
-  - Columns: ts, security_id, segment, timeframe, sma_5, sma_10, sma_20, sma_50, ema_9, ema_12, ema_26, rsi_14, macd_line, macd_signal, macd_hist, bb_upper, bb_lower, bb_middle, atr_14, obv, vwap, adx
-  - Tests: test_indicator_snapshot_ddl, test_append_indicator_snapshot
-
-- [ ] 9.2: Persist indicator values alongside 1-minute candles
-  - Files: crates/core/src/pipeline/tick_processor.rs, crates/trading/src/indicator/engine.rs
-  - Every 60s: snapshot current indicator state for all tracked securities
-  - Tests: test_indicator_snapshot_persisted, test_indicator_outside_hours_skipped
-
-- [ ] 9.3: Load indicator state from QuestDB on restart (warmup)
-  - Files: crates/trading/src/indicator/engine.rs, crates/app/src/trading_pipeline.rs
-  - At boot: query last indicator snapshot per security from DB
-  - Initialize EMA/SMA/RSI/MACD with historical state (no cold start)
-  - Tests: test_warmup_from_db, test_warmup_skips_if_no_data, test_indicators_warm_after_load
-
-- [ ] 9.4: Store indicator values for multiple timeframes (1m, 5m, 15m, 1h, 1d)
-  - Files: crates/trading/src/indicator/engine.rs
-  - Compute indicators from materialized view candles (not just ticks)
-  - Tests: test_multi_timeframe_indicators, test_5m_sma_from_candles
-
-## Scenarios
-
+### Proof Scenarios
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | mode=paper, place order | PAPER-0001 ID, zero HTTP calls |
-| 2 | mode=sandbox, place order | HTTP to sandbox.dhan.co, fills at ₹100 |
-| 3 | mode=live, place order | HTTP to api.dhan.co, real exchange fill |
-| 4 | mode=sandbox, kill switch | HTTP to sandbox.dhan.co/killswitch |
-| 5 | mode=sandbox, no static IP | IP check skipped, boot succeeds |
-| 6 | Super order cancel ENTRY_LEG | All 3 legs cancelled |
-| 7 | Super order cancel TARGET_LEG | Only target removed, cannot re-add |
-| 8 | Forever order OCO missing price1 | Rejected at build time |
-| 9 | Conditional trigger on F&O | Rejected (equities/indices only) |
-| 10 | OrderUpdate with AlgoOrdNo field | Parsed into OrderUpdate struct |
+| 1 | QuestDB down from market open to close | All ticks in ring buffer + disk spill. Zero loss. CRITICAL alert fires every 5 min. |
+| 2 | QuestDB starts 30 min after market open | Background reconnect detects QuestDB. Drains ring buffer first, then disk spill. All ticks preserved. Alert clears. |
+| 3 | QuestDB crashes mid-day, recovers 10 min later | Existing reconnect logic handles this (already works). New fix covers only cold-start gap. |
+| 4 | Ring buffer fills (300K ticks) before QuestDB starts | Overflow spills to disk. Disk spill has no size limit (bounded only by disk space). |
+
+---
+
+## BLOCK B: Wire 22 Test Type Enforcement Into Pre-Push Gate
+
+### Current State
+- `scripts/test-coverage-guard.sh` exists, passes 59/59, supports scoped checking
+- NOT wired into `.claude/hooks/pre-push-gate.sh` — can be bypassed on push
+
+### Fix (2 items)
+
+- [ ] B1: Add Gate 8 to pre-push-gate.sh — scoped 22 test type check
+  - Files: `.claude/hooks/pre-push-gate.sh`
+  - Change: Detect changed crates via `git diff`, pass as scope to `scripts/test-coverage-guard.sh`. Fast (<5s). Only checks crates with modified `.rs` files.
+  - Tests: Manual push verification
+
+- [ ] B2: Update enforcement.md to document Gate 8
+  - Files: `.claude/rules/project/enforcement.md`
+  - Change: Add Gate 8 documentation, update gate count 7 → 8
+
+---
+
+## BLOCK C: Dhan API Coverage Verification Test
+
+### Audit Results (54/58 — 4 Intentionally Skipped)
+
+**Implemented (54 endpoints):**
+- Orders: 7/7 — place, modify, cancel, slice, book, single, by-correlation
+- Trades: 3/3 — book, by-order, trade-history
+- Super Orders: 4/4 — place, modify, cancel, list
+- Forever Orders: 4/4 — create, modify, delete, list
+- Conditional Triggers: 5/5 — create, modify, delete, get-one, get-all
+- Positions & Holdings: 4/4 — positions, convert, exit-all, holdings
+- Funds & Margin: 3/3 — fund-limit, margin-single, margin-multi
+- Option Chain: 2/2 — chain, expiry-list
+- Historical Charts: 2/2 — daily, intraday
+- EDIS: 3/3 — tpin, form, inquire
+- Profile & Auth: 3/3 — profile, renew-token, generate-access-token
+- IP Management: 3/3 — set, modify, get
+- Kill Switch: 3/3 — activate, deactivate, status
+- P&L Exit: 3/3 — configure, stop, status
+- Statements: 2/2 — ledger, trade-history
+- WebSocket: 4/4 — market-feed, order-update, 20-depth, 200-depth
+- CSV Download: 2/2 — detailed, fallback
+
+**Intentionally NOT Implemented (4 — with justification):**
+| Endpoint | Why Skipped |
+|----------|-------------|
+| `POST /v2/marketfeed/ltp` | WebSocket provides real-time LTP continuously |
+| `POST /v2/marketfeed/ohlc` | WebSocket + candle aggregator provides OHLCV |
+| `POST /v2/marketfeed/quote` | WebSocket Full mode provides quote data |
+| `GET /v2/instrument/{segment}` | CSV download is faster, no auth, no rate limit |
+
+### Fix (1 item)
+
+- [ ] C1: Add integration test verifying all 54 endpoint URL constants exist
+  - Files: `crates/common/tests/dhan_api_coverage.rs`
+  - Tests: `test_all_54_dhan_rest_endpoints_have_constants`, `test_all_4_websocket_urls_defined`, `test_skipped_endpoints_documented`
+
+---
+
+## BLOCK D: Monitoring & Alerting Gap Fixes
+
+### Current State (85% Complete)
+- 30+ Prometheus metrics defined and exported to `:9091`
+- Telegram alerts: fully implemented, fire-and-forget async
+- 5 Grafana dashboards: system-overview, market-data, trading-pipeline, logs, traefik
+- OpenTelemetry: OTLP → Jaeger via `dlt-jaeger:4317`
+- Health: `GET /health` returns subsystem status
+
+### Gaps Found (3 items)
+
+- [ ] D1: Add P&L visualization panel to trading-pipeline Grafana dashboard
+  - Files: `deploy/docker/grafana/dashboards/trading-pipeline.json`
+  - Change: New panel showing `dlt_realized_pnl` + `dlt_unrealized_pnl` time series
+  - Tests: JSON validity (dashboard loads)
+
+- [ ] D2: Add `#[tracing::instrument]` to API handlers for full request tracing
+  - Files: `crates/api/src/handlers/health.rs`, `quote.rs`, `stats.rs`, `top_movers.rs`, `instruments.rs`, `index_constituency.rs`
+  - Tests: Existing handler tests verify no regression
+
+- [ ] D3: Add tick persistence health to `/health` endpoint subsystem check
+  - Files: `crates/api/src/handlers/health.rs`
+  - Change: Report tick_writer status (connected/buffering/disconnected) in health response
+  - Tests: `test_health_reports_tick_persistence_status`
+
+---
+
+## BLOCK E: Test Quality Hardening
+
+### Fix (2 items)
+
+- [ ] E1: Add adversarial tests for tick persistence cold-start scenario
+  - Files: `crates/storage/tests/tick_resilience.rs`
+  - Tests: `test_zero_tick_loss_questdb_down_from_start`, `test_zero_tick_loss_questdb_intermittent`, `test_spill_file_recovery_after_restart`, `test_buffer_capacity_at_300k_limit`, `test_disk_spill_activates_when_buffer_full`
+
+- [ ] E2: Add security tests for token handling across all code paths
+  - Files: `crates/core/tests/security_audit.rs`
+  - Tests: `test_token_never_in_log_output`, `test_token_never_in_error_display`, `test_token_never_in_debug_format`, `test_secret_zeroized_on_drop`
+
+---
+
+## BLOCK F: Documentation & Rule Updates
+
+- [ ] F1: Update CLAUDE.md test count from ~2,439 to 7,251
+  - Files: `CLAUDE.md`
+
+- [ ] F2: Update enforcement.md with Gate 8 (22 test types)
+  - Files: `.claude/rules/project/enforcement.md`
+
+- [ ] F3: Update pre-push gate count in CLAUDE.md
+  - Files: `CLAUDE.md`
+
+---
+
+## Implementation Order
+
+```
+Phase 1: B1 → B2 → F2 → F3           (Wire gate + docs — fastest win, <30 min)
+Phase 2: A1 → A2 → A3 → E1           (Tick resilience — biggest gap fix + tests)
+Phase 3: C1 → E2                      (API coverage test + security tests)
+Phase 4: D1 → D2 → D3                (Monitoring gaps)
+Phase 5: F1                           (Final doc update with new test count)
+```
+
+**Rationale:** Gate wiring first (immediately blocks bad pushes). Tick resilience second (biggest production risk). API coverage + security tests third. Monitoring last (already 85% done). Doc updates at end (accurate counts).
+
+---
+
+## Verification Scenarios
+
+| # | Scenario | Expected | Block |
+|---|----------|----------|-------|
+| 1 | QuestDB down from start to end | All ticks buffered. Zero loss. CRITICAL alert. | A |
+| 2 | QuestDB starts 30 min late | Buffer drains. All ticks preserved. | A |
+| 3 | Push with missing test type in changed crate | Gate 8 blocks push with error. | B |
+| 4 | Push with docs-only changes (no .rs files) | Gate 8 skips (NONE scope). Push proceeds. | B |
+| 5 | CI merge with any crate below 100% coverage | Stage 6 blocks merge. Branch protection enforces. | (existing) |
+| 6 | New pub fn without test | Existing Gate 6 blocks push. | (existing) |
+| 7 | Token in log/error output | Security test catches it. | E |
+| 8 | `/health` called while QuestDB down | Reports tick_persistence: "buffering" | D |
+
+---
+
+## What Is NOT In Scope (And Why)
+
+| Excluded Item | Reason |
+|---------------|--------|
+| 4 skipped REST endpoints (ltp/ohlc/quote/instrument) | WebSocket provides same data real-time; REST is redundant |
+| Alertmanager deployment | Telegram fires directly on CRITICAL; Alertmanager adds complexity for single-user |
+| Mutation testing in pre-push | Too slow (20+ min); CI weekly Monday run by design |
+| Fuzz testing in pre-push | Too slow; CI weekly Monday run by design |
+| Valkey exporter sidecar | QuestDB indirect metrics sufficient; add later if needed |
+| Previous plan items (Sandbox mode, etc.) | Separate plan, already IN_PROGRESS; this plan covers testing/enforcement only |
+
+---
+
+## Total Items: 16 across 6 blocks
+- **Block A** (Tick resilience): 3 items — HIGHEST priority
+- **Block B** (Gate wiring): 2 items — FASTEST win
+- **Block C** (API coverage test): 1 item
+- **Block D** (Monitoring): 3 items
+- **Block E** (Test hardening): 2 items
+- **Block F** (Docs): 3 items
+- **No new dependencies** — all using existing crates
+- **Every item has specific test functions listed**
