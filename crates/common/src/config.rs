@@ -546,11 +546,10 @@ const fn default_constituency_inter_batch_delay_ms() -> u64 {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct InfrastructureConfig {
     /// Whether to auto-start Docker services on boot.
-    /// Probes first — if services already running, skips immediately.
-    /// On Mac: launches Docker Desktop if needed, then docker compose up.
-    /// On AWS: docker daemon always running, just starts containers.
-    /// Default: `true` (fully automated — just click Run).
-    #[serde(default = "default_true")]
+    /// When true (default): one-click Run — app auto-launches Docker Desktop
+    /// + containers. Probes first, skips if already running. Zero manual steps.
+    /// When false: run "Docker Restart" in IntelliJ first, then "Run dhan-live-trader".
+    #[serde(default = "default_auto_start")]
     pub auto_start_docker: bool,
 }
 
@@ -562,7 +561,7 @@ impl Default for InfrastructureConfig {
     }
 }
 
-const fn default_true() -> bool {
+const fn default_auto_start() -> bool {
     true
 }
 
