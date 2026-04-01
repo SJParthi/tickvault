@@ -174,9 +174,9 @@ CHANGED_RS=$(git diff --name-only "$UPSTREAM" -- 'crates/*/src/**/*.rs' 'crates/
 if [ -z "$CHANGED_RS" ]; then
   echo "  SKIP: No .rs files changed — skipping 22 test type check" >&2
 elif [ -x "$CWD/scripts/test-coverage-guard.sh" ]; then
-  CHANGED_CRATES=$(echo "$CHANGED_RS" | sed -n 's|^crates/\([^/]*\)/.*|\1|p' | sort -u | tr '\n' ',' | sed 's/,$//')
+  CHANGED_CRATES=$(echo "$CHANGED_RS" | sed -n 's|^crates/\([^/]*\)/.*|\1|p' | sort -u | tr '\n' ' ' | sed 's/ $//')
   if [ -n "$CHANGED_CRATES" ]; then
-    TCG_OUT=$(timeout 30 "$CWD/scripts/test-coverage-guard.sh" "$CHANGED_CRATES" 2>&1)
+    TCG_OUT=$(timeout 30 "$CWD/scripts/test-coverage-guard.sh" "$CWD" "$CHANGED_CRATES" 2>&1)
     TCG_EXIT=$?
     if [ "$TCG_EXIT" -eq 0 ]; then
       echo "  PASS: 22 test type check (scope: $CHANGED_CRATES)" >&2
