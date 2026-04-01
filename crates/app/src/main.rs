@@ -1343,26 +1343,26 @@ async fn main() -> Result<()> {
             loop {
                 tokio::time::sleep(interval).await;
                 // Disk space check
-                if let Some(percent_free) = infra::check_disk_space() {
-                    if percent_free < infra::MIN_FREE_DISK_PERCENT {
-                        health_notifier.notify(NotificationEvent::Custom {
-                            message: format!(
-                                "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
-                                 Tick spill files may fail if disk fills up."
-                            ),
-                        });
-                    }
+                if let Some(percent_free) = infra::check_disk_space()
+                    && percent_free < infra::MIN_FREE_DISK_PERCENT
+                {
+                    health_notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
+                             Tick spill files may fail if disk fills up."
+                        ),
+                    });
                 }
                 // Memory RSS check
-                if let Some(rss_mb) = infra::check_memory_rss() {
-                    if rss_mb > infra::MEMORY_RSS_ALERT_MB {
-                        health_notifier.notify(NotificationEvent::Custom {
-                            message: format!(
-                                "WARNING: HIGH MEMORY — RSS {rss_mb} MB exceeds threshold. \
-                                 Consider investigating memory usage."
-                            ),
-                        });
-                    }
+                if let Some(rss_mb) = infra::check_memory_rss()
+                    && rss_mb > infra::MEMORY_RSS_ALERT_MB
+                {
+                    health_notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "WARNING: HIGH MEMORY — RSS {rss_mb} MB exceeds threshold. \
+                             Consider investigating memory usage."
+                        ),
+                    });
                 }
             }
         });
