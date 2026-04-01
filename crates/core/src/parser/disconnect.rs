@@ -12,6 +12,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — one `from_le_bytes` read + enum match.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by DISCONNECT_PACKET_SIZE check
 pub fn parse_disconnect_packet(
     raw: &[u8],

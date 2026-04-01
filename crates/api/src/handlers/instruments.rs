@@ -104,9 +104,11 @@ fn build_rebuild_response(
         }
         Err(err) => {
             warn!(%err, "manual instrument rebuild failed");
+            // B4: Redact internal error details — log the full error but return
+            // a generic message to the API consumer to prevent information leakage.
             Json(RebuildResponse {
                 status: "failed".to_string(),
-                message: format!("rebuild failed: {err}"),
+                message: "rebuild failed — check server logs for details".to_string(),
                 derivative_count: None,
                 underlying_count: None,
             })
@@ -132,8 +134,10 @@ async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
 }
 
 /// Produces a JSON error object when report serialization fails.
+/// B4: Returns generic message — full error logged server-side, not exposed via API.
 fn diagnostic_serialization_fallback(err: serde_json::Error) -> serde_json::Value {
-    serde_json::json!({"error": format!("serialization failed: {err}")})
+    warn!(%err, "instrument diagnostic serialization failed");
+    serde_json::json!({"error": "serialization failed — check server logs"})
 }
 
 /// `GET /api/instruments/diagnostic` — full instrument system health check.

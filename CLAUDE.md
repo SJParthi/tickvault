@@ -255,7 +255,7 @@ make prometheus                      # localhost:9090
 4. Secret Scan: blocks .env, AWS keys, private keys, tokens
 
 **Post-merge only:**
-5. Coverage (95% minimum for ALL crates — see `quality/crate-coverage-thresholds.toml`)
+5. Coverage (100% minimum for ALL crates — see `quality/crate-coverage-thresholds.toml`)
 6. Benchmarks (budgets in `quality/benchmark-budgets.toml`, 5% regression gate)
 7. DHAT zero-allocation (hard fail for core + trading crates)
 
@@ -404,4 +404,4 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 **Phase:** Phase 1 — Live Trading System → `docs/phases/phase-1-live-trading.md`
 **Boot sequence:** CryptoProvider → Config → Observability → Logging → Notification → Auth → QuestDB → Universe → HistoricalCandles → WebSocket → TickProcessor → OrderUpdateWS → API → TokenRenewal → Shutdown
 **Codebase size:** ~74K LoC Rust (~61K production, ~14K tests), 158 files, 6 crates
-**Test count:** ~2,439 passing tests (unit + integration + proptest), 33 integration test files, 5 benchmarks, 2 fuzz targets
+**Test count:** ~7,250 passing tests (unit + integration + proptest + adversarial), 43 integration test files, 8 benchmarks, 2 fuzz targets

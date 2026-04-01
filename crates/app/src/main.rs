@@ -387,9 +387,11 @@ async fn main() -> Result<()> {
             std::sync::Arc::new(std::sync::RwLock::new(None));
 
         // Tick broadcast for trading pipeline (cold path consumer).
-        let (fast_tick_broadcast_sender, _fast_tick_broadcast_rx) = tokio::sync::broadcast::channel::<
-            dhan_live_trader_common::tick_types::ParsedTick,
-        >(1024);
+        // A2: Use constant capacity (65536) to absorb high-volatility bursts without lagging.
+        let (fast_tick_broadcast_sender, _fast_tick_broadcast_rx) =
+            tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
+                dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
+            );
 
         let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
@@ -871,23 +873,45 @@ async fn main() -> Result<()> {
     let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
 
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
-        Ok(writer) => {
+        Ok(mut writer) => {
             info!("QuestDB tick writer connected");
+            // A1: Recover stale spill files from previous crashes.
+            let recovered = writer.recover_stale_spill_files();
+            if recovered > 0 {
+                info!(
+                    recovered,
+                    "recovered stale tick spill files from previous crashes"
+                );
+                notifier.notify(
+                    dhan_live_trader_core::notification::events::NotificationEvent::Custom {
+                        message: format!(
+                            "<b>Tick Recovery</b>\nRecovered {recovered} orphaned ticks from previous crash spill files."
+                        ),
+                    },
+                );
+            }
             Some(writer)
         }
         Err(err) => {
-            error!(
+            // A3: Start in disconnected buffering mode instead of giving up.
+            // Ticks are buffered in ring buffer + disk spill until QuestDB comes back.
+            warn!(
                 ?err,
-                "QuestDB tick writer unavailable — ticks will NOT be persisted"
+                "QuestDB tick writer failed to connect — starting in DISCONNECTED BUFFERING mode"
             );
             notifier.notify(
                 dhan_live_trader_core::notification::events::NotificationEvent::Custom {
                     message: format!(
-                        "<b>QuestDB UNAVAILABLE</b>\nTick writer failed: {err}\nTicks will NOT be persisted until restart."
+                        "<b>CRITICAL: QuestDB UNAVAILABLE</b>\nTick writer in BUFFERING mode: {err}\nTicks buffered to ring buffer + disk spill. Will drain when QuestDB recovers."
                     ),
                 },
             );
-            None
+            // A3: Create writer in disconnected mode — zero tick loss.
+            let mut writer = TickPersistenceWriter::new_disconnected(&config.questdb);
+            // Also recover any stale spill files (will skip since sender is None,
+            // but sets up the path for when reconnect succeeds).
+            let _ = writer.recover_stale_spill_files();
+            Some(writer)
         }
     };
 
@@ -974,9 +998,11 @@ async fn main() -> Result<()> {
         std::sync::Arc::new(std::sync::RwLock::new(None));
 
     // Tick broadcast: fan-out parsed ticks to the trading pipeline (cold path consumer).
-    // Capacity 1024: trading pipeline is allowed to lag — it only needs latest price.
+    // A2: Use constant capacity (65536) to absorb bursts without lagging cold-path consumers.
     let (tick_broadcast_sender, _tick_broadcast_default_rx) =
-        tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(1024);
+        tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
+            dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
+        );
 
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());

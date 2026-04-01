@@ -16,6 +16,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — two `from_le_bytes` reads.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by TICKER_PACKET_SIZE check above
 pub fn parse_ticker_packet(
     raw: &[u8],

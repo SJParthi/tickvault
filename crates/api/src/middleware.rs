@@ -28,13 +28,25 @@ use tracing::{error, info, warn};
 // ---------------------------------------------------------------------------
 
 /// Configuration for API authentication.
-#[derive(Debug, Clone)]
+///
+/// Manual `Debug` impl redacts `bearer_token` to prevent secret leakage
+/// via `format!("{:?}", config)` or tracing spans.
+#[derive(Clone)]
 pub struct ApiAuthConfig {
     /// Bearer token for authenticating mutating API requests.
     /// Empty string = auth disabled (development mode only).
     pub bearer_token: String,
     /// Whether authentication is enabled.
     pub enabled: bool,
+}
+
+impl std::fmt::Debug for ApiAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiAuthConfig")
+            .field("bearer_token", &"[REDACTED]")
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 impl ApiAuthConfig {

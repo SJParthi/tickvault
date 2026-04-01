@@ -23,6 +23,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — fixed number of `from_le_bytes` reads regardless of input.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by FULL_QUOTE_PACKET_SIZE check; depth loop is fixed 5 iterations
 pub fn parse_full_packet(
     raw: &[u8],

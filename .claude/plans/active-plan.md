@@ -1,8 +1,8 @@
 # Implementation Plan: Comprehensive Hardening — Data Safety, Security, Performance, Coverage
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-04-01
-**Approved by:** pending
+**Approved by:** Parthiban (2026-04-01)
 
 ---
 
@@ -23,26 +23,26 @@
 
 ## BLOCK A: Critical Data Safety (Zero Tick Loss)
 
-- [ ] A1: Call `recover_stale_spill_files()` at startup after TickPersistenceWriter::new()
+- [x] A1: Call `recover_stale_spill_files()` at startup — crates/app/src/main.rs:873 after TickPersistenceWriter::new()
   - Files: `crates/app/src/main.rs`
   - Change: After tick_writer creation (line ~873), call `recover_stale_spill_files()` to drain orphaned spill files from previous crashes
   - Tests: `test_stale_spill_recovery_at_startup`, `test_no_orphaned_ticks_after_crash_restart`
 
-- [ ] A2: Increase broadcast channel capacity from 256 to 65536
+- [x] A2: Increase broadcast channel capacity from 256 to 65536 — constants.rs + main.rs (2 sites)
   - Files: `crates/app/src/main.rs`, `crates/common/src/constants.rs`
   - Change: Add `TICK_BROADCAST_CAPACITY = 65_536` constant, use in broadcast::channel() creation
   - Tests: `test_broadcast_capacity_matches_constant`, `test_cold_path_no_lag_at_high_throughput`
 
-- [ ] A3: Make TickPersistenceWriter start in disconnected buffering mode
+- [x] A3: Make TickPersistenceWriter start in disconnected buffering mode — new_disconnected() + main.rs fallback
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/app/src/main.rs`
   - Change: `new()` succeeds with `sender = None`, ring buffer + disk spill activate immediately. Background reconnect polls every 30s.
   - Tests: `test_tick_writer_starts_without_questdb`, `test_ticks_buffered_before_questdb_available`, `test_reconnect_drains_buffer_after_questdb_starts`
 
-- [ ] A4: Add CRITICAL Telegram alert when tick persistence enters disconnected mode
+- [x] A4: Add CRITICAL Telegram alert when tick persistence enters disconnected mode — main.rs startup path
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/core/src/notification/events.rs`
   - Tests: `test_critical_alert_on_questdb_unavailable`
 
-- [ ] A5: Add `dlt_ticks_dropped_total` Prometheus counter (must always read 0)
+- [x] A5: Add `dlt_ticks_dropped_total` Prometheus counter — tick_persistence.rs spill_tick_to_disk
   - Files: `crates/storage/src/tick_persistence.rs`
   - Tests: `test_tick_drop_counter_zero_with_buffering`
 
@@ -50,22 +50,22 @@
 
 ## BLOCK B: Security Hardening (3 HIGH fixes)
 
-- [ ] B1: Redact bearer token in ApiAuthConfig Debug output
+- [x] B1: Redact bearer token in ApiAuthConfig Debug output — middleware.rs manual Debug impl
   - Files: `crates/api/src/middleware.rs`
   - Change: Replace `#[derive(Debug)]` with manual `fmt::Debug` impl that masks `bearer_token` as `"[REDACTED]"`
   - Tests: `test_api_auth_config_debug_redacts_token`
 
-- [ ] B2: Redact raw API response body in token_manager error messages
+- [x] B2: Redact raw API response body in token_manager error messages — token_manager.rs:465
   - Files: `crates/core/src/auth/token_manager.rs`
   - Change: At line ~465, use `redact_url_params()` on `body_text` before including in error reason
   - Tests: `test_profile_error_does_not_leak_response_body`
 
-- [ ] B3: Tighten CORS — restrict methods and headers
+- [x] B3: Tighten CORS — restrict methods and headers — lib.rs build_cors_layer
   - Files: `crates/api/src/lib.rs`
   - Change: Replace `allow_methods(Any)` with `allow_methods([Method::GET, Method::POST, Method::DELETE])`, replace `allow_headers(Any)` with `allow_headers([AUTHORIZATION, CONTENT_TYPE])`
   - Tests: `test_cors_rejects_disallowed_method`, `test_cors_allows_get_post`
 
-- [ ] B4: Redact internal error details in instruments handler API response
+- [x] B4: Redact internal error details in instruments handler — instruments.rs:109 + diagnostic_serialization_fallback
   - Files: `crates/api/src/handlers/instruments.rs`
   - Change: At line ~109, replace `format!("rebuild failed: {err}")` with generic `"rebuild failed — check server logs"`
   - Tests: `test_rebuild_error_does_not_leak_internal_details`
@@ -74,22 +74,22 @@
 
 ## BLOCK C: Hot Path Performance Fixes
 
-- [ ] C1: Replace `Box<dyn GreeksEnricher>` with concrete type on hot path
+- [ ] C1: DEFERRED — Box<dyn GreeksEnricher> constrained by crate dependency graph (core can't ref trading)
   - Files: `crates/core/src/pipeline/tick_processor.rs`, `crates/common/src/tick_types.rs`
   - Change: Since there's exactly one implementor (InlineGreeksComputer), use `Option<InlineGreeksComputer>` instead of `Option<Box<dyn GreeksEnricher>>`. Eliminates vtable dispatch on every tick.
   - Tests: existing tick processing tests + `test_greeks_enricher_no_vtable_dispatch`
 
-- [ ] C2: Replace `.collect()` with direct iteration in `rescue_in_flight()`
+- [x] C2: Replace `.collect()` with index-based iteration in `rescue_in_flight()` — tick + depth writers
   - Files: `crates/storage/src/tick_persistence.rs`
   - Change: At line ~332, replace `let rescued: Vec<ParsedTick> = self.in_flight.drain(..).collect(); for tick in rescued { ... }` with `while let Some(tick) = self.in_flight.pop() { self.buffer_tick(tick); }`
   - Tests: `test_rescue_in_flight_no_allocation`
 
-- [ ] C3: Add `#[inline]` to all top-level parser functions
+- [x] C3: Add `#[inline]` to all top-level parser functions — 10 functions across 10 files
   - Files: `crates/core/src/parser/header.rs`, `ticker.rs`, `quote.rs`, `full_packet.rs`, `oi.rs`, `previous_close.rs`, `disconnect.rs`, `market_depth.rs`, `dispatcher.rs`
   - Change: Add `#[inline]` to `parse_header`, `parse_ticker_packet`, `parse_quote_packet`, `parse_full_packet`, `parse_oi_packet`, `parse_previous_close_packet`, `parse_disconnect_packet`, `parse_market_depth_packet`, `dispatch_frame`
   - Tests: benchmark regression check (existing benches)
 
-- [ ] C4: Replace `Arc<RwLock<Option<TopMoversSnapshot>>>` with `ArcSwap`
+- [ ] C4: DEFERRED — RwLock is cold-path only (API reads, 5s writes); minimal contention for single-user
   - Files: `crates/core/src/pipeline/top_movers.rs`, `crates/core/src/pipeline/option_movers.rs`, `crates/api/src/handlers/top_movers.rs`
   - Change: Use `arc_swap::ArcSwap<Option<TopMoversSnapshot>>` for lock-free reads. Write path (every 5s) uses `store()`, read path uses `load()`.
   - Tests: existing top_movers tests + `test_top_movers_lock_free_reads`
@@ -133,7 +133,7 @@
 
 ## BLOCK F: Documentation & Enforcement Updates
 
-- [ ] F1: Fix rate limit discrepancy — align annexure doc with CLAUDE.md
+- [x] F1: Fix rate limit discrepancy — 08-annexure-enums.md updated to 1000/hr, 7000/day
   - Files: `docs/dhan-ref/08-annexure-enums.md`
   - Change: Update Order API limits from 500/hr, 5000/day to 1000/hr, 7000/day (CLAUDE.md values are correct per Dhan v2.3 release)
 
@@ -141,13 +141,13 @@
   - Files: `docs/dhan-ref/05-historical-data.md`
   - Change: Document expired options data endpoint with fields: `securityId`, `exchangeSegment`, `instrument`, `expiryFlag`, `expiryCode`, `strike`, `drvOptionType`, `requiredData`, `fromDate`, `toDate`, `interval`
 
-- [ ] F3: Fix coverage threshold discrepancy in CLAUDE.md (95% → 100%)
+- [x] F3: Fix coverage threshold discrepancy in CLAUDE.md (95% → 100%)
   - Files: `CLAUDE.md`
 
-- [ ] F4: Update CLAUDE.md test count from ~2,439 to 7,250+
+- [x] F4: Update CLAUDE.md test count from ~2,439 to ~7,250
   - Files: `CLAUDE.md`
 
-- [ ] F5: Update enforcement.md with Gate 8 (22 test type check)
+- [x] F5: Update enforcement.md with Gate 8 (7 → 8 fast gates)
   - Files: `.claude/rules/project/enforcement.md`
 
 - [ ] F6: Add Dhan API coverage test verifying all 54 endpoint constants

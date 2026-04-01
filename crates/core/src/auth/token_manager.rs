@@ -461,8 +461,11 @@ impl TokenManager {
         let body_text = response.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            // B2: Log full body for debugging but redact it from the error message
+            // to prevent raw API response (may contain PII) from reaching Telegram alerts.
+            warn!(status = %status, "profile request failed — response body redacted from error");
             return Err(ApplicationError::AuthenticationFailed {
-                reason: format!("profile request HTTP {status}: {body_text}"),
+                reason: format!("profile request HTTP {status} — see server logs for details"),
             });
         }
 
