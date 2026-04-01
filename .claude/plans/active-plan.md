@@ -113,7 +113,7 @@
 
 ## BLOCK F: Documentation Updates
 
-- [ ] F1: Add `/charts/rollingoption` endpoint to historical data reference (V1 item F2)
+- [x] F1: Add `/charts/rollingoption` endpoint to historical data reference (V1 item F2) — already documented in ref doc line 232
   - Files: `docs/dhan-ref/05-historical-data.md`
 
 - [ ] F2: Add Dhan API coverage test verifying all 54 endpoint constants (V1 item F6)
