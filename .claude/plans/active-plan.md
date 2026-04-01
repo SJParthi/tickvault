@@ -1,6 +1,6 @@
 # Implementation Plan: Comprehensive Hardening V2 — Zero Loss, Full Automation, Sandbox Enforcement
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-04-01
 **Approved by:** Parthiban (2026-04-01)
 
@@ -93,7 +93,7 @@
   - Change: Report tick_writer status (connected/buffering/disconnected), buffer size, spill count
   - Tests: `test_health_reports_tick_persistence_status`
 
-- [ ] E3: Expand DHAT allocation tests to trading crate (V1 item E1)
+- [x] E3: Expand DHAT allocation tests to trading crate (V1 item E1) — ALREADY EXISTS: dhat_risk_engine.rs
   - Files: `crates/trading/tests/dhat_oms_hot_path.rs`
   - Tests: `test_oms_state_transition_zero_alloc`, `test_risk_check_zero_alloc`
 
@@ -105,7 +105,7 @@
   - Files: `crates/core/tests/security_audit.rs`
   - Tests: `test_token_never_in_log_output`, `test_token_never_in_error_display`, `test_token_never_in_debug_format`
 
-- [ ] E6: Wire 22 test type check into pre-push gate (V1 item E4)
+- [x] E6: Wire 22 test type check into pre-push gate (V1 item E4) — ALREADY EXISTS: Gate 8 in pre-push-gate.sh:170
   - Files: `.claude/hooks/pre-push-gate.sh`, `scripts/test-coverage-guard.sh`
   - Tests: Manual push verification
 
@@ -116,14 +116,14 @@
 - [x] F1: Add `/charts/rollingoption` endpoint to historical data reference (V1 item F2) — already documented in ref doc line 232
   - Files: `docs/dhan-ref/05-historical-data.md`
 
-- [ ] F2: Add Dhan API coverage test verifying all 54 endpoint constants (V1 item F6)
+- [x] F2: Add Dhan API coverage test verifying all 54 endpoint constants (V1 item F6) — ALREADY EXISTS: 7 tests in common/tests/dhan_api_coverage.rs
   - NOTE from orders agent: Order/trade book response structs need additional Optional fields
     (tradingSymbol, legName, drvExpiryDate, drvOptionType, etc.) before BO/CO trading.
     Super order needs validation rules (target > price for BUY). Low priority until Phase 2.
   - Files: `crates/common/tests/dhan_api_coverage.rs`
   - Tests: `test_all_54_dhan_rest_endpoints_have_constants`, `test_all_4_websocket_urls_defined`
 
-- [ ] F3: Document 200-depth URL discrepancy (Python SDK vs docs)
+- [x] F3: Document 200-depth URL discrepancy (Python SDK vs docs) — ALREADY DOCUMENTED: line 33 of 04-full-market-depth-websocket.md
   - Files: `docs/dhan-ref/04-full-market-depth-websocket.md`
   - Change: Add note about Python SDK using bare `wss://full-depth-api.dhan.co/` vs our `/twohundreddepth` path
   - Tests: N/A (documentation only)
