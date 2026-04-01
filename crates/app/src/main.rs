@@ -516,6 +516,9 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Health status — created early so tick persistence consumer can update it.
+        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+
         // --- Background: Tick persistence (cold path — subscribes to broadcast) ---
         // The tick processor was started with None writers (fast boot, QuestDB wasn't
         // ready). Now QuestDB is available. Spawn a separate cold-path consumer that
@@ -524,8 +527,9 @@ async fn main() -> Result<()> {
         {
             let tick_persistence_rx = fast_tick_broadcast_sender.subscribe();
             let questdb_cfg = config.questdb.clone();
+            let hs = health_status.clone();
             tokio::spawn(async move {
-                run_tick_persistence_consumer(tick_persistence_rx, questdb_cfg).await;
+                run_tick_persistence_consumer(tick_persistence_rx, questdb_cfg, Some(hs)).await;
             });
             info!("background tick persistence consumer started (cold path)");
         }
@@ -669,7 +673,6 @@ async fn main() -> Result<()> {
             std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
 
         // --- Background: API server ---
-        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
         let api_state = SharedAppState::new(
             config.questdb.clone(),
             config.dhan.clone(),
@@ -872,9 +875,13 @@ async fn main() -> Result<()> {
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
     let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
 
+    // Health status — created early so tick persistence status can be set.
+    let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+
     let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
         Ok(mut writer) => {
             info!("QuestDB tick writer connected");
+            health_status.set_tick_persistence_connected(true);
             // A1: Recover stale spill files from previous crashes.
             let recovered = writer.recover_stale_spill_files();
             if recovered > 0 {
@@ -1251,7 +1258,6 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
     let api_state = SharedAppState::new(
         config.questdb.clone(),
         config.dhan.clone(),
@@ -1734,10 +1740,14 @@ fn spawn_historical_candle_fetch(
 async fn run_tick_persistence_consumer(
     mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
     questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+    health_status: Option<SharedHealthStatus>,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
             info!("cold-path tick persistence writer connected to QuestDB");
+            if let Some(ref hs) = health_status {
+                hs.set_tick_persistence_connected(true);
+            }
             writer
         }
         Err(err) => {

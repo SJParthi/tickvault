@@ -21,6 +21,7 @@ pub struct SubsystemStatus {
     pub questdb: SubsystemInfo,
     pub token: SubsystemInfo,
     pub pipeline: SubsystemInfo,
+    pub tick_persistence: SubsystemInfo,
 }
 
 /// Individual subsystem status info.
@@ -72,6 +73,15 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         detail: None,
     };
 
+    let tick_persistence = SubsystemInfo {
+        status: if health.tick_persistence_connected() {
+            "connected"
+        } else {
+            "unavailable"
+        },
+        detail: None,
+    };
+
     let overall = health.overall_status();
 
     Json(HealthResponse {
@@ -82,6 +92,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             questdb,
             token,
             pipeline,
+            tick_persistence,
         },
     })
 }
@@ -134,6 +145,7 @@ mod tests {
         health.set_questdb_reachable(true);
         health.set_token_valid(true);
         health.set_pipeline_active(true);
+        health.set_tick_persistence_connected(true);
 
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
@@ -144,6 +156,7 @@ mod tests {
         assert_eq!(response.subsystems.questdb.status, "reachable");
         assert_eq!(response.subsystems.token.status, "valid");
         assert_eq!(response.subsystems.pipeline.status, "active");
+        assert_eq!(response.subsystems.tick_persistence.status, "connected");
     }
 
     #[tokio::test]
@@ -187,6 +200,7 @@ mod tests {
         assert_eq!(response.subsystems.questdb.status, "unreachable");
         assert_eq!(response.subsystems.token.status, "invalid");
         assert_eq!(response.subsystems.pipeline.status, "inactive");
+        assert_eq!(response.subsystems.tick_persistence.status, "unavailable");
     }
 
     #[test]
@@ -211,6 +225,10 @@ mod tests {
                     status: "active",
                     detail: None,
                 },
+                tick_persistence: SubsystemInfo {
+                    status: "connected",
+                    detail: None,
+                },
             },
         };
         let json = serde_json::to_string(&resp).expect("serialization should succeed");
@@ -218,6 +236,7 @@ mod tests {
         assert!(json.contains("\"version\":\"0.1.0\""));
         assert!(json.contains("\"websocket\""));
         assert!(json.contains("\"questdb\""));
+        assert!(json.contains("\"tick_persistence\""));
     }
 
     // -------------------------------------------------------------------
