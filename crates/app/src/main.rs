@@ -982,13 +982,26 @@ async fn main() -> Result<()> {
     // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
     // Dhan's WebSocket server sends stale market data (last-traded prices from
     // the previous trading day) even on non-trading days. Without this guard,
-    // those stale ticks pass the time-of-day persist window check and get
-    // written to QuestDB, polluting the database with duplicate/stale data.
-    // Connect WebSocket on trading days, mock trading Saturdays, AND Muhurat sessions.
-    // Muhurat = special Diwali evening session on an otherwise closed day.
-    // Without this, Muhurat trading days get zero market data.
-    let should_connect_ws =
-        subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
+    // WebSocket guard: connect ONLY during the data collection window (9:00-15:30 IST)
+    // on trading days. Connecting outside market hours wastes bandwidth, receives stale
+    // ticks, and pollutes QuestDB with post-market data. Muhurat sessions have their
+    // own time window — handled via is_muhurat flag (evening session on Diwali).
+    let is_within_data_window =
+        dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
+            &config.trading.data_collection_start,
+            &config.trading.data_collection_end,
+        );
+    let should_connect_ws = subscription_plan.is_some()
+        && ((is_trading && is_within_data_window)
+            || (is_mock_trading && is_within_data_window)
+            || is_muhurat);
+    if subscription_plan.is_some() && is_trading && !is_within_data_window && !is_muhurat {
+        info!(
+            data_collection_start = %config.trading.data_collection_start,
+            data_collection_end = %config.trading.data_collection_end,
+            "WebSocket pool skipped — trading day but outside data collection window (market closed)"
+        );
+    }
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
             &token_handle,
@@ -1578,6 +1591,8 @@ fn spawn_historical_candle_fetch(
     let bg_dhan_config = config.dhan.clone();
     let bg_historical_config = config.historical.clone();
     let bg_questdb_config = config.questdb.clone();
+    let bg_data_collection_start = config.trading.data_collection_start.clone();
+    let bg_data_collection_end = config.trading.data_collection_end.clone();
     let bg_token_handle = token_manager.token_handle();
     let bg_notifier = std::sync::Arc::clone(notifier);
 
@@ -1619,17 +1634,28 @@ fn spawn_historical_candle_fetch(
         };
 
         // -----------------------------------------------------------------
-        // Trading day: skip initial fetch — wait for post-market signal
+        // Trading day + within market hours: wait for post-market signal
         //   (after 15:30 IST, WS disconnected, live data fully ingested)
+        // Trading day + AFTER market hours: fetch immediately (market already closed)
         // Non-trading day: fetch immediately at boot (no live data to wait for)
         // -----------------------------------------------------------------
 
-        if is_trading_day {
+        let is_within_collection_window =
+            dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
+                &bg_data_collection_start,
+                &bg_data_collection_end,
+            );
+
+        if is_trading_day && is_within_collection_window {
             info!(
-                "trading day — skipping initial historical fetch, waiting for post-market signal"
+                "trading day during market hours — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
             info!("post-market signal received — WebSockets disconnected, live data ingested");
+        } else if is_trading_day {
+            info!(
+                "trading day but market already closed — starting historical candle fetch immediately"
+            );
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }

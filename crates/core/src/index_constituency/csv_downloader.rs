@@ -128,6 +128,13 @@ async fn download_single_csv(client: &Client, name: &str, url: &str) -> Result<S
                 anyhow::bail!("empty response body for {url}");
             }
 
+            // Reject HTML responses — niftyindices.com returns 200 + HTML
+            // for non-existent slugs instead of 404.
+            let trimmed = text.trim_start();
+            if trimmed.starts_with('<') || trimmed.starts_with("<!DOCTYPE") {
+                anyhow::bail!("received HTML instead of CSV for {url}");
+            }
+
             Ok(text)
         }
     })
