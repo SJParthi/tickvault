@@ -39,6 +39,60 @@ pub struct ApplicationConfig {
     pub index_constituency: IndexConstituencyConfig,
     #[serde(default)]
     pub greeks: GreeksConfig,
+    #[serde(default)]
+    pub infrastructure: InfrastructureConfig,
+}
+
+/// Trading execution mode — controls how orders are routed.
+///
+/// - `Paper`: Zero HTTP calls. Orders simulated locally with PAPER-{counter} IDs.
+///   Use for strategy development with real market data.
+/// - `Sandbox`: HTTP calls to `sandbox.dhan.co/v2/`. Orders fill at ₹100 (simulated).
+///   Use for API integration testing before going live.
+/// - `Live`: HTTP calls to `api.dhan.co/v2/`. Real exchange orders, real money.
+///   Requires static IP. Use only when ready for production.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TradingMode {
+    /// Local simulation — no HTTP calls, PAPER-{counter} order IDs.
+    /// Default: safe — never touch real money.
+    #[default]
+    Paper,
+    /// Dhan sandbox — HTTP to sandbox.dhan.co, orders fill at ₹100.
+    Sandbox,
+    /// Real trading — HTTP to api.dhan.co, real exchange orders.
+    Live,
+}
+
+impl TradingMode {
+    /// Returns true if this mode makes real HTTP calls to Dhan (sandbox or live).
+    pub fn is_http_active(self) -> bool {
+        matches!(self, Self::Sandbox | Self::Live)
+    }
+
+    /// Returns true if this mode is paper trading (no HTTP calls).
+    pub fn is_paper(self) -> bool {
+        self == Self::Paper
+    }
+
+    /// Returns true if this is the live production mode.
+    pub fn is_live(self) -> bool {
+        self == Self::Live
+    }
+
+    /// Returns true if this is the sandbox testing mode.
+    pub fn is_sandbox(self) -> bool {
+        self == Self::Sandbox
+    }
+
+    /// Returns the display name for logging.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paper => "paper",
+            Self::Sandbox => "sandbox",
+            Self::Live => "live",
+        }
+    }
 }
 
 /// Strategy and paper-trading configuration.
@@ -52,8 +106,13 @@ pub struct StrategyConfig {
     pub capital: f64,
     /// Dry-run mode: when true, NO real orders are placed. All orders are simulated.
     /// DEFAULT: true. This is a developer-only tool.
+    /// DEPRECATED: Use `mode` instead. Kept for backward compatibility.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// Trading execution mode: paper (local sim), sandbox (Dhan DevPortal), live (real).
+    /// Overrides dry_run when set. Default: paper.
+    #[serde(default)]
+    pub mode: TradingMode,
 }
 
 impl Default for StrategyConfig {
@@ -62,6 +121,7 @@ impl Default for StrategyConfig {
             config_path: default_strategy_config_path(),
             capital: default_capital(),
             dry_run: default_dry_run(),
+            mode: TradingMode::default(),
         }
     }
 }
@@ -128,6 +188,10 @@ pub struct DhanConfig {
     pub order_update_websocket_url: String,
     /// REST API base URL (for trading, data, renewal).
     pub rest_api_base_url: String,
+    /// Sandbox API base URL (for sandbox mode order testing).
+    /// Set in config/base.toml — no default in code (must come from config).
+    #[serde(default)]
+    pub sandbox_base_url: String,
     /// Auth base URL (for token generation — separate from REST API).
     /// Dhan uses `https://auth.dhan.co` for authentication endpoints.
     pub auth_base_url: String,
@@ -478,6 +542,29 @@ const fn default_constituency_inter_batch_delay_ms() -> u64 {
     200
 }
 
+/// Infrastructure configuration — controls Docker auto-start behavior.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InfrastructureConfig {
+    /// Whether to auto-start Docker services on boot.
+    /// When true (default): one-click Run — app auto-launches Docker Desktop
+    /// and containers. Probes first, skips if already running. Zero manual steps.
+    /// When false: run "Docker Restart" in IntelliJ first, then run the app.
+    #[serde(default = "default_auto_start")]
+    pub auto_start_docker: bool,
+}
+
+impl Default for InfrastructureConfig {
+    fn default() -> Self {
+        Self {
+            auto_start_docker: true,
+        }
+    }
+}
+
+const fn default_auto_start() -> bool {
+    true
+}
+
 /// Greeks engine configuration.
 ///
 /// Controls Black-Scholes pricing parameters, IV solver settings,
@@ -746,6 +833,31 @@ impl ApplicationConfig {
             }
         }
 
+        // D1: Sandbox enforcement — prevent live trading before LIVE_TRADING_EARLIEST_DATE.
+        // This is a fail-fast guard at config validation time. If someone sets
+        // mode = "live" before the date, the application refuses to start.
+        if self.strategy.mode.is_live() {
+            let today = (chrono::Utc::now()
+                + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
+            .date_naive();
+            let earliest = match chrono::NaiveDate::from_ymd_opt(
+                crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+                crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+                crate::constants::LIVE_TRADING_EARLIEST_DAY,
+            ) {
+                Some(d) => d,
+                None => bail!("LIVE_TRADING_EARLIEST_DATE constants are invalid"),
+            };
+            if today < earliest {
+                bail!(
+                    "SANDBOX GUARD: live trading mode is locked until {}. \
+                     Current date (IST): {}. Use mode = \"sandbox\" or \"paper\" until then.",
+                    earliest,
+                    today
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -790,6 +902,7 @@ mod tests {
                 websocket_url: "wss://api-feed.dhan.co".to_string(),
                 order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
                 rest_api_base_url: "https://api.dhan.co/v2".to_string(),
+                sandbox_base_url: "https://sandbox.dhan.co/v2".to_string(),
                 auth_base_url: "https://auth.dhan.co".to_string(),
                 instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
                     .to_string(),
@@ -862,8 +975,76 @@ mod tests {
             strategy: StrategyConfig::default(),
             index_constituency: IndexConstituencyConfig::default(),
             greeks: GreeksConfig::default(),
+            infrastructure: InfrastructureConfig::default(),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // TradingMode tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_trading_mode_default_is_paper() {
+        assert_eq!(TradingMode::default(), TradingMode::Paper);
+    }
+
+    #[test]
+    fn test_trading_mode_paper_no_http() {
+        assert!(!TradingMode::Paper.is_http_active());
+        assert!(TradingMode::Paper.is_paper());
+        assert!(!TradingMode::Paper.is_live());
+        assert!(!TradingMode::Paper.is_sandbox());
+    }
+
+    #[test]
+    fn test_trading_mode_sandbox_has_http() {
+        assert!(TradingMode::Sandbox.is_http_active());
+        assert!(!TradingMode::Sandbox.is_paper());
+        assert!(!TradingMode::Sandbox.is_live());
+        assert!(TradingMode::Sandbox.is_sandbox());
+    }
+
+    #[test]
+    fn test_trading_mode_live_has_http() {
+        assert!(TradingMode::Live.is_http_active());
+        assert!(!TradingMode::Live.is_paper());
+        assert!(TradingMode::Live.is_live());
+        assert!(!TradingMode::Live.is_sandbox());
+    }
+
+    #[test]
+    fn test_trading_mode_as_str() {
+        assert_eq!(TradingMode::Paper.as_str(), "paper");
+        assert_eq!(TradingMode::Sandbox.as_str(), "sandbox");
+        assert_eq!(TradingMode::Live.as_str(), "live");
+    }
+
+    #[test]
+    fn test_trading_mode_deserialize_lowercase() {
+        let paper: TradingMode = serde_json::from_str("\"paper\"").unwrap();
+        assert_eq!(paper, TradingMode::Paper);
+        let sandbox: TradingMode = serde_json::from_str("\"sandbox\"").unwrap();
+        assert_eq!(sandbox, TradingMode::Sandbox);
+        let live: TradingMode = serde_json::from_str("\"live\"").unwrap();
+        assert_eq!(live, TradingMode::Live);
+    }
+
+    #[test]
+    fn test_trading_mode_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&TradingMode::Paper).unwrap(),
+            "\"paper\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TradingMode::Sandbox).unwrap(),
+            "\"sandbox\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TradingMode::Live).unwrap(),
+            "\"live\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_valid_config_passes_validation() {
@@ -1205,6 +1386,92 @@ mod tests {
         assert!(err.to_string().contains("websocket read timeout"));
     }
 
+    // Mutation-targeted tests: catch `replace + with -`, `replace * with +`,
+    // `replace + with *`, `replace > with >=` in validate() read timeout logic.
+
+    #[test]
+    fn test_websocket_read_timeout_exactly_at_boundary_passes() {
+        // computed = ping * (failures + 1) + pong
+        // With ping=10, failures=3, pong=10: computed = 10*(3+1)+10 = 50
+        // max = SERVER_PING_TIMEOUT_SECS * 2 = 80
+        // 50 < 80 → should pass
+        let mut config = make_valid_config();
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 3;
+        config.websocket.pong_timeout_secs = 10;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_exactly_at_max_passes() {
+        // computed = ping * (failures + 1) + pong = 80 exactly
+        // max = 80
+        // 80 > 80 is FALSE → should PASS (equal is OK)
+        // This catches `replace > with >=` mutation — if >= were used, this would fail
+        let mut config = make_valid_config();
+        // 10 * (6 + 1) + 10 = 10 * 7 + 10 = 80
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 6;
+        config.websocket.pong_timeout_secs = 10;
+        assert!(
+            config.validate().is_ok(),
+            "computed=80, max=80 → equal should PASS (> not >=)"
+        );
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_one_above_max_fails() {
+        // computed = 81, max = 80
+        // 81 > 80 → should FAIL
+        let mut config = make_valid_config();
+        // 10 * (6 + 1) + 11 = 81
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 6;
+        config.websocket.pong_timeout_secs = 11;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("websocket read timeout"));
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_plus_one_matters() {
+        // This catches `replace + with -` and `replace + with *` on the `+ 1`
+        // With failures=0: computed = ping * (0 + 1) + pong = ping + pong
+        // Mutation `+ 1` → `- 1`: computed = ping * (0 - 1) + pong = UNDERFLOW or 0 + pong
+        // Mutation `+ 1` → `* 1`: computed = ping * (0 * 1) + pong = 0 + pong
+        // Both mutations would give a DIFFERENT computed value
+        let mut config = make_valid_config();
+        // Normal: 40 * (0 + 1) + 41 = 40 + 41 = 81 > 80 → FAIL
+        // Mutant (-1): 40 * (0 - 1) + 41 → saturating = 0 + 41 = 41 ≤ 80 → PASS (wrong!)
+        // Mutant (*1): 40 * (0 * 1) + 41 = 0 + 41 = 41 ≤ 80 → PASS (wrong!)
+        config.websocket.ping_interval_secs = 40;
+        config.websocket.max_consecutive_pong_failures = 0;
+        config.websocket.pong_timeout_secs = 41;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("websocket read timeout"),
+            "failures=0 with +1 should compute 81 > 80"
+        );
+    }
+
+    #[test]
+    fn test_websocket_read_timeout_times_two_matters() {
+        // This catches `replace * with +` on `SERVER_PING_TIMEOUT_SECS * 2`
+        // Normal max = 40 * 2 = 80
+        // Mutant max = 40 + 2 = 42
+        // With computed = 50: normal 50 ≤ 80 → PASS, mutant 50 > 42 → FAIL (wrong!)
+        let mut config = make_valid_config();
+        // computed = 10 * (3 + 1) + 10 = 50
+        config.websocket.ping_interval_secs = 10;
+        config.websocket.max_consecutive_pong_failures = 3;
+        config.websocket.pong_timeout_secs = 10;
+        // 50 ≤ 80 → PASS (correct)
+        // If max were 42 (mutant): 50 > 42 → FAIL (mutation caught!)
+        assert!(
+            config.validate().is_ok(),
+            "computed=50 should be within max=80"
+        );
+    }
+
     #[test]
     fn test_feed_mode_ticker_passes() {
         let config = SubscriptionConfig {
@@ -1398,6 +1665,65 @@ mod tests {
             err.to_string().contains("not-a-date"),
             "error should mention the bad date: {}",
             err
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D1: Sandbox Guard Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sandbox_guard_blocks_live_before_july() {
+        let mut config = make_valid_config();
+        config.strategy.mode = TradingMode::Live;
+        // The guard uses the current system date. Since we're before July 2026,
+        // this should fail. If running after July 2026, the guard is no longer
+        // active and this test should be updated.
+        let today = (chrono::Utc::now()
+            + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
+        .date_naive();
+        let earliest = chrono::NaiveDate::from_ymd_opt(
+            crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+            crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+            crate::constants::LIVE_TRADING_EARLIEST_DAY,
+        )
+        .unwrap();
+        if today < earliest {
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("SANDBOX GUARD"),
+                "should mention SANDBOX GUARD: {}",
+                err
+            );
+        }
+        // If today >= earliest, live mode is permitted — test passes trivially.
+    }
+
+    #[test]
+    fn test_sandbox_and_paper_modes_always_pass_guard() {
+        let mut config = make_valid_config();
+        config.strategy.mode = TradingMode::Sandbox;
+        assert!(config.validate().is_ok(), "sandbox mode should always pass");
+
+        config.strategy.mode = TradingMode::Paper;
+        assert!(config.validate().is_ok(), "paper mode should always pass");
+    }
+
+    #[test]
+    fn test_base_config_dry_run_is_true() {
+        let config = make_valid_config();
+        assert!(
+            config.strategy.dry_run,
+            "default config must have dry_run = true for safety"
+        );
+    }
+
+    #[test]
+    fn test_base_config_mode_is_not_live() {
+        let config = make_valid_config();
+        assert!(
+            !config.strategy.mode.is_live(),
+            "default config must NOT be in live mode"
         );
     }
 }

@@ -10,6 +10,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — one `from_le_bytes` read.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by OI_PACKET_SIZE check
 pub fn parse_oi_packet(raw: &[u8], header: &PacketHeader) -> Result<u32, ParseError> {
     if raw.len() < OI_PACKET_SIZE {

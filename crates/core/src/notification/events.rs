@@ -267,6 +267,22 @@ pub enum NotificationEvent {
         deadline_hour_ist: u32,
     },
 
+    /// QuestDB persistence disconnected — ticks being buffered, not persisted.
+    QuestDbDisconnected {
+        /// Which writer lost connection (e.g., "tick", "depth", "candle").
+        writer: String,
+        /// Current ring buffer size at disconnect time.
+        buffer_size: usize,
+    },
+
+    /// QuestDB persistence reconnected — buffered data draining.
+    QuestDbReconnected {
+        /// Which writer recovered.
+        writer: String,
+        /// Total ticks/records drained from buffer.
+        drained_count: usize,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
 }
@@ -571,6 +587,25 @@ impl NotificationEvent {
                     "<b>TOKEN RENEWAL DEADLINE MISSED</b>\nPast {deadline_hour_ist}:00 IST — token not renewed"
                 )
             }
+            Self::QuestDbDisconnected {
+                writer,
+                buffer_size,
+            } => {
+                format!(
+                    "<b>CRITICAL: QuestDB {writer} DISCONNECTED</b>\n\
+                     Buffering data in ring buffer ({buffer_size} records). \
+                     Auto-reconnect every 30s."
+                )
+            }
+            Self::QuestDbReconnected {
+                writer,
+                drained_count,
+            } => {
+                format!(
+                    "<b>QuestDB {writer} RECONNECTED</b>\n\
+                     Drained {drained_count} buffered records to QuestDB."
+                )
+            }
             Self::Custom { message } => message.clone(),
         }
     }
@@ -601,6 +636,8 @@ impl NotificationEvent {
             Self::CircuitBreakerOpened { .. } => Severity::High,
             Self::OrderRejected { .. } => Severity::High,
             Self::RateLimitExhausted { .. } => Severity::High,
+            Self::QuestDbDisconnected { .. } => Severity::Critical,
+            Self::QuestDbReconnected { .. } => Severity::Medium,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,

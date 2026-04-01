@@ -271,12 +271,31 @@ async fn run_trading_pipeline(
                         let snapshot = indicator_engine.update(&tick);
 
                         // Step 2: Evaluate all strategies
+                        // Guard: skip order placement outside trading hours [09:15, 15:30) IST.
+                        // Stale ticks in WebSocket buffer after 15:30 could trigger signals.
+                        // SEBI: no orders at or after 15:30 IST.
+                        let ist_secs_of_day = {
+                            let now_utc = chrono::Utc::now().timestamp();
+                            let now_ist = now_utc.saturating_add(19_800); // +5:30
+                            (now_ist % 86_400) as u32
+                        };
+                        // 09:15:00 = 33300s, 15:29:59 = 55799s
+                        let within_trading_hours = (33_300..55_800).contains(&ist_secs_of_day);
+
                         for strategy in &mut strategies {
                             let signal = strategy.evaluate(&snapshot);
 
                             match signal {
                                 Signal::Hold => {}
                                 Signal::EnterLong { size_fraction: _, stop_loss, target } => {
+                                    if !within_trading_hours {
+                                        debug!(
+                                            security_id = tick.security_id,
+                                            ist_secs_of_day,
+                                            "LONG signal suppressed — outside trading hours [09:15, 15:30)"
+                                        );
+                                        continue;
+                                    }
                                     signals_generated = signals_generated.saturating_add(1);
                                     // Risk check before order
                                     let risk_result = risk_engine.check_order(tick.security_id, 1);
@@ -324,6 +343,14 @@ async fn run_trading_pipeline(
                                     }
                                 }
                                 Signal::EnterShort { size_fraction: _, stop_loss, target } => {
+                                    if !within_trading_hours {
+                                        debug!(
+                                            security_id = tick.security_id,
+                                            ist_secs_of_day,
+                                            "SHORT signal suppressed — outside trading hours [09:15, 15:30)"
+                                        );
+                                        continue;
+                                    }
                                     signals_generated = signals_generated.saturating_add(1);
                                     let risk_result = risk_engine.check_order(tick.security_id, -1);
                                     match risk_result {
@@ -398,7 +425,7 @@ async fn run_trading_pipeline(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        debug!(skipped, "trading pipeline lagged — skipped ticks (expected)");
+                        warn!(skipped, "trading pipeline lagged — skipped ticks, signals may be missed");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("tick broadcast closed — trading pipeline stopping");
@@ -640,6 +667,12 @@ mod tests {
             tick_size: 0.0,
             source: String::new(),
             off_mkt_flag: String::new(),
+            algo_ord_no: String::new(),
+            mkt_type: String::new(),
+            series: String::new(),
+            good_till_days_date: String::new(),
+            algo_id: String::new(),
+            multiplier: 0,
         }
     }
 

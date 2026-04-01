@@ -39,6 +39,7 @@ use super::types::{ParseError, ParsedFrame};
 ///
 /// # Performance
 /// O(1) — header parse + single packet parse. No heap allocation.
+#[inline]
 pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame, ParseError> {
     let header = parse_header(raw)?;
 

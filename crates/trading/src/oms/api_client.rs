@@ -28,10 +28,14 @@ use tracing::{debug, warn};
 use dhan_live_trader_common::constants;
 
 use super::types::{
-    DhanConvertPositionRequest, DhanExitAllResponse, DhanHoldingResponse, DhanModifyOrderRequest,
-    DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse, DhanPositionResponse,
-    FundLimitResponse, MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest,
-    MultiMarginResponse, OmsError,
+    DhanConditionalTriggerRequest, DhanConditionalTriggerResponse, DhanConvertPositionRequest,
+    DhanExitAllResponse, DhanForeverOrderRequest, DhanForeverOrderResponse,
+    DhanHistoricalTradeEntry, DhanHoldingResponse, DhanLedgerEntry, DhanModifyOrderRequest,
+    DhanModifySuperOrderRequest, DhanOrderResponse, DhanPlaceOrderRequest, DhanPlaceOrderResponse,
+    DhanPlaceSuperOrderRequest, DhanPositionResponse, DhanSuperOrderResponse, DhanTradeEntry,
+    EdisFormRequest, EdisInquiryResponse, FundLimitResponse, KillSwitchResponse,
+    MarginCalculatorRequest, MarginCalculatorResponse, MultiMarginRequest, MultiMarginResponse,
+    OmsError, PnlExitRequest, PnlExitResponse, PnlExitStatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -569,6 +573,1006 @@ impl OrderApiClient {
     }
 
     // -----------------------------------------------------------------------
+    // Conditional Trigger Endpoints (Phase 6) — docs/dhan-ref/07c-conditional-trigger.md
+    // Equities and Indices ONLY. F&O/commodities NOT supported.
+    // -----------------------------------------------------------------------
+
+    /// Creates a conditional trigger (alert-based order).
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn create_conditional_trigger(
+        &self,
+        access_token: &str,
+        request: &DhanConditionalTriggerRequest,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders", self.base_url);
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "create_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Modifies a conditional trigger.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn modify_conditional_trigger(
+        &self,
+        access_token: &str,
+        alert_id: &str,
+        request: &DhanConditionalTriggerRequest,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders/{}", self.base_url, alert_id);
+        let response = self
+            .auth_headers(self.http.put(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "modify_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Deletes a conditional trigger.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn delete_conditional_trigger(
+        &self,
+        access_token: &str,
+        alert_id: &str,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders/{}", self.base_url, alert_id);
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "delete_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets a conditional trigger by alert ID.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_conditional_trigger(
+        &self,
+        access_token: &str,
+        alert_id: &str,
+    ) -> Result<DhanConditionalTriggerResponse, OmsError> {
+        let url = format!("{}/alerts/orders/{}", self.base_url, alert_id);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_conditional_trigger")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets all conditional triggers.
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_all_conditional_triggers(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<DhanConditionalTriggerResponse>, OmsError> {
+        let url = format!("{}/alerts/orders", self.base_url);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_all_conditional_triggers")?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // EDIS Endpoints (Phase 8) — docs/dhan-ref/07d-edis.md
+    // -----------------------------------------------------------------------
+
+    /// Generates T-PIN (sent to registered mobile via SMS).
+    // TEST-EXEMPT: requires live Dhan API (sends real SMS)
+    pub async fn generate_tpin(&self, access_token: &str) -> Result<(), OmsError> {
+        let url = format!("{}/edis/tpin", self.base_url);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = response
+                .text()
+                .await
+                .map_err(|err| OmsError::HttpError(err.to_string()))?;
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        Ok(()) // 202 Accepted — T-PIN sent to SMS
+    }
+
+    /// Generates EDIS form HTML for CDSL T-PIN entry (browser rendering).
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn generate_edis_form(
+        &self,
+        access_token: &str,
+        request: &EdisFormRequest,
+    ) -> Result<String, OmsError> {
+        let url = format!("{}/edis/form", self.base_url);
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        Ok(body) // Returns HTML form
+    }
+
+    /// Inquires EDIS approval status for a security (or "ALL" for all holdings).
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn inquire_edis_approval(
+        &self,
+        access_token: &str,
+        isin: &str,
+    ) -> Result<EdisInquiryResponse, OmsError> {
+        let url = format!("{}/edis/inquire/{}", self.base_url, isin);
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Statements Endpoints (Phase 8) — docs/dhan-ref/14-statements-trade-history.md
+    // -----------------------------------------------------------------------
+
+    /// Gets ledger entries for a date range.
+    /// **NOTE:** `debit`/`credit` are STRINGS, not floats.
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn get_ledger(
+        &self,
+        access_token: &str,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<DhanLedgerEntry>, OmsError> {
+        let url = format!(
+            "{}/ledger?from-date={}&to-date={}",
+            self.base_url, from_date, to_date
+        );
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets historical trade entries with pagination.
+    /// **NOTE:** Page is 0-indexed. Uses PATH params, NOT query params.
+    // TEST-EXEMPT: requires live Dhan API
+    pub async fn get_trade_history(
+        &self,
+        access_token: &str,
+        from_date: &str,
+        to_date: &str,
+        page: u32,
+    ) -> Result<Vec<DhanHistoricalTradeEntry>, OmsError> {
+        let url = format!(
+            "{}/trades/{}/{}/{}",
+            self.base_url, from_date, to_date, page
+        );
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Super Order Endpoints (Phase 4) — docs/dhan-ref/07a-super-order.md
+    // -----------------------------------------------------------------------
+
+    /// Places a super order (entry + target + stop loss as 3 legs).
+    ///
+    /// Endpoint: `POST /v2/super/orders`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn place_super_order(
+        &self,
+        access_token: &str,
+        request: &DhanPlaceSuperOrderRequest,
+    ) -> Result<DhanSuperOrderResponse, OmsError> {
+        let url = format!("{}/super/orders", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "place_super_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Modifies a super order leg.
+    ///
+    /// Restrictions: ENTRY_LEG=all fields, TARGET_LEG=targetPrice only,
+    /// STOP_LOSS_LEG=stopLossPrice+trailingJump only.
+    ///
+    /// Endpoint: `PUT /v2/super/orders/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn modify_super_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+        request: &DhanModifySuperOrderRequest,
+    ) -> Result<DhanSuperOrderResponse, OmsError> {
+        let url = format!("{}/super/orders/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.put(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "modify_super_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Cancels a super order leg.
+    ///
+    /// ENTRY_LEG cancellation = cancels ALL legs (entire super order).
+    /// TARGET_LEG/STOP_LOSS_LEG = permanent removal, cannot re-add.
+    ///
+    /// Endpoint: `DELETE /v2/super/orders/{order-id}/{order-leg}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn cancel_super_order_leg(
+        &self,
+        access_token: &str,
+        order_id: &str,
+        leg: &str,
+    ) -> Result<DhanSuperOrderResponse, OmsError> {
+        let url = format!("{}/super/orders/{}/{}", self.base_url, order_id, leg);
+
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "cancel_super_order_leg")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Lists all super orders for today.
+    ///
+    /// Endpoint: `GET /v2/super/orders`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_super_orders(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<DhanSuperOrderResponse>, OmsError> {
+        let url = format!("{}/super/orders", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_super_orders")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Forever Order Endpoints (Phase 5) — docs/dhan-ref/07b-forever-order.md
+    // -----------------------------------------------------------------------
+
+    /// Creates a forever order (GTT — Good Till Triggered).
+    ///
+    /// Product types: CNC, MTF ONLY. INTRADAY/MARGIN rejected.
+    ///
+    /// Endpoint: `POST /v2/forever/orders`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn create_forever_order(
+        &self,
+        access_token: &str,
+        request: &DhanForeverOrderRequest,
+    ) -> Result<DhanForeverOrderResponse, OmsError> {
+        let url = format!("{}/forever/orders", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "create_forever_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Modifies a forever order (by leg name: TARGET_LEG or STOP_LOSS_LEG).
+    ///
+    /// Endpoint: `PUT /v2/forever/orders/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn modify_forever_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+        request: &DhanForeverOrderRequest,
+    ) -> Result<DhanForeverOrderResponse, OmsError> {
+        let url = format!("{}/forever/orders/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.put(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "modify_forever_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Deletes a forever order.
+    ///
+    /// Endpoint: `DELETE /v2/forever/orders/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn delete_forever_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+    ) -> Result<DhanForeverOrderResponse, OmsError> {
+        let url = format!("{}/forever/orders/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "delete_forever_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Lists all forever orders.
+    ///
+    /// Endpoint: `GET /v2/forever/all`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_all_forever_orders(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<DhanForeverOrderResponse>, OmsError> {
+        let url = format!("{}/forever/all", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_all_forever_orders")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing Standard Order Endpoints (Phase 3)
+    // Ground truth: docs/dhan-ref/07-orders.md
+    // -----------------------------------------------------------------------
+
+    /// Places an order with auto-slicing for F&O freeze quantity.
+    ///
+    /// Same request body as place_order. System automatically splits the
+    /// order into multiple legs if quantity exceeds exchange freeze limit.
+    ///
+    /// Endpoint: `POST /v2/orders/slicing`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn place_order_slicing(
+        &self,
+        access_token: &str,
+        request: &DhanPlaceOrderRequest,
+    ) -> Result<DhanPlaceOrderResponse, OmsError> {
+        let url = format!("{}/orders/slicing", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "place_order_slicing")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets an order by its correlation ID (user-supplied idempotency key).
+    ///
+    /// Endpoint: `GET /v2/orders/external/{correlation-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_order_by_correlation_id(
+        &self,
+        access_token: &str,
+        correlation_id: &str,
+    ) -> Result<DhanOrderResponse, OmsError> {
+        let url = format!("{}/orders/external/{}", self.base_url, correlation_id);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_order_by_correlation_id")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets all trades for today (trade book).
+    ///
+    /// Endpoint: `GET /v2/trades`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_trades(&self, access_token: &str) -> Result<Vec<DhanTradeEntry>, OmsError> {
+        let url = format!("{}/trades", self.base_url);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_trades")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets trades for a specific order.
+    ///
+    /// Endpoint: `GET /v2/trades/{order-id}`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_trades_for_order(
+        &self,
+        access_token: &str,
+        order_id: &str,
+    ) -> Result<Vec<DhanTradeEntry>, OmsError> {
+        let url = format!("{}/trades/{}", self.base_url, order_id);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_trades_for_order")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Trader's Control — Kill Switch + P&L Exit (5 endpoints)
+    // Ground truth: docs/dhan-ref/15-traders-control.md
+    // -----------------------------------------------------------------------
+
+    /// Activates the kill switch — disables ALL trading for the day.
+    ///
+    /// **Prerequisite:** All positions must be closed and no pending orders.
+    /// If positions exist, call `exit_all_positions()` first.
+    ///
+    /// Endpoint: `POST /v2/killswitch?killSwitchStatus=ACTIVATE`
+    // TEST-EXEMPT: requires live/sandbox Dhan API with real account state
+    pub async fn activate_kill_switch(
+        &self,
+        access_token: &str,
+    ) -> Result<KillSwitchResponse, OmsError> {
+        let url = format!(
+            "{}{}?killSwitchStatus=ACTIVATE",
+            self.base_url,
+            constants::DHAN_KILL_SWITCH_PATH
+        );
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "activate_kill_switch")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Deactivates the kill switch — re-enables trading.
+    ///
+    /// Endpoint: `POST /v2/killswitch?killSwitchStatus=DEACTIVATE`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn deactivate_kill_switch(
+        &self,
+        access_token: &str,
+    ) -> Result<KillSwitchResponse, OmsError> {
+        let url = format!(
+            "{}{}?killSwitchStatus=DEACTIVATE",
+            self.base_url,
+            constants::DHAN_KILL_SWITCH_PATH
+        );
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "deactivate_kill_switch")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets the current kill switch status.
+    ///
+    /// Endpoint: `GET /v2/killswitch`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_kill_switch_status(
+        &self,
+        access_token: &str,
+    ) -> Result<KillSwitchResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_KILL_SWITCH_PATH);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_kill_switch_status")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Configures P&L-based auto-exit for the current session.
+    ///
+    /// **WARNING:** If `profit_value` < current profit OR `loss_value` < current loss,
+    /// exit triggers IMMEDIATELY. Always check current P&L before configuring.
+    ///
+    /// Session-scoped — resets at end of trading day. Must reconfigure daily.
+    ///
+    /// Endpoint: `POST /v2/pnlExit`
+    // TEST-EXEMPT: requires live/sandbox Dhan API with real positions
+    pub async fn configure_pnl_exit(
+        &self,
+        access_token: &str,
+        request: &PnlExitRequest,
+    ) -> Result<PnlExitResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_PNL_EXIT_PATH);
+
+        let response = self
+            .auth_headers(self.http.post(&url), access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "configure_pnl_exit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Stops P&L-based auto-exit.
+    ///
+    /// Endpoint: `DELETE /v2/pnlExit`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn stop_pnl_exit(&self, access_token: &str) -> Result<PnlExitResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_PNL_EXIT_PATH);
+
+        let response = self
+            .auth_headers(self.http.delete(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "stop_pnl_exit")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    /// Gets the current P&L exit configuration.
+    ///
+    /// **Note:** Response field names differ from request:
+    /// - Request: `profitValue`, `lossValue`, `enableKillSwitch`
+    /// - Response: `profit`, `loss`, `enable_kill_switch` (shorter, snake_case mix)
+    ///
+    /// Endpoint: `GET /v2/pnlExit`
+    // TEST-EXEMPT: requires live/sandbox Dhan API
+    pub async fn get_pnl_exit_status(
+        &self,
+        access_token: &str,
+    ) -> Result<PnlExitStatusResponse, OmsError> {
+        let url = format!("{}{}", self.base_url, constants::DHAN_PNL_EXIT_PATH);
+
+        let response = self
+            .auth_headers(self.http.get(&url), access_token)
+            .send()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        self.check_rate_limit(status, "get_pnl_exit_status")?;
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| OmsError::HttpError(err.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            record_dh_error_metric(&body);
+            return Err(OmsError::DhanApiError {
+                status_code: status,
+                message: body,
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|err| OmsError::JsonError(err.to_string()))
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -631,6 +1635,7 @@ impl OrderApiClient {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::TriggerCondition;
     use super::*;
 
     #[test]
@@ -3499,5 +4504,462 @@ mod tests {
         for code in ["DH-901", "DH-904", "DH-905", "DH-906"] {
             metrics::counter!("dlt_dhan_error_total", "code" => code).increment(1);
         }
+    }
+
+    // ===================================================================
+    // Mock HTTP tests for ALL new API methods (Phase 2-8)
+    // Each method tested with success (200) and error (non-200) paths
+    // ===================================================================
+
+    // --- Kill Switch ---
+
+    #[tokio::test]
+    async fn test_activate_kill_switch_success() {
+        let body = r#"{"dhanClientId":"100","killSwitchStatus":"ACTIVATE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.activate_kill_switch("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().kill_switch_status, "ACTIVATE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_activate_kill_switch_error() {
+        let body = r#"{"errorType":"error","errorCode":"DH-905","errorMessage":"bad"}"#;
+        let (url, h) = start_mock_server(400, body).await;
+        let client = make_test_client(&url);
+        let result = client.activate_kill_switch("jwt").await;
+        assert!(result.is_err());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_deactivate_kill_switch_success() {
+        let body = r#"{"dhanClientId":"100","killSwitchStatus":"DEACTIVATE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.deactivate_kill_switch("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().kill_switch_status, "DEACTIVATE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_kill_switch_status_success() {
+        let body = r#"{"dhanClientId":"100","killSwitchStatus":"DEACTIVATE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_kill_switch_status("jwt").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    // --- P&L Exit ---
+
+    #[tokio::test]
+    async fn test_configure_pnl_exit_success() {
+        let body = r#"{"pnlExitStatus":"ACTIVE","message":"configured"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = PnlExitRequest {
+            profit_value: "1500.00".to_string(),
+            loss_value: "500.00".to_string(),
+            product_type: vec!["INTRADAY".to_string()],
+            enable_kill_switch: true,
+        };
+        let result = client.configure_pnl_exit("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().pnl_exit_status, "ACTIVE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stop_pnl_exit_success() {
+        let body = r#"{"pnlExitStatus":"DISABLED","message":"stopped"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.stop_pnl_exit("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().pnl_exit_status, "DISABLED");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_pnl_exit_status_success() {
+        let body = r#"{"pnlExitStatus":"ACTIVE","profit":"1500.00","loss":"500.00","productType":["INTRADAY"],"enable_kill_switch":true}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_pnl_exit_status("jwt").await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert_eq!(resp.profit, "1500.00");
+        assert!(resp.enable_kill_switch);
+        h.abort();
+    }
+
+    // --- Order Slicing ---
+
+    #[tokio::test]
+    async fn test_place_order_slicing_success() {
+        let body = r#"{"orderId":"SL-1","orderStatus":"PENDING","correlationId":"c1"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = make_test_place_request();
+        let result = client.place_order_slicing("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_id, "SL-1");
+        h.abort();
+    }
+
+    // --- Get by Correlation ---
+
+    #[tokio::test]
+    async fn test_get_order_by_correlation_id_success() {
+        let body = r#"{"orderId":"O1","correlationId":"c1","orderStatus":"TRADED","quantity":50,"filledQty":50,"remainingQuantity":0,"averageTradedPrice":245.5,"price":245.5,"triggerPrice":0,"omsErrorCode":"","omsErrorDescription":"","tradingSymbol":"NIFTY","securityId":"52432","tradedQuantity":50,"tradedPrice":245.5,"transactionType":"BUY","exchangeSegment":"NSE_FNO","productType":"INTRADAY","orderType":"LIMIT","validity":"DAY","exchangeOrderId":"E1","exchangeTime":"2026-03-30 10:00:00","createTime":"2026-03-30 10:00:00","updateTime":"2026-03-30 10:00:00","rejectionReason":"","tag":"","drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_order_by_correlation_id("jwt", "c1").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_id, "O1");
+        h.abort();
+    }
+
+    // --- Trade Book ---
+
+    #[tokio::test]
+    async fn test_get_trades_success() {
+        let body = r#"[{"dhanClientId":"100","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_FNO","productType":"INTRADAY","orderType":"LIMIT","tradingSymbol":"NIFTY","customSymbol":"","securityId":"52432","tradedQuantity":50,"tradedPrice":245.5,"isin":"","instrument":"OPTIDX","sebiTax":0.1,"stt":1.0,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":0.5,"stampDuty":0.01,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-30 10:00:00"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_trades("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_trades_for_order_success() {
+        let body = r#"[{"dhanClientId":"100","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_FNO","productType":"INTRADAY","orderType":"LIMIT","tradingSymbol":"NIFTY","customSymbol":"","securityId":"52432","tradedQuantity":50,"tradedPrice":245.5,"isin":"","instrument":"OPTIDX","sebiTax":0,"stt":0,"brokerageCharges":0,"serviceTax":0,"exchangeTransactionCharges":0,"stampDuty":0,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0,"exchangeTime":"2026-03-30 10:00:00"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_trades_for_order("jwt", "O1").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    // --- Super Orders ---
+
+    #[tokio::test]
+    async fn test_place_super_order_success() {
+        let body =
+            r#"{"orderId":"SO-1","orderStatus":"PENDING","correlationId":"","legDetails":[]}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 5,
+            price: 1500.0,
+            target_price: 1600.0,
+            stop_loss_price: 1400.0,
+            trailing_jump: 10.0,
+        };
+        let result = client.place_super_order("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_id, "SO-1");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_modify_super_order_success() {
+        let body =
+            r#"{"orderId":"SO-1","orderStatus":"PENDING","correlationId":"","legDetails":[]}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            leg_name: "TARGET_LEG".to_string(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: Some(1650.0),
+            stop_loss_price: None,
+            trailing_jump: None,
+        };
+        let result = client.modify_super_order("jwt", "SO-1", &req).await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancel_super_order_leg_success() {
+        let body =
+            r#"{"orderId":"SO-1","orderStatus":"CANCELLED","correlationId":"","legDetails":[]}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client
+            .cancel_super_order_leg("jwt", "SO-1", "ENTRY_LEG")
+            .await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_super_orders_success() {
+        let body =
+            r#"[{"orderId":"SO-1","orderStatus":"PENDING","correlationId":"","legDetails":[]}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_super_orders("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- Forever Orders ---
+
+    #[tokio::test]
+    async fn test_create_forever_order_success() {
+        let body = r#"{"orderId":"FO-1","orderStatus":"CONFIRM"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            order_flag: "SINGLE".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: None,
+            trigger_price1: None,
+            quantity1: None,
+        };
+        let result = client.create_forever_order("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().order_status, "CONFIRM");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_delete_forever_order_success() {
+        let body = r#"{"orderId":"FO-1","orderStatus":"CANCELLED"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.delete_forever_order("jwt", "FO-1").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_forever_orders_success() {
+        let body = r#"[{"orderId":"FO-1","orderStatus":"CONFIRM"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_all_forever_orders("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- Conditional Triggers ---
+
+    #[tokio::test]
+    async fn test_create_conditional_trigger_success() {
+        let body = r#"{"alertId":"A1","alertStatus":"ACTIVE"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "100".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "PRICE_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "1333".to_string(),
+                indicator_name: None,
+                time_frame: None,
+                operator: "GREATER_THAN".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![],
+        };
+        let result = client.create_conditional_trigger("jwt", &req).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().alert_status, "ACTIVE");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_delete_conditional_trigger_success() {
+        let body = r#"{"alertId":"A1","alertStatus":"CANCELLED"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.delete_conditional_trigger("jwt", "A1").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_all_conditional_triggers_success() {
+        let body = r#"[{"alertId":"A1","alertStatus":"ACTIVE"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_all_conditional_triggers("jwt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- EDIS ---
+
+    #[tokio::test]
+    async fn test_generate_tpin_success() {
+        let (url, h) = start_mock_server(202, "").await;
+        let client = make_test_client(&url);
+        let result = client.generate_tpin("jwt").await;
+        assert!(result.is_ok());
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_generate_edis_form_success() {
+        let html = "<html><form>CDSL Form</form></html>";
+        let (url, h) = start_mock_server(200, html).await;
+        let client = make_test_client(&url);
+        let req = EdisFormRequest {
+            isin: "INE733E01010".to_string(),
+            qty: 100,
+            exchange: "NSE".to_string(),
+            segment: "EQ".to_string(),
+            bulk: false,
+        };
+        let result = client.generate_edis_form("jwt", &req).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("CDSL Form"));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_inquire_edis_approval_success() {
+        let body = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.inquire_edis_approval("jwt", "ALL").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().aprvd_qty, 50);
+        h.abort();
+    }
+
+    // --- Statements ---
+
+    #[tokio::test]
+    async fn test_get_ledger_success() {
+        let body = r#"[{"dhanClientId":"100","narration":"trade","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client.get_ledger("jwt", "2022-06-01", "2022-06-30").await;
+        assert!(result.is_ok());
+        let entries = result.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].debit, "1500.50"); // String, not float
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_trade_history_success() {
+        let body = r#"[{"dhanClientId":"100","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0,"serviceTax":0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0,"exchangeTime":"2026-03-25 14:30:00"}]"#;
+        let (url, h) = start_mock_server(200, body).await;
+        let client = make_test_client(&url);
+        let result = client
+            .get_trade_history("jwt", "2026-03-01", "2026-03-30", 0)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        h.abort();
+    }
+
+    // --- Rate limit tests for new methods ---
+
+    #[tokio::test]
+    async fn test_kill_switch_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let result = client.activate_kill_switch("jwt").await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_super_order_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 5,
+            price: 1500.0,
+            target_price: 1600.0,
+            stop_loss_price: 1400.0,
+            trailing_jump: 0.0,
+        };
+        let result = client.place_super_order("jwt", &req).await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_forever_order_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "100".to_string(),
+            correlation_id: String::new(),
+            order_flag: "SINGLE".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: None,
+            trigger_price1: None,
+            quantity1: None,
+        };
+        let result = client.create_forever_order("jwt", &req).await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn test_conditional_trigger_rate_limited() {
+        let (url, h) = start_mock_server(429, "{}").await;
+        let client = make_test_client(&url);
+        let result = client.get_all_conditional_triggers("jwt").await;
+        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        h.abort();
     }
 }

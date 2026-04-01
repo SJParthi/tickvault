@@ -28,6 +28,7 @@ fn test_state() -> SharedAppState {
             instrument_csv_fallback_url: "https://test/csv2".to_string(),
             max_instruments_per_connection: 100,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         },
         InstrumentConfig {
             daily_download_time: "06:30:00".to_string(),

@@ -454,7 +454,7 @@ pub struct MarginCalculatorRequest {
     pub exchange_segment: String,
     /// Transaction type ("BUY" or "SELL").
     pub transaction_type: String,
-    /// Quantity in lots.
+    /// Quantity in lots (i32 per Dhan docs, but i64 for safety).
     pub quantity: i64,
     /// Product type (e.g., "INTRADAY", "MARGIN").
     pub product_type: String,
@@ -462,7 +462,7 @@ pub struct MarginCalculatorRequest {
     pub security_id: String,
     /// Order price.
     pub price: f64,
-    /// Trigger price (for stop-loss).
+    /// Trigger price (for stop-loss orders). 0.0 for non-SL orders.
     pub trigger_price: f64,
 }
 
@@ -525,7 +525,7 @@ pub struct MarginScript {
     pub security_id: String,
     /// Order price.
     pub price: f64,
-    /// Trigger price.
+    /// Trigger price (0.0 for non-SL orders).
     pub trigger_price: f64,
 }
 
@@ -610,6 +610,709 @@ pub struct FundLimitResponse {
     /// Withdrawable balance.
     #[serde(default)]
     pub withdrawable_balance: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Conditional Trigger Types (07c-conditional-trigger.md)
+// ---------------------------------------------------------------------------
+
+/// Comparison type for conditional triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ComparisonType {
+    /// Indicator vs fixed number.
+    #[serde(rename = "TECHNICAL_WITH_VALUE")]
+    TechnicalWithValue,
+    /// Indicator vs another indicator.
+    #[serde(rename = "TECHNICAL_WITH_INDICATOR")]
+    TechnicalWithIndicator,
+    /// Indicator vs closing price.
+    #[serde(rename = "TECHNICAL_WITH_CLOSE")]
+    TechnicalWithClose,
+    /// Market price vs fixed value.
+    #[serde(rename = "PRICE_WITH_VALUE")]
+    PriceWithValue,
+}
+
+/// Operator for conditional trigger comparisons (9 variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerOperator {
+    #[serde(rename = "CROSSING_UP")]
+    CrossingUp,
+    #[serde(rename = "CROSSING_DOWN")]
+    CrossingDown,
+    #[serde(rename = "CROSSING_ANY_SIDE")]
+    CrossingAnySide,
+    #[serde(rename = "GREATER_THAN")]
+    GreaterThan,
+    #[serde(rename = "LESS_THAN")]
+    LessThan,
+    #[serde(rename = "GREATER_THAN_EQUAL")]
+    GreaterThanEqual,
+    #[serde(rename = "LESS_THAN_EQUAL")]
+    LessThanEqual,
+    #[serde(rename = "EQUAL")]
+    Equal,
+    #[serde(rename = "NOT_EQUAL")]
+    NotEqual,
+}
+
+/// Timeframe for conditional trigger indicator evaluation (4 variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerTimeFrame {
+    #[serde(rename = "DAY")]
+    Day,
+    #[serde(rename = "ONE_MIN")]
+    OneMin,
+    #[serde(rename = "FIVE_MIN")]
+    FiveMin,
+    #[serde(rename = "FIFTEEN_MIN")]
+    FifteenMin,
+}
+
+/// Condition for a conditional trigger.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerCondition {
+    /// Comparison type.
+    pub comparison_type: String,
+    /// Exchange segment: "NSE_EQ" or index only. F&O NOT supported.
+    pub exchange_segment: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Indicator name (required for TECHNICAL_WITH_* types).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indicator_name: Option<String>,
+    /// Timeframe (required for TECHNICAL_WITH_* types).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_frame: Option<String>,
+    /// Comparison operator.
+    pub operator: String,
+    /// Fixed value to compare against (TECHNICAL_WITH_VALUE, PRICE_WITH_VALUE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparing_value: Option<f64>,
+    /// Second indicator to compare against (TECHNICAL_WITH_INDICATOR).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparing_indicator_name: Option<String>,
+    /// Expiry date (YYYY-MM-DD). Default: 1 year from creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp_date: Option<String>,
+    /// Trigger frequency: "ONCE" (triggers once then deactivates).
+    #[serde(default = "default_frequency")]
+    pub frequency: String,
+    /// User note/description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
+}
+
+fn default_frequency() -> String {
+    "ONCE".to_string()
+}
+
+/// Order attached to a conditional trigger.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerOrder {
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment.
+    pub exchange_segment: String,
+    /// Product type.
+    pub product_type: String,
+    /// Order type.
+    pub order_type: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// Quantity.
+    pub quantity: i64,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Price (STRING in Dhan API).
+    pub price: String,
+    /// Disclosed quantity (STRING in Dhan API).
+    #[serde(default, rename = "discQuantity")]
+    pub disc_quantity: String,
+    /// Trigger price (STRING in Dhan API).
+    pub trigger_price: String,
+}
+
+/// Create conditional trigger request.
+/// Endpoint: `POST /v2/alerts/orders`
+///
+/// **Equities and Indices ONLY.** F&O and commodities NOT supported.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanConditionalTriggerRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Trigger condition.
+    pub condition: TriggerCondition,
+    /// Orders to execute when condition fires (can be multiple).
+    pub orders: Vec<TriggerOrder>,
+}
+
+/// Conditional trigger response.
+/// Endpoint: `POST/PUT/DELETE/GET /v2/alerts/orders`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanConditionalTriggerResponse {
+    /// Alert ID.
+    #[serde(default)]
+    pub alert_id: String,
+    /// Alert status: "ACTIVE", "TRIGGERED", "EXPIRED", "CANCELLED".
+    #[serde(default)]
+    pub alert_status: String,
+}
+
+// ---------------------------------------------------------------------------
+// EDIS Types (07d-edis.md)
+// ---------------------------------------------------------------------------
+
+/// EDIS form request for CDSL T-PIN authorization.
+/// Endpoint: `POST /v2/edis/form`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EdisFormRequest {
+    /// ISIN of the security to authorize for delivery.
+    pub isin: String,
+    /// Quantity to authorize.
+    pub qty: i64,
+    /// Exchange: "NSE" or "BSE".
+    pub exchange: String,
+    /// Segment: "EQ".
+    pub segment: String,
+    /// Mark all holdings for sell.
+    pub bulk: bool,
+}
+
+/// EDIS inquiry response.
+/// Endpoint: `GET /v2/edis/inquire/{isin}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdisInquiryResponse {
+    /// Total quantity held.
+    #[serde(default)]
+    pub total_qty: i64,
+    /// Approved quantity for delivery.
+    #[serde(default)]
+    pub aprvd_qty: i64,
+    /// EDIS status.
+    #[serde(default)]
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
+// Statements Types (14-statements-trade-history.md)
+// ---------------------------------------------------------------------------
+
+/// Ledger entry from Dhan.
+/// Endpoint: `GET /v2/ledger?from-date=YYYY-MM-DD&to-date=YYYY-MM-DD`
+///
+/// **CRITICAL:** `debit` and `credit` are STRINGS, not floats.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DhanLedgerEntry {
+    /// Dhan client ID.
+    #[serde(default, rename = "dhanClientId")]
+    pub dhan_client_id: String,
+    /// Transaction narration.
+    #[serde(default)]
+    pub narration: String,
+    /// Voucher date (human-readable: "Jun 22, 2022" — NOT ISO format).
+    #[serde(default)]
+    pub voucherdate: String,
+    /// Exchange.
+    #[serde(default)]
+    pub exchange: String,
+    /// Voucher description.
+    #[serde(default)]
+    pub voucherdesc: String,
+    /// Voucher number.
+    #[serde(default)]
+    pub vouchernumber: String,
+    /// Debit amount (STRING, not float). "0.00" when credit.
+    #[serde(default)]
+    pub debit: String,
+    /// Credit amount (STRING, not float). "0.00" when debit.
+    #[serde(default)]
+    pub credit: String,
+    /// Running balance (STRING).
+    #[serde(default)]
+    pub runbal: String,
+}
+
+/// Historical trade entry from Dhan.
+/// Endpoint: `GET /v2/trades/{from-date}/{to-date}/{page}`
+///
+/// **NOTE:** Page is 0-indexed. Path params, NOT query params.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanHistoricalTradeEntry {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Exchange order ID.
+    #[serde(default)]
+    pub exchange_order_id: String,
+    /// Exchange trade ID.
+    #[serde(default)]
+    pub exchange_trade_id: String,
+    /// Transaction type.
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Product type.
+    #[serde(default)]
+    pub product_type: String,
+    /// Order type.
+    #[serde(default)]
+    pub order_type: String,
+    /// Trading symbol.
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Custom symbol.
+    #[serde(default)]
+    pub custom_symbol: String,
+    /// Security ID.
+    #[serde(default)]
+    pub security_id: String,
+    /// Traded quantity.
+    #[serde(default)]
+    pub traded_quantity: i64,
+    /// Traded price.
+    #[serde(default)]
+    pub traded_price: f64,
+    /// ISIN.
+    #[serde(default)]
+    pub isin: String,
+    /// Instrument type.
+    #[serde(default)]
+    pub instrument: String,
+    /// SEBI tax.
+    #[serde(default)]
+    pub sebi_tax: f64,
+    /// Securities Transaction Tax.
+    #[serde(default)]
+    pub stt: f64,
+    /// Brokerage charges.
+    #[serde(default)]
+    pub brokerage_charges: f64,
+    /// Service tax / GST.
+    #[serde(default)]
+    pub service_tax: f64,
+    /// Exchange transaction charges.
+    #[serde(default)]
+    pub exchange_transaction_charges: f64,
+    /// Stamp duty.
+    #[serde(default)]
+    pub stamp_duty: f64,
+    /// Derivative expiry date ("NA" for non-derivatives).
+    #[serde(default)]
+    pub drv_expiry_date: String,
+    /// Derivative option type.
+    #[serde(default)]
+    pub drv_option_type: String,
+    /// Derivative strike price.
+    #[serde(default)]
+    pub drv_strike_price: f64,
+    /// Exchange time (IST string).
+    #[serde(default)]
+    pub exchange_time: String,
+}
+
+// ---------------------------------------------------------------------------
+// Kill Switch Types
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Super Order Types (07a-super-order.md)
+// ---------------------------------------------------------------------------
+
+/// Leg type for super orders (bracket orders with entry + target + stop loss).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OrderLeg {
+    /// Entry leg — the initial order.
+    #[serde(rename = "ENTRY_LEG")]
+    EntryLeg,
+    /// Target leg — profit booking.
+    #[serde(rename = "TARGET_LEG")]
+    TargetLeg,
+    /// Stop loss leg — risk limit.
+    #[serde(rename = "STOP_LOSS_LEG")]
+    StopLossLeg,
+}
+
+impl OrderLeg {
+    /// Returns the Dhan API string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryLeg => "ENTRY_LEG",
+            Self::TargetLeg => "TARGET_LEG",
+            Self::StopLossLeg => "STOP_LOSS_LEG",
+        }
+    }
+}
+
+/// Place super order request (entry + target + stop loss as 3 legs).
+/// Endpoint: `POST /v2/super/orders`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanPlaceSuperOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// User-supplied idempotency key (max 30 chars).
+    #[serde(default)]
+    pub correlation_id: String,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment: "NSE_EQ", "NSE_FNO", etc.
+    pub exchange_segment: String,
+    /// Product type: "CNC", "INTRADAY", "MARGIN", "MTF".
+    pub product_type: String,
+    /// Order type: "LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_MARKET".
+    pub order_type: String,
+    /// Dhan security ID (STRING, not integer).
+    pub security_id: String,
+    /// Quantity in lots.
+    pub quantity: i64,
+    /// Entry price.
+    pub price: f64,
+    /// Target exit price (profit booking).
+    pub target_price: f64,
+    /// Stop loss price (risk limit).
+    pub stop_loss_price: f64,
+    /// Trailing SL price jump (0 = no trailing, 0 explicitly cancels trailing).
+    pub trailing_jump: f64,
+}
+
+/// Modify super order request (leg-specific restrictions).
+/// Endpoint: `PUT /v2/super/orders/{order-id}`
+///
+/// Modification restrictions by leg:
+/// - ENTRY_LEG: all fields modifiable (only when PENDING or PART_TRADED)
+/// - TARGET_LEG: only `targetPrice`
+/// - STOP_LOSS_LEG: only `stopLossPrice` and `trailingJump`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanModifySuperOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// Which leg to modify.
+    pub leg_name: String,
+    /// Order type (ENTRY_LEG only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_type: Option<String>,
+    /// Quantity (ENTRY_LEG only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<i64>,
+    /// Entry price (ENTRY_LEG only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
+    /// Target price (TARGET_LEG or ENTRY_LEG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_price: Option<f64>,
+    /// Stop loss price (STOP_LOSS_LEG or ENTRY_LEG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss_price: Option<f64>,
+    /// Trailing SL jump (STOP_LOSS_LEG or ENTRY_LEG). 0 = cancel trailing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailing_jump: Option<f64>,
+}
+
+/// Super order leg detail from response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuperOrderLegDetail {
+    /// Dhan order ID for this leg.
+    #[serde(default)]
+    pub order_id: String,
+    /// Leg name: "ENTRY_LEG", "TARGET_LEG", "STOP_LOSS_LEG".
+    #[serde(default)]
+    pub leg_name: String,
+    /// Transaction type: "BUY" or "SELL".
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Remaining quantity.
+    #[serde(default)]
+    pub remaining_quantity: i64,
+    /// Triggered quantity.
+    #[serde(default)]
+    pub triggered_quantity: i64,
+    /// Price for this leg.
+    #[serde(default)]
+    pub price: f64,
+    /// Status of this leg.
+    #[serde(default)]
+    pub order_status: String,
+    /// Trailing jump value.
+    #[serde(default)]
+    pub trailing_jump: f64,
+}
+
+/// Super order response (includes leg details).
+/// Endpoint: `GET /v2/super/orders` and `POST /v2/super/orders`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanSuperOrderResponse {
+    /// Dhan order ID (entry leg).
+    #[serde(default)]
+    pub order_id: String,
+    /// Order status.
+    #[serde(default)]
+    pub order_status: String,
+    /// Correlation ID.
+    #[serde(default)]
+    pub correlation_id: String,
+    /// Leg details array (target + stop loss legs).
+    #[serde(default)]
+    pub leg_details: Vec<SuperOrderLegDetail>,
+}
+
+// ---------------------------------------------------------------------------
+// Forever Order Types (07b-forever-order.md)
+// ---------------------------------------------------------------------------
+
+/// Order flag for forever orders: SINGLE (one trigger) or OCO (two triggers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ForeverOrderFlag {
+    /// Single trigger — one price condition.
+    #[serde(rename = "SINGLE")]
+    Single,
+    /// OCO (One Cancels Other) — two triggers, whichever hits first.
+    #[serde(rename = "OCO")]
+    Oco,
+}
+
+/// Place forever order (GTT) request.
+/// Endpoint: `POST /v2/forever/orders`
+///
+/// Product types: CNC, MTF ONLY (no INTRADAY, no MARGIN).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanForeverOrderRequest {
+    /// Dhan client ID.
+    pub dhan_client_id: String,
+    /// User-supplied idempotency key.
+    #[serde(default)]
+    pub correlation_id: String,
+    /// "SINGLE" or "OCO".
+    pub order_flag: String,
+    /// "BUY" or "SELL".
+    pub transaction_type: String,
+    /// Exchange segment.
+    pub exchange_segment: String,
+    /// Product type: CNC or MTF ONLY.
+    pub product_type: String,
+    /// Order type: "LIMIT" or "MARKET".
+    pub order_type: String,
+    /// Validity: "DAY" or "IOC".
+    pub validity: String,
+    /// Dhan security ID (STRING).
+    pub security_id: String,
+    /// First leg quantity.
+    pub quantity: i64,
+    /// Disclosed quantity (optional).
+    #[serde(default)]
+    pub disclosed_quantity: i64,
+    /// First leg price.
+    pub price: f64,
+    /// First leg trigger price.
+    pub trigger_price: f64,
+    /// Second leg price (OCO ONLY — REQUIRED for OCO, must NOT be sent for SINGLE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price1: Option<f64>,
+    /// Second leg trigger price (OCO ONLY).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_price1: Option<f64>,
+    /// Second leg quantity (OCO ONLY).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity1: Option<i64>,
+}
+
+/// Forever order response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanForeverOrderResponse {
+    /// Dhan order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Order status (includes CONFIRM — unique to forever orders).
+    #[serde(default)]
+    pub order_status: String,
+}
+
+// ---------------------------------------------------------------------------
+// Trade Book Types
+// ---------------------------------------------------------------------------
+
+/// A single trade entry from the trade book.
+/// Endpoint: `GET /v2/trades` and `GET /v2/trades/{order-id}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanTradeEntry {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Dhan order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Exchange order ID.
+    #[serde(default)]
+    pub exchange_order_id: String,
+    /// Exchange trade ID (unique per trade).
+    #[serde(default)]
+    pub exchange_trade_id: String,
+    /// Transaction type: "BUY" or "SELL".
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment: "NSE_EQ", "NSE_FNO", etc.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Product type: "CNC", "INTRADAY", "MARGIN", "MTF".
+    #[serde(default)]
+    pub product_type: String,
+    /// Order type: "LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_MARKET".
+    #[serde(default)]
+    pub order_type: String,
+    /// Trading symbol.
+    #[serde(default)]
+    pub trading_symbol: String,
+    /// Custom symbol.
+    #[serde(default)]
+    pub custom_symbol: String,
+    /// Dhan security ID (string in response).
+    #[serde(default)]
+    pub security_id: String,
+    /// Traded quantity.
+    #[serde(default)]
+    pub traded_quantity: i64,
+    /// Traded price.
+    #[serde(default)]
+    pub traded_price: f64,
+    /// ISIN (International Securities Identification Number).
+    #[serde(default)]
+    pub isin: String,
+    /// Instrument type.
+    #[serde(default)]
+    pub instrument: String,
+    /// SEBI tax.
+    #[serde(default)]
+    pub sebi_tax: f64,
+    /// Securities Transaction Tax.
+    #[serde(default)]
+    pub stt: f64,
+    /// Brokerage charges.
+    #[serde(default)]
+    pub brokerage_charges: f64,
+    /// Service tax / GST.
+    #[serde(default)]
+    pub service_tax: f64,
+    /// Exchange transaction charges.
+    #[serde(default)]
+    pub exchange_transaction_charges: f64,
+    /// Stamp duty.
+    #[serde(default)]
+    pub stamp_duty: f64,
+    /// Derivative expiry date ("NA" for non-derivatives, date string for F&O).
+    #[serde(default)]
+    pub drv_expiry_date: String,
+    /// Derivative option type (CE/PE or empty).
+    #[serde(default)]
+    pub drv_option_type: String,
+    /// Derivative strike price.
+    #[serde(default)]
+    pub drv_strike_price: f64,
+    /// Exchange time (IST string: "YYYY-MM-DD HH:MM:SS").
+    #[serde(default)]
+    pub exchange_time: String,
+}
+
+/// Cancel order response from Dhan.
+/// Endpoint: `DELETE /v2/orders/{order-id}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhanCancelOrderResponse {
+    /// Dhan order ID.
+    #[serde(default)]
+    pub order_id: String,
+    /// Order status after cancellation.
+    #[serde(default)]
+    pub order_status: String,
+}
+
+/// Kill switch status response from Dhan.
+/// Endpoint: `GET /v2/killswitch` and `POST /v2/killswitch`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillSwitchResponse {
+    /// Dhan client ID.
+    #[serde(default)]
+    pub dhan_client_id: String,
+    /// Kill switch status: "ACTIVATE" or "DEACTIVATE".
+    #[serde(default)]
+    pub kill_switch_status: String,
+}
+
+// ---------------------------------------------------------------------------
+// P&L Exit Types
+// ---------------------------------------------------------------------------
+
+/// P&L-based exit configuration request.
+/// Endpoint: `POST /v2/pnlExit`
+///
+/// **WARNING:** If `profit_value` < current profit OR `loss_value` < current loss,
+/// exit triggers IMMEDIATELY. Always check current P&L before configuring.
+///
+/// Session-scoped — resets at end of trading session. Must reconfigure daily.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlExitRequest {
+    /// Profit threshold (STRING, not float) — e.g., "1500.00".
+    pub profit_value: String,
+    /// Loss threshold (STRING, not float) — e.g., "500.00".
+    pub loss_value: String,
+    /// Product types to apply exit on — e.g., ["INTRADAY", "DELIVERY"].
+    pub product_type: Vec<String>,
+    /// Also activate kill switch after P&L exit triggers.
+    pub enable_kill_switch: bool,
+}
+
+/// P&L exit configure/stop response from Dhan.
+/// Endpoint: `POST /v2/pnlExit` and `DELETE /v2/pnlExit`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlExitResponse {
+    /// P&L exit status: "ACTIVE" or "DISABLED".
+    #[serde(default)]
+    pub pnl_exit_status: String,
+    /// Confirmation message.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// P&L exit status response from Dhan (GET endpoint).
+/// **Field names differ from POST request** (Dhan API inconsistency):
+/// - POST request: `profitValue`, `lossValue`, `enableKillSwitch` (camelCase)
+/// - GET response: `profit`, `loss`, `enable_kill_switch` (shorter names, snake_case mix)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PnlExitStatusResponse {
+    /// P&L exit status: "ACTIVE" or "DISABLED".
+    #[serde(default, rename = "pnlExitStatus")]
+    pub pnl_exit_status: String,
+    /// Profit threshold (shorter name than request).
+    #[serde(default)]
+    pub profit: String,
+    /// Loss threshold (shorter name than request).
+    #[serde(default)]
+    pub loss: String,
+    /// Product types.
+    #[serde(default, rename = "productType")]
+    pub product_type: Vec<String>,
+    /// Kill switch enabled flag (snake_case in GET, camelCase in POST — Dhan inconsistency).
+    #[serde(default)]
+    pub enable_kill_switch: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1589,5 +2292,448 @@ mod tests {
         assert!(debug.contains("ORD-123"), "Debug must include order_id");
         assert!(debug.contains("52432"), "Debug must include security_id");
         assert!(debug.contains("Pending"), "Debug must include status");
+    }
+
+    // -----------------------------------------------------------------------
+    // Kill Switch Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kill_switch_response_deserialize() {
+        let json = r#"{"dhanClientId":"1100003626","killSwitchStatus":"ACTIVATE"}"#;
+        let resp: KillSwitchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.kill_switch_status, "ACTIVATE");
+        assert_eq!(resp.dhan_client_id, "1100003626");
+    }
+
+    #[test]
+    fn test_kill_switch_response_deactivate() {
+        let json = r#"{"dhanClientId":"1100003626","killSwitchStatus":"DEACTIVATE"}"#;
+        let resp: KillSwitchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.kill_switch_status, "DEACTIVATE");
+    }
+
+    #[test]
+    fn test_kill_switch_response_missing_fields_default() {
+        let json = r#"{}"#;
+        let resp: KillSwitchResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.kill_switch_status.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // P&L Exit Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pnl_exit_request_serialize() {
+        let req = PnlExitRequest {
+            profit_value: "1500.00".to_string(),
+            loss_value: "500.00".to_string(),
+            product_type: vec!["INTRADAY".to_string(), "DELIVERY".to_string()],
+            enable_kill_switch: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"profitValue\":\"1500.00\""));
+        assert!(json.contains("\"lossValue\":\"500.00\""));
+        assert!(json.contains("\"enableKillSwitch\":true"));
+        assert!(json.contains("DELIVERY"));
+    }
+
+    #[test]
+    fn test_pnl_exit_request_string_values_not_floats() {
+        let req = PnlExitRequest {
+            profit_value: "1500.00".to_string(),
+            loss_value: "500.00".to_string(),
+            product_type: vec!["INTRADAY".to_string()],
+            enable_kill_switch: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // Values must be strings, not numbers
+        assert!(json.contains("\"1500.00\""));
+        assert!(json.contains("\"500.00\""));
+    }
+
+    #[test]
+    fn test_pnl_exit_response_deserialize() {
+        let json = r#"{"pnlExitStatus":"ACTIVE","message":"P&L based exit configured"}"#;
+        let resp: PnlExitResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.pnl_exit_status, "ACTIVE");
+    }
+
+    #[test]
+    fn test_pnl_exit_status_response_different_field_names() {
+        // GET response uses different field names from POST request
+        let json = r#"{"pnlExitStatus":"ACTIVE","profit":"1500.00","loss":"500.00","productType":["INTRADAY"],"enable_kill_switch":true}"#;
+        let resp: PnlExitStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.profit, "1500.00"); // Short name, not profitValue
+        assert_eq!(resp.loss, "500.00"); // Short name, not lossValue
+        assert!(resp.enable_kill_switch); // snake_case, not camelCase
+    }
+
+    // -----------------------------------------------------------------------
+    // Super Order Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_order_leg_serialize() {
+        assert_eq!(
+            serde_json::to_string(&OrderLeg::EntryLeg).unwrap(),
+            "\"ENTRY_LEG\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrderLeg::TargetLeg).unwrap(),
+            "\"TARGET_LEG\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrderLeg::StopLossLeg).unwrap(),
+            "\"STOP_LOSS_LEG\""
+        );
+    }
+
+    #[test]
+    fn test_order_leg_deserialize() {
+        let entry: OrderLeg = serde_json::from_str("\"ENTRY_LEG\"").unwrap();
+        assert_eq!(entry, OrderLeg::EntryLeg);
+        let target: OrderLeg = serde_json::from_str("\"TARGET_LEG\"").unwrap();
+        assert_eq!(target, OrderLeg::TargetLeg);
+        let sl: OrderLeg = serde_json::from_str("\"STOP_LOSS_LEG\"").unwrap();
+        assert_eq!(sl, OrderLeg::StopLossLeg);
+    }
+
+    #[test]
+    fn test_order_leg_as_str() {
+        assert_eq!(OrderLeg::EntryLeg.as_str(), "ENTRY_LEG");
+        assert_eq!(OrderLeg::TargetLeg.as_str(), "TARGET_LEG");
+        assert_eq!(OrderLeg::StopLossLeg.as_str(), "STOP_LOSS_LEG");
+    }
+
+    #[test]
+    fn test_super_order_request_serialize() {
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "1000000003".to_string(),
+            correlation_id: "abc123".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 5,
+            price: 1500.0,
+            target_price: 1600.0,
+            stop_loss_price: 1400.0,
+            trailing_jump: 10.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"targetPrice\":1600"));
+        assert!(json.contains("\"stopLossPrice\":1400"));
+        assert!(json.contains("\"trailingJump\":10"));
+        assert!(json.contains("\"securityId\":\"11536\"")); // STRING not number
+    }
+
+    #[test]
+    fn test_super_order_trailing_jump_zero_cancels_trailing() {
+        let req = DhanPlaceSuperOrderRequest {
+            dhan_client_id: "1".to_string(),
+            correlation_id: String::new(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            security_id: "11536".to_string(),
+            quantity: 1,
+            price: 100.0,
+            target_price: 110.0,
+            stop_loss_price: 90.0,
+            trailing_jump: 0.0, // Explicitly cancels trailing
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"trailingJump\":0")); // Must be 0, not omitted
+    }
+
+    #[test]
+    fn test_modify_super_order_target_only_price() {
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "1".to_string(),
+            leg_name: "TARGET_LEG".to_string(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: Some(1650.0),
+            stop_loss_price: None,
+            trailing_jump: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"targetPrice\":1650"));
+        assert!(!json.contains("quantity")); // Skipped
+        assert!(!json.contains("price\":")); // Skipped (not targetPrice)
+    }
+
+    #[test]
+    fn test_modify_super_order_sl_only_sl_and_trail() {
+        let req = DhanModifySuperOrderRequest {
+            dhan_client_id: "1".to_string(),
+            leg_name: "STOP_LOSS_LEG".to_string(),
+            order_type: None,
+            quantity: None,
+            price: None,
+            target_price: None,
+            stop_loss_price: Some(1380.0),
+            trailing_jump: Some(5.0),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"stopLossPrice\":1380"));
+        assert!(json.contains("\"trailingJump\":5"));
+        assert!(!json.contains("\"quantity\"")); // Skipped
+    }
+
+    #[test]
+    fn test_super_order_leg_detail_deserialize() {
+        let json = r#"{"orderId":"ORD-1","legName":"ENTRY_LEG","transactionType":"BUY","remainingQuantity":5,"triggeredQuantity":0,"price":1500.0,"orderStatus":"PENDING","trailingJump":10.0}"#;
+        let leg: SuperOrderLegDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(leg.order_id, "ORD-1");
+        assert_eq!(leg.leg_name, "ENTRY_LEG");
+        assert_eq!(leg.remaining_quantity, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Forever Order Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_forever_order_flag_serialize() {
+        assert_eq!(
+            serde_json::to_string(&ForeverOrderFlag::Single).unwrap(),
+            "\"SINGLE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ForeverOrderFlag::Oco).unwrap(),
+            "\"OCO\""
+        );
+    }
+
+    #[test]
+    fn test_forever_order_single_no_second_leg() {
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "1".to_string(),
+            correlation_id: String::new(),
+            order_flag: "SINGLE".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: None,
+            trigger_price1: None,
+            quantity1: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("price1")); // Omitted for SINGLE
+        assert!(!json.contains("triggerPrice1")); // Omitted for SINGLE
+        assert!(!json.contains("quantity1")); // Omitted for SINGLE
+    }
+
+    #[test]
+    fn test_forever_order_oco_has_second_leg() {
+        let req = DhanForeverOrderRequest {
+            dhan_client_id: "1".to_string(),
+            correlation_id: String::new(),
+            order_flag: "OCO".to_string(),
+            transaction_type: "BUY".to_string(),
+            exchange_segment: "NSE_EQ".to_string(),
+            product_type: "CNC".to_string(),
+            order_type: "LIMIT".to_string(),
+            validity: "DAY".to_string(),
+            security_id: "1333".to_string(),
+            quantity: 5,
+            disclosed_quantity: 0,
+            price: 1428.0,
+            trigger_price: 1427.0,
+            price1: Some(1420.0),
+            trigger_price1: Some(1419.0),
+            quantity1: Some(10),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"price1\":1420")); // Present for OCO
+        assert!(json.contains("\"triggerPrice1\":1419"));
+        assert!(json.contains("\"quantity1\":10"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional Trigger Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_comparison_type_serialize() {
+        assert_eq!(
+            serde_json::to_string(&ComparisonType::TechnicalWithValue).unwrap(),
+            "\"TECHNICAL_WITH_VALUE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComparisonType::PriceWithValue).unwrap(),
+            "\"PRICE_WITH_VALUE\""
+        );
+    }
+
+    #[test]
+    fn test_trigger_operator_all_9_variants() {
+        let operators = [
+            TriggerOperator::CrossingUp,
+            TriggerOperator::CrossingDown,
+            TriggerOperator::CrossingAnySide,
+            TriggerOperator::GreaterThan,
+            TriggerOperator::LessThan,
+            TriggerOperator::GreaterThanEqual,
+            TriggerOperator::LessThanEqual,
+            TriggerOperator::Equal,
+            TriggerOperator::NotEqual,
+        ];
+        assert_eq!(operators.len(), 9);
+        for op in &operators {
+            let json = serde_json::to_string(op).unwrap();
+            assert!(!json.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_trigger_timeframe_all_4_variants() {
+        let timeframes = [
+            TriggerTimeFrame::Day,
+            TriggerTimeFrame::OneMin,
+            TriggerTimeFrame::FiveMin,
+            TriggerTimeFrame::FifteenMin,
+        ];
+        assert_eq!(timeframes.len(), 4);
+        assert_eq!(
+            serde_json::to_string(&TriggerTimeFrame::Day).unwrap(),
+            "\"DAY\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TriggerTimeFrame::OneMin).unwrap(),
+            "\"ONE_MIN\""
+        );
+    }
+
+    #[test]
+    fn test_trigger_condition_frequency_default() {
+        let json = r#"{"comparisonType":"PRICE_WITH_VALUE","exchangeSegment":"NSE_EQ","securityId":"1333","operator":"GREATER_THAN"}"#;
+        let cond: TriggerCondition = serde_json::from_str(json).unwrap();
+        assert_eq!(cond.frequency, "ONCE"); // Default
+    }
+
+    #[test]
+    fn test_conditional_trigger_request_serialize() {
+        let req = DhanConditionalTriggerRequest {
+            dhan_client_id: "1".to_string(),
+            condition: TriggerCondition {
+                comparison_type: "TECHNICAL_WITH_VALUE".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                security_id: "12345".to_string(),
+                indicator_name: Some("SMA_5".to_string()),
+                time_frame: Some("DAY".to_string()),
+                operator: "CROSSING_UP".to_string(),
+                comparing_value: Some(250.0),
+                comparing_indicator_name: None,
+                exp_date: None,
+                frequency: "ONCE".to_string(),
+                user_note: None,
+            },
+            orders: vec![TriggerOrder {
+                transaction_type: "BUY".to_string(),
+                exchange_segment: "NSE_EQ".to_string(),
+                product_type: "CNC".to_string(),
+                order_type: "LIMIT".to_string(),
+                security_id: "12345".to_string(),
+                quantity: 10,
+                validity: "DAY".to_string(),
+                price: "250.00".to_string(),
+                disc_quantity: "0".to_string(),
+                trigger_price: "0".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("SMA_5"));
+        assert!(json.contains("CROSSING_UP"));
+        assert!(json.contains("ONCE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Trade Book + DhanTradeEntry Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trade_entry_deserialize_with_tax_breakdown() {
+        let json = r#"{"dhanClientId":"1","orderId":"ORD-1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"INTRADAY","orderType":"MARKET","tradingSymbol":"NIFTY","customSymbol":"","securityId":"11536","tradedQuantity":50,"tradedPrice":24500.0,"isin":"INE1234","instrument":"OPTIDX","sebiTax":0.5,"stt":12.25,"brokerageCharges":20.0,"serviceTax":3.6,"exchangeTransactionCharges":2.0,"stampDuty":0.1,"drvExpiryDate":"2026-03-27","drvOptionType":"CE","drvStrikePrice":24500.0,"exchangeTime":"2026-03-27 10:30:45"}"#;
+        let entry: DhanTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 50);
+        assert!((entry.stt - 12.25).abs() < f64::EPSILON);
+        assert!((entry.stamp_duty - 0.1).abs() < f64::EPSILON);
+        assert_eq!(entry.drv_option_type, "CE");
+    }
+
+    // -----------------------------------------------------------------------
+    // EDIS Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edis_form_request_serialize() {
+        let req = EdisFormRequest {
+            isin: "INE733E01010".to_string(),
+            qty: 100,
+            exchange: "NSE".to_string(),
+            segment: "EQ".to_string(),
+            bulk: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("INE733E01010"));
+        assert!(json.contains("\"bulk\":false"));
+    }
+
+    #[test]
+    fn test_edis_inquiry_response_deserialize() {
+        let json = r#"{"totalQty":100,"aprvdQty":50,"status":"APPROVED"}"#;
+        let resp: EdisInquiryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_qty, 100);
+        assert_eq!(resp.aprvd_qty, 50);
+        assert_eq!(resp.status, "APPROVED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Statement Types Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ledger_entry_string_debit_credit() {
+        // CRITICAL: debit and credit are STRINGS, not floats
+        let json = r#"{"dhanClientId":"1","narration":"test","voucherdate":"Jun 22, 2022","exchange":"NSE","voucherdesc":"desc","vouchernumber":"V1","debit":"1500.50","credit":"0.00","runbal":"50000.00"}"#;
+        let entry: DhanLedgerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.debit, "1500.50"); // String, not float
+        assert_eq!(entry.credit, "0.00"); // String, not float
+        assert_eq!(entry.voucherdate, "Jun 22, 2022"); // Human-readable format
+    }
+
+    #[test]
+    fn test_historical_trade_entry_deserialize() {
+        let json = r#"{"dhanClientId":"1","orderId":"O1","exchangeOrderId":"E1","exchangeTradeId":"T1","transactionType":"BUY","exchangeSegment":"NSE_EQ","productType":"CNC","orderType":"LIMIT","tradingSymbol":"RELIANCE","customSymbol":"","securityId":"2885","tradedQuantity":10,"tradedPrice":2500.0,"isin":"INE002A01018","instrument":"EQUITY","sebiTax":0.01,"stt":2.5,"brokerageCharges":0.0,"serviceTax":0.0,"exchangeTransactionCharges":0.5,"stampDuty":0.02,"drvExpiryDate":"NA","drvOptionType":"","drvStrikePrice":0.0,"exchangeTime":"2026-03-25 14:30:00"}"#;
+        let entry: DhanHistoricalTradeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.traded_quantity, 10);
+        assert_eq!(entry.drv_expiry_date, "NA"); // "NA" for non-derivatives
+        assert_eq!(entry.exchange_time, "2026-03-25 14:30:00"); // IST string
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel Order Response Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_order_response_deserialize() {
+        let json = r#"{"orderId":"ORD-123","orderStatus":"CANCELLED"}"#;
+        let resp: DhanCancelOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.order_id, "ORD-123");
+        assert_eq!(resp.order_status, "CANCELLED");
     }
 }

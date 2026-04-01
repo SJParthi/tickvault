@@ -25,6 +25,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — one f32 read + fixed 5-iteration depth parse.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by MARKET_DEPTH_PACKET_SIZE check; depth loop is fixed 5 iterations
 pub fn parse_market_depth_packet(
     raw: &[u8],

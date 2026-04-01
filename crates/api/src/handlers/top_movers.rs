@@ -130,6 +130,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -207,6 +208,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -306,6 +308,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),

@@ -182,6 +182,8 @@ pub struct TickPersistenceWriter {
     // O(1) EXEMPT: end
     /// Total ticks spilled to disk (ring buffer overflow).
     ticks_spilled_total: u64,
+    /// Total ticks dropped (disk spill also failed — should always be 0).
+    ticks_dropped_total: u64,
     /// Set to true after a successful reconnect + drain. The async consumer
     /// checks this flag to fire the gap integrity check.
     just_recovered: bool,
@@ -214,11 +216,41 @@ impl TickPersistenceWriter {
             tick_buffer: VecDeque::with_capacity(TICK_BUFFER_CAPACITY),
             in_flight: Vec::with_capacity(TICK_FLUSH_BATCH_SIZE),
             ticks_spilled_total: 0,
+            ticks_dropped_total: 0,
             just_recovered: false,
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
         })
+    }
+
+    /// Creates a tick writer in disconnected buffering mode.
+    ///
+    /// The writer starts with `sender = None` and immediately buffers all ticks
+    /// in the ring buffer / disk spill. Background reconnect attempts will
+    /// establish the QuestDB connection when it becomes available.
+    ///
+    /// **Use this when QuestDB is unavailable at startup.** Zero tick loss —
+    /// all ticks are buffered until QuestDB comes back.
+    pub fn new_disconnected(config: &QuestDbConfig) -> Self {
+        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+
+        Self {
+            sender: None,
+            buffer,
+            pending_count: 0,
+            last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
+            tick_buffer: VecDeque::with_capacity(TICK_BUFFER_CAPACITY),
+            in_flight: Vec::with_capacity(TICK_FLUSH_BATCH_SIZE),
+            ticks_spilled_total: 0,
+            ticks_dropped_total: 0,
+            just_recovered: false,
+            next_reconnect_allowed: std::time::Instant::now(),
+            spill_writer: None,
+            spill_path: None,
+        }
     }
 
     /// Appends a parsed tick to the ILP buffer.
@@ -326,12 +358,18 @@ impl TickPersistenceWriter {
 
     /// Rescues in-flight ticks (in the ILP buffer but not yet flushed) back to
     /// the ring buffer / disk spill. Called on flush failure to prevent data loss.
+    /// Zero allocation: drains in-flight Vec directly without collecting into a new Vec.
     #[rustfmt::skip]
     fn rescue_in_flight(&mut self) {
         if self.in_flight.is_empty() { self.pending_count = 0; return; }
-        let rescued: Vec<ParsedTick> = self.in_flight.drain(..).collect();
-        let count = rescued.len();
-        for tick in rescued { self.buffer_tick(tick); }
+        let count = self.in_flight.len();
+        // Drain front-to-back to preserve tick ordering (FIFO).
+        for i in 0..count {
+            // SAFETY: index is within bounds (0..count where count = original len).
+            // We don't modify in_flight length inside this loop.
+            self.buffer_tick(self.in_flight[i]);
+        }
+        self.in_flight.clear();
         self.pending_count = 0;
         warn!(rescued = count, ring_buffer = self.tick_buffer.len(), "rescued in-flight ticks to ring buffer after flush failure");
     }
@@ -349,8 +387,21 @@ impl TickPersistenceWriter {
     /// Returns the total number of ticks spilled to disk (ring buffer overflow).
     /// With disk spill enabled, this is NOT the number of ticks lost — they're
     /// on disk and will drain on recovery. Ticks are only lost if disk write fails.
-    pub fn ticks_dropped_total(&self) -> u64 {
+    // TEST-EXEMPT: trivial field getter, tested indirectly by 40+ spill/drain/rescue tests
+    pub fn ticks_spilled_total(&self) -> u64 {
         self.ticks_spilled_total
+    }
+
+    /// Returns the total number of ticks permanently dropped (both buffer AND disk
+    /// spill failed). This counter MUST always be 0 in production. A non-zero value
+    /// indicates a catastrophic failure (e.g., disk full during QuestDB outage).
+    pub fn ticks_dropped_total(&self) -> u64 {
+        self.ticks_dropped_total
+    }
+
+    /// Returns true if QuestDB ILP sender is connected.
+    pub fn is_connected(&self) -> bool {
+        self.sender.is_some()
     }
 
     /// Returns true (once) after a successful QuestDB reconnect + buffer drain.
@@ -394,11 +445,15 @@ impl TickPersistenceWriter {
         // Lazy-open the spill file.
         if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
             error!(?err, "CRITICAL: cannot open tick spill file — tick WILL be lost");
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
             return;
         }
         let record = serialize_tick(tick);
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
             error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — tick lost");
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
             self.spill_writer = None;
             return;
         }
@@ -1078,6 +1133,35 @@ impl DepthPersistenceWriter {
         })
     }
 
+    /// Creates a depth writer in disconnected buffering mode.
+    ///
+    /// **Use when QuestDB is unavailable at startup.** All depth snapshots are
+    /// buffered in the ring buffer (`DEPTH_BUFFER_CAPACITY`) + disk spill until
+    /// QuestDB becomes available. Auto-reconnect polls every 30 seconds.
+    pub fn new_disconnected(config: &QuestDbConfig) -> Self {
+        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+
+        Self {
+            sender: None,
+            buffer,
+            pending_count: 0,
+            last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
+            depth_buffer: VecDeque::with_capacity(DEPTH_BUFFER_CAPACITY),
+            in_flight: Vec::with_capacity(DEPTH_FLUSH_BATCH_SIZE),
+            depth_spilled_total: 0,
+            next_reconnect_allowed: std::time::Instant::now(),
+            spill_writer: None,
+            spill_path: None,
+        }
+    }
+
+    /// Returns true if QuestDB ILP sender is connected.
+    pub fn is_connected(&self) -> bool {
+        self.sender.is_some()
+    }
+
     /// Appends a 5-level depth snapshot to the ILP buffer.
     ///
     /// When QuestDB is down, depth snapshots are held in a ring buffer (up to
@@ -1200,12 +1284,14 @@ impl DepthPersistenceWriter {
     }
 
     /// Rescues in-flight depth snapshots back to the ring buffer / disk spill.
+    /// Zero allocation: drains in-flight Vec directly without collecting into a new Vec.
     #[rustfmt::skip]
     fn rescue_in_flight(&mut self) {
         if self.in_flight.is_empty() { self.pending_count = 0; return; }
-        let rescued: Vec<BufferedDepth> = self.in_flight.drain(..).collect();
-        let count = rescued.len();
-        for snapshot in rescued { self.buffer_depth(snapshot); }
+        let count = self.in_flight.len();
+        // Iterate front-to-back to preserve FIFO ordering.
+        for i in 0..count { self.buffer_depth(self.in_flight[i]); }
+        self.in_flight.clear();
         self.pending_count = 0;
         warn!(rescued = count, ring_buffer = self.depth_buffer.len(), "rescued in-flight depth snapshots to ring buffer after flush failure");
     }
@@ -11322,9 +11408,44 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
         assert_eq!(writer.ticks_dropped_total(), 0);
+        assert_eq!(writer.ticks_spilled_total(), 0);
 
+        // ticks_dropped_total tracks permanently lost ticks (separate from spilled)
+        writer.ticks_dropped_total = 5;
+        assert_eq!(writer.ticks_dropped_total(), 5);
+
+        // ticks_spilled_total tracks disk-spilled ticks (recoverable)
         writer.ticks_spilled_total = 100;
-        assert_eq!(writer.ticks_dropped_total(), 100);
+        assert_eq!(writer.ticks_spilled_total(), 100);
+    }
+
+    #[test]
+    fn test_tick_writer_is_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert!(writer.is_connected());
+    }
+
+    #[test]
+    fn test_tick_writer_new_disconnected() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: 19009,
+            http_port: 19000,
+            pg_port: 18812,
+        };
+        let writer = TickPersistenceWriter::new_disconnected(&config);
+        assert!(!writer.is_connected());
+        assert_eq!(writer.ticks_dropped_total(), 0);
+        assert_eq!(writer.ticks_spilled_total(), 0);
+        assert_eq!(writer.buffered_tick_count(), 0);
+        assert_eq!(writer.pending_count(), 0);
     }
 
     // =======================================================================

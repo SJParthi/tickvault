@@ -588,12 +588,7 @@ mod tests {
 
         // Verify strict date ascending order
         for window in entries.windows(2) {
-            assert!(
-                window[0].date <= window[1].date,
-                "Entries not sorted: {:?} should come before {:?}",
-                window[0].date,
-                window[1].date,
-            );
+            assert!(window[0].date <= window[1].date);
         }
 
         // Verify exact order: Jan 26, Mar 14, Aug 19, Nov 8, Nov 9
@@ -751,12 +746,7 @@ mod tests {
 
         // Verify strictly ascending date order
         for window in entries.windows(2) {
-            assert!(
-                window[0].date < window[1].date,
-                "Not strictly sorted: {} should come before {}",
-                window[0].date,
-                window[1].date,
-            );
+            assert!(window[0].date < window[1].date);
         }
 
         // Expected order: Jan 26, Mar 14, Aug 19, Nov 8, Dec 25

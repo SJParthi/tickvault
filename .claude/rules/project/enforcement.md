@@ -10,7 +10,7 @@ paths:
 - **PreToolUse (Edit|Write):** block-env-files.sh — prevents .env file creation
 - **PostToolUse (Edit|Write):** REMOVED — pre-commit gate enforces fmt; no per-edit rustfmt
 - **SubagentStart:** REMOVED — principles already in CLAUDE.md context
-- **Pre-push (7 fast gates via `.claude/hooks/pre-push-gate.sh`):** fmt, banned patterns, secrets, test count, data integrity, pub fn test guard, financial test guard. Heavy checks (clippy, test, audit, deny, loom) are CI-only.
+- **Pre-push (8 fast gates via `.claude/hooks/pre-push-gate.sh`):** fmt, banned patterns, secrets, test count, data integrity, pub fn test guard, financial test guard, 22 test type check (scoped to changed crates). Heavy checks (clippy, test, audit, deny, loom) are CI-only.
 - **Git hook pre-push (11 gates via `scripts/git-hooks/pre-push`):** Comprehensive — adds clippy, test, audit, deny, loom on top of the 7 fast gates.
 - **Pre-PR (5 gates):** branch check, naming, clean tree, quality state, commit format
 - **CI:** Full quality enforcement on PRs to main (fmt, clippy, test, security, coverage). Smart skip: heavy Rust steps (build/clippy/test) skipped when only config/scripts change.

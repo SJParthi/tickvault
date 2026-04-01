@@ -38,6 +38,7 @@ fn test_dhan_config() -> DhanConfig {
             .to_string(),
         max_instruments_per_connection: 5000,
         max_websocket_connections: 5,
+        sandbox_base_url: String::new(),
     }
 }
 
@@ -105,6 +106,10 @@ fn no_panic_health_response_serialization() {
             },
             pipeline: SubsystemInfo {
                 status: "active",
+                detail: None,
+            },
+            tick_persistence: SubsystemInfo {
+                status: "connected",
                 detail: None,
             },
         },

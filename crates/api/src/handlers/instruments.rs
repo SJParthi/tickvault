@@ -104,9 +104,11 @@ fn build_rebuild_response(
         }
         Err(err) => {
             warn!(%err, "manual instrument rebuild failed");
+            // B4: Redact internal error details — log the full error but return
+            // a generic message to the API consumer to prevent information leakage.
             Json(RebuildResponse {
                 status: "failed".to_string(),
-                message: format!("rebuild failed: {err}"),
+                message: "rebuild failed — check server logs for details".to_string(),
                 derivative_count: None,
                 underlying_count: None,
             })
@@ -132,8 +134,10 @@ async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
 }
 
 /// Produces a JSON error object when report serialization fails.
+/// B4: Returns generic message — full error logged server-side, not exposed via API.
 fn diagnostic_serialization_fallback(err: serde_json::Error) -> serde_json::Value {
-    serde_json::json!({"error": format!("serialization failed: {err}")})
+    warn!(%err, "instrument diagnostic serialization failed");
+    serde_json::json!({"error": "serialization failed — check server logs"})
 }
 
 /// `GET /api/instruments/diagnostic` — full instrument system health check.
@@ -252,6 +256,7 @@ mod tests {
                 instrument_csv_fallback_url: "http://127.0.0.1:1/fallback.csv".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -377,6 +382,7 @@ mod tests {
                 instrument_csv_fallback_url: "http://127.0.0.1:1/fallback.csv".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -525,7 +531,12 @@ mod tests {
         let err = anyhow::anyhow!("CSV download failed");
         let Json(resp) = build_rebuild_response(Err(err));
         assert_eq!(resp.status, "failed");
-        assert!(resp.message.contains("CSV download failed"));
+        // B4: Internal error details must NOT leak to API response.
+        assert!(
+            !resp.message.contains("CSV download failed"),
+            "internal error details must be redacted from API response"
+        );
+        assert!(resp.message.contains("check server logs"));
     }
 
     // -----------------------------------------------------------------------
@@ -559,6 +570,11 @@ mod tests {
         assert!(result.is_object());
         let error_msg = result.get("error").unwrap().as_str().unwrap();
         assert!(error_msg.contains("serialization failed"));
-        assert!(error_msg.contains("test error"));
+        // B4: Internal error details must NOT leak to API response.
+        assert!(
+            !error_msg.contains("test error"),
+            "internal error details must be redacted from API response"
+        );
+        assert!(error_msg.contains("check server logs"));
     }
 }

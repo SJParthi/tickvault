@@ -184,8 +184,8 @@ impl ExchangeSegment {
 |-------------|-----------|-----------|------------|------------------|
 | per second  | 10        | 5         | 1          | 20               |
 | per minute  | 250       | —         | Unlimited  | Unlimited        |
-| per hour    | 500       | —         | Unlimited  | Unlimited        |
-| per day     | 5000      | 100000    | Unlimited  | Unlimited        |
+| per hour    | 1000      | —         | Unlimited  | Unlimited        |
+| per day     | 7000      | 100000    | Unlimited  | Unlimited        |
 
 > Order modifications capped at **25 modifications per order**.
 

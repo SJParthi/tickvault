@@ -19,6 +19,7 @@ pub struct PreviousCloseData {
 ///
 /// # Performance
 /// O(1) — two `from_le_bytes` reads.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by PREVIOUS_CLOSE_PACKET_SIZE check
 pub fn parse_previous_close_packet(
     raw: &[u8],

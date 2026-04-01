@@ -489,6 +489,10 @@ pub const SSM_DHAN_SERVICE: &str = "dhan";
 pub const DHAN_CLIENT_ID_SECRET: &str = "client-id";
 pub const DHAN_CLIENT_SECRET_SECRET: &str = "client-secret";
 pub const DHAN_TOTP_SECRET: &str = "totp-secret";
+/// SSM secret name for Dhan sandbox client ID (DevPortal).
+pub const DHAN_SANDBOX_CLIENT_ID_SECRET: &str = "sandbox-client-id";
+/// SSM secret name for Dhan sandbox access token (DevPortal, 30-day validity).
+pub const DHAN_SANDBOX_TOKEN_SECRET: &str = "sandbox-token";
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — QuestDB Service
@@ -929,6 +933,14 @@ pub const DHAN_MARGIN_CALCULATOR_MULTI_PATH: &str = "/margincalculator/multi";
 /// Endpoint: GET <https://api.dhan.co/v2/fundlimit>
 pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
 
+/// Path for kill switch activate/deactivate (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE|DEACTIVATE>
+pub const DHAN_KILL_SWITCH_PATH: &str = "/killswitch";
+
+/// Path for P&L-based exit configuration (appended to rest_api_base_url).
+/// Endpoint: POST/DELETE/GET <https://api.dhan.co/v2/pnlExit>
+pub const DHAN_PNL_EXIT_PATH: &str = "/pnlExit";
+
 // ---------------------------------------------------------------------------
 // Full Market Depth — WebSocket Base URLs
 // ---------------------------------------------------------------------------
@@ -1220,6 +1232,12 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
 pub const TICK_BUFFER_CAPACITY: usize = 300_000;
 
+/// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
+/// tick persistence, candle aggregation). Must be large enough to absorb bursts
+/// during high-volatility events without lagging cold-path consumers.
+/// 65,536 ticks at ~112 bytes each = ~7MB. At ~1000 ticks/sec = ~65 seconds.
+pub const TICK_BROADCAST_CAPACITY: usize = 65_536;
+
 /// Resilience ring buffer capacity for live candle writer.
 /// Holds candles in memory when QuestDB is down, drains on recovery.
 /// 100,000 candles × ~48 bytes = ~5MB. At ~60 candles/sec = ~27 minutes of data.
@@ -1262,6 +1280,24 @@ pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 /// IST offset from UTC in nanoseconds (5h 30m = 19,800,000,000,000 ns).
 /// Used for converting `received_at_nanos` (system clock UTC) to IST basis.
 pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
+
+// ---------------------------------------------------------------------------
+// Sandbox Guard — Live Trading Date Lock
+// ---------------------------------------------------------------------------
+
+/// Earliest date (IST) when `mode = "live"` is permitted.
+/// Before this date, config validation rejects live mode at startup.
+/// Change these constants ONLY with explicit approval from Parthiban.
+pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2026;
+pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
+pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Periodic Health Check
+// ---------------------------------------------------------------------------
+
+/// Interval between periodic health checks (disk space, memory RSS) in seconds.
+pub const PERIODIC_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range

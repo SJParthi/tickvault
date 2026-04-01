@@ -25,6 +25,12 @@ pub struct SystemHealthStatus {
     questdb_reachable: AtomicBool,
     /// Whether the auth token is currently valid.
     token_valid: AtomicBool,
+    /// Whether the tick persistence writer is connected to QuestDB.
+    tick_persistence_connected: AtomicBool,
+    /// Number of ticks currently buffered in the ring buffer (waiting for QuestDB).
+    tick_buffer_size: AtomicU64,
+    /// Total ticks spilled to disk (ring buffer overflow).
+    ticks_spilled: AtomicU64,
     /// Boot timestamp (epoch seconds) — 0 if not yet booted.
     boot_epoch_secs: AtomicU64,
 }
@@ -37,6 +43,9 @@ impl SystemHealthStatus {
             pipeline_active: AtomicBool::new(false),
             questdb_reachable: AtomicBool::new(false),
             token_valid: AtomicBool::new(false),
+            tick_persistence_connected: AtomicBool::new(false),
+            tick_buffer_size: AtomicU64::new(0),
+            ticks_spilled: AtomicU64::new(0),
             boot_epoch_secs: AtomicU64::new(0),
         }
     }
@@ -79,6 +88,43 @@ impl SystemHealthStatus {
     /// Returns whether the auth token is valid.
     pub fn token_valid(&self) -> bool {
         self.token_valid.load(Ordering::Relaxed)
+    }
+
+    /// Marks tick persistence as connected/disconnected.
+    // TEST-EXEMPT: trivial AtomicBool store, tested indirectly by health endpoint tests
+    pub fn set_tick_persistence_connected(&self, connected: bool) {
+        self.tick_persistence_connected
+            .store(connected, Ordering::Relaxed);
+    }
+
+    /// Returns whether tick persistence is connected to QuestDB.
+    // TEST-EXEMPT: trivial AtomicBool load, tested indirectly by health endpoint tests
+    pub fn tick_persistence_connected(&self) -> bool {
+        self.tick_persistence_connected.load(Ordering::Relaxed)
+    }
+
+    /// Updates tick buffer size (ring buffer count).
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_tick_buffer_size(&self, size: u64) {
+        self.tick_buffer_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Returns tick buffer size.
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn tick_buffer_size(&self) -> u64 {
+        self.tick_buffer_size.load(Ordering::Relaxed)
+    }
+
+    /// Updates total ticks spilled to disk.
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_ticks_spilled(&self, count: u64) {
+        self.ticks_spilled.store(count, Ordering::Relaxed);
+    }
+
+    /// Returns total ticks spilled to disk.
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn ticks_spilled(&self) -> u64 {
+        self.ticks_spilled.load(Ordering::Relaxed)
     }
 
     /// Sets the boot timestamp.
@@ -211,6 +257,7 @@ mod tests {
                 .to_string(),
             max_instruments_per_connection: 5000,
             max_websocket_connections: 5,
+            sandbox_base_url: String::new(),
         }
     }
 
@@ -286,6 +333,7 @@ mod tests {
         assert!(!health.pipeline_active());
         assert!(!health.questdb_reachable());
         assert!(!health.token_valid());
+        assert!(!health.tick_persistence_connected());
         assert_eq!(health.boot_epoch_secs(), 0);
     }
 
@@ -352,6 +400,10 @@ mod tests {
             from_default.questdb_reachable()
         );
         assert_eq!(from_new.token_valid(), from_default.token_valid());
+        assert_eq!(
+            from_new.tick_persistence_connected(),
+            from_default.tick_persistence_connected()
+        );
         assert_eq!(from_new.boot_epoch_secs(), from_default.boot_epoch_secs());
         assert_eq!(from_new.overall_status(), from_default.overall_status());
     }
@@ -514,6 +566,7 @@ mod tests {
         assert!(!health.pipeline_active());
         assert!(!health.questdb_reachable());
         assert!(!health.token_valid());
+        assert!(!health.tick_persistence_connected());
         assert_eq!(health.boot_epoch_secs(), 0);
     }
 
@@ -645,6 +698,7 @@ mod tests {
         assert!(!health.pipeline_active());
         assert!(!health.questdb_reachable());
         assert!(!health.token_valid());
+        assert!(!health.tick_persistence_connected());
         assert_eq!(health.boot_epoch_secs(), 0);
         assert_eq!(health.overall_status(), "degraded");
     }
@@ -652,6 +706,16 @@ mod tests {
     // -------------------------------------------------------------------
     // SystemHealthStatus: boot_epoch_secs can be overwritten
     // -------------------------------------------------------------------
+
+    #[test]
+    fn test_system_health_status_toggle_tick_persistence_connected() {
+        let health = SystemHealthStatus::new();
+        assert!(!health.tick_persistence_connected());
+        health.set_tick_persistence_connected(true);
+        assert!(health.tick_persistence_connected());
+        health.set_tick_persistence_connected(false);
+        assert!(!health.tick_persistence_connected());
+    }
 
     #[test]
     fn test_system_health_status_boot_epoch_secs_overwrite() {

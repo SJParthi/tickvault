@@ -16,6 +16,7 @@ use super::types::ParseError;
 ///
 /// # Performance
 /// O(1) — just a length check.
+#[inline]
 pub fn validate_market_status_packet(raw: &[u8]) -> Result<(), ParseError> {
     if raw.len() < MARKET_STATUS_PACKET_SIZE {
         return Err(ParseError::InsufficientBytes {

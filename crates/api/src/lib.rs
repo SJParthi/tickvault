@@ -101,8 +101,7 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
 /// If the list is empty, falls back to permissive localhost defaults for dev safety.
 // O(1) EXEMPT: begin — cold path, called once at boot
 fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
-    use axum::http::HeaderValue;
-    use tower_http::cors::Any;
+    use axum::http::{HeaderValue, Method, header};
 
     let origins: Vec<&str> = if allowed_origins.is_empty() {
         vec!["http://localhost:3000", "http://localhost:3001"]
@@ -115,6 +114,11 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
         .filter_map(|o| o.parse::<HeaderValue>().ok())
         .collect();
 
+    // B3: Restrict methods to GET/POST/DELETE and headers to Authorization/Content-Type.
+    // Prevents CSRF-style attacks from permitted origins using arbitrary methods/headers.
+    let methods = [Method::GET, Method::POST, Method::DELETE];
+    let headers = [header::AUTHORIZATION, header::CONTENT_TYPE];
+
     if parsed.is_empty() {
         // Fallback: if all origins failed to parse, allow localhost defaults.
         // HeaderValue::from_static is infallible for string literals.
@@ -123,13 +127,13 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
                 HeaderValue::from_static("http://localhost:3000"),
                 HeaderValue::from_static("http://localhost:3001"),
             ])
-            .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_methods(methods)
+            .allow_headers(headers)
     } else {
         CorsLayer::new()
             .allow_origin(parsed)
-            .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_methods(methods)
+            .allow_headers(headers)
     }
 }
 // O(1) EXEMPT: end
@@ -197,6 +201,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -232,6 +237,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -278,6 +284,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -332,6 +339,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -382,6 +390,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -422,6 +431,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             dhan_live_trader_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),

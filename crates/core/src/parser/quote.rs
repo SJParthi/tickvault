@@ -19,6 +19,7 @@ use super::types::{PacketHeader, ParseError};
 ///
 /// # Performance
 /// O(1) — eleven `from_le_bytes` reads.
+#[inline]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by QUOTE_PACKET_SIZE check
 pub fn parse_quote_packet(
     raw: &[u8],

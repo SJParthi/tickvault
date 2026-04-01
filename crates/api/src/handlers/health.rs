@@ -21,6 +21,7 @@ pub struct SubsystemStatus {
     pub questdb: SubsystemInfo,
     pub token: SubsystemInfo,
     pub pipeline: SubsystemInfo,
+    pub tick_persistence: SubsystemInfo,
 }
 
 /// Individual subsystem status info.
@@ -72,6 +73,23 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         detail: None,
     };
 
+    let tick_buf = health.tick_buffer_size();
+    let tick_spill = health.ticks_spilled();
+    let tick_persistence = SubsystemInfo {
+        status: if health.tick_persistence_connected() {
+            "connected"
+        } else if tick_buf > 0 || tick_spill > 0 {
+            "buffering"
+        } else {
+            "unavailable"
+        },
+        detail: if tick_buf > 0 || tick_spill > 0 {
+            Some(format!("buffer: {tick_buf}, spilled: {tick_spill}"))
+        } else {
+            None
+        },
+    };
+
     let overall = health.overall_status();
 
     Json(HealthResponse {
@@ -82,6 +100,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             questdb,
             token,
             pipeline,
+            tick_persistence,
         },
     })
 }
@@ -111,6 +130,7 @@ mod tests {
                 instrument_csv_fallback_url: "https://test".to_string(),
                 max_instruments_per_connection: 5000,
                 max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
             },
             InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
@@ -133,6 +153,7 @@ mod tests {
         health.set_questdb_reachable(true);
         health.set_token_valid(true);
         health.set_pipeline_active(true);
+        health.set_tick_persistence_connected(true);
 
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
@@ -143,6 +164,7 @@ mod tests {
         assert_eq!(response.subsystems.questdb.status, "reachable");
         assert_eq!(response.subsystems.token.status, "valid");
         assert_eq!(response.subsystems.pipeline.status, "active");
+        assert_eq!(response.subsystems.tick_persistence.status, "connected");
     }
 
     #[tokio::test]
@@ -186,6 +208,7 @@ mod tests {
         assert_eq!(response.subsystems.questdb.status, "unreachable");
         assert_eq!(response.subsystems.token.status, "invalid");
         assert_eq!(response.subsystems.pipeline.status, "inactive");
+        assert_eq!(response.subsystems.tick_persistence.status, "unavailable");
     }
 
     #[test]
@@ -210,6 +233,10 @@ mod tests {
                     status: "active",
                     detail: None,
                 },
+                tick_persistence: SubsystemInfo {
+                    status: "connected",
+                    detail: None,
+                },
             },
         };
         let json = serde_json::to_string(&resp).expect("serialization should succeed");
@@ -217,6 +244,7 @@ mod tests {
         assert!(json.contains("\"version\":\"0.1.0\""));
         assert!(json.contains("\"websocket\""));
         assert!(json.contains("\"questdb\""));
+        assert!(json.contains("\"tick_persistence\""));
     }
 
     // -------------------------------------------------------------------
@@ -282,6 +310,7 @@ mod tests {
         assert!(response.subsystems.questdb.detail.is_none());
         assert!(response.subsystems.token.detail.is_none());
         assert!(response.subsystems.pipeline.detail.is_none());
+        assert!(response.subsystems.tick_persistence.detail.is_none());
     }
 
     // -------------------------------------------------------------------
@@ -301,5 +330,30 @@ mod tests {
             response.subsystems.websocket.detail,
             Some("5 connections".to_string())
         );
+    }
+
+    // -------------------------------------------------------------------
+    // HealthResponse: tick_persistence status
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_tick_persistence_connected() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_tick_persistence_connected(true);
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.tick_persistence.status, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_tick_persistence_unavailable_by_default() {
+        let health = Arc::new(SystemHealthStatus::new());
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.tick_persistence.status, "unavailable");
     }
 }
