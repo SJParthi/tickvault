@@ -1157,6 +1157,11 @@ impl DepthPersistenceWriter {
         }
     }
 
+    /// Returns true if QuestDB ILP sender is connected.
+    pub fn is_connected(&self) -> bool {
+        self.sender.is_some()
+    }
+
     /// Appends a 5-level depth snapshot to the ILP buffer.
     ///
     /// When QuestDB is down, depth snapshots are held in a ring buffer (up to

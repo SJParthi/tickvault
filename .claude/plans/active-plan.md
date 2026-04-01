@@ -97,7 +97,7 @@
   - Files: `crates/trading/tests/dhat_oms_hot_path.rs`
   - Tests: `test_oms_state_transition_zero_alloc`, `test_risk_check_zero_alloc`
 
-- [ ] E4: Add adversarial tick resilience tests (V1 item E2)
+- [x] E4: Add adversarial tick resilience tests (V1 item E2)
   - Files: `crates/storage/tests/tick_resilience.rs`
   - Tests: `test_zero_tick_loss_questdb_down_from_start`, `test_spill_file_recovery_after_restart`, `test_buffer_capacity_at_300k_limit`, `test_disk_spill_activates_when_buffer_full`
 

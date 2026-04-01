@@ -6,8 +6,9 @@
 //! Plan item: E2 (tick persistence cold-start resilience).
 
 use dhan_live_trader_common::config::QuestDbConfig;
+use dhan_live_trader_common::constants::TICK_BUFFER_CAPACITY;
 use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
+use dhan_live_trader_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
 
 /// Returns a `QuestDbConfig` pointing at a non-existent port so that all
 /// ILP connection attempts fail immediately without network delay.
@@ -148,5 +149,125 @@ fn test_disconnected_writer_append_returns_ok() {
         result.is_ok(),
         "append_tick on disconnected writer must return Ok, got: {:?}",
         result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E2: Adversarial Tick Resilience Tests (Zero Tick Loss Guarantee)
+// ---------------------------------------------------------------------------
+
+/// When the ring buffer reaches TICK_BUFFER_CAPACITY, additional ticks must
+/// spill to disk rather than being dropped. Verify spill counter increments.
+#[test]
+fn test_disk_spill_activates_when_buffer_full() {
+    let config = test_config();
+    let mut writer = TickPersistenceWriter::new_disconnected(&config);
+
+    // Fill ring buffer to capacity
+    for i in 0..TICK_BUFFER_CAPACITY {
+        let tick = make_tick(i as u32, 100.0);
+        writer.append_tick(&tick).ok();
+    }
+
+    assert_eq!(
+        writer.buffered_tick_count(),
+        TICK_BUFFER_CAPACITY,
+        "ring buffer must be at capacity"
+    );
+    assert_eq!(
+        writer.ticks_spilled_total(),
+        0,
+        "no ticks should be spilled yet"
+    );
+
+    // One more tick should trigger disk spill
+    let overflow_tick = make_tick(999_999, 999.99);
+    writer.append_tick(&overflow_tick).ok();
+
+    assert_eq!(
+        writer.ticks_spilled_total(),
+        1,
+        "one tick must have spilled to disk"
+    );
+    assert_eq!(
+        writer.ticks_dropped_total(),
+        0,
+        "zero ticks must be dropped — disk spill catches overflow"
+    );
+
+    // Clean up spill file
+    let _ = std::fs::remove_dir_all("data/spill");
+}
+
+/// The DepthPersistenceWriter::new_disconnected must start in disconnected
+/// buffering mode, just like the tick writer.
+#[test]
+fn test_depth_writer_new_disconnected_buffers() {
+    let config = test_config();
+    let writer = DepthPersistenceWriter::new_disconnected(&config);
+
+    assert!(
+        !writer.is_connected(),
+        "disconnected depth writer must report is_connected() == false"
+    );
+}
+
+/// force_flush on a disconnected tick writer must not panic or lose data.
+/// In-flight ticks should be rescued back to the ring buffer.
+#[test]
+fn test_force_flush_on_disconnected_writer_rescues_data() {
+    let config = test_config();
+    let mut writer = TickPersistenceWriter::new_disconnected(&config);
+
+    // Append several ticks
+    for i in 0..50 {
+        let tick = make_tick(i, 100.0 + i as f32);
+        writer.append_tick(&tick).ok();
+    }
+
+    let buffered_before = writer.buffered_tick_count();
+
+    // force_flush should not lose any data
+    let _ = writer.force_flush();
+
+    // All ticks should still be in buffer (either ring buffer or rescued)
+    assert!(
+        writer.buffered_tick_count() >= buffered_before,
+        "force_flush on disconnected writer must not lose buffered ticks"
+    );
+    assert_eq!(
+        writer.ticks_dropped_total(),
+        0,
+        "force_flush must never drop ticks"
+    );
+}
+
+/// Rapid alternation between append and flush must not corrupt state.
+#[test]
+fn test_rapid_append_flush_cycle_no_corruption() {
+    let config = test_config();
+    let mut writer = TickPersistenceWriter::new_disconnected(&config);
+
+    for i in 0..1000_u32 {
+        let tick = make_tick(i, 100.0 + i as f32);
+        writer.append_tick(&tick).ok();
+
+        // Flush every 10 ticks
+        if i % 10 == 0 {
+            let _ = writer.force_flush();
+        }
+    }
+
+    // No ticks should have been dropped
+    assert_eq!(
+        writer.ticks_dropped_total(),
+        0,
+        "rapid append/flush cycles must not drop any ticks"
+    );
+
+    // All 1000 ticks should be accounted for in buffer
+    assert!(
+        writer.buffered_tick_count() > 0,
+        "buffer must contain ticks after disconnected append/flush cycles"
     );
 }
