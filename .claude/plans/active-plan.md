@@ -117,6 +117,9 @@
   - Files: `docs/dhan-ref/05-historical-data.md`
 
 - [ ] F2: Add Dhan API coverage test verifying all 54 endpoint constants (V1 item F6)
+  - NOTE from orders agent: Order/trade book response structs need additional Optional fields
+    (tradingSymbol, legName, drvExpiryDate, drvOptionType, etc.) before BO/CO trading.
+    Super order needs validation rules (target > price for BUY). Low priority until Phase 2.
   - Files: `crates/common/tests/dhan_api_coverage.rs`
   - Tests: `test_all_54_dhan_rest_endpoints_have_constants`, `test_all_4_websocket_urls_defined`
 
