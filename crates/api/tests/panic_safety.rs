@@ -108,6 +108,10 @@ fn no_panic_health_response_serialization() {
                 status: "active",
                 detail: None,
             },
+            tick_persistence: SubsystemInfo {
+                status: "connected",
+                detail: None,
+            },
         },
     };
     let json = serde_json::to_string(&resp).unwrap();

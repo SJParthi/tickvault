@@ -302,6 +302,7 @@ mod tests {
         assert!(response.subsystems.questdb.detail.is_none());
         assert!(response.subsystems.token.detail.is_none());
         assert!(response.subsystems.pipeline.detail.is_none());
+        assert!(response.subsystems.tick_persistence.detail.is_none());
     }
 
     // -------------------------------------------------------------------
@@ -321,5 +322,30 @@ mod tests {
             response.subsystems.websocket.detail,
             Some("5 connections".to_string())
         );
+    }
+
+    // -------------------------------------------------------------------
+    // HealthResponse: tick_persistence status
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_tick_persistence_connected() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_tick_persistence_connected(true);
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.tick_persistence.status, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_tick_persistence_unavailable_by_default() {
+        let health = Arc::new(SystemHealthStatus::new());
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.tick_persistence.status, "unavailable");
     }
 }

@@ -8,7 +8,7 @@
 # catch before the push (banned patterns, secrets, formatting). This avoids
 # 5-10 minutes of redundant local work that CI will repeat server-side.
 #
-# Gate order (all fast, <30s total):
+# Gate order (all fast, <35s total):
 #   1. cargo fmt --check          [fast: ~2s]
 #   2. Banned pattern scan        [fast: ~2s]
 #   3. Secret scan                [fast: ~1s]
@@ -16,6 +16,7 @@
 #   5. Data integrity guard       [fast: ~2s, pattern scan]
 #   6. Pub fn test guard          [fast: ~3s, pattern scan]
 #   7. Financial test guard       [fast: ~3s, pattern scan]
+#   8. 22 test type check         [fast: ~5s, scoped to changed crates]
 #
 # Heavy gates (clippy, test, audit, deny, coverage, loom) are CI-only.
 # Branch protection blocks merge if any CI check fails.
@@ -61,7 +62,7 @@ echo "╚═══════════════════════�
 HEAD_CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
 # Gate 1: cargo fmt
-echo "  [1/7] cargo fmt --check..." >&2
+echo "  [1/8] cargo fmt --check..." >&2
 FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)
 FMT_EXIT=$?
 if [ "$FMT_EXIT" -eq 124 ]; then
@@ -76,7 +77,7 @@ else
 fi
 
 # Gate 2: Banned pattern scan (full workspace)
-echo "  [2/7] Banned pattern scan..." >&2
+echo "  [2/8] Banned pattern scan..." >&2
 ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' 2>/dev/null | tr '\n' ' ')
 if [ -n "$ALL_RS" ] && [ -x "$HOOKS_DIR/banned-pattern-scanner.sh" ]; then
   if ! timeout 60 "$HOOKS_DIR/banned-pattern-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
@@ -90,7 +91,7 @@ else
 fi
 
 # Gate 3: Secret scan
-echo "  [3/7] Secret scan..." >&2
+echo "  [3/8] Secret scan..." >&2
 if [ -x "$HOOKS_DIR/secret-scanner.sh" ]; then
   if ! timeout 30 "$HOOKS_DIR/secret-scanner.sh" "$CWD" "$ALL_RS" > /dev/null 2>&1; then
     echo "  FAIL: Secrets detected in workspace." >&2
@@ -103,7 +104,7 @@ else
 fi
 
 # Gate 4: Test count guard (ratchet — ensures test count never decreases)
-echo "  [4/7] Test count guard..." >&2
+echo "  [4/8] Test count guard..." >&2
 if [ -x "$HOOKS_DIR/test-count-guard.sh" ]; then
   if ! timeout 30 "$HOOKS_DIR/test-count-guard.sh" "$CWD" 2>&1; then
     FAILED=1
@@ -113,7 +114,7 @@ else
 fi
 
 # Gate 5: Data integrity guard (full workspace scan — pattern-based, no compilation)
-echo "  [5/7] Data integrity guard (full workspace)..." >&2
+echo "  [5/8] Data integrity guard (full workspace)..." >&2
 if [ -x "$HOOKS_DIR/data-integrity-guard.sh" ]; then
   DIG_OUT=$(timeout 60 "$HOOKS_DIR/data-integrity-guard.sh" "$CWD" 2>&1)
   DIG_EXIT=$?
@@ -131,7 +132,7 @@ else
 fi
 
 # Gate 6: Pub fn test guard (every public function has a test)
-echo "  [6/7] Pub fn test guard (full workspace)..." >&2
+echo "  [6/8] Pub fn test guard (full workspace)..." >&2
 if [ -x "$HOOKS_DIR/pub-fn-test-guard.sh" ]; then
   PUBFN_OUT=$(timeout 120 "$HOOKS_DIR/pub-fn-test-guard.sh" "$CWD" "all" 2>&1)
   PUBFN_EXIT=$?
@@ -149,7 +150,7 @@ else
 fi
 
 # Gate 7: Financial test guard (price/money fns have boundary tests)
-echo "  [7/7] Financial test guard..." >&2
+echo "  [7/8] Financial test guard..." >&2
 if [ -x "$HOOKS_DIR/financial-test-guard.sh" ]; then
   FIN_OUT=$(timeout 120 "$HOOKS_DIR/financial-test-guard.sh" "$CWD" 2>&1)
   FIN_EXIT=$?
@@ -164,6 +165,31 @@ if [ -x "$HOOKS_DIR/financial-test-guard.sh" ]; then
   fi
 else
   echo "  SKIP: financial-test-guard.sh not executable" >&2
+fi
+
+# Gate 8: 22 test type check (scoped to changed crates)
+echo "  [8/8] 22 test type check (scoped)..." >&2
+UPSTREAM=$(git rev-parse '@{upstream}' 2>/dev/null || git rev-parse 'origin/main' 2>/dev/null || echo "HEAD~1")
+CHANGED_RS=$(git diff --name-only "$UPSTREAM" -- 'crates/*/src/**/*.rs' 'crates/*/tests/**/*.rs' 2>/dev/null || true)
+if [ -z "$CHANGED_RS" ]; then
+  echo "  SKIP: No .rs files changed — skipping 22 test type check" >&2
+elif [ -x "$CWD/scripts/test-coverage-guard.sh" ]; then
+  CHANGED_CRATES=$(echo "$CHANGED_RS" | sed -n 's|^crates/\([^/]*\)/.*|\1|p' | sort -u | tr '\n' ',' | sed 's/,$//')
+  if [ -n "$CHANGED_CRATES" ]; then
+    TCG_OUT=$(timeout 30 "$CWD/scripts/test-coverage-guard.sh" "$CHANGED_CRATES" 2>&1)
+    TCG_EXIT=$?
+    if [ "$TCG_EXIT" -eq 0 ]; then
+      echo "  PASS: 22 test type check (scope: $CHANGED_CRATES)" >&2
+    else
+      echo "$TCG_OUT" >&2
+      echo "  FAIL: 22 test type check failed for crate(s): $CHANGED_CRATES" >&2
+      FAILED=1
+    fi
+  else
+    echo "  SKIP: Could not extract crate names from changed files" >&2
+  fi
+else
+  echo "  SKIP: scripts/test-coverage-guard.sh not executable" >&2
 fi
 
 echo "" >&2
@@ -195,6 +221,6 @@ if [ -n "$BRANCH_SAFE_NOW" ]; then
 fi
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  PUSH ALLOWED (7 fast gates — CI enforces rest)║" >&2
+echo "║  PUSH ALLOWED (8 fast gates — CI enforces rest)║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

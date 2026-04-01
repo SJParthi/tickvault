@@ -531,7 +531,12 @@ mod tests {
         let err = anyhow::anyhow!("CSV download failed");
         let Json(resp) = build_rebuild_response(Err(err));
         assert_eq!(resp.status, "failed");
-        assert!(resp.message.contains("CSV download failed"));
+        // B4: Internal error details must NOT leak to API response.
+        assert!(
+            !resp.message.contains("CSV download failed"),
+            "internal error details must be redacted from API response"
+        );
+        assert!(resp.message.contains("check server logs"));
     }
 
     // -----------------------------------------------------------------------
@@ -565,6 +570,11 @@ mod tests {
         assert!(result.is_object());
         let error_msg = result.get("error").unwrap().as_str().unwrap();
         assert!(error_msg.contains("serialization failed"));
-        assert!(error_msg.contains("test error"));
+        // B4: Internal error details must NOT leak to API response.
+        assert!(
+            !error_msg.contains("test error"),
+            "internal error details must be redacted from API response"
+        );
+        assert!(error_msg.contains("check server logs"));
     }
 }
