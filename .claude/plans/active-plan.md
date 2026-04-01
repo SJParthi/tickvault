@@ -83,7 +83,7 @@
 
 ## BLOCK E: Remaining V1 Plan Items (Carried Forward)
 
-- [ ] E1: Add ring buffer + disk spill to LiveCandleWriter (V1 item D1)
+- [x] E1: Add ring buffer + disk spill to LiveCandleWriter (V1 item D1) — ALREADY IMPLEMENTED in candle_persistence.rs (ring buffer 10K + disk spill + drain)
   - Files: `crates/storage/src/candle_persistence.rs`
   - Change: Already has ring buffer (100K) + disk spill. VERIFY it works end-to-end.
   - Tests: `test_live_candle_buffered_on_questdb_failure`, `test_live_candle_drained_on_recovery`
