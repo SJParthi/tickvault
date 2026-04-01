@@ -73,13 +73,21 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         detail: None,
     };
 
+    let tick_buf = health.tick_buffer_size();
+    let tick_spill = health.ticks_spilled();
     let tick_persistence = SubsystemInfo {
         status: if health.tick_persistence_connected() {
             "connected"
+        } else if tick_buf > 0 || tick_spill > 0 {
+            "buffering"
         } else {
             "unavailable"
         },
-        detail: None,
+        detail: if tick_buf > 0 || tick_spill > 0 {
+            Some(format!("buffer: {tick_buf}, spilled: {tick_spill}"))
+        } else {
+            None
+        },
     };
 
     let overall = health.overall_status();

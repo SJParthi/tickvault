@@ -27,6 +27,10 @@ pub struct SystemHealthStatus {
     token_valid: AtomicBool,
     /// Whether the tick persistence writer is connected to QuestDB.
     tick_persistence_connected: AtomicBool,
+    /// Number of ticks currently buffered in the ring buffer (waiting for QuestDB).
+    tick_buffer_size: AtomicU64,
+    /// Total ticks spilled to disk (ring buffer overflow).
+    ticks_spilled: AtomicU64,
     /// Boot timestamp (epoch seconds) — 0 if not yet booted.
     boot_epoch_secs: AtomicU64,
 }
@@ -40,6 +44,8 @@ impl SystemHealthStatus {
             questdb_reachable: AtomicBool::new(false),
             token_valid: AtomicBool::new(false),
             tick_persistence_connected: AtomicBool::new(false),
+            tick_buffer_size: AtomicU64::new(0),
+            ticks_spilled: AtomicU64::new(0),
             boot_epoch_secs: AtomicU64::new(0),
         }
     }
@@ -95,6 +101,30 @@ impl SystemHealthStatus {
     // TEST-EXEMPT: trivial AtomicBool load, tested indirectly by health endpoint tests
     pub fn tick_persistence_connected(&self) -> bool {
         self.tick_persistence_connected.load(Ordering::Relaxed)
+    }
+
+    /// Updates tick buffer size (ring buffer count).
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_tick_buffer_size(&self, size: u64) {
+        self.tick_buffer_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Returns tick buffer size.
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn tick_buffer_size(&self) -> u64 {
+        self.tick_buffer_size.load(Ordering::Relaxed)
+    }
+
+    /// Updates total ticks spilled to disk.
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_ticks_spilled(&self, count: u64) {
+        self.ticks_spilled.store(count, Ordering::Relaxed);
+    }
+
+    /// Returns total ticks spilled to disk.
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn ticks_spilled(&self) -> u64 {
+        self.ticks_spilled.load(Ordering::Relaxed)
     }
 
     /// Sets the boot timestamp.

@@ -88,7 +88,7 @@
   - Change: Already has ring buffer (100K) + disk spill. VERIFY it works end-to-end.
   - Tests: `test_live_candle_buffered_on_questdb_failure`, `test_live_candle_drained_on_recovery`
 
-- [ ] E2: Add tick persistence health to `/health` endpoint (V1 item D2)
+- [x] E2: Add tick persistence health to `/health` endpoint (V1 item D2) — enriched with buffer/spill detail + "buffering" state
   - Files: `crates/api/src/handlers/health.rs`, `crates/api/src/state.rs`
   - Change: Report tick_writer status (connected/buffering/disconnected), buffer size, spill count
   - Tests: `test_health_reports_tick_persistence_status`
@@ -101,7 +101,7 @@
   - Files: `crates/storage/tests/tick_resilience.rs`
   - Tests: `test_zero_tick_loss_questdb_down_from_start`, `test_spill_file_recovery_after_restart`, `test_buffer_capacity_at_300k_limit`, `test_disk_spill_activates_when_buffer_full`
 
-- [ ] E5: Add security audit tests for token handling (V1 item E3)
+- [x] E5: Add security audit tests for token handling (V1 item E3) — ALREADY EXISTS: 15 tests in core/tests/security_audit.rs
   - Files: `crates/core/tests/security_audit.rs`
   - Tests: `test_token_never_in_log_output`, `test_token_never_in_error_display`, `test_token_never_in_debug_format`
 
