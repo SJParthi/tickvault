@@ -1331,6 +1331,45 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
+    // Step 12b: Background periodic health check (disk space + memory RSS)
+    // -----------------------------------------------------------------------
+    // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
+    {
+        let health_notifier = notifier.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(
+                dhan_live_trader_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
+            );
+            loop {
+                tokio::time::sleep(interval).await;
+                // Disk space check
+                if let Some(percent_free) = infra::check_disk_space() {
+                    if percent_free < infra::MIN_FREE_DISK_PERCENT {
+                        health_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
+                                 Tick spill files may fail if disk fills up."
+                            ),
+                        });
+                    }
+                }
+                // Memory RSS check
+                if let Some(rss_mb) = infra::check_memory_rss() {
+                    if rss_mb > infra::MEMORY_RSS_ALERT_MB {
+                        health_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "WARNING: HIGH MEMORY — RSS {rss_mb} MB exceeds threshold. \
+                                 Consider investigating memory usage."
+                            ),
+                        });
+                    }
+                }
+            }
+        });
+        info!("background periodic health check started (every 5 minutes)");
+    }
+
+    // -----------------------------------------------------------------------
     // Step 13: Await shutdown signal
     // -----------------------------------------------------------------------
     run_shutdown_fast(

@@ -1293,6 +1293,13 @@ pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
 pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
 
 // ---------------------------------------------------------------------------
+// Periodic Health Check
+// ---------------------------------------------------------------------------
+
+/// Interval between periodic health checks (disk space, memory RSS) in seconds.
+pub const PERIODIC_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
+
+// ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
 // ---------------------------------------------------------------------------
 

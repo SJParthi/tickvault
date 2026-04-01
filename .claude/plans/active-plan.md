@@ -51,7 +51,7 @@
 
 ## BLOCK C: MEDIUM — Monitoring & Alerting Gaps
 
-- [ ] C1: Add programmatic Telegram alert for mid-session QuestDB disconnect
+- [x] C1: Add programmatic Telegram alert for mid-session QuestDB disconnect
   - Files: `crates/core/src/notification/events.rs`, `crates/core/src/pipeline/tick_processor.rs`
   - Change: Add `NotificationEvent::QuestDbDisconnected` + `QuestDbReconnected`. Track `is_connected()` state transitions in tick processor.
   - Tests: `test_questdb_disconnect_fires_telegram`, `test_questdb_reconnect_fires_telegram`
@@ -61,7 +61,7 @@
   - Change: On `RecvError::Lagged(N)` at line ~1794, fire CRITICAL Telegram alert with count. Add `dlt_ticks_permanently_lost` counter.
   - Tests: `test_broadcast_lag_fires_critical_alert`
 
-- [ ] C3: Add periodic health check timer for disk space + memory RSS
+- [x] C3: Add periodic health check timer for disk space + memory RSS
   - Files: `crates/app/src/main.rs`
   - Change: Spawn background task that calls `check_disk_space()` + `check_memory_rss()` every 5 minutes, fires Telegram on thresholds
   - Tests: `test_periodic_health_check_runs`
