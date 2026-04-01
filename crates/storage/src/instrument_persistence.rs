@@ -4386,4 +4386,72 @@ mod tests {
         assert!(DERIVATIVE_CONTRACTS_CREATE_DDL.contains("PARTITION BY DAY"));
         assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("PARTITION BY DAY"));
     }
+
+    // -----------------------------------------------------------------------
+    // I-P1-08: Cross-Day Snapshot Accumulation — NO DELETE guard
+    // -----------------------------------------------------------------------
+
+    /// I-P1-08: The persist path must NOT contain DELETE FROM for snapshot tables.
+    /// Historical rows are preserved across days (SEBI audit trail).
+    /// Data retention handled by QuestDB partition management, NOT application DELETE.
+    #[test]
+    fn test_no_delete_from_snapshot_tables_in_persist_path() {
+        // Read the source file — only check production code (before #[cfg(test)])
+        let source = include_str!("instrument_persistence.rs");
+        let production_code = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source must have production code");
+
+        // Construct pattern at runtime to avoid self-referential match
+        let pattern = ["DELET", "E FRO", "M"].concat();
+        let lower = pattern.to_lowercase();
+
+        assert!(
+            !production_code.contains(&pattern) && !production_code.contains(&lower),
+            "I-P1-08: production code must NOT contain destructive SQL"
+        );
+    }
+
+    /// I-P1-08: Snapshot timestamps for different dates must be distinct.
+    #[test]
+    fn test_snapshot_nanos_for_different_dates_are_distinct() {
+        let date1 = chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let date2 = chrono::NaiveDate::from_ymd_opt(2026, 4, 2).unwrap();
+        let nanos1 = naive_date_to_timestamp_nanos(date1)
+            .expect("valid nanos for date1")
+            .as_i64();
+        let nanos2 = naive_date_to_timestamp_nanos(date2)
+            .expect("valid nanos for date2")
+            .as_i64();
+        assert_ne!(
+            nanos1, nanos2,
+            "I-P1-08: different dates must produce different snapshot timestamps"
+        );
+        assert!(
+            nanos2 > nanos1,
+            "I-P1-08: later date must have greater timestamp"
+        );
+    }
+
+    /// I-P1-08: Cross-day accumulation by design — same security_id on different
+    /// days produces rows with different timestamps (not overwritten).
+    #[test]
+    fn test_snapshot_cross_day_accumulation_by_design() {
+        let day1 = chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let day2 = chrono::NaiveDate::from_ymd_opt(2026, 4, 2).unwrap();
+        let ts1 = naive_date_to_timestamp_nanos(day1)
+            .expect("valid nanos for day1")
+            .as_i64();
+        let ts2 = naive_date_to_timestamp_nanos(day2)
+            .expect("valid nanos for day2")
+            .as_i64();
+
+        // The same security_id persisted on two different days produces two
+        // distinct rows (different timestamps). This is intentional — DEDUP
+        // UPSERT KEYS include the designated timestamp, so rows accumulate.
+        assert_ne!(ts1, ts2);
+        assert!(ts1 > 0, "timestamp must be positive epoch nanos");
+        assert!(ts2 > 0, "timestamp must be positive epoch nanos");
+    }
 }

@@ -967,3 +967,213 @@ mod risk_pnl_tracking {
         assert!((engine.total_unrealized_pnl()).abs() < f64::EPSILON);
     }
 }
+
+// ===========================================================================
+// RISK-GAP-03: Tick Gap Detection (Integration)
+// ===========================================================================
+
+mod risk_tick_gap {
+    use dhan_live_trader_common::constants::{
+        TICK_GAP_ALERT_THRESHOLD_SECS, TICK_GAP_ERROR_THRESHOLD_SECS,
+        TICK_GAP_MIN_TICKS_BEFORE_ACTIVE,
+    };
+    use dhan_live_trader_trading::risk::tick_gap_tracker::{TickGapResult, TickGapTracker};
+
+    #[test]
+    fn warmup_suppresses_alerts() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        // During warmup, even huge gaps must not alert
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            let result = tracker.record_tick(1001, base_ts + i * 1000);
+            assert_eq!(result, TickGapResult::Ok, "warmup tick {i} must be Ok");
+        }
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+    }
+
+    #[test]
+    fn warning_threshold_triggers_after_warmup() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        // Complete warmup
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Gap exactly at warning threshold
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        match result {
+            TickGapResult::Warning { gap_secs } => {
+                assert_eq!(gap_secs, TICK_GAP_ALERT_THRESHOLD_SECS);
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+        assert_eq!(tracker.total_warnings(), 1);
+    }
+
+    #[test]
+    fn error_threshold_triggers() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        let result = tracker.record_tick(1001, gap_ts);
+        match result {
+            TickGapResult::Error { gap_secs } => {
+                assert_eq!(gap_secs, TICK_GAP_ERROR_THRESHOLD_SECS);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(tracker.total_errors(), 1);
+    }
+
+    #[test]
+    fn per_security_isolation() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        // Warmup security 1001
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Warmup security 2002
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(2002, base_ts + i);
+        }
+        // Gap on 1001 must NOT affect 2002
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        let result_1001 = tracker.record_tick(1001, gap_ts);
+        assert!(matches!(result_1001, TickGapResult::Error { .. }));
+
+        // Normal tick on 2002 — should be Ok
+        let normal_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1;
+        let result_2002 = tracker.record_tick(2002, normal_ts);
+        assert_eq!(result_2002, TickGapResult::Ok);
+        assert_eq!(tracker.tracked_securities(), 2);
+    }
+
+    #[test]
+    fn out_of_order_timestamps_no_underflow() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        // Out-of-order: earlier timestamp than last — saturating_sub prevents underflow
+        let result = tracker.record_tick(1001, base_ts);
+        assert_eq!(
+            result,
+            TickGapResult::Ok,
+            "out-of-order must not panic or alert"
+        );
+    }
+
+    #[test]
+    fn reset_clears_all_state() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
+        tracker.record_tick(1001, gap_ts);
+        assert!(tracker.total_warnings() > 0);
+
+        tracker.reset();
+        assert_eq!(tracker.tracked_securities(), 0);
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+    }
+}
+
+// ===========================================================================
+// OMS-GAP-06: Dry-Run Safety Gate (Integration)
+// ===========================================================================
+
+mod oms_dry_run_gate {
+    use dhan_live_trader_common::order_types::{
+        OrderType, OrderValidity, ProductType, TransactionType,
+    };
+    use dhan_live_trader_trading::oms::api_client::OrderApiClient;
+    use dhan_live_trader_trading::oms::engine::OrderManagementSystem;
+    use dhan_live_trader_trading::oms::rate_limiter::OrderRateLimiter;
+    use dhan_live_trader_trading::oms::types::PlaceOrderRequest;
+
+    struct TestTokenProvider;
+    impl dhan_live_trader_trading::oms::engine::TokenProvider for TestTokenProvider {
+        fn get_access_token(
+            &self,
+        ) -> Result<secrecy::SecretString, dhan_live_trader_trading::oms::types::OmsError> {
+            Ok(secrecy::SecretString::from("test-token"))
+        }
+    }
+
+    fn make_oms() -> OrderManagementSystem {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        )
+    }
+
+    #[test]
+    fn oms_defaults_to_dry_run() {
+        let oms = make_oms();
+        assert!(
+            oms.is_dry_run(),
+            "OMS-GAP-06: OMS must default to dry_run = true"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_paper_order_id() {
+        let mut oms = make_oms();
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let result = oms.place_order(request).await;
+        assert!(result.is_ok());
+        let order_id = result.unwrap();
+        assert!(
+            order_id.starts_with("PAPER-"),
+            "OMS-GAP-06: dry-run must produce PAPER-{{counter}} IDs, got: {order_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_sequential_paper_ids() {
+        let mut oms = make_oms();
+        let make_request = || PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 25,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 25,
+        };
+        let id1 = oms.place_order(make_request()).await.unwrap();
+        let id2 = oms.place_order(make_request()).await.unwrap();
+        assert_ne!(id1, id2, "OMS-GAP-06: each paper order must have unique ID");
+        assert!(id1.starts_with("PAPER-"));
+        assert!(id2.starts_with("PAPER-"));
+    }
+}

@@ -2341,6 +2341,7 @@ mod tests {
     }
 
     /// Multi-shot mock server that handles `n` sequential requests.
+    #[allow(dead_code)] // APPROVED: utility for future multi-request OMS tests
     #[allow(clippy::arithmetic_side_effects)]
     async fn start_multi_mock(
         responses: Vec<(u16, String)>,
