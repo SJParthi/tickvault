@@ -1,185 +1,171 @@
-# Implementation Plan: 100% Test Coverage & Mechanical Enforcement
+# Implementation Plan: Comprehensive Hardening — Data Safety, Security, Performance, Coverage
 
 **Status:** DRAFT
-**Date:** 2026-03-31
+**Date:** 2026-04-01
 **Approved by:** pending
 
 ---
 
-## Current State (Verified Facts — Not Hallucinated)
+## Source: 8-Agent Deep Scan (2026-04-01)
 
-| Metric | Current Value | How Verified |
-|--------|--------------|--------------|
-| Test functions | 7,251 | `grep -rE '#\[test\]' crates/ \| wc -l` |
-| 22 test types | 59/59 PASS | `bash scripts/test-coverage-guard.sh` |
-| Dhan API endpoints | 54/58 implemented | Grep of constants.rs + api_client.rs |
-| Coverage threshold config | 100% all crates | `quality/crate-coverage-thresholds.toml` |
-| Pre-push gates | 7 gates | `.claude/hooks/pre-push-gate.sh` |
-| Tick resilience | PARTIAL — fails on cold start | Code audit of tick_persistence.rs |
-| Monitoring | 85% complete | Audit of observability.rs + dashboards |
-| Disk space | 14GB free / 252GB | `df -h /` |
+| Agent | Scope | Key Findings |
+|-------|-------|-------------|
+| Dhan Market Feed checker | Live feed + annexure vs Python SDK | All packet layouts match. 1 rate limit discrepancy |
+| Dhan Depth/Historical checker | Depth, historical, auth, instruments | Covered by other agents (403 on docs site) |
+| Dhan Quotes/Funds checker | Quote, funds, statements, options, releases | 1 missing endpoint (/charts/rollingoption) |
+| Python SDK checker | Full SDK vs Rust binary parsing | 100% match. Our Rust is more correct in several areas |
+| QuestDB resilience scanner | Tick persistence, buffering, recovery | 5 gaps (1 CRITICAL, 1 HIGH, 2 MEDIUM, 1 LOW) |
+| Test coverage scanner | 22 test types, hooks, enforcement | 7,250 tests. Loom/DHAT need expansion |
+| Security reviewer | OWASP, secrets, input validation | 10 issues (3 HIGH, 4 MEDIUM, 3 LOW) |
+| Hot path reviewer | O(1) verification, allocation detection | 5 findings (1 CRITICAL, 3 WARNING) |
 
 ---
 
-## BLOCK A: Zero Tick Loss Guarantee (Even If QuestDB Down From Start)
+## BLOCK A: Critical Data Safety (Zero Tick Loss)
 
-### Current Gap (Proven by Code Audit)
-- `TickPersistenceWriter::new()` at `crates/storage/src/tick_persistence.rs` returns `Err` if QuestDB unreachable
-- `crates/app/src/main.rs:873-892`: startup failure → `tick_writer = None` → ticks **discarded silently**
-- Ring buffer (300,000 capacity) + disk spill to `data/spill/ticks-YYYYMMDD.bin` only activates AFTER initial QuestDB connection succeeds
-- `recover_stale_spill_files()` exists but requires QuestDB sender to be `Some`
-- **Result**: If QuestDB never connects during entire trading session, ALL ticks are lost
+- [ ] A1: Call `recover_stale_spill_files()` at startup after TickPersistenceWriter::new()
+  - Files: `crates/app/src/main.rs`
+  - Change: After tick_writer creation (line ~873), call `recover_stale_spill_files()` to drain orphaned spill files from previous crashes
+  - Tests: `test_stale_spill_recovery_at_startup`, `test_no_orphaned_ticks_after_crash_restart`
 
-### Fix (3 items)
+- [ ] A2: Increase broadcast channel capacity from 256 to 65536
+  - Files: `crates/app/src/main.rs`, `crates/common/src/constants.rs`
+  - Change: Add `TICK_BROADCAST_CAPACITY = 65_536` constant, use in broadcast::channel() creation
+  - Tests: `test_broadcast_capacity_matches_constant`, `test_cold_path_no_lag_at_high_throughput`
 
-- [ ] A1: Make TickPersistenceWriter start in "disconnected buffering" mode when QuestDB unavailable
+- [ ] A3: Make TickPersistenceWriter start in disconnected buffering mode
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/app/src/main.rs`
-  - Change: `new()` succeeds with `sender = None`, ring buffer + disk spill activate immediately. Background task polls QuestDB every 30s. On connect → drain buffer → set sender.
+  - Change: `new()` succeeds with `sender = None`, ring buffer + disk spill activate immediately. Background reconnect polls every 30s.
   - Tests: `test_tick_writer_starts_without_questdb`, `test_ticks_buffered_before_questdb_available`, `test_reconnect_drains_buffer_after_questdb_starts`
 
-- [ ] A2: Add CRITICAL Telegram alert when tick persistence enters disconnected mode
+- [ ] A4: Add CRITICAL Telegram alert when tick persistence enters disconnected mode
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/core/src/notification/events.rs`
-  - Change: Fire CRITICAL alert on startup if QuestDB unreachable. Repeat every 5 min until connected.
-  - Tests: `test_critical_alert_on_questdb_unavailable`, `test_alert_stops_after_questdb_connects`
+  - Tests: `test_critical_alert_on_questdb_unavailable`
 
-- [ ] A3: Add tick drop counter metric (must always read 0 after this fix)
+- [ ] A5: Add `dlt_ticks_dropped_total` Prometheus counter (must always read 0)
   - Files: `crates/storage/src/tick_persistence.rs`
-  - Change: Add `dlt_ticks_dropped_total` Prometheus counter. Incremented only if both ring buffer AND disk spill fail (should be impossible).
   - Tests: `test_tick_drop_counter_zero_with_buffering`
 
-### Proof Scenarios
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | QuestDB down from market open to close | All ticks in ring buffer + disk spill. Zero loss. CRITICAL alert fires every 5 min. |
-| 2 | QuestDB starts 30 min after market open | Background reconnect detects QuestDB. Drains ring buffer first, then disk spill. All ticks preserved. Alert clears. |
-| 3 | QuestDB crashes mid-day, recovers 10 min later | Existing reconnect logic handles this (already works). New fix covers only cold-start gap. |
-| 4 | Ring buffer fills (300K ticks) before QuestDB starts | Overflow spills to disk. Disk spill has no size limit (bounded only by disk space). |
+---
+
+## BLOCK B: Security Hardening (3 HIGH fixes)
+
+- [ ] B1: Redact bearer token in ApiAuthConfig Debug output
+  - Files: `crates/api/src/middleware.rs`
+  - Change: Replace `#[derive(Debug)]` with manual `fmt::Debug` impl that masks `bearer_token` as `"[REDACTED]"`
+  - Tests: `test_api_auth_config_debug_redacts_token`
+
+- [ ] B2: Redact raw API response body in token_manager error messages
+  - Files: `crates/core/src/auth/token_manager.rs`
+  - Change: At line ~465, use `redact_url_params()` on `body_text` before including in error reason
+  - Tests: `test_profile_error_does_not_leak_response_body`
+
+- [ ] B3: Tighten CORS — restrict methods and headers
+  - Files: `crates/api/src/lib.rs`
+  - Change: Replace `allow_methods(Any)` with `allow_methods([Method::GET, Method::POST, Method::DELETE])`, replace `allow_headers(Any)` with `allow_headers([AUTHORIZATION, CONTENT_TYPE])`
+  - Tests: `test_cors_rejects_disallowed_method`, `test_cors_allows_get_post`
+
+- [ ] B4: Redact internal error details in instruments handler API response
+  - Files: `crates/api/src/handlers/instruments.rs`
+  - Change: At line ~109, replace `format!("rebuild failed: {err}")` with generic `"rebuild failed — check server logs"`
+  - Tests: `test_rebuild_error_does_not_leak_internal_details`
 
 ---
 
-## BLOCK B: Wire 22 Test Type Enforcement Into Pre-Push Gate
+## BLOCK C: Hot Path Performance Fixes
 
-### Current State
-- `scripts/test-coverage-guard.sh` exists, passes 59/59, supports scoped checking
-- NOT wired into `.claude/hooks/pre-push-gate.sh` — can be bypassed on push
+- [ ] C1: Replace `Box<dyn GreeksEnricher>` with concrete type on hot path
+  - Files: `crates/core/src/pipeline/tick_processor.rs`, `crates/common/src/tick_types.rs`
+  - Change: Since there's exactly one implementor (InlineGreeksComputer), use `Option<InlineGreeksComputer>` instead of `Option<Box<dyn GreeksEnricher>>`. Eliminates vtable dispatch on every tick.
+  - Tests: existing tick processing tests + `test_greeks_enricher_no_vtable_dispatch`
 
-### Fix (2 items)
+- [ ] C2: Replace `.collect()` with direct iteration in `rescue_in_flight()`
+  - Files: `crates/storage/src/tick_persistence.rs`
+  - Change: At line ~332, replace `let rescued: Vec<ParsedTick> = self.in_flight.drain(..).collect(); for tick in rescued { ... }` with `while let Some(tick) = self.in_flight.pop() { self.buffer_tick(tick); }`
+  - Tests: `test_rescue_in_flight_no_allocation`
 
-- [ ] B1: Add Gate 8 to pre-push-gate.sh — scoped 22 test type check
-  - Files: `.claude/hooks/pre-push-gate.sh`
-  - Change: Detect changed crates via `git diff`, pass as scope to `scripts/test-coverage-guard.sh`. Fast (<5s). Only checks crates with modified `.rs` files.
-  - Tests: Manual push verification
+- [ ] C3: Add `#[inline]` to all top-level parser functions
+  - Files: `crates/core/src/parser/header.rs`, `ticker.rs`, `quote.rs`, `full_packet.rs`, `oi.rs`, `previous_close.rs`, `disconnect.rs`, `market_depth.rs`, `dispatcher.rs`
+  - Change: Add `#[inline]` to `parse_header`, `parse_ticker_packet`, `parse_quote_packet`, `parse_full_packet`, `parse_oi_packet`, `parse_previous_close_packet`, `parse_disconnect_packet`, `parse_market_depth_packet`, `dispatch_frame`
+  - Tests: benchmark regression check (existing benches)
 
-- [ ] B2: Update enforcement.md to document Gate 8
-  - Files: `.claude/rules/project/enforcement.md`
-  - Change: Add Gate 8 documentation, update gate count 7 → 8
-
----
-
-## BLOCK C: Dhan API Coverage Verification Test
-
-### Audit Results (54/58 — 4 Intentionally Skipped)
-
-**Implemented (54 endpoints):**
-- Orders: 7/7 — place, modify, cancel, slice, book, single, by-correlation
-- Trades: 3/3 — book, by-order, trade-history
-- Super Orders: 4/4 — place, modify, cancel, list
-- Forever Orders: 4/4 — create, modify, delete, list
-- Conditional Triggers: 5/5 — create, modify, delete, get-one, get-all
-- Positions & Holdings: 4/4 — positions, convert, exit-all, holdings
-- Funds & Margin: 3/3 — fund-limit, margin-single, margin-multi
-- Option Chain: 2/2 — chain, expiry-list
-- Historical Charts: 2/2 — daily, intraday
-- EDIS: 3/3 — tpin, form, inquire
-- Profile & Auth: 3/3 — profile, renew-token, generate-access-token
-- IP Management: 3/3 — set, modify, get
-- Kill Switch: 3/3 — activate, deactivate, status
-- P&L Exit: 3/3 — configure, stop, status
-- Statements: 2/2 — ledger, trade-history
-- WebSocket: 4/4 — market-feed, order-update, 20-depth, 200-depth
-- CSV Download: 2/2 — detailed, fallback
-
-**Intentionally NOT Implemented (4 — with justification):**
-| Endpoint | Why Skipped |
-|----------|-------------|
-| `POST /v2/marketfeed/ltp` | WebSocket provides real-time LTP continuously |
-| `POST /v2/marketfeed/ohlc` | WebSocket + candle aggregator provides OHLCV |
-| `POST /v2/marketfeed/quote` | WebSocket Full mode provides quote data |
-| `GET /v2/instrument/{segment}` | CSV download is faster, no auth, no rate limit |
-
-### Fix (1 item)
-
-- [ ] C1: Add integration test verifying all 54 endpoint URL constants exist
-  - Files: `crates/common/tests/dhan_api_coverage.rs`
-  - Tests: `test_all_54_dhan_rest_endpoints_have_constants`, `test_all_4_websocket_urls_defined`, `test_skipped_endpoints_documented`
+- [ ] C4: Replace `Arc<RwLock<Option<TopMoversSnapshot>>>` with `ArcSwap`
+  - Files: `crates/core/src/pipeline/top_movers.rs`, `crates/core/src/pipeline/option_movers.rs`, `crates/api/src/handlers/top_movers.rs`
+  - Change: Use `arc_swap::ArcSwap<Option<TopMoversSnapshot>>` for lock-free reads. Write path (every 5s) uses `store()`, read path uses `load()`.
+  - Tests: existing top_movers tests + `test_top_movers_lock_free_reads`
 
 ---
 
-## BLOCK D: Monitoring & Alerting Gap Fixes
+## BLOCK D: Resilience Enhancements
 
-### Current State (85% Complete)
-- 30+ Prometheus metrics defined and exported to `:9091`
-- Telegram alerts: fully implemented, fire-and-forget async
-- 5 Grafana dashboards: system-overview, market-data, trading-pipeline, logs, traefik
-- OpenTelemetry: OTLP → Jaeger via `dlt-jaeger:4317`
-- Health: `GET /health` returns subsystem status
+- [ ] D1: Add ring buffer + disk spill to LiveCandleWriter (parallel to tick writer)
+  - Files: `crates/storage/src/candle_persistence.rs`
+  - Change: Add `candle_buffer: VecDeque<LiveCandle>` ring buffer (capacity 10,000) + disk spill. Mirror TickPersistenceWriter's 3-tier architecture.
+  - Tests: `test_live_candle_buffered_on_questdb_failure`, `test_live_candle_drained_on_recovery`
 
-### Gaps Found (3 items)
-
-- [ ] D1: Add P&L visualization panel to trading-pipeline Grafana dashboard
-  - Files: `deploy/docker/grafana/dashboards/trading-pipeline.json`
-  - Change: New panel showing `dlt_realized_pnl` + `dlt_unrealized_pnl` time series
-  - Tests: JSON validity (dashboard loads)
-
-- [ ] D2: Add `#[tracing::instrument]` to API handlers for full request tracing
-  - Files: `crates/api/src/handlers/health.rs`, `quote.rs`, `stats.rs`, `top_movers.rs`, `instruments.rs`, `index_constituency.rs`
-  - Tests: Existing handler tests verify no regression
-
-- [ ] D3: Add tick persistence health to `/health` endpoint subsystem check
-  - Files: `crates/api/src/handlers/health.rs`
+- [ ] D2: Add tick persistence health to `/health` endpoint
+  - Files: `crates/api/src/handlers/health.rs`, `crates/api/src/state.rs`
   - Change: Report tick_writer status (connected/buffering/disconnected) in health response
   - Tests: `test_health_reports_tick_persistence_status`
 
 ---
 
-## BLOCK E: Test Quality Hardening
+## BLOCK E: Test Coverage Expansion
 
-### Fix (2 items)
+- [ ] E1: Expand DHAT allocation tests to trading crate hot paths
+  - Files: `crates/trading/tests/dhat_oms_hot_path.rs`
+  - Tests: `test_oms_state_transition_zero_alloc`, `test_risk_check_zero_alloc`
 
-- [ ] E1: Add adversarial tests for tick persistence cold-start scenario
+- [ ] E2: Add adversarial tests for tick persistence cold-start resilience
   - Files: `crates/storage/tests/tick_resilience.rs`
-  - Tests: `test_zero_tick_loss_questdb_down_from_start`, `test_zero_tick_loss_questdb_intermittent`, `test_spill_file_recovery_after_restart`, `test_buffer_capacity_at_300k_limit`, `test_disk_spill_activates_when_buffer_full`
+  - Tests: `test_zero_tick_loss_questdb_down_from_start`, `test_spill_file_recovery_after_restart`, `test_buffer_capacity_at_300k_limit`, `test_disk_spill_activates_when_buffer_full`
 
-- [ ] E2: Add security tests for token handling across all code paths
+- [ ] E3: Add security audit tests for token handling
   - Files: `crates/core/tests/security_audit.rs`
-  - Tests: `test_token_never_in_log_output`, `test_token_never_in_error_display`, `test_token_never_in_debug_format`, `test_secret_zeroized_on_drop`
+  - Tests: `test_token_never_in_log_output`, `test_token_never_in_error_display`, `test_token_never_in_debug_format`
+
+- [ ] E4: Wire 22 test type check into pre-push gate (Gate 8)
+  - Files: `.claude/hooks/pre-push-gate.sh`
+  - Change: Detect changed crates via `git diff`, pass as scope to `scripts/test-coverage-guard.sh`. Fast (<5s).
+  - Tests: Manual push verification
 
 ---
 
-## BLOCK F: Documentation & Rule Updates
+## BLOCK F: Documentation & Enforcement Updates
 
-- [ ] F1: Update CLAUDE.md test count from ~2,439 to 7,251
+- [ ] F1: Fix rate limit discrepancy — align annexure doc with CLAUDE.md
+  - Files: `docs/dhan-ref/08-annexure-enums.md`
+  - Change: Update Order API limits from 500/hr, 5000/day to 1000/hr, 7000/day (CLAUDE.md values are correct per Dhan v2.3 release)
+
+- [ ] F2: Add `/charts/rollingoption` endpoint to historical data reference
+  - Files: `docs/dhan-ref/05-historical-data.md`
+  - Change: Document expired options data endpoint with fields: `securityId`, `exchangeSegment`, `instrument`, `expiryFlag`, `expiryCode`, `strike`, `drvOptionType`, `requiredData`, `fromDate`, `toDate`, `interval`
+
+- [ ] F3: Fix coverage threshold discrepancy in CLAUDE.md (95% → 100%)
   - Files: `CLAUDE.md`
 
-- [ ] F2: Update enforcement.md with Gate 8 (22 test types)
+- [ ] F4: Update CLAUDE.md test count from ~2,439 to 7,250+
+  - Files: `CLAUDE.md`
+
+- [ ] F5: Update enforcement.md with Gate 8 (22 test type check)
   - Files: `.claude/rules/project/enforcement.md`
 
-- [ ] F3: Update pre-push gate count in CLAUDE.md
-  - Files: `CLAUDE.md`
+- [ ] F6: Add Dhan API coverage test verifying all 54 endpoint constants
+  - Files: `crates/common/tests/dhan_api_coverage.rs`
+  - Tests: `test_all_54_dhan_rest_endpoints_have_constants`, `test_all_4_websocket_urls_defined`
 
 ---
 
 ## Implementation Order
 
 ```
-Phase 1: B1 → B2 → F2 → F3           (Wire gate + docs — fastest win, <30 min)
-Phase 2: A1 → A2 → A3 → E1           (Tick resilience — biggest gap fix + tests)
-Phase 3: C1 → E2                      (API coverage test + security tests)
-Phase 4: D1 → D2 → D3                (Monitoring gaps)
-Phase 5: F1                           (Final doc update with new test count)
+Phase 1: A1 → A2 → A3 → A4 → A5    (Data safety — highest production risk)
+Phase 2: B1 → B2 → B3 → B4          (Security — 3 HIGH findings)
+Phase 3: C1 → C2 → C3 → C4          (Hot path — O(1) violations)
+Phase 4: D1 → D2                     (Resilience — candle buffer + health)
+Phase 5: E1 → E2 → E3 → E4          (Test coverage — mechanical enforcement)
+Phase 6: F1 → F2 → F3 → F4 → F5 → F6 (Documentation — accuracy)
 ```
-
-**Rationale:** Gate wiring first (immediately blocks bad pushes). Tick resilience second (biggest production risk). API coverage + security tests third. Monitoring last (already 85% done). Doc updates at end (accurate counts).
 
 ---
 
@@ -187,36 +173,40 @@ Phase 5: F1                           (Final doc update with new test count)
 
 | # | Scenario | Expected | Block |
 |---|----------|----------|-------|
-| 1 | QuestDB down from start to end | All ticks buffered. Zero loss. CRITICAL alert. | A |
-| 2 | QuestDB starts 30 min late | Buffer drains. All ticks preserved. | A |
-| 3 | Push with missing test type in changed crate | Gate 8 blocks push with error. | B |
-| 4 | Push with docs-only changes (no .rs files) | Gate 8 skips (NONE scope). Push proceeds. | B |
-| 5 | CI merge with any crate below 100% coverage | Stage 6 blocks merge. Branch protection enforces. | (existing) |
-| 6 | New pub fn without test | Existing Gate 6 blocks push. | (existing) |
-| 7 | Token in log/error output | Security test catches it. | E |
-| 8 | `/health` called while QuestDB down | Reports tick_persistence: "buffering" | D |
+| 1 | QuestDB down from market open to close | All ticks in ring buffer + disk spill. Zero loss. CRITICAL alert. | A |
+| 2 | App crashes with active spill file, restarts | Stale spill drained at startup. Zero orphaned ticks. | A |
+| 3 | Burst of 1000 ticks in 100ms | Broadcast channel (65536) absorbs burst. Cold-path no lag. | A |
+| 4 | `format!("{:?}", api_auth_config)` | Bearer token shows `[REDACTED]`. | B |
+| 5 | Dhan profile API returns error | Error message does NOT contain raw response body. | B |
+| 6 | CORS preflight with PUT method | Rejected (only GET/POST/DELETE allowed). | B |
+| 7 | Tick processing with greeks enricher | No vtable dispatch, concrete type inlined. | C |
+| 8 | QuestDB flush fails with 1000 in-flight ticks | rescue_in_flight drains without Vec allocation. | C |
+| 9 | Live candles during QuestDB outage | Candles buffered in ring buffer, drained on recovery. | D |
+| 10 | Push with missing test type in changed crate | Gate 8 blocks push. | E |
 
 ---
 
-## What Is NOT In Scope (And Why)
+## What Is NOT In Scope
 
-| Excluded Item | Reason |
-|---------------|--------|
-| 4 skipped REST endpoints (ltp/ohlc/quote/instrument) | WebSocket provides same data real-time; REST is redundant |
-| Alertmanager deployment | Telegram fires directly on CRITICAL; Alertmanager adds complexity for single-user |
-| Mutation testing in pre-push | Too slow (20+ min); CI weekly Monday run by design |
-| Fuzz testing in pre-push | Too slow; CI weekly Monday run by design |
-| Valkey exporter sidecar | QuestDB indirect metrics sufficient; add later if needed |
-| Previous plan items (Sandbox mode, etc.) | Separate plan, already IN_PROGRESS; this plan covers testing/enforcement only |
+| Excluded | Reason |
+|----------|--------|
+| Playwright/browser testing | Rust backend system. 22-type test infra already more comprehensive |
+| 4 skipped REST endpoints (ltp/ohlc/quote/instrument) | WebSocket provides same data real-time |
+| Token encryption on disk (HIGH finding) | Acceptable risk within Docker container; fix separately if deploying outside Docker |
+| DefaultHasher for client_id (MEDIUM finding) | Low risk; fix in future security pass |
+| HTTP to QuestDB (MEDIUM finding) | Internal Docker network only; no external exposure |
+| Public endpoint rate limiting (LOW finding) | Single-user system; add if exposed externally |
+| Localhost in CORS fallback (LOW finding) | Dev-only path; production uses configured origins |
+| expect() in rate_limiter (LOW finding) | Config validation at load time prevents 0 value; fix in future pass |
 
 ---
 
-## Total Items: 16 across 6 blocks
-- **Block A** (Tick resilience): 3 items — HIGHEST priority
-- **Block B** (Gate wiring): 2 items — FASTEST win
-- **Block C** (API coverage test): 1 item
-- **Block D** (Monitoring): 3 items
-- **Block E** (Test hardening): 2 items
-- **Block F** (Docs): 3 items
+## Total: 25 items across 6 blocks
+- **Block A** (Data Safety): 5 items — CRITICAL priority
+- **Block B** (Security): 4 items — HIGH priority
+- **Block C** (Hot Path): 4 items — HIGH priority
+- **Block D** (Resilience): 2 items — MEDIUM priority
+- **Block E** (Test Coverage): 4 items — MEDIUM priority
+- **Block F** (Documentation): 6 items — LOW priority
 - **No new dependencies** — all using existing crates
 - **Every item has specific test functions listed**
