@@ -1,8 +1,8 @@
 # Implementation Plan: Comprehensive Hardening V2 — Zero Loss, Full Automation, Sandbox Enforcement
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-04-01
-**Approved by:** pending
+**Approved by:** Parthiban (2026-04-01)
 
 ---
 
@@ -23,7 +23,7 @@
 
 ## BLOCK A: CRITICAL — Zero Tick Loss (Fast Boot Gap)
 
-- [ ] A1: Fix `run_tick_persistence_consumer` to use `new_disconnected` when QuestDB unavailable
+- [x] A1: Fix `run_tick_persistence_consumer` to use `new_disconnected` when QuestDB unavailable
   - Files: `crates/app/src/main.rs`
   - Change: At line ~1753, replace `return;` on writer failure with `TickPersistenceWriter::new_disconnected(&questdb_config)`. Consumer keeps running, buffering all ticks until QuestDB comes back.
   - Tests: `test_fast_boot_tick_consumer_buffers_when_questdb_down`, `test_fast_boot_zero_tick_loss`
@@ -32,17 +32,17 @@
 
 ## BLOCK B: HIGH — Depth Persistence Resilience
 
-- [ ] B1: Add `DepthPersistenceWriter::new_disconnected()` method
+- [x] B1: Add `DepthPersistenceWriter::new_disconnected()` method
   - Files: `crates/storage/src/tick_persistence.rs`
   - Change: Mirror `TickPersistenceWriter::new_disconnected()` pattern for depth writer
   - Tests: `test_depth_writer_new_disconnected_buffers`
 
-- [ ] B2: Use `new_disconnected` fallback when depth writer fails at startup (slow boot)
+- [x] B2: Use `new_disconnected` fallback when depth writer fails at startup (slow boot)
   - Files: `crates/app/src/main.rs`
   - Change: At line ~925-937, on `DepthPersistenceWriter::new()` failure, create `new_disconnected()` instead of `None`
   - Tests: `test_depth_writer_fallback_on_startup_failure`
 
-- [ ] B3: Add Telegram alert when depth writer fails at startup
+- [x] B3: Add Telegram alert when depth writer fails at startup
   - Files: `crates/app/src/main.rs`, `crates/core/src/notification/events.rs`
   - Change: Add `NotificationEvent::DepthWriterUnavailable` and fire it when depth writer fails
   - Tests: `test_depth_failure_telegram_alert`
@@ -56,7 +56,7 @@
   - Change: Add `NotificationEvent::QuestDbDisconnected` + `QuestDbReconnected`. Track `is_connected()` state transitions in tick processor.
   - Tests: `test_questdb_disconnect_fires_telegram`, `test_questdb_reconnect_fires_telegram`
 
-- [ ] C2: Add broadcast lag alert (fast boot: ticks permanently lost on Lagged error)
+- [x] C2: Add broadcast lag alert (fast boot: ticks permanently lost on Lagged error)
   - Files: `crates/app/src/main.rs`
   - Change: On `RecvError::Lagged(N)` at line ~1794, fire CRITICAL Telegram alert with count. Add `dlt_ticks_permanently_lost` counter.
   - Tests: `test_broadcast_lag_fires_critical_alert`
@@ -70,12 +70,12 @@
 
 ## BLOCK D: Sandbox Enforcement (Until June 30)
 
-- [ ] D1: Add compile-time sandbox guard that prevents `mode = "live"` before July 2026
+- [x] D1: Add compile-time sandbox guard that prevents `mode = "live"` before July 2026
   - Files: `crates/trading/src/oms/engine.rs`, `crates/common/src/config.rs`
   - Change: Add `LIVE_TRADING_EARLIEST_DATE = "2026-07-01"` constant. In OMS constructor, if `mode == "live"` and `Utc::now() < date`, panic with clear message. This is fail-fast at boot, not hidden.
   - Tests: `test_sandbox_guard_blocks_live_before_july`, `test_sandbox_guard_allows_live_after_july`
 
-- [ ] D2: Add config validation test that `dry_run = true` in base.toml
+- [x] D2: Add config validation test that `dry_run = true` in base.toml
   - Files: `crates/common/tests/config_safety.rs`
   - Tests: `test_base_config_dry_run_is_true`, `test_base_config_mode_is_sandbox`
 

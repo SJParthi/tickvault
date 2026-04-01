@@ -1133,6 +1133,30 @@ impl DepthPersistenceWriter {
         })
     }
 
+    /// Creates a depth writer in disconnected buffering mode.
+    ///
+    /// **Use when QuestDB is unavailable at startup.** All depth snapshots are
+    /// buffered in the ring buffer (`DEPTH_BUFFER_CAPACITY`) + disk spill until
+    /// QuestDB becomes available. Auto-reconnect polls every 30 seconds.
+    pub fn new_disconnected(config: &QuestDbConfig) -> Self {
+        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+
+        Self {
+            sender: None,
+            buffer,
+            pending_count: 0,
+            last_flush_ms: current_time_ms(),
+            ilp_conf_string: conf_string,
+            depth_buffer: VecDeque::with_capacity(DEPTH_BUFFER_CAPACITY),
+            in_flight: Vec::with_capacity(DEPTH_FLUSH_BATCH_SIZE),
+            depth_spilled_total: 0,
+            next_reconnect_allowed: std::time::Instant::now(),
+            spill_writer: None,
+            spill_path: None,
+        }
+    }
+
     /// Appends a 5-level depth snapshot to the ILP buffer.
     ///
     /// When QuestDB is down, depth snapshots are held in a ring buffer (up to

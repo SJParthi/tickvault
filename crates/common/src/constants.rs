@@ -1282,6 +1282,17 @@ pub const IST_UTC_OFFSET_SECONDS_I64: i64 = 19_800;
 pub const IST_UTC_OFFSET_NANOS: i64 = 19_800_000_000_000;
 
 // ---------------------------------------------------------------------------
+// Sandbox Guard — Live Trading Date Lock
+// ---------------------------------------------------------------------------
+
+/// Earliest date (IST) when `mode = "live"` is permitted.
+/// Before this date, config validation rejects live mode at startup.
+/// Change these constants ONLY with explicit approval from Parthiban.
+pub const LIVE_TRADING_EARLIEST_YEAR: i32 = 2026;
+pub const LIVE_TRADING_EARLIEST_MONTH: u32 = 7;
+pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
+
+// ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
 // ---------------------------------------------------------------------------
 

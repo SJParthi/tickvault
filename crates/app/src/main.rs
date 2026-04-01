@@ -930,9 +930,19 @@ async fn main() -> Result<()> {
         Err(err) => {
             error!(
                 ?err,
-                "QuestDB depth writer unavailable — market depth will NOT be persisted"
+                "QuestDB depth writer unavailable at startup — buffering depth in ring buffer + \
+                 disk spill until QuestDB comes back"
             );
-            None
+            // B2: Use disconnected mode instead of None — ensures zero depth data loss.
+            // The writer will auto-reconnect every 30s and drain the buffer on recovery.
+            // B3: CRITICAL Telegram alert for depth writer unavailable at startup.
+            notifier.notify(NotificationEvent::Custom {
+                message: "CRITICAL: QuestDB Depth Writer UNAVAILABLE — \
+                          Depth persistence in disconnected mode. \
+                          All depth data buffered until QuestDB comes back."
+                    .to_owned(),
+            });
+            Some(DepthPersistenceWriter::new_disconnected(&config.questdb))
         }
     };
 
@@ -1753,9 +1763,14 @@ async fn run_tick_persistence_consumer(
         Err(err) => {
             warn!(
                 ?err,
-                "cold-path tick persistence writer unavailable — ticks will NOT be persisted"
+                "cold-path tick persistence writer: QuestDB unavailable at startup — \
+                 buffering all ticks in ring buffer + disk spill until QuestDB comes back"
             );
-            return;
+            // CRITICAL FIX: Never return here. Use new_disconnected() so the consumer
+            // keeps running and buffers ALL ticks. The writer will auto-reconnect every
+            // 30 seconds and drain the buffer when QuestDB becomes available.
+            // Without this, fast-boot mode loses ALL ticks when QuestDB is down.
+            TickPersistenceWriter::new_disconnected(&questdb_config)
         }
     };
 
@@ -1792,10 +1807,15 @@ async fn run_tick_persistence_consumer(
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
+                // C2: CRITICAL — ticks permanently lost due to broadcast lag.
+                // This can happen if the persistence consumer is slower than the
+                // tick processor. Track the count and fire metrics.
+                error!(
                     skipped,
-                    "cold-path tick persistence lagged — some ticks not persisted"
+                    "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
+                    skipped
                 );
+                metrics::counter!("dlt_ticks_permanently_lost").increment(skipped);
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 info!(
@@ -1854,10 +1874,11 @@ async fn run_candle_persistence_consumer(
                 aggregator.update(&tick);
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                warn!(
+                error!(
                     skipped,
-                    "cold-path candle consumer lagged — some ticks not aggregated into candles"
+                    "CRITICAL: cold-path candle consumer lagged — {} ticks not aggregated", skipped
                 );
+                metrics::counter!("dlt_candle_ticks_lagged").increment(skipped);
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 // Shutdown: flush remaining candles

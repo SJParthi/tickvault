@@ -833,6 +833,31 @@ impl ApplicationConfig {
             }
         }
 
+        // D1: Sandbox enforcement — prevent live trading before LIVE_TRADING_EARLIEST_DATE.
+        // This is a fail-fast guard at config validation time. If someone sets
+        // mode = "live" before the date, the application refuses to start.
+        if self.strategy.mode.is_live() {
+            let today = (chrono::Utc::now()
+                + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
+            .date_naive();
+            let earliest = match chrono::NaiveDate::from_ymd_opt(
+                crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+                crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+                crate::constants::LIVE_TRADING_EARLIEST_DAY,
+            ) {
+                Some(d) => d,
+                None => bail!("LIVE_TRADING_EARLIEST_DATE constants are invalid"),
+            };
+            if today < earliest {
+                bail!(
+                    "SANDBOX GUARD: live trading mode is locked until {}. \
+                     Current date (IST): {}. Use mode = \"sandbox\" or \"paper\" until then.",
+                    earliest,
+                    today
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -954,7 +979,6 @@ mod tests {
         }
     }
 
-    #[test]
     // -----------------------------------------------------------------------
     // TradingMode tests
     // -----------------------------------------------------------------------
@@ -1641,6 +1665,65 @@ mod tests {
             err.to_string().contains("not-a-date"),
             "error should mention the bad date: {}",
             err
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D1: Sandbox Guard Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sandbox_guard_blocks_live_before_july() {
+        let mut config = make_valid_config();
+        config.strategy.mode = TradingMode::Live;
+        // The guard uses the current system date. Since we're before July 2026,
+        // this should fail. If running after July 2026, the guard is no longer
+        // active and this test should be updated.
+        let today = (chrono::Utc::now()
+            + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
+        .date_naive();
+        let earliest = chrono::NaiveDate::from_ymd_opt(
+            crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+            crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+            crate::constants::LIVE_TRADING_EARLIEST_DAY,
+        )
+        .unwrap();
+        if today < earliest {
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("SANDBOX GUARD"),
+                "should mention SANDBOX GUARD: {}",
+                err
+            );
+        }
+        // If today >= earliest, live mode is permitted — test passes trivially.
+    }
+
+    #[test]
+    fn test_sandbox_and_paper_modes_always_pass_guard() {
+        let mut config = make_valid_config();
+        config.strategy.mode = TradingMode::Sandbox;
+        assert!(config.validate().is_ok(), "sandbox mode should always pass");
+
+        config.strategy.mode = TradingMode::Paper;
+        assert!(config.validate().is_ok(), "paper mode should always pass");
+    }
+
+    #[test]
+    fn test_base_config_dry_run_is_true() {
+        let config = make_valid_config();
+        assert!(
+            config.strategy.dry_run,
+            "default config must have dry_run = true for safety"
+        );
+    }
+
+    #[test]
+    fn test_base_config_mode_is_not_live() {
+        let config = make_valid_config();
+        assert!(
+            !config.strategy.mode.is_live(),
+            "default config must NOT be in live mode"
         );
     }
 }
