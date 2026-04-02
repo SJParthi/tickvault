@@ -1332,6 +1332,7 @@ dependencies = [
  "dhan-live-trader-common",
  "dhat",
  "metrics",
+ "proptest",
  "questdb-rs",
  "redis",
  "reqwest",
