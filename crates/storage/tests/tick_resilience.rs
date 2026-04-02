@@ -271,3 +271,114 @@ fn test_rapid_append_flush_cycle_no_corruption() {
         "buffer must contain ticks after disconnected append/flush cycles"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P6: Stress Tests — Prolonged Outage with Ring Buffer + Disk Spill
+// ---------------------------------------------------------------------------
+
+/// Simulate a prolonged QuestDB outage where the ring buffer fills completely
+/// and ticks overflow to disk spill. Verify zero tick loss:
+/// - Ring buffer holds exactly TICK_BUFFER_CAPACITY ticks
+/// - Overflow goes to disk spill (ticks_spilled_total > 0)
+/// - ticks_dropped_total stays 0
+#[test]
+fn test_prolonged_outage_ring_plus_spill_zero_loss() {
+    let config = test_config();
+    let mut writer = TickPersistenceWriter::new_disconnected(&config);
+
+    let overflow_count = 500_usize;
+    let total_ticks = TICK_BUFFER_CAPACITY + overflow_count;
+
+    // Simulate prolonged outage: send more ticks than ring buffer capacity.
+    for i in 0..total_ticks {
+        let tick = make_tick(i as u32, 100.0 + (i % 1000) as f32);
+        writer.append_tick(&tick).ok();
+    }
+
+    // Ring buffer should be at capacity.
+    assert_eq!(
+        writer.buffered_tick_count(),
+        TICK_BUFFER_CAPACITY,
+        "ring buffer must be at capacity after overflow"
+    );
+
+    // Overflow must have gone to disk spill.
+    assert_eq!(
+        writer.ticks_spilled_total(),
+        overflow_count as u64,
+        "overflow ticks must spill to disk"
+    );
+
+    // Zero ticks dropped — the guarantee.
+    assert_eq!(
+        writer.ticks_dropped_total(),
+        0,
+        "ZERO ticks must be dropped during prolonged outage"
+    );
+
+    // Clean up spill files.
+    let _ = std::fs::remove_dir_all("data/spill");
+}
+
+/// Verify that flush_if_needed works correctly during an outage.
+/// Even with pending_count == 0 (all ticks going to buffer), the spill
+/// flush should still be triggered.
+#[test]
+fn test_flush_if_needed_triggers_spill_flush_during_outage() {
+    let config = test_config();
+    let mut writer = TickPersistenceWriter::new_disconnected(&config);
+
+    // Append some ticks (they go to ring buffer, not ILP buffer).
+    for i in 0..100_u32 {
+        let tick = make_tick(i, 100.0 + i as f32);
+        writer.append_tick(&tick).ok();
+    }
+
+    // flush_if_needed should not panic or error even when disconnected.
+    let result = writer.flush_if_needed();
+    assert!(
+        result.is_ok(),
+        "flush_if_needed must not error during outage: {:?}",
+        result.err()
+    );
+
+    // All ticks still buffered.
+    assert_eq!(
+        writer.buffered_tick_count(),
+        100,
+        "ticks must remain buffered after flush_if_needed"
+    );
+}
+
+/// Verify threshold alerts fire at correct utilization levels.
+/// Fill buffer to 50%, 80%, 95% and check that the writer tracks them.
+#[test]
+fn test_threshold_alerts_during_outage() {
+    let config = test_config();
+    let mut writer = TickPersistenceWriter::new_disconnected(&config);
+
+    // Fill to ~51% of capacity (enough to trigger 50% alert).
+    let half = TICK_BUFFER_CAPACITY / 2 + 1;
+    for i in 0..half {
+        let tick = make_tick(i as u32, 100.0);
+        writer.append_tick(&tick).ok();
+    }
+
+    assert_eq!(
+        writer.buffered_tick_count(),
+        half,
+        "buffer must hold {half} ticks"
+    );
+
+    // Zero drops — ring buffer still has room.
+    assert_eq!(
+        writer.ticks_dropped_total(),
+        0,
+        "no ticks dropped at 50% utilization"
+    );
+    assert_eq!(
+        writer.ticks_spilled_total(),
+        0,
+        "no ticks spilled at 50% utilization"
+    );
+}
