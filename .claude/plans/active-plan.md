@@ -1,8 +1,8 @@
 # Implementation Plan: QuestDB Resilience Hardening + Storage Proptest + Monitoring
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-04-01
-**Approved by:** pending
+**Approved by:** Parthiban ("Go ahead dude")
 
 ## Context
 
@@ -13,37 +13,40 @@ and updated docstrings.
 
 ## Plan Items
 
-- [ ] P1: Add `proptest` dev-dependency to storage crate + property-based tests
+- [x] P1: Add `proptest` dev-dependency to storage crate + property-based tests
   - Files: crates/storage/Cargo.toml, crates/storage/tests/proptest_storage.rs
-  - Tests: proptest_serialize_deserialize_roundtrip, proptest_buffer_count_invariant,
-           proptest_f32_to_f64_clean_never_panics, proptest_spill_record_size_constant,
-           proptest_ring_buffer_never_exceeds_capacity
+  - Tests: proptest_buffer_count_invariant, proptest_ring_buffer_never_exceeds_capacity,
+           proptest_append_tick_always_ok_disconnected, proptest_zero_drops_within_capacity,
+           proptest_rapid_append_flush_no_corruption
 
-- [ ] P2: Add periodic disk spill flush (fsync on heartbeat) for durability
-  - Files: crates/storage/src/tick_persistence.rs
-  - Tests: test_periodic_spill_flush_syncs_writer, test_flush_spill_no_op_when_no_writer
+- [x] P2: Add periodic disk spill flush (fsync on heartbeat) for durability
+  - Files: crates/storage/src/tick_persistence.rs (flush_spill_if_needed, flush_if_needed)
+  - Tests: test_periodic_spill_flush_syncs_writer, test_flush_spill_no_op_when_interval_not_elapsed,
+           test_spill_flush_interval_constant_is_30s
 
-- [ ] P3: Add ring buffer utilization threshold alerts (50%, 80%, 95% → metrics + log)
-  - Files: crates/storage/src/tick_persistence.rs
+- [x] P3: Add ring buffer utilization threshold alerts (50%, 80%, 95% → metrics + log)
+  - Files: crates/storage/src/tick_persistence.rs (check_buffer_thresholds, buffer_tick)
   - Tests: test_buffer_threshold_50_percent_alert, test_buffer_threshold_80_percent_alert,
-           test_buffer_threshold_95_percent_alert, test_no_duplicate_threshold_alerts
+           test_buffer_threshold_95_percent_alert, test_no_duplicate_threshold_alerts,
+           test_threshold_alerts_reset_below_25_percent, test_buffer_threshold_constants_are_ordered
 
-- [ ] P4: Improve post-recovery gap detection from 1-minute to 10-second granularity
-  - Files: crates/storage/src/tick_persistence.rs
-  - Tests: test_gap_check_query_uses_10s_sample, test_gap_check_detects_sub_minute_gaps
+- [x] P4: Improve post-recovery gap detection from 1-minute to 10-second granularity
+  - Files: crates/storage/src/tick_persistence.rs (check_tick_gaps_after_recovery)
+  - Tests: test_gap_check_query_uses_10s_sample, test_gap_check_10s_detects_sub_minute_gaps
 
-- [ ] P5: Fix outdated docstring (line 13-16 says "no buffering" but we DO buffer)
-  - Files: crates/storage/src/tick_persistence.rs
+- [x] P5: Fix outdated docstring (line 13-16 says "no buffering" but we DO buffer)
+  - Files: crates/storage/src/tick_persistence.rs (module docstring)
   - Tests: (docstring only, no test needed)
 
-- [ ] P6: Add stress test for prolonged outage scenario (full ring + disk spill + recovery)
+- [x] P6: Add stress test for prolonged outage scenario (full ring + disk spill + recovery)
   - Files: crates/storage/tests/tick_resilience.rs
   - Tests: test_prolonged_outage_ring_plus_spill_zero_loss,
-           test_concurrent_append_during_threshold_alerts
+           test_flush_if_needed_triggers_spill_flush_during_outage,
+           test_threshold_alerts_during_outage
 
-- [ ] P7: Archive previous plan + run full workspace build + clippy + test
-  - Files: (none — verification only)
-  - Tests: cargo test --workspace
+- [x] P7: Archive previous plan + run full workspace build + clippy + test
+  - Files: crates/app/src/main.rs (clippy fix)
+  - Tests: cargo fmt --check + cargo clippy + cargo test --workspace
 
 ## Scenarios
 
