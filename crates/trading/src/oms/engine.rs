@@ -708,6 +708,80 @@ fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> 
     Ok(())
 }
 
+/// Validates super order target/SL prices relative to entry price and transaction type.
+///
+/// For BUY orders: target must exceed entry, SL must be below entry.
+/// For SELL orders: target must be below entry, SL must exceed entry.
+/// All prices must be positive. Pure function — no I/O.
+///
+/// Used by `place_super_order` (to be wired in OMS super order flow).
+#[allow(dead_code)] // APPROVED: pre-wired for super order placement; called once place_super_order is implemented
+// TEST-EXEMPT: tested by 12 test_super_order_* tests in this module
+pub(crate) fn validate_super_order_prices(
+    transaction_type: &str,
+    price: f64,
+    target_price: f64,
+    stop_loss_price: f64,
+) -> Result<(), OmsError> {
+    if price <= 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("super order entry price must be positive, got {price}"),
+        });
+    }
+    if target_price <= 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("super order target price must be positive, got {target_price}"),
+        });
+    }
+    if stop_loss_price <= 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("super order stop loss price must be positive, got {stop_loss_price}"),
+        });
+    }
+
+    match transaction_type {
+        "BUY" => {
+            if target_price <= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "BUY super order target ({target_price}) must exceed entry price ({price})"
+                    ),
+                });
+            }
+            if stop_loss_price >= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "BUY super order stop loss ({stop_loss_price}) must be below entry price ({price})"
+                    ),
+                });
+            }
+        }
+        "SELL" => {
+            if target_price >= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "SELL super order target ({target_price}) must be below entry price ({price})"
+                    ),
+                });
+            }
+            if stop_loss_price <= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "SELL super order stop loss ({stop_loss_price}) must exceed entry price ({price})"
+                    ),
+                });
+            }
+        }
+        other => {
+            return Err(OmsError::RiskRejected {
+                reason: format!("unknown transaction type for super order: {other}"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Validates disclosed quantity is at least 30% of total quantity (Dhan requirement).
 ///
 /// Returns `Ok(())` if `disclosed_quantity` is 0 (fully disclosed) or meets the
@@ -2933,5 +3007,112 @@ mod tests {
         // Verify histogram macro compiles and doesn't panic when invoked.
         // O(1) atomic call — safe for cold path (order placement).
         metrics::histogram!("dlt_order_placement_duration_ns").record(1000.0_f64);
+    }
+
+    // -----------------------------------------------------------------------
+    // Super order price validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_super_order_buy_target_must_exceed_entry() {
+        let result = validate_super_order_prices("BUY", 100.0, 95.0, 90.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("target"), "error should mention target: {msg}");
+    }
+
+    #[test]
+    fn test_super_order_buy_sl_must_be_below_entry() {
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 105.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("stop loss"),
+            "error should mention stop loss: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_super_order_sell_target_must_be_below_entry() {
+        let result = validate_super_order_prices("SELL", 100.0, 110.0, 105.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("target"), "error should mention target: {msg}");
+    }
+
+    #[test]
+    fn test_super_order_sell_sl_must_exceed_entry() {
+        let result = validate_super_order_prices("SELL", 100.0, 90.0, 95.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("stop loss"),
+            "error should mention stop loss: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_super_order_valid_buy_prices_accepted() {
+        // BUY: target > entry > SL
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 90.0);
+        assert!(
+            result.is_ok(),
+            "valid BUY super order prices must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_super_order_valid_sell_prices_accepted() {
+        // SELL: SL > entry > target
+        let result = validate_super_order_prices("SELL", 100.0, 90.0, 110.0);
+        assert!(
+            result.is_ok(),
+            "valid SELL super order prices must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_super_order_zero_entry_price_rejected() {
+        let result = validate_super_order_prices("BUY", 0.0, 110.0, 90.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("entry price"));
+    }
+
+    #[test]
+    fn test_super_order_zero_target_price_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 0.0, 90.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("target price"));
+    }
+
+    #[test]
+    fn test_super_order_zero_sl_price_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 0.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stop loss price"));
+    }
+
+    #[test]
+    fn test_super_order_buy_target_equal_entry_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 100.0, 90.0);
+        assert!(result.is_err(), "target == entry must be rejected for BUY");
+    }
+
+    #[test]
+    fn test_super_order_buy_sl_equal_entry_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 100.0);
+        assert!(result.is_err(), "SL == entry must be rejected for BUY");
+    }
+
+    #[test]
+    fn test_super_order_unknown_txn_type_rejected() {
+        let result = validate_super_order_prices("UNKNOWN", 100.0, 110.0, 90.0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown transaction type")
+        );
     }
 }

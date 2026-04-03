@@ -33,6 +33,7 @@ use dhan_live_trader_common::constants::{
     TICK_PERSIST_END_SECS_OF_DAY_IST, TIMEFRAME_1D,
 };
 use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
+use dhan_live_trader_common::instrument_types::ExpiryCode;
 use dhan_live_trader_common::tick_types::{
     DhanDailyResponse, DhanIntradayResponse, HistoricalCandle,
 };
@@ -529,7 +530,7 @@ struct DailyRequest {
     exchange_segment: String,
     instrument: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    expiry_code: Option<u8>,
+    expiry_code: Option<ExpiryCode>,
     /// Whether to include Open Interest data in the response.
     /// Required for F&O instruments to receive OI in the `open_interest` array.
     oi: bool,
@@ -3070,7 +3071,7 @@ mod tests {
             security_id: "49081".to_string(),
             exchange_segment: "NSE_FNO".to_string(),
             instrument: "FUTIDX".to_string(),
-            expiry_code: Some(0),
+            expiry_code: Some(ExpiryCode::Current),
             oi: true,
             from_date: "2026-01-01".to_string(),
             to_date: "2026-03-21".to_string(),
