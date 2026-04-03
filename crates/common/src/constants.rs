@@ -1248,6 +1248,10 @@ pub const TICK_SPILL_MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 /// 65,536 ticks at ~112 bytes each = ~7MB. At ~1000 ticks/sec = ~65 seconds.
 pub const TICK_BROADCAST_CAPACITY: usize = 65_536;
 
+/// Broadcast channel capacity for order update consumers (OMS, risk engine).
+/// 256 order updates × ~512 bytes each = ~128KB. At ~10 orders/sec = ~25 seconds.
+pub const ORDER_UPDATE_BROADCAST_CAPACITY: usize = 256;
+
 /// Resilience ring buffer capacity for live candle writer.
 /// Holds candles in memory when QuestDB is down, drains on recovery.
 /// 100,000 candles × ~48 bytes = ~5MB. At ~60 candles/sec = ~27 minutes of data.

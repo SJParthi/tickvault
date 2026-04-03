@@ -1191,7 +1191,9 @@ async fn main() -> Result<()> {
     // Step 10: Spawn order update WebSocket connection
     // -----------------------------------------------------------------------
     let (order_update_sender, _order_update_receiver) =
-        tokio::sync::broadcast::channel::<dhan_live_trader_common::order_types::OrderUpdate>(256);
+        tokio::sync::broadcast::channel::<dhan_live_trader_common::order_types::OrderUpdate>(
+            dhan_live_trader_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+        );
 
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
