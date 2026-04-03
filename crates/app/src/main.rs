@@ -982,24 +982,16 @@ async fn main() -> Result<()> {
     // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
     // Dhan's WebSocket server sends stale market data (last-traded prices from
     // the previous trading day) even on non-trading days. Without this guard,
-    // WebSocket guard: connect ONLY during the data collection window (9:00-15:30 IST)
-    // on trading days. Connecting outside market hours wastes bandwidth, receives stale
-    // ticks, and pollutes QuestDB with post-market data. Muhurat sessions have their
-    // own time window — handled via is_muhurat flag (evening session on Diwali).
-    let is_within_data_window =
-        dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
-            &config.trading.data_collection_start,
-            &config.trading.data_collection_end,
-        );
-    let should_connect_ws = subscription_plan.is_some()
-        && (((is_trading || is_mock_trading) && is_within_data_window) || is_muhurat);
-    if subscription_plan.is_some() && is_trading && !is_within_data_window && !is_muhurat {
-        info!(
-            data_collection_start = %config.trading.data_collection_start,
-            data_collection_end = %config.trading.data_collection_end,
-            "WebSocket pool skipped — trading day but outside data collection window (market closed)"
-        );
-    }
+    // stale ticks pollute the pipeline.
+    //
+    // WebSocket connects IMMEDIATELY on trading/mock/muhurat days regardless of
+    // current time. Pre-market stale ticks are dropped by the tick processor's
+    // ingestion gate: [data_collection_start, data_collection_end) IST.
+    // This ensures all 5 connections are warm and ready before 9:00 AM market open.
+    // At 15:30 PM (market close), market feed + depth WS are disconnected.
+    // Order update WS stays alive until app shutdown.
+    let should_connect_ws =
+        subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
             &token_handle,
@@ -2090,11 +2082,10 @@ async fn run_shutdown_fast(
         );
         tokio::time::sleep(drain).await;
 
-        // Stop real-time data pipeline (WS + tick processor + trading)
+        // Stop real-time market data pipeline (market feed + depth WS only).
+        // Order update WS stays alive until app shutdown (16:00 IST or Ctrl+C)
+        // to capture AMO status updates and post-market order notifications.
         for handle in &ws_handles {
-            handle.abort();
-        }
-        if let Some(ref handle) = order_update_handle {
             handle.abort();
         }
         // Give tick processor time to flush remaining ticks before aborting

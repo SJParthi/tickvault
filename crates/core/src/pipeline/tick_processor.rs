@@ -513,6 +513,23 @@ pub async fn run_tick_processor(
                     continue;
                 }
 
+                // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
+                // WebSocket connects immediately on app start (pre-market warmup),
+                // but stale ticks from previous day are dropped here. At 15:30 PM
+                // the WebSocket is disconnected, but any in-flight ticks at the
+                // boundary are also caught by this gate. O(1): 1 modulo + 1 range check.
+                // Also rejects ticks from previous trading days (stale replays on reconnect).
+                if !is_today_ist(tick.exchange_timestamp, today_ist_day_number) {
+                    stale_day_filtered = stale_day_filtered.saturating_add(1);
+                    m_stale_day.increment(1);
+                    continue;
+                }
+                if !is_within_persist_window(tick.exchange_timestamp) {
+                    outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                    m_outside_hours.increment(1);
+                    continue;
+                }
+
                 // O(1) dedup: skip exact duplicate ticks (same security_id +
                 // timestamp + LTP) resent by Dhan on reconnection.
                 if dedup_ring.is_duplicate(
@@ -532,28 +549,21 @@ pub async fn run_tick_processor(
                     enricher.enrich(&mut tick);
                 }
 
-                // Persist tick to QuestDB — only during market hours [09:00, 15:30) IST
-                // AND only if the tick is from today (rejects stale data from previous days).
-                if let Some(ref mut writer) = tick_writer {
-                    if !is_today_ist(tick.exchange_timestamp, today_ist_day_number) {
-                        stale_day_filtered = stale_day_filtered.saturating_add(1);
-                        m_stale_day.increment(1);
-                    } else if is_within_persist_window(tick.exchange_timestamp) {
-                        if let Err(err) = writer.append_tick(&tick) {
-                            storage_errors = storage_errors.saturating_add(1);
-                            m_storage_errors.increment(1);
-                            if storage_errors <= 100 {
-                                warn!(
-                                    ?err,
-                                    security_id = tick.security_id,
-                                    total_errors = storage_errors,
-                                    "failed to append tick to QuestDB"
-                                );
-                            }
-                        }
-                    } else {
-                        outside_hours_filtered = outside_hours_filtered.saturating_add(1);
-                        m_outside_hours.increment(1);
+                // Persist tick to QuestDB — ingestion gate above already verified
+                // [09:00, 15:30) IST and today's date. This block only handles
+                // QuestDB write errors (connection down, buffer full, etc.).
+                if let Some(ref mut writer) = tick_writer
+                    && let Err(err) = writer.append_tick(&tick)
+                {
+                    storage_errors = storage_errors.saturating_add(1);
+                    m_storage_errors.increment(1);
+                    if storage_errors <= 100 {
+                        warn!(
+                            ?err,
+                            security_id = tick.security_id,
+                            total_errors = storage_errors,
+                            "failed to append tick to QuestDB"
+                        );
                     }
                 }
 
@@ -596,6 +606,20 @@ pub async fn run_tick_processor(
                 let tick_is_valid = is_valid_tick(tick.last_traded_price, tick.exchange_timestamp);
 
                 if tick_is_valid {
+                    // Ingestion gate: drop Full packet ticks outside [9:00 AM, 3:30 PM) IST.
+                    // Same gate as Tick path — prevents stale pre-market and post-market
+                    // data from entering dedup ring, candle aggregator, or QuestDB.
+                    if !is_today_ist(tick.exchange_timestamp, today_ist_day_number) {
+                        stale_day_filtered = stale_day_filtered.saturating_add(1);
+                        m_stale_day.increment(1);
+                        continue;
+                    }
+                    if !is_within_persist_window(tick.exchange_timestamp) {
+                        outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                        m_outside_hours.increment(1);
+                        continue;
+                    }
+
                     // O(1) dedup: skip entire snapshot if tick is exact duplicate.
                     // Market Depth code 3 (timestamp=0) bypasses dedup — each
                     // snapshot is meaningful even without a timestamp.
@@ -614,28 +638,20 @@ pub async fn run_tick_processor(
                         enricher.enrich(&mut tick);
                     }
 
-                    // Persist tick to QuestDB (Full packet with valid timestamp)
-                    // — only during market hours [09:00, 15:30) IST AND today's date.
-                    if let Some(ref mut writer) = tick_writer {
-                        if !is_today_ist(tick.exchange_timestamp, today_ist_day_number) {
-                            stale_day_filtered = stale_day_filtered.saturating_add(1);
-                            m_stale_day.increment(1);
-                        } else if is_within_persist_window(tick.exchange_timestamp) {
-                            if let Err(err) = writer.append_tick(&tick) {
-                                storage_errors = storage_errors.saturating_add(1);
-                                m_storage_errors.increment(1);
-                                if storage_errors <= 100 {
-                                    warn!(
-                                        ?err,
-                                        security_id = tick.security_id,
-                                        total_errors = storage_errors,
-                                        "failed to append tick to QuestDB"
-                                    );
-                                }
-                            }
-                        } else {
-                            outside_hours_filtered = outside_hours_filtered.saturating_add(1);
-                            m_outside_hours.increment(1);
+                    // Persist tick to QuestDB — ingestion gate above already verified
+                    // [09:00, 15:30) IST and today's date.
+                    if let Some(ref mut writer) = tick_writer
+                        && let Err(err) = writer.append_tick(&tick)
+                    {
+                        storage_errors = storage_errors.saturating_add(1);
+                        m_storage_errors.increment(1);
+                        if storage_errors <= 100 {
+                            warn!(
+                                ?err,
+                                security_id = tick.security_id,
+                                total_errors = storage_errors,
+                                "failed to append tick to QuestDB"
+                            );
                         }
                     }
                 } else if !ltp_valid {
@@ -675,8 +691,7 @@ pub async fn run_tick_processor(
                     );
                 }
 
-                // Persist 5-level depth to QuestDB (separate table)
-                // — only during market hours [09:00, 15:30) IST AND today's date.
+                // Ingestion gate for depth: only during [09:00, 15:30) IST today.
                 // For Full packets (code 8), use exchange_timestamp.
                 // For Market Depth standalone (code 3), exchange_timestamp=0,
                 // so derive wall-clock seconds from received_at_nanos.
@@ -688,30 +703,34 @@ pub async fn run_tick_processor(
                 if !is_today_ist(depth_ts_secs, today_ist_day_number) {
                     stale_day_filtered = stale_day_filtered.saturating_add(1);
                     m_stale_day.increment(1);
-                } else if is_within_persist_window(depth_ts_secs) {
-                    m_depth_snapshots.increment(1);
-                    if let Some(ref mut dw) = depth_writer
-                        && let Err(err) = dw.append_depth(
-                            tick.security_id,
-                            tick.exchange_segment_code,
-                            tick.received_at_nanos,
-                            &depth,
-                        )
-                    {
-                        storage_errors = storage_errors.saturating_add(1);
-                        m_storage_errors.increment(1);
-                        if storage_errors <= 100 {
-                            warn!(
-                                ?err,
-                                security_id = tick.security_id,
-                                total_errors = storage_errors,
-                                "failed to append depth to QuestDB"
-                            );
-                        }
-                    }
-                } else {
+                    continue;
+                }
+                if !is_within_persist_window(depth_ts_secs) {
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
+                    continue;
+                }
+
+                // Within market hours — persist depth to QuestDB.
+                m_depth_snapshots.increment(1);
+                if let Some(ref mut dw) = depth_writer
+                    && let Err(err) = dw.append_depth(
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.received_at_nanos,
+                        &depth,
+                    )
+                {
+                    storage_errors = storage_errors.saturating_add(1);
+                    m_storage_errors.increment(1);
+                    if storage_errors <= 100 {
+                        warn!(
+                            ?err,
+                            security_id = tick.security_id,
+                            total_errors = storage_errors,
+                            "failed to append depth to QuestDB"
+                        );
+                    }
                 }
 
                 // O(1) broadcast to browser WebSocket clients (if tick has valid LTP).
@@ -1073,6 +1092,23 @@ mod tests {
         RESPONSE_CODE_PREVIOUS_CLOSE, TICKER_OFFSET_LTP, TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
     };
 
+    /// Compute an IST epoch timestamp for today at the given hour/minute/second.
+    /// Uses the same IST day-number logic as the tick processor so that
+    /// `is_today_ist()` returns `true` for the result.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helper, bounded arithmetic
+    fn today_ist_epoch_at(hours: u32, minutes: u32, seconds: u32) -> u32 {
+        // IST epoch seconds for current wall-clock instant.
+        let now_utc = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch") // APPROVED: test-only
+            .as_secs() as u32;
+        // IST = UTC + 19800 seconds (5:30 offset).
+        let now_ist = now_utc + 19800;
+        // Today's IST midnight = strip time-of-day.
+        let today_midnight_ist = (now_ist / SECONDS_PER_DAY) * SECONDS_PER_DAY;
+        today_midnight_ist + hours * 3600 + minutes * 60 + seconds
+    }
+
     /// Build a valid ticker binary frame for testing.
     fn make_ticker_frame(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
         let mut buf = vec![0u8; TICKER_PACKET_SIZE];
@@ -1099,7 +1135,7 @@ mod tests {
         });
 
         // Send a valid ticker frame
-        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Give processor time to process
@@ -1128,7 +1164,7 @@ mod tests {
             .unwrap();
 
         // Send a valid frame after — should still work
-        let valid_frame = make_ticker_frame(13, 24500.0, 1772073900);
+        let valid_frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx
             .send(bytes::Bytes::from(valid_frame))
             .await
@@ -1153,7 +1189,7 @@ mod tests {
         });
 
         // Send a ticker frame with LTP=0.0 — should be filtered (not crash)
-        let frame = make_ticker_frame(13, 0.0, 1772073900);
+        let frame = make_ticker_frame(13, 0.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1195,11 +1231,11 @@ mod tests {
         });
 
         // Send junk tick first (LTP=0)
-        let junk = make_ticker_frame(13, 0.0, 1772073900);
+        let junk = make_ticker_frame(13, 0.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(junk)).await.unwrap();
 
         // Then send valid tick — processor should not crash
-        let valid = make_ticker_frame(13, 24500.0, 1772073900);
+        let valid = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(valid)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1317,7 +1353,7 @@ mod tests {
         // (Full packet uses same offsets for LTP/LTT as ticker)
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -1344,7 +1380,7 @@ mod tests {
         }
 
         // Send a valid frame after — processor should still work.
-        let valid = make_ticker_frame(13, 24500.0, 1772073900);
+        let valid = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(valid)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1367,7 +1403,7 @@ mod tests {
         });
 
         // Send a valid tick so frames_processed > 0
-        let frame = make_ticker_frame(42, 25000.0, 1772073900);
+        let frame = make_ticker_frame(42, 25000.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1389,7 +1425,7 @@ mod tests {
         });
 
         // Send first valid tick
-        let frame1 = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame1 = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame1)).await.unwrap();
 
         // Wait > 100ms so periodic flush elapsed check triggers
@@ -1416,7 +1452,7 @@ mod tests {
         });
 
         for _ in 0..15 {
-            let junk = make_ticker_frame(13, 0.0, 1772073900);
+            let junk = make_ticker_frame(13, 0.0, today_ist_epoch_at(10, 0, 0));
             frame_tx.send(bytes::Bytes::from(junk)).await.unwrap();
         }
 
@@ -1436,7 +1472,7 @@ mod tests {
         });
 
         // LTP = -1.0 should be filtered as junk
-        let frame = make_ticker_frame(13, -1.0, 1772073900);
+        let frame = make_ticker_frame(13, -1.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1464,13 +1500,19 @@ mod tests {
         // Valid tick
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                13, 24500.0, 1772073900,
+                13,
+                24500.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
         // Junk tick (LTP=0)
         frame_tx
-            .send(bytes::Bytes::from(make_ticker_frame(14, 0.0, 1772073900)))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                14,
+                0.0,
+                today_ist_epoch_at(10, 0, 0),
+            )))
             .await
             .unwrap();
         // Junk tick (timestamp=0)
@@ -1547,7 +1589,7 @@ mod tests {
         // Set LTP=0.0 and valid timestamp
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&0.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1569,7 +1611,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&25000.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1590,7 +1632,8 @@ mod tests {
 
         // Send 50 valid frames
         for i in 0..50 {
-            let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900);
+            let frame =
+                make_ticker_frame(13 + i, 24500.0 + (i as f32), today_ist_epoch_at(10, 0, 0));
             frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
@@ -1734,7 +1777,7 @@ mod tests {
         });
 
         // Send a valid tick
-        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Wait > 100ms to trigger periodic flush check
@@ -1787,7 +1830,8 @@ mod tests {
 
         // Send valid ticks — they buffer successfully but flush will fail
         for i in 0..5 {
-            let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900);
+            let frame =
+                make_ticker_frame(13 + i, 24500.0 + (i as f32), today_ist_epoch_at(10, 0, 0));
             frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
@@ -1927,7 +1971,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Send a Market Depth packet (code 3) with valid LTP but no timestamp
@@ -1953,43 +1997,43 @@ mod tests {
     #[test]
     fn test_dedup_ring_new_tick_not_duplicate() {
         let mut ring = TickDedupRing::new(8); // 256 slots
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_same_tick_is_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
-        assert!(ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_third_identical_also_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
-        assert!(ring.is_duplicate(13, 1772073900, 24500.0));
-        assert!(ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_security_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
-        assert!(!ring.is_duplicate(14, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_duplicate(14, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_timestamp_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
         assert!(!ring.is_duplicate(13, 1772073901, 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_ltp_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
-        assert!(!ring.is_duplicate(13, 1772073900, 24501.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24501.0));
     }
 
     #[test]
@@ -2012,16 +2056,16 @@ mod tests {
         // will eventually evict earlier ones, allowing re-insertion.
         let mut ring = TickDedupRing::new(8); // 256 slots
         // Insert first tick
-        assert!(!ring.is_duplicate(13, 1772073900, 24500.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
         // Fill buffer with other entries to force eviction
         for i in 1..=512 {
-            ring.is_duplicate(i + 100, 1772073900, 24500.0 + (i as f32));
+            ring.is_duplicate(i + 100, today_ist_epoch_at(10, 0, 0), 24500.0 + (i as f32));
         }
         // Original entry may have been evicted — should no longer be duplicate
         // (This tests that the ring buffer has finite memory and old entries are lost)
         // Note: this is probabilistic based on hash distribution.
         // We don't assert the result — just verify it doesn't panic.
-        let _ = ring.is_duplicate(13, 1772073900, 24500.0);
+        let _ = ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0);
     }
 
     #[test]
@@ -2029,7 +2073,7 @@ mod tests {
         let mut ring = TickDedupRing::new(12); // 4096 slots
         // Alternating security IDs should not confuse the dedup
         for round in 0..3 {
-            let ts = 1772073900 + round;
+            let ts = today_ist_epoch_at(10, 0, 0) + round;
             assert!(!ring.is_duplicate(13, ts, 24500.0));
             assert!(!ring.is_duplicate(14, ts, 24500.0));
             assert!(!ring.is_duplicate(15, ts, 24500.0));
@@ -2042,17 +2086,17 @@ mod tests {
 
     #[test]
     fn test_dedup_ring_fingerprint_deterministic() {
-        let fp1 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
-        let fp2 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
+        let fp1 = TickDedupRing::fingerprint(13, today_ist_epoch_at(10, 0, 0), 24500.0);
+        let fp2 = TickDedupRing::fingerprint(13, today_ist_epoch_at(10, 0, 0), 24500.0);
         assert_eq!(fp1, fp2);
     }
 
     #[test]
     fn test_dedup_ring_fingerprint_distinct_for_different_inputs() {
-        let fp1 = TickDedupRing::fingerprint(13, 1772073900, 24500.0);
-        let fp2 = TickDedupRing::fingerprint(14, 1772073900, 24500.0);
+        let fp1 = TickDedupRing::fingerprint(13, today_ist_epoch_at(10, 0, 0), 24500.0);
+        let fp2 = TickDedupRing::fingerprint(14, today_ist_epoch_at(10, 0, 0), 24500.0);
         let fp3 = TickDedupRing::fingerprint(13, 1772073901, 24500.0);
-        let fp4 = TickDedupRing::fingerprint(13, 1772073900, 24501.0);
+        let fp4 = TickDedupRing::fingerprint(13, today_ist_epoch_at(10, 0, 0), 24501.0);
         assert_ne!(fp1, fp2);
         assert_ne!(fp1, fp3);
         assert_ne!(fp1, fp4);
@@ -2079,7 +2123,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, f32::NAN, 1772073900);
+        let frame = make_ticker_frame(13, f32::NAN, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2095,7 +2139,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, f32::INFINITY, 1772073900);
+        let frame = make_ticker_frame(13, f32::INFINITY, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2111,7 +2155,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, f32::NEG_INFINITY, 1772073900);
+        let frame = make_ticker_frame(13, f32::NEG_INFINITY, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2130,7 +2174,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2150,7 +2194,7 @@ mod tests {
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4]
             .copy_from_slice(&f32::INFINITY.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2203,7 +2247,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx
             .send(bytes::Bytes::from(frame.clone()))
             .await
@@ -2226,7 +2270,9 @@ mod tests {
         });
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                13, 24500.0, 1772073900,
+                13,
+                24500.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2253,13 +2299,17 @@ mod tests {
         });
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                13, 24500.0, 1772073900,
+                13,
+                24500.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                13, 24501.0, 1772073900,
+                13,
+                24501.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2280,13 +2330,17 @@ mod tests {
         });
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                13, 24500.0, 1772073900,
+                13,
+                24500.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                14, 24500.0, 1772073900,
+                14,
+                24500.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2305,7 +2359,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         for _ in 0..100 {
             frame_tx
                 .send(bytes::Bytes::from(frame.clone()))
@@ -2329,13 +2383,19 @@ mod tests {
         });
         // Send junk tick
         frame_tx
-            .send(bytes::Bytes::from(make_ticker_frame(13, 0.0, 1772073900)))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                13,
+                0.0,
+                today_ist_epoch_at(10, 0, 0),
+            )))
             .await
             .unwrap();
         // Send valid tick for same security — should NOT be treated as duplicate
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                13, 24500.0, 1772073900,
+                13,
+                24500.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2357,7 +2417,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx
             .send(bytes::Bytes::from(frame.clone()))
             .await
@@ -2408,7 +2468,7 @@ mod tests {
             .await;
         });
         let subnormal: f32 = f32::MIN_POSITIVE / 2.0;
-        let frame = make_ticker_frame(13, subnormal, 1772073900);
+        let frame = make_ticker_frame(13, subnormal, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2425,7 +2485,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, -0.0, 1772073900);
+        let frame = make_ticker_frame(13, -0.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2442,7 +2502,7 @@ mod tests {
             .await;
         });
         // u32::MAX security_id with valid LTP and timestamp
-        let mut frame = make_ticker_frame(0, 24500.0, 1772073900);
+        let mut frame = make_ticker_frame(0, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2499,14 +2559,16 @@ mod tests {
         });
 
         // 1. Index Ticker (code 1)
-        let mut idx_tick = make_ticker_frame(13, 24500.0, 1772073900);
+        let mut idx_tick = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         idx_tick[0] = 1; // RESPONSE_CODE_INDEX_TICKER
         frame_tx.send(bytes::Bytes::from(idx_tick)).await.unwrap();
 
         // 2. Ticker (code 2) — already default from make_ticker_frame
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
-                14, 24600.0, 1772073900,
+                14,
+                24600.0,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2555,7 +2617,7 @@ mod tests {
         let mut full = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         full[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24800.0_f32.to_le_bytes());
         full[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(full)).await.unwrap();
 
         // 9. Disconnect (code 50)
@@ -2579,13 +2641,13 @@ mod tests {
             )
             .await;
         });
-        let frame_a = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame_a = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx
             .send(bytes::Bytes::from(frame_a.clone()))
             .await
             .unwrap();
         frame_tx.send(bytes::Bytes::from(frame_a)).await.unwrap(); // duplicate
-        let frame_b = make_ticker_frame(13, 24501.0, 1772073900);
+        let frame_b = make_ticker_frame(13, 24501.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame_b)).await.unwrap(); // NOT duplicate (different LTP)
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -2604,7 +2666,7 @@ mod tests {
         });
 
         // Valid tick
-        let valid1 = make_ticker_frame(13, 24500.0, 1772073900);
+        let valid1 = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx
             .send(bytes::Bytes::from(valid1.clone()))
             .await
@@ -2613,7 +2675,11 @@ mod tests {
         frame_tx.send(bytes::Bytes::from(valid1)).await.unwrap();
         // Junk (LTP=0)
         frame_tx
-            .send(bytes::Bytes::from(make_ticker_frame(14, 0.0, 1772073900)))
+            .send(bytes::Bytes::from(make_ticker_frame(
+                14,
+                0.0,
+                today_ist_epoch_at(10, 0, 0),
+            )))
             .await
             .unwrap();
         // NaN LTP
@@ -2621,7 +2687,7 @@ mod tests {
             .send(bytes::Bytes::from(make_ticker_frame(
                 15,
                 f32::NAN,
-                1772073900,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2630,7 +2696,7 @@ mod tests {
             .send(bytes::Bytes::from(make_ticker_frame(
                 16,
                 f32::INFINITY,
-                1772073900,
+                today_ist_epoch_at(10, 0, 0),
             )))
             .await
             .unwrap();
@@ -2914,6 +2980,54 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Ingestion gate semantic tests — verifies gate drops ticks entirely
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ingestion_gate_pre_market_tick_dropped_before_all_processing() {
+        // Pre-market tick (08:59:59 IST) must be dropped BEFORE dedup ring,
+        // candle aggregator, top movers, and broadcast — not just QuestDB persistence.
+        // This test verifies the gate function rejects pre-market timestamps.
+        let pre_market_ts = ist_hms_to_ist_epoch(8, 59, 59);
+        assert!(
+            !is_within_persist_window(pre_market_ts),
+            "pre-market tick must be rejected by ingestion gate"
+        );
+        // The tick processor calls `continue` on this result, so no downstream
+        // processing (dedup, greeks, persistence, broadcast, candles, movers) occurs.
+    }
+
+    #[test]
+    fn test_ingestion_gate_post_market_tick_dropped_before_all_processing() {
+        // Post-market tick (15:30:00 IST) must be dropped BEFORE all processing.
+        let post_market_ts = ist_hms_to_ist_epoch(15, 30, 0);
+        assert!(
+            !is_within_persist_window(post_market_ts),
+            "post-market tick (15:30 exclusive) must be rejected by ingestion gate"
+        );
+    }
+
+    #[test]
+    fn test_ingestion_gate_last_valid_tick_accepted() {
+        // 15:29:59 IST is the last second that passes the gate.
+        let last_valid_ts = ist_hms_to_ist_epoch(15, 29, 59);
+        assert!(
+            is_within_persist_window(last_valid_ts),
+            "15:29:59 IST must pass the ingestion gate (last valid candle)"
+        );
+    }
+
+    #[test]
+    fn test_ingestion_gate_first_valid_tick_accepted() {
+        // 09:00:00 IST is the first second that passes the gate.
+        let first_valid_ts = ist_hms_to_ist_epoch(9, 0, 0);
+        assert!(
+            is_within_persist_window(first_valid_ts),
+            "09:00:00 IST must pass the ingestion gate (market open)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // depth_prices_are_finite — pure function tests
     // -----------------------------------------------------------------------
 
@@ -3035,17 +3149,17 @@ mod tests {
         // NaN != NaN in IEEE 754, but to_bits() gives consistent bits.
         // Two NaN ticks with same sec+ts should be detected as duplicate.
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, f32::NAN));
-        assert!(ring.is_duplicate(13, 1772073900, f32::NAN));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
+        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
     }
 
     #[test]
     fn test_dedup_ring_neg_zero_vs_pos_zero() {
         // -0.0 and +0.0 have different bit patterns in IEEE 754.
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, 1772073900, 0.0));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 0.0));
         // -0.0 has a different bit pattern → should NOT be a duplicate
-        assert!(!ring.is_duplicate(13, 1772073900, -0.0_f32));
+        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), -0.0_f32));
     }
 
     #[test]
@@ -3053,12 +3167,12 @@ mod tests {
         let mut ring = TickDedupRing::new(16); // 65536 slots
         // Insert many unique entries
         for i in 0..1000 {
-            assert!(!ring.is_duplicate(i, 1772073900, 24500.0));
+            assert!(!ring.is_duplicate(i, today_ist_epoch_at(10, 0, 0), 24500.0));
         }
         // Re-insert all — most should still be duplicates (65536 >> 1000)
         let mut dups = 0;
         for i in 0..1000 {
-            if ring.is_duplicate(i, 1772073900, 24500.0) {
+            if ring.is_duplicate(i, today_ist_epoch_at(10, 0, 0), 24500.0) {
                 dups += 1;
             }
         }
@@ -3094,7 +3208,7 @@ mod tests {
         let invalid_ltp_nan = f32::NAN;
         let invalid_ltp_inf = f32::INFINITY;
         let invalid_ltp_neg = -1.0_f32;
-        let valid_ts = 1772073900_u32;
+        let valid_ts = today_ist_epoch_at(10, 0, 0);
         let invalid_ts = 0_u32;
 
         // Valid tick
@@ -3128,7 +3242,7 @@ mod tests {
     fn test_tick_with_depth_validity_logic() {
         // Simulates the tick_is_valid + ltp_valid logic for TickWithDepth
         let ltp = 24500.0_f32;
-        let ts_valid = 1772073900_u32;
+        let ts_valid = today_ist_epoch_at(10, 0, 0);
         let ts_zero = 0_u32;
 
         let ltp_valid = ltp.is_finite() && ltp > 0.0;
@@ -3246,27 +3360,27 @@ mod tests {
     #[test]
     fn test_is_valid_tick_valid_inputs() {
         assert!(is_valid_tick(24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP));
-        assert!(is_valid_tick(100.0, 1772073900));
+        assert!(is_valid_tick(100.0, today_ist_epoch_at(10, 0, 0)));
     }
 
     #[test]
     fn test_is_valid_tick_zero_ltp() {
-        assert!(!is_valid_tick(0.0, 1772073900));
+        assert!(!is_valid_tick(0.0, today_ist_epoch_at(10, 0, 0)));
     }
 
     #[test]
     fn test_is_valid_tick_nan_ltp() {
-        assert!(!is_valid_tick(f32::NAN, 1772073900));
+        assert!(!is_valid_tick(f32::NAN, today_ist_epoch_at(10, 0, 0)));
     }
 
     #[test]
     fn test_is_valid_tick_inf_ltp() {
-        assert!(!is_valid_tick(f32::INFINITY, 1772073900));
+        assert!(!is_valid_tick(f32::INFINITY, today_ist_epoch_at(10, 0, 0)));
     }
 
     #[test]
     fn test_is_valid_tick_negative_ltp() {
-        assert!(!is_valid_tick(-1.0, 1772073900));
+        assert!(!is_valid_tick(-1.0, today_ist_epoch_at(10, 0, 0)));
     }
 
     #[test]
@@ -3379,7 +3493,12 @@ mod tests {
     #[test]
     fn test_utc_nanos_to_ist_secs_of_day_result_in_range() {
         // Any valid input should produce secs_of_day in [0, 86400)
-        for epoch_secs in [0_i64, 1772073900, 1_000_000_000, i64::MAX / 2] {
+        for epoch_secs in [
+            0_i64,
+            i64::from(today_ist_epoch_at(10, 0, 0)),
+            1_000_000_000,
+            i64::MAX / 2,
+        ] {
             let nanos = epoch_secs.saturating_mul(1_000_000_000);
             let secs = utc_nanos_to_ist_secs_of_day(nanos);
             assert!(
@@ -3415,8 +3534,12 @@ mod tests {
     #[test]
     fn test_derive_depth_timestamp_valid_tick() {
         // tick_is_valid = true → use exchange_timestamp
-        let ts = derive_depth_timestamp_secs(true, 1772073900, 1_772_000_000_000_000_000);
-        assert_eq!(ts, 1772073900);
+        let ts = derive_depth_timestamp_secs(
+            true,
+            today_ist_epoch_at(10, 0, 0),
+            1_772_000_000_000_000_000,
+        );
+        assert_eq!(ts, today_ist_epoch_at(10, 0, 0));
     }
 
     #[test]
@@ -3477,8 +3600,10 @@ mod tests {
             .await;
         });
 
-        // Send valid tick — should be broadcast
-        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        // Send valid tick — should be broadcast.
+        // Timestamp must be today + within [09:00, 15:30) IST to pass ingestion gate.
+        let valid_ts = today_ist_epoch_at(10, 0, 0);
+        let frame = make_ticker_frame(13, 24500.0, valid_ts);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Receive from broadcast
@@ -3519,7 +3644,11 @@ mod tests {
 
         // Send valid ticks
         for i in 0..5 {
-            let frame = make_ticker_frame(13 + i, 24500.0 + (i as f32), 1772073900 + i);
+            let frame = make_ticker_frame(
+                13 + i,
+                24500.0 + (i as f32),
+                today_ist_epoch_at(10, 0, 0) + i,
+            );
             frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         }
 
@@ -3558,7 +3687,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3654,7 +3783,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, 0.0, 1772073900);
+        let frame = make_ticker_frame(13, 0.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -3675,7 +3804,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&0.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
@@ -3697,7 +3826,7 @@ mod tests {
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
         frame[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
-            .copy_from_slice(&1772073900_u32.to_le_bytes());
+            .copy_from_slice(&today_ist_epoch_at(10, 0, 0).to_le_bytes());
         // Set bid_price > ask_price at depth level 0 (offset 62 in full packet)
         // Level 0: bid_qty@62, ask_qty@66, bid_orders@70, ask_orders@72,
         //          bid_price@74, ask_price@78
@@ -3789,7 +3918,7 @@ mod tests {
             )
             .await;
         });
-        let frame = make_ticker_frame(13, 24500.0, 1772073900);
+        let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(frame_tx);
