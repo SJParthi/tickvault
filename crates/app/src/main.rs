@@ -464,13 +464,26 @@ async fn main() -> Result<()> {
                     ensure_greeks_tables(&config.questdb),
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
-                let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
+                // Gap 5: log on failure instead of silent drop.
+                if let Err(err) =
+                    calendar_persistence::persist_calendar(&trading_calendar, &config.questdb)
+                {
+                    warn!(
+                        ?err,
+                        "calendar persistence failed (non-critical, best-effort)"
+                    );
+                }
 
                 // Re-persist instrument data ONLY for CachedPlan path.
                 // FreshBuild already persisted inside load_or_build_instruments.
                 // Double-persist creates duplicate rows in QuestDB snapshot tables.
                 if _needs_persist && let Some(ref universe) = fresh_universe {
-                    let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+                    if let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await {
+                        warn!(
+                            ?err,
+                            "instrument snapshot persistence failed (non-critical)"
+                        );
+                    }
                 }
 
                 info!("QuestDB DDL complete (background)");
@@ -873,7 +886,12 @@ async fn main() -> Result<()> {
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
-    let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
+    if let Err(err) = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb) {
+        warn!(
+            ?err,
+            "calendar persistence failed (non-critical, best-effort)"
+        );
+    }
 
     // Health status — created early so tick persistence status can be set.
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
@@ -917,7 +935,14 @@ async fn main() -> Result<()> {
             let mut writer = TickPersistenceWriter::new_disconnected(&config.questdb);
             // Also recover any stale spill files (will skip since sender is None,
             // but sets up the path for when reconnect succeeds).
-            let _ = writer.recover_stale_spill_files();
+            // recover_stale_spill_files returns count, not Result — no error to handle.
+            let recovered = writer.recover_stale_spill_files();
+            if recovered > 0 {
+                info!(
+                    recovered,
+                    "recovered stale tick spill files from previous crash"
+                );
+            }
             Some(writer)
         }
     };
@@ -958,7 +983,12 @@ async fn main() -> Result<()> {
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
     if needs_instrument_persist && let Some(ref universe) = slow_boot_universe {
-        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+        if let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await {
+            warn!(
+                ?err,
+                "instrument snapshot persistence failed (non-critical)"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
