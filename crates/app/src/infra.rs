@@ -358,11 +358,11 @@ pub fn check_spill_file_size() -> u64 {
     let mut total_bytes: u64 = 0;
     let mut file_count: u64 = 0;
     for entry in dir.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() {
-                total_bytes = total_bytes.saturating_add(meta.len());
-                file_count = file_count.saturating_add(1);
-            }
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            total_bytes = total_bytes.saturating_add(meta.len());
+            file_count = file_count.saturating_add(1);
         }
     }
     metrics::gauge!("dlt_spill_files_total_bytes").set(total_bytes as f64);
