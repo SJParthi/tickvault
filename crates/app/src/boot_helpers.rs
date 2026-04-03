@@ -289,6 +289,9 @@ pub fn spawn_heartbeat_watchdog(
 
             // L4: Export system metrics (open FDs, thread count) every watchdog cycle.
             crate::infra::export_system_metrics();
+
+            // C1: Emit systemd watchdog heartbeat (no-op if not under systemd).
+            crate::infra::notify_systemd_watchdog();
         }
     })
 }

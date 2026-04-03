@@ -33,6 +33,9 @@ const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Timeout for QuestDB liveness HTTP check (SELECT 1).
+const QUESTDB_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 // O(1) EXEMPT: end
 
 /// Path to docker-compose file relative to project root.
@@ -275,6 +278,129 @@ pub fn check_memory_rss() -> Option<u64> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+/// C1: Sends systemd watchdog heartbeat (`WATCHDOG=1`) via `$NOTIFY_SOCKET`.
+///
+/// Called every watchdog cycle (30s). If `$NOTIFY_SOCKET` is not set (e.g.,
+/// running outside systemd, on macOS, or in Docker), this is a no-op.
+/// No new crate needed — uses raw Unix datagram socket.
+// TEST-EXEMPT: requires $NOTIFY_SOCKET (systemd only), no-op otherwise — tested by systemd integration
+pub fn notify_systemd_watchdog() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixDatagram;
+
+        let socket_path = match std::env::var("NOTIFY_SOCKET") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return, // Not running under systemd — no-op.
+        };
+
+        let sock = match UnixDatagram::unbound() {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(?err, "sd_notify: failed to create datagram socket");
+                return;
+            }
+        };
+
+        if let Err(err) = sock.send_to(b"WATCHDOG=1", &socket_path) {
+            tracing::warn!(?err, path = %socket_path, "sd_notify: failed to send WATCHDOG=1");
+        }
+    }
+}
+
+/// C1: Sends systemd `READY=1` notification (called once after boot).
+// TEST-EXEMPT: requires $NOTIFY_SOCKET (systemd only), no-op otherwise — tested by systemd integration
+pub fn notify_systemd_ready() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixDatagram;
+
+        let socket_path = match std::env::var("NOTIFY_SOCKET") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+
+        let sock = match UnixDatagram::unbound() {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "sd_notify: failed to create datagram socket for READY"
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = sock.send_to(b"READY=1", &socket_path) {
+            tracing::warn!(?err, "sd_notify: failed to send READY=1");
+        } else {
+            tracing::info!("sd_notify: READY=1 sent to systemd");
+        }
+    }
+}
+
+/// C2: Returns the total size (bytes) of tick spill files in `data/spill/`.
+///
+/// Exports the value as a Prometheus gauge for monitoring unbounded disk growth.
+// TEST-EXEMPT: requires data/spill directory with files — tested indirectly by tick_resilience integration tests
+pub fn check_spill_file_size() -> u64 {
+    let dir = match std::fs::read_dir("data/spill") {
+        Ok(d) => d,
+        Err(_) => {
+            metrics::gauge!("dlt_spill_files_total_bytes").set(0.0);
+            return 0;
+        }
+    };
+
+    let mut total_bytes: u64 = 0;
+    let mut file_count: u64 = 0;
+    for entry in dir.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total_bytes = total_bytes.saturating_add(meta.len());
+                file_count = file_count.saturating_add(1);
+            }
+        }
+    }
+    metrics::gauge!("dlt_spill_files_total_bytes").set(total_bytes as f64);
+    metrics::gauge!("dlt_spill_file_count").set(file_count as f64);
+    total_bytes
+}
+
+/// C3: Pings QuestDB via HTTP `SELECT 1` to verify it's alive.
+///
+/// Returns `true` if QuestDB responds, `false` otherwise.
+/// Exports result as Prometheus gauge.
+// TEST-EXEMPT: requires running QuestDB — tested indirectly by storage integration tests
+pub async fn check_questdb_liveness(config: &QuestDbConfig) -> bool {
+    let url = format!(
+        "http://{}:{}/exec?query=SELECT%201",
+        config.host, config.http_port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(QUESTDB_LIVENESS_TIMEOUT)
+        .build();
+    let client = match client {
+        Ok(c) => c,
+        Err(_) => {
+            metrics::gauge!("dlt_questdb_alive").set(0.0);
+            return false;
+        }
+    };
+
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            metrics::gauge!("dlt_questdb_alive").set(1.0);
+            true
+        }
+        _ => {
+            metrics::gauge!("dlt_questdb_alive").set(0.0);
+            tracing::error!("QuestDB liveness check failed — SELECT 1 did not respond");
+            false
+        }
     }
 }
 

@@ -1333,12 +1333,16 @@ async fn main() -> Result<()> {
         );
     }
 
+    // C1: Notify systemd that boot is complete (no-op outside systemd).
+    infra::notify_systemd_ready();
+
     // -----------------------------------------------------------------------
-    // Step 12b: Background periodic health check (disk space + memory RSS)
+    // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
     // -----------------------------------------------------------------------
     // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
     {
         let health_notifier = notifier.clone();
+        let questdb_config = config.questdb.clone();
         tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(
                 dhan_live_trader_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
@@ -1367,6 +1371,20 @@ async fn main() -> Result<()> {
                         ),
                     });
                 }
+                // C2: Spill file size check — export metric + alert if large.
+                let spill_bytes = infra::check_spill_file_size();
+                if spill_bytes > 500 * 1024 * 1024 {
+                    // > 500 MB of spill files — QuestDB likely down for extended period.
+                    health_notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "WARNING: Tick spill files total {:.1} MB — QuestDB may be \
+                             down. Data safe on disk but investigate.",
+                            spill_bytes as f64 / (1024.0 * 1024.0)
+                        ),
+                    });
+                }
+                // C3: QuestDB liveness ping (SELECT 1).
+                infra::check_questdb_liveness(&questdb_config).await;
             }
         });
         info!("background periodic health check started (every 5 minutes)");
