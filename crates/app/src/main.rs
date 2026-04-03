@@ -1487,9 +1487,12 @@ async fn load_instruments(
             (None, None, false)
         }
         Err(err) => {
-            warn!(
+            // Gap 3 fix: ERROR level triggers Telegram via Loki → Grafana.
+            // Previously WARN — operator unaware system has zero instruments.
+            error!(
                 error = %err,
-                "instrument build failed — no instruments to subscribe"
+                "CRITICAL: instrument build failed — system has ZERO instruments to \
+                 subscribe. No ticks, no trading. Investigate immediately."
             );
             (None, None, false)
         }

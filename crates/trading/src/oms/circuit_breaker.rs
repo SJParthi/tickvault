@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use dhan_live_trader_common::constants::{
     OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD, OMS_CIRCUIT_BREAKER_RESET_SECS,
@@ -143,10 +143,13 @@ impl OrderCircuitBreaker {
             {
                 self.half_open_probe_sent.store(false, Ordering::Relaxed);
                 metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
-                warn!(
+                // Gap 1 fix: ERROR level triggers Telegram via Loki → Grafana.
+                // Previously WARN — operator was unaware orders were being rejected.
+                error!(
                     failures = new_count,
                     threshold = self.failure_threshold,
-                    "circuit breaker OPEN — Dhan API failures exceeded threshold"
+                    "CRITICAL: circuit breaker OPEN — Dhan API failures exceeded threshold. \
+                     ALL order submissions blocked until recovery."
                 );
             }
         }

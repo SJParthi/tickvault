@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use super::types::{PositionInfo, RiskBreach, RiskCheck};
 
@@ -306,10 +306,13 @@ impl RiskEngine {
 
     fn trigger_halt(&mut self, breach: RiskBreach) {
         if !self.halted {
-            warn!(
+            // Gap 2 fix: ERROR level triggers Telegram via Loki → Grafana.
+            // Previously WARN — operator was unaware trading was halted.
+            error!(
                 breach = ?breach,
                 realized_pnl = self.total_realized_pnl,
-                "RISK BREACH — trading halted"
+                "CRITICAL: RISK BREACH — trading HALTED. ALL orders blocked. \
+                 Investigate immediately."
             );
             self.halted = true;
             self.halt_reason = Some(breach);
