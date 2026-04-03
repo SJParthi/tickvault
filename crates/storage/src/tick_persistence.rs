@@ -46,6 +46,12 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// (same security_id can exist on NSE_EQ and BSE_EQ).
 const DEDUP_KEY_TICKS: &str = "security_id, segment";
 
+/// Returns the DEDUP UPSERT KEY string for the ticks table.
+/// Exposed for gap enforcement integration tests (STORAGE-GAP-01).
+pub fn tick_dedup_key() -> &'static str {
+    DEDUP_KEY_TICKS
+}
+
 /// Maximum number of reconnection attempts for QuestDB ILP sender.
 const QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
@@ -876,7 +882,13 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
 #[inline]
-pub(crate) fn f32_to_f64_clean(v: f32) -> f64 {
+/// Converts f32 → f64 without IEEE 754 widening artifacts.
+///
+/// STORAGE-GAP-02: Dhan WebSocket sends prices as f32. Naive `v as f64`
+/// introduces artifacts (e.g., 21004.95_f32 → 21004.94921875_f64). This
+/// function converts via shortest decimal representation to preserve the
+/// original Dhan price. O(1) — one format + one parse.
+pub fn f32_to_f64_clean(v: f32) -> f64 {
     if v == 0.0 || !v.is_finite() {
         // APPROVED: f64::from(f32) is correct for zero/inf/NaN — no precision loss for these values
         return f64::from(v);

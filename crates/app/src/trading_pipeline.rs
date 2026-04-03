@@ -585,7 +585,16 @@ pub fn init_trading_pipeline(
         capital: config.strategy.capital,
         dry_run: config.strategy.dry_run,
         max_orders_per_second: config.trading.max_orders_per_second,
-        rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+        // B2: Route to sandbox URL when mode=Sandbox, production URL otherwise.
+        // Paper mode never makes HTTP calls (dry_run=true blocks them), so the
+        // URL doesn't matter, but we default to production for consistency.
+        rest_api_base_url: if config.strategy.mode.is_sandbox()
+            && !config.dhan.sandbox_base_url.is_empty()
+        {
+            config.dhan.sandbox_base_url.clone()
+        } else {
+            config.dhan.rest_api_base_url.clone()
+        },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
     };
