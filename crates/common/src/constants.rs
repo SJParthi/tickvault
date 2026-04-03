@@ -1232,6 +1232,16 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
 pub const TICK_BUFFER_CAPACITY: usize = 300_000;
 
+/// High watermark threshold for tick ring buffer (80% of capacity).
+/// When buffer occupancy exceeds this, a WARN-level alert fires once
+/// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
+pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 240,000
+
+/// Minimum free disk space (bytes) to log a warning before spill write.
+/// 100 MB — below this, a WARN fires on each spill open to alert operator
+/// that prolonged QuestDB outage may exhaust disk.
+pub const TICK_SPILL_MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
 /// tick persistence, candle aggregation). Must be large enough to absorb bursts
 /// during high-volatility events without lagging cold-path consumers.

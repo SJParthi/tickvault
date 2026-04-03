@@ -1,48 +1,37 @@
-# Implementation Plan: WebSocket Always-Connect + 9:00 AM Ingestion Gate
+# Implementation Plan: Block A — Critical Resilience & O(1) Fixes
 
-**Status:** VERIFIED
+**Status:** APPROVED
 **Date:** 2026-04-03
-**Approved by:** Parthiban
-
-## Context
-
-WebSocket connections currently only connect during [9:00, 15:30) IST. If the app starts
-at 7:30/8:00 AM, WebSockets are skipped entirely. The fix: connect immediately on app
-start, but gate ALL tick/depth ingestion to [9:00, 15:30) IST. Order update WS stays
-connected until app shutdown (not disconnected at 15:30).
+**Approved by:** Parthiban (approved "starting block a implement everything")
 
 ## Plan Items
 
-- [x] P1: Remove `is_within_data_window` guard from WebSocket connection (main.rs)
-  - Files: crates/app/src/main.rs
-  - Impl: Simplified `should_connect_ws` to `subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat)`. Removed `is_within_data_window` computation and stale log message.
+- [ ] A1: Flush tick ring buffer + candle ring buffer on graceful shutdown
+  - Files: crates/core/src/pipeline/tick_processor.rs, crates/storage/src/tick_persistence.rs
+  - Tests: test_graceful_shutdown_flushes_ring_buffer, test_graceful_shutdown_flushes_candle_buffer
 
-- [x] P2: Move ingestion gate BEFORE broadcast/candle/movers in tick processor
-  - Files: crates/core/src/pipeline/tick_processor.rs
-  - Impl: Added `is_today_ist()` + `is_within_persist_window()` gate after junk filter, before dedup — applies to both `Tick` and `TickWithDepth` paths. Ticks outside [9:00, 15:30) IST are dropped before dedup ring, greeks enrichment, QuestDB persistence, broadcast, candle aggregation, and top movers. Also gated depth persistence with `continue` for stale/out-of-hours depth.
-  - Tests: test_ingestion_gate_pre_market_tick_dropped_before_all_processing, test_ingestion_gate_post_market_tick_dropped_before_all_processing, test_ingestion_gate_last_valid_tick_accepted, test_ingestion_gate_first_valid_tick_accepted + 11 existing boundary tests
+- [ ] A2: Add Telegram alert when ticks_dropped_total > 0
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_tick_drop_fires_critical_metric
 
-- [x] P3: Keep order update WS alive at 15:30 market close (main.rs shutdown)
-  - Files: crates/app/src/main.rs
-  - Impl: Removed `order_update_handle.abort()` from market close phase (line ~2089). Order update WS now only aborted at final app shutdown (16:00 IST or Ctrl+C).
+- [ ] A3: Add Telegram alert when ring buffer > 80% (240K ticks)
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_buffer_high_watermark_alert
 
-- [x] P4: Verify fast boot path has no data window guard
-  - Files: crates/app/src/main.rs
-  - Impl: Confirmed zero references to `is_within_data_window` in entire file. Fast boot connects immediately during market hours. `run_shutdown_fast()` is shared — P3 fix covers both paths.
+- [ ] A4: Add disk space check before first spill write
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_disk_space_check_before_spill
 
-- [x] P5: Add/update tests for the new behavior
-  - Files: crates/core/src/pipeline/tick_processor.rs
-  - Impl: Added `today_ist_epoch_at()` test helper for dynamic today+market-hours timestamps. Updated all 80+ test frames from hardcoded `1772073900` to `today_ist_epoch_at(10, 0, 0)`. Added 4 semantic ingestion gate tests.
+- [ ] A5: Replace Box<dyn GreeksEnricher> with enum for hot path
+  - Files: crates/common/src/tick_types.rs, crates/core/src/pipeline/tick_processor.rs, crates/trading/src/greeks/inline_computer.rs, crates/app/src/main.rs
+  - Tests: test_greeks_enricher_enum_dispatch
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | App starts at 7:30 AM on trading day | WS connects, ticks dropped until 9:00 |
-| 2 | App starts at 10:00 AM on trading day | WS connects, ticks processed immediately |
-| 3 | 15:29:59.999 tick arrives | Processed (within window) |
-| 4 | 15:30:00.000 tick arrives | Dropped (outside window, exclusive end) |
-| 5 | Market close 15:30 | Market feed + depth WS disconnected. Order update WS stays alive |
-| 6 | App shutdown 16:00 (or Ctrl+C) | Order update WS disconnected |
-| 7 | Crash at 10:15 → fast boot restart | WS reconnects immediately, ticks flow (past 9:00) |
-| 8 | Non-trading day (weekend) | WS NOT connected (no change) |
+| 1 | App shutdown with 100 ticks in ring buffer | All 100 flushed before exit |
+| 2 | Ring buffer hits 240K (80%) | WARN log fires (triggers Telegram via Loki) |
+| 3 | ticks_dropped_total goes from 0 to 1 | ERROR log fires (triggers Telegram) |
+| 4 | Disk has <100MB before spill | WARN log fires, spill continues (best-effort) |
+| 5 | Greeks enricher called on hot path | No vtable indirection, enum match instead |

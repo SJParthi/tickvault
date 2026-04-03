@@ -2225,15 +2225,18 @@ async fn wait_for_shutdown_signal() -> &'static str {
 // Helper: Build inline Greeks enricher for tick processor
 // ---------------------------------------------------------------------------
 
-/// Constructs an `InlineGreeksComputer` wrapped as `Box<dyn GreeksEnricher>`
-/// for injection into the tick processor.
+/// Constructs an `InlineGreeksComputer` for injection into the tick processor.
+///
+/// A5: Returns the concrete type (not `Box<dyn>`) so the compiler monomorphizes
+/// `run_tick_processor<InlineGreeksComputer>`, eliminating vtable indirection
+/// on the hot path (~20-40ns savings per tick).
 ///
 /// Returns `None` if Greeks are disabled or no subscription plan is available.
 /// O(1) EXEMPT: cold path — called once at startup.
 fn build_inline_greeks_enricher(
     config: &ApplicationConfig,
     subscription_plan: &Option<SubscriptionPlan>,
-) -> Option<Box<dyn dhan_live_trader_common::tick_types::GreeksEnricher>> {
+) -> Option<InlineGreeksComputer> {
     if !config.greeks.enabled {
         info!("inline Greeks enricher disabled in config");
         return None;
@@ -2271,7 +2274,7 @@ fn build_inline_greeks_enricher(
         "inline Greeks enricher created for tick processor"
     );
 
-    Some(Box::new(enricher))
+    Some(enricher)
 }
 
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).

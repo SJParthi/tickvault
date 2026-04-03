@@ -209,6 +209,16 @@ pub trait GreeksEnricher: Send {
     fn enrich(&mut self, tick: &mut ParsedTick);
 }
 
+/// No-op implementation of `GreeksEnricher` for when Greeks are disabled.
+/// Used as the concrete type parameter when `greeks_enricher = None`.
+/// Zero-size type — compiler eliminates all related code completely.
+pub struct NoopGreeksEnricher;
+
+impl GreeksEnricher for NoopGreeksEnricher {
+    #[inline(always)]
+    fn enrich(&mut self, _tick: &mut ParsedTick) {}
+}
+
 // ---------------------------------------------------------------------------
 // Historical Candle — 1-minute OHLCV from Dhan intraday API
 // ---------------------------------------------------------------------------

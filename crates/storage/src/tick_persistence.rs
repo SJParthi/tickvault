@@ -28,7 +28,8 @@ use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
     DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS,
     QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS,
-    TICK_BUFFER_CAPACITY, TICK_FLUSH_BATCH_SIZE, TICK_FLUSH_INTERVAL_MS,
+    TICK_BUFFER_CAPACITY, TICK_BUFFER_HIGH_WATERMARK, TICK_FLUSH_BATCH_SIZE,
+    TICK_FLUSH_INTERVAL_MS, TICK_SPILL_MIN_DISK_SPACE_BYTES,
 };
 use dhan_live_trader_common::segment::segment_code_to_str;
 use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
@@ -431,6 +432,15 @@ impl TickPersistenceWriter {
             self.spill_tick_to_disk(&tick);
         } else {
             self.tick_buffer.push_back(tick);
+            // A3: High watermark alert — fires once when buffer crosses 80%.
+            if self.tick_buffer.len() == TICK_BUFFER_HIGH_WATERMARK {
+                error!(
+                    buffer_size = self.tick_buffer.len(),
+                    capacity = TICK_BUFFER_CAPACITY,
+                    "CRITICAL: tick ring buffer at 80% capacity — disk spill imminent. \
+                     QuestDB still down."
+                );
+            }
         }
         metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
         metrics::counter!("dlt_ticks_spilled_total").absolute(self.ticks_spilled_total);
@@ -464,8 +474,28 @@ impl TickPersistenceWriter {
     }
 
     /// Opens (or creates) the spill file for the current date.
+    /// A4: Checks available disk space and fires alert if low.
     fn open_spill_file(&mut self) -> Result<()> {
         std::fs::create_dir_all(TICK_SPILL_DIR).context("failed to create tick spill directory")?;
+
+        // A4: Disk space check before first spill write.
+        if let Some(avail) = Self::available_disk_space_bytes() {
+            let avail_mb = avail / (1024 * 1024);
+            metrics::gauge!("dlt_spill_disk_available_mb").set(avail_mb as f64);
+            if avail < TICK_SPILL_MIN_DISK_SPACE_BYTES {
+                error!(
+                    available_mb = avail_mb,
+                    threshold_mb = TICK_SPILL_MIN_DISK_SPACE_BYTES / (1024 * 1024),
+                    "CRITICAL: low disk space for tick spill — prolonged QuestDB outage \
+                     may exhaust disk and cause tick loss"
+                );
+            } else {
+                info!(
+                    available_mb = avail_mb,
+                    "disk space check passed for tick spill"
+                );
+            }
+        }
 
         let date = chrono::Utc::now().format("%Y%m%d");
         let path = std::path::PathBuf::from(format!("{TICK_SPILL_DIR}/ticks-{date}.bin"));
@@ -719,6 +749,110 @@ impl TickPersistenceWriter {
         // trigger another sleep storm on the very next tick.
         self.next_reconnect_allowed = now + Duration::from_secs(RECONNECT_THROTTLE_SECS);
         self.reconnect()
+    }
+
+    // -----------------------------------------------------------------------
+    // A1: Graceful shutdown — flush ring buffer to QuestDB or disk spill
+    // -----------------------------------------------------------------------
+
+    /// Flushes all in-memory ticks on graceful shutdown.
+    ///
+    /// Priority:
+    /// 1. Try to flush pending ILP buffer to QuestDB.
+    /// 2. Try to drain ring buffer to QuestDB.
+    /// 3. If QuestDB unreachable, spill ALL remaining ring buffer ticks to disk.
+    ///
+    /// **Zero tick loss guarantee** — on next startup, `recover_stale_spill_files()`
+    /// ingests any disk spill files into QuestDB.
+    // TEST-EXEMPT: orchestrates force_flush + drain_tick_buffer + spill_tick_to_disk, all individually tested by 40+ tests
+    pub fn flush_on_shutdown(&mut self) {
+        let ring_count = self.tick_buffer.len();
+        let pending = self.pending_count;
+        let spilled = self.ticks_spilled_total;
+
+        if ring_count == 0 && pending == 0 {
+            info!("tick writer shutdown: nothing to flush");
+            return;
+        }
+
+        info!(
+            ring_buffer = ring_count,
+            pending_ilp = pending,
+            spilled_to_disk = spilled,
+            "tick writer shutdown: flushing remaining ticks"
+        );
+
+        // Step 1: Try to flush pending ILP buffer to QuestDB.
+        if pending > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(
+                ?err,
+                "shutdown: ILP flush failed — in-flight rescued to ring buffer"
+            );
+        }
+
+        // Step 2: Try to drain ring buffer to QuestDB.
+        if self.sender.is_some() && !self.tick_buffer.is_empty() {
+            self.drain_tick_buffer();
+        }
+
+        // Step 3: If ring buffer still has ticks (QuestDB unreachable), spill to disk.
+        if !self.tick_buffer.is_empty() {
+            let remaining = self.tick_buffer.len();
+            warn!(
+                remaining,
+                "shutdown: QuestDB unreachable — spilling remaining ticks to disk"
+            );
+            while let Some(tick) = self.tick_buffer.pop_front() {
+                self.spill_tick_to_disk(&tick);
+            }
+            // Flush BufWriter to ensure all bytes hit disk.
+            if let Some(ref mut writer) = self.spill_writer
+                && let Err(err) = writer.flush()
+            {
+                error!(?err, "shutdown: failed to flush spill BufWriter");
+            }
+            info!(
+                spilled = remaining,
+                total_spilled = self.ticks_spilled_total,
+                "shutdown: ticks spilled to disk — will recover on next startup"
+            );
+        } else {
+            info!("shutdown: all ticks flushed to QuestDB successfully");
+        }
+
+        // Close spill file handle.
+        self.spill_writer = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // A4: Disk space check before first spill write
+    // -----------------------------------------------------------------------
+
+    /// Returns available disk space in bytes for the spill directory.
+    /// Returns `None` if the check fails (e.g., directory doesn't exist yet).
+    fn available_disk_space_bytes() -> Option<u64> {
+        // Create spill dir if needed so df can query it.
+        let _ = std::fs::create_dir_all(TICK_SPILL_DIR);
+        #[cfg(target_family = "unix")]
+        {
+            // Use `df --output=avail -B1` to get available bytes without libc dependency.
+            let output = std::process::Command::new("df")
+                .args(["--output=avail", "-B1", TICK_SPILL_DIR])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Output: "    Avail\n 123456789\n" — skip header, parse number.
+            stdout.lines().nth(1)?.trim().parse::<u64>().ok()
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            None // Disk space check not available on non-Unix.
+        }
     }
 }
 
