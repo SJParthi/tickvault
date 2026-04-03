@@ -992,9 +992,7 @@ async fn main() -> Result<()> {
             &config.trading.data_collection_end,
         );
     let should_connect_ws = subscription_plan.is_some()
-        && ((is_trading && is_within_data_window)
-            || (is_mock_trading && is_within_data_window)
-            || is_muhurat);
+        && (((is_trading || is_mock_trading) && is_within_data_window) || is_muhurat);
     if subscription_plan.is_some() && is_trading && !is_within_data_window && !is_muhurat {
         info!(
             data_collection_start = %config.trading.data_collection_start,
