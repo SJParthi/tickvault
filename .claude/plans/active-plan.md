@@ -1,53 +1,67 @@
-# Implementation Plan: Comprehensive Testing & API Validation Gaps
+# Implementation Plan: WebSocket Always-Connect + 9:00 AM Ingestion Gate
 
-**Status:** VERIFIED
-**Date:** 2026-04-02
-**Approved by:** Parthiban ("Go ahead dude")
+**Status:** DRAFT
+**Date:** 2026-04-03
+**Approved by:** pending
 
 ## Context
 
-Continuing from previous session's 15-item plan that couldn't execute due to shell issues.
-QuestDB resilience (7 items) is done. These are the remaining gaps from that plan:
-API reference accuracy fixes + test reinforcement for candle persistence.
+WebSocket connections currently only connect during [9:00, 15:30) IST. If the app starts
+at 7:30/8:00 AM, WebSockets are skipped entirely. The fix: connect immediately on app
+start, but gate ALL tick/depth ingestion to [9:00, 15:30) IST. Order update WS stays
+connected until app shutdown (not disconnected at 15:30).
 
 ## Plan Items
 
-- [x] P1: Add super order price validation (target/SL relative to entry price)
-  - Files: crates/trading/src/oms/engine.rs
-  - Tests: test_super_order_buy_target_must_exceed_entry, test_super_order_buy_sl_must_be_below_entry,
-           test_super_order_sell_target_must_be_below_entry, test_super_order_sell_sl_must_exceed_entry,
-           test_super_order_valid_buy_prices_accepted, test_super_order_valid_sell_prices_accepted,
-           test_super_order_zero_entry_price_rejected, test_super_order_zero_target_price_rejected,
-           test_super_order_zero_sl_price_rejected, test_super_order_buy_target_equal_entry_rejected,
-           test_super_order_buy_sl_equal_entry_rejected, test_super_order_unknown_txn_type_rejected
-  - Impl: validate_super_order_prices() at engine.rs:718
+- [ ] P1: Remove `is_within_data_window` guard from WebSocket connection (main.rs)
+  - Files: crates/app/src/main.rs
+  - Tests: test_ws_connects_on_trading_day_regardless_of_time (existing behavior test update)
+  - Details: Lines 989-1001 — remove `is_within_data_window` computation, simplify
+    `should_connect_ws` to `subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat)`.
+    Remove the "outside data collection window" log message (no longer applicable).
 
-- [x] P2: Add ExpiryCode enum with validation (replace raw u8)
-  - Files: crates/common/src/instrument_types.rs, crates/core/src/historical/candle_fetcher.rs
-  - Tests: test_expiry_code_serialize_to_u8, test_expiry_code_all_variants,
-           test_expiry_code_from_u8_invalid_rejected, test_expiry_code_roundtrip,
-           test_expiry_code_display
-  - Impl: ExpiryCode enum at instrument_types.rs:117, DailyRequest updated to use ExpiryCode
+- [ ] P2: Move ingestion gate BEFORE broadcast/candle/movers in tick processor
+  - Files: crates/core/src/pipeline/tick_processor.rs
+  - Tests: test_tick_outside_market_hours_dropped_before_broadcast,
+           test_tick_inside_market_hours_processed,
+           test_depth_outside_market_hours_dropped
+  - Details: Currently `is_within_persist_window()` only gates QuestDB persistence
+    (line 541). Ticks outside [9:00, 15:30) still reach broadcast, candle aggregator,
+    and top movers. Move the time+day gate to line ~501 (after junk filter, before dedup)
+    so ALL processing is skipped for pre-market stale ticks. Same for TickWithDepth path.
+    The existing `is_within_persist_window()` function and constants are reused (O(1),
+    zero allocation — 1 modulo + 1 range check).
 
-- [x] P3: Add LiveCandleWriter cold-start tests (QuestDB unavailable at startup)
-  - Files: crates/storage/tests/candle_resilience.rs (new test file)
-  - Tests: test_candle_writer_cold_start_succeeds, test_candle_writer_cold_start_buffers_candles,
-           test_candle_writer_cold_start_zero_drops
+- [ ] P3: Keep order update WS alive at 15:30 market close (main.rs shutdown)
+  - Files: crates/app/src/main.rs
+  - Tests: test_order_update_ws_survives_market_close (conceptual — shutdown is integration)
+  - Details: Line 2097-2099 in `run_shutdown_fast()` currently aborts `order_update_handle`
+    at market close alongside market feed. Remove those 3 lines. The order update handle
+    is already correctly aborted at line 2156 (final app shutdown at 16:00 IST).
 
-- [x] P4: Add recovery ordering integration test (ring buffer drains before disk spill)
-  - Files: crates/storage/tests/candle_resilience.rs
-  - Tests: test_recovery_ordering_ring_before_spill
+- [ ] P4: Update fast boot path to remove data window guard
+  - Files: crates/app/src/main.rs
+  - Tests: (covered by P1 — fast boot also uses `should_connect_ws` equivalent)
+  - Details: Fast boot path (lines 295-743) already connects immediately (it only runs
+    during market hours). Verify no `is_within_data_window` check exists in fast boot.
+    The fast boot `run_shutdown_fast()` is the SAME function as slow boot — P3 fix covers both.
 
-- [x] P5: Add schema validation after QuestDB reconnect + test
-  - Files: crates/storage/tests/candle_resilience.rs
-  - Tests: test_reconnect_revalidates_schema, test_disconnected_writer_fresh_buffer_does_not_corrupt
+- [ ] P5: Add/update tests for the new behavior
+  - Files: crates/core/src/pipeline/tick_processor.rs (unit tests)
+  - Tests: test_is_within_persist_window_boundary_9am_inclusive,
+           test_is_within_persist_window_boundary_330pm_exclusive,
+           test_is_within_persist_window_pre_market_rejected,
+           test_is_within_persist_window_post_market_rejected
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Super order BUY with target < entry | Rejected before API call |
-| 2 | Super order SELL with SL < entry | Rejected before API call |
-| 3 | QuestDB down at candle writer startup | Writer starts disconnected, candles buffered |
-| 4 | Ring buffer + spill during outage → reconnect | Ring drains first, then spill |
-| 5 | QuestDB restarts mid-session | Reconnect re-runs DDL validation |
+| 1 | App starts at 7:30 AM on trading day | WS connects, ticks dropped until 9:00 |
+| 2 | App starts at 10:00 AM on trading day | WS connects, ticks processed immediately |
+| 3 | 15:29:59.999 tick arrives | Processed (within window) |
+| 4 | 15:30:00.000 tick arrives | Dropped (outside window, exclusive end) |
+| 5 | Market close 15:30 | Market feed + depth WS disconnected. Order update WS stays alive |
+| 6 | App shutdown 16:00 (or Ctrl+C) | Order update WS disconnected |
+| 7 | Crash at 10:15 → fast boot restart | WS reconnects immediately, ticks flow (past 9:00) |
+| 8 | Non-trading day (weekend) | WS NOT connected (no change) |
