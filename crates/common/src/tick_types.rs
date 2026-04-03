@@ -195,7 +195,7 @@ impl Default for OptionGreeksSnapshot {
 /// Trait for enriching ticks with Greeks data on the hot path.
 ///
 /// Implemented in `crates/trading` (InlineGreeksComputer) and injected into
-/// `crates/core` tick_processor via `Box<dyn GreeksEnricher>`.
+/// `crates/core` tick_processor via generic `<G: GreeksEnricher>` (monomorphized, no vtable).
 ///
 /// # Contract
 /// - `enrich()` is called once per valid tick, BEFORE persistence and broadcast.
