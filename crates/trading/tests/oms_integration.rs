@@ -62,6 +62,7 @@ fn make_limit_order_request() -> PlaceOrderRequest {
         price: 245.50,
         trigger_price: 0.0,
         lot_size: 25,
+        expiry_date: None,
     }
 }
 
@@ -76,6 +77,7 @@ fn make_market_order_request() -> PlaceOrderRequest {
         price: 0.0,
         trigger_price: 0.0,
         lot_size: 25,
+        expiry_date: None,
     }
 }
 
@@ -549,6 +551,7 @@ async fn test_market_order_with_price_rejected() {
         price: 245.50, // MARKET orders must have price=0
         trigger_price: 0.0,
         lot_size: 25,
+        expiry_date: None,
     };
 
     let result = oms.place_order(request).await;
@@ -570,6 +573,7 @@ async fn test_stop_loss_order_without_trigger_rejected() {
         price: 245.50,
         trigger_price: 0.0, // SL orders require triggerPrice > 0
         lot_size: 25,
+        expiry_date: None,
     };
 
     let result = oms.place_order(request).await;

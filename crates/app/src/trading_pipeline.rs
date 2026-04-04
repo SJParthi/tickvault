@@ -311,6 +311,7 @@ async fn run_trading_pipeline(
                                                 price: 0.0,
                                                 trigger_price: 0.0,
                                                 lot_size: 1,
+                                            expiry_date: None,
                                             };
                                             match oms.place_order(request).await {
                                                 Ok(order_id) => {
@@ -365,6 +366,7 @@ async fn run_trading_pipeline(
                                                 price: 0.0,
                                                 trigger_price: 0.0,
                                                 lot_size: 1,
+                                            expiry_date: None,
                                             };
                                             match oms.place_order(request).await {
                                                 Ok(order_id) => {
@@ -1276,6 +1278,7 @@ threshold = 25.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
 
         assert_eq!(request.security_id, 52432);
@@ -1301,6 +1304,7 @@ threshold = 25.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
 
         assert_eq!(request.security_id, 49081);
@@ -1342,6 +1346,7 @@ threshold = 25.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
 
         let order_id = oms.place_order(request).await.unwrap();
@@ -1407,6 +1412,7 @@ threshold = 25.0
                 price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
+                expiry_date: None,
             };
             let order_id = oms.place_order(request).await.unwrap();
             assert!(order_id.starts_with("PAPER-"));
@@ -2724,6 +2730,7 @@ threshold = 70.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
         let order_id = oms.place_order(request).await.unwrap();
 
@@ -2863,6 +2870,7 @@ threshold = 30.0
                 price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
+                expiry_date: None,
             };
             let _ = oms.place_order(request).await.unwrap();
         }

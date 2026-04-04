@@ -3,6 +3,7 @@
 //! These types are OMS-internal. The external Dhan types live in `common::order_types`.
 //! REST API request/response types use camelCase serde to match Dhan's REST format.
 
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use dhan_live_trader_common::order_types::{
@@ -104,6 +105,10 @@ pub struct PlaceOrderRequest {
     pub trigger_price: f64,
     /// Lot size for risk engine integration.
     pub lot_size: u32,
+    /// I-P0-03: Expiry date for derivative contracts. When `Some`, the OMS
+    /// validates that the contract has not expired before submitting to Dhan.
+    /// `None` for equity orders or when expiry is unknown.
+    pub expiry_date: Option<NaiveDate>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1382,17 @@ pub enum OmsError {
     /// Sandbox enforcement: live orders blocked before cutover date.
     #[error("sandbox enforcement: live orders blocked until 2026-07-01")]
     SandboxEnforcement,
+
+    /// I-P0-03: Order rejected because the derivative contract has expired.
+    #[error("expired contract: security_id {security_id} expired on {expiry_date}")]
+    ExpiredContract {
+        security_id: u32,
+        expiry_date: String,
+    },
+
+    /// Maximum modifications per order exceeded.
+    #[error("max modifications ({max}) exceeded for order {order_id}")]
+    MaxModificationsExceeded { order_id: String, max: u32 },
 }
 
 // ---------------------------------------------------------------------------

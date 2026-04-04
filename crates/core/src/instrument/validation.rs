@@ -112,7 +112,7 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
         "validation: F&O stock count within range"
     );
 
-    // Check 5: Non-empty universe
+    // Check 5: Non-empty universe + minimum derivative threshold (I-P0-02)
     if universe.underlyings.is_empty() {
         bail!(ApplicationError::UniverseValidationFailed {
             check: "underlyings map is empty".to_owned(),
@@ -121,6 +121,17 @@ pub fn validate_fno_universe(universe: &FnoUniverse) -> Result<()> {
     if universe.derivative_contracts.is_empty() {
         bail!(ApplicationError::UniverseValidationFailed {
             check: "derivative_contracts map is empty".to_owned(),
+        });
+    }
+    // I-P0-02: Truncated CSV with suspiciously few derivatives = hard error.
+    // Real NSE F&O has 5000+ contracts; anything below threshold is corrupt data.
+    let derivative_count = universe.derivative_contracts.len();
+    if derivative_count < VALIDATION_MIN_DERIVATIVE_COUNT {
+        bail!(ApplicationError::UniverseValidationFailed {
+            check: format!(
+                "derivative_contracts count {} below minimum threshold {} — likely truncated CSV",
+                derivative_count, VALIDATION_MIN_DERIVATIVE_COUNT
+            ),
         });
     }
 
@@ -337,23 +348,27 @@ mod tests {
             }
         }
 
-        // Add at least one derivative contract
-        derivative_contracts.insert(
-            90001,
-            DerivativeContract {
-                security_id: 90001,
-                underlying_symbol: "NIFTY".to_owned(),
-                instrument_kind: DhanInstrumentKind::FutureIndex,
-                exchange_segment: ExchangeSegment::NseFno,
-                expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
-                strike_price: 0.0,
-                option_type: None,
-                lot_size: 75,
-                tick_size: 0.05,
-                symbol_name: "NIFTY-Mar2026-FUT".to_owned(),
-                display_name: "NIFTY MAR FUT".to_owned(),
-            },
-        );
+        // I-P0-02: Add enough derivative contracts to meet VALIDATION_MIN_DERIVATIVE_COUNT.
+        // Real NSE F&O has 5000+ contracts; test must exceed the minimum threshold.
+        for i in 0..VALIDATION_MIN_DERIVATIVE_COUNT {
+            let sec_id = 90001 + i as u32;
+            derivative_contracts.insert(
+                sec_id,
+                DerivativeContract {
+                    security_id: sec_id,
+                    underlying_symbol: "NIFTY".to_owned(),
+                    instrument_kind: DhanInstrumentKind::FutureIndex,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+                    strike_price: f64::from(i as u32) * 100.0,
+                    option_type: None,
+                    lot_size: 75,
+                    tick_size: 0.05,
+                    symbol_name: format!("NIFTY-Mar2026-{}", i),
+                    display_name: format!("NIFTY MAR {}", i),
+                },
+            );
+        }
 
         let ist_offset = dhan_live_trader_common::trading_calendar::ist_offset();
         let naive_dt = NaiveDateTime::new(
@@ -375,7 +390,7 @@ mod tests {
                 index_count: 8,
                 equity_count: 5,
                 underlying_count: 200,
-                derivative_count: 1,
+                derivative_count: VALIDATION_MIN_DERIVATIVE_COUNT,
                 option_chain_count: 0,
                 build_duration: Duration::from_millis(500),
                 build_timestamp: naive_dt.and_local_timezone(ist_offset).unwrap(),
@@ -509,6 +524,47 @@ mod tests {
             err_msg.contains("empty"),
             "error must mention empty: {}",
             err_msg
+        );
+    }
+
+    // I-P0-02: Derivative count below minimum threshold fails validation.
+    #[test]
+    fn test_derivative_count_below_minimum_fails() {
+        let mut universe = build_valid_universe();
+        // Remove derivatives until below threshold
+        let keys: Vec<u32> = universe.derivative_contracts.keys().copied().collect();
+        for key in keys.iter().skip(VALIDATION_MIN_DERIVATIVE_COUNT / 2) {
+            universe.derivative_contracts.remove(key);
+        }
+        assert!(
+            universe.derivative_contracts.len() < VALIDATION_MIN_DERIVATIVE_COUNT,
+            "test setup: derivatives must be below threshold"
+        );
+
+        let result = validate_fno_universe(&universe);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("below minimum threshold"),
+            "I-P0-02: error must mention threshold: {}",
+            err_msg
+        );
+    }
+
+    // I-P0-02: Derivative count exactly at minimum threshold passes.
+    #[test]
+    fn test_derivative_count_at_minimum_passes() {
+        let universe = build_valid_universe();
+        assert!(
+            universe.derivative_contracts.len() >= VALIDATION_MIN_DERIVATIVE_COUNT,
+            "test setup: valid universe must have at least {} derivatives",
+            VALIDATION_MIN_DERIVATIVE_COUNT
+        );
+        let result = validate_fno_universe(&universe);
+        assert!(
+            result.is_ok(),
+            "I-P0-02: universe at minimum threshold must pass: {:?}",
+            result.err()
         );
     }
 

@@ -769,6 +769,11 @@ pub const VALIDATION_FNO_STOCK_MIN_COUNT: usize = 150;
 /// Maximum expected number of F&O stock underlyings.
 pub const VALIDATION_FNO_STOCK_MAX_COUNT: usize = 300;
 
+/// I-P0-02: Minimum expected derivative contract count after universe build.
+/// A truncated CSV (< 100 derivatives) is almost certainly corrupt or incomplete.
+/// Real NSE F&O universe has 5000+ contracts on any given day.
+pub const VALIDATION_MIN_DERIVATIVE_COUNT: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Application Identity
 // ---------------------------------------------------------------------------

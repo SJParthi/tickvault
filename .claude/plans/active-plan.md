@@ -1,8 +1,8 @@
 # Implementation Plan: Gap Enforcement Completion & Final Verification
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-04-04
-**Approved by:** pending
+**Approved by:** Parthiban (2026-04-04)
 
 ## Context
 
@@ -45,25 +45,25 @@ workspace test suite verification.
 
 ## Plan Items
 
-- [ ] Fix I-P0-02: Add minimum derivative count threshold validation (configurable constant, currently only checks > 0)
-  - Files: crates/core/src/instrument/universe_builder.rs, crates/common/src/constants.rs
-  - Tests: test_validation_derivative_count_below_minimum_fails, test_validation_derivative_count_at_minimum_passes
+- [x] Fix I-P0-02: Add minimum derivative count threshold validation (VALIDATION_MIN_DERIVATIVE_COUNT=100)
+  - Files: crates/common/src/constants.rs, crates/core/src/instrument/validation.rs
+  - Tests: test_derivative_count_below_minimum_fails, test_derivative_count_at_minimum_passes
 
-- [ ] Fix I-P0-03: Add expiry_date awareness to OMS order validation path
-  - Files: crates/trading/src/oms/engine.rs, crates/common/src/order_types.rs
-  - Tests: test_expired_contract_rejected_at_gate_4, test_valid_contract_passes_gate_4
+- [x] Fix I-P0-03: Add expiry_date to PlaceOrderRequest + validate in engine.rs
+  - Files: crates/trading/src/oms/types.rs, crates/trading/src/oms/engine.rs
+  - Tests: test_validate_expired_contract_rejected, test_validate_valid_contract_passes, test_validate_no_expiry_date_passes
 
-- [ ] Fix I-P0-06: Add CRITICAL log level assertion to emergency download test
+- [x] Fix I-P0-06: Add CRITICAL log level source-code scanning test
   - Files: crates/core/tests/gap_enforcement.rs
-  - Tests: test_i_p0_06_emergency_download_logs_critical
+  - Tests: test_i_p0_06_emergency_download_uses_critical_log, test_i_p0_06_critical_logs_use_error_macro
 
-- [ ] Update gap enforcement test documentation comments to reflect actual coverage status
-  - Files: crates/trading/tests/gap_enforcement.rs (I-P0-03 comment), crates/core/tests/gap_enforcement.rs (I-P0-02, I-P0-06 comments)
-  - Tests: existing tests, no new tests needed
+- [x] Update gap enforcement test documentation comments to reflect actual coverage status
+  - Files: crates/trading/tests/gap_enforcement.rs (I-P0-03), crates/core/tests/gap_enforcement.rs (I-P0-02, I-P0-06)
+  - Tests: existing tests updated, new assertions added
 
-- [ ] Run full build verification (fmt + clippy + test) to confirm zero regressions
+- [x] Run full build verification (fmt + clippy + test) to confirm zero regressions
   - Files: none (verification only)
-  - Tests: all workspace tests
+  - Tests: 1,317 passed, 0 failed, 17 test binaries
 
 ## Scenarios
 

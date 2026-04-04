@@ -694,6 +694,18 @@ fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
         });
     }
 
+    // I-P0-03: Reject orders for expired derivative contracts.
+    // Stale universe → expired contract order → CRITICAL risk.
+    if let Some(expiry) = request.expiry_date {
+        let today = chrono::Utc::now().date_naive();
+        if expiry < today {
+            return Err(OmsError::ExpiredContract {
+                security_id: request.security_id,
+                expiry_date: expiry.to_string(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1180,6 +1192,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let order_id = oms.place_order(request).await.unwrap();
@@ -1214,6 +1227,7 @@ mod tests {
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let id1 = oms.place_order(make_request()).await.unwrap();
@@ -1246,6 +1260,7 @@ mod tests {
             price: 300.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let order_id = oms.place_order(request).await.unwrap();
@@ -1339,6 +1354,7 @@ mod tests {
             price: 245.50, // BUG: MARKET orders must have price=0
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -1373,6 +1389,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0, // BUG: SL orders require triggerPrice > 0
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -1407,6 +1424,7 @@ mod tests {
             price: 0.0, // Correct: MARKET order with price=0
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -1578,6 +1596,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let result = oms.place_order(request).await;
         assert!(result.is_ok());
@@ -1641,6 +1660,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
     }
@@ -1657,6 +1677,7 @@ mod tests {
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
     }
@@ -1673,6 +1694,7 @@ mod tests {
             price: 100.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let err = validate_order_fields(&request).unwrap_err();
         assert!(matches!(err, OmsError::RiskRejected { .. }));
@@ -1690,6 +1712,7 @@ mod tests {
             price: 245.50,
             trigger_price: 240.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
     }
@@ -1706,6 +1729,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let err = validate_order_fields(&request).unwrap_err();
         assert!(matches!(err, OmsError::RiskRejected { .. }));
@@ -1723,6 +1747,7 @@ mod tests {
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let err = validate_order_fields(&request).unwrap_err();
         assert!(matches!(err, OmsError::RiskRejected { .. }));
@@ -1740,8 +1765,78 @@ mod tests {
             price: 0.0,
             trigger_price: 240.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // I-P0-03: Expiry date validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_expired_contract_rejected() {
+        let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+            expiry_date: Some(yesterday),
+        };
+        let result = validate_order_fields(&request);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OmsError::ExpiredContract { .. }),
+            "I-P0-03: expired contract must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_valid_contract_passes() {
+        let tomorrow = chrono::Utc::now().date_naive() + chrono::Duration::days(1);
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+            expiry_date: Some(tomorrow),
+        };
+        assert!(
+            validate_order_fields(&request).is_ok(),
+            "I-P0-03: valid (non-expired) contract must pass"
+        );
+    }
+
+    #[test]
+    fn test_validate_no_expiry_date_passes() {
+        let request = PlaceOrderRequest {
+            security_id: 11536,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+            expiry_date: None,
+        };
+        assert!(
+            validate_order_fields(&request).is_ok(),
+            "I-P0-03: equity orders (no expiry) must pass"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2287,6 +2382,7 @@ mod tests {
             price: 0.0,
             trigger_price: 240.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -2489,6 +2585,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         }
     }
 
