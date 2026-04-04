@@ -63,56 +63,56 @@ and testing infrastructure.
 
 ### Priority 1: Data Loss Prevention (CRITICAL)
 
-- [ ] **Item 1: Add `flush_on_shutdown()` to DepthPersistenceWriter**
+- [x] **Item 1: Add `flush_on_shutdown()` to DepthPersistenceWriter**
   - Files: `crates/storage/src/tick_persistence.rs` (DepthPersistenceWriter section)
   - Tests: `test_depth_flush_on_shutdown_spills_to_disk`, `test_depth_shutdown_drains_ring_buffer`
   - Action: Implement 4-step shutdown matching tick persistence (flush → drain ring → spill to disk → flush BufWriter)
 
-- [ ] **Item 2: Add `recover_stale_spill_files()` to DepthPersistenceWriter**
+- [x] **Item 2: Add `recover_stale_spill_files()` to DepthPersistenceWriter**
   - Files: `crates/storage/src/tick_persistence.rs` (DepthPersistenceWriter section)
   - Tests: `test_depth_recover_stale_spill_files_on_startup`
   - Action: Implement recovery method matching tick persistence pattern
 
-- [ ] **Item 3: Call depth recovery at startup in main.rs**
+- [x] **Item 3: Call depth recovery at startup in main.rs**
   - Files: `crates/app/src/main.rs` (around line 951-973)
   - Tests: Verify startup flow calls `depth_writer.recover_stale_spill_files()`
   - Action: Add recovery call after DepthPersistenceWriter creation
 
-- [ ] **Item 4: Call candle recovery at startup in main.rs**
+- [x] **Item 4: Call candle recovery at startup in main.rs**
   - Files: `crates/app/src/main.rs`, `crates/core/src/pipeline/tick_processor.rs`
   - Tests: Verify candle stale spill recovery is called
   - Action: Add recovery call where candle writer is created
 
-- [ ] **Item 5: Add `flush_on_shutdown()` to candle writer**
+- [x] **Item 5: Add `flush_on_shutdown()` to candle writer**
   - Files: `crates/storage/src/candle_persistence.rs`
   - Tests: `test_candle_flush_on_shutdown_spills_to_disk`
   - Action: Implement shutdown matching tick persistence, update tick_processor.rs shutdown
 
-- [ ] **Item 6: Call candle + depth shutdown in tick_processor.rs**
+- [x] **Item 6: Call candle + depth shutdown in tick_processor.rs**
   - Files: `crates/core/src/pipeline/tick_processor.rs` (shutdown section around line 1008-1045)
   - Tests: `test_shutdown_flushes_all_three_writers`
   - Action: Replace `force_flush()` calls with `flush_on_shutdown()` for depth and candle writers
 
-- [ ] **Item 7: Add depth_dropped_total counter and metric**
+- [x] **Item 7: Add depth_dropped_total counter and metric**
   - Files: `crates/storage/src/tick_persistence.rs` (DepthPersistenceWriter)
   - Tests: `test_depth_drop_counter_increments_on_spill_failure`
   - Action: Add u64 counter, increment on disk spill failure, expose via pub getter + Prometheus metric
 
 ### Priority 2: Sandbox Enforcement
 
-- [ ] **Item 8: Add sandbox enforcement gate blocking live orders before July 2026**
+- [x] **Item 8: Add sandbox enforcement gate blocking live orders before July 2026**
   - Files: `crates/trading/src/oms/engine.rs`
   - Tests: `test_sandbox_enforcement_blocks_live_before_july`
   - Action: Add runtime check that prevents `dry_run = false` before 2026-07-01
 
 ### Priority 3: Verification & Push
 
-- [ ] **Item 9: Run full test suite and verify 0 failures**
+- [x] **Item 9: Run full test suite and verify 0 failures**
   - Files: All crates
   - Tests: `cargo test --workspace`
   - Action: Run, report results, fix any failures
 
-- [ ] **Item 10: Commit all changes + push to branch**
+- [x] **Item 10: Commit all changes + push to branch**
   - Files: All modified files
   - Tests: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`
   - Action: Commit and push to `claude/check-branch-sync-iBU0b`
