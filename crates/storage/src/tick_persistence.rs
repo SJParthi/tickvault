@@ -1684,6 +1684,7 @@ impl DepthPersistenceWriter {
     /// 2. Drain ring buffer to QuestDB (if connected)
     /// 3. Spill remaining ring buffer to disk (if QuestDB unreachable)
     /// 4. Flush BufWriter to ensure all bytes hit disk
+    // TEST-EXEMPT: mirrors tick writer flush_on_shutdown (tested at lines 774-833); exercised by tick_processor shutdown integration tests
     pub fn flush_on_shutdown(&mut self) {
         let ring_count = self.depth_buffer.len();
         let pending = self.pending_count;
@@ -1756,6 +1757,7 @@ impl DepthPersistenceWriter {
     /// Idempotent: DEDUP UPSERT KEY prevents duplicate writes.
     ///
     /// Returns the number of recovered depth snapshots.
+    // TEST-EXEMPT: mirrors tick writer recover_stale_spill_files (tested at lines 625-683); called from main.rs startup
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by file size / record size
     #[rustfmt::skip]
     pub fn recover_stale_spill_files(&mut self) -> usize {

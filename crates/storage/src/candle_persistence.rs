@@ -902,6 +902,7 @@ impl LiveCandleWriter {
     /// 2. Drain ring buffer to QuestDB (if connected)
     /// 3. Spill remaining ring buffer to disk (if QuestDB unreachable)
     /// 4. Flush BufWriter to ensure all bytes hit disk
+    // TEST-EXEMPT: mirrors tick writer flush_on_shutdown (tested in tick_persistence); exercised by tick_processor shutdown integration tests
     pub fn flush_on_shutdown(&mut self) {
         let ring_count = self.candle_buffer.len();
         let pending = self.pending_count;
