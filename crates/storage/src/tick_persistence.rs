@@ -1248,6 +1248,8 @@ pub struct DepthPersistenceWriter {
     // O(1) EXEMPT: end
     /// Total depth snapshots spilled to disk (ring buffer overflow).
     depth_spilled_total: u64,
+    /// Total depth snapshots permanently lost (disk spill failure).
+    depth_dropped_total: u64,
     /// Throttle: earliest time a reconnect may be attempted.
     next_reconnect_allowed: std::time::Instant,
     /// Open file handle for disk spill (lazy-opened on first overflow).
@@ -1273,6 +1275,7 @@ impl DepthPersistenceWriter {
             depth_buffer: VecDeque::with_capacity(DEPTH_BUFFER_CAPACITY),
             in_flight: Vec::with_capacity(DEPTH_FLUSH_BATCH_SIZE),
             depth_spilled_total: 0,
+            depth_dropped_total: 0,
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
@@ -1297,6 +1300,7 @@ impl DepthPersistenceWriter {
             depth_buffer: VecDeque::with_capacity(DEPTH_BUFFER_CAPACITY),
             in_flight: Vec::with_capacity(DEPTH_FLUSH_BATCH_SIZE),
             depth_spilled_total: 0,
+            depth_dropped_total: 0,
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
@@ -1478,11 +1482,17 @@ impl DepthPersistenceWriter {
     #[rustfmt::skip]
     fn spill_depth_to_disk(&mut self, snapshot: &BufferedDepth) {
         if self.spill_writer.is_none() && let Err(err) = self.open_depth_spill_file() {
-            error!(?err, "CRITICAL: cannot open depth spill file — depth snapshot WILL be lost"); return;
+            error!(?err, "CRITICAL: cannot open depth spill file — depth snapshot WILL be lost");
+            self.depth_dropped_total = self.depth_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_depth_dropped_total").absolute(self.depth_dropped_total);
+            return;
         }
         let record = serialize_depth(snapshot);
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
-            error!(?err, depth_spilled = self.depth_spilled_total, "CRITICAL: depth disk spill write failed — snapshot lost"); return;
+            error!(?err, depth_spilled = self.depth_spilled_total, "CRITICAL: depth disk spill write failed — snapshot lost");
+            self.depth_dropped_total = self.depth_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_depth_dropped_total").absolute(self.depth_dropped_total);
+            return;
         }
         self.depth_spilled_total = self.depth_spilled_total.saturating_add(1);
         if self.depth_spilled_total.is_multiple_of(1_000) {
@@ -1654,6 +1664,158 @@ impl DepthPersistenceWriter {
         }
         self.next_reconnect_allowed = now + Duration::from_secs(RECONNECT_THROTTLE_SECS);
         self.reconnect()
+    }
+
+    /// Returns the total number of depth snapshots permanently lost.
+    /// Must be 0 in production — non-zero means both ring buffer AND disk spill failed.
+    // TEST-EXEMPT: trivial accessor, tested indirectly via resilience tests
+    pub fn depth_dropped_total(&self) -> u64 {
+        self.depth_dropped_total
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful shutdown (matches tick writer flush_on_shutdown)
+    // -----------------------------------------------------------------------
+
+    /// Gracefully shuts down the depth writer.
+    ///
+    /// 4-step protocol (same as tick writer):
+    /// 1. Force-flush pending ILP buffer to QuestDB
+    /// 2. Drain ring buffer to QuestDB (if connected)
+    /// 3. Spill remaining ring buffer to disk (if QuestDB unreachable)
+    /// 4. Flush BufWriter to ensure all bytes hit disk
+    pub fn flush_on_shutdown(&mut self) {
+        let ring_count = self.depth_buffer.len();
+        let pending = self.pending_count;
+        let spilled = self.depth_spilled_total;
+
+        if ring_count == 0 && pending == 0 {
+            info!("depth writer shutdown: nothing to flush");
+            return;
+        }
+
+        info!(
+            ring_buffer = ring_count,
+            pending_ilp = pending,
+            spilled_to_disk = spilled,
+            "depth writer shutdown: flushing remaining depth snapshots"
+        );
+
+        // Step 1: Try to flush pending ILP buffer to QuestDB.
+        if pending > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(
+                ?err,
+                "shutdown: depth ILP flush failed — in-flight rescued to ring buffer"
+            );
+        }
+
+        // Step 2: Try to drain ring buffer to QuestDB.
+        if self.sender.is_some() && !self.depth_buffer.is_empty() {
+            self.drain_depth_buffer();
+        }
+
+        // Step 3: If ring buffer still has snapshots (QuestDB unreachable), spill to disk.
+        if !self.depth_buffer.is_empty() {
+            let remaining = self.depth_buffer.len();
+            warn!(
+                remaining,
+                "shutdown: QuestDB unreachable — spilling remaining depth snapshots to disk"
+            );
+            while let Some(snapshot) = self.depth_buffer.pop_front() {
+                self.spill_depth_to_disk(&snapshot);
+            }
+            // Flush BufWriter to ensure all bytes hit disk.
+            if let Some(ref mut writer) = self.spill_writer
+                && let Err(err) = writer.flush()
+            {
+                error!(?err, "shutdown: failed to flush depth spill BufWriter");
+            }
+            info!(
+                spilled = remaining,
+                total_spilled = self.depth_spilled_total,
+                "shutdown: depth snapshots spilled to disk — will recover on next startup"
+            );
+        } else {
+            info!("shutdown: all depth snapshots flushed to QuestDB successfully");
+        }
+
+        // Close spill file handle.
+        self.spill_writer = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup recovery of stale spill files (matches tick writer)
+    // -----------------------------------------------------------------------
+
+    /// Recovers stale depth spill files from previous crashes.
+    ///
+    /// Scans `data/spill/` for `depth-*.bin` files, reads fixed-size records,
+    /// writes them to QuestDB, and deletes the file on success.
+    /// Idempotent: DEDUP UPSERT KEY prevents duplicate writes.
+    ///
+    /// Returns the number of recovered depth snapshots.
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: drained counter bounded by file size / record size
+    #[rustfmt::skip]
+    pub fn recover_stale_spill_files(&mut self) -> usize {
+        if self.sender.is_none() { warn!("cannot recover stale depth spill files — QuestDB not connected"); return 0; }
+        let dir = match std::fs::read_dir(DEPTH_SPILL_DIR) {
+            Ok(d) => d,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::NotFound { return 0; }
+                warn!(?err, dir = DEPTH_SPILL_DIR, "cannot read depth spill directory for recovery"); return 0;
+            }
+        };
+        let mut total_recovered: usize = 0;
+        for entry in dir {
+            let entry = match entry { Ok(e) => e, Err(err) => { warn!(?err, "failed to read depth spill directory entry"); continue; } };
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name.starts_with("depth-") && name.ends_with(".bin") => name, _ => continue,
+            };
+            let _ = file_name;
+            if let Some(ref active_path) = self.spill_path && path == *active_path {
+                info!(path = %path.display(), "skipping active depth spill file during stale recovery"); continue;
+            }
+            info!(path = %path.display(), "recovering stale depth spill file");
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f, Err(err) => { warn!(?err, path = %path.display(), "cannot open stale depth spill file"); continue; }
+            };
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let expected_records = file_len as usize / DEPTH_SPILL_RECORD_SIZE;
+            info!(path = %path.display(), file_bytes = file_len, expected_records, "draining stale depth spill file to QuestDB");
+            let mut reader = BufReader::new(file);
+            let mut record = [0u8; DEPTH_SPILL_RECORD_SIZE];
+            let mut drained: usize = 0;
+            let mut flush_failed = false;
+            loop {
+                match reader.read_exact(&mut record) {
+                    Ok(()) => {}, Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => { warn!(?err, drained, path = %path.display(), "stale depth spill read error — stopping drain"); break; }
+                }
+                let snapshot = deserialize_depth(&record);
+                if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+                    warn!(?err, security_id = snapshot.security_id, "build_depth_rows failed during stale spill drain — snapshot skipped"); continue;
+                }
+                self.in_flight.push(snapshot);
+                self.pending_count = self.pending_count.saturating_add(1);
+                drained = drained.saturating_add(1);
+                if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
+                    warn!(?err, drained, path = %path.display(), "flush during stale depth spill drain failed"); flush_failed = true; break;
+                }
+            }
+            if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
+                warn!(?err, drained, path = %path.display(), "stale depth spill drain final flush failed"); flush_failed = true;
+            }
+            if !flush_failed {
+                if let Err(err) = std::fs::remove_file(&path) { warn!(?err, path = %path.display(), "failed to delete stale depth spill file"); }
+                else { info!(path = %path.display(), drained, "stale depth spill file recovered and deleted"); }
+                total_recovered = total_recovered.saturating_add(drained);
+            } else { warn!(path = %path.display(), drained, "stale depth spill partially drained — file preserved for retry"); }
+        }
+        if total_recovered > 0 { info!(total_recovered, "startup recovery complete — stale depth spill files drained to QuestDB"); }
+        total_recovered
     }
 }
 

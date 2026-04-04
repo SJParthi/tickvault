@@ -1373,6 +1373,10 @@ pub enum OmsError {
     /// JSON serialization/deserialization failed.
     #[error("JSON error: {0}")]
     JsonError(String),
+
+    /// Sandbox enforcement: live orders blocked before cutover date.
+    #[error("sandbox enforcement: live orders blocked until 2026-07-01")]
+    SandboxEnforcement,
 }
 
 // ---------------------------------------------------------------------------

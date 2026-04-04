@@ -949,7 +949,20 @@ async fn main() -> Result<()> {
     };
 
     let depth_writer = match DepthPersistenceWriter::new(&config.questdb) {
-        Ok(writer) => {
+        Ok(mut writer) => {
+            // Recover stale depth spill files from previous crashes.
+            let recovered = writer.recover_stale_spill_files();
+            if recovered > 0 {
+                info!(
+                    recovered,
+                    "recovered stale depth spill files from previous crash"
+                );
+                notifier.notify(NotificationEvent::Custom {
+                    message: format!(
+                        "Startup: recovered {recovered} depth snapshots from previous crash spill files"
+                    ),
+                });
+            }
             info!("QuestDB depth writer connected");
             Some(writer)
         }
@@ -968,7 +981,11 @@ async fn main() -> Result<()> {
                           All depth data buffered until QuestDB comes back."
                     .to_owned(),
             });
-            Some(DepthPersistenceWriter::new_disconnected(&config.questdb))
+            let mut writer = DepthPersistenceWriter::new_disconnected(&config.questdb);
+            // Attempt recovery even in disconnected mode — spill files may exist
+            // from a previous session where QuestDB was available.
+            let _ = writer.recover_stale_spill_files();
+            Some(writer)
         }
     };
 
@@ -1062,7 +1079,15 @@ async fn main() -> Result<()> {
             match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(
                 &config.questdb,
             ) {
-                Ok(w) => {
+                Ok(mut w) => {
+                    // Recover stale candle spill files from previous crashes.
+                    let recovered = w.recover_stale_spill_files();
+                    if recovered > 0 {
+                        info!(
+                            recovered,
+                            "recovered stale candle spill files from previous crash"
+                        );
+                    }
                     info!("QuestDB live candle writer connected (candles_1s)");
                     Some(w)
                 }

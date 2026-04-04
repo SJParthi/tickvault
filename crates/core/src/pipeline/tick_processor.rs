@@ -1007,10 +1007,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     if let Some(ref mut writer) = tick_writer {
         writer.flush_on_shutdown();
     }
-    if let Some(ref mut dw) = depth_writer
-        && let Err(err) = dw.force_flush()
-    {
-        error!(?err, "final depth flush failed");
+    if let Some(ref mut dw) = depth_writer {
+        dw.flush_on_shutdown();
     }
 
     // Flush remaining candles and persist to QuestDB
@@ -1040,9 +1038,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     c.vega,
                 );
             }
-            if let Err(err) = cw.force_flush() {
-                error!(?err, "final live candle flush failed");
-            }
+            cw.flush_on_shutdown();
         }
         agg.clear_completed();
         info!(

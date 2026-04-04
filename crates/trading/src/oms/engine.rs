@@ -200,6 +200,20 @@ impl OrderManagementSystem {
 
         // ---- LIVE MODE: actual Dhan REST API call ----
 
+        // Sandbox enforcement: block live orders before July 2026.
+        // This is a mechanical safety gate — no real money should be at risk
+        // until the system is fully validated in production.
+        // 2026-07-01T00:00:00 UTC = 1_782_777_600 epoch seconds.
+        #[cfg(not(test))]
+        {
+            const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_777_600;
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                error!("SANDBOX ENFORCEMENT: live orders blocked until 2026-07-01");
+                return Err(OmsError::SandboxEnforcement);
+            }
+        }
+
         // Step 3b: Get access token (only in live mode)
         let access_token = self.token_provider.get_access_token()?;
 
