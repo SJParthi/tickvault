@@ -145,6 +145,41 @@ services:
       - dlt-network
 
   # ---------------------------------------------------------------------------
+  # Alertmanager — Alert Routing (Prometheus → Telegram)
+  # Forwards Prometheus alerts to Telegram via webhook receiver.
+  # Pinned: prom/alertmanager:v0.28.1
+  # ---------------------------------------------------------------------------
+  dlt-alertmanager:
+    image: prom/alertmanager:v0.28.1@sha256:627635e82e34d5b4e6146aba11375e1a5afa0e833fc9f00edab85e06b2aec966
+    container_name: dlt-alertmanager
+    hostname: dlt-alertmanager
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
   # Loki — Log Aggregation
   # Bible #30: grafana/loki:3.6.6
   # ---------------------------------------------------------------------------

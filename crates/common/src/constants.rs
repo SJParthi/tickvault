@@ -1318,6 +1318,10 @@ pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
 /// Interval between periodic health checks (disk space, memory RSS) in seconds.
 pub const PERIODIC_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
 
+/// Maximum age for spill files after successful drain (7 days in seconds).
+/// Spill files older than this are auto-deleted during the periodic health check.
+pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
 // ---------------------------------------------------------------------------

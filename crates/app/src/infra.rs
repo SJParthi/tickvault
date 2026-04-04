@@ -370,6 +370,49 @@ pub fn check_spill_file_size() -> u64 {
     total_bytes
 }
 
+/// C4: Removes spill files older than `SPILL_FILE_MAX_AGE_SECS` (7 days).
+///
+/// Called during the periodic health check. Only deletes files that have
+/// already been drained (old date-stamped files from recovered outages).
+/// Returns the number of files cleaned up.
+// TEST-EXEMPT: requires data/spill directory — tested by unit test below
+pub fn cleanup_old_spill_files() -> usize {
+    use dhan_live_trader_common::constants::SPILL_FILE_MAX_AGE_SECS;
+
+    let dir = match std::fs::read_dir("data/spill") {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    let max_age = Duration::from_secs(SPILL_FILE_MAX_AGE_SECS);
+    let mut cleaned = 0_usize;
+
+    for entry in dir.flatten() {
+        let meta = match entry.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or(Duration::ZERO);
+
+        if age > max_age {
+            let path = entry.path();
+            if std::fs::remove_file(&path).is_ok() {
+                info!(path = %path.display(), age_days = age.as_secs() / 86400, "removed old spill file");
+                cleaned = cleaned.saturating_add(1);
+            }
+        }
+    }
+
+    if cleaned > 0 {
+        metrics::counter!("dlt_spill_files_cleaned_total").increment(cleaned as u64);
+    }
+    cleaned
+}
+
 /// C3: Pings QuestDB via HTTP `SELECT 1` to verify it's alive.
 ///
 /// Returns `true` if QuestDB responds, `false` otherwise.

@@ -289,6 +289,16 @@ groups:
           summary: "TICKS PERMANENTLY LOST"
           description: "{{ $value }} ticks dropped — both ring buffer and disk spill failed. IMMEDIATE investigation required."
 
+      # Circuit breaker opened — Dhan API failures exceeded threshold
+      - alert: CircuitBreakerOpen
+        expr: dlt_circuit_breaker_state == 1
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "OMS circuit breaker OPEN — order API calls halted"
+          description: "Dhan API consecutive failures exceeded threshold. All order submissions blocked until recovery."
+
       # Phase 2 (OMS) — metrics not yet emitted, alert will be inert until then
       - alert: HighOrderRejectionRate
         expr: rate(dlt_orders_rejected_total[5m]) / (rate(dlt_orders_placed_total[5m]) + 1e-10) > 0.10

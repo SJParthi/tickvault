@@ -9,6 +9,12 @@ global:
   evaluation_interval: 15s
   scrape_timeout: 10s
 
+# Route alerts to Alertmanager (→ Telegram).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["dlt-alertmanager:9093"]
+
 # Load recording rules and alert rules
 rule_files:
   - "/etc/prometheus/rules/*.yml"

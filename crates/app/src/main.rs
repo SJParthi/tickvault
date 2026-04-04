@@ -1442,8 +1442,15 @@ async fn main() -> Result<()> {
                         ),
                     });
                 }
-                // C3: QuestDB liveness ping (SELECT 1).
-                infra::check_questdb_liveness(&questdb_config).await;
+                // C3: QuestDB liveness ping (SELECT 1) — alert on failure.
+                if !infra::check_questdb_liveness(&questdb_config).await {
+                    health_notifier.notify(NotificationEvent::QuestDbDisconnected {
+                        writer: "liveness-check".to_string(),
+                        buffer_size: 0,
+                    });
+                }
+                // C4: Auto-cleanup spill files older than 7 days.
+                infra::cleanup_old_spill_files();
             }
         });
         info!("background periodic health check started (every 5 minutes)");
