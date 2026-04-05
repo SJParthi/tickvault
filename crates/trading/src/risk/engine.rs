@@ -62,6 +62,7 @@ pub struct RiskEngine {
 /// Decouples the trading crate from the core notification crate.
 pub trait RiskAlertSink: Send + Sync {
     /// Fires a risk halt alert. Best-effort — never blocks.
+    // TEST-EXEMPT: trait method implemented by app crate, tested via integration tests
     fn fire_risk_halt(&self, reason: &'static str);
 }
 
