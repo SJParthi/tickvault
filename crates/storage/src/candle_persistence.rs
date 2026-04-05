@@ -2672,9 +2672,26 @@ mod tests {
         let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
         std::fs::create_dir_all(real_spill_dir).unwrap();
 
-        // Create two stale files with different dates and candle counts.
+        // Pre-test cleanup: remove only our specific test files to avoid
+        // interference from parallel tests sharing the same spill directory.
         let stale_file_a = real_spill_dir.join("candles-20220101.bin");
         let stale_file_b = real_spill_dir.join("candles-20220202.bin");
+        let _ = std::fs::remove_file(&stale_file_a);
+        let _ = std::fs::remove_file(&stale_file_b);
+
+        // Also remove any leftover candle spill files from other tests
+        // to ensure recover_stale_spill_files() only picks up our test files.
+        if let Ok(entries) = std::fs::read_dir(real_spill_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("candles-") && name_str.ends_with(".bin") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        // Create two stale files with different dates and candle counts.
         let count_a = 25_usize;
         let count_b = 35_usize;
 
