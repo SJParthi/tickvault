@@ -31,13 +31,23 @@ use tracing::{error, info, warn};
 ///
 /// Manual `Debug` impl redacts `bearer_token` to prevent secret leakage
 /// via `format!("{:?}", config)` or tracing spans.
+///
+/// SEC-2: `bearer_token` zeroized on drop to prevent heap residency.
 #[derive(Clone)]
 pub struct ApiAuthConfig {
     /// Bearer token for authenticating mutating API requests.
     /// Empty string = auth disabled (development mode only).
+    /// Zeroized on drop (see `Drop` impl below).
     pub bearer_token: String,
     /// Whether authentication is enabled.
     pub enabled: bool,
+}
+
+/// SEC-2: Zeroize the bearer token on struct drop.
+impl Drop for ApiAuthConfig {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.bearer_token);
+    }
 }
 
 impl std::fmt::Debug for ApiAuthConfig {

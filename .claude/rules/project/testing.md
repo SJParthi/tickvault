@@ -66,6 +66,41 @@ Full workspace check only when explicitly requested or on CI PR merge.
 - Hot-path items: include `# Performance` section
 - `cargo doc --no-deps` must build with zero warnings
 
+## Weekly CI Tests (Not Per-Commit)
+
+These test types run weekly (Monday) in CI, not on every push:
+
+### ASan/TSan (D3)
+- **AddressSanitizer:** `RUSTFLAGS="-Zsanitizer=address" cargo +nightly test`
+- **ThreadSanitizer:** `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test`
+- Detects memory safety violations and data races
+- Requires nightly Rust (sanitizers not stable yet)
+
+### Mutation Testing (D4)
+- `cargo mutants --workspace` — verifies test quality by injecting mutations
+- Survived mutants = test gap = hard fail
+- Currently configured for trading crate (`crates/trading/tests/mutation_killer.rs`)
+- Phase 2: expand to core + storage crates
+
+### Fuzz Testing
+- `cargo +nightly fuzz run tick_parser` — binary protocol crash testing
+- `cargo +nightly fuzz run config_parser` — TOML parsing robustness
+- Run for minimum 1 hour per target per week
+
+### Loom Concurrency
+- `cargo test -p dhan-live-trader-core --features loom --test loom_tick_dedup`
+- Feature-gated: replaces std atomics with Loom mocks for exhaustive interleaving
+- NOT in standard `cargo test` — requires separate compilation
+
+## Regression Test Policy (D2)
+
+When a bug is found and fixed:
+1. Write a test that FAILS without the fix
+2. Name it `test_regression_<issue>_<description>`
+3. Add comment: `// Regression: <date> — <brief description>`
+4. Deterministic replay tests (`crates/core/tests/deterministic_replay.rs`) serve as
+   the primary regression suite for tick processing invariants
+
 ## Deep Reference
 - **22 test types (canonical):** `docs/standards/22-test-types.md` (single source of truth)
 - Testing standards: `docs/standards/testing-standards.md`

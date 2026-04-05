@@ -37,10 +37,12 @@ services:
     mem_limit: 4g
     cpus: 2.0
     ports:
-      - "9000:9000"    # HTTP API + Web Console
-      - "8812:8812"    # PostgreSQL wire protocol
-      - "9009:9009"    # InfluxDB Line Protocol (high-speed ingestion)
-      - "9003:9003"    # Prometheus metrics (min HTTP server)
+      # E5 security: bind web console to localhost only (no external access).
+      # PG + ILP remain on all interfaces for host app connectivity.
+      - "127.0.0.1:9000:9000"  # HTTP API + Web Console (localhost only)
+      - "8812:8812"            # PostgreSQL wire protocol
+      - "9009:9009"            # InfluxDB Line Protocol (high-speed ingestion)
+      - "127.0.0.1:9003:9003" # Prometheus metrics (localhost only)
     volumes:
       - dlt-questdb-data:/var/lib/questdb
     environment:
@@ -81,6 +83,7 @@ services:
       - dlt-valkey-data:/data
     command: >
       valkey-server
+      --requirepass ${DLT_VALKEY_PASSWORD:-dlt-dev-only}
       --maxmemory 512mb
       --maxmemory-policy allkeys-lru
       --save 60 1000
@@ -114,7 +117,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "9090:9090"
+      # E5 security: bind to localhost only (no external access to metrics).
+      - "127.0.0.1:9090:9090"
     volumes:
       - dlt-prometheus-data:/prometheus
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -137,6 +141,41 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager — Alert Routing (Prometheus → Telegram)
+  # Forwards Prometheus alerts to Telegram via webhook receiver.
+  # Pinned: prom/alertmanager:v0.28.1
+  # ---------------------------------------------------------------------------
+  dlt-alertmanager:
+    image: prom/alertmanager:v0.28.1@sha256:627635e82e34d5b4e6146aba11375e1a5afa0e833fc9f00edab85e06b2aec966
+    container_name: dlt-alertmanager
+    hostname: dlt-alertmanager
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - dlt-network
 
@@ -266,8 +305,10 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${DLT_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       GF_SECURITY_ADMIN_PASSWORD: ${DLT_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
+      # E5 security fix: anonymous users get Viewer role (not Admin).
+      # Admin access requires SSM-sourced credentials above.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: "http://localhost:3000"
       GF_ANALYTICS_REPORTING_ENABLED: "false"

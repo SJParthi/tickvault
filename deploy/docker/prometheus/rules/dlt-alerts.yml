@@ -249,6 +249,56 @@ groups:
           summary: "Over 50% ticks are duplicates"
           description: "Dedup filter rate is {{ $value | humanizePercentage }}. Possible duplicate subscriptions or feed issue."
 
+      # C2: Spill file growth — QuestDB likely down, ticks spilling to disk
+      - alert: TickSpillFilesGrowing
+        expr: dlt_spill_files_total_bytes > 100000000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tick spill files > 100 MB"
+          description: "Tick spill files total {{ $value | humanize1024 }}B. QuestDB may be down — data safe on disk but investigate."
+
+      # C3: QuestDB liveness — SELECT 1 failed
+      - alert: QuestDbDown
+        expr: dlt_questdb_alive == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "QuestDB is not responding"
+          description: "QuestDB liveness check (SELECT 1) failed for 2+ minutes. Ticks are buffering in memory/disk."
+
+      # C4: CPU spike — sustained high CPU usage
+      - alert: HighCpuUsage
+        expr: rate(process_cpu_seconds_total[5m]) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU usage > 90% sustained for 5 minutes"
+          description: "Process CPU usage is {{ $value | humanizePercentage }}. Possible infinite loop or resource exhaustion."
+
+      # C2: Tick drops — catastrophic (disk spill also failed)
+      - alert: TicksDropped
+        expr: dlt_ticks_dropped_total > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "TICKS PERMANENTLY LOST"
+          description: "{{ $value }} ticks dropped — both ring buffer and disk spill failed. IMMEDIATE investigation required."
+
+      # Circuit breaker opened — Dhan API failures exceeded threshold
+      - alert: CircuitBreakerOpen
+        expr: dlt_circuit_breaker_state == 1
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "OMS circuit breaker OPEN — order API calls halted"
+          description: "Dhan API consecutive failures exceeded threshold. All order submissions blocked until recovery."
+
       # Phase 2 (OMS) — metrics not yet emitted, alert will be inert until then
       - alert: HighOrderRejectionRate
         expr: rate(dlt_orders_rejected_total[5m]) / (rate(dlt_orders_placed_total[5m]) + 1e-10) > 0.10

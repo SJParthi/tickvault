@@ -413,7 +413,7 @@ fn test_oms_inline_endpoint_paths_documented() {
             "/forever/orders/{order-id}",
             "DELETE — delete forever order",
         ),
-        ("/forever/all", "GET — list all forever orders"),
+        ("/forever/orders", "GET — list all forever orders"),
     ];
     assert_eq!(
         forever_order_paths.len(),

@@ -103,6 +103,70 @@ impl fmt::Display for DhanInstrumentKind {
 }
 
 // ---------------------------------------------------------------------------
+// Expiry Code (Dhan Annexure Section 9)
+// ---------------------------------------------------------------------------
+
+/// Expiry code for derivative historical data requests.
+///
+/// Dhan API `expiryCode` field — exactly 3 values per Annexure Section 9:
+/// `0` = Current/Near, `1` = Next, `2` = Far.
+///
+/// Serializes as a bare integer (0, 1, 2) for JSON request bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ExpiryCode {
+    /// Current/Near month expiry.
+    Current = 0,
+    /// Next month expiry.
+    Next = 1,
+    /// Far month expiry.
+    Far = 2,
+}
+
+impl Serialize for ExpiryCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.as_u8())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpiryCode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u8::deserialize(deserializer)?;
+        Self::from_u8(value)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid expiry code: {value}")))
+    }
+}
+
+impl ExpiryCode {
+    /// Converts from a raw `u8`. Returns `None` for invalid values.
+    // TEST-EXEMPT: tested by test_expiry_code_all_variants, test_expiry_code_from_u8_invalid_rejected, test_expiry_code_roundtrip
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Current),
+            1 => Some(Self::Next),
+            2 => Some(Self::Far),
+            _ => None,
+        }
+    }
+
+    /// Returns the numeric value as `u8`.
+    // TEST-EXEMPT: tested by test_expiry_code_serialize_to_u8, test_expiry_code_roundtrip
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for ExpiryCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Current => f.write_str("Current"),
+            Self::Next => f.write_str("Next"),
+            Self::Far => f.write_str("Far"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Subscribed Index (8 F&O + 23 Display = 31 total)
 // ---------------------------------------------------------------------------
 
@@ -3352,5 +3416,47 @@ mod tests {
         assert_eq!(deserialized.csv_row_count, 100_000);
         assert_eq!(deserialized.derivative_count, 5000);
         assert_eq!(deserialized.build_duration, Duration::from_millis(1234));
+    }
+
+    // -----------------------------------------------------------------------
+    // ExpiryCode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expiry_code_serialize_to_u8() {
+        assert_eq!(ExpiryCode::Current.as_u8(), 0);
+        assert_eq!(ExpiryCode::Next.as_u8(), 1);
+        assert_eq!(ExpiryCode::Far.as_u8(), 2);
+    }
+
+    #[test]
+    fn test_expiry_code_all_variants() {
+        let current = ExpiryCode::from_u8(0).unwrap();
+        let next = ExpiryCode::from_u8(1).unwrap();
+        let far = ExpiryCode::from_u8(2).unwrap();
+        assert_eq!(current, ExpiryCode::Current);
+        assert_eq!(next, ExpiryCode::Next);
+        assert_eq!(far, ExpiryCode::Far);
+    }
+
+    #[test]
+    fn test_expiry_code_from_u8_invalid_rejected() {
+        assert!(ExpiryCode::from_u8(3).is_none());
+        assert!(ExpiryCode::from_u8(255).is_none());
+    }
+
+    #[test]
+    fn test_expiry_code_roundtrip() {
+        for val in 0..=2 {
+            let code = ExpiryCode::from_u8(val).unwrap();
+            assert_eq!(code.as_u8(), val);
+        }
+    }
+
+    #[test]
+    fn test_expiry_code_display() {
+        assert_eq!(ExpiryCode::Current.to_string(), "Current");
+        assert_eq!(ExpiryCode::Next.to_string(), "Next");
+        assert_eq!(ExpiryCode::Far.to_string(), "Far");
     }
 }

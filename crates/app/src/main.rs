@@ -464,13 +464,27 @@ async fn main() -> Result<()> {
                     ensure_greeks_tables(&config.questdb),
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
-                let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
+                // Gap 5: log on failure instead of silent drop.
+                if let Err(err) =
+                    calendar_persistence::persist_calendar(&trading_calendar, &config.questdb)
+                {
+                    warn!(
+                        ?err,
+                        "calendar persistence failed (non-critical, best-effort)"
+                    );
+                }
 
                 // Re-persist instrument data ONLY for CachedPlan path.
                 // FreshBuild already persisted inside load_or_build_instruments.
                 // Double-persist creates duplicate rows in QuestDB snapshot tables.
-                if _needs_persist && let Some(ref universe) = fresh_universe {
-                    let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+                if _needs_persist
+                    && let Some(ref universe) = fresh_universe
+                    && let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await
+                {
+                    warn!(
+                        ?err,
+                        "instrument snapshot persistence failed (non-critical)"
+                    );
                 }
 
                 info!("QuestDB DDL complete (background)");
@@ -528,8 +542,15 @@ async fn main() -> Result<()> {
             let tick_persistence_rx = fast_tick_broadcast_sender.subscribe();
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
+            let persist_notifier = std::sync::Arc::clone(&notifier);
             tokio::spawn(async move {
-                run_tick_persistence_consumer(tick_persistence_rx, questdb_cfg, Some(hs)).await;
+                run_tick_persistence_consumer(
+                    tick_persistence_rx,
+                    questdb_cfg,
+                    Some(hs),
+                    Some(persist_notifier),
+                )
+                .await;
             });
             info!("background tick persistence consumer started (cold path)");
         }
@@ -873,7 +894,12 @@ async fn main() -> Result<()> {
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
-    let _ = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb);
+    if let Err(err) = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb) {
+        warn!(
+            ?err,
+            "calendar persistence failed (non-critical, best-effort)"
+        );
+    }
 
     // Health status — created early so tick persistence status can be set.
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
@@ -917,13 +943,33 @@ async fn main() -> Result<()> {
             let mut writer = TickPersistenceWriter::new_disconnected(&config.questdb);
             // Also recover any stale spill files (will skip since sender is None,
             // but sets up the path for when reconnect succeeds).
-            let _ = writer.recover_stale_spill_files();
+            // recover_stale_spill_files returns count, not Result — no error to handle.
+            let recovered = writer.recover_stale_spill_files();
+            if recovered > 0 {
+                info!(
+                    recovered,
+                    "recovered stale tick spill files from previous crash"
+                );
+            }
             Some(writer)
         }
     };
 
     let depth_writer = match DepthPersistenceWriter::new(&config.questdb) {
-        Ok(writer) => {
+        Ok(mut writer) => {
+            // Recover stale depth spill files from previous crashes.
+            let recovered = writer.recover_stale_spill_files();
+            if recovered > 0 {
+                info!(
+                    recovered,
+                    "recovered stale depth spill files from previous crash"
+                );
+                notifier.notify(NotificationEvent::Custom {
+                    message: format!(
+                        "Startup: recovered {recovered} depth snapshots from previous crash spill files"
+                    ),
+                });
+            }
             info!("QuestDB depth writer connected");
             Some(writer)
         }
@@ -942,7 +988,11 @@ async fn main() -> Result<()> {
                           All depth data buffered until QuestDB comes back."
                     .to_owned(),
             });
-            Some(DepthPersistenceWriter::new_disconnected(&config.questdb))
+            let mut writer = DepthPersistenceWriter::new_disconnected(&config.questdb);
+            // Attempt recovery even in disconnected mode — spill files may exist
+            // from a previous session where QuestDB was available.
+            let _ = writer.recover_stale_spill_files();
+            Some(writer)
         }
     };
 
@@ -957,8 +1007,14 @@ async fn main() -> Result<()> {
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
-    if needs_instrument_persist && let Some(ref universe) = slow_boot_universe {
-        let _ = persist_instrument_snapshot(universe, &config.questdb).await;
+    if needs_instrument_persist
+        && let Some(ref universe) = slow_boot_universe
+        && let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await
+    {
+        warn!(
+            ?err,
+            "instrument snapshot persistence failed (non-critical)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -982,11 +1038,14 @@ async fn main() -> Result<()> {
     // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
     // Dhan's WebSocket server sends stale market data (last-traded prices from
     // the previous trading day) even on non-trading days. Without this guard,
-    // those stale ticks pass the time-of-day persist window check and get
-    // written to QuestDB, polluting the database with duplicate/stale data.
-    // Connect WebSocket on trading days, mock trading Saturdays, AND Muhurat sessions.
-    // Muhurat = special Diwali evening session on an otherwise closed day.
-    // Without this, Muhurat trading days get zero market data.
+    // stale ticks pollute the pipeline.
+    //
+    // WebSocket connects IMMEDIATELY on trading/mock/muhurat days regardless of
+    // current time. Pre-market stale ticks are dropped by the tick processor's
+    // ingestion gate: [data_collection_start, data_collection_end) IST.
+    // This ensures all 5 connections are warm and ready before 9:00 AM market open.
+    // At 15:30 PM (market close), market feed + depth WS are disconnected.
+    // Order update WS stays alive until app shutdown.
     let should_connect_ws =
         subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
@@ -1027,7 +1086,15 @@ async fn main() -> Result<()> {
             match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(
                 &config.questdb,
             ) {
-                Ok(w) => {
+                Ok(mut w) => {
+                    // Recover stale candle spill files from previous crashes.
+                    let recovered = w.recover_stale_spill_files();
+                    if recovered > 0 {
+                        info!(
+                            recovered,
+                            "recovered stale candle spill files from previous crash"
+                        );
+                    }
                     info!("QuestDB live candle writer connected (candles_1s)");
                     Some(w)
                 }
@@ -1158,7 +1225,9 @@ async fn main() -> Result<()> {
     // Step 10: Spawn order update WebSocket connection
     // -----------------------------------------------------------------------
     let (order_update_sender, _order_update_receiver) =
-        tokio::sync::broadcast::channel::<dhan_live_trader_common::order_types::OrderUpdate>(256);
+        tokio::sync::broadcast::channel::<dhan_live_trader_common::order_types::OrderUpdate>(
+            dhan_live_trader_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+        );
 
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
@@ -1330,12 +1399,16 @@ async fn main() -> Result<()> {
         );
     }
 
+    // C1: Notify systemd that boot is complete (no-op outside systemd).
+    infra::notify_systemd_ready();
+
     // -----------------------------------------------------------------------
-    // Step 12b: Background periodic health check (disk space + memory RSS)
+    // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
     // -----------------------------------------------------------------------
     // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
     {
         let health_notifier = notifier.clone();
+        let questdb_config = config.questdb.clone();
         tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(
                 dhan_live_trader_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
@@ -1364,6 +1437,27 @@ async fn main() -> Result<()> {
                         ),
                     });
                 }
+                // C2: Spill file size check — export metric + alert if large.
+                let spill_bytes = infra::check_spill_file_size();
+                if spill_bytes > 500 * 1024 * 1024 {
+                    // > 500 MB of spill files — QuestDB likely down for extended period.
+                    health_notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "WARNING: Tick spill files total {:.1} MB — QuestDB may be \
+                             down. Data safe on disk but investigate.",
+                            spill_bytes as f64 / (1024.0 * 1024.0)
+                        ),
+                    });
+                }
+                // C3: QuestDB liveness ping (SELECT 1) — alert on failure.
+                if !infra::check_questdb_liveness(&questdb_config).await {
+                    health_notifier.notify(NotificationEvent::QuestDbDisconnected {
+                        writer: "liveness-check".to_string(),
+                        buffer_size: 0,
+                    });
+                }
+                // C4: Auto-cleanup spill files older than 7 days.
+                infra::cleanup_old_spill_files();
             }
         });
         info!("background periodic health check started (every 5 minutes)");
@@ -1466,9 +1560,12 @@ async fn load_instruments(
             (None, None, false)
         }
         Err(err) => {
-            warn!(
+            // Gap 3 fix: ERROR level triggers Telegram via Loki → Grafana.
+            // Previously WARN — operator unaware system has zero instruments.
+            error!(
                 error = %err,
-                "instrument build failed — no instruments to subscribe"
+                "CRITICAL: instrument build failed — system has ZERO instruments to \
+                 subscribe. No ticks, no trading. Investigate immediately."
             );
             (None, None, false)
         }
@@ -1578,6 +1675,8 @@ fn spawn_historical_candle_fetch(
     let bg_dhan_config = config.dhan.clone();
     let bg_historical_config = config.historical.clone();
     let bg_questdb_config = config.questdb.clone();
+    let bg_data_collection_start = config.trading.data_collection_start.clone();
+    let bg_data_collection_end = config.trading.data_collection_end.clone();
     let bg_token_handle = token_manager.token_handle();
     let bg_notifier = std::sync::Arc::clone(notifier);
 
@@ -1619,17 +1718,28 @@ fn spawn_historical_candle_fetch(
         };
 
         // -----------------------------------------------------------------
-        // Trading day: skip initial fetch — wait for post-market signal
+        // Trading day + within market hours: wait for post-market signal
         //   (after 15:30 IST, WS disconnected, live data fully ingested)
+        // Trading day + AFTER market hours: fetch immediately (market already closed)
         // Non-trading day: fetch immediately at boot (no live data to wait for)
         // -----------------------------------------------------------------
 
-        if is_trading_day {
+        let is_within_collection_window =
+            dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
+                &bg_data_collection_start,
+                &bg_data_collection_end,
+            );
+
+        if is_trading_day && is_within_collection_window {
             info!(
-                "trading day — skipping initial historical fetch, waiting for post-market signal"
+                "trading day during market hours — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
             info!("post-market signal received — WebSockets disconnected, live data ingested");
+        } else if is_trading_day {
+            info!(
+                "trading day but market already closed — starting historical candle fetch immediately"
+            );
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }
@@ -1790,6 +1900,7 @@ async fn run_tick_persistence_consumer(
     mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
     questdb_config: dhan_live_trader_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
+    notifier: Option<std::sync::Arc<NotificationService>>,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -1835,6 +1946,13 @@ async fn run_tick_persistence_consumer(
 
                 // B2: After QuestDB recovery + buffer drain, run integrity check.
                 if tick_writer.take_recovery_flag() {
+                    // Fire immediate Telegram notification for QuestDB recovery.
+                    if let Some(ref n) = notifier {
+                        n.notify(NotificationEvent::QuestDbReconnected {
+                            writer: "tick".to_string(),
+                            drained_count: ticks_persisted as usize,
+                        });
+                    }
                     let qdb_config = questdb_config.clone();
                     tokio::spawn(async move {
                         dhan_live_trader_storage::tick_persistence::check_tick_gaps_after_recovery(
@@ -2066,11 +2184,10 @@ async fn run_shutdown_fast(
         );
         tokio::time::sleep(drain).await;
 
-        // Stop real-time data pipeline (WS + tick processor + trading)
+        // Stop real-time market data pipeline (market feed + depth WS only).
+        // Order update WS stays alive until app shutdown (16:00 IST or Ctrl+C)
+        // to capture AMO status updates and post-market order notifications.
         for handle in &ws_handles {
-            handle.abort();
-        }
-        if let Some(ref handle) = order_update_handle {
             handle.abort();
         }
         // Give tick processor time to flush remaining ticks before aborting
@@ -2210,15 +2327,18 @@ async fn wait_for_shutdown_signal() -> &'static str {
 // Helper: Build inline Greeks enricher for tick processor
 // ---------------------------------------------------------------------------
 
-/// Constructs an `InlineGreeksComputer` wrapped as `Box<dyn GreeksEnricher>`
-/// for injection into the tick processor.
+/// Constructs an `InlineGreeksComputer` for injection into the tick processor.
+///
+/// A5: Returns the concrete type (not `Box<dyn>`) so the compiler monomorphizes
+/// `run_tick_processor<InlineGreeksComputer>`, eliminating vtable indirection
+/// on the hot path (~20-40ns savings per tick).
 ///
 /// Returns `None` if Greeks are disabled or no subscription plan is available.
 /// O(1) EXEMPT: cold path — called once at startup.
 fn build_inline_greeks_enricher(
     config: &ApplicationConfig,
     subscription_plan: &Option<SubscriptionPlan>,
-) -> Option<Box<dyn dhan_live_trader_common::tick_types::GreeksEnricher>> {
+) -> Option<InlineGreeksComputer> {
     if !config.greeks.enabled {
         info!("inline Greeks enricher disabled in config");
         return None;
@@ -2256,7 +2376,7 @@ fn build_inline_greeks_enricher(
         "inline Greeks enricher created for tick processor"
     );
 
-    Some(Box::new(enricher))
+    Some(enricher)
 }
 
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).

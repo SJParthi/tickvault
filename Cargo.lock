@@ -1221,6 +1221,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1332,6 +1333,7 @@ dependencies = [
  "dhan-live-trader-common",
  "dhat",
  "metrics",
+ "proptest",
  "questdb-rs",
  "redis",
  "reqwest",

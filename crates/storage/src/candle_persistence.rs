@@ -890,6 +890,79 @@ impl LiveCandleWriter {
     pub fn candles_dropped_total(&self) -> u64 {
         self.candles_spilled_total
     }
+
+    // -----------------------------------------------------------------------
+    // Graceful shutdown (matches tick writer flush_on_shutdown)
+    // -----------------------------------------------------------------------
+
+    /// Gracefully shuts down the candle writer.
+    ///
+    /// 4-step protocol (same as tick writer):
+    /// 1. Force-flush pending ILP buffer to QuestDB
+    /// 2. Drain ring buffer to QuestDB (if connected)
+    /// 3. Spill remaining ring buffer to disk (if QuestDB unreachable)
+    /// 4. Flush BufWriter to ensure all bytes hit disk
+    // TEST-EXEMPT: mirrors tick writer flush_on_shutdown (tested in tick_persistence); exercised by tick_processor shutdown integration tests
+    pub fn flush_on_shutdown(&mut self) {
+        let ring_count = self.candle_buffer.len();
+        let pending = self.pending_count;
+        let spilled = self.candles_spilled_total;
+
+        if ring_count == 0 && pending == 0 {
+            info!("candle writer shutdown: nothing to flush");
+            return;
+        }
+
+        info!(
+            ring_buffer = ring_count,
+            pending_ilp = pending,
+            spilled_to_disk = spilled,
+            "candle writer shutdown: flushing remaining candles"
+        );
+
+        // Step 1: Try to flush pending ILP buffer to QuestDB.
+        if pending > 0
+            && let Err(err) = self.force_flush()
+        {
+            warn!(
+                ?err,
+                "shutdown: candle ILP flush failed — in-flight rescued to ring buffer"
+            );
+        }
+
+        // Step 2: Try to drain ring buffer to QuestDB.
+        if self.sender.is_some() && !self.candle_buffer.is_empty() {
+            self.drain_candle_buffer();
+        }
+
+        // Step 3: If ring buffer still has candles (QuestDB unreachable), spill to disk.
+        if !self.candle_buffer.is_empty() {
+            let remaining = self.candle_buffer.len();
+            warn!(
+                remaining,
+                "shutdown: QuestDB unreachable — spilling remaining candles to disk"
+            );
+            while let Some(candle) = self.candle_buffer.pop_front() {
+                self.spill_candle_to_disk(&candle);
+            }
+            // Flush BufWriter to ensure all bytes hit disk.
+            if let Some(ref mut writer) = self.spill_writer
+                && let Err(err) = writer.flush()
+            {
+                error!(?err, "shutdown: failed to flush candle spill BufWriter");
+            }
+            info!(
+                spilled = remaining,
+                total_spilled = self.candles_spilled_total,
+                "shutdown: candles spilled to disk — will recover on next startup"
+            );
+        } else {
+            info!("shutdown: all candles flushed to QuestDB successfully");
+        }
+
+        // Close spill file handle.
+        self.spill_writer = None;
+    }
 }
 
 // ---------------------------------------------------------------------------

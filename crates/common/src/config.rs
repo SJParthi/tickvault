@@ -858,6 +858,44 @@ impl ApplicationConfig {
             }
         }
 
+        // Gap 6: URL format validation — fail-fast on invalid URLs.
+        // Catches typos and misconfiguration at boot instead of cryptic runtime errors.
+        let validate_url = |name: &str, url: &str, required_scheme: &str| -> Result<()> {
+            if url.is_empty() {
+                bail!("{name} must not be empty");
+            }
+            if !url.starts_with(required_scheme) {
+                bail!("{name} must start with '{required_scheme}', got '{url}'");
+            }
+            Ok(())
+        };
+
+        validate_url(
+            "dhan.rest_api_base_url",
+            &self.dhan.rest_api_base_url,
+            "https://",
+        )?;
+        validate_url("dhan.auth_base_url", &self.dhan.auth_base_url, "https://")?;
+        validate_url("dhan.websocket_url", &self.dhan.websocket_url, "wss://")?;
+        validate_url(
+            "dhan.order_update_websocket_url",
+            &self.dhan.order_update_websocket_url,
+            "wss://",
+        )?;
+        validate_url(
+            "dhan.instrument_csv_url",
+            &self.dhan.instrument_csv_url,
+            "https://",
+        )?;
+        // sandbox_base_url is optional (empty when mode=paper).
+        if !self.dhan.sandbox_base_url.is_empty() {
+            validate_url(
+                "dhan.sandbox_base_url",
+                &self.dhan.sandbox_base_url,
+                "https://",
+            )?;
+        }
+
         Ok(())
     }
 }

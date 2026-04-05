@@ -9,12 +9,15 @@
 
 ## Version 2.5.1 — Mar 17, 2026
 
-### Improvements
-- **Market Order conversion**: Effective March 21 — market orders via API will be converted to limit orders with Market Protection Percentage (MPP). This is a Dhan/exchange-side conversion; API behavior unchanged.
-- **Order rate limits**: Reduced to 10/sec (already enforced since v2.3).
+### Regulatory Changes (SEBI Framework)
+- **Market Price Protection (MPP)** — Effective March 21: Market orders via API are **no longer allowed**. Dhan/exchange auto-converts `MARKET` to `LIMIT` with MPP applied. `price: 0` still accepted in request. Systems must check order execution status — converted orders may remain `PENDING`. See `07-orders.md` MPP section.
+- **Order rate limits** — Effective March 21: Reduced to **10 orders/second** (was 25/sec). Per-minute/hour/day limits unchanged. Already in our rate limiter.
+- **Static IP mandatory** — Effective April 1: ALL API orders (place/modify/cancel/super/forever) must come from whitelisted static IP. Orders from unregistered IPs are **REJECTED by exchange**. No grace period. `GET /v2/ip/getIP` response now includes `detectedIP`, `ipMatchStatus`, `ordersAllowed` fields. See `02-authentication.md` for details.
 
-### Breaking Changes
-- **Static IP mandatory for ALL API orders**: Effective April 1 — all API orders (place/modify/cancel) must come from a whitelisted static IP. Already required since v2.4 but now strictly enforced by exchange.
+### SDK Changes (v2.2.0rc1)
+- `client-id` header now sent on ALL requests by default (not just Market Quote / Option Chain)
+- `PRE_OPEN` removed from AMO time validation for place order
+- Forever Order list endpoint confirmed as `GET /forever/orders` (not `/forever/all`)
 
 ---
 

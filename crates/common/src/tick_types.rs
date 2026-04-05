@@ -195,7 +195,7 @@ impl Default for OptionGreeksSnapshot {
 /// Trait for enriching ticks with Greeks data on the hot path.
 ///
 /// Implemented in `crates/trading` (InlineGreeksComputer) and injected into
-/// `crates/core` tick_processor via `Box<dyn GreeksEnricher>`.
+/// `crates/core` tick_processor via generic `<G: GreeksEnricher>` (monomorphized, no vtable).
 ///
 /// # Contract
 /// - `enrich()` is called once per valid tick, BEFORE persistence and broadcast.
@@ -207,6 +207,16 @@ impl Default for OptionGreeksSnapshot {
 pub trait GreeksEnricher: Send {
     /// Enrich a parsed tick with Greeks. Mutates Greeks fields in place.
     fn enrich(&mut self, tick: &mut ParsedTick);
+}
+
+/// No-op implementation of `GreeksEnricher` for when Greeks are disabled.
+/// Used as the concrete type parameter when `greeks_enricher = None`.
+/// Zero-size type — compiler eliminates all related code completely.
+pub struct NoopGreeksEnricher;
+
+impl GreeksEnricher for NoopGreeksEnricher {
+    #[inline(always)]
+    fn enrich(&mut self, _tick: &mut ParsedTick) {}
 }
 
 // ---------------------------------------------------------------------------

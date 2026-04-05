@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use dhan_live_trader_common::constants::{
     OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD, OMS_CIRCUIT_BREAKER_RESET_SECS,
@@ -143,10 +143,13 @@ impl OrderCircuitBreaker {
             {
                 self.half_open_probe_sent.store(false, Ordering::Relaxed);
                 metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
-                warn!(
+                // Gap 1 fix: ERROR level triggers Telegram via Loki → Grafana.
+                // Previously WARN — operator was unaware orders were being rejected.
+                error!(
                     failures = new_count,
                     threshold = self.failure_threshold,
-                    "circuit breaker OPEN — Dhan API failures exceeded threshold"
+                    "CRITICAL: circuit breaker OPEN — Dhan API failures exceeded threshold. \
+                     ALL order submissions blocked until recovery."
                 );
             }
         }
@@ -170,6 +173,20 @@ impl OrderCircuitBreaker {
         } else {
             CircuitState::Open
         }
+    }
+
+    /// Returns the current consecutive failure count.
+    // TEST-EXEMPT: trivial atomic load getter, tested indirectly by circuit breaker state tests
+    pub fn failure_count(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the circuit breaker transitioned from open/half-open
+    /// to closed on the most recent `record_success()` call.
+    /// Used by OMS engine to fire CircuitBreakerClosed notification.
+    // TEST-EXEMPT: trivial threshold comparison, tested indirectly by OMS engine tests
+    pub fn was_previously_open(&self, prev_failures: u32) -> bool {
+        prev_failures >= self.failure_threshold
     }
 
     /// Resets the circuit breaker to closed state (operator override).

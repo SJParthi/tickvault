@@ -44,6 +44,30 @@ pub trait TokenProvider: Send + Sync {
     fn get_access_token(&self) -> Result<SecretString, OmsError>;
 }
 
+/// OMS alert types fired to Telegram via the notification bridge.
+/// Defined here to avoid coupling the trading crate to the core notification crate.
+#[derive(Debug, Clone)]
+pub enum OmsAlert {
+    /// Circuit breaker opened — all orders blocked.
+    CircuitBreakerOpened { consecutive_failures: u64 },
+    /// Circuit breaker recovered — orders allowed again.
+    CircuitBreakerClosed,
+    /// SEBI rate limit hit — order rejected.
+    RateLimitExhausted { limit_type: String },
+    /// Order rejected by Dhan API or validation.
+    OrderRejected {
+        correlation_id: String,
+        reason: String,
+    },
+}
+
+/// Callback trait for OMS → Telegram alerts.
+/// Implemented in the app crate to bridge to `NotificationService`.
+pub trait OmsAlertSink: Send + Sync {
+    /// Sends an alert. Best-effort — never blocks.
+    fn fire(&self, alert: OmsAlert);
+}
+
 // ---------------------------------------------------------------------------
 // OrderManagementSystem
 // ---------------------------------------------------------------------------
@@ -81,6 +105,10 @@ pub struct OrderManagementSystem {
     dry_run: bool,
     /// Counter for generating sequential paper order IDs.
     paper_order_counter: u64,
+    /// Alert sink for immediate Telegram notifications (cold path — orders are 1-100/day).
+    /// `None` in tests; `Some` in production. Fires CircuitBreakerOpened/Closed,
+    /// RateLimitExhausted, OrderRejected events.
+    alert_sink: Option<Box<dyn OmsAlertSink>>,
 }
 
 impl OrderManagementSystem {
@@ -112,12 +140,27 @@ impl OrderManagementSystem {
             total_updates: 0,
             dry_run: true,
             paper_order_counter: 0,
+            alert_sink: None,
         }
     }
 
     /// Returns whether the OMS is in dry-run (paper trading) mode.
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
+    }
+
+    /// Sets the alert sink for immediate Telegram notifications.
+    /// Called from the app crate boot sequence to wire OMS → Telegram.
+    // TEST-EXEMPT: setter wired at boot, tested indirectly by integration tests
+    pub fn set_alert_sink(&mut self, sink: Box<dyn OmsAlertSink>) {
+        self.alert_sink = Some(sink);
+    }
+
+    /// Fires an OMS alert if a sink is wired. Best-effort — never blocks.
+    fn fire_alert(&self, alert: OmsAlert) {
+        if let Some(ref sink) = self.alert_sink {
+            sink.fire(alert);
+        }
     }
 
     /// Places a new order through the OMS pipeline.
@@ -142,10 +185,20 @@ impl OrderManagementSystem {
         validate_order_fields(&request)?;
 
         // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
-        self.rate_limiter.check()?;
+        if let Err(err) = self.rate_limiter.check() {
+            self.fire_alert(OmsAlert::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            });
+            return Err(err);
+        }
 
         // Step 2: Circuit breaker check
-        self.circuit_breaker.check()?;
+        if let Err(err) = self.circuit_breaker.check() {
+            self.fire_alert(OmsAlert::CircuitBreakerOpened {
+                consecutive_failures: u64::from(self.circuit_breaker.failure_count()),
+            });
+            return Err(err);
+        }
 
         // Step 3: Generate correlation ID
         let correlation_id = self.correlations.generate_id();
@@ -200,6 +253,20 @@ impl OrderManagementSystem {
 
         // ---- LIVE MODE: actual Dhan REST API call ----
 
+        // Sandbox enforcement: block live orders before July 2026.
+        // This is a mechanical safety gate — no real money should be at risk
+        // until the system is fully validated in production.
+        // 2026-07-01T00:00:00 UTC = 1_782_777_600 epoch seconds.
+        #[cfg(not(test))]
+        {
+            const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_777_600;
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                error!("SANDBOX ENFORCEMENT: live orders blocked until 2026-07-01");
+                return Err(OmsError::SandboxEnforcement);
+            }
+        }
+
         // Step 3b: Get access token (only in live mode)
         let access_token = self.token_provider.get_access_token()?;
 
@@ -227,7 +294,11 @@ impl OrderManagementSystem {
             .await
         {
             Ok(resp) => {
+                let prev_failures = self.circuit_breaker.failure_count();
                 self.circuit_breaker.record_success();
+                if self.circuit_breaker.was_previously_open(prev_failures) {
+                    self.fire_alert(OmsAlert::CircuitBreakerClosed);
+                }
                 resp
             }
             Err(err) => {
@@ -236,6 +307,10 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                self.fire_alert(OmsAlert::OrderRejected {
+                    correlation_id: correlation_id.clone(),
+                    reason: format!("{err}"),
+                });
                 return Err(err);
             }
         };
@@ -680,6 +755,18 @@ fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
         });
     }
 
+    // I-P0-03: Reject orders for expired derivative contracts.
+    // Stale universe → expired contract order → CRITICAL risk.
+    if let Some(expiry) = request.expiry_date {
+        let today = chrono::Utc::now().date_naive();
+        if expiry < today {
+            return Err(OmsError::ExpiredContract {
+                security_id: request.security_id,
+                expiry_date: expiry.to_string(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -703,6 +790,80 @@ fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> 
         return Err(OmsError::RiskRejected {
             reason: "STOP_LOSS/STOP_LOSS_MARKET orders require triggerPrice > 0".to_owned(),
         });
+    }
+
+    Ok(())
+}
+
+/// Validates super order target/SL prices relative to entry price and transaction type.
+///
+/// For BUY orders: target must exceed entry, SL must be below entry.
+/// For SELL orders: target must be below entry, SL must exceed entry.
+/// All prices must be positive. Pure function — no I/O.
+///
+/// Used by `place_super_order` (to be wired in OMS super order flow).
+#[allow(dead_code)] // APPROVED: pre-wired for super order placement; called once place_super_order is implemented
+// TEST-EXEMPT: tested by 12 test_super_order_* tests in this module
+pub(crate) fn validate_super_order_prices(
+    transaction_type: &str,
+    price: f64,
+    target_price: f64,
+    stop_loss_price: f64,
+) -> Result<(), OmsError> {
+    if price <= 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("super order entry price must be positive, got {price}"),
+        });
+    }
+    if target_price <= 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("super order target price must be positive, got {target_price}"),
+        });
+    }
+    if stop_loss_price <= 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("super order stop loss price must be positive, got {stop_loss_price}"),
+        });
+    }
+
+    match transaction_type {
+        "BUY" => {
+            if target_price <= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "BUY super order target ({target_price}) must exceed entry price ({price})"
+                    ),
+                });
+            }
+            if stop_loss_price >= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "BUY super order stop loss ({stop_loss_price}) must be below entry price ({price})"
+                    ),
+                });
+            }
+        }
+        "SELL" => {
+            if target_price >= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "SELL super order target ({target_price}) must be below entry price ({price})"
+                    ),
+                });
+            }
+            if stop_loss_price <= price {
+                return Err(OmsError::RiskRejected {
+                    reason: format!(
+                        "SELL super order stop loss ({stop_loss_price}) must exceed entry price ({price})"
+                    ),
+                });
+            }
+        }
+        other => {
+            return Err(OmsError::RiskRejected {
+                reason: format!("unknown transaction type for super order: {other}"),
+            });
+        }
     }
 
     Ok(())
@@ -1092,6 +1253,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let order_id = oms.place_order(request).await.unwrap();
@@ -1126,6 +1288,7 @@ mod tests {
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let id1 = oms.place_order(make_request()).await.unwrap();
@@ -1158,6 +1321,7 @@ mod tests {
             price: 300.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let order_id = oms.place_order(request).await.unwrap();
@@ -1251,6 +1415,7 @@ mod tests {
             price: 245.50, // BUG: MARKET orders must have price=0
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -1285,6 +1450,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0, // BUG: SL orders require triggerPrice > 0
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -1319,6 +1485,7 @@ mod tests {
             price: 0.0, // Correct: MARKET order with price=0
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -1490,6 +1657,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let result = oms.place_order(request).await;
         assert!(result.is_ok());
@@ -1553,6 +1721,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
     }
@@ -1569,6 +1738,7 @@ mod tests {
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
     }
@@ -1585,6 +1755,7 @@ mod tests {
             price: 100.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let err = validate_order_fields(&request).unwrap_err();
         assert!(matches!(err, OmsError::RiskRejected { .. }));
@@ -1602,6 +1773,7 @@ mod tests {
             price: 245.50,
             trigger_price: 240.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
     }
@@ -1618,6 +1790,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let err = validate_order_fields(&request).unwrap_err();
         assert!(matches!(err, OmsError::RiskRejected { .. }));
@@ -1635,6 +1808,7 @@ mod tests {
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         };
         let err = validate_order_fields(&request).unwrap_err();
         assert!(matches!(err, OmsError::RiskRejected { .. }));
@@ -1652,8 +1826,78 @@ mod tests {
             price: 0.0,
             trigger_price: 240.0,
             lot_size: 25,
+            expiry_date: None,
         };
         assert!(validate_order_fields(&request).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // I-P0-03: Expiry date validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_expired_contract_rejected() {
+        let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+            expiry_date: Some(yesterday),
+        };
+        let result = validate_order_fields(&request);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OmsError::ExpiredContract { .. }),
+            "I-P0-03: expired contract must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_valid_contract_passes() {
+        let tomorrow = chrono::Utc::now().date_naive() + chrono::Duration::days(1);
+        let request = PlaceOrderRequest {
+            security_id: 52432,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+            expiry_date: Some(tomorrow),
+        };
+        assert!(
+            validate_order_fields(&request).is_ok(),
+            "I-P0-03: valid (non-expired) contract must pass"
+        );
+    }
+
+    #[test]
+    fn test_validate_no_expiry_date_passes() {
+        let request = PlaceOrderRequest {
+            security_id: 11536,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Limit,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 50,
+            price: 245.50,
+            trigger_price: 0.0,
+            lot_size: 25,
+            expiry_date: None,
+        };
+        assert!(
+            validate_order_fields(&request).is_ok(),
+            "I-P0-03: equity orders (no expiry) must pass"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2199,6 +2443,7 @@ mod tests {
             price: 0.0,
             trigger_price: 240.0,
             lot_size: 25,
+            expiry_date: None,
         };
 
         let result = oms.place_order(request).await;
@@ -2341,6 +2586,7 @@ mod tests {
     }
 
     /// Multi-shot mock server that handles `n` sequential requests.
+    #[allow(dead_code)] // APPROVED: utility for future multi-request OMS tests
     #[allow(clippy::arithmetic_side_effects)]
     async fn start_multi_mock(
         responses: Vec<(u16, String)>,
@@ -2400,6 +2646,7 @@ mod tests {
             price: 245.50,
             trigger_price: 0.0,
             lot_size: 25,
+            expiry_date: None,
         }
     }
 
@@ -2932,5 +3179,112 @@ mod tests {
         // Verify histogram macro compiles and doesn't panic when invoked.
         // O(1) atomic call — safe for cold path (order placement).
         metrics::histogram!("dlt_order_placement_duration_ns").record(1000.0_f64);
+    }
+
+    // -----------------------------------------------------------------------
+    // Super order price validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_super_order_buy_target_must_exceed_entry() {
+        let result = validate_super_order_prices("BUY", 100.0, 95.0, 90.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("target"), "error should mention target: {msg}");
+    }
+
+    #[test]
+    fn test_super_order_buy_sl_must_be_below_entry() {
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 105.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("stop loss"),
+            "error should mention stop loss: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_super_order_sell_target_must_be_below_entry() {
+        let result = validate_super_order_prices("SELL", 100.0, 110.0, 105.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("target"), "error should mention target: {msg}");
+    }
+
+    #[test]
+    fn test_super_order_sell_sl_must_exceed_entry() {
+        let result = validate_super_order_prices("SELL", 100.0, 90.0, 95.0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("stop loss"),
+            "error should mention stop loss: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_super_order_valid_buy_prices_accepted() {
+        // BUY: target > entry > SL
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 90.0);
+        assert!(
+            result.is_ok(),
+            "valid BUY super order prices must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_super_order_valid_sell_prices_accepted() {
+        // SELL: SL > entry > target
+        let result = validate_super_order_prices("SELL", 100.0, 90.0, 110.0);
+        assert!(
+            result.is_ok(),
+            "valid SELL super order prices must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_super_order_zero_entry_price_rejected() {
+        let result = validate_super_order_prices("BUY", 0.0, 110.0, 90.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("entry price"));
+    }
+
+    #[test]
+    fn test_super_order_zero_target_price_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 0.0, 90.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("target price"));
+    }
+
+    #[test]
+    fn test_super_order_zero_sl_price_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 0.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stop loss price"));
+    }
+
+    #[test]
+    fn test_super_order_buy_target_equal_entry_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 100.0, 90.0);
+        assert!(result.is_err(), "target == entry must be rejected for BUY");
+    }
+
+    #[test]
+    fn test_super_order_buy_sl_equal_entry_rejected() {
+        let result = validate_super_order_prices("BUY", 100.0, 110.0, 100.0);
+        assert!(result.is_err(), "SL == entry must be rejected for BUY");
+    }
+
+    #[test]
+    fn test_super_order_unknown_txn_type_rejected() {
+        let result = validate_super_order_prices("UNKNOWN", 100.0, 110.0, 90.0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown transaction type")
+        );
     }
 }

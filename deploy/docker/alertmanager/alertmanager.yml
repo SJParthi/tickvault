@@ -1,0 +1,61 @@
+# =============================================================================
+# dhan-live-trader — Alertmanager Configuration
+# =============================================================================
+# Routes Prometheus alerts to Telegram via bot webhook.
+#
+# Secrets: Bot token and chat ID must be set via environment variables:
+#   DLT_TELEGRAM_BOT_TOKEN  — from AWS SSM /dlt/<env>/telegram/bot-token
+#   DLT_TELEGRAM_CHAT_ID    — from AWS SSM /dlt/<env>/telegram/chat-id
+#
+# To test: curl -XPOST http://localhost:9093/-/reload
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  # Default receiver — all alerts go to Telegram.
+  receiver: "telegram-critical"
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # CRITICAL alerts — immediate notification, shorter repeat.
+    - match:
+        severity: critical
+      receiver: "telegram-critical"
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # WARNING alerts — grouped with longer delay.
+    - match:
+        severity: warning
+      receiver: "telegram-warning"
+      group_wait: 1m
+      repeat_interval: 4h
+
+receivers:
+  - name: "telegram-critical"
+    webhook_configs:
+      - url: "http://host.docker.internal:9091/webhook/alertmanager"
+        send_resolved: true
+        http_config:
+          follow_redirects: false
+
+  - name: "telegram-warning"
+    webhook_configs:
+      - url: "http://host.docker.internal:9091/webhook/alertmanager"
+        send_resolved: true
+        http_config:
+          follow_redirects: false
+
+# Inhibit duplicate alerts when a higher-severity alert for the same
+# alertname is already firing.
+inhibit_rules:
+  - source_match:
+      severity: "critical"
+    target_match:
+      severity: "warning"
+    equal: ["alertname"]

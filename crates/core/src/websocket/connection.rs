@@ -289,10 +289,11 @@ impl WebSocketConnection {
         // requires the request-target to start with "/"). Proxies reject this
         // with 400 Bad Request.
         let base = self.websocket_base_url.trim_end_matches('/');
-        let authenticated_url = format!(
+        // SEC-3: Zeroize the URL containing the JWT after use to prevent heap residency.
+        let authenticated_url = zeroize::Zeroizing::new(format!(
             "{base}/?version={}&token={}&clientId={}&authType={}",
             WEBSOCKET_PROTOCOL_VERSION, access_token, self.client_id, WEBSOCKET_AUTH_TYPE,
-        );
+        ));
 
         let request = authenticated_url
             .as_str()

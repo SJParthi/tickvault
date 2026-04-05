@@ -769,6 +769,11 @@ pub const VALIDATION_FNO_STOCK_MIN_COUNT: usize = 150;
 /// Maximum expected number of F&O stock underlyings.
 pub const VALIDATION_FNO_STOCK_MAX_COUNT: usize = 300;
 
+/// I-P0-02: Minimum expected derivative contract count after universe build.
+/// A truncated CSV (< 100 derivatives) is almost certainly corrupt or incomplete.
+/// Real NSE F&O universe has 5000+ contracts on any given day.
+pub const VALIDATION_MIN_DERIVATIVE_COUNT: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Application Identity
 // ---------------------------------------------------------------------------
@@ -1232,11 +1237,25 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
 pub const TICK_BUFFER_CAPACITY: usize = 300_000;
 
+/// High watermark threshold for tick ring buffer (80% of capacity).
+/// When buffer occupancy exceeds this, a WARN-level alert fires once
+/// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
+pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 240,000
+
+/// Minimum free disk space (bytes) to log a warning before spill write.
+/// 100 MB — below this, a WARN fires on each spill open to alert operator
+/// that prolonged QuestDB outage may exhaust disk.
+pub const TICK_SPILL_MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
 /// tick persistence, candle aggregation). Must be large enough to absorb bursts
 /// during high-volatility events without lagging cold-path consumers.
 /// 65,536 ticks at ~112 bytes each = ~7MB. At ~1000 ticks/sec = ~65 seconds.
 pub const TICK_BROADCAST_CAPACITY: usize = 65_536;
+
+/// Broadcast channel capacity for order update consumers (OMS, risk engine).
+/// 256 order updates × ~512 bytes each = ~128KB. At ~10 orders/sec = ~25 seconds.
+pub const ORDER_UPDATE_BROADCAST_CAPACITY: usize = 256;
 
 /// Resilience ring buffer capacity for live candle writer.
 /// Holds candles in memory when QuestDB is down, drains on recovery.
@@ -1298,6 +1317,10 @@ pub const LIVE_TRADING_EARLIEST_DAY: u32 = 1;
 
 /// Interval between periodic health checks (disk space, memory RSS) in seconds.
 pub const PERIODIC_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
+
+/// Maximum age for spill files after successful drain (7 days in seconds).
+/// Spill files older than this are auto-deleted during the periodic health check.
+pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range

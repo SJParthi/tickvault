@@ -1210,8 +1210,8 @@ mod tests {
 
         let plan = build_subscription_plan(&universe, &config, today);
 
-        // Invalid feed mode falls back to Ticker
-        assert_eq!(plan.summary.feed_mode, FeedMode::Full);
+        // Invalid feed mode falls back to Ticker (see build_subscription_plan line 112)
+        assert_eq!(plan.summary.feed_mode, FeedMode::Ticker);
     }
 
     #[test]

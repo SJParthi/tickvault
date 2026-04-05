@@ -311,6 +311,7 @@ async fn run_trading_pipeline(
                                                 price: 0.0,
                                                 trigger_price: 0.0,
                                                 lot_size: 1,
+                                            expiry_date: None,
                                             };
                                             match oms.place_order(request).await {
                                                 Ok(order_id) => {
@@ -365,6 +366,7 @@ async fn run_trading_pipeline(
                                                 price: 0.0,
                                                 trigger_price: 0.0,
                                                 lot_size: 1,
+                                            expiry_date: None,
                                             };
                                             match oms.place_order(request).await {
                                                 Ok(order_id) => {
@@ -585,7 +587,16 @@ pub fn init_trading_pipeline(
         capital: config.strategy.capital,
         dry_run: config.strategy.dry_run,
         max_orders_per_second: config.trading.max_orders_per_second,
-        rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+        // B2: Route to sandbox URL when mode=Sandbox, production URL otherwise.
+        // Paper mode never makes HTTP calls (dry_run=true blocks them), so the
+        // URL doesn't matter, but we default to production for consistency.
+        rest_api_base_url: if config.strategy.mode.is_sandbox()
+            && !config.dhan.sandbox_base_url.is_empty()
+        {
+            config.dhan.sandbox_base_url.clone()
+        } else {
+            config.dhan.rest_api_base_url.clone()
+        },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
     };
@@ -1267,6 +1278,7 @@ threshold = 25.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
 
         assert_eq!(request.security_id, 52432);
@@ -1292,6 +1304,7 @@ threshold = 25.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
 
         assert_eq!(request.security_id, 49081);
@@ -1333,6 +1346,7 @@ threshold = 25.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
 
         let order_id = oms.place_order(request).await.unwrap();
@@ -1398,6 +1412,7 @@ threshold = 25.0
                 price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
+                expiry_date: None,
             };
             let order_id = oms.place_order(request).await.unwrap();
             assert!(order_id.starts_with("PAPER-"));
@@ -2715,6 +2730,7 @@ threshold = 70.0
             price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
+            expiry_date: None,
         };
         let order_id = oms.place_order(request).await.unwrap();
 
@@ -2854,6 +2870,7 @@ threshold = 30.0
                 price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
+                expiry_date: None,
             };
             let _ = oms.place_order(request).await.unwrap();
         }

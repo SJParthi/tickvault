@@ -1002,7 +1002,8 @@ mod proptest_oms_state_machine {
     }
 
     // Terminal states: once reached, no outgoing transitions are valid.
-    const TERMINAL_STATES: &[OrderStatus] = &[
+    // Used as reference documentation; proptest inlines the values for exhaustive coverage.
+    const _TERMINAL_STATES: &[OrderStatus] = &[
         OrderStatus::Traded,
         OrderStatus::Cancelled,
         OrderStatus::Rejected,
