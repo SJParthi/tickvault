@@ -12,7 +12,7 @@
    - Create: `POST /v2/forever/orders`
    - Modify: `PUT /v2/forever/orders/{order-id}`
    - Delete: `DELETE /v2/forever/orders/{order-id}`
-   - List: `GET /v2/forever/all`
+   - List: `GET /v2/forever/orders`
 
 3. **Static IP required** (see `dhan-authentication.md` rule 7). Product types: `CNC`, `MTF` only (no INTRADAY, no MARGIN).
 

@@ -1156,9 +1156,7 @@ impl OrderApiClient {
 
     /// Lists all forever orders.
     ///
-    /// Endpoint: `GET /v2/forever/all`
-    /// NOTE: DhanHQ Python SDK uses `GET /forever/orders` for listing, but
-    /// official Dhan API docs specify `/forever/all`. We follow the docs.
+    /// Endpoint: `GET /v2/forever/orders`
     // TEST-EXEMPT: requires live/sandbox Dhan API
     pub async fn get_all_forever_orders(
         &self,
