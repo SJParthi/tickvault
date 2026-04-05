@@ -57,6 +57,11 @@
 - Missing correlationId → cannot track orders through WebSocket updates
 - Wrong orderType string → order rejected
 - Integer securityId → order rejected
+- Market order assumed filled immediately → MPP conversion may leave order PENDING
+
+18. **Market Price Protection (MPP) — effective March 21, 2026.** Market orders via API are auto-converted to LIMIT orders with MPP by the exchange. `orderType: "MARKET"` is still accepted in the request, but the order book may show `LIMIT`. Systems MUST verify order execution status after placement — a market order may remain `PENDING` if MPP limit price is not immediately executable.
+
+19. **Static IP enforcement — effective April 1, 2026.** Orders from unregistered IPs are REJECTED by the exchange. No grace period. Verify `ordersAllowed == true` from `GET /v2/ip/getIP` before market open.
 
 ## Trigger
 

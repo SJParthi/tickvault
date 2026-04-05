@@ -14,9 +14,9 @@ Good Till Triggered (GTT) orders. Two types: `SINGLE` (one trigger) and `OCO` (t
 | POST   | `/forever/orders`               | Create               |
 | PUT    | `/forever/orders/{order-id}`    | Modify               |
 | DELETE | `/forever/orders/{order-id}`    | Delete               |
-| GET    | `/forever/all`                  | List all forever orders |
+| GET    | `/forever/orders`               | List all forever orders |
 
-> **SDK note:** DhanHQ Python SDK (v2.0.2) uses `GET /forever/orders` for listing instead of `/forever/all`. Both may be valid; our ground truth follows the official Dhan API documentation.
+> **Updated (April 2026):** Dhan official docs now show `GET /forever/orders` for listing (not `/forever/all`). Both the SDK and official docs agree on this endpoint.
 
 **Static IP required.** Product types: `CNC`, `MTF` only.
 

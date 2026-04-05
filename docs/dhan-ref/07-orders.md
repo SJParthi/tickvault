@@ -21,6 +21,22 @@
 | GET    | `/trades/{order-id}`                   | Trades of specific order       |
 
 > **Static IP required** for Place/Modify/Cancel (SEBI mandate since v2.4).
+> Orders from unregistered IPs are **REJECTED** by the exchange (enforced April 1, 2026).
+
+### Market Price Protection (MPP) — Effective March 21, 2026
+
+**Market orders are NO LONGER allowed through APIs** per SEBI regulatory framework.
+
+When a `MARKET` order is submitted via API, Dhan/exchange automatically converts it to a
+`LIMIT` order with Market Price Protection (MPP) applied. The limit price is calculated
+within a predefined MPP range set by the exchange.
+
+**Implications for our system:**
+- `orderType: "MARKET"` in the request is still accepted by the API — the conversion happens server-side.
+- The order book (`GET /orders/{order-id}`) may show `orderType: "LIMIT"` for orders placed as `MARKET`.
+- `price: 0` for market orders is still valid in the request — the exchange fills in the MPP-derived limit price.
+- **Systems MUST check order execution status** after placement. A market order may remain `PENDING` if the MPP limit price is not immediately executable.
+- Order rate limits are **10 orders/second** (reduced from 25/sec, effective March 21, 2026).
 
 ---
 

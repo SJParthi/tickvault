@@ -28,12 +28,13 @@
    - Step 2: Browser login at `https://auth.dhan.co/login/consentApp-login?consentAppId={consentAppId}`
    - Step 3: `POST/GET https://auth.dhan.co/app/consumeApp-consent?tokenId={Token ID}` with headers `app_id`, `app_secret`. Note: The DhanHQ Python SDK uses GET. The official docs suggest POST. Both may work.
 
-7. **Static IP — mandatory for Order APIs only.**
+7. **Static IP — MANDATORY for Order APIs (ENFORCED April 1, 2026).**
    - Set: `POST https://api.dhan.co/v2/ip/setIP` — body: `{ "dhanClientId": "...", "ip": "...", "ipFlag": "PRIMARY" }`
    - Modify: `PUT https://api.dhan.co/v2/ip/modifyIP` — **7-day cooldown** after modification
-   - Get: `GET https://api.dhan.co/v2/ip/getIP`
+   - Get: `GET https://api.dhan.co/v2/ip/getIP` — response includes `detectedIP`, `ipMatchStatus`, `ordersAllowed`
    - Supports IPv4 and IPv6. Primary + Secondary IP per account.
    - NOT required for Data APIs, Market Feed, Portfolio, or non-order APIs.
+   - **April 1, 2026 enforcement:** Orders from unregistered IPs are REJECTED by the exchange. No grace period. Pre-market check MUST call GetIP and verify `ordersAllowed == true`.
 
 8. **TOTP — 6-digit code, 30-second window, RFC 6238.**
    - Secret in environment/SSM only. Never hardcoded. Never in .env committed to git.

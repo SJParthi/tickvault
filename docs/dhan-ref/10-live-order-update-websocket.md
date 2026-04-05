@@ -129,6 +129,8 @@ wss://api-order-update.dhan.co
 | `ExchOrderNo`      | string | Order ID from exchange                                         |
 | `OrderNo`          | string | Order ID from Dhan                                             |
 
+> **SDK note:** Python SDK accesses `data["orderNo"]` (camelCase), but the sample JSON and official docs show `"OrderNo"` (PascalCase). Use `#[serde(alias = "orderNo")]` as a fallback to handle both conventions safely.
+
 ### Transaction Details
 
 | Field              | Type   | Description                                                    |

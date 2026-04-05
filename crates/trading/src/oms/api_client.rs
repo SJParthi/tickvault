@@ -1164,7 +1164,7 @@ impl OrderApiClient {
         &self,
         access_token: &str,
     ) -> Result<Vec<DhanForeverOrderResponse>, OmsError> {
-        let url = format!("{}/forever/all", self.base_url);
+        let url = format!("{}/forever/orders", self.base_url);
 
         let response = self
             .auth_headers(self.http.get(&url), access_token)

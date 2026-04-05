@@ -139,9 +139,40 @@ Once set, cannot modify for **7 days**.
 GET https://api.dhan.co/v2/ip/getIP
 ```
 
-Response includes `modifyDatePrimary` and `modifyDateSecondary` (when modification is allowed).
+Response:
+```json
+{
+    "modifyDatePrimary": "yyyy-MM-dd",
+    "modifyDateSecondary": "yyyy-MM-dd",
+    "primaryIP": "10.200.10.10",
+    "secondaryIP": "",
+    "detectedIP": "203.0.113.42",
+    "ipMatchStatus": "PRIMARY_MATCH",
+    "ordersAllowed": true
+}
+```
+
+| Field                | Type    | Description                                           |
+|----------------------|---------|-------------------------------------------------------|
+| `modifyDatePrimary`  | string  | Date when primary IP can next be modified (yyyy-MM-dd)|
+| `modifyDateSecondary`| string  | Date when secondary IP can next be modified           |
+| `primaryIP`          | string  | Whitelisted primary IP address                        |
+| `secondaryIP`        | string  | Whitelisted secondary IP address (empty if not set)   |
+| `detectedIP`         | string  | IP address detected by Dhan API for this request      |
+| `ipMatchStatus`      | string  | `PRIMARY_MATCH`, `SECONDARY_MATCH`, or mismatch value |
+| `ordersAllowed`      | boolean | `true` if orders can be placed from current IP        |
 
 > Supports both IPv4 and IPv6. Primary + Secondary IP per account. Each user needs unique static IP.
+
+### Static IP Enforcement — MANDATORY April 1, 2026
+
+**SEBI/Exchange enforcement change:** Effective April 1, 2026, orders submitted from IPs
+NOT on the whitelist are **REJECTED by the exchange**. No grace period.
+
+Affected endpoints: Place/Modify/Cancel orders, Super Orders, Forever Orders.
+
+**Pre-market check must verify:** Call `GET /v2/ip/getIP` and assert `ordersAllowed == true`
+before market open. If `false` → CRITICAL Telegram alert.
 
 ---
 
