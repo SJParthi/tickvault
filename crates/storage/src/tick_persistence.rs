@@ -10,10 +10,13 @@
 //! # Idempotency
 //! DEDUP UPSERT KEYS on `(ts, security_id)` prevent duplicate ticks on reconnect.
 //!
-//! # Error Handling
-//! Tick persistence is observability data, NOT critical path. On QuestDB failure,
-//! the system logs WARN and continues — no data is buffered in memory beyond
-//! the current batch to prevent OOM.
+//! # Error Handling & Zero-Tick-Loss Guarantee
+//! On QuestDB failure, ticks are held in a bounded ring buffer
+//! (`TICK_BUFFER_CAPACITY` = 300K ticks). When the ring buffer fills,
+//! overflow ticks spill to disk (`data/spill/ticks-YYYYMMDD.bin`).
+//! On recovery, ring buffer drains first, then disk spill.
+//! On graceful shutdown, remaining ticks flush to QuestDB or disk.
+//! **No tick is ever silently dropped** unless both ring buffer AND disk fail.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, BufWriter, Read as _, Write as _};
