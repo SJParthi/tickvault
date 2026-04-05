@@ -52,6 +52,17 @@ pub struct RiskEngine {
     total_checks: u64,
     /// Total orders rejected by risk checks.
     total_rejections: u64,
+    /// Alert callback for immediate Telegram alerts on risk breaches.
+    /// Implemented by the app crate to bridge to `NotificationService`.
+    // O(1) EXEMPT: cold path — risk halt fires at most once per day, not per-tick
+    alert_sink: Option<Box<dyn RiskAlertSink>>,
+}
+
+/// Callback trait for Risk Engine → Telegram alerts.
+/// Decouples the trading crate from the core notification crate.
+pub trait RiskAlertSink: Send + Sync {
+    /// Fires a risk halt alert. Best-effort — never blocks.
+    fn fire_risk_halt(&self, reason: &'static str);
 }
 
 impl RiskEngine {
@@ -73,7 +84,14 @@ impl RiskEngine {
             halt_reason: None,
             total_checks: 0,
             total_rejections: 0,
+            alert_sink: None,
         }
+    }
+
+    /// Sets the alert sink for immediate Telegram alerts on risk breaches.
+    // O(1) EXEMPT: cold path — called once at boot, not per-tick
+    pub fn set_alert_sink(&mut self, sink: Box<dyn RiskAlertSink>) {
+        self.alert_sink = Some(sink);
     }
 
     /// Pre-trade risk check. Returns `Approved` or `Rejected` with reason.
@@ -316,6 +334,16 @@ impl RiskEngine {
             );
             self.halted = true;
             self.halt_reason = Some(breach);
+            // Fire immediate Telegram notification (not just ERROR log with 2-min delay).
+            // O(1) EXEMPT: cold path — risk halt fires at most once per day
+            if let Some(ref sink) = self.alert_sink {
+                let reason: &'static str = match breach {
+                    RiskBreach::MaxDailyLossExceeded => "MaxDailyLossExceeded",
+                    RiskBreach::PositionSizeLimitExceeded => "PositionSizeLimitExceeded",
+                    RiskBreach::ManualHalt => "ManualHalt",
+                };
+                sink.fire_risk_halt(reason);
+            }
         }
     }
 }

@@ -175,6 +175,18 @@ impl OrderCircuitBreaker {
         }
     }
 
+    /// Returns the current consecutive failure count.
+    pub fn failure_count(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the circuit breaker transitioned from open/half-open
+    /// to closed on the most recent `record_success()` call.
+    /// Used by OMS engine to fire CircuitBreakerClosed notification.
+    pub fn was_previously_open(&self, prev_failures: u32) -> bool {
+        prev_failures >= self.failure_threshold
+    }
+
     /// Resets the circuit breaker to closed state (operator override).
     pub fn reset(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);

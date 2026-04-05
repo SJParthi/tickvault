@@ -44,6 +44,30 @@ pub trait TokenProvider: Send + Sync {
     fn get_access_token(&self) -> Result<SecretString, OmsError>;
 }
 
+/// OMS alert types fired to Telegram via the notification bridge.
+/// Defined here to avoid coupling the trading crate to the core notification crate.
+#[derive(Debug, Clone)]
+pub enum OmsAlert {
+    /// Circuit breaker opened — all orders blocked.
+    CircuitBreakerOpened { consecutive_failures: u64 },
+    /// Circuit breaker recovered — orders allowed again.
+    CircuitBreakerClosed,
+    /// SEBI rate limit hit — order rejected.
+    RateLimitExhausted { limit_type: String },
+    /// Order rejected by Dhan API or validation.
+    OrderRejected {
+        correlation_id: String,
+        reason: String,
+    },
+}
+
+/// Callback trait for OMS → Telegram alerts.
+/// Implemented in the app crate to bridge to `NotificationService`.
+pub trait OmsAlertSink: Send + Sync {
+    /// Sends an alert. Best-effort — never blocks.
+    fn fire(&self, alert: OmsAlert);
+}
+
 // ---------------------------------------------------------------------------
 // OrderManagementSystem
 // ---------------------------------------------------------------------------
@@ -81,6 +105,10 @@ pub struct OrderManagementSystem {
     dry_run: bool,
     /// Counter for generating sequential paper order IDs.
     paper_order_counter: u64,
+    /// Alert sink for immediate Telegram notifications (cold path — orders are 1-100/day).
+    /// `None` in tests; `Some` in production. Fires CircuitBreakerOpened/Closed,
+    /// RateLimitExhausted, OrderRejected events.
+    alert_sink: Option<Box<dyn OmsAlertSink>>,
 }
 
 impl OrderManagementSystem {
@@ -112,12 +140,26 @@ impl OrderManagementSystem {
             total_updates: 0,
             dry_run: true,
             paper_order_counter: 0,
+            alert_sink: None,
         }
     }
 
     /// Returns whether the OMS is in dry-run (paper trading) mode.
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
+    }
+
+    /// Sets the alert sink for immediate Telegram notifications.
+    /// Called from the app crate boot sequence to wire OMS → Telegram.
+    pub fn set_alert_sink(&mut self, sink: Box<dyn OmsAlertSink>) {
+        self.alert_sink = Some(sink);
+    }
+
+    /// Fires an OMS alert if a sink is wired. Best-effort — never blocks.
+    fn fire_alert(&self, alert: OmsAlert) {
+        if let Some(ref sink) = self.alert_sink {
+            sink.fire(alert);
+        }
     }
 
     /// Places a new order through the OMS pipeline.
@@ -142,10 +184,20 @@ impl OrderManagementSystem {
         validate_order_fields(&request)?;
 
         // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
-        self.rate_limiter.check()?;
+        if let Err(err) = self.rate_limiter.check() {
+            self.fire_alert(OmsAlert::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            });
+            return Err(err);
+        }
 
         // Step 2: Circuit breaker check
-        self.circuit_breaker.check()?;
+        if let Err(err) = self.circuit_breaker.check() {
+            self.fire_alert(OmsAlert::CircuitBreakerOpened {
+                consecutive_failures: u64::from(self.circuit_breaker.failure_count()),
+            });
+            return Err(err);
+        }
 
         // Step 3: Generate correlation ID
         let correlation_id = self.correlations.generate_id();
@@ -241,7 +293,11 @@ impl OrderManagementSystem {
             .await
         {
             Ok(resp) => {
+                let prev_failures = self.circuit_breaker.failure_count();
                 self.circuit_breaker.record_success();
+                if self.circuit_breaker.was_previously_open(prev_failures) {
+                    self.fire_alert(OmsAlert::CircuitBreakerClosed);
+                }
                 resp
             }
             Err(err) => {
@@ -250,6 +306,10 @@ impl OrderManagementSystem {
                 if !matches!(err, OmsError::DhanRateLimited) {
                     self.circuit_breaker.record_failure();
                 }
+                self.fire_alert(OmsAlert::OrderRejected {
+                    correlation_id: correlation_id.clone(),
+                    reason: format!("{err}"),
+                });
                 return Err(err);
             }
         };

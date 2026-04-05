@@ -542,8 +542,15 @@ async fn main() -> Result<()> {
             let tick_persistence_rx = fast_tick_broadcast_sender.subscribe();
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
+            let persist_notifier = std::sync::Arc::clone(&notifier);
             tokio::spawn(async move {
-                run_tick_persistence_consumer(tick_persistence_rx, questdb_cfg, Some(hs)).await;
+                run_tick_persistence_consumer(
+                    tick_persistence_rx,
+                    questdb_cfg,
+                    Some(hs),
+                    Some(persist_notifier),
+                )
+                .await;
             });
             info!("background tick persistence consumer started (cold path)");
         }
@@ -1893,6 +1900,7 @@ async fn run_tick_persistence_consumer(
     mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
     questdb_config: dhan_live_trader_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
+    notifier: Option<std::sync::Arc<NotificationService>>,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -1938,6 +1946,13 @@ async fn run_tick_persistence_consumer(
 
                 // B2: After QuestDB recovery + buffer drain, run integrity check.
                 if tick_writer.take_recovery_flag() {
+                    // Fire immediate Telegram notification for QuestDB recovery.
+                    if let Some(ref n) = notifier {
+                        n.notify(NotificationEvent::QuestDbReconnected {
+                            writer: "tick".to_string(),
+                            drained_count: ticks_persisted as usize,
+                        });
+                    }
                     let qdb_config = questdb_config.clone();
                     tokio::spawn(async move {
                         dhan_live_trader_storage::tick_persistence::check_tick_gaps_after_recovery(
