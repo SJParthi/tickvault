@@ -151,6 +151,7 @@ impl OrderManagementSystem {
 
     /// Sets the alert sink for immediate Telegram notifications.
     /// Called from the app crate boot sequence to wire OMS → Telegram.
+    // TEST-EXEMPT: setter wired at boot, tested indirectly by integration tests
     pub fn set_alert_sink(&mut self, sink: Box<dyn OmsAlertSink>) {
         self.alert_sink = Some(sink);
     }

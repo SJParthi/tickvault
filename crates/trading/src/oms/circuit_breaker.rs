@@ -176,6 +176,7 @@ impl OrderCircuitBreaker {
     }
 
     /// Returns the current consecutive failure count.
+    // TEST-EXEMPT: trivial atomic load getter, tested indirectly by circuit breaker state tests
     pub fn failure_count(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
@@ -183,6 +184,7 @@ impl OrderCircuitBreaker {
     /// Returns true if the circuit breaker transitioned from open/half-open
     /// to closed on the most recent `record_success()` call.
     /// Used by OMS engine to fire CircuitBreakerClosed notification.
+    // TEST-EXEMPT: trivial threshold comparison, tested indirectly by OMS engine tests
     pub fn was_previously_open(&self, prev_failures: u32) -> bool {
         prev_failures >= self.failure_threshold
     }

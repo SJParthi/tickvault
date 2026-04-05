@@ -89,8 +89,10 @@ impl RiskEngine {
     }
 
     /// Sets the alert sink for immediate Telegram alerts on risk breaches.
+    // TEST-EXEMPT: setter wired at boot, tested indirectly by risk engine integration tests
     // O(1) EXEMPT: cold path — called once at boot, not per-tick
     pub fn set_alert_sink(&mut self, sink: Box<dyn RiskAlertSink>) {
+        // O(1) EXEMPT: cold path
         self.alert_sink = Some(sink);
     }
 
