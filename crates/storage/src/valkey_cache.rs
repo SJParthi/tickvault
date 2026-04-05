@@ -1177,18 +1177,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: create a pool connected to the test Redis on port 6399.
-    fn test_pool() -> Option<ValkeyPool> {
+    /// Verifies connectivity before returning — skips test if Redis is unreachable.
+    async fn test_pool() -> Option<ValkeyPool> {
         let config = ValkeyConfig {
             host: "127.0.0.1".to_string(),
             port: 6399,
             max_connections: 4,
         };
-        ValkeyPool::new(&config).ok()
+        let pool = ValkeyPool::new(&config).ok()?;
+        // Verify actual connectivity — pool creation is lazy.
+        if pool.health_check().await.is_err() {
+            return None;
+        }
+        Some(pool)
     }
 
     #[tokio::test]
     async fn test_valkey_health_check_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let result = pool.health_check().await;
         assert!(
             result.is_ok(),
@@ -1198,7 +1206,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_valkey_set_get_roundtrip_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let key = "dlt_test_set_get_roundtrip";
 
         pool.set(key, "hello_world").await.unwrap();
@@ -1211,14 +1221,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_valkey_get_missing_key_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let val = pool.get("dlt_test_nonexistent_key_xyz").await.unwrap();
         assert_eq!(val, None, "GET on missing key must return None");
     }
 
     #[tokio::test]
     async fn test_valkey_set_ex_and_exists_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let key = "dlt_test_set_ex";
 
         pool.set_ex(key, "with_ttl", 300).await.unwrap();
@@ -1234,7 +1248,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_valkey_del_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let key = "dlt_test_del";
 
         pool.set(key, "to_be_deleted").await.unwrap();
@@ -1248,14 +1264,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_valkey_exists_missing_key_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let exists = pool.exists("dlt_test_does_not_exist").await.unwrap();
         assert!(!exists, "EXISTS on missing key must return false");
     }
 
     #[tokio::test]
     async fn test_valkey_set_nx_ex_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let key = "dlt_test_set_nx_ex";
 
         // Ensure clean state.
@@ -1275,7 +1295,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_valkey_set_overwrite_real() {
-        let Some(pool) = test_pool() else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let key = "dlt_test_overwrite";
 
         pool.set(key, "first").await.unwrap();
