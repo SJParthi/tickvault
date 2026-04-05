@@ -289,6 +289,18 @@ groups:
           summary: "TICKS PERMANENTLY LOST"
           description: "{{ $value }} ticks dropped — both ring buffer and disk spill failed. IMMEDIATE investigation required."
 
+      # C3: Broadcast lag — cold-path persistence fell behind tick producer
+      # tokio broadcast channel dropped oldest ticks (capacity 65536).
+      # These ticks are PERMANENTLY LOST — they never reached ring buffer or disk.
+      - alert: BroadcastLagTickLoss
+        expr: dlt_ticks_permanently_lost > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "TICKS PERMANENTLY LOST — broadcast channel lag"
+          description: "{{ $value }} ticks lost due to cold-path persistence lagging behind tick producer. Broadcast channel (capacity 65536) dropped oldest ticks. Check tick persistence consumer performance."
+
       # Circuit breaker opened — Dhan API failures exceeded threshold
       - alert: CircuitBreakerOpen
         expr: dlt_circuit_breaker_state == 1
