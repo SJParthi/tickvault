@@ -3,6 +3,7 @@
 pub mod health;
 pub mod index_constituency;
 pub mod instruments;
+pub mod option_chain;
 pub mod quote;
 pub mod static_file;
 pub mod stats;

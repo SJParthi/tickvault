@@ -87,6 +87,14 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/api/stock-indices/{symbol}",
             axum::routing::get(handlers::index_constituency::get_stock_indices),
+        )
+        .route(
+            "/api/option-chain",
+            axum::routing::get(handlers::option_chain::get_option_chain),
+        )
+        .route(
+            "/api/pcr",
+            axum::routing::get(handlers::option_chain::get_pcr),
         );
 
     public_routes
