@@ -783,6 +783,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // PrevClose packets set the baseline for OI change calculations.
                 if let Some(ref mut opt_movers) = option_movers {
                     opt_movers.update_prev_oi(security_id, exchange_segment_code, previous_oi);
+                    opt_movers.update_prev_close(
+                        security_id,
+                        exchange_segment_code,
+                        previous_close,
+                    );
+                }
+
+                // Update stock movers with previous close price baseline.
+                // During market hours, tick.day_close = 0 (exchange sets it post-market only).
+                // PrevClose packets provide the correct baseline for change% calculations.
+                if let Some(ref mut movers) = top_movers {
+                    movers.update_prev_close(security_id, exchange_segment_code, previous_close);
                 }
 
                 // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame)
@@ -1046,6 +1058,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             final_flush = final_count,
             "candle aggregator stopped"
         );
+    }
+
+    // Flush movers writers to ensure no pending rows are lost.
+    if let Some(ref mut writer) = stock_movers_writer
+        && let Err(err) = writer.flush()
+    {
+        warn!(?err, "stock movers flush on shutdown failed");
+    }
+    if let Some(ref mut writer) = option_movers_writer
+        && let Err(err) = writer.flush()
+    {
+        warn!(?err, "option movers flush on shutdown failed");
     }
 
     // Log final top movers state

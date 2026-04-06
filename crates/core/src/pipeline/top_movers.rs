@@ -95,9 +95,16 @@ pub struct TopMoversSnapshot {
 ///
 /// Updated O(1) per tick. Snapshot computation is O(N log N) but only runs
 /// periodically on the cold path (every 5 seconds).
+///
+/// Previous close prices are populated from PrevClose WebSocket packets
+/// (code 6) which arrive at subscription time. The `day_close` field in
+/// `ParsedTick` is NOT used because the exchange only sets it post-market.
 pub struct TopMoversTracker {
     /// Per-security state keyed by `(security_id, segment_code)`.
     securities: HashMap<(u32, u8), SecurityState>,
+    /// Previous close prices from PrevClose packets, keyed by `(security_id, segment_code)`.
+    /// Populated via `update_prev_close()` when PrevClose packets arrive.
+    prev_close_prices: HashMap<(u32, u8), f32>,
     /// Latest snapshot (updated periodically).
     latest_snapshot: Option<TopMoversSnapshot>,
     /// Total ticks processed.
@@ -115,14 +122,31 @@ impl TopMoversTracker {
     pub fn new() -> Self {
         Self {
             securities: HashMap::with_capacity(TRACKER_MAP_INITIAL_CAPACITY),
+            prev_close_prices: HashMap::with_capacity(TRACKER_MAP_INITIAL_CAPACITY),
             latest_snapshot: None,
             ticks_processed: 0,
         }
     }
 
+    /// Stores previous close price from a PrevClose WebSocket packet (code 6).
+    ///
+    /// Called by tick_processor when PrevClose packets arrive (typically at boot).
+    /// This sets the baseline for change% calculations in `update()`.
+    ///
+    /// # Performance
+    /// O(1) — single HashMap insert.
+    pub fn update_prev_close(&mut self, security_id: u32, segment_code: u8, prev_close: f32) {
+        if prev_close.is_finite() && prev_close > 0.0 {
+            self.prev_close_prices
+                .insert((security_id, segment_code), prev_close);
+        }
+    }
+
     /// Updates the tracker with a new tick.
     ///
-    /// Only processes ticks with valid `day_close` (previous close > 0).
+    /// Uses previous close from PrevClose packets (populated via `update_prev_close()`).
+    /// Falls back to `tick.day_close` if available (post-market only).
+    /// Skips ticks without any valid previous close baseline.
     ///
     /// # Performance
     /// O(1) — single HashMap lookup + one division.
@@ -130,15 +154,19 @@ impl TopMoversTracker {
     pub fn update(&mut self, tick: &ParsedTick) {
         self.ticks_processed = self.ticks_processed.saturating_add(1);
 
-        // Skip ticks without valid previous close (day_close = 0 for Ticker-only feeds)
-        if !tick.day_close.is_finite() || tick.day_close <= 0.0 {
-            return;
-        }
-
         let key = (tick.security_id, tick.exchange_segment_code);
 
+        // Look up previous close: prefer PrevClose packet, fall back to day_close
+        let prev_close = if let Some(&pc) = self.prev_close_prices.get(&key) {
+            pc
+        } else if tick.day_close.is_finite() && tick.day_close > 0.0 {
+            tick.day_close
+        } else {
+            return; // No baseline — skip
+        };
+
         // Calculate percentage change: ((LTP - prev_close) / prev_close) * 100
-        let change_pct = ((tick.last_traded_price - tick.day_close) / tick.day_close) * 100.0;
+        let change_pct = ((tick.last_traded_price - prev_close) / prev_close) * 100.0;
 
         if let Some(state) = self.securities.get_mut(&key) {
             state.last_traded_price = tick.last_traded_price;
@@ -1125,5 +1153,90 @@ mod tests {
         assert_eq!(tracker.tracked_count(), 0);
         assert_eq!(tracker.ticks_processed(), 0);
         assert!(tracker.latest_snapshot().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // update_prev_close — PrevClose packet integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prev_close_map_enables_tracking_when_day_close_is_zero() {
+        let mut tracker = TopMoversTracker::new();
+        // Set prev_close from PrevClose packet
+        tracker.update_prev_close(100, 2, 1000.0);
+        // Tick with day_close=0 (during market hours) — should now be tracked
+        let tick = make_tick(100, 2, 1100.0, 0.0, 5000);
+        tracker.update(&tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            1,
+            "should track via prev_close map"
+        );
+        let snapshot = tracker.compute_snapshot();
+        let pct = snapshot.gainers[0].change_pct;
+        assert!(
+            (pct - 10.0).abs() < 0.01,
+            "expected ~10% from prev_close map, got {pct}"
+        );
+    }
+
+    #[test]
+    fn prev_close_map_takes_priority_over_day_close() {
+        let mut tracker = TopMoversTracker::new();
+        // Set prev_close from PrevClose packet
+        tracker.update_prev_close(100, 2, 200.0);
+        // Tick with day_close=100 (different from PrevClose packet)
+        let tick = make_tick(100, 2, 220.0, 100.0, 1000);
+        tracker.update(&tick);
+        let snapshot = tracker.compute_snapshot();
+        let pct = snapshot.gainers[0].change_pct;
+        // Should use prev_close map (200.0), not day_close (100.0)
+        // (220 - 200) / 200 * 100 = 10%
+        assert!(
+            (pct - 10.0).abs() < 0.01,
+            "should use prev_close map (10%), not day_close (120%), got {pct}"
+        );
+    }
+
+    #[test]
+    fn prev_close_map_rejects_invalid_values() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update_prev_close(100, 2, 0.0);
+        tracker.update_prev_close(101, 2, -50.0);
+        tracker.update_prev_close(102, 2, f32::NAN);
+        tracker.update_prev_close(103, 2, f32::INFINITY);
+        // None should be stored
+        let tick = make_tick(100, 2, 110.0, 0.0, 1000);
+        tracker.update(&tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "invalid prev_close should be rejected"
+        );
+    }
+
+    #[test]
+    fn prev_close_map_different_segments_independent() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update_prev_close(100, 1, 500.0); // NSE_EQ
+        tracker.update_prev_close(100, 2, 50.0); // NSE_FNO
+        // Tick for NSE_FNO segment
+        let tick = ParsedTick {
+            security_id: 100,
+            exchange_segment_code: 2,
+            last_traded_price: 55.0,
+            day_close: 0.0,
+            volume: 1000,
+            exchange_timestamp: 1000,
+            ..Default::default()
+        };
+        tracker.update(&tick);
+        let snapshot = tracker.compute_snapshot();
+        // (55 - 50) / 50 * 100 = 10%, NOT (55 - 500) / 500 * 100
+        let pct = snapshot.gainers[0].change_pct;
+        assert!(
+            (pct - 10.0).abs() < 0.01,
+            "should use segment-specific prev_close, got {pct}"
+        );
     }
 }
