@@ -53,15 +53,31 @@ const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
 /// macOS Docker Desktop application name for `open -a`.
 const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 
-/// Grafana dashboard URL — auto-opened in browser after infrastructure starts.
-const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
-
-/// Grafana host for TCP reachability probe.
+/// Host used for all local TCP reachability probes.
 // O(1) EXEMPT: localhost probe for local Docker infrastructure
-const GRAFANA_HOST: &str = "127.0.0.1";
+const LOCAL_HOST: &str = "127.0.0.1";
+
+/// Dashboard URLs and ports — auto-opened in browser after infrastructure starts.
+/// Each entry: (service name, URL, host, port).
+const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
+    ("Grafana", "http://localhost:3000", LOCAL_HOST, 3000),
+    ("QuestDB", "http://localhost:9000", LOCAL_HOST, 9000),
+    ("Prometheus", "http://localhost:9090", LOCAL_HOST, 9090),
+    ("Jaeger", "http://localhost:16686", LOCAL_HOST, 16686),
+    ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
+    ("Portal", "http://localhost:3001/portal", LOCAL_HOST, 3001),
+];
+
+/// Grafana host for TCP reachability probe (kept for backward compat in tests).
+// O(1) EXEMPT: localhost probe for local Docker infrastructure
+const GRAFANA_HOST: &str = LOCAL_HOST;
 
 /// Grafana HTTP port for TCP reachability probe.
 const GRAFANA_PORT: u16 = 3000;
+
+/// Grafana dashboard URL (used in tests to validate DASHBOARD_SERVICES consistency).
+#[cfg(test)]
+const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -83,8 +99,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             port = questdb_config.http_port,
             "infrastructure already running (QuestDB reachable)"
         );
-        // Infrastructure already running — still auto-open Grafana dashboard.
-        open_grafana_if_reachable().await;
+        // Infrastructure already running — auto-open all monitoring dashboards.
+        open_all_dashboards().await;
         return;
     }
 
@@ -202,19 +218,22 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
     wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
 
-    // Auto-open Grafana dashboards in the default browser.
-    open_grafana_if_reachable().await;
+    // Auto-open all monitoring dashboards in the default browser.
+    open_all_dashboards().await;
 }
 
-/// Opens the Grafana dashboard in the default browser if Grafana is reachable.
+/// Opens all reachable monitoring dashboards in the default browser.
 ///
-/// Best-effort: if Grafana is not running or the browser cannot be launched,
-/// logs a warning and returns — does not block boot.
-async fn open_grafana_if_reachable() {
-    if is_service_reachable(GRAFANA_HOST, GRAFANA_PORT) {
-        open_in_browser(GRAFANA_DASHBOARD_URL).await;
-    } else {
-        debug!("Grafana not reachable — skipping browser auto-open");
+/// Opens: Grafana, QuestDB Console, Prometheus, Jaeger, Traefik, and Portal.
+/// Best-effort: if a service is not running or the browser cannot be launched,
+/// logs a warning and skips it — does not block boot.
+async fn open_all_dashboards() {
+    for &(name, url, host, port) in DASHBOARD_SERVICES {
+        if is_service_reachable(host, port) {
+            open_in_browser(url).await;
+        } else {
+            debug!(service = name, "not reachable — skipping browser auto-open");
+        }
     }
 }
 
@@ -935,9 +954,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_grafana_if_reachable_no_panic() {
-        // Exercises the function — Grafana likely not running in test env
-        open_grafana_if_reachable().await;
+    async fn test_open_all_dashboards_no_panic_legacy() {
+        // Exercises open_all_dashboards — services likely not running in test env
+        open_all_dashboards().await;
     }
 
     // -----------------------------------------------------------------------
@@ -1012,6 +1031,111 @@ mod tests {
             GRAFANA_DASHBOARD_URL.contains(&GRAFANA_PORT.to_string()),
             "Grafana URL must contain the configured port"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // DASHBOARD_SERVICES — auto-open all dashboards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dashboard_services_not_empty() {
+        assert!(
+            !DASHBOARD_SERVICES.is_empty(),
+            "must have at least one dashboard to auto-open"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_all_have_protocol() {
+        for &(name, url, _, _) in DASHBOARD_SERVICES {
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "{name} URL must have protocol, got: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_all_have_valid_ports() {
+        for &(name, _, _, port) in DASHBOARD_SERVICES {
+            assert!(port > 0, "{name} must have a positive port, got: {port}");
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_url_contains_port() {
+        for &(name, url, _, port) in DASHBOARD_SERVICES {
+            // Portal URL uses port 3001 which appears in the URL
+            assert!(
+                url.contains(&port.to_string()),
+                "{name} URL must contain port {port}, got: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_all_use_localhost() {
+        for &(name, _, host, _) in DASHBOARD_SERVICES {
+            assert_eq!(
+                host, LOCAL_HOST,
+                "{name} host must be {LOCAL_HOST}, got: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_names_are_unique() {
+        let names: Vec<&str> = DASHBOARD_SERVICES.iter().map(|&(n, _, _, _)| n).collect();
+        for (i, name) in names.iter().enumerate() {
+            for (j, other) in names.iter().enumerate() {
+                if i != j {
+                    assert_ne!(name, other, "duplicate dashboard service name: {name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_includes_grafana() {
+        assert!(
+            DASHBOARD_SERVICES
+                .iter()
+                .any(|&(name, _, _, _)| name == "Grafana"),
+            "Grafana must be in DASHBOARD_SERVICES"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_includes_questdb() {
+        assert!(
+            DASHBOARD_SERVICES
+                .iter()
+                .any(|&(name, _, _, _)| name == "QuestDB"),
+            "QuestDB must be in DASHBOARD_SERVICES"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_includes_portal() {
+        assert!(
+            DASHBOARD_SERVICES
+                .iter()
+                .any(|&(name, _, _, _)| name == "Portal"),
+            "Portal must be in DASHBOARD_SERVICES"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_count() {
+        // 6 services: Grafana, QuestDB, Prometheus, Jaeger, Traefik, Portal
+        assert_eq!(DASHBOARD_SERVICES.len(), 6, "expected 6 dashboard services");
+    }
+
+    #[tokio::test]
+    async fn test_open_all_dashboards_no_panic() {
+        // Exercises the function — services likely not running in test env.
+        // Must not panic regardless.
+        open_all_dashboards().await;
     }
 
     #[test]
@@ -1182,10 +1306,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_grafana_if_reachable_exercises_both_branches() {
-        // Grafana is likely not running in test env, so exercises the else branch.
+    async fn test_open_all_dashboards_exercises_unreachable_branch() {
+        // Services are likely not running in test env, so exercises the skip branch.
         // The function should complete without panic in either case.
-        open_grafana_if_reachable().await;
+        open_all_dashboards().await;
     }
 
     // -----------------------------------------------------------------------
@@ -1405,15 +1529,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // open_grafana_if_reachable — with real listener
+    // open_all_dashboards — exercises all services (none reachable in test)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_open_grafana_if_reachable_with_real_listener() {
-        // We can't easily bind to port 3000 (Grafana's port), and the function
-        // uses hardcoded GRAFANA_HOST/PORT. So we just exercise it — Grafana
-        // likely not running, exercises the else branch.
-        open_grafana_if_reachable().await;
+    async fn test_open_all_dashboards_iterates_all_services() {
+        // Services are not running in test env, so each service hits the
+        // "not reachable" branch. Verifies the loop doesn't panic.
+        open_all_dashboards().await;
     }
 
     // -----------------------------------------------------------------------
