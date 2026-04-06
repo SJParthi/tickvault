@@ -22,8 +22,8 @@ use tracing::{debug, info, warn};
 use super::depth_strike_selector::{DEPTH_REBALANCE_STRIKE_THRESHOLD, should_rebalance};
 use dhan_live_trader_common::instrument_types::{FnoUniverse, OptionChainKey};
 
-/// Rebalance check interval (seconds). Checks spot drift every 5 minutes.
-const REBALANCE_CHECK_INTERVAL_SECS: u64 = 300;
+/// Rebalance check interval (seconds). Checks spot drift every 60 seconds.
+const REBALANCE_CHECK_INTERVAL_SECS: u64 = 60;
 
 /// Shared spot price tracker — updated by tick processor, read by rebalancer.
 ///
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_rebalance_check_interval() {
-        assert_eq!(REBALANCE_CHECK_INTERVAL_SECS, 300);
+        assert_eq!(REBALANCE_CHECK_INTERVAL_SECS, 60);
     }
 
     #[test]
