@@ -23,8 +23,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::constants::{
-    DHAN_TWENTY_DEPTH_WS_BASE_URL, FRAME_SEND_TIMEOUT_SECS, WEBSOCKET_AUTH_TYPE,
+    DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, FRAME_SEND_TIMEOUT_SECS,
+    WEBSOCKET_AUTH_TYPE,
 };
+use dhan_live_trader_common::types::ExchangeSegment;
 
 use super::tls::build_websocket_tls_connector;
 use super::types::{InstrumentSubscription, WebSocketError};
@@ -267,6 +269,219 @@ async fn connect_and_run_depth(
                     m_active.set(0.0);
                     return Err(WebSocketError::ConnectionFailed {
                         url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
+                        source: err,
+                    });
+                }
+                None => {
+                    m_active.set(0.0);
+                    return Ok(());
+                }
+                _ => {}
+            },
+        }
+    }
+    // O(1) EXEMPT: end
+}
+
+// ---------------------------------------------------------------------------
+// 200-Level Depth Connection
+// ---------------------------------------------------------------------------
+
+/// Runs a 200-level depth WebSocket connection for a SINGLE instrument.
+///
+/// Connects to `wss://full-depth-api.dhan.co/twohundreddepth`.
+/// Only 1 instrument per connection (Dhan limitation).
+/// Infinite reconnection with exponential backoff.
+// TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
+pub async fn run_two_hundred_depth_connection(
+    token_handle: TokenHandle,
+    client_id: String,
+    exchange_segment: ExchangeSegment,
+    security_id: u32,
+    label: String,
+    frame_sender: mpsc::Sender<Bytes>,
+) -> Result<(), WebSocketError> {
+    let segment_str = exchange_segment.as_str();
+    let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
+
+    // 200-level uses flat JSON (no InstrumentList array)
+    let subscribe_msg = serde_json::json!({
+        "RequestCode": 23,
+        "ExchangeSegment": segment_str,
+        "SecurityId": sid_str,
+    })
+    .to_string(); // O(1) EXEMPT: boot-time
+
+    info!(
+        label,
+        security_id,
+        segment = segment_str,
+        "starting 200-level depth WebSocket connection"
+    );
+
+    let reconnect_counter = AtomicU64::new(0);
+    let prefix = format!("depth-200lvl-{label}"); // O(1) EXEMPT: boot-time
+
+    loop {
+        match connect_and_run_200_depth(
+            &token_handle,
+            &client_id,
+            &subscribe_msg,
+            &frame_sender,
+            &prefix,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!("{prefix}: connection closed normally");
+            }
+            Err(err) => {
+                let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
+
+                if attempt.is_multiple_of(10) {
+                    error!(
+                        attempt,
+                        ?err,
+                        "{prefix}: reconnection threshold — still retrying"
+                    );
+                } else {
+                    warn!(
+                        attempt,
+                        ?err,
+                        "{prefix}: connection failed — will reconnect"
+                    );
+                }
+
+                let delay_ms = DEPTH_RECONNECT_INITIAL_MS
+                    .saturating_mul(1u64.checked_shl(attempt.min(63) as u32).unwrap_or(u64::MAX))
+                    .min(DEPTH_RECONNECT_MAX_MS);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        reconnect_counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Connects to the 200-level depth WebSocket and runs the read loop.
+// O(1) EXEMPT: begin — connection lifecycle
+async fn connect_and_run_200_depth(
+    token_handle: &TokenHandle,
+    client_id: &str,
+    subscribe_msg: &str,
+    frame_sender: &mpsc::Sender<Bytes>,
+    prefix: &str,
+) -> Result<(), WebSocketError> {
+    let token_guard = token_handle.load();
+    let token_state = token_guard
+        .as_ref()
+        .as_ref()
+        .ok_or(WebSocketError::NoTokenAvailable)?;
+
+    if !token_state.is_valid() {
+        return Err(WebSocketError::NoTokenAvailable);
+    }
+
+    let access_token = token_state.access_token().expose_secret().to_string();
+    let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
+    let authenticated_url = zeroize::Zeroizing::new(format!(
+        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}"
+    ));
+
+    let request = authenticated_url
+        .as_str()
+        .into_client_request()
+        .map_err(|err| WebSocketError::ConnectionFailed {
+            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+            source: err,
+        })?;
+
+    let tls_connector = build_websocket_tls_connector()?;
+    let connect_timeout = Duration::from_secs(DEPTH_CONNECT_TIMEOUT_SECS);
+
+    let connect_result = time::timeout(
+        connect_timeout,
+        connect_async_tls_with_config(request, None, false, Some(tls_connector)),
+    )
+    .await
+    .map_err(|_| WebSocketError::ConnectionFailed {
+        url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+        source: tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "200-depth WebSocket connection timed out",
+        )),
+    })?;
+
+    let (ws_stream, _response): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = connect_result
+        .map_err(|err| WebSocketError::ConnectionFailed {
+            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+            source: err,
+        })?;
+
+    info!("{prefix}: connected — sending subscription");
+
+    let (mut write, mut read) = ws_stream.split();
+
+    write
+        .send(Message::Text(subscribe_msg.to_string().into()))
+        .await
+        .map_err(|err| WebSocketError::ConnectionFailed {
+            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+            source: err,
+        })?;
+
+    info!("{prefix}: subscription sent — reading 200-level depth frames");
+
+    let m_frames =
+        metrics::counter!("dlt_depth_200lvl_frames_total", "label" => prefix.to_string());
+    let m_active =
+        metrics::gauge!("dlt_depth_200lvl_connection_active", "label" => prefix.to_string());
+    m_active.set(1.0);
+
+    let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+
+    loop {
+        match time::timeout(read_timeout, read.next()).await {
+            Err(_elapsed) => {
+                m_active.set(0.0);
+                warn!("{prefix}: read timeout — reconnecting");
+                return Err(WebSocketError::ReadTimeout {
+                    connection_id: 98,
+                    timeout_secs: DEPTH_READ_TIMEOUT_SECS,
+                });
+            }
+            Ok(frame_result) => match frame_result {
+                Some(Ok(Message::Binary(data))) => {
+                    m_frames.increment(1);
+                    let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
+                    match time::timeout(send_timeout, frame_sender.send(data)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            m_active.set(0.0);
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            warn!("{prefix}: frame send timeout — dropping frame");
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    if let Err(err) = write.send(Message::Pong(data)).await {
+                        m_active.set(0.0);
+                        return Err(WebSocketError::ConnectionFailed {
+                            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                            source: err,
+                        });
+                    }
+                }
+                Some(Ok(Message::Close(_))) => {
+                    m_active.set(0.0);
+                    info!("{prefix}: server sent close frame");
+                    return Ok(());
+                }
+                Some(Err(err)) => {
+                    m_active.set(0.0);
+                    return Err(WebSocketError::ConnectionFailed {
+                        url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
                         source: err,
                     });
                 }
