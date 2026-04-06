@@ -135,7 +135,7 @@ fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
     {
         return match code.as_str() {
             "DH-904" => ErrorAction::RateLimited,
-            "DH-905" | "DH-906" => ErrorAction::NeverRetry,
+            "DH-905" | "DH-906" | "DH-911" => ErrorAction::NeverRetry,
             "DH-901" => ErrorAction::TokenExpired,
             _ => ErrorAction::StandardRetry,
         };
