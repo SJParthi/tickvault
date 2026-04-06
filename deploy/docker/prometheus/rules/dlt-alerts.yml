@@ -379,3 +379,33 @@ groups:
         annotations:
           summary: "Alloy log collector is DOWN"
           description: "Alloy is not scraping logs. Grafana Logs dashboard will be empty."
+
+      # 20-level depth connection down
+      - alert: Depth20Disconnected
+        expr: dlt_depth_20lvl_connection_active == 0 and dlt_pipeline_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "20-level depth connection is DOWN"
+          description: "20-level depth WebSocket disconnected for 2+ minutes while pipeline is active. Order book data stale."
+
+      # 200-level depth connection down
+      - alert: Depth200Disconnected
+        expr: dlt_depth_200lvl_connection_active == 0 and dlt_pipeline_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "200-level depth connection is DOWN"
+          description: "200-level depth WebSocket disconnected for 2+ minutes while pipeline is active."
+
+      # Zero depth frames for 60 seconds
+      - alert: NoDepthFrames
+        expr: increase(dlt_depth_20lvl_frames_received[60s]) == 0 and dlt_depth_20lvl_connection_active == 1
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "No 20-level depth frames received for 60 seconds"
+          description: "Depth connection is active but no frames arriving. Possible subscription issue."

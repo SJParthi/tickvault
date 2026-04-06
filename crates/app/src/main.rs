@@ -908,6 +908,7 @@ async fn main() -> Result<()> {
         dhan_live_trader_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
+        dhan_live_trader_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1253,34 +1254,79 @@ async fn main() -> Result<()> {
                     "spawning 20-level depth connection"
                 );
 
+                // O(1) EXEMPT: begin — depth connection + persistence setup at boot
+                let (depth_tx, mut depth_rx) = tokio::sync::mpsc::channel(4096);
+                let depth_questdb = config.questdb.clone();
+                let depth_label_recv = label.clone();
+
+                // Spawn depth frame receiver with QuestDB persistence
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        dhan_live_trader_core::websocket::run_twenty_depth_connection(
-                            depth_token,
-                            depth_client_id,
-                            instruments_for_underlying,
-                            // Depth frames logged + metrics counted inside the connection.
-                            // QuestDB persistence added in tick processor's DeepDepth handler.
-                            {
-                                let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
-                                let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => label.clone());
-                                tokio::spawn(async move {
-                                    while let Some(frame) = rx.recv().await {
-                                        m.increment(1);
-                                        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                                        if let Err(err) = dhan_live_trader_core::parser::dispatch_deep_depth_frame(&frame, ts) {
-                                            tracing::warn!(?err, "failed to parse 20-level depth frame");
-                                        }
-                                    }
-                                });
-                                tx
-                            },
+                    let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
+                    let mut writer =
+                        dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
+                            &depth_questdb,
                         )
-                        .await
+                        .ok();
+                    if writer.is_some() {
+                        tracing::info!(
+                            underlying = depth_label_recv,
+                            "deep depth QuestDB writer connected"
+                        );
+                    }
+                    while let Some(frame) = depth_rx.recv().await {
+                        m.increment(1);
+                        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        match dhan_live_trader_core::parser::dispatch_deep_depth_frame(&frame, ts) {
+                            Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                security_id,
+                                exchange_segment_code,
+                                side,
+                                levels,
+                                ..
+                            }) => {
+                                let side_str = match side {
+                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
+                                        "BID"
+                                    }
+                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                        "ASK"
+                                    }
+                                };
+                                if let Some(ref mut w) = writer {
+                                    if let Err(err) = w.append_deep_depth(
+                                        security_id,
+                                        exchange_segment_code,
+                                        side_str,
+                                        &levels,
+                                        "20",
+                                        ts,
+                                    ) {
+                                        tracing::warn!(?err, "failed to persist 20-level depth");
+                                    }
+                                }
+                            }
+                            Ok(_) => {} // non-depth frame (shouldn't happen)
+                            Err(err) => {
+                                tracing::warn!(?err, "failed to parse 20-level depth frame");
+                            }
+                        }
+                    }
+                });
+
+                // Spawn depth WebSocket connection
+                tokio::spawn(async move {
+                    if let Err(err) = dhan_live_trader_core::websocket::run_twenty_depth_connection(
+                        depth_token,
+                        depth_client_id,
+                        instruments_for_underlying,
+                        depth_tx,
+                    )
+                    .await
                     {
                         tracing::error!(?err, "20-level depth connection terminated");
                     }
                 });
+                // O(1) EXEMPT: end
 
                 // 200-level: spawn 1 connection for ATM CE of this underlying
                 // Pick the first NSE_FNO option for this underlying as ATM proxy
@@ -1303,16 +1349,61 @@ async fn main() -> Result<()> {
 
                     let (tx200, mut rx200) = tokio::sync::mpsc::channel(1024);
                     let m200_label = depth200_label.clone();
+                    let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
 
+                    // Spawn 200-level depth receiver with QuestDB persistence
                     tokio::spawn(async move {
-                        let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label);
+                        let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
+                        let mut writer =
+                            dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
+                                &depth200_questdb,
+                            )
+                            .ok();
+                        if writer.is_some() {
+                            tracing::info!(
+                                label = m200_label,
+                                "200-level deep depth QuestDB writer connected"
+                            );
+                        }
                         while let Some(frame) = rx200.recv().await {
                             m.increment(1);
                             let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                            if let Err(err) =
-                                dhan_live_trader_core::parser::dispatch_deep_depth_frame(&frame, ts)
-                            {
-                                tracing::warn!(?err, "failed to parse 200-level depth frame");
+                            match dhan_live_trader_core::parser::dispatch_deep_depth_frame(
+                                &frame, ts,
+                            ) {
+                                Ok(
+                                    dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                        security_id,
+                                        exchange_segment_code,
+                                        side,
+                                        levels,
+                                        ..
+                                    },
+                                ) => {
+                                    let side_str = match side {
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => "BID",
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => "ASK",
+                                    };
+                                    if let Some(ref mut w) = writer {
+                                        if let Err(err) = w.append_deep_depth(
+                                            security_id,
+                                            exchange_segment_code,
+                                            side_str,
+                                            &levels,
+                                            "200",
+                                            ts,
+                                        ) {
+                                            tracing::warn!(
+                                                ?err,
+                                                "failed to persist 200-level depth"
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::warn!(?err, "failed to parse 200-level depth frame");
+                                }
                             }
                         }
                     });

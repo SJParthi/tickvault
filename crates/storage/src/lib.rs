@@ -20,6 +20,7 @@
 pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
+pub mod deep_depth_persistence;
 pub mod greeks_persistence;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
