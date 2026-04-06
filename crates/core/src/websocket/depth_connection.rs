@@ -530,4 +530,126 @@ mod tests {
             run_twenty_depth_connection(token_handle, "test".to_string(), vec![], tx).await;
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_depth_connection_prefix() {
+        assert_eq!(DEPTH_CONNECTION_PREFIX, "depth-20lvl");
+    }
+
+    #[test]
+    fn test_depth_connect_timeout_reasonable() {
+        assert!(DEPTH_CONNECT_TIMEOUT_SECS >= 5);
+        assert!(DEPTH_CONNECT_TIMEOUT_SECS <= 30);
+    }
+
+    #[test]
+    fn test_depth_reconnect_initial_delay() {
+        assert_eq!(DEPTH_RECONNECT_INITIAL_MS, 1000);
+    }
+
+    #[test]
+    fn test_depth_reconnect_max_delay() {
+        assert_eq!(DEPTH_RECONNECT_MAX_MS, 30000);
+    }
+
+    #[test]
+    fn test_backoff_caps_at_max_for_large_attempts() {
+        for attempt in 6..20 {
+            let delay = DEPTH_RECONNECT_INITIAL_MS
+                .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX))
+                .min(DEPTH_RECONNECT_MAX_MS);
+            assert_eq!(delay, DEPTH_RECONNECT_MAX_MS);
+        }
+    }
+
+    #[test]
+    fn test_backoff_grows_exponentially_before_cap() {
+        let delay_0 = DEPTH_RECONNECT_INITIAL_MS.min(DEPTH_RECONNECT_MAX_MS);
+        let delay_1 = DEPTH_RECONNECT_INITIAL_MS
+            .saturating_mul(2)
+            .min(DEPTH_RECONNECT_MAX_MS);
+        let delay_2 = DEPTH_RECONNECT_INITIAL_MS
+            .saturating_mul(4)
+            .min(DEPTH_RECONNECT_MAX_MS);
+        assert_eq!(delay_0, 1000);
+        assert_eq!(delay_1, 2000);
+        assert_eq!(delay_2, 4000);
+    }
+
+    #[test]
+    fn test_twenty_depth_ws_url_correct() {
+        assert_eq!(
+            DHAN_TWENTY_DEPTH_WS_BASE_URL,
+            "wss://depth-api-feed.dhan.co/twentydepth"
+        );
+    }
+
+    #[test]
+    fn test_two_hundred_depth_ws_url_correct() {
+        assert_eq!(
+            DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
+            "wss://full-depth-api.dhan.co/twohundreddepth"
+        );
+    }
+
+    #[test]
+    fn test_websocket_auth_type_is_2() {
+        assert_eq!(WEBSOCKET_AUTH_TYPE, 2);
+    }
+
+    #[test]
+    fn test_subscription_batch_size_matches_dhan_limit() {
+        // Dhan docs: max 50 instruments per 20-level depth connection
+        assert_eq!(DEPTH_SUBSCRIPTION_BATCH_SIZE, 50);
+    }
+
+    #[tokio::test]
+    async fn test_connect_and_run_depth_no_token_returns_error() {
+        let token_handle: TokenHandle =
+            std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
+        let (tx, _rx) = mpsc::channel(16);
+        let result = connect_and_run_depth(&token_handle, "test", &[], &tx, 0).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WebSocketError::NoTokenAvailable => {}
+            other => panic!("expected NoTokenAvailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_and_run_200_depth_no_token_returns_error() {
+        let token_handle: TokenHandle =
+            std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
+        let (tx, _rx) = mpsc::channel(16);
+        let result =
+            connect_and_run_200_depth(&token_handle, "test", "{}", &tx, "test-label").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WebSocketError::NoTokenAvailable => {}
+            other => panic!("expected NoTokenAvailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_200_level_subscribe_json_format() {
+        // 200-level uses flat JSON (no InstrumentList), per Dhan docs
+        let msg = serde_json::json!({
+            "RequestCode": 23,
+            "ExchangeSegment": "NSE_FNO",
+            "SecurityId": "49081",
+        });
+        let json_str = msg.to_string();
+        assert!(json_str.contains("\"RequestCode\":23"));
+        assert!(json_str.contains("\"ExchangeSegment\":\"NSE_FNO\""));
+        assert!(json_str.contains("\"SecurityId\":\"49081\""));
+        // Must NOT contain InstrumentList (that's 20-level format)
+        assert!(!json_str.contains("InstrumentList"));
+        assert!(!json_str.contains("InstrumentCount"));
+    }
+
+    #[test]
+    fn test_depth_read_timeout_matches_keepalive() {
+        // Dhan docs: server pings every 10s, connection drops after 40s
+        assert_eq!(DEPTH_READ_TIMEOUT_SECS, 40);
+    }
 }

@@ -68,9 +68,9 @@ crates/
 | Module | Contains |
 |--------|----------|
 | `parser/` | Binary packet parsing: header (8-byte), ticker (16B), quote (50B), full (162B), OI (12B), prev_close (16B), disconnect (10B), market_depth (20-level), deep_depth (200-level). All O(1) fixed-offset `from_le_bytes`. |
-| `websocket/` | Connection pool (max 5 WS), subscription builder (100 instruments/msg, string SecurityId), TLS (aws-lc-rs), order update WS (JSON, `wss://api-order-update.dhan.co`) |
+| `websocket/` | Connection pool (max 5 WS), subscription builder (100 instruments/msg, string SecurityId), TLS (aws-lc-rs), order update WS (JSON, `wss://api-order-update.dhan.co`), depth connection (20-level 4×50 instruments, 200-level 4×1 instrument) |
 | `auth/` | Token manager (arc-swap, 24h JWT, 23h refresh), TOTP generator (RFC 6238), secret manager (AWS SSM), token cache (Valkey) |
-| `instrument/` | CSV downloader, CSV parser, universe builder (F&O filter), subscription planner, binary cache (rkyv zero-copy), daily scheduler, delta detector, S3 backup, validation |
+| `instrument/` | CSV downloader, CSV parser, universe builder (F&O filter), subscription planner, binary cache (rkyv zero-copy), daily scheduler, delta detector, S3 backup, validation, depth strike selector (ATM ± 10), depth rebalancer (60s spot drift check) |
 | `pipeline/` | Tick processor (SPSC 65K buffer), candle aggregator (21 timeframes from ticks), top movers |
 | `historical/` | Candle fetcher (Dhan REST, 90-day chunks), cross-verification |
 | `network/` | IP monitor, IP verifier (static IP for order APIs) |
@@ -96,8 +96,11 @@ crates/
 | `calendar_persistence.rs` | Trading calendar storage |
 | `materialized_views.rs` | QuestDB materialized view DDL |
 | `valkey_cache.rs` | Redis/Valkey caching layer |
+| `deep_depth_persistence.rs` | 20/200-level depth ILP writer to `deep_market_depth` table |
+| `movers_persistence.rs` | Stock + option movers ILP writer |
+| `indicator_snapshot_persistence.rs` | Indicator snapshot ILP writer |
 
-### crates/api — HTTP Server (10 routes)
+### crates/api — HTTP Server (12 routes)
 
 | File | Contains |
 |------|----------|
@@ -107,7 +110,8 @@ crates/
 | `handlers/top_movers.rs` | `GET /api/top-movers` — gainers/losers/most active |
 | `handlers/instruments.rs` | `POST /api/instruments/rebuild`, `GET /api/instruments/diagnostic` |
 | `handlers/index_constituency.rs` | `GET /api/index-constituency`, `GET /api/index-constituency/{index_name}`, `GET /api/stock-indices/{symbol}` |
-| `handlers/static_file.rs` | `GET /portal` — DLT Control Panel |
+| `handlers/option_chain.rs` | `GET /api/option-chain`, `GET /api/pcr` — option chain + PCR from QuestDB |
+| `handlers/static_file.rs` | `GET /portal` — DLT Control Panel, `GET /portal/options-chain` — live options chain |
 | `middleware.rs` | Auth middleware, request tracing |
 | `state.rs` | Shared application state |
 

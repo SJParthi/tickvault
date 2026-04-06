@@ -1294,17 +1294,17 @@ async fn main() -> Result<()> {
                                         "ASK"
                                     }
                                 };
-                                if let Some(ref mut w) = writer {
-                                    if let Err(err) = w.append_deep_depth(
+                                if let Some(ref mut w) = writer
+                                    && let Err(err) = w.append_deep_depth(
                                         security_id,
                                         exchange_segment_code,
                                         side_str,
                                         &levels,
                                         "20",
                                         ts,
-                                    ) {
-                                        tracing::warn!(?err, "failed to persist 20-level depth");
-                                    }
+                                    )
+                                {
+                                    tracing::warn!(?err, "failed to persist 20-level depth");
                                 }
                             }
                             Ok(_) => {} // non-depth frame (shouldn't happen)
@@ -1386,20 +1386,20 @@ async fn main() -> Result<()> {
                                         dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => "BID",
                                         dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => "ASK",
                                     };
-                                    if let Some(ref mut w) = writer {
-                                        if let Err(err) = w.append_deep_depth(
+                                    if let Some(ref mut w) = writer
+                                        && let Err(err) = w.append_deep_depth(
                                             security_id,
                                             exchange_segment_code,
                                             side_str,
                                             &levels,
                                             "200",
                                             ts,
-                                        ) {
-                                            tracing::warn!(
-                                                ?err,
-                                                "failed to persist 200-level depth"
-                                            );
-                                        }
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            ?err,
+                                            "failed to persist 200-level depth"
+                                        );
                                     }
                                 }
                                 Ok(_) => {}

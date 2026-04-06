@@ -1779,4 +1779,52 @@ mod tests {
             "default config must NOT be in live mode"
         );
     }
+
+    // -------------------------------------------------------------------
+    // GAP 28: Depth config validation tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_subscription_config_default_has_depth_disabled() {
+        let config = SubscriptionConfig::default();
+        assert!(!config.enable_twenty_depth);
+    }
+
+    #[test]
+    fn test_subscription_config_default_depth_max_instruments() {
+        let config = SubscriptionConfig::default();
+        assert_eq!(config.twenty_depth_max_instruments, 50);
+    }
+
+    #[test]
+    fn test_subscription_config_depth_max_instruments_matches_dhan_limit() {
+        // Dhan docs: max 50 instruments per 20-level depth connection
+        let config = SubscriptionConfig::default();
+        assert!(config.twenty_depth_max_instruments <= 50);
+    }
+
+    #[test]
+    fn test_subscription_config_all_fields_present() {
+        let config = SubscriptionConfig::default();
+        assert_eq!(config.feed_mode, "Full");
+        assert!(config.subscribe_index_derivatives);
+        assert!(config.subscribe_stock_derivatives);
+        assert!(config.subscribe_display_indices);
+        assert!(config.subscribe_stock_equities);
+        assert_eq!(config.stock_atm_strikes_above, 10);
+        assert_eq!(config.stock_atm_strikes_below, 10);
+        assert!(config.stock_default_atm_fallback_enabled);
+        // Depth fields
+        assert!(!config.enable_twenty_depth);
+        assert_eq!(config.twenty_depth_max_instruments, 50);
+    }
+
+    #[test]
+    fn test_default_config_trading_mode_is_paper_not_live() {
+        let config = make_valid_config();
+        assert!(config.strategy.mode.is_paper());
+        assert!(!config.strategy.mode.is_live());
+        assert!(!config.strategy.mode.is_sandbox());
+        assert!(!config.strategy.mode.is_http_active());
+    }
 }
