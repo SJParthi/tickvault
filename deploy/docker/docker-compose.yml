@@ -109,7 +109,9 @@ services:
   # Bible: oliver006/redis_exporter:v1.67.0
   # ---------------------------------------------------------------------------
   dlt-valkey-exporter:
-    image: oliver006/redis_exporter:v1.67.0@sha256:6d1fef3a2d421d8d0218eb37b47bbe5b72f3ab3007c1a4a2a30dff808ca5e8f5
+    image: oliver006/redis_exporter:v1.67.0
+    # TODO: Pin SHA256 digest after first successful pull on Mac:
+    #   docker inspect --format='{{index .RepoDigests 0}}' oliver006/redis_exporter:v1.67.0
     container_name: dlt-valkey-exporter
     hostname: dlt-valkey-exporter
     restart: unless-stopped
