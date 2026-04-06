@@ -1255,7 +1255,7 @@ async fn main() -> Result<()> {
                 );
 
                 // O(1) EXEMPT: begin — depth connection + persistence setup at boot
-                let (depth_tx, mut depth_rx) = tokio::sync::mpsc::channel(4096);
+                let (depth_tx, mut depth_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4096);
                 let depth_questdb = config.questdb.clone();
                 let depth_label_recv = label.clone();
 
@@ -1349,7 +1349,7 @@ async fn main() -> Result<()> {
                         "spawning 200-level depth connection"
                     );
 
-                    let (tx200, mut rx200) = tokio::sync::mpsc::channel(1024);
+                    let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
                     let m200_label = depth200_label.clone();
                     let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
 
