@@ -56,6 +56,7 @@ pub struct OptionChainResponse {
 }
 
 /// `GET /api/option-chain?underlying=NIFTY&expiry=2026-04-09` — option chain from QuestDB.
+// TEST-EXEMPT: HTTP handler — tested via unit tests on serialization/validation + requires live QuestDB for integration
 pub async fn get_option_chain(
     State(state): State<SharedAppState>,
     Query(params): Query<OptionChainQuery>,
@@ -275,6 +276,7 @@ async fn query_option_chain(
 }
 
 /// `GET /api/pcr?underlying=NIFTY` — PCR snapshots from QuestDB.
+// TEST-EXEMPT: HTTP handler — tested via unit tests on serialization/validation + requires live QuestDB for integration
 pub async fn get_pcr(
     State(state): State<SharedAppState>,
     Query(params): Query<OptionChainQuery>,
