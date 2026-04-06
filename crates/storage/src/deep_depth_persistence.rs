@@ -177,9 +177,20 @@ impl DeepDepthWriter {
                     self.pending_count = 0;
                 }
                 Err(err) => {
-                    warn!(?err, "deep depth flush failed — reconnecting");
+                    let lost_rows = self.pending_count;
+                    tracing::error!(
+                        ?err,
+                        lost_rows,
+                        "deep depth flush failed — {lost_rows} rows lost, reconnecting"
+                    );
+                    metrics::counter!("dlt_deep_depth_rows_lost").increment(lost_rows as u64);
                     self.sender = None;
                     self.pending_count = 0;
+                    // IMPORTANT: Create fresh buffer, NOT clear(). The questdb-rs Buffer
+                    // state machine may be corrupted after a failed flush (production bug
+                    // 2026-03-26 in greeks_persistence). Depth data arrives every ~1s so
+                    // the next frame will repopulate.
+                    self.buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
                     // Try to reconnect
                     match Sender::from_conf(&self.ilp_conf_string) {
                         Ok(new_sender) => {
@@ -194,7 +205,14 @@ impl DeepDepthWriter {
                 }
             }
         } else {
-            // Try to reconnect
+            // Sender is None — buffer data is orphaned, discard and try to reconnect
+            if self.pending_count > 0 {
+                let lost = self.pending_count;
+                tracing::error!(lost, "deep depth writer has no sender — {lost} rows lost");
+                metrics::counter!("dlt_deep_depth_rows_lost").increment(lost as u64);
+                self.pending_count = 0;
+                self.buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+            }
             match Sender::from_conf(&self.ilp_conf_string) {
                 Ok(new_sender) => {
                     self.buffer = new_sender.new_buffer();

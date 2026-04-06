@@ -3,6 +3,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Timeout for QuestDB HTTP queries from API handlers (seconds).
+const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
+
 use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use dhan_live_trader_common::instrument_types::IndexConstituencyMap;
 use dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot;
@@ -179,6 +182,9 @@ struct AppStateInner {
     constituency_map: SharedConstituencyMap,
     /// Subsystem health status for the `/health` endpoint.
     health_status: SharedHealthStatus,
+    /// Shared HTTP client for QuestDB queries (connection pooling + keep-alive).
+    /// Reused across all handler invocations instead of creating per-request.
+    questdb_http_client: reqwest::Client,
 }
 
 impl SharedAppState {
@@ -191,6 +197,15 @@ impl SharedAppState {
         constituency_map: SharedConstituencyMap,
         health_status: SharedHealthStatus,
     ) -> Self {
+        // Single shared HTTP client for all QuestDB queries (connection pooling).
+        let questdb_http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                QUESTDB_HTTP_CLIENT_TIMEOUT_SECS,
+            ))
+            .pool_max_idle_per_host(4)
+            .build()
+            .unwrap_or_default();
+
         Self {
             inner: Arc::new(AppStateInner {
                 questdb_config,
@@ -200,6 +215,7 @@ impl SharedAppState {
                 top_movers_snapshot,
                 constituency_map,
                 health_status,
+                questdb_http_client,
             }),
         }
     }
@@ -207,6 +223,12 @@ impl SharedAppState {
     /// Returns the QuestDB config for making SQL queries.
     pub fn questdb_config(&self) -> &QuestDbConfig {
         &self.inner.questdb_config
+    }
+
+    /// Returns the shared HTTP client for QuestDB queries.
+    /// Reuses connections via keep-alive instead of creating per-request.
+    pub fn questdb_http_client(&self) -> &reqwest::Client {
+        &self.inner.questdb_http_client
     }
 
     /// Returns the Dhan API config (CSV URLs).
@@ -303,6 +325,8 @@ mod tests {
         assert_eq!(state.questdb_config().host, "test-host");
         assert_eq!(state.questdb_config().ilp_port, 9009);
         assert_eq!(state.questdb_config().http_port, 9000);
+        // Shared HTTP client is created and accessible
+        let _client = state.questdb_http_client();
     }
 
     #[test]

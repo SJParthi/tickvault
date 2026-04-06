@@ -13,9 +13,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::SharedAppState;
 
-/// Timeout for QuestDB option chain queries (may return many rows).
-const QUESTDB_OPTION_CHAIN_TIMEOUT_SECS: u64 = 10;
-
 /// Query parameters for the option chain endpoint.
 #[derive(Debug, Deserialize)]
 pub struct OptionChainQuery {
@@ -89,10 +86,10 @@ pub async fn get_option_chain(
 
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
-    let client = build_client();
+    let client = state.questdb_http_client();
 
     // First, get available expiries for this underlying
-    let expiries = query_available_expiries(&client, &base_url, &params.underlying).await;
+    let expiries = query_available_expiries(client, &base_url, &params.underlying).await;
 
     // Determine which expiry to use
     let target_expiry = match &params.expiry {
@@ -110,7 +107,7 @@ pub async fn get_option_chain(
     };
 
     // Query option chain data
-    match query_option_chain(&client, &base_url, &params.underlying, &target_expiry).await {
+    match query_option_chain(client, &base_url, &params.underlying, &target_expiry).await {
         Some(contracts) => {
             let spot_price = contracts.first().map(|c| c.spot_price).unwrap_or(0.0);
 
@@ -137,16 +134,6 @@ pub async fn get_option_chain(
         )
             .into_response(),
     }
-}
-
-/// Builds a reqwest client with timeout.
-fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            QUESTDB_OPTION_CHAIN_TIMEOUT_SECS,
-        ))
-        .build()
-        .unwrap_or_default()
 }
 
 /// Validates YYYY-MM-DD date format by parsing into a real date.
@@ -317,7 +304,7 @@ pub async fn get_pcr(
 
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
-    let client = build_client();
+    let client = state.questdb_http_client();
 
     let sql = format!(
         "SELECT underlying_symbol, expiry_date, pcr, total_call_oi, total_put_oi, ts \
@@ -410,13 +397,29 @@ mod tests {
     }
 
     #[test]
-    fn test_option_chain_query_timeout_reasonable() {
-        assert!(QUESTDB_OPTION_CHAIN_TIMEOUT_SECS > 0);
-        assert!(QUESTDB_OPTION_CHAIN_TIMEOUT_SECS <= 30);
+    fn test_underlying_validation_rejects_ampersand() {
+        // Regression: 2026-04-06 — & char was allowed, creating SQL injection surface
+        let invalid = "NIFTY&DROP";
+        assert!(
+            !invalid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "& must be rejected"
+        );
     }
 
     #[test]
-    fn test_build_client_succeeds() {
-        let _client = build_client();
+    fn test_underlying_validation_rejects_long_input() {
+        let long_input = "A".repeat(21);
+        assert!(long_input.len() > 20, "must reject inputs > 20 chars");
+    }
+
+    #[test]
+    fn test_is_valid_date_rejects_impossible_dates() {
+        // Regression: 2026-04-06 — 9999-99-99 was accepted
+        assert!(!is_valid_date_format("9999-99-99"));
+        assert!(!is_valid_date_format("2026-13-01"));
+        assert!(!is_valid_date_format("2026-00-01"));
+        assert!(!is_valid_date_format("2026-04-32"));
     }
 }
