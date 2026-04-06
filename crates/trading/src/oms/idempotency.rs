@@ -9,9 +9,13 @@
 //! 32-char hex string, then truncate to 30 chars. This preserves 120 bits of
 //! entropy (30 hex chars = 120 bits), which is collision-safe for our volume.
 //!
-//! # Phase 1
+//! # Phase 1 (current)
 //! In-memory `HashMap<String, String>` mapping `correlation_id → order_id`.
 //! Sufficient for single-instance deployment.
+//!
+//! **Known limitation:** On crash, all mappings are lost. The reconciliation
+//! module (`reconciliation.rs`) re-syncs state from Dhan REST API on startup.
+//! Phase 2 will persist the map to Valkey for fast recovery.
 
 use std::collections::HashMap;
 

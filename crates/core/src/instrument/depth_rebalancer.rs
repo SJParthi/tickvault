@@ -25,32 +25,39 @@ use dhan_live_trader_common::instrument_types::{FnoUniverse, OptionChainKey};
 /// Rebalance check interval (seconds). Checks spot drift every 60 seconds.
 const REBALANCE_CHECK_INTERVAL_SECS: u64 = 60;
 
-/// Shared spot price tracker — updated by tick processor, read by rebalancer.
+/// Shared spot price tracker — updated by tick broadcast subscriber, read by rebalancer.
 ///
+/// Uses `tokio::sync::RwLock` since both readers and writers are in async contexts.
 /// Key: underlying symbol (e.g., "NIFTY"), Value: latest spot price.
-pub type SharedSpotPrices = Arc<std::sync::RwLock<HashMap<String, f64>>>;
+pub type SharedSpotPrices = Arc<tokio::sync::RwLock<HashMap<String, f64>>>;
 
 /// Creates a new shared spot price map.
 pub fn new_shared_spot_prices() -> SharedSpotPrices {
-    Arc::new(std::sync::RwLock::new(HashMap::with_capacity(8)))
+    Arc::new(tokio::sync::RwLock::new(HashMap::with_capacity(8)))
 }
 
-/// Updates the spot price for an underlying. Called from tick processor
-/// when a tick arrives for an index instrument (IDX_I or equity underlying).
+/// Updates the spot price for an underlying. Called from tick broadcast
+/// subscriber when a tick arrives for an index instrument (IDX_I).
 ///
 /// O(1): single HashMap insert with pre-allocated capacity.
-pub fn update_spot_price(prices: &SharedSpotPrices, symbol: &str, price: f64) {
+pub async fn update_spot_price(prices: &SharedSpotPrices, symbol: &str, price: f64) {
     if !price.is_finite() || price <= 0.0 {
         return;
     }
-    if let Ok(mut map) = prices.write() {
-        map.insert(symbol.to_string(), price); // O(1) EXEMPT: cold-path spot update, not per-tick
+    let mut map = prices.write().await;
+    // M3: get_mut avoids String allocation on updates (most calls).
+    // Only allocates on first insert per underlying (~4 symbols).
+    if let Some(val) = map.get_mut(symbol) {
+        *val = price;
+    } else {
+        map.insert(symbol.to_string(), price); // O(1) EXEMPT: first insert per underlying
     }
 }
 
 /// Reads the current spot price for an underlying.
-pub fn get_spot_price(prices: &SharedSpotPrices, symbol: &str) -> Option<f64> {
-    prices.read().ok().and_then(|map| map.get(symbol).copied())
+pub async fn get_spot_price(prices: &SharedSpotPrices, symbol: &str) -> Option<f64> {
+    let map = prices.read().await;
+    map.get(symbol).copied()
 }
 
 /// Rebalance event — sent when spot drifts beyond threshold.
@@ -97,7 +104,7 @@ pub async fn run_depth_rebalancer(
 
     // Initialize with current spot prices
     for symbol in &underlyings {
-        if let Some(spot) = get_spot_price(&spot_prices, symbol) {
+        if let Some(spot) = get_spot_price(&spot_prices, symbol).await {
             previous_atm.insert(symbol.clone(), spot); // O(1) EXEMPT: init
             info!(
                 symbol,
@@ -118,6 +125,9 @@ pub async fn run_depth_rebalancer(
             break;
         }
 
+        // O2: Heartbeat — proves the rebalancer loop is alive.
+        metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
+
         // Recompute today each iteration to handle midnight crossover correctly
         let today = {
             let now_utc = chrono::Utc::now().timestamp();
@@ -130,7 +140,7 @@ pub async fn run_depth_rebalancer(
         };
 
         for symbol in &underlyings {
-            let current_spot = match get_spot_price(&spot_prices, symbol) {
+            let current_spot = match get_spot_price(&spot_prices, symbol).await {
                 Some(p) => p,
                 None => {
                     debug!(symbol, "no spot price available — skipping rebalance check");
@@ -212,58 +222,58 @@ pub async fn run_depth_rebalancer(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_new_shared_spot_prices() {
+    #[tokio::test]
+    async fn test_new_shared_spot_prices() {
         let prices = new_shared_spot_prices();
-        assert!(prices.read().unwrap().is_empty());
+        assert!(prices.read().await.is_empty());
     }
 
-    #[test]
-    fn test_update_and_get_spot_price() {
+    #[tokio::test]
+    async fn test_update_and_get_spot_price() {
         let prices = new_shared_spot_prices();
-        update_spot_price(&prices, "NIFTY", 23500.0);
-        assert_eq!(get_spot_price(&prices, "NIFTY"), Some(23500.0));
+        update_spot_price(&prices, "NIFTY", 23500.0).await;
+        assert_eq!(get_spot_price(&prices, "NIFTY").await, Some(23500.0));
     }
 
-    #[test]
-    fn test_update_spot_price_rejects_invalid() {
+    #[tokio::test]
+    async fn test_update_spot_price_rejects_invalid() {
         let prices = new_shared_spot_prices();
-        update_spot_price(&prices, "NIFTY", f64::NAN);
-        assert_eq!(get_spot_price(&prices, "NIFTY"), None);
+        update_spot_price(&prices, "NIFTY", f64::NAN).await;
+        assert_eq!(get_spot_price(&prices, "NIFTY").await, None);
 
-        update_spot_price(&prices, "NIFTY", 0.0);
-        assert_eq!(get_spot_price(&prices, "NIFTY"), None);
+        update_spot_price(&prices, "NIFTY", 0.0).await;
+        assert_eq!(get_spot_price(&prices, "NIFTY").await, None);
 
-        update_spot_price(&prices, "NIFTY", -100.0);
-        assert_eq!(get_spot_price(&prices, "NIFTY"), None);
+        update_spot_price(&prices, "NIFTY", -100.0).await;
+        assert_eq!(get_spot_price(&prices, "NIFTY").await, None);
     }
 
-    #[test]
-    fn test_get_spot_price_missing() {
+    #[tokio::test]
+    async fn test_get_spot_price_missing() {
         let prices = new_shared_spot_prices();
-        assert_eq!(get_spot_price(&prices, "UNKNOWN"), None);
+        assert_eq!(get_spot_price(&prices, "UNKNOWN").await, None);
     }
 
-    #[test]
-    fn test_update_spot_price_overwrites() {
+    #[tokio::test]
+    async fn test_update_spot_price_overwrites() {
         let prices = new_shared_spot_prices();
-        update_spot_price(&prices, "NIFTY", 23500.0);
-        update_spot_price(&prices, "NIFTY", 23600.0);
-        assert_eq!(get_spot_price(&prices, "NIFTY"), Some(23600.0));
+        update_spot_price(&prices, "NIFTY", 23500.0).await;
+        update_spot_price(&prices, "NIFTY", 23600.0).await;
+        assert_eq!(get_spot_price(&prices, "NIFTY").await, Some(23600.0));
     }
 
-    #[test]
-    fn test_multiple_underlyings() {
+    #[tokio::test]
+    async fn test_multiple_underlyings() {
         let prices = new_shared_spot_prices();
-        update_spot_price(&prices, "NIFTY", 23500.0);
-        update_spot_price(&prices, "BANKNIFTY", 51000.0);
-        update_spot_price(&prices, "FINNIFTY", 24500.0);
-        update_spot_price(&prices, "MIDCPNIFTY", 12500.0);
+        update_spot_price(&prices, "NIFTY", 23500.0).await;
+        update_spot_price(&prices, "BANKNIFTY", 51000.0).await;
+        update_spot_price(&prices, "FINNIFTY", 24500.0).await;
+        update_spot_price(&prices, "MIDCPNIFTY", 12500.0).await;
 
-        assert_eq!(get_spot_price(&prices, "NIFTY"), Some(23500.0));
-        assert_eq!(get_spot_price(&prices, "BANKNIFTY"), Some(51000.0));
-        assert_eq!(get_spot_price(&prices, "FINNIFTY"), Some(24500.0));
-        assert_eq!(get_spot_price(&prices, "MIDCPNIFTY"), Some(12500.0));
+        assert_eq!(get_spot_price(&prices, "NIFTY").await, Some(23500.0));
+        assert_eq!(get_spot_price(&prices, "BANKNIFTY").await, Some(51000.0));
+        assert_eq!(get_spot_price(&prices, "FINNIFTY").await, Some(24500.0));
+        assert_eq!(get_spot_price(&prices, "MIDCPNIFTY").await, Some(12500.0));
     }
 
     #[test]

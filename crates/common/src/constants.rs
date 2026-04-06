@@ -1268,6 +1268,19 @@ pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 2
 /// that prolonged QuestDB outage may exhaust disk.
 pub const TICK_SPILL_MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 
+/// OMS HTTP client timeout (seconds). Applied at the client level as a default
+/// for all Dhan order API calls. Individual endpoints may override with shorter
+/// per-request timeouts. 5 seconds covers normal API latency (50-200ms) with
+/// margin for Dhan-side processing spikes.
+pub const OMS_HTTP_TIMEOUT_SECS: u64 = 5;
+
+/// OMS HTTP connect timeout (seconds). TCP + TLS handshake deadline.
+pub const OMS_HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;
+
+/// OMS HTTP connection pool idle timeout (seconds). Idle connections are
+/// dropped after this duration to avoid stale sockets.
+pub const OMS_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
 /// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
 /// tick persistence, candle aggregation). Must be large enough to absorb bursts
 /// during high-volatility events without lagging cold-path consumers.

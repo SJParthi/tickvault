@@ -1051,6 +1051,7 @@ pub async fn cross_match_historical_vs_live(
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
         // M2: Check if the materialized view table exists before JOINing
+        // SAFETY: live_table is from CROSS_MATCH_TIMEFRAMES constants, not user input.
         let table_exists_query =
             format!("SELECT count() FROM tables() WHERE name = '{}'", live_table);
         let table_count = extract_count(&client, &base_url, &table_exists_query).await;

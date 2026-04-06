@@ -1434,6 +1434,85 @@ async fn main() -> Result<()> {
     // O(1) EXEMPT: end
 
     // -----------------------------------------------------------------------
+    // Step 8d: Spawn depth rebalancer (monitors spot drift, signals ATM changes)
+    // -----------------------------------------------------------------------
+    if should_connect_ws && config.subscription.enable_twenty_depth && subscription_plan.is_some() {
+        let depth_underlyings: Vec<String> = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(); // O(1) EXEMPT: boot-time vec of 4 strings
+
+        // Build FnoUniverse Arc for rebalancer (one-time clone at boot)
+        let rebalancer_universe: Option<std::sync::Arc<FnoUniverse>> =
+            slow_boot_universe.as_ref().map(|u| {
+                std::sync::Arc::new(u.clone()) // O(1) EXEMPT: boot-time universe clone
+            });
+
+        if let Some(universe_arc) = rebalancer_universe {
+            // SharedSpotPrices: updated by a tick broadcast subscriber, read by rebalancer
+            let spot_prices =
+                dhan_live_trader_core::instrument::depth_rebalancer::new_shared_spot_prices();
+            let spot_prices_updater = std::sync::Arc::clone(&spot_prices);
+
+            // Spawn spot price updater: subscribes to tick broadcast, extracts index LTPs
+            let mut spot_rx = tick_broadcast_sender.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match spot_rx.recv().await {
+                        Ok(tick) => {
+                            // IDX_I segment code = 0 — these are index ticks (NIFTY, BANKNIFTY, etc.)
+                            if tick.exchange_segment_code == 0
+                                && tick.last_traded_price > 0.0
+                                && tick.last_traded_price.is_finite()
+                            {
+                                // Look up symbol from security_id via the plan registry
+                                // For indices, we use a simple mapping from the known security IDs
+                                let symbol = match tick.security_id {
+                                    13 => Some("NIFTY"),
+                                    25 => Some("BANKNIFTY"),
+                                    27 => Some("FINNIFTY"),
+                                    442 => Some("MIDCPNIFTY"),
+                                    _ => None,
+                                };
+                                if let Some(sym) = symbol {
+                                    dhan_live_trader_core::instrument::depth_rebalancer::update_spot_price(
+                                            &spot_prices_updater,
+                                            sym,
+                                            f64::from(tick.last_traded_price),
+                                        ).await;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Rebalance event channel (watch — latest-value semantics)
+            let (rebalance_tx, _rebalance_rx) = tokio::sync::watch::channel::<
+                Option<dhan_live_trader_core::instrument::depth_rebalancer::RebalanceEvent>,
+            >(None);
+
+            // Shutdown flag for the rebalancer
+            let rebalancer_shutdown =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            tokio::spawn(
+                dhan_live_trader_core::instrument::depth_rebalancer::run_depth_rebalancer(
+                    spot_prices,
+                    universe_arc,
+                    depth_underlyings,
+                    rebalance_tx,
+                    std::sync::Arc::clone(&rebalancer_shutdown),
+                ),
+            );
+            info!("depth rebalancer spawned (checks spot drift every 60s)");
+            metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Step 9.5: Background historical candle fetch (cold path — never blocks live)
     // -----------------------------------------------------------------------
     let post_market_signal = std::sync::Arc::new(tokio::sync::Notify::new());

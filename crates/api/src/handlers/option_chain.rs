@@ -136,8 +136,8 @@ pub async fn get_option_chain(
     }
 }
 
-/// Validates YYYY-MM-DD date format by parsing into a real date.
-/// Rejects invalid dates like 9999-99-99 or 2026-02-30.
+/// Validates YYYY-MM-DD date format by parsing into a real calendar date.
+/// Rejects impossible dates like 2026-02-30 or 2025-02-29 (not a leap year).
 fn is_valid_date_format(s: &str) -> bool {
     if s.len() != 10 {
         return false;
@@ -147,24 +147,16 @@ fn is_valid_date_format(s: &str) -> bool {
     if bytes[4] != b'-' || bytes[7] != b'-' {
         return false;
     }
-    // Parse as actual date to reject impossible dates (e.g., month 13, day 32)
-    let year: u16 = match s[..4].parse() {
+    // Parse year for range check before full date parse
+    let year: i32 = match s[..4].parse() {
         Ok(y) => y,
         Err(_) => return false,
     };
-    let month: u8 = match s[5..7].parse() {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let day: u8 = match s[8..10].parse() {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    // Validate ranges (no need for external crate — simple bounds check)
-    if !(2020..=2040).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(2020..=2040).contains(&year) {
         return false;
     }
-    true
+    // Full calendar validation via chrono — rejects Feb 30, Apr 31, non-leap Feb 29, etc.
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
 }
 
 /// Queries distinct expiry dates for an underlying from `dhan_option_chain_raw`.
@@ -428,5 +420,39 @@ mod tests {
         assert!(!is_valid_date_format("2026-13-01"));
         assert!(!is_valid_date_format("2026-00-01"));
         assert!(!is_valid_date_format("2026-04-32"));
+    }
+
+    #[test]
+    fn test_is_valid_date_rejects_feb_30() {
+        assert!(!is_valid_date_format("2026-02-30"));
+        assert!(!is_valid_date_format("2026-02-29")); // 2026 is not a leap year
+        assert!(!is_valid_date_format("2026-04-31")); // April has 30 days
+        assert!(!is_valid_date_format("2026-06-31")); // June has 30 days
+    }
+
+    #[test]
+    fn test_is_valid_date_accepts_leap_year() {
+        assert!(is_valid_date_format("2024-02-29")); // 2024 is a leap year
+        assert!(is_valid_date_format("2028-02-29")); // 2028 is a leap year
+        assert!(!is_valid_date_format("2025-02-29")); // not a leap year
+    }
+
+    #[test]
+    fn test_is_valid_date_accepts_valid_dates() {
+        assert!(is_valid_date_format("2026-04-09"));
+        assert!(is_valid_date_format("2026-12-31"));
+        assert!(is_valid_date_format("2026-01-01"));
+        assert!(is_valid_date_format("2026-02-28"));
+    }
+
+    #[test]
+    fn test_is_valid_date_rejects_malformed() {
+        assert!(!is_valid_date_format(""));
+        assert!(!is_valid_date_format("2026-4-9"));
+        assert!(!is_valid_date_format("20260409"));
+        assert!(!is_valid_date_format("2026/04/09"));
+        assert!(!is_valid_date_format("abcd-ef-gh"));
+        assert!(!is_valid_date_format("2019-01-01")); // below 2020 range
+        assert!(!is_valid_date_format("2041-01-01")); // above 2040 range
     }
 }

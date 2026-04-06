@@ -429,3 +429,33 @@ groups:
         annotations:
           summary: "Depth frames being dropped (send timeout)"
           description: "{{ $value }} depth frames/sec dropped. Tick processor may be overloaded."
+
+      # Depth rebalancer not running while pipeline is active
+      - alert: DepthRebalancerDown
+        expr: dlt_depth_rebalancer_active == 0 and dlt_pipeline_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Depth rebalancer is not running"
+          description: "Depth subscriptions are static. ATM strike changes will not trigger rebalance."
+
+      # Trading pipeline loop stalled (no heartbeat for 30+ seconds)
+      - alert: TradingPipelineStalled
+        expr: time() - dlt_trading_pipeline_heartbeat > 30 and dlt_pipeline_active == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading pipeline loop stalled"
+          description: "No heartbeat from trading pipeline for 30+ seconds. Possible deadlock."
+
+      # Trading pipeline lagging behind tick producer
+      - alert: TradingPipelineLagging
+        expr: rate(dlt_trading_pipeline_ticks_lagged_total[5m]) > 0
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trading pipeline lagging behind tick stream"
+          description: "{{ $value }} ticks/sec lost to broadcast lag. Signals may be missed."

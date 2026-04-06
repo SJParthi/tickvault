@@ -201,8 +201,20 @@ async fn run_trading_pipeline(
     );
 
     // Initialize OMS (always starts in dry_run mode by default)
+    let oms_http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::OMS_HTTP_TIMEOUT_SECS,
+        ))
+        .connect_timeout(std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .pool_idle_timeout(std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
+        ))
+        .build()
+        .unwrap_or_default();
     let api_client = OrderApiClient::new(
-        reqwest::Client::new(),
+        oms_http_client,
         config.rest_api_base_url,
         config.client_id.clone(),
     );
@@ -254,7 +266,15 @@ async fn run_trading_pipeline(
     let mut wait_for_reset = make_reset_future(&daily_reset_signal);
     let mut wait_for_market_close = make_reset_future(&market_close_signal);
 
+    // O3: Trading pipeline heartbeat gauge — proves the loop is alive.
+    let m_pipeline_heartbeat = metrics::gauge!("dlt_trading_pipeline_heartbeat");
+    // O4: Lagged ticks counter — tracks ticks permanently lost to broadcast lag.
+    let m_pipeline_lagged = metrics::counter!("dlt_trading_pipeline_ticks_lagged_total");
+
     loop {
+        // O3: Heartbeat on every loop iteration.
+        m_pipeline_heartbeat.set(chrono::Utc::now().timestamp() as f64);
+
         tokio::select! {
             // Process ticks from the broadcast channel
             tick_result = tick_receiver.recv() => {
@@ -341,7 +361,12 @@ async fn run_trading_pipeline(
 
                             match signal {
                                 Signal::Hold => {}
-                                Signal::EnterLong { size_fraction: _, stop_loss, target } => {
+                                Signal::EnterLong { size_fraction, stop_loss, target } => {
+                                    // M1: size_fraction is not yet wired to position sizing — hardcoded qty=1.
+                                    // TODO(position-sizing): compute quantity from size_fraction × capital ÷ price.
+                                    if (size_fraction - 1.0).abs() > f64::EPSILON {
+                                        debug!(size_fraction, "size_fraction ignored — using quantity=1");
+                                    }
                                     if !within_trading_hours {
                                         debug!(
                                             security_id = tick.security_id,
@@ -397,7 +422,11 @@ async fn run_trading_pipeline(
                                         }
                                     }
                                 }
-                                Signal::EnterShort { size_fraction: _, stop_loss, target } => {
+                                Signal::EnterShort { size_fraction, stop_loss, target } => {
+                                    // M1: size_fraction not yet wired — hardcoded qty=1.
+                                    if (size_fraction - 1.0).abs() > f64::EPSILON {
+                                        debug!(size_fraction, "size_fraction ignored — using quantity=1");
+                                    }
                                     if !within_trading_hours {
                                         debug!(
                                             security_id = tick.security_id,
@@ -460,7 +489,7 @@ async fn run_trading_pipeline(
                                         strategy = %strategy.definition().name,
                                         "EXIT signal"
                                     );
-                                    // Exit handling: cancel active orders for this security
+                                    // Step 1: Cancel active (unfilled/pending) orders for this security
                                     let active: Vec<String> = oms
                                         .active_orders()
                                         .iter()
@@ -476,12 +505,58 @@ async fn run_trading_pipeline(
                                             );
                                         }
                                     }
+                                    // Step 2: Close open position (if any filled lots exist)
+                                    let net_lots = risk_engine.net_lots_for(tick.security_id);
+                                    if net_lots != 0 {
+                                        let close_type = if net_lots > 0 {
+                                            TransactionType::Sell
+                                        } else {
+                                            TransactionType::Buy
+                                        };
+                                        let close_qty = net_lots.unsigned_abs() as i64;
+                                        info!(
+                                            security_id = tick.security_id,
+                                            net_lots,
+                                            close_type = ?close_type,
+                                            "EXIT signal → placing closing order for open position"
+                                        );
+                                        let close_request = PlaceOrderRequest {
+                                            security_id: tick.security_id,
+                                            transaction_type: close_type,
+                                            order_type: OrderType::Market,
+                                            product_type: ProductType::Intraday,
+                                            validity: OrderValidity::Day,
+                                            quantity: close_qty,
+                                            price: 0.0,
+                                            trigger_price: 0.0,
+                                            lot_size: 1,
+                                            expiry_date: None,
+                                        };
+                                        match oms.place_order(close_request).await {
+                                            Ok(order_id) => {
+                                                info!(
+                                                    order_id = %order_id,
+                                                    security_id = tick.security_id,
+                                                    net_lots,
+                                                    "EXIT signal → closing order placed"
+                                                );
+                                            }
+                                            Err(err) => {
+                                                warn!(
+                                                    ?err,
+                                                    security_id = tick.security_id,
+                                                    "EXIT signal → closing order placement failed"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "trading pipeline lagged — skipped ticks, signals may be missed");
+                        m_pipeline_lagged.increment(skipped);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("tick broadcast closed — trading pipeline stopping");
