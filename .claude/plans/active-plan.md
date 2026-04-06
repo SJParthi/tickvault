@@ -1,32 +1,36 @@
-# Implementation Plan: Phase B — Monitoring & Dashboard Fixes
+# Implementation Plan: 20-Level Depth WebSocket Connection
 
-**Status:** VERIFIED
+**Status:** IN_PROGRESS
 **Date:** 2026-04-06
-**Approved by:** Parthiban ("everything bro")
+**Approved by:** Parthiban ("go ahead with everything")
 
 ## Plan Items
 
-- [x] Add missing Prometheus alert rules (token expiry, daily P&L, disk/memory, zero ticks 30s)
-  - Files: deploy/docker/prometheus/rules/dlt-alerts.yml
-  - Added: TokenExpiryWarning, TokenExpiryCritical, ZeroTicksBurst, HighMemoryUsage, ValkeyDown, AlloyDown
+- [x] Add config fields (enable_twenty_depth, twenty_depth_max_instruments)
+  - Files: crates/common/src/config.rs, config/base.toml
+  - Tests: existing config test coverage
 
-- [x] Add Valkey redis-exporter sidecar to Docker Compose and uncomment scrape job
-  - Files: deploy/docker/docker-compose.yml, deploy/docker/prometheus/prometheus.yml
-  - Added: dlt-valkey-exporter service (oliver006/redis_exporter:v1.67.0)
+- [ ] Create depth_connection.rs module for 20-level depth WebSocket
+  - Files: crates/core/src/websocket/depth_connection.rs, crates/core/src/websocket/mod.rs
+  - Tests: unit tests for URL construction, subscription building
 
-- [x] Fix System Overview dashboard Valkey panel to query correct exporter job
-  - Files: deploy/docker/grafana/dashboards/system-overview.json
-  - Result: Already queries up{job="dlt-valkey"} which matches new scrape job — no change needed
+- [ ] Wire depth connection into boot sequence (main.rs)
+  - Files: crates/app/src/main.rs
+  - Tests: existing boot path tests
 
-- [x] Verify clippy/fmt/tests pass, commit, push
-  - Files: all modified files
-  - Commit: a19b66f pushed to claude/fix-clippy-if-let-5EocN
+- [ ] Add QuestDB persistence for 20-level depth in tick_processor.rs
+  - Files: crates/core/src/pipeline/tick_processor.rs, crates/storage/src/tick_persistence.rs
+  - Tests: existing depth persistence tests
+
+- [ ] Commit and push
+  - Files: all modified
+  - Tests: cargo clippy, cargo test -p dhan-live-trader-core
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Docker compose up | All services start including redis-exporter |
-| 2 | Prometheus targets page | dlt-valkey shows UP |
-| 3 | Grafana System Overview | Valkey shows UP instead of "No data" |
-| 4 | Token approaching expiry | TokenExpiryWarning alert fires |
+| 1 | enable_twenty_depth=true | Depth WS connects, frames arrive in tick processor |
+| 2 | enable_twenty_depth=false | No depth connection, no error |
+| 3 | Depth WS disconnects (805) | Log warning, reconnect with backoff |
+| 4 | Deep depth frames parsed | 20 levels per side persisted to QuestDB |
