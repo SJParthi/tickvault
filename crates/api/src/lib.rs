@@ -77,6 +77,10 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         )
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .route(
+            "/portal/options-chain",
+            axum::routing::get(handlers::static_file::options_chain),
+        )
+        .route(
             "/api/index-constituency",
             axum::routing::get(handlers::index_constituency::get_constituency_summary),
         )
