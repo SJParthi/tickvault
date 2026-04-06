@@ -294,7 +294,7 @@ impl NotificationService {
 /// Posts a message to the Telegram Bot API.
 ///
 /// Logs `warn` on any failure — does not return an error to the caller.
-/// Bot token is never logged (only used in URL path).
+/// Bot token is redacted from error logs (reqwest errors may include the URL).
 ///
 /// # Performance
 ///
@@ -327,8 +327,13 @@ async fn send_telegram_message(
             }
         }
         Err(err) => {
+            // SECURITY: reqwest::Error Display may include the request URL,
+            // which contains the bot token in the path. Redact before logging.
+            let safe_msg = err
+                .to_string()
+                .replace(bot_token.expose_secret(), "[REDACTED]");
             warn!(
-                error = %err,
+                error = %safe_msg,
                 "notification: Telegram sendMessage HTTP error"
             );
         }
