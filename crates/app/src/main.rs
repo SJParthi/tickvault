@@ -1202,6 +1202,91 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 8c: Spawn 20-level depth WebSocket connection (separate endpoint)
+    // -----------------------------------------------------------------------
+    if should_connect_ws && config.subscription.enable_twenty_depth {
+        if let Some(ref plan) = subscription_plan {
+            // Select top N NSE_FNO instruments for 20-level depth (ATM strikes first).
+            let depth_instruments: Vec<
+                dhan_live_trader_core::websocket::types::InstrumentSubscription,
+            > = plan
+                .registry
+                .iter()
+                .filter(|inst| {
+                    inst.exchange_segment == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                })
+                .take(config.subscription.twenty_depth_max_instruments)
+                .map(|inst| {
+                    dhan_live_trader_core::websocket::types::InstrumentSubscription::new(
+                        inst.exchange_segment,
+                        inst.security_id,
+                    )
+                })
+                .collect(); // O(1) EXEMPT: runs once at boot
+
+            if !depth_instruments.is_empty() {
+                let depth_token = token_handle.clone();
+                let depth_client_id = ws_client_id.clone(); // O(1) EXEMPT: boot-time clone
+                // Create a sender that shares the same channel as the main feed.
+                // Deep depth frames will be dispatched by the tick processor via
+                // dispatch_deep_depth_frame() when it sees feed codes 41/51.
+                let (depth_sender, depth_receiver) = tokio::sync::mpsc::channel(4096);
+
+                // Spawn depth frame forwarder to tick processor's channel
+                // (depth uses its own channel to avoid blocking main feed sender).
+                if let Some(ref _processor) = processor_handle {
+                    info!(
+                        instruments = depth_instruments.len(),
+                        max = config.subscription.twenty_depth_max_instruments,
+                        "spawning 20-level depth WebSocket connection"
+                    );
+
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            dhan_live_trader_core::websocket::run_twenty_depth_connection(
+                                depth_token,
+                                depth_client_id,
+                                depth_instruments,
+                                depth_sender,
+                            )
+                            .await
+                        {
+                            tracing::error!(?err, "20-level depth connection terminated");
+                        }
+                    });
+
+                    // Spawn receiver that logs depth frames (tick processor handles main feed only).
+                    // In future: persist to deep_market_depth QuestDB table.
+                    tokio::spawn(async move {
+                        let mut rx = depth_receiver;
+                        let m_depth_frames = metrics::counter!("dlt_depth_20lvl_frames_received");
+                        while let Some(frame) = rx.recv().await {
+                            m_depth_frames.increment(1);
+                            // Parse and log the frame using deep depth dispatcher
+                            let received_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                            match dhan_live_trader_core::parser::dispatch_deep_depth_frame(
+                                &frame,
+                                received_at,
+                            ) {
+                                Ok(parsed) => {
+                                    tracing::trace!(?parsed, "20-level depth frame parsed");
+                                }
+                                Err(err) => {
+                                    tracing::warn!(?err, "failed to parse 20-level depth frame");
+                                }
+                            }
+                        }
+                    });
+                }
+            } else {
+                info!("20-level depth: no NSE_FNO instruments in plan — skipping");
+            }
+        }
+    } else if config.subscription.enable_twenty_depth {
+        info!("20-level depth: skipped — WebSocket connections not active");
+    }
+
+    // -----------------------------------------------------------------------
     // Step 9.5: Background historical candle fetch (cold path — never blocks live)
     // -----------------------------------------------------------------------
     let post_market_signal = std::sync::Arc::new(tokio::sync::Notify::new());
