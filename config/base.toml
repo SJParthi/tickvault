@@ -233,6 +233,10 @@ subscribe_stock_equities = true
 stock_atm_strikes_above = 10
 stock_atm_strikes_below = 10
 stock_default_atm_fallback_enabled = true
+# 20-level depth: separate WS endpoint (wss://depth-api-feed.dhan.co).
+# Does NOT use main feed connection slots — separate endpoint, separate connections.
+enable_twenty_depth = true
+twenty_depth_max_instruments = 50
 
 [notification]
 telegram_api_base_url = "https://api.telegram.org"

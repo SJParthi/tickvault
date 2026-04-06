@@ -428,6 +428,19 @@ pub struct SubscriptionConfig {
     /// This fallback ensures we subscribe to a reasonable strike range.
     /// Once live prices arrive, dynamic rebalancing (Phase 2) will adjust.
     pub stock_default_atm_fallback_enabled: bool,
+
+    /// Enable 20-level depth feed (separate WebSocket, uses 1 of 5 connection slots).
+    /// Subscribes ATM ± 5 strikes for NIFTY and BANKNIFTY on the depth endpoint.
+    #[serde(default)]
+    pub enable_twenty_depth: bool,
+
+    /// Maximum instruments to subscribe on the 20-level depth feed (max 50 per connection).
+    #[serde(default = "default_twenty_depth_max_instruments")]
+    pub twenty_depth_max_instruments: usize,
+}
+
+fn default_twenty_depth_max_instruments() -> usize {
+    50
 }
 
 impl Default for SubscriptionConfig {
@@ -441,6 +454,8 @@ impl Default for SubscriptionConfig {
             stock_atm_strikes_above: 10,
             stock_atm_strikes_below: 10,
             stock_default_atm_fallback_enabled: true,
+            enable_twenty_depth: false,
+            twenty_depth_max_instruments: 50,
         }
     }
 }
