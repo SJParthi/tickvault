@@ -150,7 +150,7 @@ services:
   # Pinned: prom/alertmanager:v0.28.1
   # ---------------------------------------------------------------------------
   dlt-alertmanager:
-    image: prom/alertmanager:v0.28.1@sha256:627635e82e34d5b4e6146aba11375e1a5afa0e833fc9f00edab85e06b2aec966
+    image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
     container_name: dlt-alertmanager
     hostname: dlt-alertmanager
     restart: unless-stopped

@@ -107,7 +107,10 @@ pub async fn download_and_build_constituency_map(
 }
 
 /// Try to load constituency data from the JSON cache.
-async fn try_load_cache(cache_dir: &str) -> Option<IndexConstituencyMap> {
+///
+/// Public so callers (e.g. boot sequence) can skip network downloads during
+/// market hours and fall back to the cached JSON directly.
+pub async fn try_load_cache(cache_dir: &str) -> Option<IndexConstituencyMap> {
     match cache::load_constituency_cache(cache_dir, INDEX_CONSTITUENCY_CSV_CACHE_FILENAME).await {
         Ok(map) => {
             info!(

@@ -664,13 +664,25 @@ async fn main() -> Result<()> {
             }
         };
 
-        // --- Background: Index constituency download (best-effort) ---
-        let bg_constituency =
+        // --- Background: Index constituency (best-effort) ---
+        // During market hours, skip network downloads to niftyindices.com
+        // (they often return HTML instead of CSV) and use the cached JSON.
+        // Fresh download happens on non-market-hours boot or post-market.
+        let bg_constituency = if is_market_hours {
+            info!(
+                "market hours — using cached constituency data (skipping niftyindices.com download)"
+            );
+            dhan_live_trader_core::index_constituency::try_load_cache(
+                &config.instrument.csv_cache_directory,
+            )
+            .await
+        } else {
             dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
                 &config.index_constituency,
                 &config.instrument.csv_cache_directory,
             )
-            .await;
+            .await
+        };
 
         // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
         // Enrich with security_ids from instrument master for news-based trading.
@@ -1304,14 +1316,23 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 10.5: Download index constituency data (non-blocking, best-effort)
+    // Step 10.5: Index constituency data (best-effort)
     // -----------------------------------------------------------------------
-    let constituency_map =
+    // During market hours, skip network downloads to niftyindices.com
+    // (they often return HTML instead of CSV) and use the cached JSON.
+    let constituency_map = if is_market_hours {
+        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
+        dhan_live_trader_core::index_constituency::try_load_cache(
+            &config.instrument.csv_cache_directory,
+        )
+        .await
+    } else {
         dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
             &config.index_constituency,
             &config.instrument.csv_cache_directory,
         )
-        .await;
+        .await
+    };
 
     // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
     // Enrich with security_ids from instrument master for news-based trading.
@@ -1915,7 +1936,9 @@ fn spawn_historical_candle_fetch(
         }
     });
 
-    info!("background historical candle fetch spawned (non-blocking)");
+    info!(
+        "background historical candle fetch task spawned (will wait for post-market signal if trading hours)"
+    );
 }
 
 // format_timeframe_details, format_violation_details, format_cross_match_details
