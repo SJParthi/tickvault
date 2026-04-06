@@ -384,10 +384,11 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL is root path (wss://full-depth-api.dhan.co/) — query params appended directly
-    let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
+    // 200-level URL is root path — SDK uses wss://full-depth-api.dhan.co/?token=...
+    // The trailing slash before ? is REQUIRED for root-path URLs (400 without it).
     let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{base}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}"
+        "{}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
     ));
 
     let request = authenticated_url
@@ -739,17 +740,21 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_url_no_double_slash_before_query() {
-        // 200-level base is root path (wss://full-depth-api.dhan.co/)
-        let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
-        let url = format!("{base}?token=TEST&clientId=TEST&authType=2");
-        assert!(
-            !url.contains("//?"),
-            "must NOT have double slash before query: {url}"
+    fn test_two_hundred_depth_url_preserves_trailing_slash() {
+        // 200-level base is root path — trailing slash before ? is REQUIRED.
+        // Without it: wss://full-depth-api.dhan.co?token=... → 400 Bad Request
+        // With it: wss://full-depth-api.dhan.co/?token=... → works (matches SDK)
+        let url = format!(
+            "{}?token=TEST&clientId=TEST&authType=2",
+            DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
         );
         assert!(
-            url.starts_with("wss://full-depth-api.dhan.co"),
-            "must use correct host: {url}"
+            url.contains(".dhan.co/?token="),
+            "200-level must have trailing slash before query: {url}"
+        );
+        assert!(
+            url.starts_with("wss://full-depth-api.dhan.co/"),
+            "must use correct host with slash: {url}"
         );
     }
 }
