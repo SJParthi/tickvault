@@ -153,10 +153,10 @@ async fn connect_and_run_depth(
 
     let access_token = token_state.access_token().expose_secret().to_string();
 
-    // Build authenticated URL
+    // Build authenticated URL — no trailing slash before query string (SDK match)
     let base = DHAN_TWENTY_DEPTH_WS_BASE_URL.trim_end_matches('/');
     let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}"
+        "{base}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}"
     ));
 
     let request = authenticated_url
@@ -384,9 +384,10 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
+    // 200-level URL is root path (wss://full-depth-api.dhan.co/) — query params appended directly
     let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
     let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}"
+        "{base}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}"
     ));
 
     let request = authenticated_url
@@ -718,5 +719,37 @@ mod tests {
         // Next failure starts from 0 again
         let attempt = counter.fetch_add(1, Ordering::Relaxed);
         assert_eq!(attempt, 0, "fresh failure after success starts at 0");
+    }
+
+    #[test]
+    fn test_twenty_depth_url_no_trailing_slash_before_query() {
+        // Regression: 2026-04-06 — trailing slash before ?token= caused HTTP 404.
+        // SDK produces: wss://depth-api-feed.dhan.co/twentydepth?token=...
+        // Bug produced: wss://depth-api-feed.dhan.co/twentydepth/?token=...
+        let base = DHAN_TWENTY_DEPTH_WS_BASE_URL.trim_end_matches('/');
+        let url = format!("{base}?token=TEST&clientId=TEST&authType=2");
+        assert!(
+            url.contains("/twentydepth?token="),
+            "must NOT have trailing slash before query: {url}"
+        );
+        assert!(
+            !url.contains("/twentydepth/?"),
+            "must NOT have /twentydepth/? pattern: {url}"
+        );
+    }
+
+    #[test]
+    fn test_two_hundred_depth_url_no_double_slash_before_query() {
+        // 200-level base is root path (wss://full-depth-api.dhan.co/)
+        let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
+        let url = format!("{base}?token=TEST&clientId=TEST&authType=2");
+        assert!(
+            !url.contains("//?"),
+            "must NOT have double slash before query: {url}"
+        );
+        assert!(
+            url.starts_with("wss://full-depth-api.dhan.co"),
+            "must use correct host: {url}"
+        );
     }
 }
