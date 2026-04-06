@@ -137,12 +137,11 @@ fn validate_header<'a>(data: &'a [u8], path: &Path) -> Result<&'a [u8]> {
 /// remains valid.
 ///
 /// # Safety
-/// Uses `rkyv::access_unchecked` internally. This is safe because:
-/// 1. The binary cache is written by our own `write_binary_cache` (same rkyv version,
-///    validated via magic bytes + version header)
+/// Uses `rkyv::access_unchecked` in `archived()` for hot-path performance. Safe because:
+/// 1. `load()` validates the archive via safe `rkyv::access` before returning
 /// 2. The mmap is read-only — no concurrent mutation possible
 /// 3. Single-process access — atomic rename prevents partial reads
-/// 4. Magic bytes + version + file size validated before access
+/// 4. Magic bytes + version + file size validated in header check
 pub struct MappedUniverse {
     mmap: Mmap,
 }
@@ -187,8 +186,13 @@ impl MappedUniverse {
 
         let mapped = Self { mmap };
 
-        // Quick field access to catch obvious corruption early
-        let archived = mapped.archived();
+        // SECURITY: Validate rkyv archive structure once at load time using safe
+        // rkyv::access (checks alignment, pointer bounds, invariants). This
+        // justifies subsequent access_unchecked calls on the hot path since the
+        // mmap is read-only and single-process — data cannot change after validation.
+        let archived =
+            rkyv::access::<ArchivedFnoUniverse, rkyv::rancor::Error>(&mapped.mmap[HEADER_LEN..])
+                .map_err(|err| anyhow::anyhow!("rkyv archive validation failed: {err}"))?;
         let _derivative_count = archived.derivative_contracts.len();
         let _underlying_count = archived.underlyings.len();
 
