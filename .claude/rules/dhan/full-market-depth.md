@@ -12,7 +12,13 @@
    - 20-level: `wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
    - 200-level: `wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2` (SDK uses root path, no `/twohundreddepth`)
 
-3. **Header is 12 bytes, NOT 8.** Different from Live Market Feed's 8-byte header. Do NOT reuse the same header parser.
+3. **Connection limits are INDEPENDENT per WebSocket type (confirmed by Dhan 2026-04-06).**
+   - Live Market Feed: 5 connections (separate pool)
+   - 20-level Depth: 5 connections (separate pool)
+   - 200-level Depth: 5 connections (separate pool)
+   - These are NOT a shared cap. Depth connections are connectable even post 3:30 PM (no data returned).
+
+4. **Header is 12 bytes, NOT 8.** Different from Live Market Feed's 8-byte header. Do NOT reuse the same header parser.
    | Byte (0-based) | Type | Field |
    |---|---|---|
    | `0-1` | i16 LE | Message Length |

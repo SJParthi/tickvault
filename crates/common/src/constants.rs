@@ -43,14 +43,31 @@ pub const MAX_WEBSOCKET_FRAME_SIZE: usize = 65536;
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Connection Limits
 // ---------------------------------------------------------------------------
+// Confirmed by Dhan (Hardik, 2026-04-06 madefortrade.in/t/63542):
+// The limit of 5 is applicable for EACH websocket type INDEPENDENTLY:
+//   - Live Market Feed: 5 connections
+//   - 20-level Depth: 5 connections
+//   - 200-level Depth: 5 connections
+// These are separate pools, not a shared 5-connection cap.
+// Depth connections are available post 3:30 PM (no data, but connectable).
+// ---------------------------------------------------------------------------
 
-/// Maximum instruments per single WebSocket connection.
+/// Maximum instruments per single Live Market Feed WebSocket connection.
 pub const MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION: usize = 5000;
 
-/// Maximum concurrent WebSocket connections per Dhan account.
+/// Maximum concurrent Live Market Feed WebSocket connections per Dhan account.
+/// NOTE: This limit is INDEPENDENT from depth connection limits.
 pub const MAX_WEBSOCKET_CONNECTIONS: usize = 5;
 
-/// Total subscription capacity across all connections.
+/// Maximum concurrent 20-level depth WebSocket connections per Dhan account.
+/// Independent limit from Live Market Feed and 200-level depth.
+pub const MAX_TWENTY_DEPTH_CONNECTIONS: usize = 5;
+
+/// Maximum concurrent 200-level depth WebSocket connections per Dhan account.
+/// Independent limit from Live Market Feed and 20-level depth.
+pub const MAX_TWO_HUNDRED_DEPTH_CONNECTIONS: usize = 5;
+
+/// Total subscription capacity across all Live Market Feed connections.
 pub const MAX_TOTAL_SUBSCRIPTIONS: usize =
     MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION * MAX_WEBSOCKET_CONNECTIONS;
 

@@ -38,6 +38,15 @@ wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 | `clientId`  | Yes      | Dhan Client ID                 |
 | `authType`  | Yes      | `2` (always)                   |
 
+> **Connection limits (confirmed by Dhan team, 2026-04-06):**
+> The limit of **5 connections** applies to EACH WebSocket type **independently**:
+> - Live Market Feed: 5 connections (separate pool)
+> - 20-level Depth: 5 connections (separate pool)
+> - 200-level Depth: 5 connections (separate pool)
+>
+> These are NOT a shared 5-connection cap. Depth connections remain connectable
+> after 3:30 PM (post market close) — they simply won't return data.
+
 ---
 
 ## 3. Subscribing to Instruments
