@@ -30,7 +30,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::constants::MAX_INDICATOR_INSTRUMENTS;
+use dhan_live_trader_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
 use dhan_live_trader_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
@@ -285,7 +285,7 @@ async fn run_trading_pipeline(
                         if last_indicator_persist.elapsed().as_secs() >= INDICATOR_PERSIST_INTERVAL_SECS {
                             let ist_now = {
                                 let utc = chrono::Utc::now().timestamp();
-                                let ist = utc.saturating_add(19_800);
+                                let ist = utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
                                 (ist % 86_400) as u32
                             };
                             if (INDICATOR_PERSIST_START..INDICATOR_PERSIST_END).contains(&ist_now)
@@ -330,7 +330,7 @@ async fn run_trading_pipeline(
                         // SEBI: no orders at or after 15:30 IST.
                         let ist_secs_of_day = {
                             let now_utc = chrono::Utc::now().timestamp();
-                            let now_ist = now_utc.saturating_add(19_800); // +5:30
+                            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)); // +5:30
                             (now_ist % 86_400) as u32
                         };
                         // 09:15:00 = 33300s, 15:29:59 = 55799s

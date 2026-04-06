@@ -247,6 +247,7 @@ async fn connect_and_run_depth(
                         }
                         Err(_) => {
                             warn!("{DEPTH_CONNECTION_PREFIX}: frame send timeout — dropping frame");
+                            metrics::counter!("dlt_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "20").increment(1);
                         }
                     }
                 }
@@ -465,6 +466,7 @@ async fn connect_and_run_200_depth(
                         }
                         Err(_) => {
                             warn!("{prefix}: frame send timeout — dropping frame");
+                            metrics::counter!("dlt_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "200").increment(1);
                         }
                     }
                 }

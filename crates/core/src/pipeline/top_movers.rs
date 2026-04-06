@@ -152,6 +152,11 @@ impl TopMoversTracker {
     /// O(1) — single HashMap lookup + one division.
     #[inline]
     pub fn update(&mut self, tick: &ParsedTick) {
+        // Reject ticks with non-finite or non-positive LTP (NaN, Inf, 0, negative)
+        if !tick.last_traded_price.is_finite() || tick.last_traded_price <= 0.0 {
+            return;
+        }
+
         self.ticks_processed = self.ticks_processed.saturating_add(1);
 
         let key = (tick.security_id, tick.exchange_segment_code);

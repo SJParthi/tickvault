@@ -168,6 +168,9 @@ fn is_valid_date_format(s: &str) -> bool {
 }
 
 /// Queries distinct expiry dates for an underlying from `dhan_option_chain_raw`.
+///
+/// SAFETY: QuestDB HTTP API does not support parameterized queries.
+/// `underlying` is sanitized by the caller: alphanumeric + underscore only, max 20 chars.
 async fn query_available_expiries(
     client: &reqwest::Client,
     base_url: &str,
@@ -213,6 +216,10 @@ async fn query_available_expiries(
 }
 
 /// Queries option chain contracts for a specific underlying + expiry.
+///
+/// SAFETY: QuestDB HTTP API does not support parameterized queries.
+/// `underlying` is sanitized: alphanumeric + underscore, max 20 chars.
+/// `expiry` is sanitized: YYYY-MM-DD format validated with range checks.
 async fn query_option_chain(
     client: &reqwest::Client,
     base_url: &str,

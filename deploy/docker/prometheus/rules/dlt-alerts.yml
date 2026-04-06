@@ -409,3 +409,23 @@ groups:
         annotations:
           summary: "No 20-level depth frames received for 60 seconds"
           description: "Depth connection is active but no frames arriving. Possible subscription issue."
+
+      # Deep depth data loss — rows dropped on flush failure
+      - alert: DeepDepthDataLoss
+        expr: dlt_deep_depth_rows_lost > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DEEP DEPTH DATA PERMANENTLY LOST"
+          description: "{{ $value }} deep depth rows dropped. DeepDepthWriter flush failed."
+
+      # Depth frames dropped due to send timeout
+      - alert: DepthFramesDropped
+        expr: rate(dlt_depth_frames_dropped_total[5m]) > 0
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Depth frames being dropped (send timeout)"
+          description: "{{ $value }} depth frames/sec dropped. Tick processor may be overloaded."
