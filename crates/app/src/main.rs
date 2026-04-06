@@ -1406,10 +1406,36 @@ async fn main() -> Result<()> {
     // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
     // -----------------------------------------------------------------------
     // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
+    // Alert dedup: each category sends at most 1 alert per ALERT_COOLDOWN_SECS
+    // to avoid spamming Telegram when a condition persists across intervals.
     {
         let health_notifier = notifier.clone();
         let questdb_config = config.questdb.clone();
         tokio::spawn(async move {
+            use std::time::Instant;
+
+            /// Minimum seconds between repeated alerts of the same category.
+            const ALERT_COOLDOWN_SECS: u64 = 1800; // 30 minutes
+            let cooldown = std::time::Duration::from_secs(ALERT_COOLDOWN_SECS);
+
+            // Per-category last-alert timestamps for dedup.
+            let mut last_disk_alert: Option<Instant> = None;
+            let mut last_memory_alert: Option<Instant> = None;
+            let mut last_spill_alert: Option<Instant> = None;
+            let mut last_docker_alert: Option<Instant> = None;
+
+            /// Returns true if cooldown has elapsed (or first alert).
+            fn should_alert(last: &mut Option<Instant>, cooldown: std::time::Duration) -> bool {
+                let now = Instant::now();
+                match last {
+                    Some(t) if now.duration_since(*t) < cooldown => false,
+                    _ => {
+                        *last = Some(now);
+                        true
+                    }
+                }
+            }
+
             let interval = std::time::Duration::from_secs(
                 dhan_live_trader_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
             );
@@ -1418,6 +1444,7 @@ async fn main() -> Result<()> {
                 // Disk space check
                 if let Some(percent_free) = infra::check_disk_space()
                     && percent_free < infra::MIN_FREE_DISK_PERCENT
+                    && should_alert(&mut last_disk_alert, cooldown)
                 {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
@@ -1429,6 +1456,7 @@ async fn main() -> Result<()> {
                 // Memory RSS check
                 if let Some(rss_mb) = infra::check_memory_rss()
                     && rss_mb > infra::MEMORY_RSS_ALERT_MB
+                    && should_alert(&mut last_memory_alert, cooldown)
                 {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
@@ -1439,7 +1467,8 @@ async fn main() -> Result<()> {
                 }
                 // C2: Spill file size check — export metric + alert if large.
                 let spill_bytes = infra::check_spill_file_size();
-                if spill_bytes > 500 * 1024 * 1024 {
+                if spill_bytes > 500 * 1024 * 1024 && should_alert(&mut last_spill_alert, cooldown)
+                {
                     // > 500 MB of spill files — QuestDB likely down for extended period.
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
@@ -1460,7 +1489,7 @@ async fn main() -> Result<()> {
                 infra::cleanup_old_spill_files();
                 // C5: Docker container watchdog — detect and restart unhealthy containers.
                 let unhealthy = infra::check_and_restart_containers().await;
-                if unhealthy > 0 {
+                if unhealthy > 0 && should_alert(&mut last_docker_alert, cooldown) {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
                             "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
