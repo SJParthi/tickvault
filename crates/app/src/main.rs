@@ -1276,7 +1276,9 @@ async fn main() -> Result<()> {
                     while let Some(frame) = depth_rx.recv().await {
                         m.increment(1);
                         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        match dhan_live_trader_core::parser::dispatch_deep_depth_frame(&frame, ts) {
+                        match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                            &frame, ts,
+                        ) {
                             Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
                                 security_id,
                                 exchange_segment_code,
@@ -1368,7 +1370,7 @@ async fn main() -> Result<()> {
                         while let Some(frame) = rx200.recv().await {
                             m.increment(1);
                             let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                            match dhan_live_trader_core::parser::dispatch_deep_depth_frame(
+                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
                                 &frame, ts,
                             ) {
                                 Ok(
