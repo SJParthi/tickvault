@@ -27,10 +27,10 @@ wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&auth
 ### 200-Level Endpoint
 
 ```
-wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
+wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 ```
 
-> **SDK note:** DhanHQ Python SDK (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (no path segment) for 200-level. Our ground truth follows the official Dhan API documentation which specifies `/twohundreddepth`. Verify against live API.
+> **SDK verified (2026-04-06):** DhanHQ Python SDK (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (root path, no `/twohundreddepth`). Our code now matches the SDK. Earlier Dhan documentation referenced `/twohundreddepth` but the SDK is the ground truth for what works in production.
 
 | Parameter   | Required | Value                          |
 |-------------|----------|--------------------------------|
@@ -254,7 +254,7 @@ pub struct TwoHundredDepthPacket {
 
 | Aspect                    | Live Market Feed               | Full Market Depth (20-lvl)     | Full Market Depth (200-lvl)    |
 |---------------------------|-------------------------------|-------------------------------|-------------------------------|
-| Endpoint                  | `wss://api-feed.dhan.co`     | `wss://depth-api-feed.dhan.co/twentydepth` | `wss://full-depth-api.dhan.co/twohundreddepth` |
+| Endpoint                  | `wss://api-feed.dhan.co`     | `wss://depth-api-feed.dhan.co/twentydepth` | `wss://full-depth-api.dhan.co/` |
 | Header size               | 8 bytes                       | 12 bytes                      | 12 bytes                      |
 | Header byte 1             | Response code                 | Message length (low byte)     | Message length (low byte)     |
 | Depth levels              | 5 (Full mode only)            | 20                            | Up to 200                     |

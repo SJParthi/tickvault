@@ -106,16 +106,6 @@ pub async fn run_depth_rebalancer(
         }
     }
 
-    let today = {
-        let now_utc = chrono::Utc::now().timestamp();
-        let now_ist = now_utc.saturating_add(i64::from(
-            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS,
-        ));
-        chrono::DateTime::from_timestamp(now_ist, 0)
-            .map(|dt| dt.date_naive())
-            .unwrap_or_else(|| chrono::Utc::now().date_naive())
-    };
-
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("depth rebalancer shutting down");
@@ -127,6 +117,17 @@ pub async fn run_depth_rebalancer(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+
+        // Recompute today each iteration to handle midnight crossover correctly
+        let today = {
+            let now_utc = chrono::Utc::now().timestamp();
+            let now_ist = now_utc.saturating_add(i64::from(
+                dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS,
+            ));
+            chrono::DateTime::from_timestamp(now_ist, 0)
+                .map(|dt| dt.date_naive())
+                .unwrap_or_else(|| chrono::Utc::now().date_naive())
+        };
 
         for symbol in &underlyings {
             let current_spot = match get_spot_price(&spot_prices, symbol) {

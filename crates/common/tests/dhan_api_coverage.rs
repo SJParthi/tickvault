@@ -195,8 +195,8 @@ fn test_all_websocket_urls_defined() {
         "20-level depth WS base URL"
     );
     assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/twohundreddepth",
-        "200-level depth WS base URL"
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/",
+        "200-level depth WS base URL — matches DhanHQ Python SDK (root path, no /twohundreddepth)"
     );
 
     // Both must use wss:// (TLS required)
@@ -602,9 +602,10 @@ fn test_depth_websocket_urls_correct_hostnames() {
         DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("full-depth-api.dhan.co"),
         "200-depth must use full-depth-api.dhan.co"
     );
+    // SDK uses root path (no /twohundreddepth) — verified 2026-04-06
     assert!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("/twohundreddepth"),
-        "200-depth must have /twohundreddepth path"
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.starts_with("wss://full-depth-api.dhan.co/"),
+        "200-depth must start with wss://full-depth-api.dhan.co/"
     );
 
     // 20-depth and 200-depth use DIFFERENT hosts

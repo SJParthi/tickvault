@@ -579,7 +579,7 @@ Total per-side packet: 12 (header) + 320 (body) = 332 bytes
 
 | Parameter | Value |
 |-----------|-------|
-| Endpoint | `wss://full-depth-api.dhan.co/twohundreddepth` (from config) |
+| Endpoint | `wss://full-depth-api.dhan.co/` (matches DhanHQ Python SDK) |
 | Auth | Token + client ID as URL query params (same as 20-depth) |
 | Max connections | 5 (shared limit) |
 | Max instruments per connection | **1** (critical limitation) |

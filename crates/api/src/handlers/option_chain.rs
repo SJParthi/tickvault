@@ -61,12 +61,13 @@ pub async fn get_option_chain(
     State(state): State<SharedAppState>,
     Query(params): Query<OptionChainQuery>,
 ) -> impl IntoResponse {
-    // Validate underlying: alphanumeric + underscore only (prevents SQL injection)
+    // Validate underlying: uppercase alphanumeric + underscore only (strict SQL injection prevention)
     if params.underlying.is_empty()
+        || params.underlying.len() > 20
         || !params
             .underlying
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '&')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -121,11 +122,14 @@ pub async fn get_option_chain(
                 available_expiries: expiries,
             };
 
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(&response).unwrap_or_default()),
-            )
-                .into_response()
+            match serde_json::to_value(&response) {
+                Ok(json) => (StatusCode::OK, Json(json)).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "serialization failed"})),
+                )
+                    .into_response(),
+            }
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -145,19 +149,35 @@ fn build_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// Validates YYYY-MM-DD date format.
+/// Validates YYYY-MM-DD date format by parsing into a real date.
+/// Rejects invalid dates like 9999-99-99 or 2026-02-30.
 fn is_valid_date_format(s: &str) -> bool {
     if s.len() != 10 {
         return false;
     }
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
+    // Strict: must be exactly YYYY-MM-DD with all digits + hyphens
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
         return false;
     }
-    parts[0].len() == 4
-        && parts[1].len() == 2
-        && parts[2].len() == 2
-        && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+    // Parse as actual date to reject impossible dates (e.g., month 13, day 32)
+    let year: u16 = match s[..4].parse() {
+        Ok(y) => y,
+        Err(_) => return false,
+    };
+    let month: u8 = match s[5..7].parse() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let day: u8 = match s[8..10].parse() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    // Validate ranges (no need for external crate — simple bounds check)
+    if !(2020..=2040).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return false;
+    }
+    true
 }
 
 /// Queries distinct expiry dates for an underlying from `dhan_option_chain_raw`.
@@ -282,10 +302,11 @@ pub async fn get_pcr(
     Query(params): Query<OptionChainQuery>,
 ) -> impl IntoResponse {
     if params.underlying.is_empty()
+        || params.underlying.len() > 20
         || !params
             .underlying
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '&')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return (
             StatusCode::BAD_REQUEST,

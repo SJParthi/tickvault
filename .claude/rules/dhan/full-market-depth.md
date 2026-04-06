@@ -10,7 +10,7 @@
 
 2. **Two SEPARATE endpoints. Never mix them.**
    - 20-level: `wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
-   - 200-level: `wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
+   - 200-level: `wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2` (SDK uses root path, no `/twohundreddepth`)
 
 3. **Header is 12 bytes, NOT 8.** Different from Live Market Feed's 8-byte header. Do NOT reuse the same header parser.
    | Byte (0-based) | Type | Field |

@@ -2,7 +2,7 @@
 //!
 //! Separate connections from the Live Market Feed. Connect to:
 //! - 20-level: `wss://depth-api-feed.dhan.co/twentydepth`
-//! - 200-level: `wss://full-depth-api.dhan.co/twohundreddepth`
+//! - 200-level: `wss://full-depth-api.dhan.co/` (matches DhanHQ Python SDK)
 //!
 //! Frames are sent to the same `mpsc::Sender<Bytes>` channel as the main feed,
 //! so the tick processor handles dispatch via `dispatch_deep_depth_frame()`.
@@ -100,11 +100,14 @@ pub async fn run_twenty_depth_connection(
         {
             Ok(()) => {
                 info!("{DEPTH_CONNECTION_PREFIX}: connection closed normally");
+                // Reset counter only on successful connection (failures accumulate for backoff)
+                reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
-                if attempt.is_multiple_of(10) {
+                // Escalate to ERROR after 10+ consecutive failures (not on first failure)
+                if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,
                         ?err,
@@ -125,9 +128,6 @@ pub async fn run_twenty_depth_connection(
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
-
-        // Reset counter on successful connection (only failures accumulate)
-        reconnect_counter.store(0, Ordering::Relaxed);
     }
 }
 
@@ -289,7 +289,7 @@ async fn connect_and_run_depth(
 
 /// Runs a 200-level depth WebSocket connection for a SINGLE instrument.
 ///
-/// Connects to `wss://full-depth-api.dhan.co/twohundreddepth`.
+/// Connects to `wss://full-depth-api.dhan.co/` (matches DhanHQ Python SDK).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
@@ -334,11 +334,14 @@ pub async fn run_two_hundred_depth_connection(
         {
             Ok(()) => {
                 info!("{prefix}: connection closed normally");
+                // Reset counter only on successful connection (failures accumulate for backoff)
+                reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
-                if attempt.is_multiple_of(10) {
+                // Escalate to ERROR after 10+ consecutive failures (not on first failure)
+                if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,
                         ?err,
@@ -358,7 +361,6 @@ pub async fn run_two_hundred_depth_connection(
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
-        reconnect_counter.store(0, Ordering::Relaxed);
     }
 }
 
@@ -586,9 +588,10 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_ws_url_correct() {
+        // Updated to match DhanHQ Python SDK (fulldepth.py) which uses root path
         assert_eq!(
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-            "wss://full-depth-api.dhan.co/twohundreddepth"
+            "wss://full-depth-api.dhan.co/"
         );
     }
 
@@ -651,5 +654,69 @@ mod tests {
     fn test_depth_read_timeout_matches_keepalive() {
         // Dhan docs: server pings every 10s, connection drops after 40s
         assert_eq!(DEPTH_READ_TIMEOUT_SECS, 40);
+    }
+
+    #[test]
+    fn test_reconnect_counter_accumulates_on_consecutive_failures() {
+        // Regression: 2026-04-06 — reconnect counter was reset after BOTH Ok and Err,
+        // causing backoff to always use attempt=0 (1s delay instead of exponential).
+        // Fix: reset only inside Ok() arm.
+        let counter = AtomicU64::new(0);
+
+        // Simulate 5 consecutive failures
+        for expected in 0..5u64 {
+            let attempt = counter.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(attempt, expected, "attempt must accumulate on failure");
+        }
+        // After 5 failures, counter should be 5
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
+
+        // Verify backoff grows: attempt 0 = 1s, attempt 4 = 16s
+        let delay_0 = DEPTH_RECONNECT_INITIAL_MS
+            .saturating_mul(1u64.checked_shl(0).unwrap_or(u64::MAX))
+            .min(DEPTH_RECONNECT_MAX_MS);
+        let delay_4 = DEPTH_RECONNECT_INITIAL_MS
+            .saturating_mul(1u64.checked_shl(4).unwrap_or(u64::MAX))
+            .min(DEPTH_RECONNECT_MAX_MS);
+        assert_eq!(delay_0, 1000, "first attempt: 1s");
+        assert_eq!(delay_4, 16000, "fifth attempt: 16s");
+
+        // Only reset on success (simulated Ok path)
+        counter.store(0, Ordering::Relaxed);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_reconnect_counter_resets_only_on_success() {
+        // Regression: 2026-04-06 — counter must NOT reset after Err
+        let counter = AtomicU64::new(0);
+
+        // Failure path: increment
+        let _ = counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "should be 1 after failure"
+        );
+
+        // Another failure: still accumulates
+        let _ = counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "should be 2 after second failure"
+        );
+
+        // Success path: now we reset
+        counter.store(0, Ordering::Relaxed);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "should be 0 after success"
+        );
+
+        // Next failure starts from 0 again
+        let attempt = counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(attempt, 0, "fresh failure after success starts at 0");
     }
 }
