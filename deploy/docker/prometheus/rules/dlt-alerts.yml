@@ -320,3 +320,62 @@ groups:
         annotations:
           summary: "Order rejection rate > 10%"
           description: "More than 10% of placed orders are being rejected."
+
+      # Token expiry — refresh at 23h, warn at 1h remaining
+      - alert: TokenExpiryWarning
+        expr: dlt_token_remaining_seconds < 3600
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JWT token expires in < 1 hour"
+          description: "Token has {{ $value }}s remaining. Auto-refresh should trigger at 23h mark."
+
+      - alert: TokenExpiryCritical
+        expr: dlt_token_remaining_seconds < 600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "JWT token expires in < 10 minutes"
+          description: "Token has {{ $value }}s remaining. Immediate renewal needed or trading will halt."
+
+      # Zero ticks for 30 seconds during market hours (more aggressive than NoTicksReceived)
+      - alert: ZeroTicksBurst
+        expr: increase(dlt_ticks_processed_total[30s]) == 0 and dlt_pipeline_active == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No ticks received for 30 seconds while pipeline is active"
+          description: "Tick flow stopped while pipeline is running. Check WebSocket connections and Dhan feed status."
+
+      # Memory usage — process RSS
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes{job="dlt-application"} > 2147483648
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Application memory > 2GB"
+          description: "Process RSS is {{ $value | humanize1024 }}B. Possible memory leak."
+
+      # Valkey (cache) down
+      - alert: ValkeyDown
+        expr: up{job="dlt-valkey"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valkey cache is DOWN"
+          description: "Valkey is unreachable. App continues without cache (degraded performance)."
+
+      # Alloy (log collector) down — explains empty Logs dashboard
+      - alert: AlloyDown
+        expr: up{job="dlt-alloy"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alloy log collector is DOWN"
+          description: "Alloy is not scraping logs. Grafana Logs dashboard will be empty."
