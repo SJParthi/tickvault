@@ -1458,6 +1458,16 @@ async fn main() -> Result<()> {
                 }
                 // C4: Auto-cleanup spill files older than 7 days.
                 infra::cleanup_old_spill_files();
+                // C5: Docker container watchdog — detect and restart unhealthy containers.
+                let unhealthy = infra::check_and_restart_containers().await;
+                if unhealthy > 0 {
+                    health_notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
+                             Auto-restart triggered via docker compose up -d."
+                        ),
+                    });
+                }
             }
         });
         info!("background periodic health check started (every 5 minutes)");

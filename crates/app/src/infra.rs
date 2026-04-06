@@ -28,6 +28,15 @@ const INFRA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wait time for Docker services to become healthy.
 const INFRA_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum retries for `docker compose up -d` during startup.
+const COMPOSE_UP_MAX_RETRIES: u32 = 5;
+
+/// Initial delay between `docker compose up -d` retries.
+const COMPOSE_UP_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Interval for infrastructure watchdog container health checks.
+pub const INFRA_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum wait time for Docker daemon to start after launching Docker Desktop.
 const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -145,18 +154,37 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         ),
     ];
 
-    // Run docker compose up -d.
-    match run_docker_compose_up(&env_vars).await {
-        Ok(()) => {
-            info!("docker compose started — waiting for services to be healthy");
+    // Run docker compose up -d with retries.
+    let mut compose_succeeded = false;
+    for attempt in 1..=COMPOSE_UP_MAX_RETRIES {
+        match run_docker_compose_up(&env_vars).await {
+            Ok(()) => {
+                info!(
+                    attempt,
+                    "docker compose started — waiting for services to be healthy"
+                );
+                compose_succeeded = true;
+                break;
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    attempt,
+                    max_attempts = COMPOSE_UP_MAX_RETRIES,
+                    "docker compose up failed — retrying"
+                );
+                if attempt < COMPOSE_UP_MAX_RETRIES {
+                    tokio::time::sleep(COMPOSE_UP_RETRY_DELAY).await;
+                }
+            }
         }
-        Err(err) => {
-            warn!(
-                ?err,
-                "docker compose up failed — services may not be available"
-            );
-            return;
-        }
+    }
+    if !compose_succeeded {
+        tracing::error!(
+            "docker compose up failed after {COMPOSE_UP_MAX_RETRIES} attempts — \
+             services may not be available. Telegram CRITICAL alert should fire."
+        );
+        return;
     }
 
     // Wait for QuestDB and Grafana to become healthy.
@@ -470,6 +498,112 @@ pub fn export_system_metrics() {
         let count = entries.count();
         metrics::gauge!("dlt_process_open_fds").set(count as f64);
     }
+}
+
+/// Checks Docker container health and auto-restarts any unhealthy/exited containers.
+///
+/// Runs `docker compose ps` to detect container state, then `docker compose up -d`
+/// for any that are not running. Returns the number of containers restarted.
+///
+/// Called by the periodic health check loop (every 5 minutes). Best-effort —
+/// if Docker is not available, returns 0 without blocking.
+// TEST-EXEMPT: requires Docker daemon — tested by manual integration
+pub async fn check_and_restart_containers() -> usize {
+    use tokio::process::Command;
+
+    // Quick check: is Docker daemon even running?
+    if !is_docker_daemon_running().await {
+        warn!("Docker daemon not running — cannot check container health");
+        metrics::gauge!("dlt_docker_containers_healthy").set(0.0);
+        return 0;
+    }
+
+    // Get container status via docker compose ps.
+    let output = match Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            DOCKER_COMPOSE_PATH,
+            "ps",
+            "--format",
+            "{{.Name}} {{.State}}",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(err) => {
+            warn!(?err, "failed to run docker compose ps");
+            return 0;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut total_containers: usize = 0;
+    let mut unhealthy_containers: usize = 0;
+    let mut unhealthy_names: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        total_containers = total_containers.saturating_add(1);
+        // State is the second word: "running", "exited", "restarting", etc.
+        let is_running = line.contains("running");
+        if !is_running {
+            unhealthy_containers = unhealthy_containers.saturating_add(1);
+            if let Some(name) = line.split_whitespace().next() {
+                unhealthy_names.push(name.to_string());
+            }
+        }
+    }
+
+    metrics::gauge!("dlt_docker_containers_total").set(total_containers as f64);
+    metrics::gauge!("dlt_docker_containers_healthy")
+        .set((total_containers.saturating_sub(unhealthy_containers)) as f64);
+
+    if unhealthy_containers == 0 {
+        debug!(total_containers, "all Docker containers healthy");
+        return 0;
+    }
+
+    // Containers are unhealthy — attempt restart.
+    tracing::error!(
+        unhealthy_containers,
+        names = ?unhealthy_names,
+        "unhealthy Docker containers detected — attempting docker compose up -d"
+    );
+
+    let restart_result = Command::new("docker")
+        .args(["compose", "-f", DOCKER_COMPOSE_PATH, "up", "-d"])
+        .output()
+        .await;
+
+    match restart_result {
+        Ok(output) if output.status.success() => {
+            info!(
+                unhealthy_containers,
+                names = ?unhealthy_names,
+                "docker compose up -d completed — containers restarting"
+            );
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(
+                stderr = %stderr.trim(),
+                "docker compose up -d failed during watchdog restart"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "failed to execute docker compose up -d during watchdog"
+            );
+        }
+    }
+
+    unhealthy_containers
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,5 +1633,36 @@ mod tests {
             super::MEMORY_RSS_ALERT_MB >= 128 && super::MEMORY_RSS_ALERT_MB <= 8192,
             "RSS alert threshold must be between 128MB and 8GB"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Watchdog & retry constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_retry_constants_are_reasonable() {
+        assert!(
+            COMPOSE_UP_MAX_RETRIES >= 3 && COMPOSE_UP_MAX_RETRIES <= 10,
+            "compose retries must be between 3 and 10"
+        );
+        assert!(
+            COMPOSE_UP_RETRY_DELAY.as_secs() >= 5 && COMPOSE_UP_RETRY_DELAY.as_secs() <= 30,
+            "compose retry delay must be between 5s and 30s"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_interval_is_reasonable() {
+        assert!(
+            INFRA_WATCHDOG_INTERVAL.as_secs() >= 30 && INFRA_WATCHDOG_INTERVAL.as_secs() <= 300,
+            "watchdog interval must be between 30s and 5min"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_and_restart_containers_no_panic() {
+        // Exercises the function — result depends on Docker availability.
+        // Must not panic regardless of whether Docker is installed.
+        let _result = check_and_restart_containers().await;
     }
 }
