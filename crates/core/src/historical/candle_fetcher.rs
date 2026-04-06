@@ -63,11 +63,17 @@ const DH_904_MAX_BACKOFF_ATTEMPTS: u32 = 4;
 
 /// Maximum retry waves for failed instruments after the initial pass.
 /// Each wave re-attempts all transiently-failed instruments with increasing backoff.
-const RETRY_WAVE_MAX: usize = 5;
+/// Set high to ensure we NEVER give up — every instrument must be fetched.
+/// With capped backoff at 300s (5 min), wave 100 = ~8 hours of total retries.
+/// If Dhan API is down for 8+ hours, it's a market-wide outage.
+const RETRY_WAVE_MAX: usize = 100;
 
-/// Base backoff between retry waves (seconds). Wave N sleeps N * base seconds.
-/// Wave 1: 30s, Wave 2: 60s, Wave 3: 90s, Wave 4: 120s, Wave 5: 150s.
+/// Base backoff between retry waves (seconds). Wave N sleeps min(N * base, MAX_BACKOFF).
+/// Wave 1: 30s, Wave 2: 60s, ..., Wave 10+: capped at 300s (5 min).
 const RETRY_WAVE_BACKOFF_BASE_SECS: u64 = 30;
+
+/// Maximum backoff between retry waves (seconds). Caps exponential growth.
+const RETRY_WAVE_MAX_BACKOFF_SECS: u64 = 300;
 
 /// Dhan error response structure — exactly 3 string fields per API docs.
 #[derive(Debug, serde::Deserialize)]
@@ -172,7 +178,8 @@ const TOKEN_REFRESH_WAIT_SECS: u64 = 30;
 
 /// Maximum token-expired retry cycles before giving up on an instrument.
 /// After this many 807 errors across retry waves, the instrument is marked Failed.
-const MAX_TOKEN_EXPIRED_RETRIES: usize = 2;
+/// Set to 10 — allows time for token renewal background task to complete.
+const MAX_TOKEN_EXPIRED_RETRIES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Pure Helper Functions (extracted for testability)
@@ -296,9 +303,11 @@ fn compute_retry_delay_ms(attempt: u32) -> u64 {
 }
 
 /// Computes the backoff duration in seconds for a retry wave.
-/// Wave N sleeps `N * RETRY_WAVE_BACKOFF_BASE_SECS`.
+/// Wave N sleeps `min(N * BASE, MAX)`. Caps at 300s to avoid excessive waits.
 fn compute_retry_wave_backoff_secs(wave: usize) -> u64 {
-    RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64)
+    RETRY_WAVE_BACKOFF_BASE_SECS
+        .saturating_mul(wave as u64)
+        .min(RETRY_WAVE_MAX_BACKOFF_SECS)
 }
 
 /// Returns the instrument type string for a subscription category, or `None`
@@ -713,12 +722,24 @@ pub async fn fetch_historical_candles(
 
         if wave > 0 {
             let backoff_secs = compute_retry_wave_backoff_secs(wave);
-            warn!(
-                wave,
-                remaining = pending_indices.len(),
-                backoff_secs,
-                "retry wave — backing off before re-attempting failed instruments"
-            );
+            // Escalate to error every 10 waves so Telegram alert fires
+            if wave % 10 == 0 {
+                error!(
+                    wave,
+                    remaining = pending_indices.len(),
+                    backoff_secs,
+                    "historical fetch still retrying — {} instruments pending after {} waves",
+                    pending_indices.len(),
+                    wave,
+                );
+            } else {
+                warn!(
+                    wave,
+                    remaining = pending_indices.len(),
+                    backoff_secs,
+                    "retry wave — backing off before re-attempting failed instruments"
+                );
+            }
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         }
 
@@ -1902,13 +1923,13 @@ mod tests {
 
     #[test]
     fn test_retry_wave_backoff_sequence() {
-        // Wave 1: 30s, Wave 2: 60s, Wave 3: 90s, Wave 4: 120s, Wave 5: 150s
+        // Backoff grows linearly but caps at RETRY_WAVE_MAX_BACKOFF_SECS (300s)
         for wave in 1..=RETRY_WAVE_MAX {
-            let backoff = RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64);
+            let backoff = compute_retry_wave_backoff_secs(wave);
             assert!(backoff > 0, "wave {wave} backoff must be positive");
             assert!(
-                backoff <= 300,
-                "wave {wave} backoff {backoff}s should not exceed 5 minutes"
+                backoff <= RETRY_WAVE_MAX_BACKOFF_SECS,
+                "wave {wave} backoff {backoff}s should not exceed max backoff"
             );
         }
     }
@@ -1924,15 +1945,22 @@ mod tests {
 
     #[test]
     fn test_retry_wave_max_total_backoff() {
-        // Total maximum backoff across all waves: sum(1..=5) * 30 = 15 * 30 = 450s = 7.5 min
+        // With 100 waves and 300s cap, total backoff is bounded.
+        // Waves 1-10: linear (30+60+...+300 = 1650s), Waves 11-100: capped (90 * 300 = 27000s)
+        // Total ~28650s (~8 hours). This ensures we never give up on a short outage.
         let mut total_backoff = 0_u64;
         for wave in 1..=RETRY_WAVE_MAX {
-            total_backoff = total_backoff
-                .saturating_add(RETRY_WAVE_BACKOFF_BASE_SECS.saturating_mul(wave as u64));
+            total_backoff = total_backoff.saturating_add(compute_retry_wave_backoff_secs(wave));
         }
+        // Total should be bounded (not infinite)
         assert!(
-            total_backoff <= 600,
-            "total retry backoff {total_backoff}s should not exceed 10 minutes"
+            total_backoff < 100_000,
+            "total retry backoff {total_backoff}s should be bounded"
+        );
+        // But should be substantial enough to cover extended outages
+        assert!(
+            total_backoff > 3600,
+            "total retry backoff {total_backoff}s should cover at least 1 hour of retries"
         );
     }
 
@@ -2113,8 +2141,8 @@ mod tests {
                 // "must retry at least once after token refresh"
             );
             assert!(
-                MAX_TOKEN_EXPIRED_RETRIES <= 5,
-                // "don't retry forever if token is truly dead"
+                MAX_TOKEN_EXPIRED_RETRIES <= 20,
+                // "bounded but generous — allow time for token renewal"
             );
         }
     }
@@ -2864,7 +2892,7 @@ mod tests {
     #[test]
     fn test_build_failure_reasons_all_token_expired() {
         let pending = vec![0, 1];
-        let token_counts = vec![2, 3]; // Both >= MAX_TOKEN_EXPIRED_RETRIES (2)
+        let token_counts = vec![10, 15]; // Both >= MAX_TOKEN_EXPIRED_RETRIES (10)
         let reasons = build_failure_reasons(&pending, &token_counts, 0);
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons["token_expired"], 2);
@@ -2882,7 +2910,7 @@ mod tests {
     #[test]
     fn test_build_failure_reasons_mixed() {
         let pending = vec![0, 1, 2];
-        let token_counts = vec![2, 0, 3]; // indices 0 and 2 are token_expired, 1 is network
+        let token_counts = vec![10, 0, 15]; // indices 0 and 2 >= MAX (10), 1 is network
         let reasons = build_failure_reasons(&pending, &token_counts, 0);
         assert_eq!(reasons.len(), 2);
         assert_eq!(reasons["token_expired"], 2);
@@ -3438,8 +3466,11 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_retry_wave_max_is_five() {
-        assert_eq!(RETRY_WAVE_MAX, 5);
+    fn test_retry_wave_max_is_at_least_fifty() {
+        assert!(
+            RETRY_WAVE_MAX >= 50,
+            "RETRY_WAVE_MAX must be >= 50 for guaranteed fetch"
+        );
     }
 
     #[test]
@@ -3454,7 +3485,7 @@ mod tests {
 
     #[test]
     fn test_max_token_expired_retries_value() {
-        assert_eq!(MAX_TOKEN_EXPIRED_RETRIES, 2);
+        assert_eq!(MAX_TOKEN_EXPIRED_RETRIES, 10);
     }
 
     #[test]
