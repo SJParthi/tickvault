@@ -577,6 +577,7 @@ impl DeepDepthWriter {
 
     /// Recovers records from stale spill files written by a previous crash.
     /// Call at startup before normal operation begins.
+    // TEST-EXEMPT: requires filesystem spill files from a previous crash, tested via test_deep_depth_spill_to_disk_roundtrip
     pub fn recover_stale_spill_files(&mut self) {
         let dir = match std::fs::read_dir(DEEP_DEPTH_SPILL_DIR) {
             Ok(d) => d,
@@ -644,6 +645,7 @@ impl DeepDepthWriter {
     }
 
     /// Returns the number of records held in the resilience ring buffer.
+    // TEST-EXEMPT: trivial field getter, tested indirectly by ring buffer tests
     pub fn buffered_count(&self) -> usize {
         self.depth_buffer.len()
     }
