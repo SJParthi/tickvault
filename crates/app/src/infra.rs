@@ -154,6 +154,17 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         ),
     ];
 
+    // Ensure data/logs/ exists before Docker mounts it (fresh clone won't have it).
+    // Alloy container mounts ../../data/logs → /var/log/dlt-app/ to watch app.log.
+    // If the directory doesn't exist, Docker creates it as root-owned, which can
+    // cause permission issues or Alloy file watch failures.
+    if let Err(err) = std::fs::create_dir_all("data/logs") {
+        warn!(
+            ?err,
+            "failed to create data/logs directory for Alloy log mount"
+        );
+    }
+
     // Run docker compose up -d with retries.
     let mut compose_succeeded = false;
     for attempt in 1..=COMPOSE_UP_MAX_RETRIES {

@@ -26,7 +26,7 @@
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use dhan_live_trader_app::boot_helpers::{
-    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START,
+    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
     compute_market_close_sleep, create_log_file_writer, effective_ws_stagger, format_bind_addr,
     format_cross_match_details, format_timeframe_details, format_violation_details,
 };
@@ -143,11 +143,15 @@ async fn main() -> Result<()> {
         None => (None, None),
     };
 
+    // IST timestamp formatter — all log timestamps show +05:30 offset.
+    let ist_timer = IstTimer;
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true)
         .with_file(false)
-        .with_line_number(false);
+        .with_line_number(false)
+        .with_timer(ist_timer.clone());
 
     // Box the fmt layer so both JSON and text branches produce the same type,
     // allowing a single subscriber chain (required for OpenTelemetryLayer<S> inference).
@@ -169,6 +173,7 @@ async fn main() -> Result<()> {
                     .with_thread_ids(true)
                     .with_file(false)
                     .with_line_number(false)
+                    .with_timer(ist_timer)
                     .json()
                     .with_writer(std::sync::Mutex::new(file));
                 Some(Box::new(file_fmt))

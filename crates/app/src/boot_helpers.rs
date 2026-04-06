@@ -43,6 +43,25 @@ pub const OFF_HOURS_CONNECTION_STAGGER_MS: u64 = 1000;
 pub const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 
 // ---------------------------------------------------------------------------
+// IST timestamp formatter for tracing-subscriber
+// ---------------------------------------------------------------------------
+
+/// Custom `FormatTime` implementation that outputs IST timestamps with +05:30 offset.
+///
+/// All log timestamps display as `2026-04-06T11:31:41.806275+05:30` instead of
+/// UTC `2026-04-06T06:01:41.806275Z`. Required for SEBI compliance and IST-native
+/// debugging during market hours.
+#[derive(Clone, Debug)]
+pub struct IstTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for IstTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Utc::now().with_timezone(&ist_offset());
+        write!(w, "{}", now.format("%Y-%m-%dT%H:%M:%S%.6f%:z"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure helper functions
 // ---------------------------------------------------------------------------
 
