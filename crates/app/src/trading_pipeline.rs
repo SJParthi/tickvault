@@ -245,6 +245,13 @@ async fn run_trading_pipeline(
     // Indicator snapshot persistence (every 60 seconds during market hours)
     let mut indicator_writer = config.indicator_snapshot_writer;
     let mut last_indicator_persist = std::time::Instant::now();
+    // O(1) EXEMPT: cold-path HashMap for indicator snapshot batching.
+    // Accumulates latest snapshot per security_id between 60s flush cycles.
+    // Max ~25K entries (one per subscribed instrument), cleared after each flush.
+    let mut indicator_batch: std::collections::HashMap<
+        u32,
+        (u8, dhan_live_trader_trading::indicator::IndicatorSnapshot),
+    > = std::collections::HashMap::with_capacity(4096);
     // 09:15:00 IST = 33300 secs of day, 15:30:00 IST = 55800 secs of day
     const INDICATOR_PERSIST_START: u32 = 33_300;
     const INDICATOR_PERSIST_END: u32 = 55_800;
@@ -301,7 +308,12 @@ async fn run_trading_pipeline(
                         // Step 1: Update indicators (O(1) per tick)
                         let snapshot = indicator_engine.update(&tick);
 
-                        // Step 1.5: Persist indicator snapshot periodically (cold path, every 60s)
+                        // Step 1.5: Accumulate indicator snapshot for batch persistence.
+                        // O(1) per tick: single HashMap insert (overwrite latest per security_id).
+                        // The batch is flushed every 60s during market hours.
+                        indicator_batch.insert(snapshot.security_id, (tick.exchange_segment_code, snapshot));
+
+                        // Flush ALL accumulated indicator snapshots every 60 seconds (cold path).
                         if last_indicator_persist.elapsed().as_secs() >= INDICATOR_PERSIST_INTERVAL_SECS {
                             let ist_now = {
                                 let utc = chrono::Utc::now().timestamp();
@@ -315,31 +327,44 @@ async fn run_trading_pipeline(
                                     .timestamp_nanos_opt()
                                     .unwrap_or(0)
                                     .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
-                                if let Err(err) = writer.append_snapshot(
-                                    ts_nanos,
-                                    snapshot.security_id,
-                                    tick.exchange_segment_code,
-                                    snapshot.ema_fast,
-                                    snapshot.ema_slow,
-                                    snapshot.sma,
-                                    snapshot.rsi,
-                                    snapshot.macd_line,
-                                    snapshot.macd_signal,
-                                    snapshot.macd_histogram,
-                                    snapshot.bollinger_upper,
-                                    snapshot.bollinger_middle,
-                                    snapshot.bollinger_lower,
-                                    snapshot.atr,
-                                    snapshot.supertrend,
-                                    snapshot.supertrend_bullish,
-                                    snapshot.adx,
-                                    snapshot.obv,
-                                    snapshot.vwap,
-                                    snapshot.last_traded_price,
-                                    snapshot.is_warm,
-                                ) {
-                                    tracing::warn!(?err, "indicator snapshot append failed");
+                                let mut persisted: u64 = 0;
+                                // O(1) EXEMPT: cold path — iterate all accumulated snapshots (max ~25K).
+                                for (&_sid, &(seg, ref snap)) in &indicator_batch {
+                                    if let Err(err) = writer.append_snapshot(
+                                        ts_nanos,
+                                        snap.security_id,
+                                        seg,
+                                        snap.ema_fast,
+                                        snap.ema_slow,
+                                        snap.sma,
+                                        snap.rsi,
+                                        snap.macd_line,
+                                        snap.macd_signal,
+                                        snap.macd_histogram,
+                                        snap.bollinger_upper,
+                                        snap.bollinger_middle,
+                                        snap.bollinger_lower,
+                                        snap.atr,
+                                        snap.supertrend,
+                                        snap.supertrend_bullish,
+                                        snap.adx,
+                                        snap.obv,
+                                        snap.vwap,
+                                        snap.last_traded_price,
+                                        snap.is_warm,
+                                    ) {
+                                        tracing::warn!(?err, "indicator snapshot append failed — aborting batch");
+                                        break;
+                                    }
+                                    persisted = persisted.saturating_add(1);
                                 }
+                                if let Err(err) = writer.flush() {
+                                    tracing::warn!(?err, "indicator snapshot flush failed");
+                                }
+                                if persisted > 0 {
+                                    debug!(persisted, batch_size = indicator_batch.len(), "indicator snapshots flushed to QuestDB");
+                                }
+                                indicator_batch.clear();
                             }
                             last_indicator_persist = std::time::Instant::now();
                         }

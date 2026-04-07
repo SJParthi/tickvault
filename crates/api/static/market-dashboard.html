@@ -69,12 +69,33 @@
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
         .loading { text-align: center; padding: 40px; color: var(--text-muted); }
+
+        /* Connection Status Bar */
+        .conn-bar { display: flex; gap: 12px; padding: 4px 16px; background: var(--bg); border-bottom: 1px solid var(--border); font-size: 11px; align-items: center; flex-wrap: wrap; }
+        .conn-item { display: flex; align-items: center; gap: 4px; }
+        .conn-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+        .conn-dot.up { background: var(--green); }
+        .conn-dot.down { background: var(--red); }
+        .conn-dot.partial { background: var(--yellow); }
+        .conn-label { color: var(--text-muted); }
+        .conn-value { color: var(--text-dim); font-weight: 500; }
     </style>
 </head>
 <body>
     <!-- Index Ticker Bar -->
     <div class="ticker-bar" id="tickerBar">
         <div class="ticker-item"><span class="ticker-name">Loading...</span></div>
+    </div>
+
+    <!-- Connection Status Bar -->
+    <div class="conn-bar" id="connBar">
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Live Feed:</span><span class="conn-value" id="connWs">--</span></div>
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Depth 20:</span><span class="conn-value" id="connD20">--</span></div>
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Depth 200:</span><span class="conn-value" id="connD200">--</span></div>
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Order WS:</span><span class="conn-value" id="connOrder">--</span></div>
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">QuestDB:</span><span class="conn-value" id="connQdb">--</span></div>
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Token:</span><span class="conn-value" id="connToken">--</span></div>
+        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Pipeline:</span><span class="conn-value" id="connPipeline">--</span></div>
     </div>
 
     <!-- Header -->
@@ -339,10 +360,36 @@ function fetchOptionMovers() {
         .catch(function() {});
 }
 
+function fetchHealth() {
+    fetch('/health')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            var subs = d.subsystems || {};
+            function setConn(id, info) {
+                var el = document.getElementById(id);
+                var dot = el ? el.previousElementSibling : null;
+                if (!el || !dot) return;
+                var s = info ? info.status : 'unknown';
+                var detail = info ? (info.detail || s) : '--';
+                el.textContent = detail;
+                dot.className = 'conn-dot ' + (s === 'connected' || s === 'reachable' || s === 'valid' || s === 'active' ? 'up' : s === 'buffering' ? 'partial' : 'down');
+            }
+            setConn('connWs', subs.websocket);
+            setConn('connD20', subs.depth_20);
+            setConn('connD200', subs.depth_200);
+            setConn('connOrder', subs.order_update);
+            setConn('connQdb', subs.questdb);
+            setConn('connToken', subs.token);
+            setConn('connPipeline', subs.pipeline);
+        })
+        .catch(function() {});
+}
+
 function fetchAll() {
     fetchIndices();
     fetchStockMovers();
     fetchOptionMovers();
+    fetchHealth();
 }
 
 // Init
