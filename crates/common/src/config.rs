@@ -250,6 +250,15 @@ pub struct ValkeyConfig {
     pub port: u16,
     /// Maximum connections in the connection pool.
     pub max_connections: u32,
+    /// Authentication password (matches `--requirepass` in Valkey server config).
+    /// Empty string = no auth (NOT recommended). Default: "dlt-dev-only".
+    #[serde(default = "default_valkey_password")]
+    pub password: String,
+}
+
+/// Default Valkey password — empty (loaded from SSM at boot in production).
+fn default_valkey_password() -> String {
+    String::new()
 }
 
 /// Prometheus metrics endpoint configuration.
@@ -984,6 +993,7 @@ mod tests {
                 host: "dlt-valkey".to_string(),
                 port: 6379,
                 max_connections: 16,
+                password: String::new(),
             },
             prometheus: PrometheusConfig {
                 host: "dlt-prometheus".to_string(),

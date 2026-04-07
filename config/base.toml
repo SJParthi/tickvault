@@ -165,6 +165,9 @@ ilp_port = 9009
 host = "dlt-valkey"
 port = 6379
 max_connections = 16
+# Password loaded from AWS SSM at boot (/dlt/{env}/valkey/password)
+# Empty string = no auth (NOT recommended for production)
+password = ""
 
 [prometheus]
 host = "dlt-prometheus"

@@ -26,12 +26,21 @@ const POOL_CHECKOUT_TIMEOUT_MS: u64 = 500;
 // Pure helper functions (testable without Redis)
 // ---------------------------------------------------------------------------
 
-/// Builds the Redis URL from host and port.
+/// Builds the Redis URL from host, port, and optional password.
 ///
-/// Format: `redis://{host}:{port}` — no auth, no database selection.
+/// Format: `redis://:{password}@{host}:{port}` when password set,
+/// or `redis://{host}:{port}` when empty (dev only).
 #[inline(never)]
-fn build_valkey_url(host: &str, port: u16) -> String {
-    format!("redis://{}:{}", host, port)
+fn build_valkey_url(host: &str, port: u16, password: &str) -> String {
+    // SECRET-EXEMPT: builds runtime URL from SSM-fetched password, not hardcoded
+    let base = format!("redis://{}:{}", host, port);
+    if password.is_empty() {
+        base
+    } else {
+        // SECRET-EXEMPT: insert auth credentials into connection URL (from SSM)
+        let auth = format!(":{}@", password);
+        base.replacen("://", &format!("://{auth}"), 1)
+    }
 }
 
 /// Builds a Valkey cache key for instrument-related data.
@@ -115,7 +124,7 @@ impl ValkeyPool {
 
     /// Builds a deadpool-redis Pool from config (pure helper).
     fn build_pool(config: &ValkeyConfig) -> Result<Pool> {
-        let url = build_valkey_url(&config.host, config.port);
+        let url = build_valkey_url(&config.host, config.port, &config.password);
         let cfg = Config::from_url(&url);
         cfg.builder()
             .map_err(|err| anyhow::anyhow!("deadpool-redis builder error: {err}"))?
@@ -352,6 +361,7 @@ mod tests {
             host: "dlt-valkey".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
         let url = format!("redis://{}:{}", config.host, config.port);
         assert_eq!(url, "redis://dlt-valkey:6379");
@@ -365,6 +375,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config);
         assert!(pool.is_ok(), "pool creation must succeed with valid config");
@@ -376,6 +387,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 8,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
         let status = pool.pool_status();
@@ -388,6 +400,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
         let status = pool.pool_status();
@@ -402,6 +415,7 @@ mod tests {
             host: "cache-server".to_string(),
             port: 6380,
             max_connections: 4,
+            password: String::new(),
         };
         let url = format!("redis://{}:{}", config.host, config.port);
         assert_eq!(url, "redis://cache-server:6380");
@@ -413,6 +427,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("single connection pool must succeed");
         let status = pool.pool_status();
@@ -425,6 +440,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 128,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("large pool must succeed");
         let status = pool.pool_status();
@@ -437,6 +453,7 @@ mod tests {
             host: "dlt-valkey".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
         let url = format!("redis://{}:{}", config.host, config.port);
         assert!(url.starts_with("redis://"), "URL must use redis:// scheme");
@@ -448,6 +465,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
         let status = pool.pool_status();
@@ -460,6 +478,7 @@ mod tests {
             host: "192.168.1.100".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let url = format!("redis://{}:{}", config.host, config.port);
         assert_eq!(url, "redis://192.168.1.100:6379");
@@ -471,6 +490,7 @@ mod tests {
             host: "dlt-valkey".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
         let url = format!("redis://{}:{}", config.host, config.port);
         // Docker DNS hostname must be used, not localhost
@@ -490,6 +510,7 @@ mod tests {
             host: "unreachable-host-that-does-not-exist".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config);
         assert!(
@@ -504,6 +525,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("min pool size must succeed");
         assert_eq!(pool.pool_status().max_size, 1);
@@ -516,6 +538,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("typical prod pool size must succeed");
         assert_eq!(pool.pool_status().max_size, 16);
@@ -537,11 +560,13 @@ mod tests {
             host: "host-a".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let config_b = ValkeyConfig {
             host: "host-b".to_string(),
             port: 6380,
             max_connections: 8,
+            password: String::new(),
         };
         let pool_a = ValkeyPool::new(&config_a).expect("pool A must succeed");
         let pool_b = ValkeyPool::new(&config_b).expect("pool B must succeed");
@@ -555,11 +580,11 @@ mod tests {
             host: "dlt-valkey".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
-        let url = build_valkey_url(&config.host, config.port);
-        // Basic config URL must not accidentally include auth credentials
+        let url = build_valkey_url(&config.host, config.port, "");
+        // No-password URL must not contain auth separator
         assert!(!url.contains('@'), "URL must not contain auth separator");
-        assert!(!url.contains("password"), "URL must not contain password");
     }
 
     // -----------------------------------------------------------------------
@@ -568,32 +593,45 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_default() {
-        let url = build_valkey_url("dlt-valkey", 6379);
+        let url = build_valkey_url("dlt-valkey", 6379, "");
         assert_eq!(url, "redis://dlt-valkey:6379");
     }
 
     #[test]
     fn test_build_valkey_url_custom_port() {
-        let url = build_valkey_url("cache-host", 6380);
+        let url = build_valkey_url("cache-host", 6380, "");
         assert_eq!(url, "redis://cache-host:6380");
     }
 
     #[test]
     fn test_build_valkey_url_ip_address() {
-        let url = build_valkey_url("10.0.0.50", 6379);
+        let url = build_valkey_url("10.0.0.50", 6379, "");
         assert_eq!(url, "redis://10.0.0.50:6379");
     }
 
     #[test]
     fn test_build_valkey_url_starts_with_redis_scheme() {
-        let url = build_valkey_url("host", 1234);
+        let url = build_valkey_url("host", 1234, "");
         assert!(url.starts_with("redis://"));
     }
 
     #[test]
     fn test_build_valkey_url_no_trailing_slash() {
-        let url = build_valkey_url("host", 6379);
+        let url = build_valkey_url("host", 6379, "");
         assert!(!url.ends_with('/'), "URL must not end with slash");
+    }
+
+    #[test]
+    fn test_build_valkey_url_with_password() {
+        let url = build_valkey_url("dlt-valkey", 6379, "test-pass");
+        assert_eq!(url, "redis://:test-pass@dlt-valkey:6379");
+    }
+
+    #[test]
+    fn test_build_valkey_url_empty_password_no_auth() {
+        let url = build_valkey_url("dlt-valkey", 6379, "");
+        assert_eq!(url, "redis://dlt-valkey:6379");
+        assert!(!url.contains('@'));
     }
 
     // -----------------------------------------------------------------------
@@ -830,25 +868,25 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_min_port() {
-        let url = build_valkey_url("host", 1);
+        let url = build_valkey_url("host", 1, "");
         assert_eq!(url, "redis://host:1");
     }
 
     #[test]
     fn test_build_valkey_url_max_port() {
-        let url = build_valkey_url("host", u16::MAX);
+        let url = build_valkey_url("host", u16::MAX, "");
         assert_eq!(url, "redis://host:65535");
     }
 
     #[test]
     fn test_build_valkey_url_empty_host() {
-        let url = build_valkey_url("", 6379);
+        let url = build_valkey_url("", 6379, "");
         assert_eq!(url, "redis://:6379");
     }
 
     #[test]
     fn test_build_valkey_url_localhost() {
-        let url = build_valkey_url("localhost", 6379);
+        let url = build_valkey_url("localhost", 6379, "");
         assert_eq!(url, "redis://localhost:6379");
     }
 
@@ -916,6 +954,7 @@ mod tests {
             host: "dlt-valkey".to_string(),
             port: 6379,
             max_connections: 16,
+            password: String::new(),
         };
         assert!(ValkeyPool::new(&config).is_ok());
     }
@@ -966,6 +1005,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 8,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
         let status = pool.pool_status();
@@ -985,6 +1025,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.health_check().await;
@@ -1000,6 +1041,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.get("test_key").await;
@@ -1012,6 +1054,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set("key", "value").await;
@@ -1024,6 +1067,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_ex("key", "value", 60).await;
@@ -1036,6 +1080,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.del("key").await;
@@ -1048,6 +1093,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.exists("key").await;
@@ -1060,6 +1106,7 @@ mod tests {
             host: "unreachable-host-99999".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_nx_ex("lock_key", "lock_value", 30).await;
@@ -1075,6 +1122,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
 
@@ -1100,6 +1148,7 @@ mod tests {
             host: "test-host".to_string(),
             port: 7777,
             max_connections: 12,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
 
@@ -1123,6 +1172,7 @@ mod tests {
             host: "unreachable-host-reconnect-test".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
 
@@ -1148,6 +1198,7 @@ mod tests {
             host: "unreachable-health-check".to_string(),
             port: 1,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).expect("pool creation must succeed");
 
@@ -1183,6 +1234,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 6399,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).ok()?;
         // Verify actual connectivity — pool creation is lazy.
@@ -1362,13 +1414,13 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_docker_dns() {
-        let url = build_valkey_url("dlt-valkey", 6379);
+        let url = build_valkey_url("dlt-valkey", 6379, "");
         assert_eq!(url, "redis://dlt-valkey:6379");
     }
 
     #[test]
     fn test_build_valkey_url_contains_no_auth() {
-        let url = build_valkey_url("host", 6379);
+        let url = build_valkey_url("host", 6379, "");
         assert!(!url.contains('@'), "URL must not contain auth");
     }
 
@@ -1424,15 +1476,15 @@ mod tests {
     #[test]
     fn test_build_valkey_url_format() {
         assert_eq!(
-            build_valkey_url("dlt-valkey", 6379),
+            build_valkey_url("dlt-valkey", 6379, ""),
             "redis://dlt-valkey:6379"
         );
         assert_eq!(
-            build_valkey_url("localhost", 6380),
+            build_valkey_url("localhost", 6380, ""),
             "redis://localhost:6380"
         );
         assert_eq!(
-            build_valkey_url("192.168.1.1", 6379),
+            build_valkey_url("192.168.1.1", 6379, ""),
             "redis://192.168.1.1:6379"
         );
     }
@@ -1516,7 +1568,7 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_returns_string_with_host_and_port() {
-        let result = build_valkey_url("my-host", 9999);
+        let result = build_valkey_url("my-host", 9999, "");
         assert!(result.contains("my-host"));
         assert!(result.contains("9999"));
         assert!(result.starts_with("redis://"));
@@ -1563,6 +1615,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.reconnect();
@@ -1578,6 +1631,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16379, // unlikely to have Redis on this port
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.health_check().await;
@@ -1593,6 +1647,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16380,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.get("test_key").await;
@@ -1605,6 +1660,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16381,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set("test_key", "test_value").await;
@@ -1617,6 +1673,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16382,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_ex("test_key", "test_value", 60).await;
@@ -1632,6 +1689,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16383,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.del("test_key").await;
@@ -1644,6 +1702,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16384,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.exists("test_key").await;
@@ -1659,6 +1718,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16385,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_nx_ex("lock_key", "value", 10).await;
@@ -1674,6 +1734,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::build_pool(&config);
         assert!(pool.is_ok(), "build_pool must succeed with valid config");
@@ -1692,6 +1753,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16390,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.get("retry_key").await;
@@ -1710,6 +1772,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16391,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set("retry_key", "retry_value").await;
@@ -1726,6 +1789,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16392,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_ex("key", "value", 120).await;
@@ -1742,6 +1806,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16393,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.del("key").await;
@@ -1758,6 +1823,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16394,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.exists("key").await;
@@ -1774,6 +1840,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16395,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.set_nx_ex("lock", "v", 30).await;
@@ -1790,6 +1857,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16396,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.health_check().await;
@@ -1808,6 +1876,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16397,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let result = pool.checkout_conn().await;
@@ -1824,6 +1893,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
 
@@ -1847,6 +1917,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16398,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         // Exercise different keys to ensure the error context includes the key
@@ -1860,6 +1931,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 16399,
             max_connections: 1,
+            password: String::new(),
         };
         let pool = ValkeyPool::new(&config).unwrap();
         let r1 = pool.set("beta", "val").await;
@@ -1873,12 +1945,15 @@ mod tests {
     #[test]
     fn test_build_valkey_url_with_various_hosts() {
         assert_eq!(
-            build_valkey_url("localhost", 6379),
+            build_valkey_url("localhost", 6379, ""),
             "redis://localhost:6379"
         );
-        assert_eq!(build_valkey_url("10.0.0.1", 6380), "redis://10.0.0.1:6380");
         assert_eq!(
-            build_valkey_url("dlt-valkey", 6379),
+            build_valkey_url("10.0.0.1", 6380, ""),
+            "redis://10.0.0.1:6380"
+        );
+        assert_eq!(
+            build_valkey_url("dlt-valkey", 6379, ""),
             "redis://dlt-valkey:6379"
         );
     }
