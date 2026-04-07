@@ -180,9 +180,6 @@ fn persist_stock_movers_snapshot(
         return;
     }
 
-    let segment_str =
-        |code: u8| -> &'static str { dhan_live_trader_common::segment::segment_code_to_str(code) };
-
     // O(1) EXEMPT: cold path — registry lookup per entry (max 60 lookups per snapshot).
     let lookup_symbol = |security_id: u32| -> &str {
         registry
@@ -208,7 +205,9 @@ fn persist_stock_movers_snapshot(
                     category,
                     (i as i32).saturating_add(1),
                     entry.security_id,
-                    segment_str(entry.exchange_segment_code),
+                    dhan_live_trader_common::segment::segment_code_to_str(
+                        entry.exchange_segment_code,
+                    ),
                     symbol,
                     ltp,
                     prev_close,
@@ -246,34 +245,32 @@ fn persist_option_movers_snapshot(
          entries: &[super::option_movers::OptionMoverEntry],
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
-                // Enrich from registry — all O(1) lookups on cold path
-                let (contract_name, underlying, option_type_str, strike, expiry_str) =
-                    if let Some(reg) = registry {
-                        if let Some(inst) = reg.get(entry.security_id) {
-                            let ot = inst
-                                .option_type
-                                .map(|ot| match ot {
-                                    dhan_live_trader_common::types::OptionType::Call => "CE",
-                                    dhan_live_trader_common::types::OptionType::Put => "PE",
-                                })
-                                .unwrap_or("");
-                            let strike_val = inst.strike_price.unwrap_or(0.0);
-                            let expiry = inst
-                                .expiry_date
+                // Enrich from registry — O(1) lookup on cold path, flattened with and_then
+                let enriched = registry
+                    .as_ref()
+                    .and_then(|reg| reg.get(entry.security_id))
+                    .map(|inst| {
+                        let ot = inst
+                            .option_type
+                            .map(|ot| match ot {
+                                dhan_live_trader_common::types::OptionType::Call => "CE",
+                                dhan_live_trader_common::types::OptionType::Put => "PE",
+                            })
+                            .unwrap_or("");
+                        (
+                            inst.display_label.as_str(),
+                            inst.underlying_symbol.as_str(),
+                            ot,
+                            inst.strike_price.unwrap_or(0.0),
+                            inst.expiry_date
                                 .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default();
-                            (
-                                inst.display_label.as_str(),
-                                inst.underlying_symbol.as_str(),
-                                ot,
-                                strike_val,
-                                expiry,
-                            )
-                        } else {
-                            ("", "", "", 0.0, String::new())
-                        }
-                    } else {
-                        ("", "", "", 0.0, String::new())
+                                .unwrap_or_default(),
+                        )
+                    });
+                let (contract_name, underlying, option_type_str, strike, expiry_str) =
+                    match enriched {
+                        Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
+                        None => ("", "", "", 0.0, String::new()),
                     };
 
                 // Spot price: look up underlying's LTP from registry
@@ -1010,9 +1007,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     && let Some(ref mut writer) = stock_movers_writer
                 {
                     let snapshot = movers.compute_snapshot();
-                    let ts_nanos = received_at_nanos.saturating_add(
-                        i64::from(IST_UTC_OFFSET_SECONDS).saturating_mul(1_000_000_000),
-                    );
+                    let ts_nanos = received_at_nanos
+                        .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
                     persist_stock_movers_snapshot(
                         writer,
                         &snapshot,
@@ -1028,9 +1024,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     && let Some(ref mut opt_writer) = option_movers_writer
                 {
                     let opt_snapshot = opt_movers.compute_snapshot();
-                    let ts_nanos = received_at_nanos.saturating_add(
-                        i64::from(IST_UTC_OFFSET_SECONDS).saturating_mul(1_000_000_000),
-                    );
+                    let ts_nanos = received_at_nanos
+                        .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
                     persist_option_movers_snapshot(
                         opt_writer,
                         &opt_snapshot,

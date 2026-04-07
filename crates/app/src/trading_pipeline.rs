@@ -329,7 +329,7 @@ async fn run_trading_pipeline(
                                     .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
                                 let mut persisted: u64 = 0;
                                 // O(1) EXEMPT: cold path — iterate all accumulated snapshots (max ~25K).
-                                for (&_sid, &(seg, ref snap)) in &indicator_batch {
+                                for &(seg, ref snap) in indicator_batch.values() {
                                     if let Err(err) = writer.append_snapshot(
                                         ts_nanos,
                                         snap.security_id,
