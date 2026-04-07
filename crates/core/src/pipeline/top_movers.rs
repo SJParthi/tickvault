@@ -577,21 +577,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn nan_change_pct_excluded_from_snapshot() {
+    fn nan_ltp_rejected_by_update() {
         let mut tracker = TopMoversTracker::new();
-        // LTP = NaN results in NaN change_pct which should be filtered
+        // NaN LTP is rejected by the guard (non-finite LTP rejected at entry)
         tracker.update(&make_tick(100, 2, f32::NAN, 100.0, 1000));
+        assert_eq!(tracker.tracked_count(), 0, "NaN LTP must be rejected");
 
-        // NaN day_close is rejected (tracked_count = 0)
-        // Let's instead produce a NaN change_pct via valid inputs:
-        // day_close=f32::MIN_POSITIVE → change_pct=(NaN-close)/close but LTP must be NaN
-        // Actually, day_close <= 0.0 is already skipped. So we need day_close > 0 and
-        // LTP that produces NaN change_pct. But (ltp - close) / close for finite values is finite.
-        // So NaN change_pct only comes from NaN LTP. But NaN LTP is finite? No: NaN.is_finite()=false.
-        // Actually the update() function does NOT check LTP for finiteness — only day_close.
-        // So NaN LTP with valid day_close will produce NaN change_pct.
         let mut tracker2 = TopMoversTracker::new();
-        // This tick has NaN LTP but valid close → change_pct = NaN
         let tick = ParsedTick {
             security_id: 200,
             exchange_segment_code: 2,
@@ -602,18 +594,11 @@ mod tests {
             ..Default::default()
         };
         tracker2.update(&tick);
-        assert_eq!(tracker2.tracked_count(), 1, "tick should be tracked");
+        assert_eq!(tracker2.tracked_count(), 0, "NaN LTP rejected by guard");
 
         let snapshot = tracker2.compute_snapshot();
-        // NaN change_pct entries are filtered out of gainers/losers
-        assert!(
-            snapshot.gainers.is_empty(),
-            "NaN change_pct should not appear in gainers"
-        );
-        assert!(
-            snapshot.losers.is_empty(),
-            "NaN change_pct should not appear in losers"
-        );
+        assert!(snapshot.gainers.is_empty());
+        assert!(snapshot.losers.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -796,9 +781,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_with_nan_change_pct_excluded_from_all_lists() {
-        // NaN LTP with valid day_close produces NaN change_pct.
-        // NaN entries must be filtered from gainers, losers, and most_active.
+    fn snapshot_with_nan_ltp_rejected_produces_empty_snapshot() {
+        // NaN LTP is rejected at update() entry — never tracked.
         let mut tracker = TopMoversTracker::new();
         let tick = ParsedTick {
             security_id: 1,
@@ -810,13 +794,11 @@ mod tests {
             ..Default::default()
         };
         tracker.update(&tick);
-        assert_eq!(tracker.tracked_count(), 1);
+        assert_eq!(tracker.tracked_count(), 0, "NaN LTP rejected by guard");
 
         let snapshot = tracker.compute_snapshot();
         assert!(snapshot.gainers.is_empty(), "NaN excluded from gainers");
         assert!(snapshot.losers.is_empty(), "NaN excluded from losers");
-        // NaN entries are also filtered from the entries vec before sorting,
-        // so most_active won't contain them
         assert!(
             snapshot.most_active.is_empty(),
             "NaN excluded from most_active"
@@ -1028,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn inf_ltp_with_valid_close_produces_inf_change_pct_filtered() {
+    fn inf_ltp_rejected_by_update() {
         let mut tracker = TopMoversTracker::new();
         let tick = ParsedTick {
             security_id: 1,
@@ -1040,26 +1022,27 @@ mod tests {
             ..Default::default()
         };
         tracker.update(&tick);
-        assert_eq!(tracker.tracked_count(), 1);
+        // Inf LTP is non-finite → rejected by guard
+        assert_eq!(tracker.tracked_count(), 0, "Inf LTP rejected by guard");
 
         let snapshot = tracker.compute_snapshot();
-        // inf change_pct: is_finite() returns false, so filtered from snapshot
         assert!(
             snapshot.gainers.is_empty(),
-            "inf change_pct should be filtered"
+            "inf LTP should not produce any entries"
         );
     }
 
     #[test]
     fn tracker_with_many_securities_caps_at_top_n_for_all_lists() {
         let mut tracker = TopMoversTracker::new();
-        // 50 gainers, 50 losers
+        // 50 gainers, 50 losers (all with positive LTP to pass the guard)
         for i in 1..=50u32 {
             let ltp = 100.0 + (i as f32) * 2.0; // gainers
             tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
         }
         for i in 51..=100u32 {
-            let ltp = 100.0 - ((i - 50) as f32) * 2.0; // losers
+            // Use ltp > 0 for all: smallest is 100.0 - 49*1.9 = 6.9
+            let ltp = 100.0 - ((i - 50) as f32) * 1.9; // losers (all > 0)
             tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
         }
         let snapshot = tracker.compute_snapshot();

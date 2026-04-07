@@ -195,8 +195,8 @@ fn test_all_websocket_urls_defined() {
         "20-level depth WS base URL"
     );
     assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/",
-        "200-level depth WS base URL — matches DhanHQ Python SDK (root path, no /twohundreddepth)"
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/twohundreddepth",
+        "200-level depth WS base URL — official Dhan API docs path"
     );
 
     // Both must use wss:// (TLS required)

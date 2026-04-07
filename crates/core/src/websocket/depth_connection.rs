@@ -422,8 +422,8 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL is root path — SDK uses wss://full-depth-api.dhan.co/?token=...
-    // The trailing slash before ? is REQUIRED for root-path URLs (400 without it).
+    // 200-level URL uses /twohundreddepth path per official Dhan API docs.
+    // SDK used root path but that causes ResetWithoutClosingHandshake on the server.
     let authenticated_url = zeroize::Zeroizing::new(format!(
         "{}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
         DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
@@ -629,10 +629,10 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_ws_url_correct() {
-        // Updated to match DhanHQ Python SDK (fulldepth.py) which uses root path
+        // Official Dhan API docs specify /twohundreddepth path
         assert_eq!(
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-            "wss://full-depth-api.dhan.co/"
+            "wss://full-depth-api.dhan.co/twohundreddepth"
         );
     }
 
@@ -779,21 +779,19 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_url_preserves_trailing_slash() {
-        // 200-level base is root path — trailing slash before ? is REQUIRED.
-        // Without it: wss://full-depth-api.dhan.co?token=... → 400 Bad Request
-        // With it: wss://full-depth-api.dhan.co/?token=... → works (matches SDK)
+    fn test_two_hundred_depth_url_uses_twohundreddepth_path() {
+        // Official Dhan API docs: wss://full-depth-api.dhan.co/twohundreddepth?token=...
         let url = format!(
             "{}?token=TEST&clientId=TEST&authType=2",
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
         );
         assert!(
-            url.contains(".dhan.co/?token="),
-            "200-level must have trailing slash before query: {url}"
+            url.contains("/twohundreddepth?token="),
+            "200-level must use /twohundreddepth path: {url}"
         );
         assert!(
             url.starts_with("wss://full-depth-api.dhan.co/"),
-            "must use correct host with slash: {url}"
+            "must use correct host: {url}"
         );
     }
 }
