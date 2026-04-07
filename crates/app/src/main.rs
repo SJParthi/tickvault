@@ -1756,6 +1756,12 @@ async fn main() -> Result<()> {
 
     info!(address = %bind_addr, "API server listening");
 
+    // Auto-open Portal and Market Dashboard in browser (API server now ready).
+    // Best-effort: non-blocking, logged on failure.
+    tokio::spawn(async {
+        crate::infra::open_in_browser("http://localhost:3001/portal/market-dashboard").await;
+    });
+
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             error!(?err, "API server error");

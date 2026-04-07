@@ -1073,6 +1073,8 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     }
 
     // Step 2: Enable DEDUP UPSERT KEYS (idempotent — re-enabling is a no-op).
+    // If DEDUP fails with "deduplicate key column not found", the table has a stale
+    // schema (ts is not the designated timestamp). Auto-recover by DROP + CREATE.
     let dedup_sql = format!(
         "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
         QUESTDB_TABLE_TICKS, DEDUP_KEY_TICKS
@@ -1087,13 +1089,32 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
             if response.status().is_success() {
                 debug!("DEDUP UPSERT KEYS enabled for ticks table");
             } else {
-                let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                warn!(
-                    %status,
-                    body = body.chars().take(200).collect::<String>(),
-                    "ticks table DEDUP DDL returned non-success"
-                );
+                if body.contains("deduplicate key column not found") {
+                    warn!("ticks table has stale schema — dropping and recreating");
+                    let drop_sql = format!("DROP TABLE IF EXISTS {QUESTDB_TABLE_TICKS}");
+                    let _ = client
+                        .get(&base_url)
+                        .query(&[("query", &drop_sql)])
+                        .send()
+                        .await;
+                    let _ = client
+                        .get(&base_url)
+                        .query(&[("query", TICKS_CREATE_DDL)])
+                        .send()
+                        .await;
+                    let _ = client
+                        .get(&base_url)
+                        .query(&[("query", &dedup_sql)])
+                        .send()
+                        .await;
+                    info!("ticks table recreated with correct schema");
+                } else {
+                    warn!(
+                        body = body.chars().take(200).collect::<String>(),
+                        "ticks table DEDUP DDL returned non-success"
+                    );
+                }
             }
         }
         Err(err) => {

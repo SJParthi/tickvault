@@ -737,7 +737,7 @@ async fn ensure_docker_daemon_running() -> bool {
 ///
 /// Uses `open` on macOS, `xdg-open` on Linux. Best-effort — logs a warning
 /// if the browser cannot be launched.
-async fn open_in_browser(url: &str) {
+pub async fn open_in_browser(url: &str) {
     use tokio::process::Command;
 
     let program = if cfg!(target_os = "macos") {
