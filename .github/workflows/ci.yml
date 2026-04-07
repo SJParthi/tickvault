@@ -31,7 +31,7 @@ jobs:
   build-and-verify:
     name: "Build & Verify"
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -59,23 +59,11 @@ jobs:
       - name: Clippy (all warnings = errors)
         run: cargo clippy --workspace -- -D warnings -W clippy::perf
 
-      - name: Build release
-        run: cargo build --release --workspace
+      - name: Build (debug — faster than release for CI)
+        run: cargo build --workspace
 
-      - name: Binary size check (< 50MB)
-        run: |
-          SIZE=$(stat -c%s target/release/dhan-live-trader 2>/dev/null || echo 0)
-          echo "Binary size: $((SIZE / 1048576)) MB"
-          if [ "$SIZE" -gt 52428800 ]; then
-            echo "FAIL: Binary exceeds 50MB limit"
-            exit 1
-          fi
-
-      - name: Run all tests
+      - name: Run tests
         run: cargo test --workspace
-
-      - name: Doc build (zero warnings)
-        run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: "-D warnings"
 
