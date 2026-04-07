@@ -1315,8 +1315,19 @@ async fn main() -> Result<()> {
                     }
                 });
 
-                // Spawn depth WebSocket connection
+                // Spawn depth WebSocket connection with Telegram alerts + health updates
+                let d20_notifier = notifier.clone();
+                let d20_health = health_status.clone();
+                let d20_label_notify = label.clone();
                 tokio::spawn(async move {
+                    // Alert: connected
+                    d20_notifier.notify(NotificationEvent::DepthTwentyConnected {
+                        underlying: d20_label_notify.clone(),
+                    });
+                    d20_health.set_depth_20_connections(
+                        d20_health.depth_20_connections().saturating_add(1),
+                    );
+
                     if let Err(err) = dhan_live_trader_core::websocket::run_twenty_depth_connection(
                         depth_token,
                         depth_client_id,
@@ -1326,6 +1337,13 @@ async fn main() -> Result<()> {
                     .await
                     {
                         tracing::error!(?err, "20-level depth connection terminated");
+                        d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
+                            underlying: d20_label_notify,
+                            reason: format!("{err}"),
+                        });
+                        d20_health.set_depth_20_connections(
+                            d20_health.depth_20_connections().saturating_sub(1),
+                        );
                     }
                 });
                 // O(1) EXEMPT: end
@@ -1410,7 +1428,18 @@ async fn main() -> Result<()> {
                         }
                     });
 
+                    let d200_notifier = notifier.clone();
+                    let d200_health = health_status.clone();
+                    let d200_label_notify = depth200_label.clone();
                     tokio::spawn(async move {
+                        // Alert: connected
+                        d200_notifier.notify(NotificationEvent::DepthTwoHundredConnected {
+                            underlying: d200_label_notify.clone(),
+                        });
+                        d200_health.set_depth_200_connections(
+                            d200_health.depth_200_connections().saturating_add(1),
+                        );
+
                         if let Err(err) =
                             dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
                                 depth200_token,
@@ -1423,6 +1452,13 @@ async fn main() -> Result<()> {
                             .await
                         {
                             tracing::error!(?err, "200-level depth connection terminated");
+                            d200_notifier.notify(NotificationEvent::DepthTwoHundredDisconnected {
+                                underlying: d200_label_notify,
+                                reason: format!("{err}"),
+                            });
+                            d200_health.set_depth_200_connections(
+                                d200_health.depth_200_connections().saturating_sub(1),
+                            );
                         }
                     });
                 }
@@ -1563,8 +1599,17 @@ async fn main() -> Result<()> {
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
+        let ou_notifier = notifier.clone();
+        let ou_health = health_status.clone();
         tokio::spawn(async move {
+            ou_notifier.notify(NotificationEvent::OrderUpdateConnected);
+            ou_health.set_order_update_connected(true);
             run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
+            // If run_order_update_connection returns, connection terminated
+            ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
+                reason: "connection task exited".to_string(),
+            });
+            ou_health.set_order_update_connected(false);
         })
     };
     info!("order update WebSocket started");
@@ -2094,9 +2139,10 @@ fn spawn_historical_candle_fetch(
         };
 
         // -----------------------------------------------------------------
-        // Trading day + within market hours: wait for post-market signal
-        //   (after 15:30 IST, WS disconnected, live data fully ingested)
-        // Trading day + AFTER market hours: fetch immediately (market already closed)
+        // Historical fetch timing on trading days:
+        //   Before 08:00 IST → fetch immediately (pre-market, yesterday's data)
+        //   08:00–15:30 IST  → WAIT for post-market signal (market active or about to open)
+        //   After 15:30 IST  → fetch immediately (market closed, today's data ready)
         // Non-trading day: fetch immediately at boot (no live data to wait for)
         // -----------------------------------------------------------------
 
@@ -2106,16 +2152,26 @@ fn spawn_historical_candle_fetch(
                 &bg_data_collection_end,
             );
 
-        if is_trading_day && is_within_collection_window {
+        // Extended guard: also wait if between 08:00 and data_collection_start (09:00)
+        // This prevents fetching at 8:36 AM when market is about to open
+        let is_pre_market_wait_zone = if is_trading_day {
+            let now_ist =
+                chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
+            let hour = now_ist.format("%H").to_string().parse::<u32>().unwrap_or(0);
+            // Between 08:00 and 09:00 IST — market about to open, don't fetch
+            hour >= 8 && !is_within_collection_window
+        } else {
+            false
+        };
+
+        if is_trading_day && (is_within_collection_window || is_pre_market_wait_zone) {
             info!(
-                "trading day during market hours — waiting for post-market signal before historical fetch"
+                "trading day (08:00-15:30 IST) — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
-            info!("post-market signal received — WebSockets disconnected, live data ingested");
+            info!("post-market signal received — starting historical candle fetch");
         } else if is_trading_day {
-            info!(
-                "trading day but market already closed — starting historical candle fetch immediately"
-            );
+            info!("trading day outside 08:00-15:30 — starting historical candle fetch immediately");
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }

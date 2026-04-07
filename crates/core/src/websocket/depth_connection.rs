@@ -48,6 +48,29 @@ const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
 /// Subscription batch size for 20-level depth (max 50 per Dhan docs).
 const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
 
+/// Pre-market backoff delay for 200-level depth (seconds).
+/// Dhan's 200-level depth servers reset connections outside market hours.
+/// Instead of aggressive exponential retry, wait this long before retrying pre-market.
+const DEPTH_200_PRE_MARKET_BACKOFF_SECS: u64 = 60;
+
+/// Returns true if current IST time is within market data hours (08:55 - 16:00).
+/// 200-level depth connections should only retry aggressively during this window.
+// O(1) EXEMPT: called once per reconnection attempt (cold path), not per tick
+fn is_within_market_data_hours() -> bool {
+    let now_utc = chrono::Utc::now();
+    // IST = UTC + 5:30
+    let ist_secs = now_utc.timestamp() + 19800;
+    let ist_hour = ((ist_secs % 86400) / 3600) as u32;
+    let ist_minute = ((ist_secs % 3600) / 60) as u32;
+    let time_mins = ist_hour * 60 + ist_minute;
+    // 08:55 = 535 minutes, 16:00 = 960 minutes
+    // O(1) EXEMPT: integer comparison, not Vec::contains
+    #[allow(clippy::manual_range_contains)] // APPROVED: avoids banned .contains() pattern
+    {
+        time_mins >= 535 && time_mins <= 960
+    }
+}
+
 /// Connection timeout for depth WebSocket (seconds).
 const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
 
@@ -341,7 +364,21 @@ pub async fn run_two_hundred_depth_connection(
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
-                // Escalate to ERROR after 10+ consecutive failures (not on first failure)
+                // Outside market data hours (before 08:55 or after 16:00 IST),
+                // Dhan's 200-level depth servers reset connections. Use a long
+                // fixed backoff instead of spamming exponential retries.
+                if !is_within_market_data_hours() {
+                    if attempt == 0 {
+                        info!(
+                            "{prefix}: outside market hours — will retry every {DEPTH_200_PRE_MARKET_BACKOFF_SECS}s"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(DEPTH_200_PRE_MARKET_BACKOFF_SECS))
+                        .await;
+                    continue;
+                }
+
+                // During market hours: escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,

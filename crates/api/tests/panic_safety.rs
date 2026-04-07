@@ -96,6 +96,18 @@ fn no_panic_health_response_serialization() {
                 status: "connected",
                 detail: Some("3 connections".to_string()),
             },
+            depth_20: SubsystemInfo {
+                status: "connected",
+                detail: Some("4 connections".to_string()),
+            },
+            depth_200: SubsystemInfo {
+                status: "connected",
+                detail: Some("4 connections".to_string()),
+            },
+            order_update: SubsystemInfo {
+                status: "connected",
+                detail: None,
+            },
             questdb: SubsystemInfo {
                 status: "reachable",
                 detail: None,

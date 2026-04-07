@@ -81,6 +81,16 @@ mod tests {
     }
 
     #[test]
+    fn test_portal_html_contains_websocket_status() {
+        assert!(PORTAL_HTML.contains("WebSocket Connections"));
+        assert!(PORTAL_HTML.contains("wsLiveCount"));
+        assert!(PORTAL_HTML.contains("wsD20Count"));
+        assert!(PORTAL_HTML.contains("wsD200Count"));
+        assert!(PORTAL_HTML.contains("wsOUStatus"));
+        assert!(PORTAL_HTML.contains("loadWsStatus"));
+    }
+
+    #[test]
     fn test_options_chain_html_contains_api_endpoint() {
         assert!(OPTIONS_CHAIN_HTML.contains("/api/option-chain"));
     }

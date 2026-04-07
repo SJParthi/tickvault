@@ -1,8 +1,8 @@
 # Implementation Plan: WebSocket Connection Monitoring — Portal + Telegram + Fixes
 
-**Status:** DRAFT
+**Status:** VERIFIED
 **Date:** 2026-04-07
-**Approved by:** pending
+**Approved by:** Parthiban
 
 ## Summary
 
@@ -13,31 +13,31 @@
 
 ## Plan Items
 
-- [ ] Item 1: Add depth + order update atomic counters to SystemHealthStatus
+- [x] Item 1: Add depth + order update atomic counters to SystemHealthStatus
   - Files: crates/api/src/state.rs
   - Tests: test_depth_20_connections, test_depth_200_connections, test_order_update_connected
 
-- [ ] Item 2: Expose depth + order update status in /health response
+- [x] Item 2: Expose depth + order update status in /health response
   - Files: crates/api/src/handlers/health.rs
   - Tests: test_health_check_depth_detail, test_health_check_order_update_detail
 
-- [ ] Item 3: Add WebSocket connection status section to portal with live auto-refresh
+- [x] Item 3: Add WebSocket connection status section to portal with live auto-refresh
   - Files: crates/api/static/portal.html
   - Tests: test_portal_html_contains_websocket_status (in static_file.rs)
 
-- [ ] Item 4: Wire Telegram notifications for depth + order update connect/disconnect
+- [x] Item 4: Wire Telegram notifications for depth + order update connect/disconnect
   - Files: crates/app/src/main.rs
   - Tests: existing notification event tests cover formatting
 
-- [ ] Item 5: Add market-hours awareness to 200-level depth reconnection
+- [x] Item 5: Add market-hours awareness to 200-level depth reconnection
   - Files: crates/core/src/websocket/depth_connection.rs
   - Tests: unit test for pre-market backoff logic
 
-- [ ] Item 6: Fix historical fetch time window (before 8:00 AM OR after 15:30 only)
+- [x] Item 6: Fix historical fetch time window (before 8:00 AM OR after 15:30 only)
   - Files: crates/app/src/main.rs
   - Tests: test_historical_fetch_time_guard
 
-- [ ] Item 7: Build and verify all changes
+- [x] Item 7: Build and verify all changes
   - Files: n/a
   - Tests: cargo build + cargo test
 

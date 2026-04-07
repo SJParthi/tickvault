@@ -18,6 +18,9 @@ pub struct HealthResponse {
 #[derive(Serialize)]
 pub struct SubsystemStatus {
     pub websocket: SubsystemInfo,
+    pub depth_20: SubsystemInfo,
+    pub depth_200: SubsystemInfo,
+    pub order_update: SubsystemInfo,
     pub questdb: SubsystemInfo,
     pub token: SubsystemInfo,
     pub pipeline: SubsystemInfo,
@@ -44,6 +47,35 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             "disconnected"
         },
         detail: Some(format!("{ws_count} connections")),
+    };
+
+    let d20_count = health.depth_20_connections();
+    let depth_20 = SubsystemInfo {
+        status: if d20_count > 0 {
+            "connected"
+        } else {
+            "disconnected"
+        },
+        detail: Some(format!("{d20_count} connections")),
+    };
+
+    let d200_count = health.depth_200_connections();
+    let depth_200 = SubsystemInfo {
+        status: if d200_count > 0 {
+            "connected"
+        } else {
+            "disconnected"
+        },
+        detail: Some(format!("{d200_count} connections")),
+    };
+
+    let order_update = SubsystemInfo {
+        status: if health.order_update_connected() {
+            "connected"
+        } else {
+            "disconnected"
+        },
+        detail: None,
     };
 
     let questdb = SubsystemInfo {
@@ -97,6 +129,9 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         version: env!("CARGO_PKG_VERSION"),
         subsystems: SubsystemStatus {
             websocket,
+            depth_20,
+            depth_200,
+            order_update,
             questdb,
             token,
             pipeline,
@@ -220,6 +255,18 @@ mod tests {
                 websocket: SubsystemInfo {
                     status: "connected",
                     detail: Some("3 connections".to_string()),
+                },
+                depth_20: SubsystemInfo {
+                    status: "connected",
+                    detail: Some("4 connections".to_string()),
+                },
+                depth_200: SubsystemInfo {
+                    status: "connected",
+                    detail: Some("4 connections".to_string()),
+                },
+                order_update: SubsystemInfo {
+                    status: "connected",
+                    detail: None,
                 },
                 questdb: SubsystemInfo {
                     status: "reachable",
@@ -345,6 +392,62 @@ mod tests {
         let Json(response) = health_check(State(state)).await;
 
         assert_eq!(response.subsystems.tick_persistence.status, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_depth_20_detail_shows_count() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_depth_20_connections(4);
+        health.set_token_valid(true);
+        health.set_websocket_connections(5);
+        health.set_questdb_reachable(true);
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.depth_20.status, "connected");
+        assert_eq!(
+            response.subsystems.depth_20.detail,
+            Some("4 connections".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_depth_200_detail_shows_count() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_depth_200_connections(3);
+        health.set_token_valid(true);
+        health.set_websocket_connections(5);
+        health.set_questdb_reachable(true);
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.depth_200.status, "connected");
+        assert_eq!(
+            response.subsystems.depth_200.detail,
+            Some("3 connections".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_order_update_connected() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_order_update_connected(true);
+        health.set_token_valid(true);
+        health.set_websocket_connections(5);
+        health.set_questdb_reachable(true);
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.order_update.status, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_order_update_disconnected_by_default() {
+        let health = Arc::new(SystemHealthStatus::new());
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.order_update.status, "disconnected");
     }
 
     #[tokio::test]

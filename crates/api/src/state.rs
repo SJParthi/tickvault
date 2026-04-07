@@ -20,8 +20,14 @@ pub type SharedHealthStatus = Arc<SystemHealthStatus>;
 ///
 /// All fields are atomic for lock-free O(1) reads on the API hot path.
 pub struct SystemHealthStatus {
-    /// Number of active WebSocket connections (0-5).
+    /// Number of active Live Market Feed WebSocket connections (0-5).
     websocket_connections: AtomicU64,
+    /// Number of active 20-level depth connections (0-4).
+    depth_20_connections: AtomicU64,
+    /// Number of active 200-level depth connections (0-4).
+    depth_200_connections: AtomicU64,
+    /// Whether the order update WebSocket is connected.
+    order_update_connected: AtomicBool,
     /// Whether the tick pipeline is actively processing.
     pipeline_active: AtomicBool,
     /// Whether QuestDB was reachable at last check.
@@ -43,6 +49,9 @@ impl SystemHealthStatus {
     pub fn new() -> Self {
         Self {
             websocket_connections: AtomicU64::new(0),
+            depth_20_connections: AtomicU64::new(0),
+            depth_200_connections: AtomicU64::new(0),
+            order_update_connected: AtomicBool::new(false),
             pipeline_active: AtomicBool::new(false),
             questdb_reachable: AtomicBool::new(false),
             token_valid: AtomicBool::new(false),
@@ -61,6 +70,43 @@ impl SystemHealthStatus {
     /// Returns current WebSocket connection count.
     pub fn websocket_connections(&self) -> u64 {
         self.websocket_connections.load(Ordering::Relaxed)
+    }
+
+    /// Updates the 20-level depth connection count.
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_depth_20_connections(&self, count: u64) {
+        self.depth_20_connections.store(count, Ordering::Relaxed);
+    }
+
+    /// Returns current 20-level depth connection count.
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn depth_20_connections(&self) -> u64 {
+        self.depth_20_connections.load(Ordering::Relaxed)
+    }
+
+    /// Updates the 200-level depth connection count.
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_depth_200_connections(&self, count: u64) {
+        self.depth_200_connections.store(count, Ordering::Relaxed);
+    }
+
+    /// Returns current 200-level depth connection count.
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn depth_200_connections(&self) -> u64 {
+        self.depth_200_connections.load(Ordering::Relaxed)
+    }
+
+    /// Marks order update WebSocket as connected/disconnected.
+    // TEST-EXEMPT: trivial AtomicBool store, tested indirectly by health endpoint tests
+    pub fn set_order_update_connected(&self, connected: bool) {
+        self.order_update_connected
+            .store(connected, Ordering::Relaxed);
+    }
+
+    /// Returns whether order update WebSocket is connected.
+    // TEST-EXEMPT: trivial AtomicBool load, tested indirectly by health endpoint tests
+    pub fn order_update_connected(&self) -> bool {
+        self.order_update_connected.load(Ordering::Relaxed)
     }
 
     /// Marks the tick pipeline as active/inactive.
@@ -354,11 +400,40 @@ mod tests {
         let health = SystemHealthStatus::new();
         assert_eq!(health.overall_status(), "degraded");
         assert_eq!(health.websocket_connections(), 0);
+        assert_eq!(health.depth_20_connections(), 0);
+        assert_eq!(health.depth_200_connections(), 0);
+        assert!(!health.order_update_connected());
         assert!(!health.pipeline_active());
         assert!(!health.questdb_reachable());
         assert!(!health.token_valid());
         assert!(!health.tick_persistence_connected());
         assert_eq!(health.boot_epoch_secs(), 0);
+    }
+
+    #[test]
+    fn test_depth_20_connections_set_and_get() {
+        let health = SystemHealthStatus::new();
+        assert_eq!(health.depth_20_connections(), 0);
+        health.set_depth_20_connections(4);
+        assert_eq!(health.depth_20_connections(), 4);
+    }
+
+    #[test]
+    fn test_depth_200_connections_set_and_get() {
+        let health = SystemHealthStatus::new();
+        assert_eq!(health.depth_200_connections(), 0);
+        health.set_depth_200_connections(4);
+        assert_eq!(health.depth_200_connections(), 4);
+    }
+
+    #[test]
+    fn test_order_update_connected_set_and_get() {
+        let health = SystemHealthStatus::new();
+        assert!(!health.order_update_connected());
+        health.set_order_update_connected(true);
+        assert!(health.order_update_connected());
+        health.set_order_update_connected(false);
+        assert!(!health.order_update_connected());
     }
 
     #[test]
@@ -417,6 +492,18 @@ mod tests {
         assert_eq!(
             from_new.websocket_connections(),
             from_default.websocket_connections()
+        );
+        assert_eq!(
+            from_new.depth_20_connections(),
+            from_default.depth_20_connections()
+        );
+        assert_eq!(
+            from_new.depth_200_connections(),
+            from_default.depth_200_connections()
+        );
+        assert_eq!(
+            from_new.order_update_connected(),
+            from_default.order_update_connected()
         );
         assert_eq!(from_new.pipeline_active(), from_default.pipeline_active());
         assert_eq!(
@@ -587,6 +674,9 @@ mod tests {
     fn test_system_health_status_default_all_fields_zero_or_false() {
         let health = SystemHealthStatus::default();
         assert_eq!(health.websocket_connections(), 0);
+        assert_eq!(health.depth_20_connections(), 0);
+        assert_eq!(health.depth_200_connections(), 0);
+        assert!(!health.order_update_connected());
         assert!(!health.pipeline_active());
         assert!(!health.questdb_reachable());
         assert!(!health.token_valid());
@@ -719,6 +809,9 @@ mod tests {
     fn test_system_health_status_default_via_default_trait() {
         let health: SystemHealthStatus = Default::default();
         assert_eq!(health.websocket_connections(), 0);
+        assert_eq!(health.depth_20_connections(), 0);
+        assert_eq!(health.depth_200_connections(), 0);
+        assert!(!health.order_update_connected());
         assert!(!health.pipeline_active());
         assert!(!health.questdb_reachable());
         assert!(!health.token_valid());
