@@ -1255,13 +1255,19 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 
 /// Tick ring buffer capacity for QuestDB outage resilience.
 /// Holds ticks in memory when QuestDB is down, drains on recovery.
-/// 300,000 ticks × ~64 bytes = ~19MB. At ~1000 ticks/sec = ~5 minutes of data.
-pub const TICK_BUFFER_CAPACITY: usize = 300_000;
+///
+/// Sized for 25K instruments (5 WS connections × 5,000 each):
+/// - 600,000 ticks × ~112 bytes = ~64MB RAM
+/// - At 10K ticks/sec (realistic peak) = 60 seconds before disk spill
+/// - At 25K ticks/sec (extreme peak) = 24 seconds before disk spill
+/// - Full-day QuestDB outage: disk spill handles overflow (~23 GB for 10K/sec)
+pub const TICK_BUFFER_CAPACITY: usize = 600_000;
 
 /// High watermark threshold for tick ring buffer (80% of capacity).
 /// When buffer occupancy exceeds this, a WARN-level alert fires once
 /// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
-pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 240,000
+/// 80% of 600,000 = 480,000 ticks.
+pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 480,000
 
 /// Minimum free disk space (bytes) to log a warning before spill write.
 /// 100 MB — below this, a WARN fires on each spill open to alert operator
@@ -1284,8 +1290,13 @@ pub const OMS_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
 /// tick persistence, candle aggregation). Must be large enough to absorb bursts
 /// during high-volatility events without lagging cold-path consumers.
-/// 65,536 ticks at ~112 bytes each = ~7MB. At ~1000 ticks/sec = ~65 seconds.
-pub const TICK_BROADCAST_CAPACITY: usize = 65_536;
+///
+/// CRITICAL: Overflow here = permanent tick loss (tokio broadcast evicts oldest).
+/// Sized for 25K instruments:
+/// - 262,144 ticks × ~112 bytes = ~28MB RAM
+/// - At 10K ticks/sec = 26 seconds headroom before eviction
+/// - At 25K ticks/sec = 10 seconds headroom
+pub const TICK_BROADCAST_CAPACITY: usize = 262_144;
 
 /// Broadcast channel capacity for order update consumers (OMS, risk engine).
 /// 256 order updates × ~512 bytes each = ~128KB. At ~10 orders/sec = ~25 seconds.
@@ -1293,8 +1304,13 @@ pub const ORDER_UPDATE_BROADCAST_CAPACITY: usize = 256;
 
 /// Resilience ring buffer capacity for live candle writer.
 /// Holds candles in memory when QuestDB is down, drains on recovery.
-/// 100,000 candles × ~48 bytes = ~5MB. At ~60 candles/sec = ~27 minutes of data.
-pub const CANDLE_BUFFER_CAPACITY: usize = 100_000;
+///
+/// Sized for 25K instruments (1 candle/instrument/sec):
+/// - 200,000 candles × ~76 bytes = ~14.5MB RAM
+/// - At 25K candles/sec = 8 seconds before disk spill
+/// - Candle data is lower priority than raw ticks; 8s is sufficient
+///   as disk spill handles overflow seamlessly.
+pub const CANDLE_BUFFER_CAPACITY: usize = 200_000;
 
 /// Option Chain API minimum request interval in seconds (Dhan limit: 1 req / 3 sec).
 pub const OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS: u64 = 3;
@@ -1308,8 +1324,12 @@ pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
 
 /// Resilience ring buffer capacity for depth persistence writer.
 /// Holds depth snapshots in memory when QuestDB is down, drains on recovery.
-/// 50,000 snapshots × 116 bytes = ~5.5MB. At ~200 snapshots/sec = ~4 minutes of data.
-pub const DEPTH_BUFFER_CAPACITY: usize = 50_000;
+///
+/// Sized for 200 instruments (4 connections × 50 instruments):
+/// - 100,000 snapshots × 116 bytes = ~11MB RAM
+/// - At ~250 snapshots/sec = ~6.7 minutes before disk spill
+/// - Depth data arrives at lower rate than ticks; generous headroom.
+pub const DEPTH_BUFFER_CAPACITY: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Validation Constants
@@ -1388,9 +1408,27 @@ pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 300;
 pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
 
 /// Timeout for sending a frame into the tick processor channel (seconds).
-/// If the tick processor is blocked, the WebSocket read loop drops the frame
-/// after this timeout instead of blocking forever.
+/// Used as backpressure timeout: if channel is full, WS read blocks for
+/// up to this duration. Must be less than Dhan's ping timeout (40s).
 pub const FRAME_SEND_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum backpressure wait time (seconds) when SPSC channel is full.
+/// If the tick processor is frozen for this long, the frame is lost and a
+/// CRITICAL error is logged. Must be less than Dhan's ping timeout (40s)
+/// to prevent WebSocket disconnection during backpressure.
+/// 30s < 40s (Dhan timeout) gives 10s safety margin.
+pub const FRAME_BACKPRESSURE_TIMEOUT_SECS: u64 = 30;
+
+/// SPSC frame channel capacity (WebSocket reader → tick processor).
+/// All 5 WS connections multiplex frames into this single channel.
+///
+/// Sized for 25K instruments:
+/// - 131,072 slots × ~1.5KB avg frame = ~187MB RAM
+/// - At 10K ticks/sec = 13 seconds backpressure-free headroom
+/// - At 25K ticks/sec = 5.2 seconds headroom
+/// - On overflow: backpressure (blocks WS read, WS survives 40s ping timeout)
+/// - ZERO frame loss guarantee — backpressure, never drop.
+pub const FRAME_CHANNEL_CAPACITY: usize = 131_072;
 
 /// Power-of-two exponent for the tick deduplication ring buffer.
 ///

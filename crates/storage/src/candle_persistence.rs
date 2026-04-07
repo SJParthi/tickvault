@@ -2046,13 +2046,13 @@ mod tests {
 
     #[test]
     fn test_candle_buffer_capacity_constant() {
-        assert_eq!(CANDLE_BUFFER_CAPACITY, 100_000);
-        // Memory footprint: ~48 bytes × 100K = ~4.8MB — reasonable.
+        assert_eq!(CANDLE_BUFFER_CAPACITY, 200_000);
+        // Memory footprint: ~76 bytes × 200K = ~14.5MB — sized for 25K instruments.
         let size = std::mem::size_of::<BufferedCandle>();
         let total_mb = (size * CANDLE_BUFFER_CAPACITY) as f64 / 1_048_576.0;
         assert!(
-            total_mb < 10.0,
-            "candle ring buffer must be < 10MB, got {total_mb:.1}MB"
+            total_mb < 20.0,
+            "candle ring buffer must be < 20MB, got {total_mb:.1}MB"
         );
     }
 
