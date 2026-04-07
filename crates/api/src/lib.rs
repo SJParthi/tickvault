@@ -115,6 +115,10 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/portal/market-dashboard",
             axum::routing::get(handlers::static_file::market_dashboard),
+        )
+        .route(
+            "/portal/ws-dashboard",
+            axum::routing::get(handlers::static_file::ws_dashboard),
         );
 
     public_routes

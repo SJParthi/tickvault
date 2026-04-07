@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DLT WebSocket Dashboard</title>
+    <style>
+        :root {
+            --bg: #0d1117; --bg-card: #161b22; --border: #30363d;
+            --text: #e6edf3; --text-dim: #8b949e; --text-muted: #484f58;
+            --green: #26a69a; --red: #ef5350; --blue: #2962ff;
+            --yellow: #ffab00; --purple: #7c4dff;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; }
+
+        /* Ticker Bar — WS Pool Summary */
+        .ticker-bar { display: flex; gap: 2px; padding: 8px 12px; background: var(--bg-card); border-bottom: 1px solid var(--border); overflow-x: auto; white-space: nowrap; }
+        .ticker-item { display: flex; align-items: baseline; gap: 8px; padding: 4px 14px; border-right: 1px solid var(--border); min-width: 200px; }
+        .ticker-item:last-child { border-right: none; }
+        .ticker-name { font-weight: 600; font-size: 12px; color: var(--text-dim); }
+        .ticker-count { font-weight: 700; font-size: 14px; }
+        .ticker-status { font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
+        .ticker-status.up { background: rgba(38,166,154,0.15); color: var(--green); }
+        .ticker-status.down { background: rgba(239,83,80,0.15); color: var(--red); }
+
+        /* Connection Status Bar */
+        .conn-bar { display: flex; gap: 12px; padding: 4px 16px; background: var(--bg); border-bottom: 1px solid var(--border); font-size: 11px; align-items: center; flex-wrap: wrap; }
+        .conn-item { display: flex; align-items: center; gap: 4px; }
+        .conn-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+        .conn-dot.up { background: var(--green); }
+        .conn-dot.down { background: var(--red); }
+        .conn-dot.partial { background: var(--yellow); }
+        .conn-label { color: var(--text-muted); }
+        .conn-value { color: var(--text-dim); font-weight: 500; }
+
+        /* Header */
+        .header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+        .header h1 { font-size: 16px; font-weight: 600; }
+        .header h1 span { color: var(--blue); }
+        .header .meta { font-size: 11px; color: var(--text-dim); display: flex; gap: 16px; align-items: center; }
+        .header .back { color: var(--text-dim); text-decoration: none; font-size: 12px; }
+        .header .back:hover { color: var(--text); }
+        .clock { font-family: 'SF Mono', Monaco, Consolas, monospace; color: var(--green); font-size: 13px; }
+
+        /* Tabs */
+        .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+        .tab { padding: 10px 24px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-dim); border-bottom: 2px solid transparent; transition: all 0.15s; }
+        .tab:hover { color: var(--text); }
+        .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+        /* Sub-tabs */
+        .sub-tabs { display: flex; gap: 4px; padding: 8px 16px; background: var(--bg); border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
+        .sub-tab { padding: 5px 14px; cursor: pointer; font-size: 12px; border-radius: 4px; color: var(--text-dim); background: var(--bg-card); border: 1px solid var(--border); transition: all 0.15s; }
+        .sub-tab:hover { color: var(--text); border-color: var(--text-dim); }
+        .sub-tab.active { color: var(--blue); border-color: var(--blue); background: rgba(41,98,255,0.1); }
+
+        /* Table */
+        .data-table { width: 100%; border-collapse: collapse; }
+        .data-table th { position: sticky; top: 0; background: var(--bg-card); padding: 8px 12px; text-align: right; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 2px solid var(--border); white-space: nowrap; z-index: 10; }
+        .data-table th:first-child { text-align: left; }
+        .data-table td { padding: 7px 12px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; font-size: 13px; }
+        .data-table td:first-child { text-align: left; font-weight: 500; }
+        .data-table tr:hover { background: rgba(255,255,255,0.03); }
+
+        .positive { color: var(--green); }
+        .negative { color: var(--red); }
+        .dim { color: var(--text-muted); }
+        .mono { font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 11px; color: var(--blue); }
+        .verified { color: var(--green); font-weight: 700; }
+
+        .tab-content { display: none; overflow-y: auto; max-height: calc(100vh - 180px); }
+        .tab-content.active { display: block; }
+
+        .status-bar { display: flex; justify-content: space-between; padding: 6px 16px; background: var(--bg-card); border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); position: fixed; bottom: 0; left: 0; right: 0; }
+        .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 4px; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        .loading { text-align: center; padding: 40px; color: var(--text-muted); }
+
+        /* Pool meter inline */
+        .meter-cell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+        .meter-bar { width: 60px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+        .meter-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+        .meter-fill.green { background: var(--green); }
+        .meter-fill.red { background: var(--red); }
+        .meter-fill.yellow { background: var(--yellow); }
+
+        /* Status badge */
+        .badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .badge.up { background: rgba(38,166,154,0.15); color: var(--green); }
+        .badge.down { background: rgba(239,83,80,0.15); color: var(--red); }
+        .badge.warn { background: rgba(255,171,0,0.15); color: var(--yellow); }
+    </style>
+</head>
+<body>
+    <!-- Ticker Bar — WS Pool Summary -->
+    <div class="ticker-bar" id="tickerBar">
+        <div class="ticker-item">
+            <span class="ticker-name">Live Feed</span>
+            <span class="ticker-count dim" id="tkFeedCount">--</span>
+            <span class="ticker-status down" id="tkFeedStatus">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Depth 20</span>
+            <span class="ticker-count dim" id="tkD20Count">--</span>
+            <span class="ticker-status down" id="tkD20Status">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Depth 200</span>
+            <span class="ticker-count dim" id="tkD200Count">--</span>
+            <span class="ticker-status down" id="tkD200Status">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Order WS</span>
+            <span class="ticker-count dim" id="tkOUCount">--</span>
+            <span class="ticker-status down" id="tkOUStatus">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">QuestDB</span>
+            <span class="ticker-count dim" id="tkQdbStatus">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Token</span>
+            <span class="ticker-count dim" id="tkTokenStatus">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Pipeline</span>
+            <span class="ticker-count dim" id="tkPipelineStatus">--</span>
+        </div>
+    </div>
+
+    <!-- Connection Status Bar -->
+    <div class="conn-bar" id="connBar">
+        <div class="conn-item"><span class="conn-dot down" id="connWsDot"></span><span class="conn-label">Live Feed:</span><span class="conn-value" id="connWs">--</span></div>
+        <div class="conn-item"><span class="conn-dot down" id="connD20Dot"></span><span class="conn-label">Depth 20:</span><span class="conn-value" id="connD20">--</span></div>
+        <div class="conn-item"><span class="conn-dot down" id="connD200Dot"></span><span class="conn-label">Depth 200:</span><span class="conn-value" id="connD200">--</span></div>
+        <div class="conn-item"><span class="conn-dot down" id="connOrderDot"></span><span class="conn-label">Order WS:</span><span class="conn-value" id="connOrder">--</span></div>
+        <div class="conn-item"><span class="conn-dot down" id="connQdbDot"></span><span class="conn-label">QuestDB:</span><span class="conn-value" id="connQdb">--</span></div>
+        <div class="conn-item"><span class="conn-dot down" id="connTokenDot"></span><span class="conn-label">Token:</span><span class="conn-value" id="connToken">--</span></div>
+        <div class="conn-item"><span class="conn-dot down" id="connPipelineDot"></span><span class="conn-label">Pipeline:</span><span class="conn-value" id="connPipeline">--</span></div>
+    </div>
+
+    <!-- Header -->
+    <div class="header">
+        <div style="display:flex;align-items:center;gap:16px">
+            <a class="back" href="/portal">&larr; Portal</a>
+            <h1><span>DLT</span> WebSocket Dashboard</h1>
+        </div>
+        <div class="meta">
+            <span id="healthBadge" class="badge down">CHECKING</span>
+            <span>v<span id="appVersion">--</span></span>
+            <span class="clock" id="clock">--:--:--</span>
+            <span>IST</span>
+        </div>
+    </div>
+
+    <!-- Main Tabs -->
+    <div class="tabs">
+        <div class="tab active" onclick="switchTab('connections')">Connections</div>
+        <div class="tab" onclick="switchTab('subsystems')">Subsystems</div>
+        <div class="tab" onclick="switchTab('limits')">Limits</div>
+    </div>
+
+    <!-- CONNECTIONS TAB -->
+    <div class="tab-content active" id="tab-connections">
+        <div class="sub-tabs">
+            <div class="sub-tab active" data-conn-sub="pools" onclick="switchConnSub('pools')">Pool Status</div>
+            <div class="sub-tab" data-conn-sub="detail" onclick="switchConnSub('detail')">Connection Detail</div>
+        </div>
+        <!-- Pool Status sub-tab -->
+        <div id="connSub-pools">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Pool</th>
+                        <th>Status</th>
+                        <th>Active</th>
+                        <th>Max</th>
+                        <th>Utilization</th>
+                        <th>Protocol</th>
+                    </tr>
+                </thead>
+                <tbody id="poolBody">
+                    <tr>
+                        <td>Live Market Feed</td>
+                        <td><span class="badge down" id="poolFeedBadge">--</span></td>
+                        <td id="poolFeedActive">--</td>
+                        <td>5</td>
+                        <td><div class="meter-cell"><span id="poolFeedPct">0%</span><div class="meter-bar"><div class="meter-fill" id="poolFeedMeter" style="width:0"></div></div></div></td>
+                        <td class="dim">Binary LE &middot; f32 &middot; 8B hdr</td>
+                    </tr>
+                    <tr>
+                        <td>Depth 20-Level</td>
+                        <td><span class="badge down" id="poolD20Badge">--</span></td>
+                        <td id="poolD20Active">--</td>
+                        <td>5</td>
+                        <td><div class="meter-cell"><span id="poolD20Pct">0%</span><div class="meter-bar"><div class="meter-fill" id="poolD20Meter" style="width:0"></div></div></div></td>
+                        <td class="dim">Binary LE &middot; f64 &middot; 12B hdr</td>
+                    </tr>
+                    <tr>
+                        <td>Depth 200-Level</td>
+                        <td><span class="badge down" id="poolD200Badge">--</span></td>
+                        <td id="poolD200Active">--</td>
+                        <td>5</td>
+                        <td><div class="meter-cell"><span id="poolD200Pct">0%</span><div class="meter-bar"><div class="meter-fill" id="poolD200Meter" style="width:0"></div></div></div></td>
+                        <td class="dim">Binary LE &middot; f64 &middot; 12B hdr</td>
+                    </tr>
+                    <tr>
+                        <td>Order Update</td>
+                        <td><span class="badge down" id="poolOUBadge">--</span></td>
+                        <td id="poolOUActive">--</td>
+                        <td>1</td>
+                        <td><div class="meter-cell"><span id="poolOUPct">0%</span><div class="meter-bar"><div class="meter-fill" id="poolOUMeter" style="width:0"></div></div></div></td>
+                        <td class="dim">JSON &middot; MsgCode 42</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <!-- Connection Detail sub-tab -->
+        <div id="connSub-detail" style="display:none">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Pool</th>
+                        <th>Endpoint</th>
+                        <th>Max Instruments</th>
+                        <th>Msg Batch</th>
+                        <th>Status Detail</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Live Market Feed</td>
+                        <td class="mono">wss://api-feed.dhan.co</td>
+                        <td>5,000 / conn</td>
+                        <td>100 / msg</td>
+                        <td id="detailFeed" class="dim">--</td>
+                    </tr>
+                    <tr>
+                        <td>Depth 20-Level</td>
+                        <td class="mono">wss://depth-api-feed.dhan.co</td>
+                        <td>50 / conn</td>
+                        <td>50 / msg</td>
+                        <td id="detailD20" class="dim">--</td>
+                    </tr>
+                    <tr>
+                        <td>Depth 200-Level</td>
+                        <td class="mono">wss://full-depth-api.dhan.co</td>
+                        <td>1 / conn</td>
+                        <td>1 / msg</td>
+                        <td id="detailD200" class="dim">--</td>
+                    </tr>
+                    <tr>
+                        <td>Order Update</td>
+                        <td class="mono">wss://api-order-update.dhan.co</td>
+                        <td>N/A</td>
+                        <td>N/A</td>
+                        <td id="detailOU" class="dim">--</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- SUBSYSTEMS TAB -->
+    <div class="tab-content" id="tab-subsystems">
+        <div class="sub-tabs">
+            <div class="sub-tab active" data-sys-sub="health" onclick="switchSysSub('health')">Subsystem Health</div>
+            <div class="sub-tab" data-sys-sub="all" onclick="switchSysSub('all')">All Components</div>
+        </div>
+        <!-- Health sub-tab -->
+        <div id="sysSub-health">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Subsystem</th>
+                        <th>Status</th>
+                        <th>Detail</th>
+                        <th>Category</th>
+                    </tr>
+                </thead>
+                <tbody id="subsystemBody">
+                    <tr>
+                        <td>QuestDB</td>
+                        <td><span class="badge down" id="sysQdbBadge">--</span></td>
+                        <td id="sysQdbDetail" class="dim">checking...</td>
+                        <td class="dim">Database</td>
+                    </tr>
+                    <tr>
+                        <td>Auth Token</td>
+                        <td><span class="badge down" id="sysTokenBadge">--</span></td>
+                        <td id="sysTokenDetail" class="dim">checking...</td>
+                        <td class="dim">Authentication</td>
+                    </tr>
+                    <tr>
+                        <td>Tick Pipeline</td>
+                        <td><span class="badge down" id="sysPipelineBadge">--</span></td>
+                        <td id="sysPipelineDetail" class="dim">checking...</td>
+                        <td class="dim">Processing</td>
+                    </tr>
+                    <tr>
+                        <td>Tick Persistence</td>
+                        <td><span class="badge down" id="sysPersistBadge">--</span></td>
+                        <td id="sysPersistDetail" class="dim">checking...</td>
+                        <td class="dim">Storage</td>
+                    </tr>
+                    <tr>
+                        <td>Live Market Feed</td>
+                        <td><span class="badge down" id="sysWsBadge">--</span></td>
+                        <td id="sysWsDetail" class="dim">checking...</td>
+                        <td class="dim">WebSocket</td>
+                    </tr>
+                    <tr>
+                        <td>Depth 20-Level</td>
+                        <td><span class="badge down" id="sysD20Badge">--</span></td>
+                        <td id="sysD20Detail" class="dim">checking...</td>
+                        <td class="dim">WebSocket</td>
+                    </tr>
+                    <tr>
+                        <td>Depth 200-Level</td>
+                        <td><span class="badge down" id="sysD200Badge">--</span></td>
+                        <td id="sysD200Detail" class="dim">checking...</td>
+                        <td class="dim">WebSocket</td>
+                    </tr>
+                    <tr>
+                        <td>Order Update</td>
+                        <td><span class="badge down" id="sysOUBadge">--</span></td>
+                        <td id="sysOUDetail" class="dim">checking...</td>
+                        <td class="dim">WebSocket</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <!-- All Components sub-tab -->
+        <div id="sysSub-all" style="display:none">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Component</th>
+                        <th>Type</th>
+                        <th>Status</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td>WebSocket Pool</td><td class="dim">Connection</td><td id="compWs" class="dim">--</td><td class="dim">Max 5 per type (independent)</td></tr>
+                    <tr><td>20-Level Depth Pool</td><td class="dim">Connection</td><td id="compD20" class="dim">--</td><td class="dim">12B header, f64 prices, bid/ask separate</td></tr>
+                    <tr><td>200-Level Depth Pool</td><td class="dim">Connection</td><td id="compD200" class="dim">--</td><td class="dim">1 instrument/conn, variable row count</td></tr>
+                    <tr><td>Order Update WS</td><td class="dim">Connection</td><td id="compOU" class="dim">--</td><td class="dim">JSON auth, MsgCode 42, PascalCase</td></tr>
+                    <tr><td>QuestDB ILP</td><td class="dim">Database</td><td id="compQdb" class="dim">--</td><td class="dim">Zero-alloc tick persistence</td></tr>
+                    <tr><td>JWT Token</td><td class="dim">Auth</td><td id="compToken" class="dim">--</td><td class="dim">24h validity, arc-swap refresh</td></tr>
+                    <tr><td>SPSC Pipeline</td><td class="dim">Processing</td><td id="compPipeline" class="dim">--</td><td class="dim">65K buffer, async channel</td></tr>
+                    <tr><td>Tick Writer</td><td class="dim">Storage</td><td id="compPersist" class="dim">--</td><td class="dim">QuestDB ILP, segment in dedup key</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- LIMITS TAB -->
+    <div class="tab-content" id="tab-limits">
+        <div class="sub-tabs">
+            <div class="sub-tab active">Connection Limits Reference (Verified 2026-04-06)</div>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>WebSocket Type</th>
+                    <th>Endpoint</th>
+                    <th>Max Connections</th>
+                    <th>Max Instruments</th>
+                    <th>Header Size</th>
+                    <th>Price Type</th>
+                    <th>Pool</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Live Market Feed</td>
+                    <td class="mono">wss://api-feed.dhan.co</td>
+                    <td class="verified">5</td>
+                    <td>5,000/conn &middot; 100/msg</td>
+                    <td>8 bytes</td>
+                    <td>f32</td>
+                    <td class="positive">Independent</td>
+                </tr>
+                <tr>
+                    <td>20-Level Depth</td>
+                    <td class="mono">wss://depth-api-feed.dhan.co</td>
+                    <td class="verified">5</td>
+                    <td>50/conn</td>
+                    <td>12 bytes</td>
+                    <td>f64</td>
+                    <td class="positive">Independent</td>
+                </tr>
+                <tr>
+                    <td>200-Level Depth</td>
+                    <td class="mono">wss://full-depth-api.dhan.co</td>
+                    <td class="verified">5</td>
+                    <td>1/conn</td>
+                    <td>12 bytes</td>
+                    <td>f64</td>
+                    <td class="positive">Independent</td>
+                </tr>
+                <tr>
+                    <td>Order Update</td>
+                    <td class="mono">wss://api-order-update.dhan.co</td>
+                    <td class="verified">1</td>
+                    <td>N/A</td>
+                    <td>JSON</td>
+                    <td>N/A</td>
+                    <td class="dim">Dedicated</td>
+                </tr>
+            </tbody>
+        </table>
+        <!-- Rate limits sub-table -->
+        <div style="padding:16px 0 0">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>API Category</th>
+                        <th>Per Second</th>
+                        <th>Per Minute</th>
+                        <th>Per Hour</th>
+                        <th>Per Day</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Order APIs</td>
+                        <td>10</td>
+                        <td>250</td>
+                        <td>1,000</td>
+                        <td>7,000</td>
+                        <td class="dim">Max 25 modifications/order</td>
+                    </tr>
+                    <tr>
+                        <td>Data APIs</td>
+                        <td>5</td>
+                        <td class="dim">--</td>
+                        <td class="dim">--</td>
+                        <td>100,000</td>
+                        <td class="dim">WS Feed + Depth + Historical + OC</td>
+                    </tr>
+                    <tr>
+                        <td>Quote APIs</td>
+                        <td>1</td>
+                        <td class="dim">unlimited</td>
+                        <td class="dim">unlimited</td>
+                        <td class="dim">unlimited</td>
+                        <td class="dim">LTP / OHLC / Full Quote REST</td>
+                    </tr>
+                    <tr>
+                        <td>Non-Trading</td>
+                        <td>20</td>
+                        <td class="dim">unlimited</td>
+                        <td class="dim">unlimited</td>
+                        <td class="dim">unlimited</td>
+                        <td class="dim">Portfolio, Funds, Profile</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+        <span><span class="live-dot" id="liveDot"></span> DLT WebSocket Dashboard v0.2.0</span>
+        <span>Auto-refresh: 3s | Limits confirmed by Dhan (independent per WS type) | <a href="/portal/market-dashboard" style="color:var(--blue);text-decoration:none">Market Dashboard</a> | <a href="/portal" style="color:var(--blue);text-decoration:none">Control Panel</a></span>
+    </div>
+
+<script>
+/* O(1) DOM lookups — cached once at load, only textContent/className swaps on refresh */
+var els = {
+    /* Ticker bar */
+    tkFeedCount: document.getElementById('tkFeedCount'),
+    tkFeedStatus: document.getElementById('tkFeedStatus'),
+    tkD20Count: document.getElementById('tkD20Count'),
+    tkD20Status: document.getElementById('tkD20Status'),
+    tkD200Count: document.getElementById('tkD200Count'),
+    tkD200Status: document.getElementById('tkD200Status'),
+    tkOUCount: document.getElementById('tkOUCount'),
+    tkOUStatus: document.getElementById('tkOUStatus'),
+    tkQdbStatus: document.getElementById('tkQdbStatus'),
+    tkTokenStatus: document.getElementById('tkTokenStatus'),
+    tkPipelineStatus: document.getElementById('tkPipelineStatus'),
+    /* Conn bar */
+    connWs: document.getElementById('connWs'), connWsDot: document.getElementById('connWsDot'),
+    connD20: document.getElementById('connD20'), connD20Dot: document.getElementById('connD20Dot'),
+    connD200: document.getElementById('connD200'), connD200Dot: document.getElementById('connD200Dot'),
+    connOrder: document.getElementById('connOrder'), connOrderDot: document.getElementById('connOrderDot'),
+    connQdb: document.getElementById('connQdb'), connQdbDot: document.getElementById('connQdbDot'),
+    connToken: document.getElementById('connToken'), connTokenDot: document.getElementById('connTokenDot'),
+    connPipeline: document.getElementById('connPipeline'), connPipelineDot: document.getElementById('connPipelineDot'),
+    /* Header */
+    healthBadge: document.getElementById('healthBadge'),
+    appVersion: document.getElementById('appVersion'),
+    clock: document.getElementById('clock'),
+    liveDot: document.getElementById('liveDot'),
+    /* Pool table */
+    poolFeedBadge: document.getElementById('poolFeedBadge'),
+    poolFeedActive: document.getElementById('poolFeedActive'),
+    poolFeedPct: document.getElementById('poolFeedPct'),
+    poolFeedMeter: document.getElementById('poolFeedMeter'),
+    poolD20Badge: document.getElementById('poolD20Badge'),
+    poolD20Active: document.getElementById('poolD20Active'),
+    poolD20Pct: document.getElementById('poolD20Pct'),
+    poolD20Meter: document.getElementById('poolD20Meter'),
+    poolD200Badge: document.getElementById('poolD200Badge'),
+    poolD200Active: document.getElementById('poolD200Active'),
+    poolD200Pct: document.getElementById('poolD200Pct'),
+    poolD200Meter: document.getElementById('poolD200Meter'),
+    poolOUBadge: document.getElementById('poolOUBadge'),
+    poolOUActive: document.getElementById('poolOUActive'),
+    poolOUPct: document.getElementById('poolOUPct'),
+    poolOUMeter: document.getElementById('poolOUMeter'),
+    /* Detail table */
+    detailFeed: document.getElementById('detailFeed'),
+    detailD20: document.getElementById('detailD20'),
+    detailD200: document.getElementById('detailD200'),
+    detailOU: document.getElementById('detailOU'),
+    /* Subsystem table */
+    sysQdbBadge: document.getElementById('sysQdbBadge'),
+    sysQdbDetail: document.getElementById('sysQdbDetail'),
+    sysTokenBadge: document.getElementById('sysTokenBadge'),
+    sysTokenDetail: document.getElementById('sysTokenDetail'),
+    sysPipelineBadge: document.getElementById('sysPipelineBadge'),
+    sysPipelineDetail: document.getElementById('sysPipelineDetail'),
+    sysPersistBadge: document.getElementById('sysPersistBadge'),
+    sysPersistDetail: document.getElementById('sysPersistDetail'),
+    sysWsBadge: document.getElementById('sysWsBadge'),
+    sysWsDetail: document.getElementById('sysWsDetail'),
+    sysD20Badge: document.getElementById('sysD20Badge'),
+    sysD20Detail: document.getElementById('sysD20Detail'),
+    sysD200Badge: document.getElementById('sysD200Badge'),
+    sysD200Detail: document.getElementById('sysD200Detail'),
+    sysOUBadge: document.getElementById('sysOUBadge'),
+    sysOUDetail: document.getElementById('sysOUDetail'),
+    /* All components */
+    compWs: document.getElementById('compWs'),
+    compD20: document.getElementById('compD20'),
+    compD200: document.getElementById('compD200'),
+    compOU: document.getElementById('compOU'),
+    compQdb: document.getElementById('compQdb'),
+    compToken: document.getElementById('compToken'),
+    compPipeline: document.getElementById('compPipeline'),
+    compPersist: document.getElementById('compPersist')
+};
+
+/* Tab names for each tab group */
+var tabNames = ['connections', 'subsystems', 'limits'];
+
+/* Tab switching — O(1): no querySelectorAll per call, use cached NodeLists */
+var tabEls = document.querySelectorAll('.tab');
+var tabContentEls = document.querySelectorAll('.tab-content');
+
+function switchTab(name) {
+    for (var i = 0; i < tabEls.length; i++) {
+        tabEls[i].classList.toggle('active', tabNames[i] === name);
+    }
+    for (var j = 0; j < tabContentEls.length; j++) {
+        tabContentEls[j].classList.toggle('active', tabContentEls[j].id === 'tab-' + name);
+    }
+}
+
+function switchConnSub(sub) {
+    document.querySelectorAll('[data-conn-sub]').forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-conn-sub') === sub);
+    });
+    document.getElementById('connSub-pools').style.display = sub === 'pools' ? '' : 'none';
+    document.getElementById('connSub-detail').style.display = sub === 'detail' ? '' : 'none';
+}
+
+function switchSysSub(sub) {
+    document.querySelectorAll('[data-sys-sub]').forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-sys-sub') === sub);
+    });
+    document.getElementById('sysSub-health').style.display = sub === 'health' ? '' : 'none';
+    document.getElementById('sysSub-all').style.display = sub === 'all' ? '' : 'none';
+}
+
+/* Helpers */
+function parseCount(detail) {
+    if (!detail) return 0;
+    var n = parseInt(detail, 10);
+    return isNaN(n) ? 0 : n;
+}
+
+function isUp(status) {
+    return status === 'connected' || status === 'reachable' || status === 'valid' || status === 'active';
+}
+
+function dotCls(status) {
+    return 'conn-dot ' + (isUp(status) ? 'up' : status === 'buffering' ? 'partial' : 'down');
+}
+
+function badgeCls(status) {
+    return 'badge ' + (isUp(status) ? 'up' : status === 'buffering' ? 'warn' : 'down');
+}
+
+function badgeText(status) {
+    return isUp(status) ? 'UP' : status === 'buffering' ? 'BUFFERING' : 'DOWN';
+}
+
+/* Update pool row — O(1), textContent + className only */
+function updatePoolRow(badge, activeEl, pctEl, meterEl, count, max, connected) {
+    badge.className = connected ? 'badge up' : 'badge down';
+    badge.textContent = connected ? 'CONNECTED' : 'DOWN';
+    activeEl.textContent = count;
+    activeEl.className = connected ? 'positive' : 'negative';
+    var pct = max > 0 ? Math.round((count / max) * 100) : 0;
+    pctEl.textContent = pct + '%';
+    meterEl.style.width = pct + '%';
+    meterEl.className = 'meter-fill ' + (connected ? (pct > 80 ? 'yellow' : 'green') : 'red');
+}
+
+/* Update ticker item */
+function updateTicker(countEl, statusEl, count, connected) {
+    countEl.textContent = count;
+    countEl.className = 'ticker-count ' + (connected ? 'positive' : count === '--' ? 'dim' : 'negative');
+    statusEl.textContent = connected ? 'UP' : 'DOWN';
+    statusEl.className = 'ticker-status ' + (connected ? 'up' : 'down');
+}
+
+function updateTickerSimple(el, status) {
+    el.textContent = isUp(status) ? 'OK' : status || '--';
+    el.className = 'ticker-count ' + (isUp(status) ? 'positive' : 'dim');
+}
+
+/* Main health fetch — O(1) updates, no innerHTML, no DOM creation */
+function fetchHealth() {
+    fetch('/health')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            var s = d.subsystems || {};
+
+            /* Overall badge */
+            var st = d.status || 'degraded';
+            els.healthBadge.textContent = st.toUpperCase();
+            els.healthBadge.className = 'badge ' + (st === 'healthy' ? 'up' : st === 'degraded' ? 'warn' : 'down');
+            els.appVersion.textContent = d.version || '--';
+
+            /* WebSocket pools */
+            var wsCount = parseCount(s.websocket ? s.websocket.detail : null);
+            var wsUp = s.websocket && s.websocket.status === 'connected';
+            var d20Count = parseCount(s.depth_20 ? s.depth_20.detail : null);
+            var d20Up = s.depth_20 && s.depth_20.status === 'connected';
+            var d200Count = parseCount(s.depth_200 ? s.depth_200.detail : null);
+            var d200Up = s.depth_200 && s.depth_200.status === 'connected';
+            var ouUp = s.order_update && s.order_update.status === 'connected';
+            var ouCount = ouUp ? 1 : 0;
+
+            /* Ticker bar */
+            updateTicker(els.tkFeedCount, els.tkFeedStatus, wsCount, wsUp);
+            updateTicker(els.tkD20Count, els.tkD20Status, d20Count, d20Up);
+            updateTicker(els.tkD200Count, els.tkD200Status, d200Count, d200Up);
+            updateTicker(els.tkOUCount, els.tkOUStatus, ouCount, ouUp);
+            updateTickerSimple(els.tkQdbStatus, s.questdb ? s.questdb.status : null);
+            updateTickerSimple(els.tkTokenStatus, s.token ? s.token.status : null);
+            updateTickerSimple(els.tkPipelineStatus, s.pipeline ? s.pipeline.status : null);
+
+            /* Conn bar */
+            function setConn(el, dot, info) {
+                var st2 = info ? info.status : 'unknown';
+                el.textContent = info ? (info.detail || st2) : '--';
+                dot.className = dotCls(st2);
+            }
+            setConn(els.connWs, els.connWsDot, s.websocket);
+            setConn(els.connD20, els.connD20Dot, s.depth_20);
+            setConn(els.connD200, els.connD200Dot, s.depth_200);
+            setConn(els.connOrder, els.connOrderDot, s.order_update);
+            setConn(els.connQdb, els.connQdbDot, s.questdb);
+            setConn(els.connToken, els.connTokenDot, s.token);
+            setConn(els.connPipeline, els.connPipelineDot, s.pipeline);
+
+            /* Pool table */
+            updatePoolRow(els.poolFeedBadge, els.poolFeedActive, els.poolFeedPct, els.poolFeedMeter, wsCount, 5, wsUp);
+            updatePoolRow(els.poolD20Badge, els.poolD20Active, els.poolD20Pct, els.poolD20Meter, d20Count, 5, d20Up);
+            updatePoolRow(els.poolD200Badge, els.poolD200Active, els.poolD200Pct, els.poolD200Meter, d200Count, 5, d200Up);
+            updatePoolRow(els.poolOUBadge, els.poolOUActive, els.poolOUPct, els.poolOUMeter, ouCount, 1, ouUp);
+
+            /* Detail table */
+            els.detailFeed.textContent = wsCount + ' of 5 connections';
+            els.detailD20.textContent = d20Count + ' of 5 connections';
+            els.detailD200.textContent = d200Count + ' of 5 connections';
+            els.detailOU.textContent = ouCount + ' of 1 connection';
+
+            /* Subsystem table */
+            function setSys(badge, detail, info) {
+                var st3 = info ? info.status : 'unknown';
+                badge.className = badgeCls(st3);
+                badge.textContent = badgeText(st3);
+                detail.textContent = info ? (info.detail || st3) : '--';
+            }
+            setSys(els.sysQdbBadge, els.sysQdbDetail, s.questdb);
+            setSys(els.sysTokenBadge, els.sysTokenDetail, s.token);
+            setSys(els.sysPipelineBadge, els.sysPipelineDetail, s.pipeline);
+            setSys(els.sysPersistBadge, els.sysPersistDetail, s.tick_persistence);
+            setSys(els.sysWsBadge, els.sysWsDetail, s.websocket);
+            setSys(els.sysD20Badge, els.sysD20Detail, s.depth_20);
+            setSys(els.sysD200Badge, els.sysD200Detail, s.depth_200);
+            setSys(els.sysOUBadge, els.sysOUDetail, s.order_update);
+
+            /* All components */
+            function setComp(el, info) {
+                var st4 = info ? info.status : 'unknown';
+                el.textContent = st4 + (info && info.detail ? ' (' + info.detail + ')' : '');
+                el.className = isUp(st4) ? 'positive' : st4 === 'buffering' ? '' : 'negative';
+            }
+            setComp(els.compWs, s.websocket);
+            setComp(els.compD20, s.depth_20);
+            setComp(els.compD200, s.depth_200);
+            setComp(els.compOU, s.order_update);
+            setComp(els.compQdb, s.questdb);
+            setComp(els.compToken, s.token);
+            setComp(els.compPipeline, s.pipeline);
+            setComp(els.compPersist, s.tick_persistence);
+
+            els.liveDot.style.background = 'var(--green)';
+        })
+        .catch(function() {
+            els.healthBadge.textContent = 'UNREACHABLE';
+            els.healthBadge.className = 'badge down';
+            els.liveDot.style.background = 'var(--red)';
+        });
+}
+
+/* IST Clock — O(1) */
+function updateClock() {
+    var now = new Date();
+    var ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000));
+    var h = String(ist.getHours()).padStart(2, '0');
+    var m = String(ist.getMinutes()).padStart(2, '0');
+    var s = String(ist.getSeconds()).padStart(2, '0');
+    els.clock.textContent = h + ':' + m + ':' + s;
+}
+
+/* Init */
+fetchHealth();
+updateClock();
+setInterval(fetchHealth, 3000);
+setInterval(updateClock, 1000);
+</script>
+</body>
+</html>
