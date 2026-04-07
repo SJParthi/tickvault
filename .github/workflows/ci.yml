@@ -26,9 +26,11 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          # Use PR base SHA for accurate diff (origin/main may differ in CI context)
-          BASE="${BASE_SHA:-origin/main}"
-          echo "Checking commits from $BASE..HEAD"
+          # Fetch main to ensure origin/main is available
+          git fetch origin main --depth=1 2>/dev/null || true
+          # Use PR base SHA for accurate diff
+          BASE="${BASE_SHA:-$(git rev-parse origin/main 2>/dev/null || echo HEAD~1)}"
+          echo "Checking commits from $BASE..HEAD ($(git log --oneline "$BASE"..HEAD | wc -l) commits)"
           COMMITS=$(git log --format='%s' "$BASE"..HEAD)
           PATTERN='^(feat|fix|refactor|test|docs|chore|perf|security)\([a-z0-9_/-]+\): .+'
           FAILED=0
