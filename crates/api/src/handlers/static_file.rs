@@ -11,12 +11,26 @@ const PORTAL_HTML: &str = include_str!("../../static/portal.html");
 /// Live option chain with Greeks, IV, OI — auto-refreshes from QuestDB.
 const OPTIONS_CHAIN_HTML: &str = include_str!("../../static/options-chain.html");
 
+/// Embedded HTML content for the Market Dashboard page.
+/// Live market data: Index tickers, Stock Movers, Option Movers — auto-refreshes.
+const MARKET_DASHBOARD_HTML: &str = include_str!("../../static/market-dashboard.html");
+
 /// GET /portal — serves the DLT Control Panel with links to all services.
 pub async fn portal() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         PORTAL_HTML,
+    )
+}
+
+/// GET /portal/market-dashboard — serves the live Market Dashboard.
+// TEST-EXEMPT: static HTML serving — tested via pattern tests below
+pub async fn market_dashboard() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        MARKET_DASHBOARD_HTML,
     )
 }
 
@@ -100,5 +114,32 @@ mod tests {
         assert!(OPTIONS_CHAIN_HTML.contains("</html>"));
         assert!(OPTIONS_CHAIN_HTML.contains("</body>"));
         assert!(OPTIONS_CHAIN_HTML.contains("</script>"));
+    }
+
+    #[test]
+    fn test_market_dashboard_html_not_empty() {
+        assert!(!MARKET_DASHBOARD_HTML.is_empty());
+        assert!(MARKET_DASHBOARD_HTML.contains("<!DOCTYPE html>"));
+        assert!(MARKET_DASHBOARD_HTML.contains("Market Dashboard"));
+    }
+
+    #[tokio::test]
+    async fn test_market_dashboard_handler_returns_ok() {
+        let response = market_dashboard().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_market_dashboard_html_contains_api_endpoints() {
+        assert!(MARKET_DASHBOARD_HTML.contains("/api/market/indices"));
+        assert!(MARKET_DASHBOARD_HTML.contains("/api/market/stock-movers"));
+        assert!(MARKET_DASHBOARD_HTML.contains("/api/market/option-movers"));
+    }
+
+    #[test]
+    fn test_market_dashboard_html_has_tabs() {
+        assert!(MARKET_DASHBOARD_HTML.contains("Stocks"));
+        assert!(MARKET_DASHBOARD_HTML.contains("Options"));
+        assert!(MARKET_DASHBOARD_HTML.contains("Index"));
     }
 }

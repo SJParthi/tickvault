@@ -99,6 +99,22 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/api/pcr",
             axum::routing::get(handlers::option_chain::get_pcr),
+        )
+        .route(
+            "/api/market/indices",
+            axum::routing::get(handlers::market_data::get_indices),
+        )
+        .route(
+            "/api/market/stock-movers",
+            axum::routing::get(handlers::market_data::get_stock_movers),
+        )
+        .route(
+            "/api/market/option-movers",
+            axum::routing::get(handlers::market_data::get_option_movers),
+        )
+        .route(
+            "/portal/market-dashboard",
+            axum::routing::get(handlers::static_file::market_dashboard),
         );
 
     public_routes
