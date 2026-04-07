@@ -44,7 +44,7 @@ impl CorrelationTracker {
     /// Creates a new empty tracker.
     pub fn new() -> Self {
         Self {
-            index: HashMap::new(),
+            index: HashMap::with_capacity(256),
         }
     }
 

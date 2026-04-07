@@ -62,11 +62,14 @@ pub async fn get_quote(
     let client = build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS);
 
     match query_latest_tick(&client, &base_url, security_id).await {
-        Some(quote) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&quote).unwrap_or_default()),
-        )
-            .into_response(),
+        Some(quote) => match serde_json::to_value(&quote) {
+            Ok(json) => (StatusCode::OK, Json(json)).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to serialize quote response"})),
+            )
+                .into_response(),
+        },
         None => {
             // Distinguish between QuestDB unreachable and no data.
             // Try a simple connectivity check.

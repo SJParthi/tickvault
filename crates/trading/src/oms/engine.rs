@@ -129,7 +129,7 @@ impl OrderManagementSystem {
         client_id: String,
     ) -> Self {
         Self {
-            orders: HashMap::new(),
+            orders: HashMap::with_capacity(256),
             correlations: CorrelationTracker::new(),
             api_client,
             rate_limiter,

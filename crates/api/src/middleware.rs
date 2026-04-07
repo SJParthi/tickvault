@@ -149,7 +149,16 @@ pub async fn require_bearer_auth(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..]; // Skip "Bearer "
-            if token == config.bearer_token {
+            // SEC-3: Constant-time comparison prevents timing oracle attacks.
+            // Length check + byte-by-byte XOR ensures equal-time regardless of position.
+            let token_match = token.len() == config.bearer_token.len()
+                && token
+                    .as_bytes()
+                    .iter()
+                    .zip(config.bearer_token.as_bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0;
+            if token_match {
                 Ok(next.run(request).await)
             } else {
                 warn!("GAP-SEC-01: API auth failed — invalid bearer token");

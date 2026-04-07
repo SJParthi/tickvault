@@ -412,7 +412,7 @@ groups:
 
       # Deep depth data loss — rows dropped on flush failure
       - alert: DeepDepthDataLoss
-        expr: dlt_deep_depth_rows_lost > 0
+        expr: dlt_deep_depth_dropped_total > 0
         for: 0s
         labels:
           severity: critical
@@ -459,3 +459,62 @@ groups:
         annotations:
           summary: "Trading pipeline lagging behind tick stream"
           description: "{{ $value }} ticks/sec lost to broadcast lag. Signals may be missed."
+
+      # Daily P&L approaching max loss limit (2% of capital)
+      - alert: DailyPnlWarning
+        expr: (dlt_realized_pnl + dlt_unrealized_pnl) < -15000
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Daily P&L exceeds -15K warning threshold"
+          description: "Combined P&L is {{ $value }}. Max daily loss limit is 2% of capital."
+
+      - alert: DailyPnlCritical
+        expr: (dlt_realized_pnl + dlt_unrealized_pnl) < -18000
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Daily P&L approaching max loss — HALT IMMINENT"
+          description: "Combined P&L is {{ $value }}. Auto-halt triggers at -20K (2% of 10L capital)."
+
+      # Order placement latency SLA breach
+      - alert: HighOrderLatency
+        expr: histogram_quantile(0.99, rate(dlt_order_placement_duration_ns_bucket[5m])) > 100000000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order placement p99 latency > 100ms"
+          description: "Order API call p99 is {{ $value }}ns. SLA target is 100ms."
+
+      # Valkey cache error rate
+      - alert: HighValkeyErrorRate
+        expr: rate(dlt_valkey_errors_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valkey cache errors > 1/sec"
+          description: "Cache error rate is {{ $value }}/sec. Check Valkey connectivity."
+
+      # WebSocket backpressure — frames queuing
+      - alert: WebSocketBackpressure
+        expr: rate(dlt_ws_backpressure_timeout_total[5m]) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket frame send timeouts detected"
+          description: "{{ $value }} send timeouts/sec. Tick processor may be overloaded."
+
+      # SEBI rate limiter denying orders
+      - alert: RateLimiterDenying
+        expr: rate(dlt_rate_limiter_denied_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "SEBI rate limiter blocking orders"
+          description: "{{ $value }} orders/sec denied by rate limiter. Regulatory compliance at risk."
