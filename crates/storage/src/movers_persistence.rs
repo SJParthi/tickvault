@@ -163,17 +163,18 @@ impl StockMoversWriter {
         let change_abs = ltp - prev_close;
         let ts = TimestampNanos::new(ts_nanos);
 
+        // ILP requires: table → ALL symbols → ALL columns → at
         self.buffer
             .table(QUESTDB_TABLE_STOCK_MOVERS)
             .context("table")?
             .symbol("category", category)
             .context("category")?
-            .column_i64("security_id", i64::from(security_id))
-            .context("security_id")?
             .symbol("segment", segment)
             .context("segment")?
             .symbol("symbol", symbol)
             .context("symbol")?
+            .column_i64("security_id", i64::from(security_id))
+            .context("security_id")?
             .column_f64("ltp", ltp)
             .context("ltp")?
             .column_f64("prev_close", prev_close)
@@ -307,13 +308,13 @@ impl OptionMoversWriter {
     ) -> Result<()> {
         let ts = TimestampNanos::new(ts_nanos);
 
+        // ILP requires: table → ALL symbols → ALL columns → at
         self.buffer
             .table(QUESTDB_TABLE_OPTION_MOVERS)
             .context("table")?
+            // Symbols first
             .symbol("category", category)
             .context("category")?
-            .column_i64("security_id", i64::from(security_id))
-            .context("security_id")?
             .symbol("segment", segment)
             .context("segment")?
             .symbol("contract_name", contract_name)
@@ -322,10 +323,13 @@ impl OptionMoversWriter {
             .context("underlying")?
             .symbol("option_type", option_type)
             .context("option_type")?
-            .column_f64("strike", strike)
-            .context("strike")?
             .symbol("expiry", expiry)
             .context("expiry")?
+            // Then columns
+            .column_i64("security_id", i64::from(security_id))
+            .context("security_id")?
+            .column_f64("strike", strike)
+            .context("strike")?
             .column_f64("spot_price", spot_price)
             .context("spot_price")?
             .column_f64("ltp", ltp)

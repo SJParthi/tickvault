@@ -66,6 +66,12 @@ const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
     ("Jaeger", "http://localhost:16686", LOCAL_HOST, 16686),
     ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
     ("Portal", "http://localhost:3001/portal", LOCAL_HOST, 3001),
+    (
+        "Market Dashboard",
+        "http://localhost:3001/portal/market-dashboard",
+        LOCAL_HOST,
+        3001,
+    ),
 ];
 
 /// Grafana host for TCP reachability probe (kept for backward compat in tests).
