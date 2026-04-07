@@ -236,12 +236,24 @@ pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoR
     .into_response()
 }
 
+/// Valid stock mover categories (whitelist for SQL injection prevention).
+const VALID_STOCK_CATEGORIES: &[&str] = &["GAINER", "LOSER", "MOST_ACTIVE"];
+
 /// Queries QuestDB for stock movers of a given category.
+///
+/// # Safety (SQL injection)
+/// `category` is validated against `VALID_STOCK_CATEGORIES` whitelist.
+/// Unrecognized values return an empty Vec (no query executed).
 async fn query_movers(
     client: &reqwest::Client,
     base_url: &str,
     category: &str,
 ) -> Vec<StockMoverEntry> {
+    // GAP-SEC-02: whitelist validation prevents SQL injection via category interpolation
+    if !VALID_STOCK_CATEGORIES.contains(&category) {
+        return Vec::new();
+    }
+
     let query = format!(
         "SELECT rank, symbol, security_id, ltp, change_abs, change_pct, volume, prev_close \
          FROM stock_movers \

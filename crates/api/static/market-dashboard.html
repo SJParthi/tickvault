@@ -211,6 +211,12 @@ var currentStockSub = 'losers';
 var currentOptionSub = 'HIGHEST_OI';
 var refreshTimer = null;
 
+// XSS prevention: escape HTML entities in API-sourced strings before innerHTML
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 // Formatters
 function fmt(v, d) { d = d || 2; return v != null && isFinite(v) ? Number(v).toLocaleString('en-IN', {minimumFractionDigits: d, maximumFractionDigits: d}) : '--'; }
 function fmtInt(v) { return v != null ? Number(v).toLocaleString('en-IN') : '--'; }
@@ -273,7 +279,7 @@ function fetchIndices() {
                 var c = idx.change >= 0 ? 'positive' : 'negative';
                 var arrow = idx.change >= 0 ? '&#9650;' : '&#9660;';
                 bar += '<div class="ticker-item">';
-                bar += '<span class="ticker-name">' + idx.name + '</span>';
+                bar += '<span class="ticker-name">' + esc(idx.name) + '</span>';
                 bar += '<span class="ticker-price">' + fmt(idx.ltp, 2) + '</span>';
                 bar += '<span class="ticker-change ' + c + '">' + arrow + ' ' + sign(idx.change) + fmt(idx.change, 2) + ' (' + sign(idx.change_pct) + fmt(idx.change_pct, 2) + '%)</span>';
                 bar += '</div>';
@@ -285,7 +291,7 @@ function fetchIndices() {
             d.indices.forEach(function(idx) {
                 var c = cls(idx.change);
                 html += '<tr>';
-                html += '<td>' + idx.name + '</td>';
+                html += '<td>' + esc(idx.name) + '</td>';
                 html += '<td>' + fmt(idx.ltp, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(idx.change) + fmt(idx.change, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(idx.change_pct) + fmt(idx.change_pct, 2) + ' %</td>';
@@ -318,7 +324,7 @@ function fetchStockMovers() {
                 var c = cls(s.change_pct);
                 var name = s.symbol || ('SID-' + s.security_id);
                 html += '<tr>';
-                html += '<td>' + name + '</td>';
+                html += '<td>' + esc(name) + '</td>';
                 html += '<td>' + fmt(s.ltp, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(s.change) + fmt(s.change, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(s.change_pct) + fmt(s.change_pct, 2) + ' %</td>';
@@ -344,7 +350,7 @@ function fetchOptionMovers() {
                 var oic = cls(o.oi_change_pct);
                 var name = o.contract_name || ('SID-' + o.security_id);
                 html += '<tr>';
-                html += '<td>' + name + '</td>';
+                html += '<td>' + esc(name) + '</td>';
                 html += '<td>' + fmt(o.spot_price, 2) + '</td>';
                 html += '<td>' + fmt(o.ltp, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(o.change) + fmt(o.change, 2) + '</td>';
