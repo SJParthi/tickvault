@@ -230,7 +230,10 @@ mod tests {
     fn test_ws_dashboard_html_max_5_connections_per_type() {
         // Verify "of 5 connections" appears 3 times (Feed + D20 + D200)
         let count = WS_DASHBOARD_HTML.matches("of 5 connections").count();
-        assert_eq!(count, 3, "should show 'of 5 connections' for Feed, D20, D200");
+        assert_eq!(
+            count, 3,
+            "should show 'of 5 connections' for Feed, D20, D200"
+        );
         // Order Update shows "of 1 connection"
         assert!(WS_DASHBOARD_HTML.contains("of 1 connection"));
     }
@@ -245,7 +248,13 @@ mod tests {
     fn test_portal_html_depth_labels_show_max_5() {
         // Both depth cards must say "max 5 connections" (not "max 4")
         let count = PORTAL_HTML.matches("max 5 connections").count();
-        assert!(count >= 3, "Live Feed + D20 + D200 should all say 'max 5 connections', found {count}");
-        assert!(!PORTAL_HTML.contains("max 4 connections"), "portal must not contain 'max 4 connections'");
+        assert!(
+            count >= 3,
+            "Live Feed + D20 + D200 should all say 'max 5 connections', found {count}"
+        );
+        assert!(
+            !PORTAL_HTML.contains("max 4 connections"),
+            "portal must not contain 'max 4 connections'"
+        );
     }
 }
