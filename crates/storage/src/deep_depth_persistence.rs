@@ -331,7 +331,13 @@ impl DeepDepthWriter {
             received_at_nanos,
         );
 
-        self.write_record_to_ilp(&record)?;
+        if let Err(err) = self.write_record_to_ilp(&record) {
+            // ILP buffer is in a dirty state after partial write failure.
+            // Clear it to prevent cascading errors on subsequent calls.
+            self.buffer.clear();
+            self.pending_count = 0;
+            return Err(err);
+        }
 
         // Track in-flight for rescue on flush failure.
         self.in_flight.push(record);
@@ -364,15 +370,21 @@ impl DeepDepthWriter {
                 continue;
             }
 
+            // ILP requires: table → ALL symbols → ALL columns → at
+            // Symbols MUST come before any column_* calls
             self.buffer
                 .table(QUESTDB_TABLE_DEEP_MARKET_DEPTH)
                 .context("deep depth table")?
+                // Symbols first (tag columns in QuestDB)
                 .symbol("segment", segment_str)
                 .context("segment")?
-                .column_i64("security_id", i64::from(record.security_id))
-                .context("security_id")?
                 .symbol("side", record.side_str())
                 .context("side")?
+                .symbol("depth_type", record.depth_type_str())
+                .context("depth_type")?
+                // Then columns (value columns)
+                .column_i64("security_id", i64::from(record.security_id))
+                .context("security_id")?
                 .column_i64("level", (i as i64).saturating_add(1))
                 .context("level")?
                 .column_f64("price", level.price)
@@ -381,8 +393,6 @@ impl DeepDepthWriter {
                 .context("quantity")?
                 .column_i64("orders", i64::from(level.orders))
                 .context("orders")?
-                .symbol("depth_type", record.depth_type_str())
-                .context("depth_type")?
                 .column_ts("received_at", received_nanos)
                 .context("received_at")?
                 .at(received_nanos)
