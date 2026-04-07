@@ -64,6 +64,8 @@ pub struct MoverEntry {
     pub exchange_segment_code: u8,
     /// Last traded price.
     pub last_traded_price: f32,
+    /// Previous close price (from PrevClose packets).
+    pub prev_close: f32,
     /// Percentage change from previous close.
     pub change_pct: f32,
     /// Cumulative volume.
@@ -202,12 +204,20 @@ impl TopMoversTracker {
             .securities
             .iter()
             .filter(|(_, state)| state.change_pct.is_finite())
-            .map(|(&(security_id, _), state)| MoverEntry {
-                security_id,
-                exchange_segment_code: state.exchange_segment_code,
-                last_traded_price: state.last_traded_price,
-                change_pct: state.change_pct,
-                volume: state.volume,
+            .map(|(&(security_id, segment_code), state)| {
+                let prev_close = self
+                    .prev_close_prices
+                    .get(&(security_id, segment_code))
+                    .copied()
+                    .unwrap_or(0.0);
+                MoverEntry {
+                    security_id,
+                    exchange_segment_code: state.exchange_segment_code,
+                    last_traded_price: state.last_traded_price,
+                    prev_close,
+                    change_pct: state.change_pct,
+                    volume: state.volume,
+                }
             })
             .collect();
 
@@ -482,6 +492,7 @@ mod tests {
             security_id: 42,
             exchange_segment_code: 2,
             last_traded_price: 100.0,
+            prev_close: 0.0,
             change_pct: 5.0,
             volume: 1000,
         };
@@ -652,6 +663,7 @@ mod tests {
             security_id: 42,
             exchange_segment_code: 2,
             last_traded_price: 100.5,
+            prev_close: 0.0,
             change_pct: 5.25,
             volume: 1000,
         };
@@ -852,6 +864,7 @@ mod tests {
             security_id: 42,
             exchange_segment_code: 2,
             last_traded_price: 100.5,
+            prev_close: 0.0,
             change_pct: 5.25,
             volume: 1000,
         };
@@ -986,6 +999,7 @@ mod tests {
             security_id: 12345,
             exchange_segment_code: 1,
             last_traded_price: 2345.50,
+            prev_close: 0.0,
             change_pct: -3.75,
             volume: 99999,
         };

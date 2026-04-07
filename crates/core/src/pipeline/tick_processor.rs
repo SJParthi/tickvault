@@ -162,10 +162,14 @@ fn utc_nanos_to_ist_epoch_secs(received_at_nanos: i64) -> u32 {
 ///
 /// Writes top 20 gainers, losers, and most active as separate rows.
 /// Each row tagged with category + rank for easy Grafana queries.
+/// Symbol names enriched from InstrumentRegistry O(1) lookups.
 fn persist_stock_movers_snapshot(
     writer: &mut dhan_live_trader_storage::movers_persistence::StockMoversWriter,
     snapshot: &super::top_movers::TopMoversSnapshot,
     ts_nanos: i64,
+    registry: &Option<
+        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+    >,
 ) {
     if snapshot.gainers.is_empty() && snapshot.losers.is_empty() && snapshot.most_active.is_empty()
     {
@@ -179,65 +183,44 @@ fn persist_stock_movers_snapshot(
     let segment_str =
         |code: u8| -> &'static str { dhan_live_trader_common::segment::segment_code_to_str(code) };
 
-    // Persist gainers
-    for (i, entry) in snapshot.gainers.iter().enumerate() {
-        let _ = writer.append_stock_mover(
-            ts_nanos,
-            "GAINER",
-            (i as i32).saturating_add(1),
-            entry.security_id,
-            segment_str(entry.exchange_segment_code),
-            "", // symbol not yet enriched (Phase A Item 3)
-            dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub(
-                entry.last_traded_price,
-            ),
-            0.0, // prev_close not in MoverEntry yet
-            dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub(
-                entry.change_pct,
-            ),
-            i64::from(entry.volume),
-        );
-    }
+    // O(1) EXEMPT: cold path — registry lookup per entry (max 60 lookups per snapshot).
+    let lookup_symbol = |security_id: u32| -> &str {
+        registry
+            .as_ref()
+            .and_then(|r| r.get(security_id))
+            .map(|inst| inst.display_label.as_str())
+            .unwrap_or("")
+    };
 
-    // Persist losers
-    for (i, entry) in snapshot.losers.iter().enumerate() {
-        let _ = writer.append_stock_mover(
-            ts_nanos,
-            "LOSER",
-            (i as i32).saturating_add(1),
-            entry.security_id,
-            segment_str(entry.exchange_segment_code),
-            "",
-            dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub(
-                entry.last_traded_price,
-            ),
-            0.0,
-            dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub(
-                entry.change_pct,
-            ),
-            i64::from(entry.volume),
-        );
-    }
+    let f32_clean = dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub;
 
-    // Persist most active
-    for (i, entry) in snapshot.most_active.iter().enumerate() {
-        let _ = writer.append_stock_mover(
-            ts_nanos,
-            "MOST_ACTIVE",
-            (i as i32).saturating_add(1),
-            entry.security_id,
-            segment_str(entry.exchange_segment_code),
-            "",
-            dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub(
-                entry.last_traded_price,
-            ),
-            0.0,
-            dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub(
-                entry.change_pct,
-            ),
-            i64::from(entry.volume),
-        );
-    }
+    let persist_entries =
+        |writer: &mut dhan_live_trader_storage::movers_persistence::StockMoversWriter,
+         entries: &[super::top_movers::MoverEntry],
+         category: &str| {
+            for (i, entry) in entries.iter().enumerate() {
+                let symbol = lookup_symbol(entry.security_id);
+                let prev_close = f32_clean(entry.prev_close);
+                let ltp = f32_clean(entry.last_traded_price);
+                let change_pct = f32_clean(entry.change_pct);
+                let _ = writer.append_stock_mover(
+                    ts_nanos,
+                    category,
+                    (i as i32).saturating_add(1),
+                    entry.security_id,
+                    segment_str(entry.exchange_segment_code),
+                    symbol,
+                    ltp,
+                    prev_close,
+                    change_pct,
+                    i64::from(entry.volume),
+                );
+            }
+        };
+
+    persist_entries(writer, &snapshot.gainers, "GAINER");
+    persist_entries(writer, &snapshot.losers, "LOSER");
+    persist_entries(writer, &snapshot.most_active, "MOST_ACTIVE");
 
     // Best-effort flush
     let _ = writer.flush();
@@ -246,18 +229,59 @@ fn persist_stock_movers_snapshot(
 /// Persists an option movers snapshot to QuestDB (cold path, best-effort).
 ///
 /// Writes top 20 entries per category (7 categories × 20 = 140 rows max).
+/// Contract metadata enriched from InstrumentRegistry O(1) lookups.
 fn persist_option_movers_snapshot(
     writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
     snapshot: &super::option_movers::OptionMoversSnapshot,
     ts_nanos: i64,
+    registry: &Option<
+        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+    >,
 ) {
     let f32_clean = dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub;
 
+    // O(1) EXEMPT: cold path — registry lookup per entry (max 140 lookups per snapshot).
     let persist_category =
         |writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
          entries: &[super::option_movers::OptionMoverEntry],
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
+                // Enrich from registry — all O(1) lookups on cold path
+                let (contract_name, underlying, option_type_str, strike, expiry_str) =
+                    if let Some(reg) = registry {
+                        if let Some(inst) = reg.get(entry.security_id) {
+                            let ot = inst
+                                .option_type
+                                .map(|ot| match ot {
+                                    dhan_live_trader_common::types::OptionType::Call => "CE",
+                                    dhan_live_trader_common::types::OptionType::Put => "PE",
+                                })
+                                .unwrap_or("");
+                            let strike_val = inst.strike_price.unwrap_or(0.0);
+                            let expiry = inst
+                                .expiry_date
+                                .map(|d| d.format("%Y-%m-%d").to_string())
+                                .unwrap_or_default();
+                            (
+                                inst.display_label.as_str(),
+                                inst.underlying_symbol.as_str(),
+                                ot,
+                                strike_val,
+                                expiry,
+                            )
+                        } else {
+                            ("", "", "", 0.0, String::new())
+                        }
+                    } else {
+                        ("", "", "", 0.0, String::new())
+                    };
+
+                // Spot price: look up underlying's LTP from registry
+                // (Not available from registry — registry is static metadata.
+                //  Spot price requires live tick data. Use 0.0 for now;
+                //  the dashboard API enriches from QuestDB at query time.)
+                let spot_price = 0.0;
+
                 let _ = writer.append_option_mover(
                     ts_nanos,
                     category,
@@ -266,12 +290,12 @@ fn persist_option_movers_snapshot(
                     dhan_live_trader_common::segment::segment_code_to_str(
                         entry.exchange_segment_code,
                     ),
-                    "",  // contract_name — enriched later
-                    "",  // underlying — enriched later
-                    "",  // option_type — enriched later
-                    0.0, // strike — enriched later
-                    "",  // expiry — enriched later
-                    0.0, // spot_price — enriched later
+                    contract_name,
+                    underlying,
+                    option_type_str,
+                    strike,
+                    &expiry_str,
+                    spot_price,
                     f32_clean(entry.ltp),
                     f32_clean(entry.change),
                     f32_clean(entry.change_pct),
@@ -391,7 +415,7 @@ impl TickDedupRing {
 ///   so the compiler monomorphizes (no vtable on hot path). When present, enriches every
 ///   valid tick with IV + delta/gamma/theta/vega BEFORE persistence and broadcast.
 ///   O(1) per tick (HashMap lookup + Jaeckel solve).
-// APPROVED: 12 params genuinely needed — pipeline entry point wiring tick/candle/depth/greeks/movers subsystems
+// APPROVED: 13 params genuinely needed — pipeline entry point wiring tick/candle/depth/greeks/movers subsystems + registry for enrichment
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tick_processor<G: GreeksEnricher>(
     mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
@@ -409,6 +433,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     mut option_movers: Option<super::option_movers::OptionMoversTracker>,
     mut option_movers_writer: Option<
         dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+    >,
+    instrument_registry: Option<
+        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
     >,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
@@ -986,7 +1013,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let ts_nanos = received_at_nanos.saturating_add(
                         i64::from(IST_UTC_OFFSET_SECONDS).saturating_mul(1_000_000_000),
                     );
-                    persist_stock_movers_snapshot(writer, &snapshot, ts_nanos);
+                    persist_stock_movers_snapshot(
+                        writer,
+                        &snapshot,
+                        ts_nanos,
+                        &instrument_registry,
+                    );
                     movers_persist_count = movers_persist_count.saturating_add(1);
                     m_movers_persisted.increment(1);
                 }
@@ -999,7 +1031,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let ts_nanos = received_at_nanos.saturating_add(
                         i64::from(IST_UTC_OFFSET_SECONDS).saturating_mul(1_000_000_000),
                     );
-                    persist_option_movers_snapshot(opt_writer, &opt_snapshot, ts_nanos);
+                    persist_option_movers_snapshot(
+                        opt_writer,
+                        &opt_snapshot,
+                        ts_nanos,
+                        &instrument_registry,
+                    );
                 }
 
                 last_movers_persist = Instant::now();
@@ -1147,6 +1184,7 @@ mod tests {
             stock_movers_writer,
             option_movers,
             option_movers_writer,
+            None, // instrument_registry — not needed in tests
         )
         .await;
     }

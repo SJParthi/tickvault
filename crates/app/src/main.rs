@@ -407,6 +407,11 @@ async fn main() -> Result<()> {
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
+            // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
+            let fast_registry = subscription_plan
+                .as_ref()
+                .map(|p| std::sync::Arc::new(p.registry.clone()));
+
             // Start with None writers — ticks are processed in-memory for trading.
             // QuestDB persistence reconnects in background (tables already exist
             // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
@@ -424,6 +429,7 @@ async fn main() -> Result<()> {
                     None, // stock_movers_writer — QuestDB reconnects in background
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
+                    fast_registry,
                 )
                 .await;
             });
@@ -1169,6 +1175,11 @@ async fn main() -> Result<()> {
                 }
             };
 
+        // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
+        let slow_registry = subscription_plan
+            .as_ref()
+            .map(|p| std::sync::Arc::new(p.registry.clone()));
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -1183,6 +1194,7 @@ async fn main() -> Result<()> {
                 stock_movers_writer,
                 option_movers_tracker,
                 option_movers_writer,
+                slow_registry,
             )
             .await;
         });

@@ -1133,8 +1133,8 @@ mod tests {
 
     #[test]
     fn test_dashboard_services_count() {
-        // 6 services: Grafana, QuestDB, Prometheus, Jaeger, Traefik, Portal
-        assert_eq!(DASHBOARD_SERVICES.len(), 6, "expected 6 dashboard services");
+        // 7 services: Grafana, QuestDB, Prometheus, Jaeger, Traefik, Portal, Market Dashboard
+        assert_eq!(DASHBOARD_SERVICES.len(), 7, "expected 7 dashboard services");
     }
 
     #[tokio::test]

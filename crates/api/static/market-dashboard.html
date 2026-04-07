@@ -37,10 +37,17 @@
         .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
 
         /* Sub-tabs */
-        .sub-tabs { display: flex; gap: 4px; padding: 8px 16px; background: var(--bg); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+        .sub-tabs { display: flex; gap: 4px; padding: 8px 16px; background: var(--bg); border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
         .sub-tab { padding: 5px 14px; cursor: pointer; font-size: 12px; border-radius: 4px; color: var(--text-dim); background: var(--bg-card); border: 1px solid var(--border); transition: all 0.15s; }
         .sub-tab:hover { color: var(--text); border-color: var(--text-dim); }
         .sub-tab.active { color: var(--blue); border-color: var(--blue); background: rgba(41,98,255,0.1); }
+
+        /* Toggle switch (Gainers/Losers) */
+        .toggle-group { display: flex; align-items: center; gap: 0; margin-left: 16px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+        .toggle-btn { padding: 4px 12px; cursor: pointer; font-size: 11px; font-weight: 600; background: var(--bg-card); color: var(--text-muted); border: none; transition: all 0.15s; }
+        .toggle-btn.active-green { background: var(--green); color: #fff; }
+        .toggle-btn.active-red { background: var(--red); color: #fff; }
+        .toggle-sep { width: 1px; height: 20px; background: var(--border); }
 
         /* Table */
         .data-table { width: 100%; border-collapse: collapse; }
@@ -62,9 +69,6 @@
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
         .loading { text-align: center; padding: 40px; color: var(--text-muted); }
-
-        /* Format helpers */
-        .val-cr { font-size: 11px; color: var(--text-dim); }
     </style>
 </head>
 <body>
@@ -95,9 +99,14 @@
     <!-- STOCKS TAB -->
     <div class="tab-content active" id="tab-stocks">
         <div class="sub-tabs">
-            <div class="sub-tab active" onclick="switchStockSub('losers')">Price Losers</div>
-            <div class="sub-tab" onclick="switchStockSub('gainers')">Price Gainers</div>
-            <div class="sub-tab" onclick="switchStockSub('most_active')">Most Active</div>
+            <div class="sub-tab active" data-stock-sub="losers" onclick="switchStockSub('losers')">Price Losers</div>
+            <div class="sub-tab" data-stock-sub="gainers" onclick="switchStockSub('gainers')">Price Gainers</div>
+            <div class="sub-tab" data-stock-sub="most_active" onclick="switchStockSub('most_active')">Most Active</div>
+            <div class="toggle-group">
+                <div class="toggle-btn active-green" id="toggleGainers" onclick="toggleGainersLosers('gainers')">Gainers</div>
+                <div class="toggle-sep"></div>
+                <div class="toggle-btn active-red" id="toggleLosers" onclick="toggleGainersLosers('losers')">Losers</div>
+            </div>
         </div>
         <table class="data-table">
             <thead>
@@ -118,12 +127,12 @@
     <!-- OPTIONS TAB -->
     <div class="tab-content" id="tab-options">
         <div class="sub-tabs">
-            <div class="sub-tab active" onclick="switchOptionSub('TOP_VOLUME')">Top Volume</div>
-            <div class="sub-tab" onclick="switchOptionSub('HIGHEST_OI')">Highest OI</div>
-            <div class="sub-tab" onclick="switchOptionSub('OI_GAINER')">OI Gainers</div>
-            <div class="sub-tab" onclick="switchOptionSub('OI_LOSER')">OI Losers</div>
-            <div class="sub-tab" onclick="switchOptionSub('PRICE_GAINER')">Price Gainers</div>
-            <div class="sub-tab" onclick="switchOptionSub('PRICE_LOSER')">Price Losers</div>
+            <div class="sub-tab active" data-opt-sub="HIGHEST_OI" onclick="switchOptionSub('HIGHEST_OI')">Highest OI</div>
+            <div class="sub-tab" data-opt-sub="OI_GAINER" onclick="switchOptionSub('OI_GAINER')">OI Gainers</div>
+            <div class="sub-tab" data-opt-sub="OI_LOSER" onclick="switchOptionSub('OI_LOSER')">OI Losers</div>
+            <div class="sub-tab" data-opt-sub="TOP_VOLUME" onclick="switchOptionSub('TOP_VOLUME')">Top Volume</div>
+            <div class="sub-tab" data-opt-sub="PRICE_GAINER" onclick="switchOptionSub('PRICE_GAINER')">Price Gainers</div>
+            <div class="sub-tab" data-opt-sub="PRICE_LOSER" onclick="switchOptionSub('PRICE_LOSER')">Price Losers</div>
         </div>
         <table class="data-table">
             <thead>
@@ -171,24 +180,30 @@
 
     <!-- Status Bar -->
     <div class="status-bar">
-        <span>DLT Market Dashboard v0.1.0</span>
+        <span>DLT Market Dashboard v0.2.0</span>
         <span>Auto-refresh: 3s | <a href="/portal/options-chain" style="color:var(--blue);text-decoration:none">Options Chain</a> | <a href="/portal" style="color:var(--blue);text-decoration:none">Control Panel</a></span>
     </div>
 
 <script>
-// ── State ──
+// State
 var currentStockSub = 'losers';
-var currentOptionSub = 'TOP_VOLUME';
+var currentOptionSub = 'HIGHEST_OI';
 var refreshTimer = null;
 
-// ── Formatters ──
-function fmt(v, d) { d = d || 2; return v != null && isFinite(v) ? Number(v).toFixed(d) : '--'; }
+// Formatters
+function fmt(v, d) { d = d || 2; return v != null && isFinite(v) ? Number(v).toLocaleString('en-IN', {minimumFractionDigits: d, maximumFractionDigits: d}) : '--'; }
 function fmtInt(v) { return v != null ? Number(v).toLocaleString('en-IN') : '--'; }
-function fmtOI(v) { return v != null ? (Math.abs(v) >= 100000 ? (v/100000).toFixed(2)+'L' : Number(v).toLocaleString('en-IN')) : '--'; }
+function fmtOI(v) {
+    if (v == null) return '--';
+    var abs = Math.abs(v);
+    if (abs >= 10000000) return (v/10000000).toFixed(2) + 'Cr';
+    if (abs >= 100000) return (v/100000).toFixed(2) + 'L';
+    return Number(v).toLocaleString('en-IN');
+}
 function cls(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'dim'; }
 function sign(v) { return v > 0 ? '+' : ''; }
 
-// ── Tab Switching ──
+// Tab switching
 function switchTab(name) {
     document.querySelectorAll('.tab').forEach(function(t,i) {
         t.classList.toggle('active', ['stocks','options','index'][i] === name);
@@ -200,39 +215,46 @@ function switchTab(name) {
 
 function switchStockSub(sub) {
     currentStockSub = sub;
-    document.querySelectorAll('#tab-stocks .sub-tab').forEach(function(t) {
-        t.classList.toggle('active', t.textContent.toLowerCase().replace(/\s/g,'_') === sub || (sub === 'losers' && t.textContent === 'Price Losers') || (sub === 'gainers' && t.textContent === 'Price Gainers') || (sub === 'most_active' && t.textContent === 'Most Active'));
+    document.querySelectorAll('[data-stock-sub]').forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-stock-sub') === sub);
     });
     fetchStockMovers();
 }
 
 function switchOptionSub(cat) {
     currentOptionSub = cat;
-    document.querySelectorAll('#tab-options .sub-tab').forEach(function(t) {
-        var map = {'Top Volume':'TOP_VOLUME','Highest OI':'HIGHEST_OI','OI Gainers':'OI_GAINER','OI Losers':'OI_LOSER','Price Gainers':'PRICE_GAINER','Price Losers':'PRICE_LOSER'};
-        t.classList.toggle('active', map[t.textContent] === cat);
+    document.querySelectorAll('[data-opt-sub]').forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-opt-sub') === cat);
     });
     fetchOptionMovers();
 }
 
-// ── Data Fetchers ──
+function toggleGainersLosers(which) {
+    if (which === 'gainers') {
+        switchStockSub('gainers');
+    } else {
+        switchStockSub('losers');
+    }
+}
+
+// Data fetchers
 function fetchIndices() {
     fetch('/api/market/indices')
         .then(function(r) { return r.json(); })
         .then(function(d) {
             if (!d.available) return;
-            // Ticker bar — show top 5 indices
-            var majorIds = [13, 25, 27, 21, 442]; // Nifty, BankNifty, FinNifty, VIX, Midcap
+            // Ticker bar - top 5 major indices
+            var majorIds = [13, 25, 27, 21, 442];
             var bar = '';
             var majors = d.indices.filter(function(i) { return majorIds.indexOf(i.security_id) >= 0; });
-            // Sort by majorIds order
             majors.sort(function(a,b) { return majorIds.indexOf(a.security_id) - majorIds.indexOf(b.security_id); });
             majors.forEach(function(idx) {
                 var c = idx.change >= 0 ? 'positive' : 'negative';
+                var arrow = idx.change >= 0 ? '&#9650;' : '&#9660;';
                 bar += '<div class="ticker-item">';
                 bar += '<span class="ticker-name">' + idx.name + '</span>';
                 bar += '<span class="ticker-price">' + fmt(idx.ltp, 2) + '</span>';
-                bar += '<span class="ticker-change ' + c + '">' + sign(idx.change) + fmt(idx.change, 2) + ' (' + sign(idx.change_pct) + fmt(idx.change_pct, 2) + '%)</span>';
+                bar += '<span class="ticker-change ' + c + '">' + arrow + ' ' + sign(idx.change) + fmt(idx.change, 2) + ' (' + sign(idx.change_pct) + fmt(idx.change_pct, 2) + '%)</span>';
                 bar += '</div>';
             });
             document.getElementById('tickerBar').innerHTML = bar || '<div class="ticker-item"><span class="ticker-name">No data</span></div>';
@@ -273,8 +295,9 @@ function fetchStockMovers() {
             var html = '';
             list.forEach(function(s) {
                 var c = cls(s.change_pct);
+                var name = s.symbol || ('SID-' + s.security_id);
                 html += '<tr>';
-                html += '<td>' + s.symbol + '</td>';
+                html += '<td>' + name + '</td>';
                 html += '<td>' + fmt(s.ltp, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(s.change) + fmt(s.change, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(s.change_pct) + fmt(s.change_pct, 2) + ' %</td>';
@@ -298,8 +321,9 @@ function fetchOptionMovers() {
             d.entries.forEach(function(o) {
                 var c = cls(o.change_pct);
                 var oic = cls(o.oi_change_pct);
+                var name = o.contract_name || ('SID-' + o.security_id);
                 html += '<tr>';
-                html += '<td>' + o.contract_name + '</td>';
+                html += '<td>' + name + '</td>';
                 html += '<td>' + fmt(o.spot_price, 2) + '</td>';
                 html += '<td>' + fmt(o.ltp, 2) + '</td>';
                 html += '<td class="' + c + '">' + sign(o.change) + fmt(o.change, 2) + '</td>';
@@ -321,7 +345,7 @@ function fetchAll() {
     fetchOptionMovers();
 }
 
-// ── Init ──
+// Init
 fetchAll();
 refreshTimer = setInterval(fetchAll, 3000);
 </script>
