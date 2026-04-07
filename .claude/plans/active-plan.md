@@ -1,53 +1,96 @@
-# Implementation Plan: WebSocket Connection Monitoring — Portal + Telegram + Fixes
+# Implementation Plan: Live Market Dashboard (Dhan web.dhan.co Clone)
 
-**Status:** VERIFIED
+**Status:** DRAFT
 **Date:** 2026-04-07
-**Approved by:** Parthiban
+**Approved by:** pending
 
 ## Summary
 
-1. Portal shows zero WebSocket connection status — need live display for all WS types
-2. Telegram alert events for depth/order-update exist in events.rs but are NEVER fired
-3. 200-level depth retries endlessly outside market hours (log spam)
-4. Historical fetch runs at 8:36 AM (should only run before 8:00 AM or after 15:30)
+Build a full live market dashboard webpage at `/portal/market-dashboard` that replicates
+Dhan's web.dhan.co market views — showing Index tickers, Stock Price Movers (Gainers/Losers),
+Option Movers (OI/Volume/Price), Index Dashboard (all NSE indices OHLC), and full Options Chain
+with Greeks. All data from our live tick pipeline + QuestDB. Dark theme, auto-refreshing,
+mobile-responsive, AWS-deployable with auth.
+
+## Data Sources (Already Available)
+
+| Data | Source | API |
+|------|--------|-----|
+| Index LTP/Change/OHLC | `ticks` table (segment=IDX_I) | NEW: `/api/market/indices` |
+| Stock LTP/Change/Volume | In-memory `TopMoversSnapshot` | EXISTS: `/api/top-movers` (needs symbol names) |
+| Options Chain + Greeks | `option_greeks` + `dhan_option_chain_raw` | EXISTS: `/api/option-chain` |
+| PCR | QuestDB `pcr_snapshots` | EXISTS: `/api/pcr` |
+| Previous Close | `previous_close` table | Already used by tick processor |
+| Option Movers | `option_movers` table in QuestDB | NEW: `/api/market/option-movers` |
 
 ## Plan Items
 
-- [x] Item 1: Add depth + order update atomic counters to SystemHealthStatus
-  - Files: crates/api/src/state.rs
-  - Tests: test_depth_20_connections, test_depth_200_connections, test_order_update_connected
+- [ ] Item 1: Add symbol name lookup to TopMoversResponse (MoverEntry currently has only security_id)
+  - Files: crates/core/src/pipeline/top_movers.rs, crates/api/src/handlers/top_movers.rs
+  - Change: Add `symbol: String` field to MoverEntry, lookup from instrument registry
+  - Tests: test_mover_entry_includes_symbol
 
-- [x] Item 2: Expose depth + order update status in /health response
-  - Files: crates/api/src/handlers/health.rs
-  - Tests: test_health_check_depth_detail, test_health_check_order_update_detail
+- [ ] Item 2: Add `/api/market/indices` endpoint — live index data from ticks
+  - Files: crates/api/src/handlers/market_data.rs (new), crates/api/src/lib.rs
+  - Returns: Array of {name, ltp, change, change_pct, open, high, low, prev_close}
+  - Source: QuestDB query on `ticks` for IDX_I segment + `previous_close`
+  - Tests: test_indices_response_format, test_indices_empty_when_no_data
 
-- [x] Item 3: Add WebSocket connection status section to portal with live auto-refresh
-  - Files: crates/api/static/portal.html
-  - Tests: test_portal_html_contains_websocket_status (in static_file.rs)
+- [ ] Item 3: Add `/api/market/option-movers` endpoint — top options by OI/Volume/Price change
+  - Files: crates/api/src/handlers/market_data.rs, crates/api/src/lib.rs
+  - Returns: {highest_oi, oi_gainers, oi_losers, top_volume, price_gainers, price_losers}
+  - Source: QuestDB query on `option_movers` table
+  - Tests: test_option_movers_response_format
 
-- [x] Item 4: Wire Telegram notifications for depth + order update connect/disconnect
-  - Files: crates/app/src/main.rs
-  - Tests: existing notification event tests cover formatting
+- [ ] Item 4: Build `/portal/market-dashboard` HTML page with all 5 tabs
+  - Files: crates/api/static/market-dashboard.html (new), crates/api/src/handlers/static_file.rs, crates/api/src/lib.rs
+  - Tabs: Stocks | Options | Index | (using existing /api/option-chain for Options Chain)
+  - Features: Index ticker bar (top), auto-refresh 3s, dark theme, mobile responsive
+  - Tests: test_market_dashboard_html_not_empty, test_market_dashboard_handler_returns_ok
 
-- [x] Item 5: Add market-hours awareness to 200-level depth reconnection
-  - Files: crates/core/src/websocket/depth_connection.rs
-  - Tests: unit test for pre-market backoff logic
+- [ ] Item 5: Register new routes and test
+  - Files: crates/api/src/lib.rs
+  - Tests: route registration test
 
-- [x] Item 6: Fix historical fetch time window (before 8:00 AM OR after 15:30 only)
-  - Files: crates/app/src/main.rs
-  - Tests: test_historical_fetch_time_guard
-
-- [x] Item 7: Build and verify all changes
+- [ ] Item 6: Build, clippy, fmt, test
   - Files: n/a
-  - Tests: cargo build + cargo test
+  - Tests: cargo build + cargo test --workspace
+
+## Page Layout (matching Dhan web.dhan.co)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ NIFTY 22,819 -148 (-0.65%) │ BANKNIFTY 52,029 -579 (-1.10%)  │
+│ FINNIFTY 24,390 -213       │ VIX 25.79 +0.32 │ MIDCAP 12,455 │
+├─────────────────────────────────────────────────────────────────┤
+│ [Stocks] [Options] [Index]                                      │
+├─────────────────────────────────────────────────────────────────┤
+│ STOCKS TAB:                                                     │
+│ [Gainers] [Losers] [Most Active] [F&O Stocks]                  │
+│ Name         LTP      Change   Change%  Value(Cr)  Volume      │
+│ HDFC Bank    766.00   -5.00    -0.65%   xxx        xxx         │
+│ ...                                                             │
+├─────────────────────────────────────────────────────────────────┤
+│ OPTIONS TAB:                                                    │
+│ [Highest OI] [OI Gainers] [OI Losers] [Top Volume] [Price +/-] │
+│ Name                Spot    LTP   Change  Change%  OI    Volume │
+│ BANKNIFTY 28APR ... 52,055  630   -215    -25.47%  92640  ...  │
+├─────────────────────────────────────────────────────────────────┤
+│ INDEX TAB:                                                      │
+│ [Global] [NSE] [BSE]                                           │
+│ Name          LTP      Change   Change%  Open     High    Low  │
+│ Nifty 50      22,819   -148     -0.65%   22,838   22,843  ... │
+│ Nifty Bank    52,029   -579     -1.10%   52,258   52,290  ... │
+│ ...                                                             │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Boot at 8:36 AM | Portal shows 5/5 Live Feed, 4/4 depth-20, 0/4 depth-200. Historical fetch SKIPPED (8:00-15:30 window). Telegram: connection alerts for each WS. |
-| 2 | Boot at 7:50 AM | Historical fetch runs (before 8:00 cutoff). |
-| 3 | Market open 9:15 AM | 200-level depth connects. Portal updates 4/4. Telegram fires connect alerts. |
-| 4 | Post-market 15:35 | Historical fetch runs. |
-| 5 | WS disconnect mid-market | Portal updates count. Telegram fires DISCONNECTED alert. |
-| 6 | 200-level depth pre-market | Logs INFO once, waits until 8:55 AM before retrying. No spam. |
+| 1 | Market open 9:15+ | All tabs populated with live data, auto-refreshing every 3s |
+| 2 | Pre-market 9:00-9:15 | Index bar shows pre-open prices, movers may be empty |
+| 3 | Post-market 15:30+ | Last known data displayed, marked as "Market Closed" |
+| 4 | Mobile browser | Responsive layout, horizontal scroll on tables |
+| 5 | AWS deployment | Accessible via Traefik reverse proxy with basic auth |
