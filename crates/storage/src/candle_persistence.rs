@@ -278,8 +278,12 @@ impl CandlePersistenceWriter {
 const LIVE_CANDLE_FLUSH_BATCH_SIZE: usize = 128;
 
 /// Max reconnection attempts per cycle for live candle writer.
+/// Retained for test assertions. Production reconnect is now non-blocking.
+#[cfg(test)]
 const LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// Initial backoff delay (ms) for reconnection.
+/// Retained for test assertions. Production reconnect no longer sleeps.
+#[cfg(test)]
 const LIVE_CANDLE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 /// Minimum interval between reconnection attempt cycles.
 const LIVE_CANDLE_RECONNECT_THROTTLE_SECS: u64 = 30;
@@ -807,48 +811,33 @@ impl LiveCandleWriter {
         total_recovered
     }
 
-    /// Attempts to reconnect to QuestDB with exponential backoff.
+    /// Attempts to reconnect to QuestDB — non-blocking (no sleep on hot path).
+    ///
+    /// Single immediate attempt. If it fails, candles are buffered in the ring
+    /// buffer. The 30-second throttle in `try_reconnect_on_error()` prevents
+    /// reconnect storms without blocking the tick processor.
     fn reconnect(&mut self) -> Result<()> {
-        let mut delay_ms = LIVE_CANDLE_RECONNECT_INITIAL_DELAY_MS;
+        warn!(
+            buffered_candles = self.candle_buffer.len(),
+            "attempting QuestDB ILP reconnection for candle writer (non-blocking)"
+        );
 
-        for attempt in 1..=LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS {
-            warn!(
-                attempt,
-                max_attempts = LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
-                delay_ms,
-                buffered_candles = self.candle_buffer.len(),
-                "attempting QuestDB ILP reconnection for candle writer"
-            );
-
-            std::thread::sleep(Duration::from_millis(delay_ms));
-
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(new_sender) => {
-                    self.buffer = new_sender.new_buffer();
-                    self.sender = Some(new_sender);
-                    self.pending_count = 0;
-                    info!(
-                        attempt,
-                        "QuestDB ILP reconnection succeeded for candle writer"
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(
-                        attempt,
-                        max_attempts = LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
-                        ?err,
-                        "QuestDB ILP reconnection failed for candle writer"
-                    );
-                    delay_ms = delay_ms.saturating_mul(2);
-                }
+        match Sender::from_conf(&self.ilp_conf_string) {
+            Ok(new_sender) => {
+                self.buffer = new_sender.new_buffer();
+                self.sender = Some(new_sender);
+                self.pending_count = 0;
+                info!("QuestDB ILP reconnection succeeded for candle writer");
+                return Ok(());
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "QuestDB ILP reconnection failed for candle writer — candles buffered in ring"
+                );
+                anyhow::bail!("QuestDB ILP reconnection failed for candle writer")
             }
         }
-
-        anyhow::bail!(
-            "QuestDB ILP reconnection failed after {} attempts for candle writer",
-            LIVE_CANDLE_MAX_RECONNECT_ATTEMPTS,
-        )
     }
 
     /// Creates a fresh ILP buffer. Uses sender's config if available,

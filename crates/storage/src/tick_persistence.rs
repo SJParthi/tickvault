@@ -56,10 +56,16 @@ pub fn tick_dedup_key() -> &'static str {
 }
 
 /// Maximum number of reconnection attempts for QuestDB ILP sender.
+/// Used in tests to verify reconnect policy. Production reconnect is now
+/// non-blocking (single attempt per 30s throttle window).
+#[cfg(test)]
 const QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
 /// Initial reconnect delay for QuestDB ILP sender (milliseconds).
-/// Exponential backoff: 1000ms, 2000ms, 4000ms.
+/// Retained for test assertions. Production reconnect no longer sleeps —
+/// the 30-second throttle gate prevents reconnect storms without blocking
+/// the async executor.
+#[cfg(test)]
 const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
@@ -687,55 +693,37 @@ impl TickPersistenceWriter {
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
     ///
-    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
-    /// On success, replaces the sender and creates a fresh buffer.
-    /// In-flight ticks must be rescued BEFORE calling this method
-    /// (via `rescue_in_flight()`).
+    /// **Non-blocking:** No sleep/backoff in the hot path. Attempts connection
+    /// immediately. If it fails, returns error and the caller buffers ticks to
+    /// the ring buffer. The 30-second throttle in `try_reconnect_on_error()`
+    /// prevents reconnect storms. This design ensures the tick processor task
+    /// is NEVER blocked by QuestDB outages.
     ///
     /// # Errors
-    /// Returns error if all reconnection attempts fail.
+    /// Returns error if reconnection fails.
     fn reconnect(&mut self) -> Result<()> {
-        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+        // Single non-blocking attempt — no std::thread::sleep on the hot path.
+        // The RECONNECT_THROTTLE_SECS gate in try_reconnect_on_error() ensures
+        // we only attempt once per 30 seconds during sustained outages.
+        warn!("attempting QuestDB ILP reconnection for tick writer (non-blocking)");
 
-        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
-            warn!(
-                attempt,
-                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                delay_ms,
-                "attempting QuestDB ILP reconnection for tick writer"
-            );
-
-            std::thread::sleep(Duration::from_millis(delay_ms));
-
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(new_sender) => {
-                    self.buffer = new_sender.new_buffer();
-                    self.sender = Some(new_sender);
-                    self.pending_count = 0;
-                    self.last_flush_ms = current_time_ms();
-                    info!(
-                        attempt,
-                        "QuestDB ILP reconnection succeeded for tick writer"
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(
-                        attempt,
-                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                        ?err,
-                        "QuestDB ILP reconnection failed for tick writer"
-                    );
-                    // Exponential backoff: double the delay for next attempt.
-                    delay_ms = delay_ms.saturating_mul(2);
-                }
+        match Sender::from_conf(&self.ilp_conf_string) {
+            Ok(new_sender) => {
+                self.buffer = new_sender.new_buffer();
+                self.sender = Some(new_sender);
+                self.pending_count = 0;
+                self.last_flush_ms = current_time_ms();
+                info!("QuestDB ILP reconnection succeeded for tick writer");
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "QuestDB ILP reconnection failed for tick writer — ticks buffered in ring"
+                );
+                anyhow::bail!("QuestDB ILP reconnection failed for tick writer")
             }
         }
-
-        anyhow::bail!(
-            "QuestDB ILP reconnection failed after {} attempts for tick writer",
-            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-        )
     }
 
     /// Attempts reconnection only when the sender is `None` (i.e., after a
@@ -1622,55 +1610,36 @@ impl DepthPersistenceWriter {
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
     ///
-    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
-    /// On success, replaces the sender and creates a fresh buffer.
-    /// In-flight snapshots must be rescued BEFORE calling this method
-    /// (via `rescue_in_flight()`).
+    /// **Non-blocking:** No sleep/backoff in the hot path. Attempts connection
+    /// immediately. If it fails, returns error and the caller buffers depth
+    /// snapshots to the ring buffer. The 30-second throttle in
+    /// `try_reconnect_on_error()` prevents reconnect storms.
     ///
     /// # Errors
-    /// Returns error if all reconnection attempts fail.
+    /// Returns error if reconnection fails.
     fn reconnect(&mut self) -> Result<()> {
-        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+        warn!(
+            buffered_snapshots = self.depth_buffer.len(),
+            "attempting QuestDB ILP reconnection for depth writer (non-blocking)"
+        );
 
-        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
-            warn!(
-                attempt,
-                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                delay_ms,
-                buffered_snapshots = self.depth_buffer.len(),
-                "attempting QuestDB ILP reconnection for depth writer"
-            );
-
-            std::thread::sleep(Duration::from_millis(delay_ms));
-
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(new_sender) => {
-                    self.buffer = new_sender.new_buffer();
-                    self.sender = Some(new_sender);
-                    self.pending_count = 0;
-                    self.last_flush_ms = current_time_ms();
-                    info!(
-                        attempt,
-                        "QuestDB ILP reconnection succeeded for depth writer"
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(
-                        attempt,
-                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                        ?err,
-                        "QuestDB ILP reconnection failed for depth writer"
-                    );
-                    delay_ms = delay_ms.saturating_mul(2);
-                }
+        match Sender::from_conf(&self.ilp_conf_string) {
+            Ok(new_sender) => {
+                self.buffer = new_sender.new_buffer();
+                self.sender = Some(new_sender);
+                self.pending_count = 0;
+                self.last_flush_ms = current_time_ms();
+                info!("QuestDB ILP reconnection succeeded for depth writer");
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "QuestDB ILP reconnection failed for depth writer — depth buffered in ring"
+                );
+                anyhow::bail!("QuestDB ILP reconnection failed for depth writer")
             }
         }
-
-        anyhow::bail!(
-            "QuestDB ILP reconnection failed after {} attempts for depth writer",
-            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-        )
     }
 
     /// Attempts reconnection only when the sender is `None`. Throttled to at
