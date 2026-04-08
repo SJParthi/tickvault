@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Options Chain — dhan-live-trader</title>
+    <style>
+        :root {
+            --bg: #0d1117; --bg-card: #161b22; --border: #30363d;
+            --text: #e6edf3; --text-dim: #8b949e; --text-muted: #484f58;
+            --green: #26a69a; --red: #ef5350; --blue: #2962ff;
+            --yellow: #ffab00; --purple: #7c4dff;
+            --ce-bg: rgba(38,166,154,0.06); --pe-bg: rgba(239,83,80,0.06);
+            --atm-bg: rgba(41,98,255,0.15);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 12px; }
+
+        .header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+        .header h1 { font-size: 16px; font-weight: 600; }
+        .header h1 span { color: var(--blue); }
+        .header .back { color: var(--text-dim); text-decoration: none; font-size: 13px; }
+        .header .back:hover { color: var(--text); }
+
+        .controls { display: flex; gap: 12px; align-items: center; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); flex-wrap: wrap; }
+        .controls label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .controls select, .controls input { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; }
+        .controls select:focus, .controls input:focus { outline: none; border-color: var(--blue); }
+
+        .summary { display: flex; gap: 24px; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+        .summary .item { display: flex; flex-direction: column; }
+        .summary .item .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .summary .item .value { font-size: 14px; font-weight: 600; }
+        .summary .item .value.green { color: var(--green); }
+        .summary .item .value.red { color: var(--red); }
+        .summary .item .value.blue { color: var(--blue); }
+
+        .chain-table { width: 100%; border-collapse: collapse; }
+        .chain-table th { position: sticky; top: 0; background: var(--bg-card); padding: 6px 8px; text-align: right; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 2px solid var(--border); white-space: nowrap; z-index: 10; }
+        .chain-table th.strike { text-align: center; background: var(--bg); }
+        .chain-table th.ce { color: var(--green); }
+        .chain-table th.pe { color: var(--red); }
+
+        .chain-table td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+        .chain-table td.strike { text-align: center; font-weight: 700; font-size: 13px; background: var(--bg); border-left: 2px solid var(--border); border-right: 2px solid var(--border); }
+        .chain-table tr.ce-row td:not(.strike) { background: var(--ce-bg); }
+        .chain-table tr.pe-row td:not(.strike) { background: var(--pe-bg); }
+        .chain-table tr.atm td.strike { background: var(--atm-bg); color: var(--blue); }
+        .chain-table tr:hover td { filter: brightness(1.2); }
+
+        .positive { color: var(--green); }
+        .negative { color: var(--red); }
+        .dim { color: var(--text-muted); }
+
+        .status-bar { display: flex; justify-content: space-between; padding: 6px 20px; border-top: 1px solid var(--border); background: var(--bg-card); font-size: 11px; color: var(--text-muted); position: fixed; bottom: 0; left: 0; right: 0; }
+        .status-bar .live { color: var(--green); }
+        .status-bar .error { color: var(--red); }
+
+        .loading { text-align: center; padding: 40px; color: var(--text-dim); }
+        .table-wrapper { overflow-y: auto; max-height: calc(100vh - 180px); }
+
+        .expiry-tabs { display: flex; gap: 2px; padding: 0 20px; }
+        .expiry-tab { padding: 6px 14px; cursor: pointer; color: var(--text-dim); border-bottom: 2px solid transparent; font-size: 12px; transition: all 0.15s; }
+        .expiry-tab:hover { color: var(--text); }
+        .expiry-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span>DLT</span> Options Chain</h1>
+        <a href="/portal" class="back">Back to Control Panel</a>
+    </div>
+
+    <div class="controls">
+        <div>
+            <label>Underlying</label>
+            <select id="underlying">
+                <option value="NIFTY">NIFTY 50</option>
+                <option value="BANKNIFTY">BANK NIFTY</option>
+                <option value="FINNIFTY">FIN NIFTY</option>
+                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
+            </select>
+        </div>
+        <div>
+            <label>Refresh</label>
+            <select id="refresh-interval">
+                <option value="5000">5s</option>
+                <option value="10000" selected>10s</option>
+                <option value="30000">30s</option>
+                <option value="0">Off</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="expiry-tabs" id="expiry-tabs"></div>
+
+    <div class="summary" id="summary">
+        <div class="item"><span class="label">Spot</span><span class="value blue" id="spot-price">--</span></div>
+        <div class="item"><span class="label">ATM Strike</span><span class="value" id="atm-strike">--</span></div>
+        <div class="item"><span class="label">ATM IV (CE)</span><span class="value" id="atm-iv-ce">--</span></div>
+        <div class="item"><span class="label">ATM IV (PE)</span><span class="value" id="atm-iv-pe">--</span></div>
+        <div class="item"><span class="label">PCR</span><span class="value" id="pcr-value">--</span></div>
+        <div class="item"><span class="label">Total CE OI</span><span class="value green" id="total-ce-oi">--</span></div>
+        <div class="item"><span class="label">Total PE OI</span><span class="value red" id="total-pe-oi">--</span></div>
+        <div class="item"><span class="label">Contracts</span><span class="value" id="contract-count">--</span></div>
+    </div>
+
+    <div class="table-wrapper">
+        <table class="chain-table">
+            <thead>
+                <tr>
+                    <th class="ce">OI</th>
+                    <th class="ce">Volume</th>
+                    <th class="ce">IV</th>
+                    <th class="ce">Delta</th>
+                    <th class="ce">Theta</th>
+                    <th class="ce">Gamma</th>
+                    <th class="ce">Vega</th>
+                    <th class="ce">Chg%</th>
+                    <th class="ce">LTP</th>
+                    <th class="strike">STRIKE</th>
+                    <th class="pe">LTP</th>
+                    <th class="pe">Chg%</th>
+                    <th class="pe">Vega</th>
+                    <th class="pe">Gamma</th>
+                    <th class="pe">Theta</th>
+                    <th class="pe">Delta</th>
+                    <th class="pe">IV</th>
+                    <th class="pe">Volume</th>
+                    <th class="pe">OI</th>
+                </tr>
+            </thead>
+            <tbody id="chain-body">
+                <tr><td colspan="19" class="loading">Loading option chain data...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="status-bar">
+        <span id="status-text">Connecting...</span>
+        <span id="last-update">--</span>
+    </div>
+
+<script>
+let refreshTimer = null;
+let currentExpiry = null;
+
+function fmt(v, d=2) { return v != null && isFinite(v) ? v.toFixed(d) : '--'; }
+function fmtOI(v) { return v != null ? (v >= 100000 ? (v/100000).toFixed(2)+'L' : v.toLocaleString('en-IN')) : '--'; }
+function fmtPct(v) { return v != null && isFinite(v) ? (v >= 0 ? '+' : '') + v.toFixed(2) + '%' : '--'; }
+function cls(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'dim'; }
+
+async function fetchChain() {
+    const underlying = document.getElementById('underlying').value;
+    const expiryParam = currentExpiry ? `&expiry=${currentExpiry}` : '';
+    const statusEl = document.getElementById('status-text');
+
+    try {
+        const resp = await fetch(`/api/option-chain?underlying=${underlying}${expiryParam}`);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            statusEl.innerHTML = `<span class="error">Error: ${err.error || resp.statusText}</span>`;
+            return;
+        }
+        const data = await resp.json();
+        renderExpiries(data.available_expiries, data.expiry);
+        renderSummary(data);
+        renderChain(data);
+        statusEl.innerHTML = `<span class="live">LIVE</span> ${underlying} | ${data.contracts.length} contracts`;
+        document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'}) + ' IST';
+    } catch(e) {
+        statusEl.innerHTML = `<span class="error">Fetch failed: ${e.message}</span>`;
+    }
+}
+
+function renderExpiries(expiries, active) {
+    const tabs = document.getElementById('expiry-tabs');
+    tabs.innerHTML = '';
+    (expiries || []).forEach(exp => {
+        const tab = document.createElement('div');
+        tab.className = 'expiry-tab' + (exp === active ? ' active' : '');
+        const d = new Date(exp + 'T00:00:00+05:30');
+        tab.textContent = d.toLocaleDateString('en-IN', {day:'numeric', month:'short'});
+        tab.onclick = () => { currentExpiry = exp; fetchChain(); };
+        tabs.appendChild(tab);
+    });
+}
+
+function renderSummary(data) {
+    document.getElementById('spot-price').textContent = fmt(data.spot_price, 2);
+
+    const strikes = [...new Set(data.contracts.map(c => c.strike_price))].sort((a,b) => a-b);
+    const atmStrike = strikes.reduce((best, s) => Math.abs(s - data.spot_price) < Math.abs(best - data.spot_price) ? s : best, strikes[0] || 0);
+    document.getElementById('atm-strike').textContent = fmt(atmStrike, 0);
+
+    const atmCE = data.contracts.find(c => c.strike_price === atmStrike && c.option_type === 'CE');
+    const atmPE = data.contracts.find(c => c.strike_price === atmStrike && c.option_type === 'PE');
+    document.getElementById('atm-iv-ce').textContent = atmCE ? fmt(atmCE.iv * 100, 1) + '%' : '--';
+    document.getElementById('atm-iv-pe').textContent = atmPE ? fmt(atmPE.iv * 100, 1) + '%' : '--';
+
+    let totalCeOI = 0, totalPeOI = 0;
+    data.contracts.forEach(c => { if(c.option_type==='CE') totalCeOI += c.oi; else totalPeOI += c.oi; });
+    document.getElementById('total-ce-oi').textContent = fmtOI(totalCeOI);
+    document.getElementById('total-pe-oi').textContent = fmtOI(totalPeOI);
+    const pcr = totalCeOI > 0 ? (totalPeOI / totalCeOI) : 0;
+    const pcrEl = document.getElementById('pcr-value');
+    pcrEl.textContent = fmt(pcr, 2);
+    pcrEl.className = 'value ' + (pcr > 1.2 ? 'red' : pcr < 0.8 ? 'green' : 'blue');
+    document.getElementById('contract-count').textContent = data.contracts.length;
+}
+
+function renderChain(data) {
+    const strikes = [...new Set(data.contracts.map(c => c.strike_price))].sort((a,b) => a-b);
+    const atmStrike = strikes.reduce((best, s) => Math.abs(s - data.spot_price) < Math.abs(best - data.spot_price) ? s : best, strikes[0] || 0);
+
+    const ceMap = {}, peMap = {};
+    data.contracts.forEach(c => { if(c.option_type==='CE') ceMap[c.strike_price]=c; else peMap[c.strike_price]=c; });
+
+    const tbody = document.getElementById('chain-body');
+    let html = '';
+    strikes.forEach(strike => {
+        const ce = ceMap[strike] || {};
+        const pe = peMap[strike] || {};
+        const isATM = strike === atmStrike;
+        const itm_ce = strike < data.spot_price;
+        const itm_pe = strike > data.spot_price;
+
+        html += `<tr class="${isATM ? 'atm' : ''}">`;
+        // CE side (left)
+        html += `<td class="${itm_ce ? 'dim' : ''}">${fmtOI(ce.oi)}</td>`;
+        html += `<td class="${itm_ce ? 'dim' : ''}">${fmtOI(ce.volume)}</td>`;
+        html += `<td>${ce.iv ? fmt(ce.iv*100,1)+'%' : '--'}</td>`;
+        html += `<td>${fmt(ce.delta, 3)}</td>`;
+        html += `<td class="negative">${fmt(ce.theta, 2)}</td>`;
+        html += `<td>${fmt(ce.gamma, 4)}</td>`;
+        html += `<td>${fmt(ce.vega, 2)}</td>`;
+        html += `<td class="${cls(ce.change_pct)}">${fmtPct(ce.change_pct)}</td>`;
+        html += `<td style="font-weight:600">${fmt(ce.ltp, 2)}</td>`;
+        // Strike
+        html += `<td class="strike">${fmt(strike, 0)}</td>`;
+        // PE side (right)
+        html += `<td style="font-weight:600">${fmt(pe.ltp, 2)}</td>`;
+        html += `<td class="${cls(pe.change_pct)}">${fmtPct(pe.change_pct)}</td>`;
+        html += `<td>${fmt(pe.vega, 2)}</td>`;
+        html += `<td>${fmt(pe.gamma, 4)}</td>`;
+        html += `<td class="negative">${fmt(pe.theta, 2)}</td>`;
+        html += `<td>${fmt(pe.delta, 3)}</td>`;
+        html += `<td>${pe.iv ? fmt(pe.iv*100,1)+'%' : '--'}</td>`;
+        html += `<td class="${itm_pe ? 'dim' : ''}">${fmtOI(pe.volume)}</td>`;
+        html += `<td class="${itm_pe ? 'dim' : ''}">${fmtOI(pe.oi)}</td>`;
+        html += `</tr>`;
+    });
+    tbody.innerHTML = html || '<tr><td colspan="19" class="loading">No data available</td></tr>';
+
+    // Scroll to ATM
+    if(strikes.length > 0) {
+        const atmIdx = strikes.indexOf(atmStrike);
+        const rows = tbody.querySelectorAll('tr');
+        if(rows[atmIdx]) rows[atmIdx].scrollIntoView({block:'center', behavior:'smooth'});
+    }
+}
+
+function startRefresh() {
+    if(refreshTimer) clearInterval(refreshTimer);
+    const interval = parseInt(document.getElementById('refresh-interval').value);
+    if(interval > 0) refreshTimer = setInterval(fetchChain, interval);
+}
+
+document.getElementById('underlying').addEventListener('change', () => { currentExpiry = null; fetchChain(); });
+document.getElementById('refresh-interval').addEventListener('change', startRefresh);
+
+fetchChain();
+startRefresh();
+</script>
+</body>
+</html>
