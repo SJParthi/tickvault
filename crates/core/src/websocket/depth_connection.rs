@@ -100,11 +100,9 @@ fn calculate_secs_until_market_open() -> u64 {
         86400 - secs_into_day + market_open_secs
     };
 
-    // Clamp: at least check interval (safety net), at most the calculated time
+    // Clamp: sleep for the calculated time, but at least the check interval (safety net).
     let secs_until = secs_until.max(0) as u64;
-    secs_until
-        .min(secs_until)
-        .max(DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS)
+    secs_until.max(DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS)
 }
 
 /// Connection timeout for depth WebSocket (seconds).

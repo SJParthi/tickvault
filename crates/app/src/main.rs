@@ -35,7 +35,7 @@ use dhan_live_trader_app::{infra, observability, trading_pipeline};
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
@@ -133,8 +133,12 @@ async fn main() -> Result<()> {
     // Step 3: Initialize structured logging + OpenTelemetry tracing layer
     // -----------------------------------------------------------------------
     let log_filter = config.logging.level.as_str();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter));
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Suppress AWS SDK credential logging (leaks access_key_id at INFO level).
+        tracing_subscriber::EnvFilter::new(format!(
+            "{log_filter},aws_config::profile::credentials=warn"
+        ))
+    });
 
     let (otel_layer, otel_provider) = match observability::init_tracing(&config.observability)
         .context("failed to initialize OpenTelemetry tracing")?
@@ -1019,6 +1023,30 @@ async fn main() -> Result<()> {
             Some(writer)
         }
     };
+
+    // -----------------------------------------------------------------------
+    // Step 6c: Pre-market readiness check (08:00/08:05 IST on trading days)
+    // -----------------------------------------------------------------------
+    // On AWS the app starts at 08:00 IST. Verify essential conditions before
+    // market open so failures are caught with 75 minutes to spare.
+    // Checks: data plan active, derivative segment enabled, token >4h remaining.
+    if is_trading {
+        let now_ist =
+            chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
+        let hour = now_ist.hour();
+        // Run pre-market check if booting between 08:00-09:14 IST (before market open).
+        if hour == 8 || (hour == 9 && now_ist.minute() < 15) {
+            info!("running pre-market readiness check (08:00–09:14 IST)");
+            match token_manager.pre_market_check().await {
+                Ok(()) => info!("pre-market readiness check passed"),
+                Err(err) => {
+                    // WARN, not ERROR — system continues but operator should investigate.
+                    // During market hours this would be CRITICAL; at 08:00 there's time to fix.
+                    warn!(error = %err, "pre-market readiness check FAILED — investigate before 09:15");
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Step 7: Load or build instruments (three-layer defense)
@@ -2947,7 +2975,8 @@ mod tests {
         assert!(addr.contains("3001"));
 
         let stagger = effective_ws_stagger(3000, true);
-        assert_eq!(stagger, 3000);
+        // Always uses fast stagger (1000ms) for crash recovery.
+        assert_eq!(stagger, 1000);
 
         let mode = determine_boot_mode(true, true);
         assert_eq!(mode, "fast");

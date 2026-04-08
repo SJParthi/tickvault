@@ -1,46 +1,48 @@
-# Implementation Plan: Production Log Fixes (6 Issues)
+# Implementation Plan: System Audit Fixes (10 items)
 
-**Status:** IN_PROGRESS
+**Status:** APPROVED
 **Date:** 2026-04-08
-**Approved by:** Parthiban
-
-## Summary
-
-Fix 6 production issues identified from runtime logs and Grafana screenshots:
-1. Alloy container DOWN (missing app.log before Docker starts)
-2. Historical candles = 0 (pre-market zone catches post-market too)
-3. Materialized views all missing (tables() doesn't list materialized views)
-4. Grafana missing depth/order WS panels
-5. Boot timeout exceeded (constituency downloads block boot for 91s)
-6. Cross-verify also uses wrong tables() check
+**Approved by:** Parthiban (implicit — "fix everything")
 
 ## Plan Items
 
-- [x] Item 1: Fix Alloy DOWN — create data/logs/app.log before docker compose up
-  - Files: crates/app/src/infra.rs
-  - Change: Added OpenOptions::new().create(true).append(true).open("data/logs/app.log") after create_dir_all
+- [ ] 1. Greeks pipeline market hours gate — skip cycles outside 09:15-15:30 IST
+  - Files: crates/app/src/greeks_pipeline.rs
+  - Tests: test_greeks_market_hours_gate_source_code
 
-- [x] Item 2: Fix historical candle fetch — narrow pre-market zone
+- [ ] 2. Historical candle invalid-day log — downgrade WARN to DEBUG for expected boundary skips
+  - Files: crates/core/src/historical/candle_fetcher.rs
+  - Tests: existing tests pass
+
+- [ ] 3. Depth connection .min(secs_until) no-op bug — remove useless .min()
+  - Files: crates/core/src/websocket/depth_connection.rs
+  - Tests: test_calculate_secs_until_market_open_*
+
+- [ ] 4. AWS log filter — suppress aws_config::profile::credentials at warn level
   - Files: crates/app/src/main.rs
-  - Change: Changed `hour >= 8` to `(8..16).contains(&hour)` — 16:00+ means post-market, fetch immediately
+  - Tests: test_aws_log_filter_source_code
 
-- [x] Item 3: Fix materialized view verification — use SHOW COLUMNS instead of tables()
-  - Files: crates/storage/src/materialized_views.rs
-  - Change: Replaced `SELECT count() FROM tables() WHERE name = '...'` with `SHOW COLUMNS FROM <view>` (proven pattern from views_missing_greeks)
-
-- [x] Item 4: Fix cross-verify also uses wrong tables() check
-  - Files: crates/core/src/historical/cross_verify.rs
-  - Change: Replaced tables() check with SHOW COLUMNS FROM approach
-
-- [x] Item 5: Fix boot timeout — move constituency downloads to background
+- [ ] 5. Pre-market readiness check at 08:00/08:05 IST
   - Files: crates/app/src/main.rs
-  - Change: Wrapped non-market-hours constituency download in tokio::spawn() (non-blocking). Cache loading during market hours remains synchronous (fast, no network).
+  - Tests: test_pre_market_check_source_code
 
-- [x] Item 6: Add depth + order update WS metrics and Grafana panels
-  - Files: crates/core/src/websocket/order_update_connection.rs, deploy/docker/grafana/dashboards/trading-pipeline.json
-  - Change: Added dlt_order_update_ws_active gauge + dlt_order_update_messages_total counter. Added 4 Grafana panels for depth 20/200-level connections, depth frames rate, depth frames dropped.
+- [ ] 6. Alloy container — ensure data/logs dir exists + improve Alloy config
+  - Files: deploy/docker/alloy/alloy-config.alloy, crates/app/src/infra.rs
+  - Tests: manual verification
 
-- [ ] Item 7: Build, clippy, fmt, test — verify all pass
+- [ ] 7. Constituency CSV downloader — add User-Agent header for NSE
+  - Files: crates/core/src/index_constituency/csv_downloader.rs
+  - Tests: existing tests pass
+
+- [ ] 8. Duplicate security_id log level WARN → DEBUG
+  - Files: crates/core/src/instrument/universe_builder.rs
+  - Tests: existing tests pass
+
+- [ ] 9. Invalid candle count log level WARN → DEBUG for small counts
+  - Files: crates/core/src/historical/candle_fetcher.rs (same as item 2)
+  - Tests: existing tests pass
+
+- [ ] 10. Build, clippy, fmt, test — verify all pass
   - Files: all modified
   - Tests: cargo test --workspace
 
@@ -48,9 +50,10 @@ Fix 6 production issues identified from runtime logs and Grafana screenshots:
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | App starts after 3:30 PM (17:08 IST) | Historical fetch runs immediately (not blocked by post-market signal wait) |
-| 2 | App starts at 8:30 AM | Still waits for post-market signal (pre-market zone) |
-| 3 | QuestDB materialized views created | SHOW COLUMNS verifies they exist (not tables()) |
-| 4 | Constituency download slow (91s) | Background tokio::spawn, boot completes under 120s |
-| 5 | Fresh Docker start | app.log exists before Alloy → healthcheck passes → UP |
-| 6 | Grafana Trading Pipeline dashboard | Shows depth 20/200-level + order update WS connections |
+| 1 | Boot at 21:00 IST | Greeks pipeline skips cycles, logs "outside market hours" |
+| 2 | Boot at 09:00 IST | Pre-market check at 08:00, greeks runs normally |
+| 3 | Depth WS timeout off-hours | Sleep uses correct clamped value |
+| 4 | AWS SSM fetch | No access_key_id in INFO logs |
+| 5 | Invalid candles | DEBUG log, not WARN |
+| 6 | Duplicate security_id | DEBUG log, not WARN |
+| 7 | NSE returns HTML for CSV | Better User-Agent header |

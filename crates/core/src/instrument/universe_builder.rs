@@ -316,7 +316,7 @@ fn build_derivatives_and_chains(
         match row.segment {
             'I' => {
                 if !seen_security_ids.insert(row.security_id) {
-                    warn!(
+                    debug!(
                         security_id = row.security_id,
                         symbol = %row.underlying_symbol,
                         segment = "I",
@@ -338,7 +338,7 @@ fn build_derivatives_and_chains(
                 && row.series == CSV_SERIES_EQUITY =>
             {
                 if !seen_security_ids.insert(row.security_id) {
-                    warn!(
+                    debug!(
                         security_id = row.security_id,
                         symbol = %row.underlying_symbol,
                         segment = "E",
@@ -441,7 +441,7 @@ fn build_derivatives_and_chains(
 
         // Dedup: skip if security_id already seen (keep first occurrence)
         if !seen_security_ids.insert(row.security_id) {
-            warn!(
+            debug!(
                 security_id = row.security_id,
                 symbol = %row.underlying_symbol,
                 segment = "D",
