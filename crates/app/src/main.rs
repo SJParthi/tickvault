@@ -2354,17 +2354,38 @@ fn spawn_historical_candle_fetch(
         if is_trading_day {
             let cross_match =
                 cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
-            if cross_match.passed {
+
+            if cross_match.candles_compared == 0 && cross_match.missing_views.is_empty() {
+                // First run or no live data yet — skip cross-match, don't flag as failure.
+                info!(
+                    "cross-match SKIPPED — no live data in materialized views (first run or fresh DB)"
+                );
+                bg_notifier.notify(NotificationEvent::Custom {
+                    message: "Historical vs Live cross-match SKIPPED\nNo live data in materialized views (first run or fresh DB). Will compare on next run after live ticks are collected.".to_string(),
+                });
+            } else if cross_match.passed {
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
                     timeframes_checked: cross_match.timeframes_checked,
                     candles_compared: cross_match.candles_compared,
                 });
             } else {
+                // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
+                let tf_summary: String = cross_match
+                    .per_timeframe_mismatches
+                    .iter()
+                    .map(|(tf, count)| format!("{tf}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let mut details = format_cross_match_details(&cross_match.mismatch_details);
+                // Prepend per-timeframe summary as first line
+                if !tf_summary.is_empty() {
+                    details.insert(0, format!("Per-timeframe: {tf_summary}"));
+                }
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
                     candles_compared: cross_match.candles_compared,
                     mismatches: cross_match.mismatches,
                     missing_live: cross_match.missing_live,
-                    mismatch_details: format_cross_match_details(&cross_match.mismatch_details),
+                    mismatch_details: details,
                 });
             }
 
@@ -2377,12 +2398,13 @@ fn spawn_historical_candle_fetch(
                 "post-market historical fetch + cross-verification complete"
             );
         } else {
+            // Non-trading day: skip cross-match (no live data to compare).
             info!(
                 instruments_fetched = summary.instruments_fetched,
                 instruments_failed = summary.instruments_failed,
                 total_candles = summary.total_candles,
                 verification_passed = verify_report.passed,
-                "non-trading day historical fetch complete"
+                "non-trading day historical fetch complete (cross-match skipped — no live data)"
             );
         }
     });

@@ -100,6 +100,8 @@ pub struct CrossMatchReport {
     pub mismatch_details: Vec<CrossMatchMismatch>,
     /// Materialized view tables that don't exist yet (skipped during cross-match).
     pub missing_views: Vec<String>,
+    /// Per-timeframe mismatch counts for Telegram display (e.g., "1m: 3, 5m: 0").
+    pub per_timeframe_mismatches: Vec<(String, usize)>,
     /// Whether the cross-match passed (mismatches within tolerance).
     pub passed: bool,
 }
@@ -186,19 +188,17 @@ const VERIFIED_TIMEFRAMES: &[&str] = &["1m", "5m", "15m", "60m", "1d"];
 const MAX_VIOLATION_DETAILS: usize = 500;
 
 /// Price tolerance for cross-match comparison (absolute).
-/// f32→f64 already fixed via `f32_to_f64_clean()` — any real diff is meaningful.
-/// Epsilon-level tolerance only absorbs IEEE754 floating point noise.
-/// Minimum tick in Indian markets = 0.05, so any real diff >> 1e-6.
-const CROSS_MATCH_PRICE_EPSILON: f64 = 1e-6;
+/// EXACT MATCHING: zero tolerance. Any price difference flags as mismatch.
+/// f32→f64 already fixed via `f32_to_f64_clean()` — no IEEE754 noise.
+const CROSS_MATCH_PRICE_EPSILON: f64 = 0.0;
 
-/// Volume tolerance for cross-match (relative, 10%).
-/// If |hist_vol - live_vol| / max(hist_vol, 1) > 10%, it's a mismatch.
-/// Volume is the best indicator of missed WebSocket ticks.
-const CROSS_MATCH_VOLUME_TOLERANCE_PCT: f64 = 0.10;
+/// Volume tolerance for cross-match (relative).
+/// EXACT MATCHING: zero tolerance. Any volume difference flags as mismatch.
+const CROSS_MATCH_VOLUME_TOLERANCE_PCT: f64 = 0.0;
 
-/// OI (Open Interest) tolerance for cross-match (relative, 10%).
-/// Only applied when both historical and live OI > 0 (derivatives only).
-const CROSS_MATCH_OI_TOLERANCE_PCT: f64 = 0.10;
+/// OI (Open Interest) tolerance for cross-match (relative).
+/// EXACT MATCHING: zero tolerance. Any OI difference flags as mismatch.
+const CROSS_MATCH_OI_TOLERANCE_PCT: f64 = 0.0;
 
 /// Mapping from historical timeframe labels to materialized view table names.
 const CROSS_MATCH_TIMEFRAMES: &[(&str, &str)] = &[
@@ -319,24 +319,17 @@ fn has_price_mismatch(d_open: f64, d_high: f64, d_low: f64, d_close: f64, epsilo
 
 /// Detects whether a volume mismatch exists.
 ///
-/// Uses relative tolerance: |diff| / max(hist_volume, 1) > tolerance_pct.
-fn has_volume_mismatch(h_volume: i64, m_volume: i64, tolerance_pct: f64) -> bool {
-    let h_vol_max = (h_volume.max(1)) as f64;
-    let vol_diff_pct = (m_volume.saturating_sub(h_volume) as f64).abs() / h_vol_max;
-    vol_diff_pct > tolerance_pct
+/// Exact matching: any difference in volume values flags as mismatch.
+fn has_volume_mismatch(h_volume: i64, m_volume: i64, _tolerance_pct: f64) -> bool {
+    h_volume != m_volume
 }
 
 /// Detects whether an OI mismatch exists.
 ///
-/// Only applies when both historical and live OI > 0 (derivatives).
-fn has_oi_mismatch(h_oi: i64, m_oi: i64, tolerance_pct: f64) -> bool {
-    if h_oi > 0 && m_oi > 0 {
-        let h_oi_max = h_oi.max(1) as f64;
-        let oi_diff_pct = (m_oi.saturating_sub(h_oi) as f64).abs() / h_oi_max;
-        oi_diff_pct > tolerance_pct
-    } else {
-        false
-    }
+/// Exact matching: any difference in OI values flags as mismatch.
+/// Both zero = match (equity instruments). One zero, one non-zero = mismatch.
+fn has_oi_mismatch(h_oi: i64, m_oi: i64, _tolerance_pct: f64) -> bool {
+    h_oi != m_oi
 }
 
 /// Classifies the type of mismatch based on which fields differ.
@@ -1048,6 +1041,7 @@ pub async fn cross_match_historical_vs_live(
     let mut all_details: Vec<CrossMatchMismatch> = Vec::new();
     let mut timeframes_checked = 0_usize;
     let mut missing_views: Vec<String> = Vec::new();
+    let mut per_timeframe_mismatches: Vec<(String, usize)> = Vec::new();
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
         // M2: Check if the materialized view exists before JOINing.
@@ -1129,6 +1123,10 @@ pub async fn cross_match_historical_vs_live(
             }
         }
 
+        // Track per-timeframe mismatch count for Telegram display.
+        let tf_mismatch_count = details.len();
+        per_timeframe_mismatches.push((hist_tf.to_string(), tf_mismatch_count));
+
         all_details.extend(details);
     }
 
@@ -1155,6 +1153,7 @@ pub async fn cross_match_historical_vs_live(
         oi_mismatches: total_oi_mismatches,
         mismatch_details: all_details,
         missing_views,
+        per_timeframe_mismatches,
         passed,
     }
 }
@@ -1170,6 +1169,7 @@ fn failed_cross_match_report() -> CrossMatchReport {
         oi_mismatches: 0,
         mismatch_details: Vec::new(),
         missing_views: Vec::new(),
+        per_timeframe_mismatches: Vec::new(),
         passed: false,
     }
 }
@@ -1547,6 +1547,7 @@ mod tests {
             oi_mismatches: 2,
             mismatch_details: vec![],
             missing_views: vec![],
+            per_timeframe_mismatches: vec![],
             passed: false,
         };
         assert_eq!(report.timeframes_checked, 5);
@@ -1603,13 +1604,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_match_epsilon_tolerance() {
-        // Epsilon must be tiny — only absorbs IEEE754 noise, not real diffs
+    fn test_cross_match_exact_price_matching() {
+        // EXACT matching: zero tolerance for price comparisons.
         const {
-            assert!(CROSS_MATCH_PRICE_EPSILON > 0.0);
             assert!(
-                CROSS_MATCH_PRICE_EPSILON < 0.001,
-                "epsilon must be < 0.001 (min tick = 0.05)"
+                CROSS_MATCH_PRICE_EPSILON == 0.0,
+                "price epsilon must be 0.0 for exact matching"
             );
         }
     }
@@ -1626,23 +1626,23 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_match_volume_tolerance_constant() {
+    fn test_cross_match_exact_volume_matching() {
+        // EXACT matching: zero tolerance for volume comparisons.
         const {
-            assert!(CROSS_MATCH_VOLUME_TOLERANCE_PCT > 0.0);
             assert!(
-                CROSS_MATCH_VOLUME_TOLERANCE_PCT <= 0.20,
-                "volume tolerance must be <= 20%"
+                CROSS_MATCH_VOLUME_TOLERANCE_PCT == 0.0,
+                "volume tolerance must be 0.0 for exact matching"
             );
         }
     }
 
     #[test]
-    fn test_cross_match_oi_tolerance_constant() {
+    fn test_cross_match_exact_oi_matching() {
+        // EXACT matching: zero tolerance for OI comparisons.
         const {
-            assert!(CROSS_MATCH_OI_TOLERANCE_PCT > 0.0);
             assert!(
-                CROSS_MATCH_OI_TOLERANCE_PCT <= 0.20,
-                "OI tolerance must be <= 20%"
+                CROSS_MATCH_OI_TOLERANCE_PCT == 0.0,
+                "OI tolerance must be 0.0 for exact matching"
             );
         }
     }
@@ -1658,6 +1658,7 @@ mod tests {
             oi_mismatches: 3,
             mismatch_details: vec![],
             missing_views: vec!["candles_1d".to_string()],
+            per_timeframe_mismatches: vec![],
             passed: false,
         };
         assert_eq!(report.oi_mismatches, 3);
@@ -1676,6 +1677,7 @@ mod tests {
             oi_mismatches: 0,
             mismatch_details: vec![],
             missing_views: vec!["candles_5m".to_string(), "candles_1d".to_string()],
+            per_timeframe_mismatches: vec![],
             passed: false,
         };
         assert!(!report.passed, "missing views must fail cross-match");
@@ -2012,19 +2014,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_has_volume_mismatch_no_mismatch() {
-        assert!(!has_volume_mismatch(100000, 105000, 0.10));
-    }
-
-    #[test]
-    fn test_has_volume_mismatch_exceeds_tolerance() {
-        assert!(has_volume_mismatch(100000, 115000, 0.10));
-    }
-
-    #[test]
-    fn test_has_volume_mismatch_exact_tolerance() {
-        // 10% of 100 = 10, diff = 10 → not exceeds (> not >=)
-        assert!(!has_volume_mismatch(100, 110, 0.10));
+    fn test_has_volume_mismatch_exact_matching() {
+        // EXACT matching: any difference flags as mismatch.
+        assert!(has_volume_mismatch(100000, 105000, 0.0));
+        assert!(has_volume_mismatch(100000, 100001, 0.0));
+        assert!(has_volume_mismatch(100, 110, 0.0));
     }
 
     #[test]
@@ -2048,19 +2042,12 @@ mod tests {
     }
 
     #[test]
-    fn test_has_oi_mismatch_hist_zero() {
-        // When hist_oi = 0, condition `h_oi > 0 && m_oi > 0` is false
-        assert!(!has_oi_mismatch(0, 1000, 0.10));
-    }
-
-    #[test]
-    fn test_has_oi_mismatch_live_zero() {
-        assert!(!has_oi_mismatch(1000, 0, 0.10));
-    }
-
-    #[test]
-    fn test_has_oi_mismatch_within_tolerance() {
-        assert!(!has_oi_mismatch(10000, 10500, 0.10));
+    fn test_has_oi_mismatch_exact_matching() {
+        // EXACT matching: any difference flags as mismatch, even if one is zero.
+        assert!(has_oi_mismatch(0, 1000, 0.0));
+        assert!(has_oi_mismatch(1000, 0, 0.0));
+        assert!(has_oi_mismatch(10000, 10500, 0.0));
+        assert!(has_oi_mismatch(10000, 10001, 0.0));
     }
 
     #[test]
@@ -2309,14 +2296,17 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_cross_match_row_within_volume_tolerance() {
-        // Volume diff = 5% which is within 10% tolerance
+    fn test_classify_cross_match_row_exact_volume_mismatch() {
+        // EXACT matching: any volume diff = mismatch.
         let result = classify_cross_match_row(
             test_ctx("TCS", "NSE_EQ", "1m", "2026-03-18 10:00 IST"),
             cv(3500.0, 3510.0, 3495.0, 3505.0, 100000, 0),
             cv(3500.0, 3510.0, 3495.0, 3505.0, 105000, 0),
         );
-        assert!(result.is_none(), "5% volume diff is within 10% tolerance");
+        assert!(
+            result.is_some(),
+            "exact matching: 5% volume diff IS a mismatch"
+        );
     }
 
     #[test]
@@ -2569,18 +2559,14 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_cross_match_row_just_over_epsilon() {
-        // Differences just over epsilon — should trigger mismatch
-        let over_eps = CROSS_MATCH_PRICE_EPSILON * 2.0;
+    fn test_classify_cross_match_row_any_price_diff_is_mismatch() {
+        // EXACT matching: any price difference = mismatch.
         let result = classify_cross_match_row(
             test_ctx("TCS", "NSE_EQ", "1m", "2026-03-18 10:00 IST"),
             cv(100.0, 200.0, 50.0, 150.0, 100000, 0),
-            cv(100.0 + over_eps, 200.0, 50.0, 150.0, 100000, 0),
+            cv(100.05, 200.0, 50.0, 150.0, 100000, 0),
         );
-        assert!(
-            result.is_some(),
-            "diffs over epsilon should trigger mismatch"
-        );
+        assert!(result.is_some(), "any price diff should trigger mismatch");
         let m = result.unwrap();
         assert_eq!(m.mismatch_type, "price_diff");
     }
@@ -2613,9 +2599,11 @@ mod tests {
     }
 
     #[test]
-    fn test_has_volume_mismatch_large_volumes() {
-        // Large but proportionally close volumes
-        assert!(!has_volume_mismatch(1_000_000, 1_050_000, 0.10));
+    fn test_has_volume_mismatch_large_volumes_exact() {
+        // EXACT matching: even large proportionally close volumes flag as mismatch.
+        assert!(has_volume_mismatch(1_000_000, 1_050_000, 0.0));
+        // Equal volumes = no mismatch.
+        assert!(!has_volume_mismatch(1_000_000, 1_000_000, 0.0));
     }
 
     // -----------------------------------------------------------------------
@@ -2630,9 +2618,11 @@ mod tests {
 
     #[test]
     fn test_has_oi_mismatch_negative_oi() {
-        // Negative OI — condition h_oi > 0 fails
-        assert!(!has_oi_mismatch(-100, 100, 0.10));
-        assert!(!has_oi_mismatch(100, -100, 0.10));
+        // EXACT matching: different values = mismatch, even if negative.
+        assert!(has_oi_mismatch(-100, 100, 0.0));
+        assert!(has_oi_mismatch(100, -100, 0.0));
+        // Equal negative values = no mismatch.
+        assert!(!has_oi_mismatch(-100, -100, 0.0));
     }
 
     // -----------------------------------------------------------------------
@@ -3106,8 +3096,8 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_parsed_cross_match_row_within_tolerance() {
-        // Volume diff = 5% which is within 10% tolerance
+    fn test_classify_parsed_cross_match_row_exact_volume_diff() {
+        // EXACT matching: any volume difference = mismatch.
         let parsed = ParsedCrossMatchRow {
             security_id: 42,
             segment: "NSE_EQ".to_string(),
@@ -3118,7 +3108,10 @@ mod tests {
         };
         let registry = InstrumentRegistry::empty();
         let result = classify_parsed_cross_match_row(&parsed, &registry, "1m");
-        assert!(result.is_none());
+        assert!(
+            result.is_some(),
+            "exact matching: volume diff IS a mismatch"
+        );
     }
 
     #[test]
