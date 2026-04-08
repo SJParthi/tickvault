@@ -127,6 +127,7 @@ pub async fn run_twenty_depth_connection(
     client_id: String,
     instruments: Vec<InstrumentSubscription>,
     frame_sender: mpsc::Sender<Bytes>,
+    connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), WebSocketError> {
     if instruments.is_empty() {
         info!("20-level depth: no instruments to subscribe — skipping");
@@ -146,6 +147,9 @@ pub async fn run_twenty_depth_connection(
     );
 
     let reconnect_counter = AtomicU64::new(0);
+    // Consumed on first successful subscription — notifies caller that
+    // the connection is truly alive and receiving data.
+    let mut pending_signal = connected_signal;
 
     loop {
         match connect_and_run_depth(
@@ -154,6 +158,7 @@ pub async fn run_twenty_depth_connection(
             &subscription_messages,
             &frame_sender,
             instrument_count,
+            &mut pending_signal,
         )
         .await
         {
@@ -214,6 +219,7 @@ async fn connect_and_run_depth(
     subscription_messages: &[String],
     frame_sender: &mpsc::Sender<Bytes>,
     instrument_count: usize,
+    connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), WebSocketError> {
     // Read token
     let token_guard = token_handle.load();
@@ -290,6 +296,11 @@ async fn connect_and_run_depth(
         subscription_count = subscription_messages.len(),
         "{DEPTH_CONNECTION_PREFIX}: all subscriptions sent — reading depth frames"
     );
+
+    // Fire connected signal — connection is truly alive and subscribed.
+    if let Some(signal) = connected_signal.take() {
+        let _ = signal.send(());
+    }
 
     // Metrics
     let m_frames = metrics::counter!("dlt_depth_20lvl_frames_total");
@@ -394,6 +405,7 @@ pub async fn run_two_hundred_depth_connection(
     security_id: u32,
     label: String,
     frame_sender: mpsc::Sender<Bytes>,
+    connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), WebSocketError> {
     let segment_str = exchange_segment.as_str();
     let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
@@ -415,6 +427,7 @@ pub async fn run_two_hundred_depth_connection(
 
     let reconnect_counter = AtomicU64::new(0);
     let prefix = format!("depth-200lvl-{label}"); // O(1) EXEMPT: boot-time
+    let mut pending_signal = connected_signal;
 
     loop {
         match connect_and_run_200_depth(
@@ -423,6 +436,7 @@ pub async fn run_two_hundred_depth_connection(
             &subscribe_msg,
             &frame_sender,
             &prefix,
+            &mut pending_signal,
         )
         .await
         {
@@ -482,6 +496,7 @@ async fn connect_and_run_200_depth(
     subscribe_msg: &str,
     frame_sender: &mpsc::Sender<Bytes>,
     prefix: &str,
+    connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), WebSocketError> {
     let token_guard = token_handle.load();
     let token_state = token_guard
@@ -544,6 +559,11 @@ async fn connect_and_run_200_depth(
         })?;
 
     info!("{prefix}: subscription sent — reading 200-level depth frames");
+
+    // Fire connected signal — connection is truly alive and subscribed.
+    if let Some(signal) = connected_signal.take() {
+        let _ = signal.send(());
+    }
 
     let m_frames =
         metrics::counter!("dlt_depth_200lvl_frames_total", "label" => prefix.to_string());
@@ -660,7 +680,7 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let result =
-            run_twenty_depth_connection(token_handle, "test".to_string(), vec![], tx).await;
+            run_twenty_depth_connection(token_handle, "test".to_string(), vec![], tx, None).await;
         assert!(result.is_ok());
     }
 
@@ -742,7 +762,7 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
-        let result = connect_and_run_depth(&token_handle, "test", &[], &tx, 0).await;
+        let result = connect_and_run_depth(&token_handle, "test", &[], &tx, 0, &mut None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             WebSocketError::NoTokenAvailable => {}
@@ -756,7 +776,8 @@ mod tests {
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
         let result =
-            connect_and_run_200_depth(&token_handle, "test", "{}", &tx, "test-label").await;
+            connect_and_run_200_depth(&token_handle, "test", "{}", &tx, "test-label", &mut None)
+                .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             WebSocketError::NoTokenAvailable => {}

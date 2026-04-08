@@ -1330,15 +1330,10 @@ async fn main() -> Result<()> {
                 // Spawn depth WebSocket connection with Telegram alerts + health updates
                 let d20_notifier = notifier.clone();
                 let d20_health = health_status.clone();
-                let d20_label_notify = label.clone();
+                let d20_label_for_disconnect = label.clone();
+                let d20_label_for_signal = label.clone();
+                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 tokio::spawn(async move {
-                    // Only notify "connected" during market hours — outside hours,
-                    // Dhan resets depth connections within 40s (misleading Telegram spam).
-                    if is_market_hours {
-                        d20_notifier.notify(NotificationEvent::DepthTwentyConnected {
-                            underlying: d20_label_notify.clone(),
-                        });
-                    }
                     d20_health.set_depth_20_connections(
                         d20_health.depth_20_connections().saturating_add(1),
                     );
@@ -1348,12 +1343,13 @@ async fn main() -> Result<()> {
                         depth_client_id,
                         instruments_for_underlying,
                         depth_tx,
+                        Some(signal_tx),
                     )
                     .await
                     {
                         tracing::error!(?err, "20-level depth connection terminated");
                         d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
-                            underlying: d20_label_notify,
+                            underlying: d20_label_for_disconnect,
                             reason: format!("{err}"),
                         });
                         d20_health.set_depth_20_connections(
@@ -1362,6 +1358,19 @@ async fn main() -> Result<()> {
                     }
                 });
                 // O(1) EXEMPT: end
+
+                // Telegram alert fires ONLY after actual connection + subscription succeeds.
+                {
+                    let notify_label = d20_label_for_signal;
+                    let notify_sender = notifier.clone();
+                    tokio::spawn(async move {
+                        if signal_rx.await.is_ok() {
+                            notify_sender.notify(NotificationEvent::DepthTwentyConnected {
+                                underlying: notify_label,
+                            });
+                        }
+                    });
+                }
 
                 // 200-level: spawn 1 connection for ATM CE of this underlying
                 // Pick the first NSE_FNO option for this underlying as ATM proxy
@@ -1443,17 +1452,12 @@ async fn main() -> Result<()> {
                         }
                     });
 
-                    let d200_notifier = notifier.clone();
                     let d200_health = health_status.clone();
-                    let d200_label_notify = depth200_label.clone();
+                    let d200_notifier = notifier.clone();
+                    let d200_label_for_disconnect = depth200_label.clone();
+                    let d200_label_for_signal = depth200_label.clone();
+                    let (d200_signal_tx, d200_signal_rx) = tokio::sync::oneshot::channel::<()>();
                     tokio::spawn(async move {
-                        // Only notify "connected" during market hours — outside hours,
-                        // Dhan resets depth connections within 40s (misleading Telegram spam).
-                        if is_market_hours {
-                            d200_notifier.notify(NotificationEvent::DepthTwoHundredConnected {
-                                underlying: d200_label_notify.clone(),
-                            });
-                        }
                         d200_health.set_depth_200_connections(
                             d200_health.depth_200_connections().saturating_add(1),
                         );
@@ -1466,12 +1470,13 @@ async fn main() -> Result<()> {
                                 depth200_sid,
                                 depth200_label,
                                 tx200,
+                                Some(d200_signal_tx),
                             )
                             .await
                         {
                             tracing::error!(?err, "200-level depth connection terminated");
                             d200_notifier.notify(NotificationEvent::DepthTwoHundredDisconnected {
-                                underlying: d200_label_notify,
+                                underlying: d200_label_for_disconnect,
                                 reason: format!("{err}"),
                             });
                             d200_health.set_depth_200_connections(
@@ -1479,6 +1484,17 @@ async fn main() -> Result<()> {
                             );
                         }
                     });
+                    // Telegram alert fires ONLY after actual connection + subscription.
+                    {
+                        let notify_sender = notifier.clone();
+                        tokio::spawn(async move {
+                            if d200_signal_rx.await.is_ok() {
+                                notify_sender.notify(NotificationEvent::DepthTwoHundredConnected {
+                                    underlying: d200_label_for_signal,
+                                });
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -1620,11 +1636,8 @@ async fn main() -> Result<()> {
         let ou_notifier = notifier.clone();
         let ou_health = health_status.clone();
         tokio::spawn(async move {
-            // Only notify "connected" during market hours — off-hours the WS
-            // may timeout and reconnect, which would spam Telegram.
-            if is_market_hours {
-                ou_notifier.notify(NotificationEvent::OrderUpdateConnected);
-            }
+            // Connected notification is sent from INSIDE the connection function
+            // after the login handshake succeeds (not here, before connection starts).
             ou_health.set_order_update_connected(true);
             run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
             // If run_order_update_connection returns, connection terminated
