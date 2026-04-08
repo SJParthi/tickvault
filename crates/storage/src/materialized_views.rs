@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{QUESTDB_IST_ALIGN_OFFSET, QUESTDB_TABLE_CANDLES_1S};
@@ -355,6 +355,86 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
         views_total = VIEW_DEFS.len(),
         "candle materialized views setup complete"
     );
+
+    // Step 6: Verify which views actually exist in QuestDB.
+    // This provides clear diagnostics when cross-match fails due to missing views.
+    verify_views_exist(&client, &base_url).await;
+}
+
+/// The 5 cross-match critical view names checked by `cross_verify.rs`.
+/// These are the views that MUST exist for live-vs-historical cross-match to work.
+const CROSS_MATCH_CRITICAL_VIEWS: &[&str] = &[
+    "candles_1m",
+    "candles_5m",
+    "candles_15m",
+    "candles_1h",
+    "candles_1d",
+];
+
+/// Verifies which materialized views actually exist in QuestDB after creation.
+///
+/// Queries `tables()` for each of the 18 views and logs the result.
+/// Missing views are logged at ERROR level to provide clear diagnostics
+/// when cross-match verification fails.
+async fn verify_views_exist(client: &reqwest::Client, base_url: &str) {
+    let mut existing_count: u32 = 0;
+    let mut missing: Vec<&str> = Vec::new();
+
+    for def in VIEW_DEFS {
+        // SAFETY: def.name is from VIEW_DEFS constants, not user input.
+        let query = format!("SELECT count() FROM tables() WHERE name = '{}'", def.name);
+        let exists = match client
+            .get(base_url)
+            .query(&[("query", &query)])
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await.unwrap_or_default();
+                // QuestDB returns CSV: header + data row. count > 0 means table exists.
+                !body.contains(",0\r\n") && !body.ends_with(",0\n") && !body.ends_with(",0")
+            }
+            _ => false,
+        };
+
+        if exists {
+            existing_count = existing_count.saturating_add(1);
+        } else {
+            missing.push(def.name);
+        }
+    }
+
+    if missing.is_empty() {
+        info!(
+            existing_count,
+            "all materialized views verified — cross-match ready"
+        );
+    } else {
+        // Check if any critical views (used by cross-match) are missing
+        let critical_missing: Vec<&str> = missing
+            .iter()
+            .filter(|name| CROSS_MATCH_CRITICAL_VIEWS.contains(name))
+            .copied()
+            .collect();
+
+        if critical_missing.is_empty() {
+            warn!(
+                existing = existing_count,
+                missing_count = missing.len(),
+                missing_views = ?missing,
+                "some materialized views missing (non-critical for cross-match)"
+            );
+        } else {
+            error!(
+                existing = existing_count,
+                missing_count = missing.len(),
+                missing_views = ?missing,
+                critical_missing = ?critical_missing,
+                "CRITICAL: materialized views missing — cross-match will fail. \
+                 Check QuestDB logs for view creation errors."
+            );
+        }
+    }
 }
 
 /// The 5 Greeks column names used in ticks, candles_1s, and materialized views.
@@ -1332,5 +1412,81 @@ mod tests {
             .unwrap();
         let base_url = "http://192.0.2.1:1/exec";
         ensure_greeks_columns_on_table(&client, base_url, "test_table").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_views_exist tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cross_match_critical_views_count() {
+        assert_eq!(
+            CROSS_MATCH_CRITICAL_VIEWS.len(),
+            5,
+            "must have 5 critical views for cross-match"
+        );
+    }
+
+    #[test]
+    fn test_cross_match_critical_views_are_defined() {
+        // Every critical view must exist in VIEW_DEFS
+        let all_names: Vec<&str> = VIEW_DEFS.iter().map(|d| d.name).collect();
+        for &critical in CROSS_MATCH_CRITICAL_VIEWS {
+            assert!(
+                all_names.contains(&critical),
+                "critical view {critical} must exist in VIEW_DEFS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cross_match_critical_views_exact_names() {
+        assert_eq!(CROSS_MATCH_CRITICAL_VIEWS[0], "candles_1m");
+        assert_eq!(CROSS_MATCH_CRITICAL_VIEWS[1], "candles_5m");
+        assert_eq!(CROSS_MATCH_CRITICAL_VIEWS[2], "candles_15m");
+        assert_eq!(CROSS_MATCH_CRITICAL_VIEWS[3], "candles_1h");
+        assert_eq!(CROSS_MATCH_CRITICAL_VIEWS[4], "candles_1d");
+    }
+
+    #[tokio::test]
+    async fn test_verify_views_exist_with_mock_200_no_panic() {
+        // When QuestDB returns 200 for all queries, verify_views_exist should not panic.
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        verify_views_exist(&client, &base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_views_exist_with_mock_400_no_panic() {
+        // When QuestDB returns 400 for all queries, verify_views_exist logs errors but no panic.
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        verify_views_exist(&client, &base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_views_exist_with_unreachable_no_panic() {
+        // When QuestDB is unreachable, verify_views_exist must not panic.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let base_url = "http://192.0.2.1:1/exec";
+        verify_views_exist(&client, base_url).await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_views_exist_with_tracing() {
+        // With subscriber installed, verify info!/warn!/error! fields evaluate.
+        let _guard = install_test_subscriber();
+        let port = spawn_mock_http_server(MOCK_HTTP_200).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        verify_views_exist(&client, &base_url).await;
     }
 }

@@ -828,7 +828,7 @@ impl LiveCandleWriter {
                 self.sender = Some(new_sender);
                 self.pending_count = 0;
                 info!("QuestDB ILP reconnection succeeded for candle writer");
-                return Ok(());
+                Ok(())
             }
             Err(err) => {
                 error!(

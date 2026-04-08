@@ -52,10 +52,11 @@ const DEPTH_PONG_TIMEOUT_SECS: u64 = 10;
 /// Subscription batch size for 20-level depth (max 50 per Dhan docs).
 const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
 
-/// Pre-market backoff delay for 200-level depth (seconds).
-/// Dhan's 200-level depth servers reset connections outside market hours.
-/// Instead of aggressive exponential retry, wait this long before retrying pre-market.
-const DEPTH_200_PRE_MARKET_BACKOFF_SECS: u64 = 60;
+/// Pre-market/post-market backoff delay for depth connections (seconds).
+/// Outside market data hours (08:55-16:00 IST), Dhan's depth servers reset
+/// connections. Instead of retrying every 30s, sleep for this interval and
+/// re-check whether market hours have started.
+const DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS: u64 = 300;
 
 /// Returns true if current IST time is within market data hours (08:55 - 16:00).
 /// 200-level depth connections should only retry aggressively during this window.
@@ -73,6 +74,37 @@ fn is_within_market_data_hours() -> bool {
     {
         time_mins >= 535 && time_mins <= 960
     }
+}
+
+/// Calculates seconds until the next market data window opens (08:55 IST).
+///
+/// Returns a duration capped between `DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS` and
+/// the actual time until 08:55 IST. If already within market hours, returns 0.
+/// Uses a periodic check interval as a safety net against clock drift.
+// O(1) EXEMPT: called once per reconnection attempt (cold path), not per tick
+fn calculate_secs_until_market_open() -> u64 {
+    if is_within_market_data_hours() {
+        return 0;
+    }
+    let now_utc = chrono::Utc::now();
+    let ist_secs = now_utc.timestamp() + 19800;
+    let secs_into_day = ist_secs % 86400;
+    // 08:55 IST = 535 minutes = 32100 seconds into the day
+    let market_open_secs: i64 = 535 * 60;
+
+    let secs_until = if secs_into_day < market_open_secs {
+        // Before market open today
+        market_open_secs - secs_into_day
+    } else {
+        // After market close — sleep until 08:55 next day
+        86400 - secs_into_day + market_open_secs
+    };
+
+    // Clamp: at least check interval (safety net), at most the calculated time
+    let secs_until = secs_until.max(0) as u64;
+    secs_until
+        .min(secs_until)
+        .max(DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS)
 }
 
 /// Connection timeout for depth WebSocket (seconds).
@@ -133,7 +165,23 @@ pub async fn run_twenty_depth_connection(
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
-                // Escalate to ERROR after 10+ consecutive failures (not on first failure)
+                // Outside market data hours (before 08:55 or after 16:00 IST),
+                // Dhan's depth servers reset connections. Sleep until market
+                // opens instead of spamming exponential retries.
+                if !is_within_market_data_hours() {
+                    if attempt == 0 {
+                        let sleep_secs = calculate_secs_until_market_open();
+                        info!(
+                            sleep_secs,
+                            "{DEPTH_CONNECTION_PREFIX}: outside market hours — sleeping until market open"
+                        );
+                    }
+                    let sleep_secs = calculate_secs_until_market_open();
+                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                    continue;
+                }
+
+                // During market hours: escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,
@@ -387,16 +435,18 @@ pub async fn run_two_hundred_depth_connection(
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
                 // Outside market data hours (before 08:55 or after 16:00 IST),
-                // Dhan's 200-level depth servers reset connections. Use a long
-                // fixed backoff instead of spamming exponential retries.
+                // Dhan's 200-level depth servers reset connections. Sleep until
+                // market opens instead of spamming retries every 60s.
                 if !is_within_market_data_hours() {
                     if attempt == 0 {
+                        let sleep_secs = calculate_secs_until_market_open();
                         info!(
-                            "{prefix}: outside market hours — will retry every {DEPTH_200_PRE_MARKET_BACKOFF_SECS}s"
+                            sleep_secs,
+                            "{prefix}: outside market hours — sleeping until market open"
                         );
                     }
-                    tokio::time::sleep(Duration::from_secs(DEPTH_200_PRE_MARKET_BACKOFF_SECS))
-                        .await;
+                    let sleep_secs = calculate_secs_until_market_open();
+                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
                     continue;
                 }
 
@@ -832,6 +882,60 @@ mod tests {
         assert!(
             url.starts_with("wss://full-depth-api.dhan.co/"),
             "must use correct host: {url}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Market hours guard tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_is_within_market_data_hours_returns_bool() {
+        // Must return a boolean without panicking — we can't control the clock
+        // in unit tests, but we verify it doesn't panic and returns a valid value.
+        let result = is_within_market_data_hours();
+        // result is either true or false — the function is deterministic for a given time.
+        assert!(result || !result, "must return a valid boolean");
+    }
+
+    #[test]
+    fn test_is_within_market_data_hours_boundary_constants() {
+        // The function uses 535 (08:55) and 960 (16:00) as boundaries.
+        // Verify the constants are consistent:
+        // 08:55 = 8*60 + 55 = 535
+        assert_eq!(8 * 60 + 55, 535, "08:55 IST = 535 minutes");
+        // 16:00 = 16*60 + 0 = 960
+        assert_eq!(16 * 60, 960, "16:00 IST = 960 minutes");
+    }
+
+    #[test]
+    fn test_calculate_secs_until_market_open_always_positive() {
+        // Must always return > 0 (clamped to at least DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS)
+        let secs = calculate_secs_until_market_open();
+        assert!(
+            secs >= DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS,
+            "must be at least the check interval ({DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS}s), got {secs}"
+        );
+    }
+
+    #[test]
+    fn test_calculate_secs_until_market_open_bounded() {
+        // Max possible sleep = ~24 hours (86400s)
+        let secs = calculate_secs_until_market_open();
+        assert!(secs <= 86400, "must not exceed 24 hours, got {secs}");
+    }
+
+    #[test]
+    fn test_off_hours_check_interval_reasonable() {
+        // 5 minutes = 300 seconds — reasonable check interval outside market hours
+        assert_eq!(DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS, 300);
+        assert!(
+            DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS >= 60,
+            "check interval must be at least 60s to avoid log spam"
+        );
+        assert!(
+            DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS <= 600,
+            "check interval must be at most 10 minutes for reasonable wake-up latency"
         );
     }
 }

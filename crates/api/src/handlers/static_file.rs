@@ -28,6 +28,9 @@ const MARKETS_STOCKS_HTML: &str = include_str!("../../static/markets-stocks.html
 /// Embedded HTML for Markets > Index page (Dhan-styled).
 const MARKETS_INDEX_HTML: &str = include_str!("../../static/markets-index.html");
 
+/// Embedded HTML for Options Chain V2 page (enhanced layout).
+const OPTIONS_CHAIN_V2_HTML: &str = include_str!("../../static/option-chain-v2.html");
+
 /// GET /portal — serves the DLT Control Panel with links to all services.
 pub async fn portal() -> impl IntoResponse {
     (
@@ -94,6 +97,16 @@ pub async fn markets_index() -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         MARKETS_INDEX_HTML,
+    )
+}
+
+/// GET /portal/option-chain-v2 — enhanced Options Chain page.
+// TEST-EXEMPT: static HTML serving
+pub async fn options_chain_v2() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        OPTIONS_CHAIN_V2_HTML,
     )
 }
 
@@ -338,5 +351,46 @@ mod tests {
     async fn test_markets_index_handler_returns_ok() {
         let response = markets_index().await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -------------------------------------------------------------------
+    // Options Chain V2 tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_options_chain_v2_html_not_empty() {
+        assert!(!OPTIONS_CHAIN_V2_HTML.is_empty());
+        assert!(OPTIONS_CHAIN_V2_HTML.contains("<!DOCTYPE html>"));
+        assert!(OPTIONS_CHAIN_V2_HTML.contains("</html>"));
+    }
+
+    #[tokio::test]
+    async fn test_options_chain_v2_handler_returns_ok() {
+        let response = options_chain_v2().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_options_chain_v2_handler_content_type_is_html() {
+        let response = options_chain_v2().await.into_response();
+        let ct = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn test_options_chain_v2_html_has_closing_tags() {
+        assert!(OPTIONS_CHAIN_V2_HTML.contains("</html>"));
+        assert!(OPTIONS_CHAIN_V2_HTML.contains("</body>"));
+        assert!(OPTIONS_CHAIN_V2_HTML.contains("</script>"));
+    }
+
+    #[test]
+    fn test_options_chain_v2_html_contains_option_chain_endpoint() {
+        assert!(OPTIONS_CHAIN_V2_HTML.contains("/api/option-chain"));
     }
 }
