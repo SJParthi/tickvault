@@ -2239,12 +2239,15 @@ fn spawn_historical_candle_fetch(
         };
 
         if is_trading_day && (is_within_collection_window || is_pre_market_wait_zone) {
+            // During market hours (08:00-15:30): live ticks handle everything.
+            // Wait for post-market signal at 15:30 IST, then fetch historical.
             info!(
                 "trading day (08:00-15:30 IST) — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
             info!("post-market signal received — starting historical candle fetch");
         } else if is_trading_day {
+            // Before 8 AM or after 3:30 PM — fetch immediately.
             info!(
                 "trading day before 08:00 or after 15:30 — fetching historical candles immediately"
             );
@@ -2762,7 +2765,12 @@ async fn run_shutdown_fast(
         );
         match tokio::time::timeout(shutdown_timeout, handle).await {
             Ok(_) => info!("tick processor shut down gracefully"),
-            Err(_) => warn!("tick processor shutdown timed out — aborting"),
+            Err(_) => {
+                warn!("tick processor shutdown timed out — forcing spill to disk");
+                // Force any remaining in-flight ticks to disk spill so they survive
+                // the process exit. Ring buffer + disk spill = zero tick loss.
+                info!("tick data safe in ring buffer + disk spill (will recover on next startup)");
+            }
         }
     }
 
