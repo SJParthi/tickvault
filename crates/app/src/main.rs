@@ -625,7 +625,7 @@ async fn main() -> Result<()> {
         {
             let signal = std::sync::Arc::clone(&daily_reset_signal);
             let reset_sleep = compute_market_close_sleep(
-                dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST,
+                dhan_live_trader_common::constants::APP_DAILY_RESET_TIME_IST,
             );
             if reset_sleep > std::time::Duration::ZERO {
                 tokio::spawn(async move {
@@ -1332,10 +1332,13 @@ async fn main() -> Result<()> {
                 let d20_health = health_status.clone();
                 let d20_label_notify = label.clone();
                 tokio::spawn(async move {
-                    // Alert: connected
-                    d20_notifier.notify(NotificationEvent::DepthTwentyConnected {
-                        underlying: d20_label_notify.clone(),
-                    });
+                    // Only notify "connected" during market hours — outside hours,
+                    // Dhan resets depth connections within 40s (misleading Telegram spam).
+                    if is_market_hours {
+                        d20_notifier.notify(NotificationEvent::DepthTwentyConnected {
+                            underlying: d20_label_notify.clone(),
+                        });
+                    }
                     d20_health.set_depth_20_connections(
                         d20_health.depth_20_connections().saturating_add(1),
                     );
@@ -1444,10 +1447,13 @@ async fn main() -> Result<()> {
                     let d200_health = health_status.clone();
                     let d200_label_notify = depth200_label.clone();
                     tokio::spawn(async move {
-                        // Alert: connected
-                        d200_notifier.notify(NotificationEvent::DepthTwoHundredConnected {
-                            underlying: d200_label_notify.clone(),
-                        });
+                        // Only notify "connected" during market hours — outside hours,
+                        // Dhan resets depth connections within 40s (misleading Telegram spam).
+                        if is_market_hours {
+                            d200_notifier.notify(NotificationEvent::DepthTwoHundredConnected {
+                                underlying: d200_label_notify.clone(),
+                            });
+                        }
                         d200_health.set_depth_200_connections(
                             d200_health.depth_200_connections().saturating_add(1),
                         );
@@ -1614,7 +1620,11 @@ async fn main() -> Result<()> {
         let ou_notifier = notifier.clone();
         let ou_health = health_status.clone();
         tokio::spawn(async move {
-            ou_notifier.notify(NotificationEvent::OrderUpdateConnected);
+            // Only notify "connected" during market hours — off-hours the WS
+            // may timeout and reconnect, which would spam Telegram.
+            if is_market_hours {
+                ou_notifier.notify(NotificationEvent::OrderUpdateConnected);
+            }
             ou_health.set_order_update_connected(true);
             run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
             // If run_order_update_connection returns, connection terminated
@@ -1632,8 +1642,9 @@ async fn main() -> Result<()> {
     let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     {
         let signal = std::sync::Arc::clone(&daily_reset_signal);
-        let reset_sleep =
-            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
+        let reset_sleep = compute_market_close_sleep(
+            dhan_live_trader_common::constants::APP_DAILY_RESET_TIME_IST,
+        );
         if reset_sleep > std::time::Duration::ZERO {
             tokio::spawn(async move {
                 tokio::time::sleep(reset_sleep).await;
@@ -2694,25 +2705,15 @@ async fn run_shutdown_fast(
             "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
         );
 
-        // Phase 2: Auto-shutdown at APP_SHUTDOWN_TIME (16:00 IST) or Ctrl+C
-        let shutdown_sleep =
-            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
-        if shutdown_sleep > std::time::Duration::ZERO {
-            info!(
-                wait_secs = shutdown_sleep.as_secs(),
-                "auto-shutdown scheduled at 16:00 IST (Ctrl+C for immediate)"
-            );
-            tokio::select! {
-                _ = tokio::time::sleep(shutdown_sleep) => {
-                    info!("16:00 IST reached — initiating full auto-shutdown");
-                }
-                reason = wait_for_shutdown_signal() => {
-                    info!(reason, "shutdown signal received — stopping remaining services");
-                }
-            }
-        } else {
-            info!("past 16:00 IST — initiating full shutdown immediately");
-        }
+        // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
+        // No auto-shutdown — the daily reset signal at 16:00 IST handles
+        // candle aggregator reset, indicator flush, etc. without stopping the app.
+        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
+        let reason = wait_for_shutdown_signal().await;
+        info!(
+            reason,
+            "shutdown signal received — stopping remaining services"
+        );
     } else {
         info!("shutdown signal received — stopping gracefully");
     }

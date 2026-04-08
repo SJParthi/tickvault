@@ -1022,10 +1022,12 @@ pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 /// meaning the last candle returned starts at 15:29.
 pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 
-/// Full application auto-shutdown time (IST). After market close at 15:30,
-/// historical re-fetch + cross-verification runs. At 16:00 IST the entire
-/// application shuts down — matching the target AWS instance lifecycle.
-pub const APP_SHUTDOWN_TIME_IST: &str = "16:00:00";
+/// Daily reset signal time (IST). After market close at 15:30,
+/// historical re-fetch + cross-verification runs. At 16:00 IST the daily
+/// reset signal fires (candle aggregator reset, indicator reset, etc.).
+/// NOTE: Auto-shutdown is DISABLED. App runs 24/7 until manual Ctrl+C.
+/// For AWS instance lifecycle, use systemd timer or cron for restart.
+pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
