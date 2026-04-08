@@ -1,34 +1,42 @@
-# Implementation Plan: Fix Alloy, Indicator Snapshots, WS Status on Dashboard
+# Implementation Plan: Depth WS Market-Hours Guard + Materialized View Diagnostic
 
-**Status:** VERIFIED
-**Date:** 2026-04-07
-**Approved by:** Parthiban
+**Status:** DRAFT
+**Date:** 2026-04-08
+**Approved by:** pending
 
 ## Summary
 
-Fix 4 issues: Alloy DOWN (missing app.log), indicator snapshots only persisting 1 security/60s,
-market dashboard missing depth/order WS status, and revert 200-level URL (both paths fail).
+Fix 2 runtime issues from production logs:
+1. Depth WS reconnection storm after market close (590+ attempts per connection)
+2. Materialized views not being created — cross-match verification fails
 
 ## Plan Items
 
-- [x] Item 1: Fix Alloy — ensure data/logs/app.log exists at boot
-  - Files: data/logs/.gitkeep (can't commit — data/ gitignored), app.log created manually
-  - Tests: compilation
+- [ ] Item 1: Add market-hours guard to 20-level depth reconnection (currently missing)
+  - Files: crates/core/src/websocket/depth_connection.rs
+  - Change: Add `is_within_market_data_hours()` check in 20-level reconnection loop, sleep until market open when outside hours
+  - Tests: test_twenty_depth_market_hours_backoff_constant, test_is_within_market_data_hours_boundary_values
 
-- [x] Item 2: Fix indicator snapshots — persist ALL tracked securities every 60s
-  - Files: crates/app/src/trading_pipeline.rs
-  - Change: HashMap batch accumulates snapshots per tick, flushes all every 60s
-  - Tests: 375/375 app tests pass
+- [ ] Item 2: Improve 200-level depth to sleep until market open (currently 60s retry)
+  - Files: crates/core/src/websocket/depth_connection.rs
+  - Change: Replace 60s fixed retry with calculated sleep duration to next market window (08:55 IST). Log once.
+  - Tests: test_calculate_secs_until_market_open_always_positive, test_calculate_secs_until_market_open_during_hours
 
-- [x] Item 3: Add health/WS status to market dashboard
-  - Files: crates/api/static/market-dashboard.html
-  - Change: Connection status bar with green/red dots for all 7 subsystems, fetches /health
-  - Tests: compilation
+- [ ] Item 3: Add materialized view post-setup verification with diagnostic logging
+  - Files: crates/storage/src/materialized_views.rs
+  - Change: After creating views, verify each exists via `tables()` query. Log ERROR for missing views. This gives clear diagnostics on WHY cross-match fails.
+  - Tests: test_verify_views_exist_all_present, test_verify_views_exist_unreachable, test_view_names_for_verification
 
-- [x] Item 4: 200-level URL verified correct (/twohundreddepth per official docs)
-  - Files: already committed in previous commit
-  - Tests: existing tests pass
+- [ ] Item 4: Build, test, commit and push
+  - Files: all modified
+  - Tests: cargo test --workspace
 
-- [x] Item 5: Build, test, commit, push
-  - Files: n/a
-  - Tests: cargo build + 375/375 app tests pass
+## Scenarios
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | Market close 15:30 IST, depth WS disconnects | Both 20/200-level log once, sleep until 08:55 next day |
+| 2 | Market opens 08:55 IST | Both resume normal exponential backoff reconnection |
+| 3 | During market hours, depth WS fails | Normal exponential backoff (unchanged) |
+| 4 | Views fail to create at QuestDB | ERROR log with exact missing view names |
+| 5 | Views all created successfully | INFO log confirming all 18 views verified |
