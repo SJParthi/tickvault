@@ -607,7 +607,7 @@ Do NOT confuse this WebSocket with the **Full Market Depth** WebSocket:
 
 | Aspect               | Live Market Feed (this doc)          | Full Market Depth                      |
 |-----------------------|--------------------------------------|----------------------------------------|
-| Endpoint              | `wss://api-feed.dhan.co`            | 20-lvl: `wss://depth-api-feed.dhan.co/twentydepth`, 200-lvl: `wss://full-depth-api.dhan.co/twohundreddepth` |
+| Endpoint              | `wss://api-feed.dhan.co`            | 20-lvl: `wss://depth-api-feed.dhan.co/twentydepth`, 200-lvl: `wss://full-depth-api.dhan.co/` |
 | Depth levels          | 5 levels (in Full mode only)         | 20 or 200 levels                       |
 | Header size           | 8 bytes                              | 12 bytes (different byte order!)       |
 | Depth prices          | f32 (4 bytes)                        | f64 (8 bytes)                          |

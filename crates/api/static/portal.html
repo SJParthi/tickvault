@@ -231,6 +231,32 @@
     </div>
 
     <div class="grid">
+        <div class="section-title">🔌 WebSocket Connections (Live) &nbsp;<a href="/portal/ws-dashboard" style="font-size:10px;color:#2962ff;text-decoration:none;letter-spacing:0;text-transform:none;font-weight:400">→ Full Dashboard</a></div>
+    </div>
+    <div class="stats-grid" id="wsGrid">
+        <div class="stat-card" id="wsLiveFeed">
+            <div class="stat-value" id="wsLiveCount" style="color:var(--text-dim)">—</div>
+            <div class="stat-label">Live Market Feed</div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:4px" id="wsLiveDetail">max 5 connections</div>
+        </div>
+        <div class="stat-card" id="wsDepth20">
+            <div class="stat-value" id="wsD20Count" style="color:var(--text-dim)">—</div>
+            <div class="stat-label">Depth 20-Level</div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:4px" id="wsD20Detail">max 5 connections</div>
+        </div>
+        <div class="stat-card" id="wsDepth200">
+            <div class="stat-value" id="wsD200Count" style="color:var(--text-dim)">—</div>
+            <div class="stat-label">Depth 200-Level</div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:4px" id="wsD200Detail">max 5 connections</div>
+        </div>
+        <div class="stat-card" id="wsOrderUpdate">
+            <div class="stat-value" id="wsOUStatus" style="color:var(--text-dim)">—</div>
+            <div class="stat-label">Order Update WS</div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:4px" id="wsOUDetail">single connection</div>
+        </div>
+    </div>
+
+    <div class="grid">
         <div class="section-title">📊 Application</div>
 
         <a class="card" href="/health" target="_blank">
@@ -239,6 +265,22 @@
             <div class="card-desc">Application health status. Returns version, status, and runtime mode (LIVE/OFFLINE).</div>
             <div class="card-url">http://localhost:3001/health</div>
             <span class="card-badge badge-live">API</span>
+        </a>
+
+        <a class="card" href="/portal/market-dashboard" target="_blank">
+            <div class="card-icon">📊</div>
+            <div class="card-title">Market Dashboard</div>
+            <div class="card-desc">Live market data: Index tickers, Stock Movers (Gainers/Losers), Option Movers (OI/Volume), all NSE indices. Auto-refreshes 3s.</div>
+            <div class="card-url">http://localhost:3001/portal/market-dashboard</div>
+            <span class="card-badge badge-live">LIVE</span>
+        </a>
+
+        <a class="card" href="/portal/options-chain" target="_blank">
+            <div class="card-icon">📈</div>
+            <div class="card-title">Options Chain</div>
+            <div class="card-desc">Live option chain with Greeks, IV, OI, volume. Auto-refreshes from QuestDB. NIFTY, BANKNIFTY, FINNIFTY.</div>
+            <div class="card-url">http://localhost:3001/portal/options-chain</div>
+            <span class="card-badge badge-live">LIVE</span>
         </a>
 
         <div class="section-title">🗄️ Database & Storage</div>
@@ -403,15 +445,54 @@
             document.getElementById('clock').textContent = h + ':' + m + ':' + s;
         }
 
+        // ── WebSocket Connection Status ─────────────────────────────────
+        function updateWsCard(cardId, valueId, detailId, status, detail) {
+            var card = document.getElementById(cardId);
+            var val = document.getElementById(valueId);
+            if (status === 'connected') {
+                val.style.color = 'var(--accent-green)';
+                card.style.borderColor = 'rgba(38, 166, 154, 0.3)';
+            } else {
+                val.style.color = 'var(--accent-red)';
+                card.style.borderColor = 'rgba(239, 83, 80, 0.3)';
+            }
+        }
+
+        function loadWsStatus() {
+            fetch('/health')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var s = d.subsystems;
+                    // Live Market Feed
+                    var wsEl = document.getElementById('wsLiveCount');
+                    wsEl.textContent = s.websocket.detail || '0';
+                    updateWsCard('wsLiveFeed', 'wsLiveCount', 'wsLiveDetail', s.websocket.status);
+                    // Depth 20
+                    var d20El = document.getElementById('wsD20Count');
+                    d20El.textContent = s.depth_20.detail || '0';
+                    updateWsCard('wsDepth20', 'wsD20Count', 'wsD20Detail', s.depth_20.status);
+                    // Depth 200
+                    var d200El = document.getElementById('wsD200Count');
+                    d200El.textContent = s.depth_200.detail || '0';
+                    updateWsCard('wsDepth200', 'wsD200Count', 'wsD200Detail', s.depth_200.status);
+                    // Order Update
+                    var ouEl = document.getElementById('wsOUStatus');
+                    ouEl.textContent = s.order_update.status === 'connected' ? 'CONNECTED' : 'DOWN';
+                    updateWsCard('wsOrderUpdate', 'wsOUStatus', 'wsOUDetail', s.order_update.status);
+                }).catch(function() {});
+        }
+
         // ── Init ────────────────────────────────────────────────────────
         checkHealth();
         checkQuestDB();
         loadStats();
+        loadWsStatus();
         updateClock();
 
         setInterval(checkHealth, 10000);
         setInterval(checkQuestDB, 30000);
         setInterval(loadStats, 30000);
+        setInterval(loadWsStatus, 5000);
         setInterval(updateClock, 1000);
     </script>
 </body>

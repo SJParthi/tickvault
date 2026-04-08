@@ -26,7 +26,7 @@
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use dhan_live_trader_app::boot_helpers::{
-    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START,
+    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
     compute_market_close_sleep, create_log_file_writer, effective_ws_stagger, format_bind_addr,
     format_cross_match_details, format_timeframe_details, format_violation_details,
 };
@@ -143,11 +143,15 @@ async fn main() -> Result<()> {
         None => (None, None),
     };
 
+    // IST timestamp formatter — all log timestamps show +05:30 offset.
+    let ist_timer = IstTimer;
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true)
         .with_file(false)
-        .with_line_number(false);
+        .with_line_number(false)
+        .with_timer(ist_timer.clone());
 
     // Box the fmt layer so both JSON and text branches produce the same type,
     // allowing a single subscriber chain (required for OpenTelemetryLayer<S> inference).
@@ -169,6 +173,7 @@ async fn main() -> Result<()> {
                     .with_thread_ids(true)
                     .with_file(false)
                     .with_line_number(false)
+                    .with_timer(ist_timer)
                     .json()
                     .with_writer(std::sync::Mutex::new(file));
                 Some(Box::new(file_fmt))
@@ -402,6 +407,11 @@ async fn main() -> Result<()> {
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
+            // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
+            let fast_registry = subscription_plan
+                .as_ref()
+                .map(|p| std::sync::Arc::new(p.registry.clone()));
+
             // Start with None writers — ticks are processed in-memory for trading.
             // QuestDB persistence reconnects in background (tables already exist
             // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
@@ -419,6 +429,7 @@ async fn main() -> Result<()> {
                     None, // stock_movers_writer — QuestDB reconnects in background
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
+                    fast_registry,
                 )
                 .await;
             });
@@ -664,13 +675,25 @@ async fn main() -> Result<()> {
             }
         };
 
-        // --- Background: Index constituency download (best-effort) ---
-        let bg_constituency =
+        // --- Background: Index constituency (best-effort) ---
+        // During market hours, skip network downloads to niftyindices.com
+        // (they often return HTML instead of CSV) and use the cached JSON.
+        // Fresh download happens on non-market-hours boot or post-market.
+        let bg_constituency = if is_market_hours {
+            info!(
+                "market hours — using cached constituency data (skipping niftyindices.com download)"
+            );
+            dhan_live_trader_core::index_constituency::try_load_cache(
+                &config.instrument.csv_cache_directory,
+            )
+            .await
+        } else {
             dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
                 &config.index_constituency,
                 &config.instrument.csv_cache_directory,
             )
-            .await;
+            .await
+        };
 
         // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
         // Enrich with security_ids from instrument master for news-based trading.
@@ -891,6 +914,7 @@ async fn main() -> Result<()> {
         dhan_live_trader_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
+        dhan_live_trader_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1151,6 +1175,11 @@ async fn main() -> Result<()> {
                 }
             };
 
+        // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
+        let slow_registry = subscription_plan
+            .as_ref()
+            .map(|p| std::sync::Arc::new(p.registry.clone()));
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -1165,6 +1194,7 @@ async fn main() -> Result<()> {
                 stock_movers_writer,
                 option_movers_tracker,
                 option_movers_writer,
+                slow_registry,
             )
             .await;
         });
@@ -1183,6 +1213,352 @@ async fn main() -> Result<()> {
     } else {
         Vec::new()
     };
+
+    // -----------------------------------------------------------------------
+    // Step 8c: Spawn 20-level + 200-level depth WebSocket connections
+    // -----------------------------------------------------------------------
+    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 50 instruments each
+    // 200-level: 4 connections, 1 ATM instrument each
+    // NSE only — BSE (SENSEX) depth not supported by Dhan depth endpoint.
+    // SENSEX gets 5-level depth from main Live Market Feed.
+    // O(1) EXEMPT: begin — boot-time depth connection setup
+    if should_connect_ws && config.subscription.enable_twenty_depth {
+        if let Some(ref plan) = subscription_plan {
+            let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
+
+            for underlying in &depth_underlyings {
+                // Collect NSE_FNO instruments for this underlying (ATM strikes first from plan)
+                let instruments_for_underlying: Vec<
+                    dhan_live_trader_core::websocket::types::InstrumentSubscription,
+                > = plan
+                    .registry
+                    .iter()
+                    .filter(|inst| {
+                        inst.exchange_segment
+                            == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                            && inst.underlying_symbol == *underlying
+                    })
+                    .take(config.subscription.twenty_depth_max_instruments)
+                    .map(|inst| {
+                        dhan_live_trader_core::websocket::types::InstrumentSubscription::new(
+                            inst.exchange_segment,
+                            inst.security_id,
+                        )
+                    })
+                    .collect();
+
+                if instruments_for_underlying.is_empty() {
+                    info!(
+                        underlying,
+                        "20-level depth: no instruments found — skipping"
+                    );
+                    continue;
+                }
+
+                let depth_token = token_handle.clone();
+                let depth_client_id = ws_client_id.clone();
+                let instrument_count = instruments_for_underlying.len();
+                let label = (*underlying).to_string();
+
+                info!(
+                    underlying,
+                    instruments = instrument_count,
+                    "spawning 20-level depth connection"
+                );
+
+                // O(1) EXEMPT: begin — depth connection + persistence setup at boot
+                let (depth_tx, mut depth_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4096);
+                let depth_questdb = config.questdb.clone();
+                let depth_label_recv = label.clone();
+
+                // Spawn depth frame receiver with QuestDB persistence
+                tokio::spawn(async move {
+                    let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
+                    let mut writer =
+                        dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
+                            &depth_questdb,
+                        )
+                        .ok();
+                    if writer.is_some() {
+                        tracing::info!(
+                            underlying = depth_label_recv,
+                            "deep depth QuestDB writer connected"
+                        );
+                    }
+                    while let Some(frame) = depth_rx.recv().await {
+                        m.increment(1);
+                        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                            &frame, ts,
+                        ) {
+                            Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                security_id,
+                                exchange_segment_code,
+                                side,
+                                levels,
+                                ..
+                            }) => {
+                                let side_str = match side {
+                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
+                                        "BID"
+                                    }
+                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                        "ASK"
+                                    }
+                                };
+                                if let Some(ref mut w) = writer
+                                    && let Err(err) = w.append_deep_depth(
+                                        security_id,
+                                        exchange_segment_code,
+                                        side_str,
+                                        &levels,
+                                        "20",
+                                        ts,
+                                    )
+                                {
+                                    tracing::warn!(?err, "failed to persist 20-level depth");
+                                }
+                            }
+                            Ok(_) => {} // non-depth frame (shouldn't happen)
+                            Err(err) => {
+                                tracing::warn!(?err, "failed to parse 20-level depth frame");
+                            }
+                        }
+                    }
+                });
+
+                // Spawn depth WebSocket connection with Telegram alerts + health updates
+                let d20_notifier = notifier.clone();
+                let d20_health = health_status.clone();
+                let d20_label_notify = label.clone();
+                tokio::spawn(async move {
+                    // Alert: connected
+                    d20_notifier.notify(NotificationEvent::DepthTwentyConnected {
+                        underlying: d20_label_notify.clone(),
+                    });
+                    d20_health.set_depth_20_connections(
+                        d20_health.depth_20_connections().saturating_add(1),
+                    );
+
+                    if let Err(err) = dhan_live_trader_core::websocket::run_twenty_depth_connection(
+                        depth_token,
+                        depth_client_id,
+                        instruments_for_underlying,
+                        depth_tx,
+                    )
+                    .await
+                    {
+                        tracing::error!(?err, "20-level depth connection terminated");
+                        d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
+                            underlying: d20_label_notify,
+                            reason: format!("{err}"),
+                        });
+                        d20_health.set_depth_20_connections(
+                            d20_health.depth_20_connections().saturating_sub(1),
+                        );
+                    }
+                });
+                // O(1) EXEMPT: end
+
+                // 200-level: spawn 1 connection for ATM CE of this underlying
+                // Pick the first NSE_FNO option for this underlying as ATM proxy
+                if let Some(atm_instrument) = plan.registry.iter().find(|inst| {
+                    inst.exchange_segment == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                        && inst.underlying_symbol == *underlying
+                        && inst.option_type.is_some()
+                }) {
+                    let depth200_token = token_handle.clone();
+                    let depth200_client_id = ws_client_id.clone();
+                    let depth200_segment = atm_instrument.exchange_segment;
+                    let depth200_sid = atm_instrument.security_id;
+                    let depth200_label = format!("{underlying}-ATM");
+
+                    info!(
+                        underlying,
+                        security_id = depth200_sid,
+                        "spawning 200-level depth connection"
+                    );
+
+                    let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+                    let m200_label = depth200_label.clone();
+                    let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
+
+                    // Spawn 200-level depth receiver with QuestDB persistence
+                    tokio::spawn(async move {
+                        let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
+                        let mut writer =
+                            dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
+                                &depth200_questdb,
+                            )
+                            .ok();
+                        if writer.is_some() {
+                            tracing::info!(
+                                label = m200_label,
+                                "200-level deep depth QuestDB writer connected"
+                            );
+                        }
+                        while let Some(frame) = rx200.recv().await {
+                            m.increment(1);
+                            let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                                &frame, ts,
+                            ) {
+                                Ok(
+                                    dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                        security_id,
+                                        exchange_segment_code,
+                                        side,
+                                        levels,
+                                        ..
+                                    },
+                                ) => {
+                                    let side_str = match side {
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => "BID",
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => "ASK",
+                                    };
+                                    if let Some(ref mut w) = writer
+                                        && let Err(err) = w.append_deep_depth(
+                                            security_id,
+                                            exchange_segment_code,
+                                            side_str,
+                                            &levels,
+                                            "200",
+                                            ts,
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            ?err,
+                                            "failed to persist 200-level depth"
+                                        );
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::warn!(?err, "failed to parse 200-level depth frame");
+                                }
+                            }
+                        }
+                    });
+
+                    let d200_notifier = notifier.clone();
+                    let d200_health = health_status.clone();
+                    let d200_label_notify = depth200_label.clone();
+                    tokio::spawn(async move {
+                        // Alert: connected
+                        d200_notifier.notify(NotificationEvent::DepthTwoHundredConnected {
+                            underlying: d200_label_notify.clone(),
+                        });
+                        d200_health.set_depth_200_connections(
+                            d200_health.depth_200_connections().saturating_add(1),
+                        );
+
+                        if let Err(err) =
+                            dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
+                                depth200_token,
+                                depth200_client_id,
+                                depth200_segment,
+                                depth200_sid,
+                                depth200_label,
+                                tx200,
+                            )
+                            .await
+                        {
+                            tracing::error!(?err, "200-level depth connection terminated");
+                            d200_notifier.notify(NotificationEvent::DepthTwoHundredDisconnected {
+                                underlying: d200_label_notify,
+                                reason: format!("{err}"),
+                            });
+                            d200_health.set_depth_200_connections(
+                                d200_health.depth_200_connections().saturating_sub(1),
+                            );
+                        }
+                    });
+                }
+            }
+        }
+    } else if config.subscription.enable_twenty_depth {
+        info!("depth connections skipped — WebSocket connections not active");
+    }
+    // O(1) EXEMPT: end
+
+    // -----------------------------------------------------------------------
+    // Step 8d: Spawn depth rebalancer (monitors spot drift, signals ATM changes)
+    // -----------------------------------------------------------------------
+    if should_connect_ws && config.subscription.enable_twenty_depth && subscription_plan.is_some() {
+        let depth_underlyings: Vec<String> = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(); // O(1) EXEMPT: boot-time vec of 4 strings
+
+        // Build FnoUniverse Arc for rebalancer (one-time clone at boot)
+        let rebalancer_universe: Option<std::sync::Arc<FnoUniverse>> =
+            slow_boot_universe.as_ref().map(|u| {
+                std::sync::Arc::new(u.clone()) // O(1) EXEMPT: boot-time universe clone
+            });
+
+        if let Some(universe_arc) = rebalancer_universe {
+            // SharedSpotPrices: updated by a tick broadcast subscriber, read by rebalancer
+            let spot_prices =
+                dhan_live_trader_core::instrument::depth_rebalancer::new_shared_spot_prices();
+            let spot_prices_updater = std::sync::Arc::clone(&spot_prices);
+
+            // Spawn spot price updater: subscribes to tick broadcast, extracts index LTPs
+            let mut spot_rx = tick_broadcast_sender.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match spot_rx.recv().await {
+                        Ok(tick) => {
+                            // IDX_I segment code = 0 — these are index ticks (NIFTY, BANKNIFTY, etc.)
+                            if tick.exchange_segment_code == 0
+                                && tick.last_traded_price > 0.0
+                                && tick.last_traded_price.is_finite()
+                            {
+                                // Look up symbol from security_id via the plan registry
+                                // For indices, we use a simple mapping from the known security IDs
+                                let symbol = match tick.security_id {
+                                    13 => Some("NIFTY"),
+                                    25 => Some("BANKNIFTY"),
+                                    27 => Some("FINNIFTY"),
+                                    442 => Some("MIDCPNIFTY"),
+                                    _ => None,
+                                };
+                                if let Some(sym) = symbol {
+                                    dhan_live_trader_core::instrument::depth_rebalancer::update_spot_price(
+                                            &spot_prices_updater,
+                                            sym,
+                                            f64::from(tick.last_traded_price),
+                                        ).await;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Rebalance event channel (watch — latest-value semantics)
+            let (rebalance_tx, _rebalance_rx) = tokio::sync::watch::channel::<
+                Option<dhan_live_trader_core::instrument::depth_rebalancer::RebalanceEvent>,
+            >(None);
+
+            // Shutdown flag for the rebalancer
+            let rebalancer_shutdown =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            tokio::spawn(
+                dhan_live_trader_core::instrument::depth_rebalancer::run_depth_rebalancer(
+                    spot_prices,
+                    universe_arc,
+                    depth_underlyings,
+                    rebalance_tx,
+                    std::sync::Arc::clone(&rebalancer_shutdown),
+                ),
+            );
+            info!("depth rebalancer spawned (checks spot drift every 60s)");
+            metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Step 9.5: Background historical candle fetch (cold path — never blocks live)
@@ -1235,8 +1611,17 @@ async fn main() -> Result<()> {
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
+        let ou_notifier = notifier.clone();
+        let ou_health = health_status.clone();
         tokio::spawn(async move {
+            ou_notifier.notify(NotificationEvent::OrderUpdateConnected);
+            ou_health.set_order_update_connected(true);
             run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
+            // If run_order_update_connection returns, connection terminated
+            ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
+                reason: "connection task exited".to_string(),
+            });
+            ou_health.set_order_update_connected(false);
         })
     };
     info!("order update WebSocket started");
@@ -1304,14 +1689,23 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 10.5: Download index constituency data (non-blocking, best-effort)
+    // Step 10.5: Index constituency data (best-effort)
     // -----------------------------------------------------------------------
-    let constituency_map =
+    // During market hours, skip network downloads to niftyindices.com
+    // (they often return HTML instead of CSV) and use the cached JSON.
+    let constituency_map = if is_market_hours {
+        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
+        dhan_live_trader_core::index_constituency::try_load_cache(
+            &config.instrument.csv_cache_directory,
+        )
+        .await
+    } else {
         dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
             &config.index_constituency,
             &config.instrument.csv_cache_directory,
         )
-        .await;
+        .await
+    };
 
     // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
     // Enrich with security_ids from instrument master for news-based trading.
@@ -1362,6 +1756,12 @@ async fn main() -> Result<()> {
 
     info!(address = %bind_addr, "API server listening");
 
+    // Auto-open Portal and Market Dashboard in browser (API server now ready).
+    // Best-effort: non-blocking, logged on failure.
+    tokio::spawn(async {
+        crate::infra::open_in_browser("http://localhost:3001/portal/market-dashboard").await;
+    });
+
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             error!(?err, "API server error");
@@ -1406,10 +1806,36 @@ async fn main() -> Result<()> {
     // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
     // -----------------------------------------------------------------------
     // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
+    // Alert dedup: each category sends at most 1 alert per ALERT_COOLDOWN_SECS
+    // to avoid spamming Telegram when a condition persists across intervals.
     {
         let health_notifier = notifier.clone();
         let questdb_config = config.questdb.clone();
         tokio::spawn(async move {
+            use std::time::Instant;
+
+            /// Minimum seconds between repeated alerts of the same category.
+            const ALERT_COOLDOWN_SECS: u64 = 1800; // 30 minutes
+            let cooldown = std::time::Duration::from_secs(ALERT_COOLDOWN_SECS);
+
+            // Per-category last-alert timestamps for dedup.
+            let mut last_disk_alert: Option<Instant> = None;
+            let mut last_memory_alert: Option<Instant> = None;
+            let mut last_spill_alert: Option<Instant> = None;
+            let mut last_docker_alert: Option<Instant> = None;
+
+            /// Returns true if cooldown has elapsed (or first alert).
+            fn should_alert(last: &mut Option<Instant>, cooldown: std::time::Duration) -> bool {
+                let now = Instant::now();
+                match last {
+                    Some(t) if now.duration_since(*t) < cooldown => false,
+                    _ => {
+                        *last = Some(now);
+                        true
+                    }
+                }
+            }
+
             let interval = std::time::Duration::from_secs(
                 dhan_live_trader_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
             );
@@ -1418,6 +1844,7 @@ async fn main() -> Result<()> {
                 // Disk space check
                 if let Some(percent_free) = infra::check_disk_space()
                     && percent_free < infra::MIN_FREE_DISK_PERCENT
+                    && should_alert(&mut last_disk_alert, cooldown)
                 {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
@@ -1429,6 +1856,7 @@ async fn main() -> Result<()> {
                 // Memory RSS check
                 if let Some(rss_mb) = infra::check_memory_rss()
                     && rss_mb > infra::MEMORY_RSS_ALERT_MB
+                    && should_alert(&mut last_memory_alert, cooldown)
                 {
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
@@ -1439,7 +1867,8 @@ async fn main() -> Result<()> {
                 }
                 // C2: Spill file size check — export metric + alert if large.
                 let spill_bytes = infra::check_spill_file_size();
-                if spill_bytes > 500 * 1024 * 1024 {
+                if spill_bytes > 500 * 1024 * 1024 && should_alert(&mut last_spill_alert, cooldown)
+                {
                     // > 500 MB of spill files — QuestDB likely down for extended period.
                     health_notifier.notify(NotificationEvent::Custom {
                         message: format!(
@@ -1458,6 +1887,16 @@ async fn main() -> Result<()> {
                 }
                 // C4: Auto-cleanup spill files older than 7 days.
                 infra::cleanup_old_spill_files();
+                // C5: Docker container watchdog — detect and restart unhealthy containers.
+                let unhealthy = infra::check_and_restart_containers().await;
+                if unhealthy > 0 && should_alert(&mut last_docker_alert, cooldown) {
+                    health_notifier.notify(NotificationEvent::Custom {
+                        message: format!(
+                            "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
+                             Auto-restart triggered via docker compose up -d."
+                        ),
+                    });
+                }
             }
         });
         info!("background periodic health check started (every 5 minutes)");
@@ -1718,9 +2157,10 @@ fn spawn_historical_candle_fetch(
         };
 
         // -----------------------------------------------------------------
-        // Trading day + within market hours: wait for post-market signal
-        //   (after 15:30 IST, WS disconnected, live data fully ingested)
-        // Trading day + AFTER market hours: fetch immediately (market already closed)
+        // Historical fetch timing on trading days:
+        //   Before 08:00 IST → fetch immediately (pre-market, yesterday's data)
+        //   08:00–15:30 IST  → WAIT for post-market signal (market active or about to open)
+        //   After 15:30 IST  → fetch immediately (market closed, today's data ready)
         // Non-trading day: fetch immediately at boot (no live data to wait for)
         // -----------------------------------------------------------------
 
@@ -1730,16 +2170,26 @@ fn spawn_historical_candle_fetch(
                 &bg_data_collection_end,
             );
 
-        if is_trading_day && is_within_collection_window {
+        // Extended guard: also wait if between 08:00 and data_collection_start (09:00)
+        // This prevents fetching at 8:36 AM when market is about to open
+        let is_pre_market_wait_zone = if is_trading_day {
+            let now_ist =
+                chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
+            let hour = now_ist.format("%H").to_string().parse::<u32>().unwrap_or(0);
+            // Between 08:00 and 09:00 IST — market about to open, don't fetch
+            hour >= 8 && !is_within_collection_window
+        } else {
+            false
+        };
+
+        if is_trading_day && (is_within_collection_window || is_pre_market_wait_zone) {
             info!(
-                "trading day during market hours — waiting for post-market signal before historical fetch"
+                "trading day (08:00-15:30 IST) — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
-            info!("post-market signal received — WebSockets disconnected, live data ingested");
+            info!("post-market signal received — starting historical candle fetch");
         } else if is_trading_day {
-            info!(
-                "trading day but market already closed — starting historical candle fetch immediately"
-            );
+            info!("trading day outside 08:00-15:30 — starting historical candle fetch immediately");
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }
@@ -1876,7 +2326,9 @@ fn spawn_historical_candle_fetch(
         }
     });
 
-    info!("background historical candle fetch spawned (non-blocking)");
+    info!(
+        "background historical candle fetch task spawned (will wait for post-market signal if trading hours)"
+    );
 }
 
 // format_timeframe_details, format_violation_details, format_cross_match_details

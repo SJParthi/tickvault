@@ -20,6 +20,7 @@
 pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
+pub mod deep_depth_persistence;
 pub mod greeks_persistence;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
@@ -194,6 +195,7 @@ mod tests {
             host: "unreachable-host".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         // Pool creation is lazy — should succeed even with unreachable host
         let pool = crate::valkey_cache::ValkeyPool::new(&config);
@@ -206,6 +208,7 @@ mod tests {
             host: "unreachable-host".to_string(),
             port: 6379,
             max_connections: 4,
+            password: String::new(),
         };
         let pool = crate::valkey_cache::ValkeyPool::new(&config).unwrap();
         // Reconnect should succeed (rebuilds pool, doesn't try to connect)

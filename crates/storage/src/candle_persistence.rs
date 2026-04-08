@@ -2046,13 +2046,13 @@ mod tests {
 
     #[test]
     fn test_candle_buffer_capacity_constant() {
-        assert_eq!(CANDLE_BUFFER_CAPACITY, 100_000);
-        // Memory footprint: ~48 bytes × 100K = ~4.8MB — reasonable.
+        assert_eq!(CANDLE_BUFFER_CAPACITY, 200_000);
+        // Memory footprint: ~76 bytes × 200K = ~14.5MB — sized for 25K instruments.
         let size = std::mem::size_of::<BufferedCandle>();
         let total_mb = (size * CANDLE_BUFFER_CAPACITY) as f64 / 1_048_576.0;
         assert!(
-            total_mb < 10.0,
-            "candle ring buffer must be < 10MB, got {total_mb:.1}MB"
+            total_mb < 20.0,
+            "candle ring buffer must be < 20MB, got {total_mb:.1}MB"
         );
     }
 
@@ -2672,9 +2672,26 @@ mod tests {
         let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
         std::fs::create_dir_all(real_spill_dir).unwrap();
 
-        // Create two stale files with different dates and candle counts.
+        // Pre-test cleanup: remove only our specific test files to avoid
+        // interference from parallel tests sharing the same spill directory.
         let stale_file_a = real_spill_dir.join("candles-20220101.bin");
         let stale_file_b = real_spill_dir.join("candles-20220202.bin");
+        let _ = std::fs::remove_file(&stale_file_a);
+        let _ = std::fs::remove_file(&stale_file_b);
+
+        // Also remove any leftover candle spill files from other tests
+        // to ensure recover_stale_spill_files() only picks up our test files.
+        if let Ok(entries) = std::fs::read_dir(real_spill_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("candles-") && name_str.ends_with(".bin") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        // Create two stale files with different dates and candle counts.
         let count_a = 25_usize;
         let count_b = 35_usize;
 

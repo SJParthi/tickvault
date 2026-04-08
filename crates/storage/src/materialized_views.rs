@@ -310,8 +310,21 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     }
 
     // Step 2: Enable DEDUP UPSERT KEYS on candles_1s.
+    // If DEDUP fails with "deduplicate key column not found", the table has stale
+    // schema — auto-recover by DROP + CREATE + DEDUP.
     let dedup_sql = build_dedup_sql(QUESTDB_TABLE_CANDLES_1S, DEDUP_KEY_CANDLES_1S);
-    execute_ddl(&client, &base_url, &dedup_sql, "candles_1s DEDUP").await;
+    if !execute_ddl_check_stale(
+        &client,
+        &base_url,
+        &dedup_sql,
+        "candles_1s DEDUP",
+        QUESTDB_TABLE_CANDLES_1S,
+        CANDLES_1S_CREATE_DDL,
+    )
+    .await
+    {
+        return;
+    }
 
     // Step 3: Add Greeks columns to candles_1s if missing (schema migration).
     // QuestDB ALTER TABLE ADD COLUMN is idempotent — adding an already-existing
@@ -421,6 +434,69 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
         );
     }
     info!("all 18 materialized views dropped for Greeks migration");
+}
+
+/// Executes a DEDUP DDL with auto-recovery on stale schema. Returns true on success.
+///
+/// If DEDUP fails with "deduplicate key column not found", drops and recreates the table.
+async fn execute_ddl_check_stale(
+    client: &reqwest::Client,
+    base_url: &str,
+    dedup_sql: &str,
+    label: &str,
+    table_name: &str,
+    create_ddl: &str,
+) -> bool {
+    match client
+        .get(base_url)
+        .query(&[("query", dedup_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                debug!(label, "DDL executed successfully");
+                true
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("deduplicate key column not found") {
+                    warn!(
+                        table_name,
+                        "stale schema detected — dropping and recreating"
+                    );
+                    let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
+                    let _ = client
+                        .get(base_url)
+                        .query(&[("query", &drop_sql)])
+                        .send()
+                        .await;
+                    let _ = client
+                        .get(base_url)
+                        .query(&[("query", create_ddl)])
+                        .send()
+                        .await;
+                    let _ = client
+                        .get(base_url)
+                        .query(&[("query", dedup_sql)])
+                        .send()
+                        .await;
+                    info!(table_name, "table recreated with correct schema");
+                    true
+                } else {
+                    warn!(
+                        label,
+                        body = body.chars().take(200).collect::<String>(),
+                        "DDL returned non-success"
+                    );
+                    false
+                }
+            }
+        }
+        Err(err) => {
+            warn!(label, ?err, "DDL request failed");
+            false
+        }
+    }
 }
 
 /// Executes a single DDL statement against QuestDB. Returns true on success.

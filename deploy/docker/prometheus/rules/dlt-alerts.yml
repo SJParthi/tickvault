@@ -289,6 +289,18 @@ groups:
           summary: "TICKS PERMANENTLY LOST"
           description: "{{ $value }} ticks dropped — both ring buffer and disk spill failed. IMMEDIATE investigation required."
 
+      # C3: Broadcast lag — cold-path persistence fell behind tick producer
+      # tokio broadcast channel dropped oldest ticks (capacity 65536).
+      # These ticks are PERMANENTLY LOST — they never reached ring buffer or disk.
+      - alert: BroadcastLagTickLoss
+        expr: dlt_ticks_permanently_lost > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "TICKS PERMANENTLY LOST — broadcast channel lag"
+          description: "{{ $value }} ticks lost due to cold-path persistence lagging behind tick producer. Broadcast channel (capacity 65536) dropped oldest ticks. Check tick persistence consumer performance."
+
       # Circuit breaker opened — Dhan API failures exceeded threshold
       - alert: CircuitBreakerOpen
         expr: dlt_circuit_breaker_state == 1
@@ -308,3 +320,201 @@ groups:
         annotations:
           summary: "Order rejection rate > 10%"
           description: "More than 10% of placed orders are being rejected."
+
+      # Token expiry — refresh at 23h, warn at 1h remaining
+      - alert: TokenExpiryWarning
+        expr: dlt_token_remaining_seconds < 3600
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JWT token expires in < 1 hour"
+          description: "Token has {{ $value }}s remaining. Auto-refresh should trigger at 23h mark."
+
+      - alert: TokenExpiryCritical
+        expr: dlt_token_remaining_seconds < 600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "JWT token expires in < 10 minutes"
+          description: "Token has {{ $value }}s remaining. Immediate renewal needed or trading will halt."
+
+      # Zero ticks for 30 seconds during market hours (more aggressive than NoTicksReceived)
+      - alert: ZeroTicksBurst
+        expr: increase(dlt_ticks_processed_total[30s]) == 0 and dlt_pipeline_active == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No ticks received for 30 seconds while pipeline is active"
+          description: "Tick flow stopped while pipeline is running. Check WebSocket connections and Dhan feed status."
+
+      # Memory usage — process RSS
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes{job="dlt-application"} > 2147483648
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Application memory > 2GB"
+          description: "Process RSS is {{ $value | humanize1024 }}B. Possible memory leak."
+
+      # Valkey (cache) down
+      - alert: ValkeyDown
+        expr: up{job="dlt-valkey"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valkey cache is DOWN"
+          description: "Valkey is unreachable. App continues without cache (degraded performance)."
+
+      # Alloy (log collector) down — explains empty Logs dashboard
+      - alert: AlloyDown
+        expr: up{job="dlt-alloy"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alloy log collector is DOWN"
+          description: "Alloy is not scraping logs. Grafana Logs dashboard will be empty."
+
+      # 20-level depth connection down
+      - alert: Depth20Disconnected
+        expr: dlt_depth_20lvl_connection_active == 0 and dlt_pipeline_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "20-level depth connection is DOWN"
+          description: "20-level depth WebSocket disconnected for 2+ minutes while pipeline is active. Order book data stale."
+
+      # 200-level depth connection down
+      - alert: Depth200Disconnected
+        expr: dlt_depth_200lvl_connection_active == 0 and dlt_pipeline_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "200-level depth connection is DOWN"
+          description: "200-level depth WebSocket disconnected for 2+ minutes while pipeline is active."
+
+      # Zero depth frames for 60 seconds
+      - alert: NoDepthFrames
+        expr: increase(dlt_depth_20lvl_frames_received[60s]) == 0 and dlt_depth_20lvl_connection_active == 1
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "No 20-level depth frames received for 60 seconds"
+          description: "Depth connection is active but no frames arriving. Possible subscription issue."
+
+      # Deep depth data loss — rows dropped on flush failure
+      - alert: DeepDepthDataLoss
+        expr: dlt_deep_depth_dropped_total > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DEEP DEPTH DATA PERMANENTLY LOST"
+          description: "{{ $value }} deep depth rows dropped. DeepDepthWriter flush failed."
+
+      # Depth frames dropped due to send timeout
+      - alert: DepthFramesDropped
+        expr: rate(dlt_depth_frames_dropped_total[5m]) > 0
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Depth frames being dropped (send timeout)"
+          description: "{{ $value }} depth frames/sec dropped. Tick processor may be overloaded."
+
+      # Depth rebalancer not running while pipeline is active
+      - alert: DepthRebalancerDown
+        expr: dlt_depth_rebalancer_active == 0 and dlt_pipeline_active == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Depth rebalancer is not running"
+          description: "Depth subscriptions are static. ATM strike changes will not trigger rebalance."
+
+      # Trading pipeline loop stalled (no heartbeat for 30+ seconds)
+      - alert: TradingPipelineStalled
+        expr: time() - dlt_trading_pipeline_heartbeat > 30 and dlt_pipeline_active == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading pipeline loop stalled"
+          description: "No heartbeat from trading pipeline for 30+ seconds. Possible deadlock."
+
+      # Trading pipeline lagging behind tick producer
+      - alert: TradingPipelineLagging
+        expr: rate(dlt_trading_pipeline_ticks_lagged_total[5m]) > 0
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trading pipeline lagging behind tick stream"
+          description: "{{ $value }} ticks/sec lost to broadcast lag. Signals may be missed."
+
+      # Daily P&L approaching max loss limit (2% of capital)
+      - alert: DailyPnlWarning
+        expr: (dlt_realized_pnl + dlt_unrealized_pnl) < -15000
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Daily P&L exceeds -15K warning threshold"
+          description: "Combined P&L is {{ $value }}. Max daily loss limit is 2% of capital."
+
+      - alert: DailyPnlCritical
+        expr: (dlt_realized_pnl + dlt_unrealized_pnl) < -18000
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Daily P&L approaching max loss — HALT IMMINENT"
+          description: "Combined P&L is {{ $value }}. Auto-halt triggers at -20K (2% of 10L capital)."
+
+      # Order placement latency SLA breach
+      - alert: HighOrderLatency
+        expr: histogram_quantile(0.99, rate(dlt_order_placement_duration_ns_bucket[5m])) > 100000000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order placement p99 latency > 100ms"
+          description: "Order API call p99 is {{ $value }}ns. SLA target is 100ms."
+
+      # Valkey cache error rate
+      - alert: HighValkeyErrorRate
+        expr: rate(dlt_valkey_errors_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valkey cache errors > 1/sec"
+          description: "Cache error rate is {{ $value }}/sec. Check Valkey connectivity."
+
+      # WebSocket backpressure — frames queuing
+      - alert: WebSocketBackpressure
+        expr: rate(dlt_ws_backpressure_timeout_total[5m]) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket frame send timeouts detected"
+          description: "{{ $value }} send timeouts/sec. Tick processor may be overloaded."
+
+      # SEBI rate limiter denying orders
+      - alert: RateLimiterDenying
+        expr: rate(dlt_rate_limiter_denied_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "SEBI rate limiter blocking orders"
+          description: "{{ $value }} orders/sec denied by rate limiter. Regulatory compliance at risk."

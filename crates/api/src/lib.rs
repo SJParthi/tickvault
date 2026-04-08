@@ -77,6 +77,10 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         )
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .route(
+            "/portal/options-chain",
+            axum::routing::get(handlers::static_file::options_chain),
+        )
+        .route(
             "/api/index-constituency",
             axum::routing::get(handlers::index_constituency::get_constituency_summary),
         )
@@ -87,6 +91,34 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/api/stock-indices/{symbol}",
             axum::routing::get(handlers::index_constituency::get_stock_indices),
+        )
+        .route(
+            "/api/option-chain",
+            axum::routing::get(handlers::option_chain::get_option_chain),
+        )
+        .route(
+            "/api/pcr",
+            axum::routing::get(handlers::option_chain::get_pcr),
+        )
+        .route(
+            "/api/market/indices",
+            axum::routing::get(handlers::market_data::get_indices),
+        )
+        .route(
+            "/api/market/stock-movers",
+            axum::routing::get(handlers::market_data::get_stock_movers),
+        )
+        .route(
+            "/api/market/option-movers",
+            axum::routing::get(handlers::market_data::get_option_movers),
+        )
+        .route(
+            "/portal/market-dashboard",
+            axum::routing::get(handlers::static_file::market_dashboard),
+        )
+        .route(
+            "/portal/ws-dashboard",
+            axum::routing::get(handlers::static_file::ws_dashboard),
         );
 
     public_routes

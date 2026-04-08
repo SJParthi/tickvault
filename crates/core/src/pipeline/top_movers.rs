@@ -64,6 +64,8 @@ pub struct MoverEntry {
     pub exchange_segment_code: u8,
     /// Last traded price.
     pub last_traded_price: f32,
+    /// Previous close price (from PrevClose packets).
+    pub prev_close: f32,
     /// Percentage change from previous close.
     pub change_pct: f32,
     /// Cumulative volume.
@@ -95,9 +97,16 @@ pub struct TopMoversSnapshot {
 ///
 /// Updated O(1) per tick. Snapshot computation is O(N log N) but only runs
 /// periodically on the cold path (every 5 seconds).
+///
+/// Previous close prices are populated from PrevClose WebSocket packets
+/// (code 6) which arrive at subscription time. The `day_close` field in
+/// `ParsedTick` is NOT used because the exchange only sets it post-market.
 pub struct TopMoversTracker {
     /// Per-security state keyed by `(security_id, segment_code)`.
     securities: HashMap<(u32, u8), SecurityState>,
+    /// Previous close prices from PrevClose packets, keyed by `(security_id, segment_code)`.
+    /// Populated via `update_prev_close()` when PrevClose packets arrive.
+    prev_close_prices: HashMap<(u32, u8), f32>,
     /// Latest snapshot (updated periodically).
     latest_snapshot: Option<TopMoversSnapshot>,
     /// Total ticks processed.
@@ -115,30 +124,56 @@ impl TopMoversTracker {
     pub fn new() -> Self {
         Self {
             securities: HashMap::with_capacity(TRACKER_MAP_INITIAL_CAPACITY),
+            prev_close_prices: HashMap::with_capacity(TRACKER_MAP_INITIAL_CAPACITY),
             latest_snapshot: None,
             ticks_processed: 0,
         }
     }
 
+    /// Stores previous close price from a PrevClose WebSocket packet (code 6).
+    ///
+    /// Called by tick_processor when PrevClose packets arrive (typically at boot).
+    /// This sets the baseline for change% calculations in `update()`.
+    ///
+    /// # Performance
+    /// O(1) — single HashMap insert.
+    pub fn update_prev_close(&mut self, security_id: u32, segment_code: u8, prev_close: f32) {
+        if prev_close.is_finite() && prev_close > 0.0 {
+            self.prev_close_prices
+                .insert((security_id, segment_code), prev_close);
+        }
+    }
+
     /// Updates the tracker with a new tick.
     ///
-    /// Only processes ticks with valid `day_close` (previous close > 0).
+    /// Uses previous close from PrevClose packets (populated via `update_prev_close()`).
+    /// Falls back to `tick.day_close` if available (post-market only).
+    /// Skips ticks without any valid previous close baseline.
     ///
     /// # Performance
     /// O(1) — single HashMap lookup + one division.
     #[inline]
     pub fn update(&mut self, tick: &ParsedTick) {
-        self.ticks_processed = self.ticks_processed.saturating_add(1);
-
-        // Skip ticks without valid previous close (day_close = 0 for Ticker-only feeds)
-        if !tick.day_close.is_finite() || tick.day_close <= 0.0 {
+        // Reject ticks with non-finite or non-positive LTP (NaN, Inf, 0, negative)
+        if !tick.last_traded_price.is_finite() || tick.last_traded_price <= 0.0 {
             return;
         }
 
+        self.ticks_processed = self.ticks_processed.saturating_add(1);
+
         let key = (tick.security_id, tick.exchange_segment_code);
 
+        // Look up previous close: prefer PrevClose packet, fall back to day_close
+        let prev_close = if let Some(&pc) = self.prev_close_prices.get(&key) {
+            pc
+        } else if tick.day_close.is_finite() && tick.day_close > 0.0 {
+            tick.day_close
+        } else {
+            return; // No baseline — skip
+        };
+
         // Calculate percentage change: ((LTP - prev_close) / prev_close) * 100
-        let change_pct = ((tick.last_traded_price - tick.day_close) / tick.day_close) * 100.0;
+        let change_pct = ((tick.last_traded_price - prev_close) / prev_close) * 100.0;
 
         if let Some(state) = self.securities.get_mut(&key) {
             state.last_traded_price = tick.last_traded_price;
@@ -169,12 +204,20 @@ impl TopMoversTracker {
             .securities
             .iter()
             .filter(|(_, state)| state.change_pct.is_finite())
-            .map(|(&(security_id, _), state)| MoverEntry {
-                security_id,
-                exchange_segment_code: state.exchange_segment_code,
-                last_traded_price: state.last_traded_price,
-                change_pct: state.change_pct,
-                volume: state.volume,
+            .map(|(&(security_id, segment_code), state)| {
+                let prev_close = self
+                    .prev_close_prices
+                    .get(&(security_id, segment_code))
+                    .copied()
+                    .unwrap_or(0.0);
+                MoverEntry {
+                    security_id,
+                    exchange_segment_code: state.exchange_segment_code,
+                    last_traded_price: state.last_traded_price,
+                    prev_close,
+                    change_pct: state.change_pct,
+                    volume: state.volume,
+                }
             })
             .collect();
 
@@ -449,6 +492,7 @@ mod tests {
             security_id: 42,
             exchange_segment_code: 2,
             last_traded_price: 100.0,
+            prev_close: 0.0,
             change_pct: 5.0,
             volume: 1000,
         };
@@ -533,21 +577,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn nan_change_pct_excluded_from_snapshot() {
+    fn nan_ltp_rejected_by_update() {
         let mut tracker = TopMoversTracker::new();
-        // LTP = NaN results in NaN change_pct which should be filtered
+        // NaN LTP is rejected by the guard (non-finite LTP rejected at entry)
         tracker.update(&make_tick(100, 2, f32::NAN, 100.0, 1000));
+        assert_eq!(tracker.tracked_count(), 0, "NaN LTP must be rejected");
 
-        // NaN day_close is rejected (tracked_count = 0)
-        // Let's instead produce a NaN change_pct via valid inputs:
-        // day_close=f32::MIN_POSITIVE → change_pct=(NaN-close)/close but LTP must be NaN
-        // Actually, day_close <= 0.0 is already skipped. So we need day_close > 0 and
-        // LTP that produces NaN change_pct. But (ltp - close) / close for finite values is finite.
-        // So NaN change_pct only comes from NaN LTP. But NaN LTP is finite? No: NaN.is_finite()=false.
-        // Actually the update() function does NOT check LTP for finiteness — only day_close.
-        // So NaN LTP with valid day_close will produce NaN change_pct.
         let mut tracker2 = TopMoversTracker::new();
-        // This tick has NaN LTP but valid close → change_pct = NaN
         let tick = ParsedTick {
             security_id: 200,
             exchange_segment_code: 2,
@@ -558,18 +594,11 @@ mod tests {
             ..Default::default()
         };
         tracker2.update(&tick);
-        assert_eq!(tracker2.tracked_count(), 1, "tick should be tracked");
+        assert_eq!(tracker2.tracked_count(), 0, "NaN LTP rejected by guard");
 
         let snapshot = tracker2.compute_snapshot();
-        // NaN change_pct entries are filtered out of gainers/losers
-        assert!(
-            snapshot.gainers.is_empty(),
-            "NaN change_pct should not appear in gainers"
-        );
-        assert!(
-            snapshot.losers.is_empty(),
-            "NaN change_pct should not appear in losers"
-        );
+        assert!(snapshot.gainers.is_empty());
+        assert!(snapshot.losers.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -619,6 +648,7 @@ mod tests {
             security_id: 42,
             exchange_segment_code: 2,
             last_traded_price: 100.5,
+            prev_close: 0.0,
             change_pct: 5.25,
             volume: 1000,
         };
@@ -751,9 +781,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_with_nan_change_pct_excluded_from_all_lists() {
-        // NaN LTP with valid day_close produces NaN change_pct.
-        // NaN entries must be filtered from gainers, losers, and most_active.
+    fn snapshot_with_nan_ltp_rejected_produces_empty_snapshot() {
+        // NaN LTP is rejected at update() entry — never tracked.
         let mut tracker = TopMoversTracker::new();
         let tick = ParsedTick {
             security_id: 1,
@@ -765,13 +794,11 @@ mod tests {
             ..Default::default()
         };
         tracker.update(&tick);
-        assert_eq!(tracker.tracked_count(), 1);
+        assert_eq!(tracker.tracked_count(), 0, "NaN LTP rejected by guard");
 
         let snapshot = tracker.compute_snapshot();
         assert!(snapshot.gainers.is_empty(), "NaN excluded from gainers");
         assert!(snapshot.losers.is_empty(), "NaN excluded from losers");
-        // NaN entries are also filtered from the entries vec before sorting,
-        // so most_active won't contain them
         assert!(
             snapshot.most_active.is_empty(),
             "NaN excluded from most_active"
@@ -819,6 +846,7 @@ mod tests {
             security_id: 42,
             exchange_segment_code: 2,
             last_traded_price: 100.5,
+            prev_close: 0.0,
             change_pct: 5.25,
             volume: 1000,
         };
@@ -953,6 +981,7 @@ mod tests {
             security_id: 12345,
             exchange_segment_code: 1,
             last_traded_price: 2345.50,
+            prev_close: 0.0,
             change_pct: -3.75,
             volume: 99999,
         };
@@ -981,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn inf_ltp_with_valid_close_produces_inf_change_pct_filtered() {
+    fn inf_ltp_rejected_by_update() {
         let mut tracker = TopMoversTracker::new();
         let tick = ParsedTick {
             security_id: 1,
@@ -993,26 +1022,27 @@ mod tests {
             ..Default::default()
         };
         tracker.update(&tick);
-        assert_eq!(tracker.tracked_count(), 1);
+        // Inf LTP is non-finite → rejected by guard
+        assert_eq!(tracker.tracked_count(), 0, "Inf LTP rejected by guard");
 
         let snapshot = tracker.compute_snapshot();
-        // inf change_pct: is_finite() returns false, so filtered from snapshot
         assert!(
             snapshot.gainers.is_empty(),
-            "inf change_pct should be filtered"
+            "inf LTP should not produce any entries"
         );
     }
 
     #[test]
     fn tracker_with_many_securities_caps_at_top_n_for_all_lists() {
         let mut tracker = TopMoversTracker::new();
-        // 50 gainers, 50 losers
+        // 50 gainers, 50 losers (all with positive LTP to pass the guard)
         for i in 1..=50u32 {
             let ltp = 100.0 + (i as f32) * 2.0; // gainers
             tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
         }
         for i in 51..=100u32 {
-            let ltp = 100.0 - ((i - 50) as f32) * 2.0; // losers
+            // Use ltp > 0 for all: smallest is 100.0 - 49*1.9 = 6.9
+            let ltp = 100.0 - ((i - 50) as f32) * 1.9; // losers (all > 0)
             tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
         }
         let snapshot = tracker.compute_snapshot();
@@ -1125,5 +1155,90 @@ mod tests {
         assert_eq!(tracker.tracked_count(), 0);
         assert_eq!(tracker.ticks_processed(), 0);
         assert!(tracker.latest_snapshot().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // update_prev_close — PrevClose packet integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prev_close_map_enables_tracking_when_day_close_is_zero() {
+        let mut tracker = TopMoversTracker::new();
+        // Set prev_close from PrevClose packet
+        tracker.update_prev_close(100, 2, 1000.0);
+        // Tick with day_close=0 (during market hours) — should now be tracked
+        let tick = make_tick(100, 2, 1100.0, 0.0, 5000);
+        tracker.update(&tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            1,
+            "should track via prev_close map"
+        );
+        let snapshot = tracker.compute_snapshot();
+        let pct = snapshot.gainers[0].change_pct;
+        assert!(
+            (pct - 10.0).abs() < 0.01,
+            "expected ~10% from prev_close map, got {pct}"
+        );
+    }
+
+    #[test]
+    fn prev_close_map_takes_priority_over_day_close() {
+        let mut tracker = TopMoversTracker::new();
+        // Set prev_close from PrevClose packet
+        tracker.update_prev_close(100, 2, 200.0);
+        // Tick with day_close=100 (different from PrevClose packet)
+        let tick = make_tick(100, 2, 220.0, 100.0, 1000);
+        tracker.update(&tick);
+        let snapshot = tracker.compute_snapshot();
+        let pct = snapshot.gainers[0].change_pct;
+        // Should use prev_close map (200.0), not day_close (100.0)
+        // (220 - 200) / 200 * 100 = 10%
+        assert!(
+            (pct - 10.0).abs() < 0.01,
+            "should use prev_close map (10%), not day_close (120%), got {pct}"
+        );
+    }
+
+    #[test]
+    fn prev_close_map_rejects_invalid_values() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update_prev_close(100, 2, 0.0);
+        tracker.update_prev_close(101, 2, -50.0);
+        tracker.update_prev_close(102, 2, f32::NAN);
+        tracker.update_prev_close(103, 2, f32::INFINITY);
+        // None should be stored
+        let tick = make_tick(100, 2, 110.0, 0.0, 1000);
+        tracker.update(&tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "invalid prev_close should be rejected"
+        );
+    }
+
+    #[test]
+    fn prev_close_map_different_segments_independent() {
+        let mut tracker = TopMoversTracker::new();
+        tracker.update_prev_close(100, 1, 500.0); // NSE_EQ
+        tracker.update_prev_close(100, 2, 50.0); // NSE_FNO
+        // Tick for NSE_FNO segment
+        let tick = ParsedTick {
+            security_id: 100,
+            exchange_segment_code: 2,
+            last_traded_price: 55.0,
+            day_close: 0.0,
+            volume: 1000,
+            exchange_timestamp: 1000,
+            ..Default::default()
+        };
+        tracker.update(&tick);
+        let snapshot = tracker.compute_snapshot();
+        // (55 - 50) / 50 * 100 = 10%, NOT (55 - 500) / 500 * 100
+        let pct = snapshot.gainers[0].change_pct;
+        assert!(
+            (pct - 10.0).abs() < 0.01,
+            "should use segment-specific prev_close, got {pct}"
+        );
     }
 }

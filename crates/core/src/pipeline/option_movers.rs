@@ -159,6 +159,11 @@ impl OptionMoversTracker {
             return;
         }
 
+        // Reject ticks with non-finite or non-positive LTP (NaN, Inf, 0, negative)
+        if !tick.last_traded_price.is_finite() || tick.last_traded_price <= 0.0 {
+            return;
+        }
+
         self.ticks_processed = self.ticks_processed.saturating_add(1);
 
         let key = (tick.security_id, tick.exchange_segment_code);
@@ -193,6 +198,38 @@ impl OptionMoversTracker {
         let key = (security_id, segment_code);
         if let Some(state) = self.options.get_mut(&key) {
             state.prev_oi = prev_oi;
+        }
+    }
+
+    /// Updates previous close price from PrevClose packet.
+    ///
+    /// Called when a PrevClose packet arrives for an F&O instrument.
+    /// This sets the baseline for price change% calculations. During market
+    /// hours, `tick.day_close` is 0 (exchange only sets it post-market), so
+    /// PrevClose packets are the only source of previous close price.
+    pub fn update_prev_close(&mut self, security_id: u32, segment_code: u8, prev_close: f32) {
+        if segment_code != NSE_FNO_SEGMENT {
+            return;
+        }
+        if !prev_close.is_finite() || prev_close <= 0.0 {
+            return;
+        }
+        let key = (security_id, segment_code);
+        if let Some(state) = self.options.get_mut(&key) {
+            state.prev_close = prev_close;
+        } else {
+            // Pre-populate entry so prev_close is ready when the first tick arrives.
+            self.options.insert(
+                key,
+                OptionState {
+                    ltp: 0.0,
+                    prev_close,
+                    oi: 0,
+                    prev_oi: 0,
+                    volume: 0,
+                    exchange_segment_code: segment_code,
+                },
+            );
         }
     }
 
@@ -701,5 +738,60 @@ mod tests {
         };
         let json = serde_json::to_string(&snapshot);
         assert!(json.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // update_prev_close — PrevClose packet integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_prev_close_sets_baseline() {
+        let mut tracker = OptionMoversTracker::new();
+        tracker.update_prev_close(1000, NSE_FNO_SEGMENT, 50.0);
+        // Entry should be pre-populated with prev_close
+        assert_eq!(tracker.tracked_count(), 1);
+    }
+
+    #[test]
+    fn test_update_prev_close_updates_existing() {
+        let mut tracker = OptionMoversTracker::new();
+        tracker.update(&make_option_tick(1000, 55.0, 50.0, 10_000, 5000));
+        // Now update prev_close from PrevClose packet
+        tracker.update_prev_close(1000, NSE_FNO_SEGMENT, 48.0);
+        let snapshot = tracker.compute_snapshot();
+        // Change should use new prev_close: (55 - 48) / 48 * 100 = 14.58%
+        if let Some(gainer) = snapshot.price_gainers.first() {
+            let expected = ((55.0 - 48.0) / 48.0) * 100.0;
+            assert!(
+                (gainer.change_pct - expected).abs() < 0.1,
+                "expected ~{expected}%, got {}%",
+                gainer.change_pct
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_prev_close_rejects_invalid() {
+        let mut tracker = OptionMoversTracker::new();
+        tracker.update_prev_close(1000, NSE_FNO_SEGMENT, 0.0);
+        tracker.update_prev_close(1001, NSE_FNO_SEGMENT, -10.0);
+        tracker.update_prev_close(1002, NSE_FNO_SEGMENT, f32::NAN);
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "invalid prev_close should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_update_prev_close_only_fno_segment() {
+        let mut tracker = OptionMoversTracker::new();
+        // NSE_EQ segment should be ignored
+        tracker.update_prev_close(1000, 1, 50.0);
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "non-FNO segment should be ignored"
+        );
     }
 }

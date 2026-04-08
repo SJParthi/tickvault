@@ -27,16 +27,25 @@ wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&auth
 ### 200-Level Endpoint
 
 ```
-wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
+wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 ```
 
-> **SDK note:** DhanHQ Python SDK (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (no path segment) for 200-level. Our ground truth follows the official Dhan API documentation which specifies `/twohundreddepth`. Verify against live API.
+> **SDK verified (2026-04-06):** DhanHQ Python SDK (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (root path, no `/twohundreddepth`). Our code now matches the SDK. Earlier Dhan documentation referenced `/twohundreddepth` but the SDK is the ground truth for what works in production.
 
 | Parameter   | Required | Value                          |
 |-------------|----------|--------------------------------|
 | `token`     | Yes      | Access Token                   |
 | `clientId`  | Yes      | Dhan Client ID                 |
 | `authType`  | Yes      | `2` (always)                   |
+
+> **Connection limits (confirmed by Dhan team, 2026-04-06):**
+> The limit of **5 connections** applies to EACH WebSocket type **independently**:
+> - Live Market Feed: 5 connections (separate pool)
+> - 20-level Depth: 5 connections (separate pool)
+> - 200-level Depth: 5 connections (separate pool)
+>
+> These are NOT a shared 5-connection cap. Depth connections remain connectable
+> after 3:30 PM (post market close) — they simply won't return data.
 
 ---
 
@@ -254,7 +263,7 @@ pub struct TwoHundredDepthPacket {
 
 | Aspect                    | Live Market Feed               | Full Market Depth (20-lvl)     | Full Market Depth (200-lvl)    |
 |---------------------------|-------------------------------|-------------------------------|-------------------------------|
-| Endpoint                  | `wss://api-feed.dhan.co`     | `wss://depth-api-feed.dhan.co/twentydepth` | `wss://full-depth-api.dhan.co/twohundreddepth` |
+| Endpoint                  | `wss://api-feed.dhan.co`     | `wss://depth-api-feed.dhan.co/twentydepth` | `wss://full-depth-api.dhan.co/` |
 | Header size               | 8 bytes                       | 12 bytes                      | 12 bytes                      |
 | Header byte 1             | Response code                 | Message length (low byte)     | Message length (low byte)     |
 | Depth levels              | 5 (Full mode only)            | 20                            | Up to 200                     |

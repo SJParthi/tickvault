@@ -142,7 +142,7 @@ pub fn dispatch_deep_depth_frame(
 // TEST-EXEMPT: tested via test_split_stacked_single_packet, test_split_stacked_bid_ask_pair, etc.
 pub fn split_stacked_depth_packets(raw: &[u8]) -> Result<Vec<&[u8]>, ParseError> {
     // O(1) EXEMPT: begin — stacked packet splitting, runs once per WS message at receive time
-    let mut packets = Vec::new();
+    let mut packets = Vec::with_capacity(100); // max 50 instruments x 2 sides
     let mut offset = 0;
 
     while offset < raw.len() {

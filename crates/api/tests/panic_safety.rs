@@ -96,6 +96,18 @@ fn no_panic_health_response_serialization() {
                 status: "connected",
                 detail: Some("3 connections".to_string()),
             },
+            depth_20: SubsystemInfo {
+                status: "connected",
+                detail: Some("4 connections".to_string()),
+            },
+            depth_200: SubsystemInfo {
+                status: "connected",
+                detail: Some("4 connections".to_string()),
+            },
+            order_update: SubsystemInfo {
+                status: "connected",
+                detail: None,
+            },
             questdb: SubsystemInfo {
                 status: "reachable",
                 detail: None,
@@ -142,6 +154,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
             security_id: u32::MAX,
             exchange_segment_code: 255,
             last_traded_price: f32::MAX,
+            prev_close: 0.0,
             change_pct: f32::INFINITY,
             volume: u32::MAX,
         }],
@@ -149,6 +162,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
             security_id: 0,
             exchange_segment_code: 0,
             last_traded_price: 0.0,
+            prev_close: 0.0,
             change_pct: f32::NEG_INFINITY,
             volume: 0,
         }],
@@ -156,6 +170,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
             security_id: 1,
             exchange_segment_code: 2,
             last_traded_price: f32::NAN,
+            prev_close: 0.0,
             change_pct: f32::NAN,
             volume: 1,
         }],

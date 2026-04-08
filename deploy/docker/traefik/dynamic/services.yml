@@ -39,11 +39,21 @@ http:
       entryPoints: [web]
       middlewares: [dev-basic-auth, jaeger-stripprefix]
 
-    # Application API: http://localhost/api
-    app-api:
-      rule: "PathPrefix(`/api`) || PathPrefix(`/health`) || PathPrefix(`/portal`)"
+    # Application API: http://localhost/api (basicAuth protected)
+    # Health endpoint exposed without auth for monitoring tools (Prometheus, Docker health check)
+    app-health:
+      rule: "PathPrefix(`/health`)"
       service: app
       entryPoints: [web]
+      priority: 70
+
+    # All other app routes: /api/*, /portal/* — protected with basicAuth
+    app-api:
+      rule: "PathPrefix(`/api`) || PathPrefix(`/portal`)"
+      service: app
+      entryPoints: [web]
+      middlewares: [dev-basic-auth]
+      priority: 68
 
     # Alloy UI: http://localhost/alloy
     alloy:

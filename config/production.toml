@@ -1,0 +1,46 @@
+# =============================================================================
+# dhan-live-trader — Production Configuration Override
+# =============================================================================
+# Layer on top of base.toml. Only settings that DIFFER from dev go here.
+# Secrets come from AWS SSM Parameter Store (/dlt/prod/...).
+# Deploy: config/base.toml + config/production.toml merged via figment.
+# =============================================================================
+
+[strategy]
+# CRITICAL: dry_run = false enables REAL order placement
+dry_run = false
+
+[risk]
+max_daily_loss_percent = 2.0
+max_position_lots = 50
+auto_halt_on_error = true
+
+[dhan]
+# Production uses the same Dhan API — no sandbox
+sandbox_base_url = ""
+
+[websocket]
+# Production: infinite retries (0 = never give up)
+reconnect_max_attempts = 0
+
+[network]
+# Static IP verification mandatory for order APIs (SEBI April 2026)
+ip_verification_enabled = true
+ip_check_interval_secs = 300
+
+[valkey]
+# Password loaded from SSM at boot: /dlt/prod/valkey/password
+password = ""
+
+[logging]
+# Production: JSON structured output, no pretty printing
+level = "info"
+format = "json"
+
+[api]
+host = "0.0.0.0"
+port = 3001
+
+[notification]
+# Enable SNS SMS alerts in production for CRITICAL events
+sns_enabled = true

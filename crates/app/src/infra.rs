@@ -28,6 +28,15 @@ const INFRA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wait time for Docker services to become healthy.
 const INFRA_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum retries for `docker compose up -d` during startup.
+const COMPOSE_UP_MAX_RETRIES: u32 = 5;
+
+/// Initial delay between `docker compose up -d` retries.
+const COMPOSE_UP_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Interval for infrastructure watchdog container health checks.
+pub const INFRA_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum wait time for Docker daemon to start after launching Docker Desktop.
 const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -44,15 +53,37 @@ const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
 /// macOS Docker Desktop application name for `open -a`.
 const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 
-/// Grafana dashboard URL — auto-opened in browser after infrastructure starts.
-const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
-
-/// Grafana host for TCP reachability probe.
+/// Host used for all local TCP reachability probes.
 // O(1) EXEMPT: localhost probe for local Docker infrastructure
-const GRAFANA_HOST: &str = "127.0.0.1";
+const LOCAL_HOST: &str = "127.0.0.1";
+
+/// Dashboard URLs and ports — auto-opened in browser after infrastructure starts.
+/// Each entry: (service name, URL, host, port).
+const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
+    ("Grafana", "http://localhost:3000", LOCAL_HOST, 3000),
+    ("QuestDB", "http://localhost:9000", LOCAL_HOST, 9000),
+    ("Prometheus", "http://localhost:9090", LOCAL_HOST, 9090),
+    ("Jaeger", "http://localhost:16686", LOCAL_HOST, 16686),
+    ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
+    ("Portal", "http://localhost:3001/portal", LOCAL_HOST, 3001),
+    (
+        "Market Dashboard",
+        "http://localhost:3001/portal/market-dashboard",
+        LOCAL_HOST,
+        3001,
+    ),
+];
+
+/// Grafana host for TCP reachability probe (kept for backward compat in tests).
+// O(1) EXEMPT: localhost probe for local Docker infrastructure
+const GRAFANA_HOST: &str = LOCAL_HOST;
 
 /// Grafana HTTP port for TCP reachability probe.
 const GRAFANA_PORT: u16 = 3000;
+
+/// Grafana dashboard URL (used in tests to validate DASHBOARD_SERVICES consistency).
+#[cfg(test)]
+const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -74,8 +105,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             port = questdb_config.http_port,
             "infrastructure already running (QuestDB reachable)"
         );
-        // Infrastructure already running — still auto-open Grafana dashboard.
-        open_grafana_if_reachable().await;
+        // Infrastructure already running — auto-open all monitoring dashboards.
+        open_all_dashboards().await;
         return;
     }
 
@@ -145,37 +176,70 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         ),
     ];
 
-    // Run docker compose up -d.
-    match run_docker_compose_up(&env_vars).await {
-        Ok(()) => {
-            info!("docker compose started — waiting for services to be healthy");
+    // Ensure data/logs/ exists before Docker mounts it (fresh clone won't have it).
+    // Alloy container mounts ../../data/logs → /var/log/dlt-app/ to watch app.log.
+    // If the directory doesn't exist, Docker creates it as root-owned, which can
+    // cause permission issues or Alloy file watch failures.
+    if let Err(err) = std::fs::create_dir_all("data/logs") {
+        warn!(
+            ?err,
+            "failed to create data/logs directory for Alloy log mount"
+        );
+    }
+
+    // Run docker compose up -d with retries.
+    let mut compose_succeeded = false;
+    for attempt in 1..=COMPOSE_UP_MAX_RETRIES {
+        match run_docker_compose_up(&env_vars).await {
+            Ok(()) => {
+                info!(
+                    attempt,
+                    "docker compose started — waiting for services to be healthy"
+                );
+                compose_succeeded = true;
+                break;
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    attempt,
+                    max_attempts = COMPOSE_UP_MAX_RETRIES,
+                    "docker compose up failed — retrying"
+                );
+                if attempt < COMPOSE_UP_MAX_RETRIES {
+                    tokio::time::sleep(COMPOSE_UP_RETRY_DELAY).await;
+                }
+            }
         }
-        Err(err) => {
-            warn!(
-                ?err,
-                "docker compose up failed — services may not be available"
-            );
-            return;
-        }
+    }
+    if !compose_succeeded {
+        tracing::error!(
+            "docker compose up failed after {COMPOSE_UP_MAX_RETRIES} attempts — \
+             services may not be available. Telegram CRITICAL alert should fire."
+        );
+        return;
     }
 
     // Wait for QuestDB and Grafana to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
     wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
 
-    // Auto-open Grafana dashboards in the default browser.
-    open_grafana_if_reachable().await;
+    // Auto-open all monitoring dashboards in the default browser.
+    open_all_dashboards().await;
 }
 
-/// Opens the Grafana dashboard in the default browser if Grafana is reachable.
+/// Opens all reachable monitoring dashboards in the default browser.
 ///
-/// Best-effort: if Grafana is not running or the browser cannot be launched,
-/// logs a warning and returns — does not block boot.
-async fn open_grafana_if_reachable() {
-    if is_service_reachable(GRAFANA_HOST, GRAFANA_PORT) {
-        open_in_browser(GRAFANA_DASHBOARD_URL).await;
-    } else {
-        debug!("Grafana not reachable — skipping browser auto-open");
+/// Opens: Grafana, QuestDB Console, Prometheus, Jaeger, Traefik, and Portal.
+/// Best-effort: if a service is not running or the browser cannot be launched,
+/// logs a warning and skips it — does not block boot.
+async fn open_all_dashboards() {
+    for &(name, url, host, port) in DASHBOARD_SERVICES {
+        if is_service_reachable(host, port) {
+            open_in_browser(url).await;
+        } else {
+            debug!(service = name, "not reachable — skipping browser auto-open");
+        }
     }
 }
 
@@ -472,6 +536,112 @@ pub fn export_system_metrics() {
     }
 }
 
+/// Checks Docker container health and auto-restarts any unhealthy/exited containers.
+///
+/// Runs `docker compose ps` to detect container state, then `docker compose up -d`
+/// for any that are not running. Returns the number of containers restarted.
+///
+/// Called by the periodic health check loop (every 5 minutes). Best-effort —
+/// if Docker is not available, returns 0 without blocking.
+// TEST-EXEMPT: requires Docker daemon — tested by manual integration
+pub async fn check_and_restart_containers() -> usize {
+    use tokio::process::Command;
+
+    // Quick check: is Docker daemon even running?
+    if !is_docker_daemon_running().await {
+        warn!("Docker daemon not running — cannot check container health");
+        metrics::gauge!("dlt_docker_containers_healthy").set(0.0);
+        return 0;
+    }
+
+    // Get container status via docker compose ps.
+    let output = match Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            DOCKER_COMPOSE_PATH,
+            "ps",
+            "--format",
+            "{{.Name}} {{.State}}",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(err) => {
+            warn!(?err, "failed to run docker compose ps");
+            return 0;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut total_containers: usize = 0;
+    let mut unhealthy_containers: usize = 0;
+    let mut unhealthy_names: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        total_containers = total_containers.saturating_add(1);
+        // State is the second word: "running", "exited", "restarting", etc.
+        let is_running = line.contains("running");
+        if !is_running {
+            unhealthy_containers = unhealthy_containers.saturating_add(1);
+            if let Some(name) = line.split_whitespace().next() {
+                unhealthy_names.push(name.to_string());
+            }
+        }
+    }
+
+    metrics::gauge!("dlt_docker_containers_total").set(total_containers as f64);
+    metrics::gauge!("dlt_docker_containers_healthy")
+        .set((total_containers.saturating_sub(unhealthy_containers)) as f64);
+
+    if unhealthy_containers == 0 {
+        debug!(total_containers, "all Docker containers healthy");
+        return 0;
+    }
+
+    // Containers are unhealthy — attempt restart.
+    tracing::error!(
+        unhealthy_containers,
+        names = ?unhealthy_names,
+        "unhealthy Docker containers detected — attempting docker compose up -d"
+    );
+
+    let restart_result = Command::new("docker")
+        .args(["compose", "-f", DOCKER_COMPOSE_PATH, "up", "-d"])
+        .output()
+        .await;
+
+    match restart_result {
+        Ok(output) if output.status.success() => {
+            info!(
+                unhealthy_containers,
+                names = ?unhealthy_names,
+                "docker compose up -d completed — containers restarting"
+            );
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(
+                stderr = %stderr.trim(),
+                "docker compose up -d failed during watchdog restart"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "failed to execute docker compose up -d during watchdog"
+            );
+        }
+    }
+
+    unhealthy_containers
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
@@ -567,7 +737,7 @@ async fn ensure_docker_daemon_running() -> bool {
 ///
 /// Uses `open` on macOS, `xdg-open` on Linux. Best-effort — logs a warning
 /// if the browser cannot be launched.
-async fn open_in_browser(url: &str) {
+pub async fn open_in_browser(url: &str) {
     use tokio::process::Command;
 
     let program = if cfg!(target_os = "macos") {
@@ -790,9 +960,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_grafana_if_reachable_no_panic() {
-        // Exercises the function — Grafana likely not running in test env
-        open_grafana_if_reachable().await;
+    async fn test_open_all_dashboards_no_panic_legacy() {
+        // Exercises open_all_dashboards — services likely not running in test env
+        open_all_dashboards().await;
     }
 
     // -----------------------------------------------------------------------
@@ -867,6 +1037,111 @@ mod tests {
             GRAFANA_DASHBOARD_URL.contains(&GRAFANA_PORT.to_string()),
             "Grafana URL must contain the configured port"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // DASHBOARD_SERVICES — auto-open all dashboards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dashboard_services_not_empty() {
+        assert!(
+            !DASHBOARD_SERVICES.is_empty(),
+            "must have at least one dashboard to auto-open"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_all_have_protocol() {
+        for &(name, url, _, _) in DASHBOARD_SERVICES {
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "{name} URL must have protocol, got: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_all_have_valid_ports() {
+        for &(name, _, _, port) in DASHBOARD_SERVICES {
+            assert!(port > 0, "{name} must have a positive port, got: {port}");
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_url_contains_port() {
+        for &(name, url, _, port) in DASHBOARD_SERVICES {
+            // Portal URL uses port 3001 which appears in the URL
+            assert!(
+                url.contains(&port.to_string()),
+                "{name} URL must contain port {port}, got: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_all_use_localhost() {
+        for &(name, _, host, _) in DASHBOARD_SERVICES {
+            assert_eq!(
+                host, LOCAL_HOST,
+                "{name} host must be {LOCAL_HOST}, got: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_names_are_unique() {
+        let names: Vec<&str> = DASHBOARD_SERVICES.iter().map(|&(n, _, _, _)| n).collect();
+        for (i, name) in names.iter().enumerate() {
+            for (j, other) in names.iter().enumerate() {
+                if i != j {
+                    assert_ne!(name, other, "duplicate dashboard service name: {name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dashboard_services_includes_grafana() {
+        assert!(
+            DASHBOARD_SERVICES
+                .iter()
+                .any(|&(name, _, _, _)| name == "Grafana"),
+            "Grafana must be in DASHBOARD_SERVICES"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_includes_questdb() {
+        assert!(
+            DASHBOARD_SERVICES
+                .iter()
+                .any(|&(name, _, _, _)| name == "QuestDB"),
+            "QuestDB must be in DASHBOARD_SERVICES"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_includes_portal() {
+        assert!(
+            DASHBOARD_SERVICES
+                .iter()
+                .any(|&(name, _, _, _)| name == "Portal"),
+            "Portal must be in DASHBOARD_SERVICES"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_services_count() {
+        // 7 services: Grafana, QuestDB, Prometheus, Jaeger, Traefik, Portal, Market Dashboard
+        assert_eq!(DASHBOARD_SERVICES.len(), 7, "expected 7 dashboard services");
+    }
+
+    #[tokio::test]
+    async fn test_open_all_dashboards_no_panic() {
+        // Exercises the function — services likely not running in test env.
+        // Must not panic regardless.
+        open_all_dashboards().await;
     }
 
     #[test]
@@ -1037,10 +1312,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_grafana_if_reachable_exercises_both_branches() {
-        // Grafana is likely not running in test env, so exercises the else branch.
+    async fn test_open_all_dashboards_exercises_unreachable_branch() {
+        // Services are likely not running in test env, so exercises the skip branch.
         // The function should complete without panic in either case.
-        open_grafana_if_reachable().await;
+        open_all_dashboards().await;
     }
 
     // -----------------------------------------------------------------------
@@ -1260,15 +1535,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // open_grafana_if_reachable — with real listener
+    // open_all_dashboards — exercises all services (none reachable in test)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_open_grafana_if_reachable_with_real_listener() {
-        // We can't easily bind to port 3000 (Grafana's port), and the function
-        // uses hardcoded GRAFANA_HOST/PORT. So we just exercise it — Grafana
-        // likely not running, exercises the else branch.
-        open_grafana_if_reachable().await;
+    async fn test_open_all_dashboards_iterates_all_services() {
+        // Services are not running in test env, so each service hits the
+        // "not reachable" branch. Verifies the loop doesn't panic.
+        open_all_dashboards().await;
     }
 
     // -----------------------------------------------------------------------
@@ -1499,5 +1773,36 @@ mod tests {
             super::MEMORY_RSS_ALERT_MB >= 128 && super::MEMORY_RSS_ALERT_MB <= 8192,
             "RSS alert threshold must be between 128MB and 8GB"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Watchdog & retry constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_retry_constants_are_reasonable() {
+        assert!(
+            COMPOSE_UP_MAX_RETRIES >= 3 && COMPOSE_UP_MAX_RETRIES <= 10,
+            "compose retries must be between 3 and 10"
+        );
+        assert!(
+            COMPOSE_UP_RETRY_DELAY.as_secs() >= 5 && COMPOSE_UP_RETRY_DELAY.as_secs() <= 30,
+            "compose retry delay must be between 5s and 30s"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_interval_is_reasonable() {
+        assert!(
+            INFRA_WATCHDOG_INTERVAL.as_secs() >= 30 && INFRA_WATCHDOG_INTERVAL.as_secs() <= 300,
+            "watchdog interval must be between 30s and 5min"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_and_restart_containers_no_panic() {
+        // Exercises the function — result depends on Docker availability.
+        // Must not panic regardless of whether Docker is installed.
+        let _result = check_and_restart_containers().await;
     }
 }

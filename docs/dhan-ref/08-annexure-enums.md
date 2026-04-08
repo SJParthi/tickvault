@@ -205,6 +205,7 @@ impl ExchangeSegment {
 | Internal Server Error  | `DH-908` | Server processing failure (rare)                       |
 | Network Error          | `DH-909` | API unable to communicate with backend                 |
 | Others                 | `DH-910` | Other errors                                           |
+| Invalid IP             | `DH-911` | Invalid IP address (static IP enforcement)             |
 
 ---
 

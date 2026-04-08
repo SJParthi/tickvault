@@ -250,6 +250,15 @@ pub struct ValkeyConfig {
     pub port: u16,
     /// Maximum connections in the connection pool.
     pub max_connections: u32,
+    /// Authentication password (matches `--requirepass` in Valkey server config).
+    /// Empty string = no auth (NOT recommended). Default: "dlt-dev-only".
+    #[serde(default = "default_valkey_password")]
+    pub password: String,
+}
+
+/// Default Valkey password — empty (loaded from SSM at boot in production).
+fn default_valkey_password() -> String {
+    String::new()
 }
 
 /// Prometheus metrics endpoint configuration.
@@ -428,6 +437,19 @@ pub struct SubscriptionConfig {
     /// This fallback ensures we subscribe to a reasonable strike range.
     /// Once live prices arrive, dynamic rebalancing (Phase 2) will adjust.
     pub stock_default_atm_fallback_enabled: bool,
+
+    /// Enable 20-level depth feed (separate WebSocket, uses 1 of 5 connection slots).
+    /// Subscribes ATM ± 5 strikes for NIFTY and BANKNIFTY on the depth endpoint.
+    #[serde(default)]
+    pub enable_twenty_depth: bool,
+
+    /// Maximum instruments to subscribe on the 20-level depth feed (max 50 per connection).
+    #[serde(default = "default_twenty_depth_max_instruments")]
+    pub twenty_depth_max_instruments: usize,
+}
+
+fn default_twenty_depth_max_instruments() -> usize {
+    50
 }
 
 impl Default for SubscriptionConfig {
@@ -441,6 +463,8 @@ impl Default for SubscriptionConfig {
             stock_atm_strikes_above: 10,
             stock_atm_strikes_below: 10,
             stock_default_atm_fallback_enabled: true,
+            enable_twenty_depth: false,
+            twenty_depth_max_instruments: 50,
         }
     }
 }
@@ -969,6 +993,7 @@ mod tests {
                 host: "dlt-valkey".to_string(),
                 port: 6379,
                 max_connections: 16,
+                password: String::new(),
             },
             prometheus: PrometheusConfig {
                 host: "dlt-prometheus".to_string(),
@@ -1763,5 +1788,53 @@ mod tests {
             !config.strategy.mode.is_live(),
             "default config must NOT be in live mode"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // GAP 28: Depth config validation tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_subscription_config_default_has_depth_disabled() {
+        let config = SubscriptionConfig::default();
+        assert!(!config.enable_twenty_depth);
+    }
+
+    #[test]
+    fn test_subscription_config_default_depth_max_instruments() {
+        let config = SubscriptionConfig::default();
+        assert_eq!(config.twenty_depth_max_instruments, 50);
+    }
+
+    #[test]
+    fn test_subscription_config_depth_max_instruments_matches_dhan_limit() {
+        // Dhan docs: max 50 instruments per 20-level depth connection
+        let config = SubscriptionConfig::default();
+        assert!(config.twenty_depth_max_instruments <= 50);
+    }
+
+    #[test]
+    fn test_subscription_config_all_fields_present() {
+        let config = SubscriptionConfig::default();
+        assert_eq!(config.feed_mode, "Full");
+        assert!(config.subscribe_index_derivatives);
+        assert!(config.subscribe_stock_derivatives);
+        assert!(config.subscribe_display_indices);
+        assert!(config.subscribe_stock_equities);
+        assert_eq!(config.stock_atm_strikes_above, 10);
+        assert_eq!(config.stock_atm_strikes_below, 10);
+        assert!(config.stock_default_atm_fallback_enabled);
+        // Depth fields
+        assert!(!config.enable_twenty_depth);
+        assert_eq!(config.twenty_depth_max_instruments, 50);
+    }
+
+    #[test]
+    fn test_default_config_trading_mode_is_paper_not_live() {
+        let config = make_valid_config();
+        assert!(config.strategy.mode.is_paper());
+        assert!(!config.strategy.mode.is_live());
+        assert!(!config.strategy.mode.is_sandbox());
+        assert!(!config.strategy.mode.is_http_active());
     }
 }

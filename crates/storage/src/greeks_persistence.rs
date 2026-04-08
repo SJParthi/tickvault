@@ -307,31 +307,37 @@ pub async fn ensure_greeks_tables(questdb_config: &QuestDbConfig) {
     )
     .await;
     // Step 2: DEDUP UPSERT KEYS via ALTER TABLE (idempotent — re-enabling is a no-op).
-    let dedup_statements: &[(&str, &str, &str)] = &[
+    // If DEDUP fails with "deduplicate key column not found", the table has stale
+    // schema — auto-recover by DROP + CREATE + DEDUP.
+    let dedup_statements: &[(&str, &str, &str, &str)] = &[
         (
             TABLE_OPTION_GREEKS,
             DEDUP_KEY_OPTION_GREEKS,
             "option_greeks DEDUP",
+            OPTION_GREEKS_DDL,
         ),
         (
             TABLE_PCR_SNAPSHOTS,
             DEDUP_KEY_PCR_SNAPSHOTS,
             "pcr_snapshots DEDUP",
+            PCR_SNAPSHOTS_DDL,
         ),
         (
             TABLE_DHAN_OPTION_CHAIN_RAW,
             DEDUP_KEY_DHAN_OPTION_CHAIN_RAW,
             "dhan_option_chain_raw DEDUP",
+            DHAN_OPTION_CHAIN_RAW_DDL,
         ),
         (
             TABLE_GREEKS_VERIFICATION,
             DEDUP_KEY_GREEKS_VERIFICATION,
             "greeks_verification DEDUP",
+            GREEKS_VERIFICATION_DDL,
         ),
     ];
-    for (table, dedup_key, label) in dedup_statements {
+    for (table, dedup_key, label, create_ddl) in dedup_statements {
         let dedup_sql = format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, {dedup_key})");
-        execute_ddl(&client, &base_url, &dedup_sql, label).await;
+        execute_ddl_with_recovery(&client, &base_url, &dedup_sql, label, table, create_ddl).await;
     }
 
     // Step 3: Drop deprecated _live tables (replaced by inline Greeks in ticks/candles).
@@ -358,6 +364,67 @@ async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 warn!(%status, label, body = body.chars().take(200).collect::<String>(), "DDL returned non-success");
+            }
+        }
+        Err(err) => {
+            warn!(?err, label, "DDL request failed");
+        }
+    }
+}
+
+/// Executes a DEDUP DDL with auto-recovery on stale schema.
+///
+/// If DEDUP fails with "deduplicate key column not found", the table has a stale
+/// schema where `ts` is not the designated timestamp. Auto-recovers by
+/// DROP TABLE → CREATE TABLE → DEDUP (all idempotent).
+async fn execute_ddl_with_recovery(
+    client: &Client,
+    base_url: &str,
+    dedup_sql: &str,
+    label: &str,
+    table_name: &str,
+    create_ddl: &str,
+) {
+    match client
+        .get(base_url)
+        .query(&[("query", dedup_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                debug!(label, "DDL executed successfully");
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("deduplicate key column not found") {
+                    warn!(
+                        table_name,
+                        "stale schema detected — dropping and recreating"
+                    );
+                    let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
+                    let _ = client
+                        .get(base_url)
+                        .query(&[("query", &drop_sql)])
+                        .send()
+                        .await;
+                    let _ = client
+                        .get(base_url)
+                        .query(&[("query", create_ddl)])
+                        .send()
+                        .await;
+                    let _ = client
+                        .get(base_url)
+                        .query(&[("query", dedup_sql)])
+                        .send()
+                        .await;
+                    info!(table_name, "table recreated with correct schema");
+                } else {
+                    warn!(
+                        label,
+                        body = body.chars().take(200).collect::<String>(),
+                        "DDL returned non-success"
+                    );
+                }
             }
         }
         Err(err) => {

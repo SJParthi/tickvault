@@ -94,8 +94,11 @@ impl WebSocketConnectionPool {
         }
 
         // Shared channel: all connections send frames to a single receiver.
-        // Buffer size: enough for burst traffic without blocking senders.
-        let (frame_sender, frame_receiver) = mpsc::channel(65536);
+        // Buffer size: 131,072 (FRAME_CHANNEL_CAPACITY) — sized for 25K instruments.
+        // At 10K ticks/sec = 13 seconds backpressure-free headroom.
+        // On overflow: backpressure (blocks WS read, never drops frames).
+        let (frame_sender, frame_receiver) =
+            mpsc::channel(dhan_live_trader_common::constants::FRAME_CHANNEL_CAPACITY);
 
         // O(1) EXEMPT: begin — pool constructor runs once at startup, not per tick
         // Distribute instruments round-robin across connections.

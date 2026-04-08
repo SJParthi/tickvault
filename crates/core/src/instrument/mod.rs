@@ -12,6 +12,8 @@ pub mod csv_downloader;
 pub mod csv_parser;
 pub mod daily_scheduler;
 pub mod delta_detector;
+pub mod depth_rebalancer;
+pub mod depth_strike_selector;
 pub mod diagnostic;
 pub mod instrument_loader;
 pub mod s3_backup;

@@ -30,7 +30,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::constants::MAX_INDICATOR_INSTRUMENTS;
+use dhan_live_trader_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
 use dhan_live_trader_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
@@ -102,6 +102,9 @@ pub struct TradingPipelineConfig {
     pub client_id: String,
     /// Token handle for authentication.
     pub token_handle: TokenHandle,
+    /// Indicator snapshot writer for QuestDB persistence (None = no persistence).
+    pub indicator_snapshot_writer:
+        Option<dhan_live_trader_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter>,
 }
 
 /// Spawns the trading pipeline as a background task.
@@ -198,8 +201,20 @@ async fn run_trading_pipeline(
     );
 
     // Initialize OMS (always starts in dry_run mode by default)
+    let oms_http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::OMS_HTTP_TIMEOUT_SECS,
+        ))
+        .connect_timeout(std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .pool_idle_timeout(std::time::Duration::from_secs(
+            dhan_live_trader_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
+        ))
+        .build()
+        .unwrap_or_default();
     let api_client = OrderApiClient::new(
-        reqwest::Client::new(),
+        oms_http_client,
         config.rest_api_base_url,
         config.client_id.clone(),
     );
@@ -227,6 +242,21 @@ async fn run_trading_pipeline(
     let mut ticks_processed: u64 = 0;
     let mut signals_generated: u64 = 0;
 
+    // Indicator snapshot persistence (every 60 seconds during market hours)
+    let mut indicator_writer = config.indicator_snapshot_writer;
+    let mut last_indicator_persist = std::time::Instant::now();
+    // O(1) EXEMPT: cold-path HashMap for indicator snapshot batching.
+    // Accumulates latest snapshot per security_id between 60s flush cycles.
+    // Max ~25K entries (one per subscribed instrument), cleared after each flush.
+    let mut indicator_batch: std::collections::HashMap<
+        u32,
+        (u8, dhan_live_trader_trading::indicator::IndicatorSnapshot),
+    > = std::collections::HashMap::with_capacity(4096);
+    // 09:15:00 IST = 33300 secs of day, 15:30:00 IST = 55800 secs of day
+    const INDICATOR_PERSIST_START: u32 = 33_300;
+    const INDICATOR_PERSIST_END: u32 = 55_800;
+    const INDICATOR_PERSIST_INTERVAL_SECS: u64 = 60;
+
     // Daily reset: await the signal (or pend forever if None).
     // Uses Pin<Box<dyn Future>> so the future can be re-armed after each reset.
     fn make_reset_future(
@@ -243,7 +273,15 @@ async fn run_trading_pipeline(
     let mut wait_for_reset = make_reset_future(&daily_reset_signal);
     let mut wait_for_market_close = make_reset_future(&market_close_signal);
 
+    // O3: Trading pipeline heartbeat gauge — proves the loop is alive.
+    let m_pipeline_heartbeat = metrics::gauge!("dlt_trading_pipeline_heartbeat");
+    // O4: Lagged ticks counter — tracks ticks permanently lost to broadcast lag.
+    let m_pipeline_lagged = metrics::counter!("dlt_trading_pipeline_ticks_lagged_total");
+
     loop {
+        // O3: Heartbeat on every loop iteration.
+        m_pipeline_heartbeat.set(chrono::Utc::now().timestamp() as f64);
+
         tokio::select! {
             // Process ticks from the broadcast channel
             tick_result = tick_receiver.recv() => {
@@ -270,13 +308,74 @@ async fn run_trading_pipeline(
                         // Step 1: Update indicators (O(1) per tick)
                         let snapshot = indicator_engine.update(&tick);
 
+                        // Step 1.5: Accumulate indicator snapshot for batch persistence.
+                        // O(1) per tick: single HashMap insert (overwrite latest per security_id).
+                        // The batch is flushed every 60s during market hours.
+                        indicator_batch.insert(snapshot.security_id, (tick.exchange_segment_code, snapshot));
+
+                        // Flush ALL accumulated indicator snapshots every 60 seconds (cold path).
+                        if last_indicator_persist.elapsed().as_secs() >= INDICATOR_PERSIST_INTERVAL_SECS {
+                            let ist_now = {
+                                let utc = chrono::Utc::now().timestamp();
+                                let ist = utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                                (ist % 86_400) as u32
+                            };
+                            if (INDICATOR_PERSIST_START..INDICATOR_PERSIST_END).contains(&ist_now)
+                                && let Some(ref mut writer) = indicator_writer
+                            {
+                                let ts_nanos = chrono::Utc::now()
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0)
+                                    .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
+                                let mut persisted: u64 = 0;
+                                // O(1) EXEMPT: cold path — iterate all accumulated snapshots (max ~25K).
+                                for &(seg, ref snap) in indicator_batch.values() {
+                                    if let Err(err) = writer.append_snapshot(
+                                        ts_nanos,
+                                        snap.security_id,
+                                        seg,
+                                        snap.ema_fast,
+                                        snap.ema_slow,
+                                        snap.sma,
+                                        snap.rsi,
+                                        snap.macd_line,
+                                        snap.macd_signal,
+                                        snap.macd_histogram,
+                                        snap.bollinger_upper,
+                                        snap.bollinger_middle,
+                                        snap.bollinger_lower,
+                                        snap.atr,
+                                        snap.supertrend,
+                                        snap.supertrend_bullish,
+                                        snap.adx,
+                                        snap.obv,
+                                        snap.vwap,
+                                        snap.last_traded_price,
+                                        snap.is_warm,
+                                    ) {
+                                        tracing::warn!(?err, "indicator snapshot append failed — aborting batch");
+                                        break;
+                                    }
+                                    persisted = persisted.saturating_add(1);
+                                }
+                                if let Err(err) = writer.flush() {
+                                    tracing::warn!(?err, "indicator snapshot flush failed");
+                                }
+                                if persisted > 0 {
+                                    debug!(persisted, batch_size = indicator_batch.len(), "indicator snapshots flushed to QuestDB");
+                                }
+                                indicator_batch.clear();
+                            }
+                            last_indicator_persist = std::time::Instant::now();
+                        }
+
                         // Step 2: Evaluate all strategies
                         // Guard: skip order placement outside trading hours [09:15, 15:30) IST.
                         // Stale ticks in WebSocket buffer after 15:30 could trigger signals.
                         // SEBI: no orders at or after 15:30 IST.
                         let ist_secs_of_day = {
                             let now_utc = chrono::Utc::now().timestamp();
-                            let now_ist = now_utc.saturating_add(19_800); // +5:30
+                            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)); // +5:30
                             (now_ist % 86_400) as u32
                         };
                         // 09:15:00 = 33300s, 15:29:59 = 55799s
@@ -287,7 +386,12 @@ async fn run_trading_pipeline(
 
                             match signal {
                                 Signal::Hold => {}
-                                Signal::EnterLong { size_fraction: _, stop_loss, target } => {
+                                Signal::EnterLong { size_fraction, stop_loss, target } => {
+                                    // M1: size_fraction is not yet wired to position sizing — hardcoded qty=1.
+                                    // TODO(position-sizing): compute quantity from size_fraction × capital ÷ price.
+                                    if (size_fraction - 1.0).abs() > f64::EPSILON {
+                                        debug!(size_fraction, "size_fraction ignored — using quantity=1");
+                                    }
                                     if !within_trading_hours {
                                         debug!(
                                             security_id = tick.security_id,
@@ -343,7 +447,11 @@ async fn run_trading_pipeline(
                                         }
                                     }
                                 }
-                                Signal::EnterShort { size_fraction: _, stop_loss, target } => {
+                                Signal::EnterShort { size_fraction, stop_loss, target } => {
+                                    // M1: size_fraction not yet wired — hardcoded qty=1.
+                                    if (size_fraction - 1.0).abs() > f64::EPSILON {
+                                        debug!(size_fraction, "size_fraction ignored — using quantity=1");
+                                    }
                                     if !within_trading_hours {
                                         debug!(
                                             security_id = tick.security_id,
@@ -406,7 +514,7 @@ async fn run_trading_pipeline(
                                         strategy = %strategy.definition().name,
                                         "EXIT signal"
                                     );
-                                    // Exit handling: cancel active orders for this security
+                                    // Step 1: Cancel active (unfilled/pending) orders for this security
                                     let active: Vec<String> = oms
                                         .active_orders()
                                         .iter()
@@ -422,12 +530,58 @@ async fn run_trading_pipeline(
                                             );
                                         }
                                     }
+                                    // Step 2: Close open position (if any filled lots exist)
+                                    let net_lots = risk_engine.net_lots_for(tick.security_id);
+                                    if net_lots != 0 {
+                                        let close_type = if net_lots > 0 {
+                                            TransactionType::Sell
+                                        } else {
+                                            TransactionType::Buy
+                                        };
+                                        let close_qty = net_lots.unsigned_abs() as i64;
+                                        info!(
+                                            security_id = tick.security_id,
+                                            net_lots,
+                                            close_type = ?close_type,
+                                            "EXIT signal → placing closing order for open position"
+                                        );
+                                        let close_request = PlaceOrderRequest {
+                                            security_id: tick.security_id,
+                                            transaction_type: close_type,
+                                            order_type: OrderType::Market,
+                                            product_type: ProductType::Intraday,
+                                            validity: OrderValidity::Day,
+                                            quantity: close_qty,
+                                            price: 0.0,
+                                            trigger_price: 0.0,
+                                            lot_size: 1,
+                                            expiry_date: None,
+                                        };
+                                        match oms.place_order(close_request).await {
+                                            Ok(order_id) => {
+                                                info!(
+                                                    order_id = %order_id,
+                                                    security_id = tick.security_id,
+                                                    net_lots,
+                                                    "EXIT signal → closing order placed"
+                                                );
+                                            }
+                                            Err(err) => {
+                                                warn!(
+                                                    ?err,
+                                                    security_id = tick.security_id,
+                                                    "EXIT signal → closing order placement failed"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "trading pipeline lagged — skipped ticks, signals may be missed");
+                        m_pipeline_lagged.increment(skipped);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("tick broadcast closed — trading pipeline stopping");
@@ -599,6 +753,16 @@ pub fn init_trading_pipeline(
         },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
+        indicator_snapshot_writer: match dhan_live_trader_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter::new(&config.questdb) {
+            Ok(w) => {
+                info!("QuestDB indicator snapshot writer connected");
+                Some(w)
+            }
+            Err(err) => {
+                tracing::warn!(?err, "indicator snapshot writer unavailable — snapshots will not be persisted");
+                None
+            }
+        },
     };
 
     Some((pipeline_config, hot_reloader))
@@ -962,6 +1126,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test_client".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         assert!(config.dry_run, "dry_run must be true for safety");
@@ -1034,6 +1199,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "client_123".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         assert_eq!(config.strategies.len(), 2);
@@ -1461,6 +1627,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
         // Zero capital is technically allowed at construction — risk engine
         // will handle this by immediately breaching daily loss threshold.
@@ -1482,6 +1649,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
         assert!((config.max_daily_loss_percent - 100.0).abs() < f64::EPSILON);
     }
@@ -1511,6 +1679,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
         assert_eq!(config.indicator_params.ema_fast_period, 5);
         assert_eq!(config.indicator_params.ema_slow_period, 10);
@@ -1534,6 +1703,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "live_client".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
         assert!(
             !config.dry_run,
@@ -1556,6 +1726,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
         assert_eq!(config.max_orders_per_second, 1);
     }
@@ -1841,6 +2012,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -1888,6 +2060,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -1935,6 +2108,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2098,6 +2272,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2130,6 +2305,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2299,6 +2475,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2342,6 +2519,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2380,6 +2558,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2478,6 +2657,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         assert!(config.dry_run, "must be paper trading mode");
@@ -2506,6 +2686,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         assert!(!config.dry_run, "must be live mode");
@@ -2812,6 +2993,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2944,6 +3126,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
         assert!(
             config.rest_api_base_url.contains("/v2"),
@@ -3073,6 +3256,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         // Pass the reloader to the pipeline — exercises the `if let Some(ref reloader)` path
@@ -3156,6 +3340,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3210,6 +3395,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3344,6 +3530,7 @@ threshold = 65.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3423,6 +3610,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3468,6 +3656,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3496,6 +3685,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            indicator_snapshot_writer: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);

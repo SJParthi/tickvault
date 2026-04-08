@@ -104,6 +104,38 @@ services:
       - dlt-network
 
   # ---------------------------------------------------------------------------
+  # Valkey Exporter — Prometheus metrics for Valkey/Redis
+  # Exports Valkey INFO stats as Prometheus metrics on :9121/metrics.
+  # Bible: oliver006/redis_exporter:v1.67.0
+  # ---------------------------------------------------------------------------
+  dlt-valkey-exporter:
+    image: oliver006/redis_exporter:v1.67.0@sha256:120f7ec77293459ccfdad66bb1db75ab72e8bfeab99f58b1cc2564cadcd7a9e7
+    container_name: dlt-valkey-exporter
+    hostname: dlt-valkey-exporter
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    environment:
+      - REDIS_ADDR=redis://dlt-valkey:6379
+      - REDIS_PASSWORD=${DLT_VALKEY_PASSWORD:-dlt-dev-only}
+    depends_on:
+      dlt-valkey:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:9121/metrics || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dlt-network
+
+  # ---------------------------------------------------------------------------
   # Prometheus — Metrics Collection
   # Bible #28: prom/prometheus:v3.9.1
   # ---------------------------------------------------------------------------
@@ -150,7 +182,7 @@ services:
   # Pinned: prom/alertmanager:v0.28.1
   # ---------------------------------------------------------------------------
   dlt-alertmanager:
-    image: prom/alertmanager:v0.28.1@sha256:627635e82e34d5b4e6146aba11375e1a5afa0e833fc9f00edab85e06b2aec966
+    image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
     container_name: dlt-alertmanager
     hostname: dlt-alertmanager
     restart: unless-stopped

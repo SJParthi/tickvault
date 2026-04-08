@@ -80,6 +80,24 @@ pub enum NotificationEvent {
     /// WebSocket reconnected after disconnection.
     WebSocketReconnected { connection_index: usize },
 
+    /// 20-level depth WebSocket connected for an underlying.
+    DepthTwentyConnected { underlying: String },
+
+    /// 20-level depth WebSocket disconnected.
+    DepthTwentyDisconnected { underlying: String, reason: String },
+
+    /// 200-level depth WebSocket connected for an underlying.
+    DepthTwoHundredConnected { underlying: String },
+
+    /// 200-level depth WebSocket disconnected.
+    DepthTwoHundredDisconnected { underlying: String, reason: String },
+
+    /// Order update WebSocket connected.
+    OrderUpdateConnected,
+
+    /// Order update WebSocket disconnected.
+    OrderUpdateDisconnected { reason: String },
+
     /// Graceful shutdown initiated.
     ShutdownInitiated,
 
@@ -326,6 +344,22 @@ impl NotificationEvent {
             }
             Self::WebSocketReconnected { connection_index } => {
                 format!("<b>WebSocket #{connection_index} reconnected</b>")
+            }
+            Self::DepthTwentyConnected { underlying } => {
+                format!("<b>Depth 20-level connected</b>\nUnderlying: {underlying}")
+            }
+            Self::DepthTwentyDisconnected { underlying, reason } => {
+                format!("<b>Depth 20-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
+            }
+            Self::DepthTwoHundredConnected { underlying } => {
+                format!("<b>Depth 200-level connected</b>\nUnderlying: {underlying}")
+            }
+            Self::DepthTwoHundredDisconnected { underlying, reason } => {
+                format!("<b>Depth 200-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
+            }
+            Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
+            Self::OrderUpdateDisconnected { reason } => {
+                format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
             }
             Self::InstrumentBuildSuccess {
                 source,
@@ -639,9 +673,15 @@ impl NotificationEvent {
             Self::QuestDbDisconnected { .. } => Severity::Critical,
             Self::QuestDbReconnected { .. } => Severity::Medium,
             Self::WebSocketReconnected { .. } => Severity::Medium,
+            Self::DepthTwentyDisconnected { .. } => Severity::High,
+            Self::DepthTwoHundredDisconnected { .. } => Severity::High,
+            Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
+            Self::DepthTwentyConnected { .. } => Severity::Low,
+            Self::DepthTwoHundredConnected { .. } => Severity::Low,
+            Self::OrderUpdateConnected => Severity::Low,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,

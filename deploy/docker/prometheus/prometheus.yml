@@ -88,12 +88,10 @@ scrape_configs:
           service: "jaeger"
     metrics_path: "/metrics"
 
-  # Valkey metrics (via built-in INFO command → Prometheus-compatible exporter)
-  # NOTE: Valkey does not expose /metrics natively. When a Valkey exporter
-  # sidecar is added, uncomment and point to its port. For now, QuestDB
-  # and application metrics cover the cache layer indirectly.
-  # - job_name: "dlt-valkey"
-  #   static_configs:
-  #     - targets: ["dlt-valkey-exporter:9121"]
-  #       labels:
-  #         service: "valkey"
+  # Valkey metrics (via redis_exporter sidecar on :9121)
+  - job_name: "dlt-valkey"
+    static_configs:
+      - targets: ["dlt-valkey-exporter:9121"]
+        labels:
+          service: "valkey"
+    metrics_path: "/metrics"

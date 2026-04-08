@@ -271,6 +271,11 @@ impl RiskEngine {
         self.halt_reason
     }
 
+    /// Returns the net lots for a specific security (positive = long, negative = short, 0 = flat).
+    pub fn net_lots_for(&self, security_id: u32) -> i32 {
+        self.positions.get(&security_id).map_or(0, |p| p.net_lots)
+    }
+
     /// Returns the total realized P&L for today.
     pub fn total_realized_pnl(&self) -> f64 {
         self.total_realized_pnl
@@ -597,6 +602,34 @@ mod tests {
     fn position_for_unknown_security() {
         let engine = make_engine();
         assert!(engine.position(9999).is_none());
+    }
+
+    #[test]
+    fn test_net_lots_for_long_position() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 10, 100.0, 25);
+        assert_eq!(engine.net_lots_for(1001), 10);
+    }
+
+    #[test]
+    fn test_net_lots_for_short_position() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, -5, 200.0, 50);
+        assert_eq!(engine.net_lots_for(1001), -5);
+    }
+
+    #[test]
+    fn test_net_lots_for_flat_position() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 10, 100.0, 25);
+        engine.record_fill(1001, -10, 110.0, 25);
+        assert_eq!(engine.net_lots_for(1001), 0);
+    }
+
+    #[test]
+    fn test_net_lots_for_unknown_security() {
+        let engine = make_engine();
+        assert_eq!(engine.net_lots_for(9999), 0);
     }
 
     // -----------------------------------------------------------------------

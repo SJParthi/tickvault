@@ -165,6 +165,9 @@ ilp_port = 9009
 host = "dlt-valkey"
 port = 6379
 max_connections = 16
+# Password loaded from AWS SSM at boot (/dlt/{env}/valkey/password)
+# Empty string = no auth (NOT recommended for production)
+password = ""
 
 [prometheus]
 host = "dlt-prometheus"
@@ -233,6 +236,10 @@ subscribe_stock_equities = true
 stock_atm_strikes_above = 10
 stock_atm_strikes_below = 10
 stock_default_atm_fallback_enabled = true
+# 20-level depth: separate WS endpoint (wss://depth-api-feed.dhan.co).
+# Does NOT use main feed connection slots — separate endpoint, separate connections.
+enable_twenty_depth = true
+twenty_depth_max_instruments = 50
 
 [notification]
 telegram_api_base_url = "https://api.telegram.org"

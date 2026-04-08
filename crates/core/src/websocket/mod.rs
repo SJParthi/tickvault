@@ -14,6 +14,7 @@
 
 pub mod connection;
 pub mod connection_pool;
+pub mod depth_connection;
 pub mod order_update_connection;
 pub mod subscription_builder;
 pub mod tls;
@@ -21,6 +22,7 @@ pub mod types;
 
 pub use connection::WebSocketConnection;
 pub use connection_pool::WebSocketConnectionPool;
+pub use depth_connection::{run_twenty_depth_connection, run_two_hundred_depth_connection};
 pub use order_update_connection::run_order_update_connection;
 pub use subscription_builder::build_subscription_messages;
 pub use types::{ConnectionId, ConnectionState, DisconnectCode, WebSocketError};
